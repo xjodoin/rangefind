@@ -26,8 +26,10 @@
   "scripts": {
     "build:example": "node bin/rangefind.js build --config examples/basic/rangefind.config.json",
     "serve:example": "node scripts/serve.mjs examples/basic/public 5178",
-    "check": "node --check bin/rangefind.js && node --check src/analyzer.js && node --check src/builder.js && node --check src/runtime.js && node --check scripts/serve.mjs",
-    "test:smoke": "npm run build:example && node scripts/smoke.mjs"
+    "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js; do node --check \"$f\"; done",
+    "test": "node --test",
+    "test:smoke": "npm run build:example && node scripts/smoke.mjs",
+    "test:all": "npm run check && npm test && npm run test:smoke"
   },
   "devDependencies": {}
 }

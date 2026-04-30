@@ -15,10 +15,10 @@ export const DEFAULT_STOPWORDS = new Set([
 export function fold(text) {
   return String(text || "")
     .normalize("NFKD")
+    .toLowerCase()
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/œ/g, "oe")
-    .replace(/æ/g, "ae")
-    .toLowerCase();
+    .replace(/æ/g, "ae");
 }
 
 export function stem(token) {

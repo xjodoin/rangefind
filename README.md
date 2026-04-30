@@ -99,6 +99,19 @@ console.log(result.results);
 The runtime expects the host to support HTTP `Range` requests for `.bin` files.
 GitHub Pages supports this. The included local server also supports it.
 
+## Development
+
+```bash
+npm run check
+npm test
+npm run test:smoke
+npm run test:all
+```
+
+The unit tests cover analyzer normalization, binary varint/fixed-width codecs,
+config resolution, shard/range planning, term/code binary round-trips, and an
+end-to-end build plus browser-runtime query against a local HTTP `Range` server.
+
 ## Project Direction
 
 This is the first standalone extraction. The next milestones are:
