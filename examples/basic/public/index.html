@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Rangefind example</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 760px; }
+  input, button { font: inherit; padding: .5rem .65rem; }
+  input { width: min(480px, 75vw); }
+  article { border-top: 1px solid #ddd; padding: 1rem 0; }
+  small { color: #666; }
+</style>
+<h1>Rangefind example</h1>
+<form id="form">
+  <input id="q" value="range static search" autofocus>
+  <button>Search</button>
+</form>
+<div id="out"></div>
+<script type="module">
+  import { createSearch } from "../../../src/runtime.js";
+
+  const engine = await createSearch({ baseUrl: "./rangefind/" });
+  const form = document.querySelector("#form");
+  const input = document.querySelector("#q");
+  const out = document.querySelector("#out");
+
+  async function run() {
+    const result = await engine.search({ q: input.value, size: 5 });
+    out.innerHTML = `<p>${result.total} results</p>` + result.results.map(item => `
+      <article>
+        <h2>${item.title}</h2>
+        <small>${item.category} · ${item.year} · score ${item.score}</small>
+        <p>${item.body}</p>
+      </article>
+    `).join("");
+  }
+
+  form.addEventListener("submit", event => {
+    event.preventDefault();
+    run();
+  });
+  run();
+</script>

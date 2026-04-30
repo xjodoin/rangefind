@@ -1,0 +1,21 @@
+{
+  "input": "docs.jsonl",
+  "output": "public/rangefind",
+  "idPath": "id",
+  "urlPath": "url",
+  "display": ["id", "url", "title", "body", "category", "year"],
+  "fields": [
+    { "name": "title", "path": "title", "weight": 4.5, "b": 0.55, "phrase": true, "phraseWeight": 8 },
+    { "name": "body", "path": "body", "weight": 1.0, "b": 0.75 },
+    { "name": "category", "path": "category", "weight": 1.4, "b": 0.0 }
+  ],
+  "facets": [
+    { "name": "category", "path": "category" }
+  ],
+  "numbers": [
+    { "name": "year", "path": "year" }
+  ],
+  "docChunkSize": 2,
+  "targetShardPostings": 6,
+  "packBytes": 65536
+}

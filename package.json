@@ -1,0 +1,33 @@
+{
+  "name": "rangefind",
+  "version": "0.1.0",
+  "description": "Range-packed static search for large sites with no search server.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "rangefind": "./bin/rangefind.js"
+  },
+  "exports": {
+    ".": "./src/runtime.js",
+    "./builder": "./src/builder.js",
+    "./analyzer": "./src/analyzer.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "docs/",
+    "scripts/",
+    "examples/basic/docs.jsonl",
+    "examples/basic/rangefind.config.json",
+    "examples/basic/public/index.html",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:example": "node bin/rangefind.js build --config examples/basic/rangefind.config.json",
+    "serve:example": "node scripts/serve.mjs examples/basic/public 5178",
+    "check": "node --check bin/rangefind.js && node --check src/analyzer.js && node --check src/builder.js && node --check src/runtime.js && node --check scripts/serve.mjs",
+    "test:smoke": "npm run build:example && node scripts/smoke.mjs"
+  },
+  "devDependencies": {}
+}
