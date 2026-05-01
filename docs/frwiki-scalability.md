@@ -3,7 +3,8 @@
 Rangefind includes a reproducible scalability fixture for French Wikipedia.
 The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
-records a local request/transfer benchmark.
+records a local request/transfer benchmark with cold-transfer breakdowns for
+directory, term, typo, code, and document payload fetches.
 
 ## Data Source
 
@@ -65,23 +66,27 @@ Result:
 Docs indexed:        5,000
 Dump pages read:     5,913
 Body cap:            6,000 cleaned characters/article
-Build + bench time:  25.18 s real
+Build + bench time:  12.62 s real with prepared JSONL reused
 Logical shards:      7,565
 Term packs:          2
-Index files:         53
-Index bytes:         42.1 MB
-Init:                10.3 ms, 1 request, 338.8 KB
+Index files:         16
+Index bytes:         18.4 MB
+Init:                11.2 ms, 1 request, 238.3 KB
 ```
 
 Representative cold queries:
 
 ```text
-Paris:                    26.8 ms, 10 requests, 4.2 MB, top Paris (homonymie)
-Révolution française:     15.6 ms, 10 requests, 5.0 MB, top Révolution française
-intelligence artificielle:11.8 ms,  8 requests, 3.7 MB, top Intelligence artificielle
-football:                  7.3 ms,  4 requests, 2.0 MB, top Coupe du monde de football
-Québec:                    0.6 ms,  1 request, 4.2 KB, top Système éducatif au Québec
+Paris:                    25.0 ms, 14 requests, 122.6 KB, top Paris (homonymie)
+Révolution française:      9.3 ms, 10 requests,  32.3 KB, top Révolution française
+intelligence artificielle: 6.1 ms, 11 requests,  44.7 KB, top Intelligence artificielle
+football:                  4.5 ms, 11 requests,   5.1 KB, top Coupe du monde de football
+Québec:                    3.7 ms, 10 requests,   8.8 KB, top Système éducatif au Québec
 ```
+
+The cold-transfer breakdown shows term pack fetches in the 0.5-54.3 KB range
+and result document fetches in the 3.5-11.2 KB range. The first query also pays
+for the term and document range-directory pages, which were 86.4 KB in this run.
 
 Warm repeated queries in this run were served from the runtime cache with zero
 additional network requests.

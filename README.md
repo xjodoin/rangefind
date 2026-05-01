@@ -22,6 +22,7 @@ a large thesis corpus.
 - Single ESM browser runtime bundle at `dist/runtime.browser.js`.
 - Lazy paged binary range directories at `terms/directory-root.bin.gz` and
   `terms/directory-pages/*.bin.gz`.
+- Range-packed result payloads with capped display fields.
 - Parallel build-time shard reduction with deterministic final pack assembly.
 - Browser runtime with coalesced HTTP `Range` fetches.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
@@ -103,6 +104,13 @@ Create `rangefind.config.json`:
 }
 ```
 
+`display` controls only the payload returned with search results. Indexed fields
+can stay long while returned fields are capped, for example:
+
+```json
+{ "name": "body", "path": "body", "maxChars": 640 }
+```
+
 Build:
 
 ```bash
@@ -155,6 +163,8 @@ site. `bench:quality` reports known-item and typo-recovery Hit@k/MRR.
 `bench:performance` reports query latency, HTTP request count, and transfer size.
 `bench:directories` compares global, naive prefix, and paged range-directory
 layouts against an existing built index.
+`docs/performance-research.md` tracks the top-k retrieval papers currently
+guiding format decisions.
 
 ## Project Direction
 

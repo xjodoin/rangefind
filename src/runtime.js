@@ -14,6 +14,8 @@ import {
 const RERANK_CANDIDATES = 30;
 const DEPENDENCY_SCORE_SCALE = 0.12;
 const SKIP_MAX_TERMS = 30;
+const DOC_INDEX_KEY_WIDTH = 8;
+const textDecoder = new TextDecoder();
 
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
@@ -54,9 +56,11 @@ export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
   const termDirectory = createDirectoryState(manifest.directory, "terms");
+  const docDirectory = manifest.docs?.directory ? createDirectoryState(manifest.docs.directory, "docs") : null;
   const shardCache = new Map();
   const typoShardCache = new Map();
   const docCache = new Map();
+  const packedDocCache = new Map();
   let typoManifest = null;
   let typoManifestPromise = null;
   let typoDirectory = null;
@@ -102,6 +106,10 @@ export async function createSearch(options = {}) {
     const entries = await loadDirectoryPage(state, page);
     const entry = entries.get(shard);
     return entry ? { shard, entry } : null;
+  }
+
+  function docIndexKey(index) {
+    return String(index).padStart(DOC_INDEX_KEY_WIDTH, "0");
   }
 
   async function resolveDirectoryShard(value, state, baseDepth, maxDepth) {
@@ -314,7 +322,7 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function loadDoc(index) {
+  async function loadChunkDoc(index) {
     const chunk = Math.floor(index / manifest.doc_chunk_size);
     const local = index - chunk * manifest.doc_chunk_size;
     if (!docCache.has(chunk)) {
@@ -322,6 +330,63 @@ export async function createSearch(options = {}) {
       docCache.set(chunk, fetch(new URL(file, baseUrl)).then(r => r.json()));
     }
     return (await docCache.get(chunk))[local];
+  }
+
+  async function resolvePackedDoc(index) {
+    if (!docDirectory) return null;
+    const key = docIndexKey(index);
+    const root = await loadDirectoryRoot(docDirectory);
+    const resolved = await directoryEntryFromRoot(docDirectory, root, key);
+    return resolved ? { index, key, entry: resolved.entry } : null;
+  }
+
+  async function loadPackedDocs(indexes) {
+    const wanted = [];
+    const pending = [];
+    const unique = [...new Set(indexes)];
+    for (const index of unique) {
+      wanted.push(index);
+      if (packedDocCache.has(index)) continue;
+      let resolveDoc;
+      let rejectDoc;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveDoc = resolvePromise;
+        rejectDoc = rejectPromise;
+      });
+      packedDocCache.set(index, promise);
+      const resolved = await resolvePackedDoc(index);
+      if (resolved) pending.push({ ...resolved, resolve: resolveDoc, reject: rejectDoc });
+      else resolveDoc(loadChunkDoc(index));
+    }
+
+    await Promise.all(groupRanges(pending).map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const start = item.entry.offset - group.start;
+          const end = start + item.entry.length;
+          const inflated = await inflateGzip(compressed.slice(start, end));
+          item.resolve(JSON.parse(textDecoder.decode(new Uint8Array(inflated))));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          packedDocCache.delete(item.index);
+          item.reject(error);
+        }
+      }
+    }));
+
+    return Promise.all(wanted.map(index => packedDocCache.get(index)));
+  }
+
+  async function loadDocs(indexes) {
+    if (docDirectory) return loadPackedDocs(indexes);
+    return Promise.all(indexes.map(loadChunkDoc));
+  }
+
+  async function rowsToResults(rows) {
+    const docs = await loadDocs(rows.map(([index]) => index));
+    return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
   }
 
   function passesFilters(doc, codeData, filters) {
@@ -501,7 +566,7 @@ export async function createSearch(options = {}) {
       page,
       size,
       approximate: !exhausted,
-      results: await Promise.all(rows.map(async ([index, score]) => ({ ...(await loadDoc(index)), score }))),
+      results: await rowsToResults(rows),
       stats: {
         exact: exhausted,
         blocksDecoded,
@@ -545,7 +610,7 @@ export async function createSearch(options = {}) {
       total: ranked.length,
       page,
       size,
-      results: await Promise.all(rows.map(async ([index, score]) => ({ ...(await loadDoc(index)), score }))),
+      results: await rowsToResults(rows),
       approximate: false,
       stats: {
         exact: true,

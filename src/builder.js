@@ -86,18 +86,46 @@ function flushPostingBuffer(buffer) {
 function docPayload(doc, config, index) {
   const payload = { id: String(getPath(doc, config.idPath || "id", index)), index };
   for (const item of config.display) {
-    if (typeof item === "string") payload[item] = getPath(doc, item);
-    else payload[item.name] = getPath(doc, item.path);
+    if (typeof item === "string") {
+      payload[item] = getPath(doc, item);
+    } else {
+      let value = getPath(doc, item.path);
+      const maxChars = Number(item.maxChars || 0);
+      if (maxChars > 0 && typeof value === "string" && value.length > maxChars) {
+        value = value.slice(0, maxChars).trimEnd();
+      }
+      payload[item.name] = value;
+    }
   }
   if (!payload.title) payload.title = payload.id;
   if (!payload.url) payload.url = getPath(doc, config.urlPath || "url", "");
   return payload;
 }
 
-function writeDocChunk(out, docs, index) {
-  if (!docs.length) return;
-  const file = `${String(index).padStart(4, "0")}.json`;
-  writeFileSync(resolve(out, "docs", file), JSON.stringify(docs));
+function docIndexKey(index) {
+  return String(index).padStart(8, "0");
+}
+
+function writePackedDoc(packWriter, payload, index) {
+  const bytes = Buffer.from(JSON.stringify(payload));
+  writePackedShard(packWriter, docIndexKey(index), gzipSync(bytes, { level: 6 }));
+}
+
+function finishDocPacks(out, packWriter, total, pageBytes) {
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const entries = [];
+  for (let index = 0; index < total; index++) {
+    const key = docIndexKey(index);
+    const entry = packWriter.entries[key];
+    entries.push({ shard: key, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length });
+  }
+  const directory = writeDirectoryFiles(resolve(out, "docs"), entries, pageBytes, "docs");
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    directory,
+    packs: packWriter.packs
+  };
 }
 
 async function writePostingRuns(config, measured, dirs, typoBuffer) {
@@ -107,9 +135,8 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 
   const initialResults = [];
   const buffer = { byShard: new Map(), lines: 0, runsOut: dirs.runsOut };
+  const docPackWriter = createPackWriter(resolve(dirs.out, "docs", "packs"), config.docPackBytes);
   const baseShards = new Set();
-  let chunk = [];
-  let chunkIndex = 0;
 
   await eachJsonLine(config.input, async (doc, index) => {
     const weighted = new Map();
@@ -134,15 +161,15 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 
     const payload = docPayload(doc, config, index);
     if (initialResults.length < config.initialResultLimit) initialResults.push(payload);
-    chunk.push(payload);
-    if (chunk.length >= config.docChunkSize) {
-      writeDocChunk(dirs.out, chunk, chunkIndex++);
-      chunk = [];
-    }
+    writePackedDoc(docPackWriter, payload, index);
   });
-  writeDocChunk(dirs.out, chunk, chunkIndex);
   flushPostingBuffer(buffer);
-  return { codes, initialResults, baseShards: [...baseShards].sort() };
+  return {
+    codes,
+    initialResults,
+    baseShards: [...baseShards].sort(),
+    docs: finishDocPacks(dirs.out, docPackWriter, measured.total, config.docDirectoryPageBytes)
+  };
 }
 
 async function reduceShard(baseShard, config, measured, runData, filters, packWriter, typoBuffer) {
@@ -331,6 +358,7 @@ export async function build({ configPath }) {
     built_at: new Date().toISOString(),
     total: measured.total,
     doc_chunk_size: config.docChunkSize,
+    docs: runData.docs,
     initial_results: runData.initialResults,
     fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
     facets: Object.fromEntries(Object.entries(measured.dicts).map(([name, dict]) => [name, dict.values])),
@@ -354,6 +382,12 @@ export async function build({ configPath }) {
       term_directory_bytes: reduced.directory.total_bytes,
       term_pack_files: reduced.packs.length,
       term_pack_bytes: reduced.packBytes,
+      doc_storage: runData.docs.storage,
+      doc_directory_format: runData.docs.directory.format,
+      doc_directory_page_files: runData.docs.directory.page_files,
+      doc_directory_bytes: runData.docs.directory.total_bytes,
+      doc_pack_files: runData.docs.packs.length,
+      doc_pack_bytes: runData.docs.packs.reduce((sum, pack) => sum + pack.bytes, 0),
       reduce_workers: reduced.reduceWorkers,
       posting_block_size: config.postingBlockSize,
       base_shard_depth: config.baseShardDepth,

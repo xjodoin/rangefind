@@ -67,11 +67,14 @@ test("builder output is searchable through the range-based runtime", async (t) =
     ],
     facets: [{ name: "category", path: "category" }],
     numbers: [{ name: "year", path: "year" }],
-    display: ["title", "url", "category", "year"]
+    display: ["title", "url", "category", "year", { name: "bodySnippet", path: "body", maxChars: 16 }]
   }));
 
   await build({ configPath });
   assert.ok(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.ok(await readFile(join(output, "docs", "directory-root.bin.gz")));
+  assert.ok(await readFile(join(output, "docs", "directory-pages", "0000.bin.gz")));
+  assert.ok(await readFile(join(output, "docs", "packs", "0000.bin")));
   assert.ok(await readFile(join(output, "terms", "directory-root.bin.gz")));
   assert.ok(await readFile(join(output, "terms", "directory-pages", "0000.bin.gz")));
   assert.ok(await readFile(join(output, "codes.bin.gz")));
@@ -84,6 +87,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
 
   const results = await search.search({ q: "static range search", size: 3 });
   assert.equal(results.results[0].title, "Static range search");
+  assert.equal(results.results[0].bodySnippet, "Rangefind builds");
   assert.ok(results.stats.shards > 0);
 
   const exactResults = await search.search({ q: "static range search", size: 3, exact: true });

@@ -79,26 +79,37 @@ export async function readJsonLines(path) {
   return text.split(/\n/u).filter(line => line.trim()).map(line => JSON.parse(line));
 }
 
-export function createFetchMeter(match = /\/rangefind\//u) {
+export function createFetchMeter(match = /\/rangefind\//u, classify = () => "matched") {
   const nativeFetch = globalThis.fetch;
-  const meter = { requests: 0, bytes: 0 };
+  const meter = { requests: 0, bytes: 0, by: {} };
   globalThis.fetch = async (input, init) => {
     const response = await nativeFetch(input, init);
     const url = String(input?.url || input);
     if (match.test(url)) {
+      const bucket = classify(url, init, response) || "matched";
+      if (!meter.by[bucket]) meter.by[bucket] = { requests: 0, bytes: 0 };
       meter.requests++;
+      meter.by[bucket].requests++;
       const length = Number(response.headers.get("content-length") || 0);
-      if (Number.isFinite(length) && length > 0) meter.bytes += length;
+      if (Number.isFinite(length) && length > 0) {
+        meter.bytes += length;
+        meter.by[bucket].bytes += length;
+      }
     }
     return response;
   };
   return {
     snapshot() {
-      return { ...meter };
+      return {
+        requests: meter.requests,
+        bytes: meter.bytes,
+        by: Object.fromEntries(Object.entries(meter.by).map(([key, value]) => [key, { ...value }]))
+      };
     },
     reset() {
       meter.requests = 0;
       meter.bytes = 0;
+      meter.by = {};
     },
     restore() {
       globalThis.fetch = nativeFetch;

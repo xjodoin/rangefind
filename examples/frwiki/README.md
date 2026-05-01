@@ -2,7 +2,9 @@
 
 This fixture builds a static Rangefind site from French Wikipedia article data.
 It streams the official Wikimedia dump, converts pages to JSONL, builds the
-index, and runs a local search benchmark with request and transfer counts.
+index, and runs a local search benchmark with request and transfer counts. The
+benchmark JSON also breaks cold-query transfer down by directory, term, typo,
+code, and document payload fetches.
 
 Quick bounded run:
 

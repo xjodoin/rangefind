@@ -19,7 +19,11 @@ rangefind/
   manifest.json
   codes.bin.gz
   docs/
-    0000.json
+    directory-root.bin.gz
+    directory-pages/
+      0000.bin.gz
+    packs/
+      0000.bin
   terms/
     directory-root.bin.gz
     directory-pages/
@@ -48,6 +52,14 @@ shard files and typo index-term run files into `_build/`; the parent then
 assembles final range packs in sorted task order so pack offsets stay
 deterministic. Set `reduceWorkers` in the config to control the worker count;
 `1` is the default, while `0` or `"auto"` uses up to four workers.
+
+Document packs contain independently compressed result-display payloads addressed
+through the same paged range-directory pattern as term shards. They contain only
+configured display fields, not necessarily the full indexed text. A display
+object can set `maxChars` to cap a returned string field while the corresponding
+indexed field remains uncapped for scoring. This keeps random result-fetch
+traffic bounded for long documents and avoids over-fetching a whole JSON chunk
+for one result.
 
 ## Retrieval Model
 

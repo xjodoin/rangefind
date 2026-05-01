@@ -266,7 +266,7 @@ function writeSite(args, docsPath) {
       { name: "body", path: "body", weight: 1.0, b: 0.75, typo: false }
     ],
     facets: [{ name: "category", path: "category" }],
-    display: ["id", "title", "url", "body", "category"]
+    display: ["id", "title", "url", { name: "body", path: "body", maxChars: 640 }, "category"]
   };
   writeFileSync(configPath, JSON.stringify(config, null, 2));
   writeFileSync(resolve(publicDir, "index.html"), `<!doctype html>
@@ -310,10 +310,29 @@ async function buildFixture(args) {
   await build({ configPath });
 }
 
+function networkBucket(url) {
+  const path = new URL(url).pathname;
+  if (path.endsWith("/runtime.browser.js")) return "runtime";
+  if (path.endsWith("/manifest.json")) return "manifest";
+  if (path.includes("/directory-")) return "directory";
+  if (path.includes("/terms/packs/")) return "terms";
+  if (path.includes("/typo/")) return "typo";
+  if (path.includes("/docs/")) return "docs";
+  if (path.endsWith("/codes.bin.gz")) return "codes";
+  return "other";
+}
+
+function networkKbBy(snapshot) {
+  return Object.fromEntries(Object.entries(snapshot.by || {}).map(([bucket, value]) => [bucket, {
+    requests: value.requests,
+    kb: kb(value.bytes)
+  }]));
+}
+
 async function benchFixture(args) {
   const root = resolve(args.root, "public");
   const server = await serveStatic(root);
-  const meter = createFetchMeter(/\/(rangefind|runtime\.browser\.js)/u);
+  const meter = createFetchMeter(/\/(rangefind|runtime\.browser\.js)/u, networkBucket);
   try {
     meter.reset();
     const initStart = performance.now();
@@ -325,6 +344,7 @@ async function benchFixture(args) {
       const times = [];
       const requests = [];
       const bytes = [];
+      const networks = [];
       let total = 0;
       let top = "";
       for (let i = 0; i < args.runs; i++) {
@@ -333,6 +353,7 @@ async function benchFixture(args) {
         const response = await engine.search({ q, size: args.size });
         times.push(performance.now() - start);
         const network = meter.snapshot();
+        networks.push(network);
         requests.push(network.requests);
         bytes.push(network.bytes);
         total = response.total;
@@ -345,6 +366,7 @@ async function benchFixture(args) {
         coldMs: times[0] || 0,
         coldRequests: requests[0] || 0,
         coldKb: kb(bytes[0] || 0),
+        coldBy: networkKbBy(networks[0] || {}),
         warmP50Ms: quantile(times.slice(1), 0.5),
         warmAvgRequests: mean(requests.slice(1)),
         warmAvgKb: kb(mean(bytes.slice(1))),
@@ -359,7 +381,7 @@ async function benchFixture(args) {
       root,
       index: dirStats(resolve(root, "rangefind")),
       meta: existsSync(resolve(args.root, "data", "frwiki.meta.json")) ? JSON.parse(readFileSync(resolve(args.root, "data", "frwiki.meta.json"), "utf8")) : null,
-      init: { ms: initMs, requests: initNetwork.requests, kb: kb(initNetwork.bytes) },
+      init: { ms: initMs, requests: initNetwork.requests, kb: kb(initNetwork.bytes), by: networkKbBy(initNetwork) },
       rows
     };
     const reportPath = resolve(args.root, "frwiki-bench.json");
