@@ -9,6 +9,7 @@ export const DEFAULTS = {
   packBytes: 4 * 1024 * 1024,
   postingFlushLines: 100000,
   maxTermsPerDoc: 160,
+  maxExpansionTermsPerDoc: 12,
   initialResultLimit: 20,
   postingBlockSize: 128,
   bm25fK1: 1.2

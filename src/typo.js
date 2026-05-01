@@ -11,10 +11,10 @@ const SEPARATOR = "\u0001";
 
 export const TYPO_DEFAULTS = {
   enabled: true,
-  minTermLength: 4,
+  minTermLength: 5,
   minSurfaceLength: 4,
   maxSurfaceLength: 24,
-  maxTermLength: 24,
+  maxTermLength: 20,
   minDf: 1,
   maxDfRatio: 0.08,
   maxEdits: 2,
@@ -23,7 +23,7 @@ export const TYPO_DEFAULTS = {
   targetShardCandidates: 12000,
   maxCandidatesPerDelete: 32,
   packBytes: 4 * 1024 * 1024,
-  flushLines: 100000
+  flushLines: 200000
 };
 
 export function typoOptions(config) {
@@ -121,6 +121,7 @@ export function addTypoSurfacePairs(buffer, pairs) {
 export function surfacePairsForFields(doc, fields, fieldText) {
   const pairs = new Map();
   for (const field of fields) {
+    if (field.typo === false) continue;
     for (const [surface, term] of surfaceStemPairs(fieldText(doc, field))) {
       pairs.set(`${surface}${SEPARATOR}${term}`, [surface, term]);
     }

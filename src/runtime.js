@@ -1,4 +1,4 @@
-import { analyzeTerms, queryTerms, tokenize } from "./analyzer.js";
+import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
 import { decodePostings, parseCodes, parseRangeDirectory, parseShard } from "./codec.js";
 import { groupRanges, shardFor } from "./shards.js";
 import {
@@ -10,6 +10,9 @@ import {
   typoMaxEditsFor,
   typoShardFor
 } from "./typo_runtime.js";
+
+const RERANK_CANDIDATES = 30;
+const DEPENDENCY_SCORE_SCALE = 0.12;
 
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
@@ -213,6 +216,73 @@ export async function createSearch(options = {}) {
     return out;
   }
 
+  function dependencyTerms(baseTerms) {
+    if (baseTerms.length < 3) return [];
+    const window = manifest.stats?.proximity_window || 5;
+    const out = new Map();
+    for (let i = 0; i < baseTerms.length; i++) {
+      const end = Math.min(baseTerms.length, i + window + 1);
+      for (let j = i + 1; j < end; j++) {
+        const term = proximityTerm(baseTerms[i], baseTerms[j]);
+        if (!term) continue;
+        out.set(term, (out.get(term) || 0) + DEPENDENCY_SCORE_SCALE / Math.max(1, j - i));
+      }
+    }
+    return [...out.entries()].map(([term, weight]) => ({ term, weight }));
+  }
+
+  async function rerankWithDependencies(ranked, baseTerms, candidateLimit = RERANK_CANDIDATES) {
+    const features = dependencyTerms(baseTerms);
+    const limit = Math.min(ranked.length, candidateLimit);
+    const disabledStats = {
+      rerankCandidates: limit,
+      dependencyFeatures: features.length,
+      dependencyTermsMatched: 0,
+      dependencyPostingsScanned: 0,
+      dependencyCandidateMatches: 0
+    };
+    if (!features.length || limit <= 1) return { ranked, stats: disabledStats };
+
+    const head = ranked.slice(0, limit);
+    const tail = ranked.slice(limit);
+    const candidateScores = new Map(head.map(([doc, score], index) => [doc, { doc, score, originalRank: index }]));
+    const featureWeights = new Map(features.map(feature => [feature.term, feature.weight]));
+    let dependencyTermsMatched = 0;
+    let dependencyPostingsScanned = 0;
+    let dependencyCandidateMatches = 0;
+
+    for (const { term, shard, entry } of await termEntries(features.map(feature => feature.term))) {
+      const weight = featureWeights.get(term) || 0;
+      if (!weight) continue;
+      dependencyTermsMatched++;
+      const postings = decodePostings(shard, entry);
+      dependencyPostingsScanned += postings.length / 2;
+      for (let i = 0; i < postings.length; i += 2) {
+        const candidate = candidateScores.get(postings[i]);
+        if (candidate) {
+          candidate.score += postings[i + 1] * weight;
+          dependencyCandidateMatches++;
+        }
+      }
+    }
+
+    head.sort((a, b) => {
+      const left = candidateScores.get(a[0]);
+      const right = candidateScores.get(b[0]);
+      return right.score - left.score || left.originalRank - right.originalRank || a[0] - b[0];
+    });
+    return {
+      ranked: head.map(([doc]) => [doc, candidateScores.get(doc).score]).concat(tail),
+      stats: {
+        rerankCandidates: limit,
+        dependencyFeatures: features.length,
+        dependencyTermsMatched,
+        dependencyPostingsScanned,
+        dependencyCandidateMatches
+      }
+    };
+  }
+
   async function loadDoc(index) {
     const chunk = Math.floor(index / manifest.doc_chunk_size);
     const local = index - chunk * manifest.doc_chunk_size;
@@ -236,7 +306,7 @@ export async function createSearch(options = {}) {
     return true;
   }
 
-  async function runExactSearch({ q, page, size, filters, baseTerms, terms }) {
+  async function runExactSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
     const entries = await termEntries(terms);
@@ -257,16 +327,20 @@ export async function createSearch(options = {}) {
     }
 
     const minShouldMatch = baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
-    const ranked = [...scores.entries()]
+    let ranked = [...scores.entries()]
       .filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch))
       .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    const reranked = rerank === false
+      ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
+      : await rerankWithDependencies(ranked, baseTerms, Math.max(RERANK_CANDIDATES, offset + size));
+    ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
     return {
       total: ranked.length,
       page,
       size,
       results: await Promise.all(rows.map(async ([index, score]) => ({ ...(await loadDoc(index)), score }))),
-      stats: { exact: true, terms: terms.length, shards: new Set(entries.map(item => item.shard)).size, postings: entries.reduce((sum, item) => sum + item.entry.count, 0) }
+      stats: { exact: true, terms: terms.length, shards: new Set(entries.map(item => item.shard)).size, postings: entries.reduce((sum, item) => sum + item.entry.count, 0), ...reranked.stats }
     };
   }
 
@@ -374,7 +448,7 @@ export async function createSearch(options = {}) {
         ...params,
         q: plan.q,
         baseTerms: plan.baseTerms,
-        terms: queryTerms(plan.q)
+        terms: expandedTermsFromBaseTerms(plan.baseTerms)
       });
       if (corrected.total <= response.total) continue;
       const value = plan.score + Math.min(corrected.total, 20) * 0.05;
@@ -414,8 +488,8 @@ export async function createSearch(options = {}) {
 
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map(item => item.term);
-    const response = await runExactSearch({ q, page, size, filters, baseTerms, terms: queryTerms(q) });
-    return maybeTypoFallback({ q, page, size, filters }, response, baseTerms, analyzedTerms);
+    const response = await runExactSearch({ q, page, size, filters, baseTerms, terms: queryTerms(q), rerank: params.rerank });
+    return maybeTypoFallback({ q, page, size, filters, rerank: params.rerank }, response, baseTerms, analyzedTerms);
   }
 
   return {

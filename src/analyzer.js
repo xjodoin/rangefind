@@ -86,6 +86,10 @@ export function analyzeTerms(text, options = {}) {
 
 export function queryTerms(text) {
   const terms = tokenize(text);
+  return expandedTermsFromBaseTerms(terms);
+}
+
+export function expandedTermsFromBaseTerms(terms) {
   const expanded = [...terms];
   for (const n of [2, 3]) {
     for (let i = 0; i <= terms.length - n; i++) {
@@ -93,4 +97,10 @@ export function queryTerms(text) {
     }
   }
   return [...new Set(expanded)];
+}
+
+export function proximityTerm(left, right) {
+  if (!left || !right || left === right) return "";
+  const [a, b] = left < right ? [left, right] : [right, left];
+  return `n_${a}_${b}`;
 }

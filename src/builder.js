@@ -19,7 +19,7 @@ import {
 import { getPath, readConfig } from "./config.js";
 import { eachJsonLine } from "./jsonl.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
-import { addFieldScores, bm25fScores, fieldText, topTerms } from "./scoring.js";
+import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
 import { baseShardFor, partitionEntries } from "./shards.js";
 import {
   addTypoIndexTerm,
@@ -111,8 +111,15 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 
   await eachJsonLine(config.input, async (doc, index) => {
     const weighted = new Map();
+    const expansion = new Map();
     for (const field of config.fields) addFieldScores(doc, field, measured.avgLens[field.name], weighted);
-    for (const [term, score] of topTerms(bm25fScores(weighted, config.bm25fK1), config.maxTermsPerDoc)) {
+    for (const field of config.fields) addFieldExpansionScores(doc, field, expansion);
+    for (const [term, score] of selectDocTerms(
+      bm25fScores(weighted, config.bm25fK1),
+      expansion,
+      config.maxTermsPerDoc,
+      config.maxExpansionTermsPerDoc
+    )) {
       bufferPosting(buffer, config, term, index, score);
       baseShards.add(baseShardFor(term, config));
     }
@@ -217,7 +224,7 @@ export async function build({ configPath }) {
     total: measured.total,
     doc_chunk_size: config.docChunkSize,
     initial_results: runData.initialResults,
-    fields: config.fields.map(({ name, weight, b, phrase }) => ({ name, weight, b, phrase: !!phrase })),
+    fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
     facets: Object.fromEntries(Object.entries(measured.dicts).map(([name, dict]) => [name, dict.values])),
     numbers: config.numbers.map(n => ({ name: n.name })),
     block_filters: reduced.filters,
@@ -227,7 +234,7 @@ export async function build({ configPath }) {
       compression: typoManifest.compression,
       shards: typoManifest.shards.length,
       packs: typoManifest.packs.length,
-      stats: typoManifest.stats
+      stats: { ...typoManifest.stats, pack_files: typoManifest.packs.length }
     } : null,
     stats: {
       terms: reduced.termCount,
@@ -239,7 +246,10 @@ export async function build({ configPath }) {
       posting_block_size: config.postingBlockSize,
       base_shard_depth: config.baseShardDepth,
       max_shard_depth: config.maxShardDepth,
-      target_shard_postings: config.targetShardPostings
+      target_shard_postings: config.targetShardPostings,
+      max_expansion_terms_per_doc: config.maxExpansionTermsPerDoc,
+      proximity_window: Math.max(0, ...config.fields.map(field => field.proximityWindow || 0)),
+      scoring: "rangefind-bm25f-phrase-proximity-v2"
     }
   };
   writeFileSync(resolve(dirs.out, "manifest.json"), JSON.stringify(manifest));

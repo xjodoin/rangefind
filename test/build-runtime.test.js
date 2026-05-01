@@ -51,7 +51,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   await writeFile(docsPath, [
     JSON.stringify({ id: "a", title: "Static range search", body: "Rangefind builds a static index with range requests.", category: "indexing", year: 2026, url: "/a" }),
     JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", category: "baseline", year: 2025, url: "/b" }),
-    JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", year: 2026, url: "/c" })
+    JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", year: 2026, url: "/c" }),
+    JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", year: 2026, url: "/d" })
   ].join("\n"));
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
@@ -88,6 +89,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(typo.correctedQuery, "static range search");
   assert.deepEqual(typo.corrections.map(item => item.to), ["static"]);
   assert.equal(typo.stats.typoApplied, true);
+
+  const stemmedTypo = await search.search({ q: "elecrtified winding insulation", size: 3 });
+  assert.equal(stemmedTypo.results[0].title, "Electrified winding insulation");
+  assert.equal(stemmedTypo.stats.typoApplied, true);
 
   const filtered = await search.search({
     q: "search",
