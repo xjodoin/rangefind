@@ -89,17 +89,19 @@ function mb(bytes) {
 }
 
 function packNumber(pack) {
-  return Number(String(pack || "0").replace(/\D/gu, "")) || 0;
+  const match = /^(\d+)/u.exec(String(pack || "0"));
+  return match ? Number(match[1]) || 0 : 0;
 }
 
-function loadDirectoryEntries(indexRoot, directory, fallbackDir) {
-  const rootPath = resolve(indexRoot, directory?.root || `${fallbackDir}/directory-root.bin.gz`);
+function loadDirectoryEntries(indexRoot, directory) {
+  if (!directory?.root || !directory?.pages) throw new Error("Rangefind directory metadata is missing root/pages.");
+  const rootPath = resolve(indexRoot, directory.root);
   const rootCompressed = readFileSync(rootPath);
   const root = parseDirectoryRoot(gunzipSync(rootCompressed));
   const pageBytes = new Map();
   const entries = [];
   for (const page of root.pages) {
-    const pagePath = resolve(indexRoot, `${(directory?.pages || `${fallbackDir}/directory-pages/`).replace(/\/?$/u, "/")}${page.file}`);
+    const pagePath = resolve(indexRoot, `${directory.pages.replace(/\/?$/u, "/")}${page.file}`);
     const compressed = readFileSync(pagePath);
     pageBytes.set(page.file, compressed.length);
     const parsed = parseDirectoryPage(gunzipSync(compressed));
@@ -121,7 +123,7 @@ function loadDirectoryEntries(indexRoot, directory, fallbackDir) {
 }
 
 function loadTermEntries(indexRoot, manifest) {
-  return loadDirectoryEntries(indexRoot, manifest.directory, "terms");
+  return loadDirectoryEntries(indexRoot, manifest.directory);
 }
 
 function currentPagedDirectory(loaded) {
@@ -148,11 +150,12 @@ function currentPagedDirectory(loaded) {
   };
 }
 
-function loadTypoEntries(indexRoot) {
-  const manifestPath = resolve(indexRoot, "typo", "manifest.json");
+function loadTypoEntries(indexRoot, rootManifest) {
+  if (!rootManifest.typo?.manifest) return null;
+  const manifestPath = resolve(indexRoot, rootManifest.typo.manifest);
   if (!existsSync(manifestPath)) return null;
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  return { manifest, manifestBytes: statSync(manifestPath).size, ...loadDirectoryEntries(indexRoot, manifest.directory, "typo") };
+  return { manifest, manifestBytes: statSync(manifestPath).size, ...loadDirectoryEntries(indexRoot, manifest.directory) };
 }
 
 function scaledEntries(entries, scale) {
@@ -374,7 +377,7 @@ const indexRoot = resolve(args.index);
 const manifest = JSON.parse(readFileSync(resolve(indexRoot, "manifest.json"), "utf8"));
 const terms = loadTermEntries(indexRoot, manifest);
 const termSets = termShardSets(args.queries, manifest, terms.entries);
-const typo = loadTypoEntries(indexRoot);
+const typo = loadTypoEntries(indexRoot, manifest);
 const typoSets = typo ? typoShardSets(args.typoTokens, typo.manifest, typo.entries) : [];
 
 const report = {

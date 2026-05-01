@@ -3,10 +3,15 @@ import {
   readdirSync,
   readFileSync,
   mkdirSync,
+  openSync,
+  closeSync,
+  readSync,
   rmSync,
   unlinkSync,
+  writeSync,
   writeFileSync
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -20,9 +25,13 @@ import {
   rewriteTermShardForExternalBlocks
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
+import { docLayoutRecord, orderDocIdsByLocality, summarizeDocLayout } from "./doc_layout.js";
+import { buildDocPagePointerTable, DOC_PAGE_FORMAT } from "./doc_pages.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
+import { buildDocOrdinalTable, buildDocPointerTable } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
-import { createPackWriter, writePackedShard } from "./packs.js";
+import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
+import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
 import { baseShardFor, partitionEntries } from "./shards.js";
@@ -174,50 +183,202 @@ function docIndexKey(index) {
   return String(index).padStart(8, "0");
 }
 
-function writePackedDoc(packWriter, payload, index) {
-  const bytes = Buffer.from(JSON.stringify(payload));
-  writePackedShard(packWriter, docIndexKey(index), gzipSync(bytes, { level: 6 }));
+function docPageKey(index) {
+  return String(index).padStart(8, "0");
 }
 
-function finishDocPacks(out, packWriter, total, pageBytes) {
-  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  const entries = [];
-  for (let index = 0; index < total; index++) {
-    const key = docIndexKey(index);
-    const entry = packWriter.entries[key];
-    entries.push({ shard: key, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length });
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function hashedFile(prefix, hash, suffix) {
+  return `${prefix}.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}${suffix}`;
+}
+
+function createDocSpool(outDir) {
+  mkdirSync(outDir, { recursive: true });
+  const path = resolve(outDir, "payloads.bin");
+  return {
+    path,
+    fd: openSync(path, "w"),
+    offset: 0,
+    bytes: 0,
+    entries: [],
+    layout: []
+  };
+}
+
+function closeDocSpool(spool) {
+  if (spool.fd == null) return;
+  closeSync(spool.fd);
+  spool.fd = null;
+}
+
+function writeSpooledDoc(spool, payload, index, layoutRecord) {
+  const bytes = Buffer.from(JSON.stringify(payload));
+  const compressed = gzipSync(bytes, { level: 6 });
+  writeSync(spool.fd, compressed, 0, compressed.length, spool.offset);
+  spool.entries[index] = {
+    offset: spool.offset,
+    length: compressed.length,
+    logicalLength: bytes.length
+  };
+  spool.layout[index] = layoutRecord;
+  spool.offset += compressed.length;
+  spool.bytes += compressed.length;
+}
+
+function readSpooledDoc(fd, entry) {
+  const buffer = Buffer.alloc(entry.length);
+  const bytesRead = readSync(fd, buffer, 0, entry.length, entry.offset);
+  if (bytesRead !== entry.length) throw new Error("Rangefind doc spool ended before a payload could be read.");
+  return buffer;
+}
+
+function finishDocPacks(out, spool, total, config) {
+  const packWriter = createPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
+  const order = orderDocIdsByLocality(spool.layout, total);
+  const entriesByDoc = new Array(total);
+  const fd = openSync(spool.path, "r");
+  try {
+    for (const index of order) {
+      const entry = spool.entries[index];
+      if (!entry) throw new Error(`Rangefind doc spool is missing document ${index}.`);
+      writePackedShard(packWriter, docIndexKey(index), readSpooledDoc(fd, entry), {
+        kind: "doc",
+        codec: "json-v1",
+        logicalLength: entry.logicalLength
+      });
+      entriesByDoc[index] = packWriter.entries[docIndexKey(index)];
+    }
+  } finally {
+    closeSync(fd);
   }
-  const directory = writeDirectoryFiles(resolve(out, "docs"), entries, pageBytes, "docs");
+  finalizePackWriter(packWriter);
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const pointerTable = buildDocPointerTable(order.map(index => entriesByDoc[index]), packIndexes);
+  const hash = sha256Hex(pointerTable.buffer);
+  const file = `docs/pointers/${hashedFile("0000", hash, ".bin")}`;
+  mkdirSync(resolve(out, "docs", "pointers"), { recursive: true });
+  writeFileSync(resolve(out, file), pointerTable.buffer);
+  const ordinalTable = buildDocOrdinalTable(order, total);
+  const ordinalHash = sha256Hex(ordinalTable.buffer);
+  const ordinalFile = `docs/ordinals/${hashedFile("0000", ordinalHash, ".bin")}`;
+  mkdirSync(resolve(out, "docs", "ordinals"), { recursive: true });
+  writeFileSync(resolve(out, ordinalFile), ordinalTable.buffer);
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
-    directory,
+    layout: {
+      ...summarizeDocLayout(spool.layout, total, config),
+      spool_bytes: spool.bytes
+    },
+    pointers: {
+      ...pointerTable.meta,
+      file,
+      order: "layout",
+      content_hash: hash,
+      immutable: true,
+      bytes: pointerTable.buffer.length,
+      pack_table: packTable(packWriter.packs),
+      ordinals: {
+        ...ordinalTable.meta,
+        file: ordinalFile,
+        content_hash: ordinalHash,
+        immutable: true,
+        bytes: ordinalTable.buffer.length
+      }
+    },
+    packs: packWriter.packs
+  };
+}
+
+function finishDocPages(out, spool, total, config) {
+  const pageSize = Math.max(1, Math.floor(Number(config.docPageSize || 32)));
+  const packWriter = createPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
+  const entries = [];
+  const fd = openSync(spool.path, "r");
+  try {
+    for (let pageStart = 0, pageIndex = 0; pageStart < total; pageStart += pageSize, pageIndex++) {
+      const pageEnd = Math.min(total, pageStart + pageSize);
+      const parts = [];
+      let logicalLength = 2;
+      for (let index = pageStart; index < pageEnd; index++) {
+        const entry = spool.entries[index];
+        if (!entry) throw new Error(`Rangefind doc spool is missing document ${index}.`);
+        const payload = gunzipSync(readSpooledDoc(fd, entry)).toString("utf8");
+        parts.push(payload);
+        logicalLength += Buffer.byteLength(payload) + (parts.length > 1 ? 1 : 0);
+      }
+      const source = Buffer.from(`[${parts.join(",")}]`);
+      const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
+        kind: "doc-page",
+        codec: DOC_PAGE_FORMAT,
+        logicalLength
+      });
+      entries[pageIndex] = packed;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  finalizePackWriter(packWriter);
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const pointerTable = buildDocPagePointerTable(entries, packIndexes);
+  const hash = sha256Hex(pointerTable.buffer);
+  const file = `docs/pages/${hashedFile("0000", hash, ".bin")}`;
+  mkdirSync(resolve(out, "docs", "pages"), { recursive: true });
+  writeFileSync(resolve(out, file), pointerTable.buffer);
+  return {
+    storage: "range-pack-v1",
+    format: DOC_PAGE_FORMAT,
+    compression: "gzip-member",
+    page_size: pageSize,
+    max_overfetch_docs: Math.max(1, Math.floor(Number(config.docPageMaxOverfetchDocs || 16))),
+    pointers: {
+      ...pointerTable.meta,
+      file,
+      order: "doc-id-page",
+      content_hash: hash,
+      immutable: true,
+      bytes: pointerTable.buffer.length,
+      pack_table: packTable(packWriter.packs)
+    },
     packs: packWriter.packs
   };
 }
 
 function writeFacetDictionaries(out, dicts, config) {
   const packWriter = createPackWriter(resolve(out, "facets", "packs"), config.facetDictionaryPackBytes || config.packBytes);
-  const entries = [];
   const fields = {};
   for (const [name, dict] of Object.entries(dicts || {})) {
     const values = dict.values || [];
     const source = buildFacetDictionary(values);
-    const entry = writePackedShard(packWriter, name, gzipSync(source, { level: 6 }));
-    entries.push({ shard: name, pack: entry.pack, offset: entry.offset, length: entry.length });
+    const entry = writePackedShard(packWriter, name, gzipSync(source, { level: 6 }), {
+      kind: "facet-dictionary",
+      codec: "rffacetdict-v1",
+      logicalLength: source.length
+    });
     fields[name] = {
       count: values.length,
       source_bytes: source.length,
       bytes: entry.length
     };
   }
-  const directory = writeDirectoryFiles(resolve(out, "facets"), entries, config.directoryPageBytes, "facets");
+  finalizePackWriter(packWriter);
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const entries = Object.keys(dicts || {}).map((name) => {
+    const entry = packWriter.entries[name];
+    return { shard: name, packIndex: packIndexes.get(entry.pack), ...entry };
+  }).filter(entry => entry.pack);
+  const directory = writeDirectoryFiles(resolve(out, "facets"), entries, config.directoryPageBytes, "facets", { packTable: packWriter.packs });
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
     format: "rffacetdict-v1",
     directory,
     packs: "facets/packs/",
+    pack_table: packTable(packWriter.packs),
+    pack_objects: packWriter.packs,
     pack_files: packWriter.packs.length,
     pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0),
     fields
@@ -227,7 +388,6 @@ function writeFacetDictionaries(out, dicts, config) {
 function writeDocValuePacks(out, config, total, codes) {
   const chunkSize = Math.max(1, Number(config.docValueChunkSize || 2048));
   const packWriter = createPackWriter(resolve(out, "doc-values", "packs"), config.docValuePackBytes);
-  const packIndexes = () => new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const fields = {};
   for (const field of docValueFields(config, codes)) {
     const chunks = [];
@@ -235,13 +395,21 @@ function writeDocValuePacks(out, config, total, codes) {
       const rows = (codes[field.name] || []).slice(start, Math.min(total, start + chunkSize));
       const encoded = buildDocValueChunk(field, start, rows);
       const key = `${field.name}\u0000${chunks.length}`;
-      const entry = writePackedShard(packWriter, key, gzipSync(encoded.buffer, { level: 6 }));
+      const entry = writePackedShard(packWriter, key, gzipSync(encoded.buffer, { level: 6 }), {
+        kind: "doc-value",
+        codec: "rfdocvalues-v1",
+        logicalLength: encoded.buffer.length
+      });
       chunks.push({
+        key,
         start,
         count: rows.length,
         pack: entry.pack,
         offset: entry.offset,
         length: entry.length,
+        physicalLength: entry.physicalLength,
+        logicalLength: entry.logicalLength,
+        checksum: entry.checksum,
         width: encoded.width,
         min: encoded.summary?.min ?? null,
         max: encoded.summary?.max ?? null,
@@ -256,9 +424,22 @@ function writeDocValuePacks(out, config, total, codes) {
       chunks
     };
   }
-  const indexes = packIndexes();
+  finalizePackWriter(packWriter);
+  const indexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   for (const field of Object.values(fields)) {
-    for (const chunk of field.chunks) chunk.packIndex = indexes.get(chunk.pack);
+    for (const chunk of field.chunks) {
+      const entry = packWriter.entries[chunk.key];
+      Object.assign(chunk, {
+        pack: entry.pack,
+        offset: entry.offset,
+        length: entry.length,
+        physicalLength: entry.physicalLength,
+        logicalLength: entry.logicalLength,
+        checksum: entry.checksum,
+        packIndex: indexes.get(entry.pack)
+      });
+      delete chunk.key;
+    }
   }
   return {
     storage: "range-pack-v1",
@@ -267,6 +448,21 @@ function writeDocValuePacks(out, config, total, codes) {
     chunk_size: chunkSize,
     fields,
     packs: packWriter.packs
+  };
+}
+
+function packTable(packs) {
+  return (packs || []).map(pack => pack.file);
+}
+
+function summarizeDedup(...packSets) {
+  const packs = packSets.flat().filter(Boolean);
+  return {
+    strategy: "sha256-exact-compressed-object",
+    objects: packs.reduce((sum, pack) => sum + (pack.objects || 0), 0),
+    references: packs.reduce((sum, pack) => sum + (pack.references || pack.shards || 0), 0),
+    deduped_objects: packs.reduce((sum, pack) => sum + (pack.dedupedObjects || 0), 0),
+    deduped_bytes: packs.reduce((sum, pack) => sum + (pack.dedupedBytes || 0), 0)
   };
 }
 
@@ -290,7 +486,11 @@ function externalizeTermShard(encoded, config, filters, blockPackWriter) {
   }
   return rewriteTermShardForExternalBlocks(encoded, { block_filters: filters }, config, ({ term, blockIndex, bytes }) => {
     const key = `${term}\u0000${blockIndex}\u0000${blockPackWriter.bytes}`;
-    return writePackedShard(blockPackWriter, key, gzipSync(Buffer.from(bytes), { level: 6 }));
+    return writePackedShard(blockPackWriter, key, gzipSync(Buffer.from(bytes), { level: 6 }), {
+      kind: "posting-block",
+      codec: "rfpostings-v1",
+      logicalLength: bytes.length
+    });
   });
 }
 
@@ -303,46 +503,51 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 
   const initialResults = [];
   const buffer = { byShard: new Map(), lines: 0, runsOut: dirs.runsOut };
-  const docPackWriter = createPackWriter(resolve(dirs.out, "docs", "packs"), config.docPackBytes);
+  const docSpool = createDocSpool(resolve(dirs.out, "_build", "docs"));
   const baseShards = new Set();
 
-  await eachJsonLine(config.input, async (doc, index) => {
-    const weighted = new Map();
-    const expansion = new Map();
-    for (const field of config.fields) addFieldScores(doc, field, measured.avgLens[field.name], weighted);
-    for (const field of config.fields) addFieldExpansionScores(doc, field, expansion);
-    for (const [term, score] of selectDocTerms(
-      bm25fScores(weighted, config.bm25fK1),
-      expansion,
-      config.maxTermsPerDoc,
-      config.maxExpansionTermsPerDoc
-    )) {
-      bufferPosting(buffer, config, term, index, score);
-      baseShards.add(baseShardFor(term, config));
-    }
-
-    for (const facet of config.facets) {
-      const values = [];
-      for (const item of facetValues(doc, facet)) {
-        const code = addDict(measured.dicts[facet.name], item.value, item.label);
-        values.push(code);
+  try {
+    await eachJsonLine(config.input, async (doc, index) => {
+      const weighted = new Map();
+      const expansion = new Map();
+      for (const field of config.fields) addFieldScores(doc, field, measured.avgLens[field.name], weighted);
+      for (const field of config.fields) addFieldExpansionScores(doc, field, expansion);
+      const selectedTerms = selectDocTerms(
+        bm25fScores(weighted, config.bm25fK1),
+        expansion,
+        config.maxTermsPerDoc,
+        config.maxExpansionTermsPerDoc
+      );
+      for (const [term, score] of selectedTerms) {
+        bufferPosting(buffer, config, term, index, score);
+        baseShards.add(baseShardFor(term, config));
       }
-      codes[facet.name][index] = facetBits(measured.dicts[facet.name], values);
-    }
-    for (const number of config.numbers) codes[number.name][index] = numericValue(doc, number);
-    for (const boolean of config.booleans || []) codes[boolean.name][index] = booleanValue(doc, boolean);
-    addTypoSurfacePairs(typoBuffer, surfacePairsForFields(doc, config.fields, fieldText));
 
-    const payload = docPayload(doc, config, index);
-    if (initialResults.length < config.initialResultLimit) initialResults.push(payload);
-    writePackedDoc(docPackWriter, payload, index);
-  });
+      for (const facet of config.facets) {
+        const values = [];
+        for (const item of facetValues(doc, facet)) {
+          const code = addDict(measured.dicts[facet.name], item.value, item.label);
+          values.push(code);
+        }
+        codes[facet.name][index] = facetBits(measured.dicts[facet.name], values);
+      }
+      for (const number of config.numbers) codes[number.name][index] = numericValue(doc, number);
+      for (const boolean of config.booleans || []) codes[boolean.name][index] = booleanValue(doc, boolean);
+      addTypoSurfacePairs(typoBuffer, surfacePairsForFields(doc, config.fields, fieldText));
+
+      const payload = docPayload(doc, config, index);
+      if (initialResults.length < config.initialResultLimit) initialResults.push(payload);
+      writeSpooledDoc(docSpool, payload, index, docLayoutRecord(index, selectedTerms, config));
+    });
+  } finally {
+    closeDocSpool(docSpool);
+  }
   flushPostingBuffer(buffer);
   return {
     codes,
     initialResults,
     baseShards: [...baseShards].sort(),
-    docs: finishDocPacks(dirs.out, docPackWriter, measured.total, config.docDirectoryPageBytes)
+    docSpool
   };
 }
 
@@ -369,7 +574,11 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
     const encoded = buildTermShard(partition.entries, measured.total, runData.codes, filters, config);
     const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
     addPostingBlockStats(blockStats, externalized.stats);
-    writePackedShard(packWriter, partition.name, gzipSync(externalized.buffer, { level: 6 }));
+    writePackedShard(packWriter, partition.name, gzipSync(externalized.buffer, { level: 6 }), {
+      kind: "term-shard",
+      codec: "rfterm-v1",
+      logicalLength: externalized.buffer.length
+    });
     finalShards.push(partition.name);
   }
   unlinkSync(path);
@@ -477,10 +686,16 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
       const encoded = gunzipSync(readFileSync(item.path));
       const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
       addPostingBlockStats(blockStats, externalized.stats);
-      writePackedShard(packWriter, item.shard, gzipSync(externalized.buffer, { level: 6 }));
+      writePackedShard(packWriter, item.shard, gzipSync(externalized.buffer, { level: 6 }), {
+        kind: "term-shard",
+        codec: "rfterm-v1",
+        logicalLength: externalized.buffer.length
+      });
       finalShards.add(item.shard);
     }
   }
+  if (blockPackWriter) finalizePackWriter(blockPackWriter);
+  finalizePackWriter(packWriter);
   return { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount };
 }
 
@@ -506,15 +721,17 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       addPostingBlockStats(blockStats, stats.blockStats);
       for (const shard of stats.shards) finalShards.add(shard);
     }
+    if (blockPackWriter) finalizePackWriter(blockPackWriter);
+    finalizePackWriter(packWriter);
     reduced = { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount };
   }
   const shards = [...reduced.finalShards].sort();
   const packIndexes = new Map(reduced.packWriter.packs.map((pack, index) => [pack.file, index]));
   const entries = shards.map((shard) => {
     const entry = reduced.packWriter.entries[shard];
-    return { shard, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length };
+    return { shard, packIndex: packIndexes.get(entry.pack), ...entry };
   });
-  const directory = writeDirectoryFiles(resolve(dirs.out, "terms"), entries, config.directoryPageBytes, "terms");
+  const directory = writeDirectoryFiles(resolve(dirs.out, "terms"), entries, config.directoryPageBytes, "terms", { packTable: reduced.packWriter.packs });
   return {
     filters,
     shards,
@@ -548,6 +765,8 @@ export async function build({ configPath }) {
   const typoBuffer = typo.enabled ? createTypoRunBuffer(dirs.typoRunsOut, typo) : null;
   const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
   const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
+  const docs = finishDocPacks(dirs.out, runData.docSpool, measured.total, config);
+  docs.pages = finishDocPages(dirs.out, runData.docSpool, measured.total, config);
   const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
   const docValues = writeDocValuePacks(dirs.out, config, measured.total, runData.codes);
   const facetDictionaries = writeFacetDictionaries(dirs.out, measured.dicts, config);
@@ -555,10 +774,61 @@ export async function build({ configPath }) {
   const manifest = {
     version: 1,
     engine: "rangefind",
+    features: {
+      objectPointers: true,
+      checksummedObjects: true,
+      contentAddressedObjects: true,
+      deduplicatedObjects: true,
+      denseDocPointers: true,
+      docLocalityLayout: true,
+      docPages: true,
+      rangeDirectoryV2: true,
+      docValues: true,
+      facetDictionaries: true,
+      externalPostingBlocks: config.externalPostingBlocks !== false,
+      typoSidecar: !!typoManifest
+    },
+    object_store: {
+      format: OBJECT_STORE_FORMAT,
+      pointer_format: OBJECT_POINTER_FORMAT,
+      checksum: OBJECT_CHECKSUM_ALGORITHM,
+      compression: "gzip-member",
+      immutable_names: true,
+      name_hash: {
+        algorithm: OBJECT_CHECKSUM_ALGORITHM,
+        length: OBJECT_NAME_HASH_LENGTH
+      },
+      pack_table: {
+        terms: packTable(reduced.packs),
+        postingBlocks: packTable(reduced.blockPacks),
+        docs: packTable(docs.packs),
+        docPages: packTable(docs.pages.packs),
+        docValues: packTable(docValues.packs),
+        facets: packTable(facetDictionaries.pack_objects),
+        typo: packTable(typoManifest?.packs)
+      },
+      dedupe: summarizeDedup(
+        reduced.packs,
+        reduced.blockPacks,
+        docs.packs,
+        docs.pages.packs,
+        docValues.packs,
+        facetDictionaries.pack_objects,
+        typoManifest?.packs || []
+      ),
+      directories: {
+        terms: reduced.directory,
+        facets: facetDictionaries.directory,
+        typo: typoManifest?.directory || null
+      },
+      pointers: {
+        docs: docs.pointers,
+        docPages: docs.pages.pointers
+      }
+    },
     built_at: new Date().toISOString(),
     total: measured.total,
-    doc_chunk_size: config.docChunkSize,
-    docs: runData.docs,
+    docs,
     doc_values: {
       storage: docValues.storage,
       compression: docValues.compression,
@@ -579,6 +849,8 @@ export async function build({ configPath }) {
     typo: typoManifest ? {
       format: typoManifest.format,
       compression: typoManifest.compression,
+      manifest: typoManifest.manifest,
+      manifest_hash: typoManifest.manifest_hash,
       directory: typoManifest.directory,
       shards: typoManifest.directory.entries,
       packs: typoManifest.packs.length,
@@ -601,12 +873,21 @@ export async function build({ configPath }) {
       external_posting_postings: reduced.blockStats.externalPostings,
       external_posting_source_bytes: reduced.blockStats.externalPostingBytes,
       inline_posting_source_bytes: reduced.blockStats.inlinePostingBytes,
-      doc_storage: runData.docs.storage,
-      doc_directory_format: runData.docs.directory.format,
-      doc_directory_page_files: runData.docs.directory.page_files,
-      doc_directory_bytes: runData.docs.directory.total_bytes,
-      doc_pack_files: runData.docs.packs.length,
-      doc_pack_bytes: runData.docs.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+      doc_storage: docs.storage,
+      doc_layout_format: docs.layout.format,
+      doc_layout_primary_terms: docs.layout.primary_terms,
+      doc_pointer_format: docs.pointers.format,
+      doc_pointer_bytes: docs.pointers.bytes,
+      doc_pointer_record_bytes: docs.pointers.recordBytes,
+      doc_pack_files: docs.packs.length,
+      doc_pack_bytes: docs.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+      doc_page_format: docs.pages.format,
+      doc_page_size: docs.pages.page_size,
+      doc_page_max_overfetch_docs: docs.pages.max_overfetch_docs,
+      doc_page_pointer_format: docs.pages.pointers.format,
+      doc_page_pointer_bytes: docs.pages.pointers.bytes,
+      doc_page_pack_files: docs.pages.packs.length,
+      doc_page_pack_bytes: docs.pages.packs.reduce((sum, pack) => sum + pack.bytes, 0),
       doc_value_storage: docValues.storage,
       doc_value_format: docValues.format,
       doc_value_chunk_size: docValues.chunk_size,

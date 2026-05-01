@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { build } from "../src/builder.js";
+import { parseDocPagePointerPage } from "../src/doc_pages.js";
+import { parseDocOrdinalTable, parseDocPointerPage } from "../src/doc_pointers.js";
 import { createSearch } from "../src/runtime.js";
 
 async function serveStatic(root) {
@@ -61,7 +63,6 @@ test("builder output is searchable through the range-based runtime", async (t) =
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
     output: "public/rangefind",
-    docChunkSize: 2,
     docValueChunkSize: 2,
     baseShardDepth: 2,
     maxShardDepth: 3,
@@ -81,25 +82,56 @@ test("builder output is searchable through the range-based runtime", async (t) =
 
   await build({ configPath });
   assert.ok(await readFile(join(output, "manifest.json"), "utf8"));
-  assert.ok(await readFile(join(output, "docs", "directory-root.bin.gz")));
-  assert.ok(await readFile(join(output, "docs", "directory-pages", "0000.bin.gz")));
-  assert.ok(await readFile(join(output, "docs", "packs", "0000.bin")));
-  assert.ok(await readFile(join(output, "terms", "directory-root.bin.gz")));
-  assert.ok(await readFile(join(output, "terms", "directory-pages", "0000.bin.gz")));
-  assert.ok(await readFile(join(output, "terms", "block-packs", "0000.bin")));
   const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.equal(manifest.features.checksummedObjects, true);
+  assert.equal(manifest.features.contentAddressedObjects, true);
+  assert.equal(manifest.features.deduplicatedObjects, true);
+  assert.equal(manifest.features.denseDocPointers, true);
+  assert.equal(manifest.features.docLocalityLayout, true);
+  assert.equal(manifest.features.docPages, true);
+  assert.equal(manifest.object_store.pointer_format, "rfbp-v1");
+  assert.equal(manifest.object_store.immutable_names, true);
+  assert.equal(manifest.docs.layout.format, "rflocal-doc-v1");
+  assert.equal(manifest.docs.layout.strategy, "primary-base-term-impact");
+  assert.ok(manifest.docs.layout.primary_terms > 0);
+  assert.equal(manifest.docs.pointers.format, "rfdocptr-v1");
+  assert.equal(manifest.docs.pointers.order, "layout");
+  assert.equal(manifest.docs.pointers.ordinals.format, "rfdocord-v1");
+  assert.equal(manifest.docs.pages.format, "rfdocpage-v1");
+  assert.equal(manifest.docs.pages.pointers.format, "rfdocpageptr-v1");
+  assert.equal(manifest.docs.pages.pointers.order, "doc-id-page");
+  assert.equal(manifest.docs.pages.page_size, 32);
+  assert.match(manifest.docs.pointers.file, /^docs\/pointers\/0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.docs.pointers.ordinals.file, /^docs\/ordinals\/0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.docs.pages.pointers.file, /^docs\/pages\/0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.docs.pointers.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.docs.pages.pointers.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.object_store.pack_table.docPages[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.object_store.pack_table.postingBlocks[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.equal(manifest.directory.format, "rfdir-v2");
+  assert.ok(await readFile(join(output, manifest.docs.pointers.file)));
+  assert.ok(await readFile(join(output, manifest.docs.pointers.ordinals.file)));
+  assert.ok(await readFile(join(output, manifest.docs.pages.pointers.file)));
+  assert.ok(await readFile(join(output, "docs", "packs", manifest.docs.pointers.pack_table[0])));
+  assert.ok(await readFile(join(output, "docs", "page-packs", manifest.docs.pages.pointers.pack_table[0])));
+  assert.ok(await readFile(join(output, manifest.directory.root)));
+  assert.ok(await readFile(join(output, "terms", "block-packs", manifest.object_store.pack_table.postingBlocks[0])));
   assert.equal(manifest.doc_values.storage, "range-pack-v1");
   assert.ok(manifest.doc_values.fields.tags);
   assert.ok(manifest.doc_values.fields.published);
-  assert.ok(await readFile(join(output, "doc-values", "packs", "0000.bin")));
+  assert.ok(manifest.doc_values.fields.tags.chunks[0].checksum.value);
+  assert.match(manifest.doc_values.fields.tags.chunks[0].pack, /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.ok(await readFile(join(output, "doc-values", "packs", manifest.doc_values.fields.tags.chunks[0].pack)));
   assert.equal(manifest.facets.category.count, 5);
   assert.equal(manifest.facet_dictionaries.storage, "range-pack-v1");
+  assert.equal(manifest.facet_dictionaries.directory.format, "rfdir-v2");
   assert.ok(manifest.facet_dictionaries.fields.category);
-  assert.ok(await readFile(join(output, "facets", "directory-root.bin.gz")));
-  assert.ok(await readFile(join(output, "facets", "directory-pages", "0000.bin.gz")));
-  assert.ok(await readFile(join(output, "facets", "packs", "0000.bin")));
-  assert.ok(await readFile(join(output, "typo", "manifest.json")));
-  assert.ok(await readFile(join(output, "typo", "directory-root.bin.gz")));
+  assert.ok(await readFile(join(output, manifest.facet_dictionaries.directory.root)));
+  assert.match(manifest.facet_dictionaries.directory.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.ok(await readFile(join(output, "facets", "packs", manifest.facet_dictionaries.directory.pack_table[0])));
+  assert.match(manifest.typo.manifest, /^typo\/manifest\.[0-9a-f]{24}\.json$/u);
+  assert.ok(await readFile(join(output, manifest.typo.manifest)));
+  assert.ok(await readFile(join(output, manifest.typo.directory.root)));
 
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());
@@ -166,4 +198,30 @@ test("builder output is searchable through the range-based runtime", async (t) =
 
   const sortedInitial = await search.search({ q: "", sort: "-year", size: 2 });
   assert.deepEqual(sortedInitial.results.map(result => result.id), ["a", "c"]);
+  assert.equal(sortedInitial.stats.docPayloadLane, "docPages");
+
+  const packedOnlySearch = await createSearch({ baseUrl: server.baseUrl, useDocPages: false });
+  const packedSortedInitial = await packedOnlySearch.search({ q: "", sort: "-year", size: 2 });
+  assert.deepEqual(packedSortedInitial.results.map(result => result.id), ["a", "c"]);
+  assert.equal(packedSortedInitial.stats.docPayloadLane, "packedDocs");
+
+  const pageTable = parseDocPagePointerPage(await readFile(join(output, manifest.docs.pages.pointers.file)), {
+    packTable: manifest.docs.pages.pointers.pack_table
+  });
+  assert.equal(pageTable.entries.length, Math.ceil(manifest.total / manifest.docs.pages.page_size));
+
+  const pointerTable = parseDocPointerPage(await readFile(join(output, manifest.docs.pointers.file)), {
+    packTable: manifest.docs.pointers.pack_table
+  });
+  const ordinalTable = parseDocOrdinalTable(await readFile(join(output, manifest.docs.pointers.ordinals.file)));
+  const firstDocPointer = pointerTable.entries[ordinalTable.entries[0]];
+  const docPack = join(output, "docs", "packs", firstDocPointer.pack);
+  const corrupted = Buffer.from(await readFile(docPack));
+  corrupted[firstDocPointer.offset] ^= 0xff;
+  await writeFile(docPack, corrupted);
+  const corruptSearch = await createSearch({ baseUrl: server.baseUrl });
+  await assert.rejects(
+    () => corruptSearch.search({ q: "static range search", size: 1 }),
+    /checksum mismatch/
+  );
 });

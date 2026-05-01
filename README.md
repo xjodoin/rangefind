@@ -20,13 +20,20 @@ a large thesis corpus.
 - Adaptive logical term shards.
 - Independently compressed logical shards packed into `terms/packs/*.bin`.
 - Single ESM browser runtime bundle at `dist/runtime.browser.js`.
-- Lazy paged binary range directories at `terms/directory-root.bin.gz` and
-  `terms/directory-pages/*.bin.gz`.
+- Lazy paged binary range directories at `terms/directory-root.<hash>.bin.gz`
+  and `terms/directory-pages/*.bin.gz`.
+- ZFS-inspired object pointers with SHA-256 verification before decompression.
+- Content-addressed immutable pack and directory filenames for CDN caching.
+- Exact compressed-object deduplication during index construction.
+- Locality-ordered doc packs with a tiny doc-id ordinal table and dense pointer
+  records for low-transfer result fetching.
+- Dense doc-page payload packs for browse, filter, and sort result pages where
+  original document ids are clustered.
 - Range-packed result payloads with capped display fields.
 - Range-addressable posting-block sidecar for high-df terms.
 - Range-packed binary facet dictionaries for high-cardinality metadata.
 - Parallel build-time shard reduction with deterministic final pack assembly.
-- Browser runtime with coalesced HTTP `Range` fetches.
+- Browser runtime with adaptive HTTP `Range` coalescing and bounded overfetch.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
   fetches only when an exact first-page query returns no results.
 - Multi-value keyword facets with lazy dictionary loading.
@@ -73,7 +80,8 @@ node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
 Use `--limit=0` to run against the full dump. The generated site lives at
 `examples/frwiki/public/`. The fixture validates text query top-k against the
 exact retrieval path by default and records cold request counts, transfer bytes,
-runtime posting-block stats, and typed filter/sort validation.
+runtime posting-block stats, typed filter/sort validation, and an A/B packed-doc
+fallback for doc-page browse rows.
 
 ## Build A Custom Index
 

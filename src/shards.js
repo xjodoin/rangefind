@@ -28,7 +28,11 @@ export function partitionEntries(entries, config, depth = config.baseShardDepth)
     .flatMap(([, group]) => partitionEntries(group, config, depth + 1));
 }
 
-export function groupRanges(items, mergeGapBytes = RANGE_MERGE_GAP_BYTES) {
+export function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
+  const mergeGapBytes = typeof options === "number" ? options : options.mergeGapBytes ?? RANGE_MERGE_GAP_BYTES;
+  const maxMergedBytes = typeof options === "number" ? Infinity : options.maxMergedBytes ?? Infinity;
+  const maxOverfetchBytes = typeof options === "number" ? Infinity : options.maxOverfetchBytes ?? Infinity;
+  const maxOverfetchRatio = typeof options === "number" ? Infinity : options.maxOverfetchRatio ?? Infinity;
   const byPack = new Map();
   for (const item of items) {
     if (!byPack.has(item.entry.pack)) byPack.set(item.entry.pack, []);
@@ -41,12 +45,29 @@ export function groupRanges(items, mergeGapBytes = RANGE_MERGE_GAP_BYTES) {
       .sort((a, b) => a.start - b.start);
     let current = null;
     for (const item of sorted) {
-      if (!current || item.start > current.end + mergeGapBytes) {
+      const itemBytes = item.end - item.start;
+      if (!current) {
         current = { pack, start: item.start, end: item.end, items: [item] };
+        Object.defineProperty(current, "exactBytes", { value: itemBytes, writable: true, enumerable: false });
+        groups.push(current);
+        continue;
+      }
+      const nextEnd = Math.max(current.end, item.end);
+      const mergedBytes = nextEnd - current.start;
+      const exactBytes = current.exactBytes + itemBytes;
+      const overfetchBytes = mergedBytes - exactBytes;
+      const shouldMerge = item.start <= current.end + mergeGapBytes
+        && mergedBytes <= maxMergedBytes
+        && overfetchBytes <= maxOverfetchBytes
+        && mergedBytes <= exactBytes * maxOverfetchRatio;
+      if (!shouldMerge) {
+        current = { pack, start: item.start, end: item.end, items: [item] };
+        Object.defineProperty(current, "exactBytes", { value: itemBytes, writable: true, enumerable: false });
         groups.push(current);
       } else {
         current.items.push(item);
-        current.end = Math.max(current.end, item.end);
+        current.end = nextEnd;
+        current.exactBytes = exactBytes;
       }
     }
   }

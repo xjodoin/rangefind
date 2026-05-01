@@ -1,6 +1,8 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parseShard } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
+import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.js";
+import { verifyBlockPointer } from "./object_store.js";
 import { groupRanges, shardKey } from "./shards.js";
 import {
   boundedDamerauLevenshtein,
@@ -14,8 +16,7 @@ import {
 const RERANK_CANDIDATES = 30;
 const DEPENDENCY_SCORE_SCALE = 0.12;
 const SKIP_MAX_TERMS = 30;
-const EXTERNAL_POSTING_BLOCK_PREFETCH = 4;
-const DOC_INDEX_KEY_WIDTH = 8;
+const EXTERNAL_POSTING_BLOCK_PREFETCH = 16;
 const textDecoder = new TextDecoder();
 
 async function inflateGzip(responseOrBuffer) {
@@ -69,13 +70,19 @@ function facetCodeMatches(words, selected) {
 export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
-  const termDirectory = createDirectoryState(manifest.directory, "terms");
-  const docDirectory = manifest.docs?.directory ? createDirectoryState(manifest.docs.directory, "docs") : null;
-  const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory, "facets") : null;
+  const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
+  const useDocPages = options.useDocPages !== false;
+  const termDirectory = createDirectoryState(manifest.directory);
+  const docPointers = manifest.docs?.pointers;
+  const docPages = manifest.docs?.pages || null;
+  const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
   const shardCache = new Map();
   const typoShardCache = new Map();
-  const docCache = new Map();
+  const docOrdinalCache = new Map();
+  const docPointerCache = new Map();
   const packedDocCache = new Map();
+  const docPagePointerCache = new Map();
+  const docPageCache = new Map();
   const docValueCache = new Map();
   const facetDictionaryCache = new Map();
   let typoManifest = null;
@@ -87,13 +94,28 @@ export async function createSearch(options = {}) {
   const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
+  const rangePlans = {
+    default: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: 4 },
+    docOrdinals: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 4 * 1024, maxOverfetchRatio: Infinity },
+    docPointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    docs: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
+    docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
+    ...(options.rangePlans || {})
+  };
 
-  function createDirectoryState(meta, fallbackDir) {
-    const directory = meta || {};
+  function rangeGroups(items, kind = "default") {
+    return groupRanges(items, rangePlans[kind] || rangePlans.default);
+  }
+
+  function createDirectoryState(directory) {
+    if (!directory?.root || !directory?.pages) throw new Error("Rangefind index is missing a range directory.");
     return {
       meta: {
-        root: directory.root || `${fallbackDir}/directory-root.bin.gz`,
-        pages: directory.pages || `${fallbackDir}/directory-pages/`
+        root: directory.root,
+        pages: directory.pages,
+        packTable: directory.pack_table || directory.packs || []
       },
       root: null,
       rootPromise: null,
@@ -116,7 +138,7 @@ export async function createSearch(options = {}) {
 
   async function loadDirectoryPage(state, page) {
     if (!state.pages.has(page.file)) {
-      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then(parseDirectoryPage));
+      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then(buffer => parseDirectoryPage(buffer, { packTable: state.meta.packTable })));
     }
     return state.pages.get(page.file);
   }
@@ -127,10 +149,6 @@ export async function createSearch(options = {}) {
     const entries = await loadDirectoryPage(state, page);
     const entry = entries.get(shard);
     return entry ? { shard, entry } : null;
-  }
-
-  function docIndexKey(index) {
-    return String(index).padStart(DOC_INDEX_KEY_WIDTH, "0");
   }
 
   async function resolveDirectoryShard(value, state, baseDepth, maxDepth) {
@@ -149,6 +167,18 @@ export async function createSearch(options = {}) {
     return codes;
   }
 
+  async function inflateObject(compressed, pointer, label) {
+    if (verifyChecksums) await verifyBlockPointer(compressed, pointer, label);
+    return inflateGzip(compressed);
+  }
+
+  async function inflateGroupItem(compressed, groupStart, item, label) {
+    const start = item.entry.offset - groupStart;
+    const end = start + item.entry.length;
+    const slice = compressed.slice(start, end);
+    return inflateObject(slice, item.entry, label);
+  }
+
   function docValueField(field) {
     return docValues?.fields?.[field] || null;
   }
@@ -157,17 +187,21 @@ export async function createSearch(options = {}) {
     if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
     if (!facetDirectory || !manifest.facet_dictionaries?.fields?.[field]) return [];
     if (!facetDictionaryCache.has(field)) {
-      facetDictionaryCache.set(field, (async () => {
+      const promise = (async () => {
         const root = await loadDirectoryRoot(facetDirectory);
         const resolved = await directoryEntryFromRoot(facetDirectory, root, field);
         if (!resolved) return [];
         const packs = manifest.facet_dictionaries.packs || "facets/packs/";
         const buffer = await fetchRange(new URL(`${packs.replace(/\/?$/u, "/")}${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
-        const values = parseFacetDictionary(await inflateGzip(buffer));
+        const values = parseFacetDictionary(await inflateObject(buffer, resolved.entry, `facet dictionary ${field}`));
         if (!manifest.facets) manifest.facets = {};
         manifest.facets[field] = values;
         return values;
-      })());
+      })();
+      promise.catch(() => {
+        facetDictionaryCache.delete(field);
+      });
+      facetDictionaryCache.set(field, promise);
     }
     return facetDictionaryCache.get(field);
   }
@@ -203,16 +237,15 @@ export async function createSearch(options = {}) {
         resolve = res;
         reject = rej;
       });
+      promise.catch(() => {});
       docValueCache.set(key, promise);
       pending.push({ field: request.field, index: request.index, entry: chunk, resolve, reject });
     }
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          const parsed = parseDocValueChunk(await inflateGzip(compressed.slice(start, end)));
+          const parsed = parseDocValueChunk(await inflateGroupItem(compressed, group.start, item, `doc-value ${item.field}:${item.index}`));
           docValueCache.set(docValueCacheKey(item.field, item.index), parsed);
           item.resolve(parsed);
         }));
@@ -221,6 +254,7 @@ export async function createSearch(options = {}) {
           docValueCache.delete(docValueCacheKey(item.field, item.index));
           item.reject(error);
         }
+        throw error;
       }
     }));
   }
@@ -278,12 +312,16 @@ export async function createSearch(options = {}) {
   async function loadTypoManifest() {
     if (typoManifest !== null) return typoManifest;
     if (!typoManifestPromise) {
-      typoManifestPromise = fetch(new URL("typo/manifest.json", baseUrl))
+      if (!manifest.typo?.manifest) {
+        typoManifest = false;
+        return typoManifest;
+      }
+      typoManifestPromise = fetch(new URL(manifest.typo.manifest, baseUrl))
         .then(response => response.ok ? response.json() : false)
         .catch(() => false);
     }
     typoManifest = await typoManifestPromise;
-    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory, "typo");
+    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory);
     return typoManifest;
   }
 
@@ -302,23 +340,23 @@ export async function createSearch(options = {}) {
         resolve = res;
         reject = rej;
       });
+      promise.catch(() => {});
       shardCache.set(shard, promise);
       pending.push({ shard, entry, resolve, reject });
     }
 
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`terms/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          item.resolve(parseShard(await inflateGzip(compressed.slice(start, end)), manifest));
+          item.resolve(parseShard(await inflateGroupItem(compressed, group.start, item, `term shard ${item.shard}`), manifest));
         }));
       } catch (error) {
         for (const item of group.items) {
           shardCache.delete(item.shard);
           item.reject(error);
         }
+        throw error;
       }
     }));
 
@@ -348,23 +386,23 @@ export async function createSearch(options = {}) {
         resolve = res;
         reject = rej;
       });
+      promise.catch(() => {});
       typoShardCache.set(shard, promise);
       pending.push({ shard, entry, resolve, reject });
     }
 
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`typo/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          item.resolve(parseTypoShard(await inflateGzip(compressed.slice(start, end))));
+          item.resolve(parseTypoShard(await inflateGroupItem(compressed, group.start, item, `typo shard ${item.shard}`)));
         }));
       } catch (error) {
         for (const item of group.items) {
           typoShardCache.delete(item.shard);
           item.reject(error);
         }
+        throw error;
       }
     }));
 
@@ -475,28 +513,93 @@ export async function createSearch(options = {}) {
       : Math.max(RERANK_CANDIDATES, k);
   }
 
-  async function loadChunkDoc(index) {
-    const chunk = Math.floor(index / manifest.doc_chunk_size);
-    const local = index - chunk * manifest.doc_chunk_size;
-    if (!docCache.has(chunk)) {
-      const file = `docs/${String(chunk).padStart(4, "0")}.json`;
-      docCache.set(chunk, fetch(new URL(file, baseUrl)).then(r => r.json()));
+  async function loadDocOrdinals(indexes) {
+    const ordinalMeta = docPointers?.ordinals;
+    if (!ordinalMeta?.file) throw new Error("Rangefind index is missing dense doc ordinals.");
+    const pending = [];
+    const unique = [...new Set(indexes)];
+    for (const index of unique) {
+      if (docOrdinalCache.has(index)) continue;
+      let resolveOrdinal;
+      let rejectOrdinal;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveOrdinal = resolvePromise;
+        rejectOrdinal = rejectPromise;
+      });
+      promise.catch(() => {});
+      docOrdinalCache.set(index, promise);
+      const offset = ordinalMeta.dataOffset + index * ordinalMeta.recordBytes;
+      pending.push({
+        index,
+        entry: { pack: ordinalMeta.file, offset, length: ordinalMeta.recordBytes },
+        resolve: resolveOrdinal,
+        reject: rejectOrdinal
+      });
     }
-    return (await docCache.get(chunk))[local];
+
+    await Promise.all(rangeGroups(pending, "docOrdinals").map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          item.resolve(decodeDocOrdinalRecord(buffer, item.entry.offset - group.start, ordinalMeta));
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          docOrdinalCache.delete(item.index);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
   }
 
-  async function resolvePackedDoc(index) {
-    if (!docDirectory) return null;
-    const key = docIndexKey(index);
-    const root = await loadDirectoryRoot(docDirectory);
-    const resolved = await directoryEntryFromRoot(docDirectory, root, key);
-    return resolved ? { index, key, entry: resolved.entry } : null;
+  async function loadDocPointers(indexes) {
+    if (!docPointers?.file || docPointers.order !== "layout") throw new Error("Rangefind index is missing layout-ordered dense doc pointers.");
+    await loadDocOrdinals(indexes);
+    const pending = [];
+    const unique = [...new Set(indexes)];
+    for (const index of unique) {
+      if (docPointerCache.has(index)) continue;
+      let resolvePointer;
+      let rejectPointer;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePointer = resolvePromise;
+        rejectPointer = rejectPromise;
+      });
+      promise.catch(() => {});
+      docPointerCache.set(index, promise);
+      const ordinal = await docOrdinalCache.get(index);
+      const offset = docPointers.dataOffset + ordinal * docPointers.recordBytes;
+      pending.push({
+        index,
+        entry: { pack: docPointers.file, offset, length: docPointers.recordBytes },
+        resolve: resolvePointer,
+        reject: rejectPointer
+      });
+    }
+
+    await Promise.all(rangeGroups(pending, "docPointers").map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
+          item.resolve(pointer);
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          docPointerCache.delete(item.index);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
   }
 
   async function loadPackedDocs(indexes) {
     const wanted = [];
     const pending = [];
     const unique = [...new Set(indexes)];
+    await loadDocPointers(unique);
     for (const index of unique) {
       wanted.push(index);
       if (packedDocCache.has(index)) continue;
@@ -506,19 +609,17 @@ export async function createSearch(options = {}) {
         resolveDoc = resolvePromise;
         rejectDoc = rejectPromise;
       });
+      promise.catch(() => {});
       packedDocCache.set(index, promise);
-      const resolved = await resolvePackedDoc(index);
-      if (resolved) pending.push({ ...resolved, resolve: resolveDoc, reject: rejectDoc });
-      else resolveDoc(loadChunkDoc(index));
+      const entry = await docPointerCache.get(index);
+      pending.push({ index, entry, resolve: resolveDoc, reject: rejectDoc });
     }
 
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending, "docs").map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          const inflated = await inflateGzip(compressed.slice(start, end));
+          const inflated = await inflateGroupItem(compressed, group.start, item, `doc ${item.index}`);
           item.resolve(JSON.parse(textDecoder.decode(new Uint8Array(inflated))));
         }));
       } catch (error) {
@@ -526,19 +627,128 @@ export async function createSearch(options = {}) {
           packedDocCache.delete(item.index);
           item.reject(error);
         }
+        throw error;
       }
     }));
 
     return Promise.all(wanted.map(index => packedDocCache.get(index)));
   }
 
-  async function loadDocs(indexes) {
-    if (docDirectory) return loadPackedDocs(indexes);
-    return Promise.all(indexes.map(loadChunkDoc));
+  function docPageSize() {
+    return Math.max(1, Number(docPages?.page_size || 0));
   }
 
-  async function rowsToResults(rows) {
-    const docs = await loadDocs(rows.map(([index]) => index));
+  function docPageIndex(index) {
+    return Math.floor(index / docPageSize());
+  }
+
+  function docPagePlan(indexes, context = {}) {
+    if (!useDocPages || !docPages?.pointers?.file || !context.preferDocPages) return null;
+    const unique = [...new Set(indexes)];
+    if (!unique.length) return null;
+    const pages = [...new Set(unique.map(docPageIndex))].sort((a, b) => a - b);
+    const payloadDocs = pages.length * docPageSize();
+    const maxOverfetchDocs = Math.max(1, Number(docPages.max_overfetch_docs || 16));
+    const maxPayloadDocs = Math.max(docPageSize(), unique.length * maxOverfetchDocs);
+    if (payloadDocs > maxPayloadDocs) return null;
+    return { pages, pageSize: docPageSize(), payloadDocs, uniqueDocs: unique.length };
+  }
+
+  async function loadDocPagePointers(pageIndexes) {
+    const pointerMeta = docPages?.pointers;
+    if (!pointerMeta?.file) throw new Error("Rangefind index is missing dense doc page pointers.");
+    const pending = [];
+    const unique = [...new Set(pageIndexes)];
+    for (const pageIndexValue of unique) {
+      if (docPagePointerCache.has(pageIndexValue)) continue;
+      if (pageIndexValue < 0 || pageIndexValue >= pointerMeta.count) throw new Error(`Rangefind doc page ${pageIndexValue} is outside the index.`);
+      let resolvePointer;
+      let rejectPointer;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePointer = resolvePromise;
+        rejectPointer = rejectPromise;
+      });
+      promise.catch(() => {});
+      docPagePointerCache.set(pageIndexValue, promise);
+      const offset = pointerMeta.dataOffset + pageIndexValue * pointerMeta.recordBytes;
+      pending.push({
+        pageIndex: pageIndexValue,
+        entry: { pack: pointerMeta.file, offset, length: pointerMeta.recordBytes },
+        resolve: resolvePointer,
+        reject: rejectPointer
+      });
+    }
+
+    await Promise.all(rangeGroups(pending, "docPagePointers").map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
+          item.resolve(pointer);
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          docPagePointerCache.delete(item.pageIndex);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+  }
+
+  async function loadDocPages(indexes, plan) {
+    await loadDocPagePointers(plan.pages);
+    const pending = [];
+    for (const pageIndexValue of plan.pages) {
+      if (docPageCache.has(pageIndexValue)) continue;
+      let resolvePage;
+      let rejectPage;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePage = resolvePromise;
+        rejectPage = rejectPromise;
+      });
+      promise.catch(() => {});
+      docPageCache.set(pageIndexValue, promise);
+      const entry = await docPagePointerCache.get(pageIndexValue);
+      pending.push({ pageIndex: pageIndexValue, entry, resolve: resolvePage, reject: rejectPage });
+    }
+
+    await Promise.all(rangeGroups(pending, "docPages").map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`docs/page-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `doc page ${item.pageIndex}`);
+          item.resolve(JSON.parse(textDecoder.decode(new Uint8Array(inflated))));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          docPageCache.delete(item.pageIndex);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    return Promise.all(indexes.map(async (index) => {
+      const pageIndexValue = docPageIndex(index);
+      const page = await docPageCache.get(pageIndexValue);
+      const doc = page[index - pageIndexValue * plan.pageSize];
+      if (!doc) throw new Error(`Rangefind doc page ${pageIndexValue} is missing document ${index}.`);
+      return doc;
+    }));
+  }
+
+  async function loadDocs(indexes, context = {}) {
+    const plan = docPagePlan(indexes, context);
+    context.docPayloadLane = plan ? "docPages" : "packedDocs";
+    context.docPayloadPages = plan?.pages.length || 0;
+    context.docPayloadRows = indexes.length;
+    context.docPayloadOverfetchDocs = plan?.payloadDocs || indexes.length;
+    return plan ? loadDocPages(indexes, plan) : loadPackedDocs(indexes);
+  }
+
+  async function rowsToResults(rows, context = {}) {
+    const docs = await loadDocs(rows.map(([index]) => index), context);
     return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
   }
 
@@ -576,23 +786,23 @@ export async function createSearch(options = {}) {
         resolveBlock = resolvePromise;
         rejectBlock = rejectPromise;
       });
+      promise.catch(() => {});
       entry.blockPostings.set(blockIndex, promise);
       pending.push({ blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
     }
 
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending, "postingBlocks").map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          item.resolve(decodePostingBytes(await inflateGzip(compressed.slice(start, end))));
+          item.resolve(decodePostingBytes(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`)));
         }));
       } catch (error) {
         for (const item of group.items) {
           entry.blockPostings.delete(item.blockIndex);
           item.reject(error);
         }
+        throw error;
       }
     }));
 
@@ -950,12 +1160,14 @@ export async function createSearch(options = {}) {
       : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: true, preferDocPages: false };
+    const results = await rowsToResults(rows, resultContext);
     return {
       total: exhausted ? ranked.length : Math.max(ranked.length, k),
       page,
       size,
       approximate: !exhausted,
-      results: await rowsToResults(rows),
+      results,
       stats: {
         exact: exhausted,
         blocksDecoded,
@@ -964,6 +1176,9 @@ export async function createSearch(options = {}) {
         skippedBlocks: cursors.reduce((sum, cursor) => sum + cursor.skippedBlocks, 0),
         terms: terms.length,
         shards: new Set(entries.map(item => item.shardName)).size,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         ...reranked.stats
       }
     };
@@ -1010,11 +1225,13 @@ export async function createSearch(options = {}) {
     if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: !!sortPlan };
+    const results = await rowsToResults(rows, resultContext);
     return {
       total: ranked.length,
       page,
       size,
-      results: await rowsToResults(rows),
+      results,
       approximate: false,
       stats: {
         exact: true,
@@ -1025,6 +1242,9 @@ export async function createSearch(options = {}) {
         postingsDecoded: entries.reduce((sum, item) => sum + item.entry.count, 0),
         postingsAccepted: ranked.length,
         skippedBlocks: 0,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         ...reranked.stats
       }
     };
@@ -1207,7 +1427,19 @@ export async function createSearch(options = {}) {
           };
       const ranked = sortPlan ? selected.ranked : sortRanked(selected.ranked, codeData, sortPlan);
       const rows = ranked.slice(offset, offset + size);
-      return { total: selected.total, results: await rowsToResults(rows), page, size };
+      const resultContext = { hasTextTerms: false, preferDocPages: true };
+      const results = await rowsToResults(rows, resultContext);
+      return {
+        total: selected.total,
+        results,
+        page,
+        size,
+        stats: {
+          docPayloadLane: resultContext.docPayloadLane,
+          docPayloadPages: resultContext.docPayloadPages,
+          docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+        }
+      };
     }
 
     const analyzedTerms = analyzeTerms(q);

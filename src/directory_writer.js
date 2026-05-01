@@ -1,25 +1,46 @@
 import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
-import { buildPagedDirectory } from "./directory.js";
+import { buildDirectoryRoot, buildPagedDirectory } from "./directory.js";
+import { OBJECT_NAME_HASH_LENGTH } from "./object_store.js";
 
-export function writeDirectoryFiles(outDir, entries, pageBytes, relativeBase) {
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function hashedFile(prefix, hash, suffix) {
+  return `${prefix}.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}${suffix}`;
+}
+
+export function writeDirectoryFiles(outDir, entries, pageBytes, relativeBase, options = {}) {
   const directory = buildPagedDirectory(entries, { pageBytes });
   const pagesDir = resolve(outDir, "directory-pages");
   mkdirSync(pagesDir, { recursive: true });
-  const rootCompressed = gzipSync(directory.root, { level: 9 });
-  writeFileSync(resolve(outDir, "directory-root.bin.gz"), rootCompressed);
   let pageCompressedBytes = 0;
   for (const page of directory.pages) {
     const compressed = gzipSync(page.buffer, { level: 9 });
+    const hash = sha256Hex(compressed);
+    page.file = hashedFile(page.file.replace(/\.bin\.gz$/u, ""), hash, ".bin.gz");
+    page.contentHash = hash;
     pageCompressedBytes += compressed.length;
     writeFileSync(resolve(pagesDir, page.file), compressed);
   }
+  const root = buildDirectoryRoot(directory.pages, directory.stats.entries, directory.bloom);
+  const rootCompressed = gzipSync(root, { level: 9 });
+  const rootHash = sha256Hex(rootCompressed);
+  const rootFile = hashedFile("directory-root", rootHash, ".bin.gz");
+  writeFileSync(resolve(outDir, rootFile), rootCompressed);
   const base = relativeBase ? `${relativeBase.replace(/\/?$/u, "/")}` : "";
+  const packTable = (options.packTable || options.packs || []).map(pack => typeof pack === "string" ? pack : pack.file);
   return {
     format: directory.format,
-    root: `${base}directory-root.bin.gz`,
+    version: directory.version,
+    root: `${base}${rootFile}`,
     pages: `${base}directory-pages/`,
+    pack_table: packTable,
+    immutable: true,
+    root_hash: rootHash,
     entries: directory.stats.entries,
     page_bytes: directory.stats.page_bytes,
     page_files: directory.stats.page_files,

@@ -12,7 +12,7 @@ test("readConfig resolves input and output relative to the config file", async (
   const config = await readConfig(configPath);
   assert.equal(config.input, join(dir, "docs.jsonl"));
   assert.equal(config.output, join(dir, "public/search"));
-  assert.equal(config.docChunkSize, 100);
+  assert.equal(config.docValueChunkSize, 2048);
 });
 
 test("getPath reads nested values, arrays, nulls, and fallbacks", () => {

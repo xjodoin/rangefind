@@ -1,14 +1,20 @@
 import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { surfaceStemPairs } from "./analyzer.js";
 import { TYPO_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
-import { createPackWriter, writePackedShard } from "./packs.js";
+import { OBJECT_NAME_HASH_LENGTH } from "./object_store.js";
+import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
 
 const SEPARATOR = "\u0001";
+
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
 
 export const TYPO_DEFAULTS = {
   enabled: true,
@@ -252,7 +258,11 @@ async function reduceTypoShard(baseShard, buffer, packWriter) {
   for (const partition of partitions) {
     const encoded = buildTypoShard(new Map(partition.entries), buffer.options);
     if (!encoded.stats.deleteKeys) continue;
-    writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }));
+    writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }), {
+      kind: "typo-shard",
+      codec: "rftypo-v1",
+      logicalLength: encoded.buffer.length
+    });
     finalShards.push(partition.name);
     deleteKeys += encoded.stats.deleteKeys;
     pairs += encoded.stats.pairs;
@@ -277,14 +287,15 @@ export async function reduceTypoRuns(buffer, outDir) {
     candidates += stats.candidates;
     for (const finalShard of stats.shards) finalShards.add(finalShard);
   }
+  finalizePackWriter(packWriter);
   const shards = [...finalShards].sort();
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const directoryEntries = shards.map((shard) => {
     const entry = packWriter.entries[shard];
-    return { shard, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length };
+    return { shard, packIndex: packIndexes.get(entry.pack), ...entry };
   });
   mkdirSync(resolve(outDir, "typo"), { recursive: true });
-  const directory = writeDirectoryFiles(resolve(outDir, "typo"), directoryEntries, buffer.options.directoryPageBytes, "typo");
+  const directory = writeDirectoryFiles(resolve(outDir, "typo"), directoryEntries, buffer.options.directoryPageBytes, "typo", { packTable: packWriter.packs });
   const manifest = {
     version: 1,
     format: "rftypo-v1",
@@ -311,7 +322,11 @@ export async function reduceTypoRuns(buffer, outDir) {
       directory_bytes: directory.total_bytes
     }
   };
-  writeFileSync(resolve(outDir, "typo", "manifest.json"), JSON.stringify(manifest));
+  const manifestJson = JSON.stringify(manifest);
+  const manifestHash = sha256Hex(manifestJson);
+  manifest.manifest = `typo/manifest.${manifestHash.slice(0, OBJECT_NAME_HASH_LENGTH)}.json`;
+  manifest.manifest_hash = manifestHash;
+  writeFileSync(resolve(outDir, manifest.manifest), manifestJson);
   return manifest;
 }
 

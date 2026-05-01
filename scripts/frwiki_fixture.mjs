@@ -280,7 +280,6 @@ function writeSite(args, docsPath) {
     output: "public/rangefind",
     idPath: "id",
     urlPath: "url",
-    docChunkSize: 128,
     maxTermsPerDoc: 180,
     maxExpansionTermsPerDoc: 8,
     targetShardPostings: 45000,
@@ -365,12 +364,16 @@ async function buildFixture(args) {
 function networkBucket(url) {
   const path = new URL(url).pathname;
   if (path.endsWith("/runtime.browser.js")) return "runtime";
-  if (path.endsWith("/manifest.json")) return "manifest";
+  if (/\/manifest(?:\.[0-9a-f]+)?\.json$/u.test(path)) return "manifest";
   if (path.includes("/directory-")) return "directory";
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/facets/packs/")) return "facetDictionaries";
   if (path.includes("/doc-values/")) return "docValues";
+  if (path.includes("/docs/ordinals/")) return "docOrdinals";
+  if (path.includes("/docs/pointers/")) return "docPointers";
+  if (path.includes("/docs/pages/")) return "docPagePointers";
+  if (path.includes("/docs/page-packs/")) return "docPages";
   if (path.includes("/typo/")) return "typo";
   if (path.includes("/docs/")) return "docs";
   if (path.endsWith("/codes.bin.gz")) return "codes";
@@ -418,6 +421,15 @@ function typedCases(manifest) {
         }
       },
       sort: { field: "bodyLength", order: "desc" }
+    },
+    {
+      label: "dense filter browse",
+      q: "",
+      filters: {
+        numbers: {
+          bodyLength: { min: 80 }
+        }
+      }
     }
   ];
   const tagValues = Array.isArray(manifest.facets?.articleTags) ? manifest.facets.articleTags : [];
@@ -500,6 +512,9 @@ function compactRuntimeStats(stats = {}) {
     dependencyTermsMatched: stats.dependencyTermsMatched || 0,
     dependencyPostingsScanned: stats.dependencyPostingsScanned || 0,
     dependencyCandidateMatches: stats.dependencyCandidateMatches || 0,
+    docPayloadLane: stats.docPayloadLane || "",
+    docPayloadPages: stats.docPayloadPages || 0,
+    docPayloadOverfetchDocs: stats.docPayloadOverfetchDocs || 0,
     typoApplied: Boolean(stats.typoApplied)
   };
 }
@@ -550,6 +565,7 @@ async function benchFixture(args) {
     const rows = [];
     const cases = benchmarkCases(args, engine.manifest);
     for (const item of cases) {
+      const caseEngine = await createSearch({ baseUrl: new URL("rangefind/", server.url) });
       const times = [];
       const requests = [];
       const bytes = [];
@@ -559,10 +575,11 @@ async function benchFixture(args) {
       let resultIds = [];
       let coldStats = {};
       let validationErrors = [];
+      let withoutDocPages = null;
       for (let i = 0; i < args.runs; i++) {
         meter.reset();
         const start = performance.now();
-        const response = await engine.search({ q: item.q, filters: item.filters, sort: item.sort, size: item.size || args.size });
+        const response = await caseEngine.search({ q: item.q, filters: item.filters, sort: item.sort, size: item.size || args.size });
         times.push(performance.now() - start);
         const network = meter.snapshot();
         networks.push(network);
@@ -573,8 +590,24 @@ async function benchFixture(args) {
         if (i === 0) {
           resultIds = response.results.map(result => result.id);
           coldStats = compactRuntimeStats(response.stats);
-          validationErrors = validateResponse(item, response, engine.manifest);
+          validationErrors = validateResponse(item, response, caseEngine.manifest);
         }
+      }
+      if (coldStats.docPayloadLane === "docPages") {
+        const fallbackEngine = await createSearch({ baseUrl: new URL("rangefind/", server.url), useDocPages: false });
+        meter.reset();
+        const start = performance.now();
+        const response = await fallbackEngine.search({ q: item.q, filters: item.filters, sort: item.sort, size: item.size || args.size });
+        const network = meter.snapshot();
+        const fallbackErrors = validateResponse(item, response, fallbackEngine.manifest);
+        if (fallbackErrors.length) validationErrors = [...new Set([...validationErrors, ...fallbackErrors.map(error => `withoutDocPages: ${error}`)])];
+        withoutDocPages = {
+          ms: performance.now() - start,
+          requests: network.requests,
+          kb: kb(network.bytes),
+          by: networkKbBy(network),
+          stats: compactRuntimeStats(response.stats)
+        };
       }
       rows.push({
         q: item.label,
@@ -595,7 +628,8 @@ async function benchFixture(args) {
         p50Ms: quantile(times, 0.5),
         p95Ms: quantile(times, 0.95),
         avgRequests: mean(requests),
-        avgKb: kb(mean(bytes))
+        avgKb: kb(mean(bytes)),
+        withoutDocPages
       });
     }
     await addExactChecks(args, server.url, rows, cases);
@@ -604,6 +638,10 @@ async function benchFixture(args) {
       root,
       index: dirStats(resolve(root, "rangefind")),
       meta: existsSync(resolve(args.root, "data", "frwiki.meta.json")) ? JSON.parse(readFileSync(resolve(args.root, "data", "frwiki.meta.json"), "utf8")) : null,
+      benchmark: {
+        coldEnginePerCase: true,
+        queryColdExcludesInit: true
+      },
       init: { ms: initMs, requests: initNetwork.requests, kb: kb(initNetwork.bytes), by: networkKbBy(initNetwork) },
       rows
     };

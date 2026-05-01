@@ -216,6 +216,10 @@ function readFloat64(bytes, state) {
 function packFileFromIndex(index) {
   return `${String(index).padStart(4, "0")}.bin`;
 }
+function objectPackFileFromIndex(index, manifest, kind) {
+  const table = manifest.object_store?.pack_table?.[kind] || manifest.object_store?.packs?.[kind] || [];
+  return table[index] || packFileFromIndex(index);
+}
 function readBlockFilterSummary(bytes, state, manifest) {
   const filters = {};
   for (const filter of manifest.block_filters || []) {
@@ -239,6 +243,7 @@ function parseShard(buffer, manifest) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, TERM_SHARD_MAGIC, "Unsupported Rangefind term shard");
   const externalBlockFormat = manifest.stats?.posting_block_storage === "range-pack-v1";
+  const objectPointers = manifest.object_store?.pointer_format === "rfbp-v1" || manifest.features?.checksummedObjects;
   const state = { pos: TERM_SHARD_MAGIC.length };
   const termCount = readVarint(bytes, state);
   const terms = /* @__PURE__ */ new Map();
@@ -264,11 +269,21 @@ function parseShard(buffer, manifest) {
       };
       block.filters = readBlockFilterSummary(bytes, state, manifest);
       if (entry.external) {
-        block.range = {
-          pack: packFileFromIndex(readVarint(bytes, state)),
+        const packIndex = readVarint(bytes, state);
+        const range = {
+          pack: objectPackFileFromIndex(packIndex, manifest, "postingBlocks"),
           offset: readVarint(bytes, state),
           length: readVarint(bytes, state)
         };
+        range.physicalLength = range.length;
+        if (objectPointers) {
+          const logicalLength = readVarint(bytes, state);
+          const algorithm = readUtf8(bytes, state);
+          const value = readUtf8(bytes, state);
+          range.logicalLength = logicalLength || null;
+          range.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
+        }
+        block.range = range;
       }
       entry.blocks[j] = block;
     }
@@ -444,9 +459,9 @@ function parseFacetDictionary(buffer) {
 }
 
 // src/directory.js
-var DIRECTORY_FORMAT = "rfdir-v1";
+var DIRECTORY_FORMAT = "rfdir-v2";
 var DEFAULT_DIRECTORY_PAGE_BYTES = 64 * 1024;
-var DIRECTORY_VERSION = 1;
+var DIRECTORY_VERSION = 2;
 var textEncoder2 = new TextEncoder();
 function hashString(value, seed) {
   let hash = (2166136261 ^ seed) >>> 0;
@@ -499,7 +514,8 @@ function parseDirectoryRoot(buffer) {
     bloom: { bits: bloomBits, hashes: bloomHashes, bytes: bloomBytes }
   };
 }
-function parseDirectoryPage(buffer) {
+function parseDirectoryPage(buffer, options = {}) {
+  const packTable = Array.isArray(options) ? options : options.packTable || options.packs || [];
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, DIRECTORY_PAGE_MAGIC, "Unsupported Rangefind directory page");
   const state = { pos: DIRECTORY_PAGE_MAGIC.length };
@@ -512,11 +528,20 @@ function parseDirectoryPage(buffer) {
     const prefix = readVarint(bytes, state);
     const suffix = readUtf8(bytes, state);
     const shard = previous.slice(0, prefix) + suffix;
-    entries.set(shard, {
-      pack: `${String(readVarint(bytes, state)).padStart(4, "0")}.bin`,
+    const packIndex = readVarint(bytes, state);
+    const entry = {
+      pack: packTable[packIndex] || `${String(packIndex).padStart(4, "0")}.bin`,
       offset: readVarint(bytes, state),
       length: readVarint(bytes, state)
-    });
+    };
+    entry.physicalLength = entry.length;
+    const logicalLength = readVarint(bytes, state);
+    const algorithm = readUtf8(bytes, state);
+    const value = readUtf8(bytes, state);
+    if (!value) throw new Error(`Rangefind directory page entry ${shard} is missing a checksum.`);
+    entry.logicalLength = logicalLength || null;
+    entry.checksum = { algorithm: algorithm || "sha256", value };
+    entries.set(shard, entry);
     previous = shard;
   }
   return entries;
@@ -538,12 +563,88 @@ function findDirectoryPage(root, shard) {
   return null;
 }
 
+// src/doc_pointers.js
+var SHA256_BYTES = 32;
+function bytesToHex(bytes, offset) {
+  let out = "";
+  for (let i = 0; i < SHA256_BYTES; i++) {
+    out += bytes[offset + i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+function decodeDocPointerRecord(buffer, offset, meta, packTable = []) {
+  const bytes = new Uint8Array(buffer);
+  let pos = offset;
+  const packIndex = readFixedInt(bytes, pos, meta.widths.pack);
+  pos += meta.widths.pack;
+  const pointerOffset = readFixedInt(bytes, pos, meta.widths.offset);
+  pos += meta.widths.offset;
+  const length = readFixedInt(bytes, pos, meta.widths.length);
+  pos += meta.widths.length;
+  const logicalLength = readFixedInt(bytes, pos, meta.widths.logicalLength);
+  pos += meta.widths.logicalLength;
+  const value = bytesToHex(bytes, pos);
+  const pack = packTable[packIndex];
+  if (!pack) throw new Error(`Rangefind doc pointer references missing pack table index ${packIndex}.`);
+  return {
+    pack,
+    offset: pointerOffset,
+    length,
+    physicalLength: length,
+    logicalLength: logicalLength || null,
+    checksum: { algorithm: "sha256", value }
+  };
+}
+function decodeDocOrdinalRecord(buffer, offset, meta) {
+  return readFixedInt(new Uint8Array(buffer), offset, meta.width);
+}
+
+// src/object_store.js
+var OBJECT_CHECKSUM_ALGORITHM = "sha256";
+function bytesView(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  return new Uint8Array(value.buffer, value.byteOffset || 0, value.byteLength);
+}
+function hex(bytes) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Hex(value) {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("Rangefind checksum verification requires crypto.subtle.");
+  }
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytesView(value));
+  return hex(new Uint8Array(digest));
+}
+function pointerChecksum(pointer) {
+  if (!pointer?.checksum?.value) return null;
+  return {
+    algorithm: pointer.checksum.algorithm || OBJECT_CHECKSUM_ALGORITHM,
+    value: pointer.checksum.value
+  };
+}
+async function verifyBlockPointer(value, pointer, label = "range object") {
+  const checksum = pointerChecksum(pointer);
+  if (!checksum?.value) throw new Error(`Rangefind missing checksum for ${label}.`);
+  if (checksum.algorithm !== OBJECT_CHECKSUM_ALGORITHM) {
+    throw new Error(`Rangefind unsupported checksum ${checksum.algorithm} for ${label}.`);
+  }
+  const actual = await sha256Hex(value);
+  if (actual !== checksum.value) {
+    throw new Error(`Rangefind checksum mismatch for ${label}.`);
+  }
+}
+
 // src/shards.js
 var RANGE_MERGE_GAP_BYTES = 8 * 1024;
 function shardKey(term, depth) {
   return String(term || "").slice(0, depth).padEnd(depth, "_");
 }
-function groupRanges(items, mergeGapBytes = RANGE_MERGE_GAP_BYTES) {
+function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
+  const mergeGapBytes = typeof options === "number" ? options : options.mergeGapBytes ?? RANGE_MERGE_GAP_BYTES;
+  const maxMergedBytes = typeof options === "number" ? Infinity : options.maxMergedBytes ?? Infinity;
+  const maxOverfetchBytes = typeof options === "number" ? Infinity : options.maxOverfetchBytes ?? Infinity;
+  const maxOverfetchRatio = typeof options === "number" ? Infinity : options.maxOverfetchRatio ?? Infinity;
   const byPack = /* @__PURE__ */ new Map();
   for (const item of items) {
     if (!byPack.has(item.entry.pack)) byPack.set(item.entry.pack, []);
@@ -554,12 +655,26 @@ function groupRanges(items, mergeGapBytes = RANGE_MERGE_GAP_BYTES) {
     const sorted = packItems.map((item) => ({ ...item, start: item.entry.offset, end: item.entry.offset + item.entry.length })).sort((a, b) => a.start - b.start);
     let current = null;
     for (const item of sorted) {
-      if (!current || item.start > current.end + mergeGapBytes) {
+      const itemBytes = item.end - item.start;
+      if (!current) {
         current = { pack, start: item.start, end: item.end, items: [item] };
+        Object.defineProperty(current, "exactBytes", { value: itemBytes, writable: true, enumerable: false });
+        groups.push(current);
+        continue;
+      }
+      const nextEnd = Math.max(current.end, item.end);
+      const mergedBytes = nextEnd - current.start;
+      const exactBytes = current.exactBytes + itemBytes;
+      const overfetchBytes = mergedBytes - exactBytes;
+      const shouldMerge = item.start <= current.end + mergeGapBytes && mergedBytes <= maxMergedBytes && overfetchBytes <= maxOverfetchBytes && mergedBytes <= exactBytes * maxOverfetchRatio;
+      if (!shouldMerge) {
+        current = { pack, start: item.start, end: item.end, items: [item] };
+        Object.defineProperty(current, "exactBytes", { value: itemBytes, writable: true, enumerable: false });
         groups.push(current);
       } else {
         current.items.push(item);
-        current.end = Math.max(current.end, item.end);
+        current.end = nextEnd;
+        current.exactBytes = exactBytes;
       }
     }
   }
@@ -674,8 +789,7 @@ function typoCandidateScore(token, surface, df, distance) {
 var RERANK_CANDIDATES = 30;
 var DEPENDENCY_SCORE_SCALE = 0.12;
 var SKIP_MAX_TERMS = 30;
-var EXTERNAL_POSTING_BLOCK_PREFETCH = 4;
-var DOC_INDEX_KEY_WIDTH = 8;
+var EXTERNAL_POSTING_BLOCK_PREFETCH = 16;
 var textDecoder2 = new TextDecoder();
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
@@ -721,13 +835,19 @@ function facetCodeMatches(words, selected) {
 async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then((r) => r.json());
-  const termDirectory = createDirectoryState(manifest.directory, "terms");
-  const docDirectory = manifest.docs?.directory ? createDirectoryState(manifest.docs.directory, "docs") : null;
-  const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory, "facets") : null;
+  const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
+  const useDocPages = options.useDocPages !== false;
+  const termDirectory = createDirectoryState(manifest.directory);
+  const docPointers = manifest.docs?.pointers;
+  const docPages = manifest.docs?.pages || null;
+  const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
   const shardCache = /* @__PURE__ */ new Map();
   const typoShardCache = /* @__PURE__ */ new Map();
-  const docCache = /* @__PURE__ */ new Map();
+  const docOrdinalCache = /* @__PURE__ */ new Map();
+  const docPointerCache = /* @__PURE__ */ new Map();
   const packedDocCache = /* @__PURE__ */ new Map();
+  const docPagePointerCache = /* @__PURE__ */ new Map();
+  const docPageCache = /* @__PURE__ */ new Map();
   const docValueCache = /* @__PURE__ */ new Map();
   const facetDictionaryCache = /* @__PURE__ */ new Map();
   let typoManifest = null;
@@ -739,12 +859,26 @@ async function createSearch(options = {}) {
   const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
-  function createDirectoryState(meta, fallbackDir) {
-    const directory = meta || {};
+  const rangePlans = {
+    default: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: 4 },
+    docOrdinals: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 4 * 1024, maxOverfetchRatio: Infinity },
+    docPointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    docs: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
+    docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
+    ...options.rangePlans || {}
+  };
+  function rangeGroups(items, kind = "default") {
+    return groupRanges(items, rangePlans[kind] || rangePlans.default);
+  }
+  function createDirectoryState(directory) {
+    if (!directory?.root || !directory?.pages) throw new Error("Rangefind index is missing a range directory.");
     return {
       meta: {
-        root: directory.root || `${fallbackDir}/directory-root.bin.gz`,
-        pages: directory.pages || `${fallbackDir}/directory-pages/`
+        root: directory.root,
+        pages: directory.pages,
+        packTable: directory.pack_table || directory.packs || []
       },
       root: null,
       rootPromise: null,
@@ -764,7 +898,7 @@ async function createSearch(options = {}) {
   }
   async function loadDirectoryPage(state, page) {
     if (!state.pages.has(page.file)) {
-      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then(parseDirectoryPage));
+      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then((buffer) => parseDirectoryPage(buffer, { packTable: state.meta.packTable })));
     }
     return state.pages.get(page.file);
   }
@@ -774,9 +908,6 @@ async function createSearch(options = {}) {
     const entries = await loadDirectoryPage(state, page);
     const entry = entries.get(shard);
     return entry ? { shard, entry } : null;
-  }
-  function docIndexKey(index) {
-    return String(index).padStart(DOC_INDEX_KEY_WIDTH, "0");
   }
   async function resolveDirectoryShard(value, state, baseDepth, maxDepth) {
     const root = await loadDirectoryRoot(state);
@@ -792,6 +923,16 @@ async function createSearch(options = {}) {
     codes = await codesPromise;
     return codes;
   }
+  async function inflateObject(compressed, pointer, label) {
+    if (verifyChecksums) await verifyBlockPointer(compressed, pointer, label);
+    return inflateGzip(compressed);
+  }
+  async function inflateGroupItem(compressed, groupStart, item, label) {
+    const start = item.entry.offset - groupStart;
+    const end = start + item.entry.length;
+    const slice = compressed.slice(start, end);
+    return inflateObject(slice, item.entry, label);
+  }
   function docValueField(field) {
     return docValues?.fields?.[field] || null;
   }
@@ -799,17 +940,21 @@ async function createSearch(options = {}) {
     if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
     if (!facetDirectory || !manifest.facet_dictionaries?.fields?.[field]) return [];
     if (!facetDictionaryCache.has(field)) {
-      facetDictionaryCache.set(field, (async () => {
+      const promise = (async () => {
         const root = await loadDirectoryRoot(facetDirectory);
         const resolved = await directoryEntryFromRoot(facetDirectory, root, field);
         if (!resolved) return [];
         const packs = manifest.facet_dictionaries.packs || "facets/packs/";
         const buffer = await fetchRange(new URL(`${packs.replace(/\/?$/u, "/")}${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
-        const values = parseFacetDictionary(await inflateGzip(buffer));
+        const values = parseFacetDictionary(await inflateObject(buffer, resolved.entry, `facet dictionary ${field}`));
         if (!manifest.facets) manifest.facets = {};
         manifest.facets[field] = values;
         return values;
-      })());
+      })();
+      promise.catch(() => {
+        facetDictionaryCache.delete(field);
+      });
+      facetDictionaryCache.set(field, promise);
     }
     return facetDictionaryCache.get(field);
   }
@@ -841,16 +986,16 @@ async function createSearch(options = {}) {
         resolve = res;
         reject = rej;
       });
+      promise.catch(() => {
+      });
       docValueCache.set(key, promise);
       pending.push({ field: request.field, index: request.index, entry: chunk, resolve, reject });
     }
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          const parsed = parseDocValueChunk(await inflateGzip(compressed.slice(start, end)));
+          const parsed = parseDocValueChunk(await inflateGroupItem(compressed, group.start, item, `doc-value ${item.field}:${item.index}`));
           docValueCache.set(docValueCacheKey(item.field, item.index), parsed);
           item.resolve(parsed);
         }));
@@ -859,6 +1004,7 @@ async function createSearch(options = {}) {
           docValueCache.delete(docValueCacheKey(item.field, item.index));
           item.reject(error);
         }
+        throw error;
       }
     }));
   }
@@ -910,10 +1056,14 @@ async function createSearch(options = {}) {
   async function loadTypoManifest() {
     if (typoManifest !== null) return typoManifest;
     if (!typoManifestPromise) {
-      typoManifestPromise = fetch(new URL("typo/manifest.json", baseUrl)).then((response) => response.ok ? response.json() : false).catch(() => false);
+      if (!manifest.typo?.manifest) {
+        typoManifest = false;
+        return typoManifest;
+      }
+      typoManifestPromise = fetch(new URL(manifest.typo.manifest, baseUrl)).then((response) => response.ok ? response.json() : false).catch(() => false);
     }
     typoManifest = await typoManifestPromise;
-    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory, "typo");
+    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory);
     return typoManifest;
   }
   async function loadShards(shards) {
@@ -931,22 +1081,23 @@ async function createSearch(options = {}) {
         resolve = res;
         reject = rej;
       });
+      promise.catch(() => {
+      });
       shardCache.set(shard, promise);
       pending.push({ shard, entry, resolve, reject });
     }
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`terms/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          item.resolve(parseShard(await inflateGzip(compressed.slice(start, end)), manifest));
+          item.resolve(parseShard(await inflateGroupItem(compressed, group.start, item, `term shard ${item.shard}`), manifest));
         }));
       } catch (error) {
         for (const item of group.items) {
           shardCache.delete(item.shard);
           item.reject(error);
         }
+        throw error;
       }
     }));
     const out = /* @__PURE__ */ new Map();
@@ -973,22 +1124,23 @@ async function createSearch(options = {}) {
         resolve = res;
         reject = rej;
       });
+      promise.catch(() => {
+      });
       typoShardCache.set(shard, promise);
       pending.push({ shard, entry, resolve, reject });
     }
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`typo/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          item.resolve(parseTypoShard(await inflateGzip(compressed.slice(start, end))));
+          item.resolve(parseTypoShard(await inflateGroupItem(compressed, group.start, item, `typo shard ${item.shard}`)));
         }));
       } catch (error) {
         for (const item of group.items) {
           typoShardCache.delete(item.shard);
           item.reject(error);
         }
+        throw error;
       }
     }));
     const out = /* @__PURE__ */ new Map();
@@ -1088,26 +1240,91 @@ async function createSearch(options = {}) {
   function candidateLimitFor(baseTerms, k, rerank = true) {
     return rerank === false || !dependencyTerms(baseTerms).length ? k : Math.max(RERANK_CANDIDATES, k);
   }
-  async function loadChunkDoc(index) {
-    const chunk = Math.floor(index / manifest.doc_chunk_size);
-    const local = index - chunk * manifest.doc_chunk_size;
-    if (!docCache.has(chunk)) {
-      const file = `docs/${String(chunk).padStart(4, "0")}.json`;
-      docCache.set(chunk, fetch(new URL(file, baseUrl)).then((r) => r.json()));
+  async function loadDocOrdinals(indexes) {
+    const ordinalMeta = docPointers?.ordinals;
+    if (!ordinalMeta?.file) throw new Error("Rangefind index is missing dense doc ordinals.");
+    const pending = [];
+    const unique = [...new Set(indexes)];
+    for (const index of unique) {
+      if (docOrdinalCache.has(index)) continue;
+      let resolveOrdinal;
+      let rejectOrdinal;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveOrdinal = resolvePromise;
+        rejectOrdinal = rejectPromise;
+      });
+      promise.catch(() => {
+      });
+      docOrdinalCache.set(index, promise);
+      const offset = ordinalMeta.dataOffset + index * ordinalMeta.recordBytes;
+      pending.push({
+        index,
+        entry: { pack: ordinalMeta.file, offset, length: ordinalMeta.recordBytes },
+        resolve: resolveOrdinal,
+        reject: rejectOrdinal
+      });
     }
-    return (await docCache.get(chunk))[local];
+    await Promise.all(rangeGroups(pending, "docOrdinals").map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          item.resolve(decodeDocOrdinalRecord(buffer, item.entry.offset - group.start, ordinalMeta));
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          docOrdinalCache.delete(item.index);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
   }
-  async function resolvePackedDoc(index) {
-    if (!docDirectory) return null;
-    const key = docIndexKey(index);
-    const root = await loadDirectoryRoot(docDirectory);
-    const resolved = await directoryEntryFromRoot(docDirectory, root, key);
-    return resolved ? { index, key, entry: resolved.entry } : null;
+  async function loadDocPointers(indexes) {
+    if (!docPointers?.file || docPointers.order !== "layout") throw new Error("Rangefind index is missing layout-ordered dense doc pointers.");
+    await loadDocOrdinals(indexes);
+    const pending = [];
+    const unique = [...new Set(indexes)];
+    for (const index of unique) {
+      if (docPointerCache.has(index)) continue;
+      let resolvePointer;
+      let rejectPointer;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePointer = resolvePromise;
+        rejectPointer = rejectPromise;
+      });
+      promise.catch(() => {
+      });
+      docPointerCache.set(index, promise);
+      const ordinal = await docOrdinalCache.get(index);
+      const offset = docPointers.dataOffset + ordinal * docPointers.recordBytes;
+      pending.push({
+        index,
+        entry: { pack: docPointers.file, offset, length: docPointers.recordBytes },
+        resolve: resolvePointer,
+        reject: rejectPointer
+      });
+    }
+    await Promise.all(rangeGroups(pending, "docPointers").map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
+          item.resolve(pointer);
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          docPointerCache.delete(item.index);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
   }
   async function loadPackedDocs(indexes) {
     const wanted = [];
     const pending = [];
     const unique = [...new Set(indexes)];
+    await loadDocPointers(unique);
     for (const index of unique) {
       wanted.push(index);
       if (packedDocCache.has(index)) continue;
@@ -1117,18 +1334,17 @@ async function createSearch(options = {}) {
         resolveDoc = resolvePromise;
         rejectDoc = rejectPromise;
       });
+      promise.catch(() => {
+      });
       packedDocCache.set(index, promise);
-      const resolved = await resolvePackedDoc(index);
-      if (resolved) pending.push({ ...resolved, resolve: resolveDoc, reject: rejectDoc });
-      else resolveDoc(loadChunkDoc(index));
+      const entry = await docPointerCache.get(index);
+      pending.push({ index, entry, resolve: resolveDoc, reject: rejectDoc });
     }
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending, "docs").map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          const inflated = await inflateGzip(compressed.slice(start, end));
+          const inflated = await inflateGroupItem(compressed, group.start, item, `doc ${item.index}`);
           item.resolve(JSON.parse(textDecoder2.decode(new Uint8Array(inflated))));
         }));
       } catch (error) {
@@ -1136,16 +1352,119 @@ async function createSearch(options = {}) {
           packedDocCache.delete(item.index);
           item.reject(error);
         }
+        throw error;
       }
     }));
     return Promise.all(wanted.map((index) => packedDocCache.get(index)));
   }
-  async function loadDocs(indexes) {
-    if (docDirectory) return loadPackedDocs(indexes);
-    return Promise.all(indexes.map(loadChunkDoc));
+  function docPageSize() {
+    return Math.max(1, Number(docPages?.page_size || 0));
   }
-  async function rowsToResults(rows) {
-    const docs = await loadDocs(rows.map(([index]) => index));
+  function docPageIndex(index) {
+    return Math.floor(index / docPageSize());
+  }
+  function docPagePlan(indexes, context = {}) {
+    if (!useDocPages || !docPages?.pointers?.file || !context.preferDocPages) return null;
+    const unique = [...new Set(indexes)];
+    if (!unique.length) return null;
+    const pages = [...new Set(unique.map(docPageIndex))].sort((a, b) => a - b);
+    const payloadDocs = pages.length * docPageSize();
+    const maxOverfetchDocs = Math.max(1, Number(docPages.max_overfetch_docs || 16));
+    const maxPayloadDocs = Math.max(docPageSize(), unique.length * maxOverfetchDocs);
+    if (payloadDocs > maxPayloadDocs) return null;
+    return { pages, pageSize: docPageSize(), payloadDocs, uniqueDocs: unique.length };
+  }
+  async function loadDocPagePointers(pageIndexes) {
+    const pointerMeta = docPages?.pointers;
+    if (!pointerMeta?.file) throw new Error("Rangefind index is missing dense doc page pointers.");
+    const pending = [];
+    const unique = [...new Set(pageIndexes)];
+    for (const pageIndexValue of unique) {
+      if (docPagePointerCache.has(pageIndexValue)) continue;
+      if (pageIndexValue < 0 || pageIndexValue >= pointerMeta.count) throw new Error(`Rangefind doc page ${pageIndexValue} is outside the index.`);
+      let resolvePointer;
+      let rejectPointer;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePointer = resolvePromise;
+        rejectPointer = rejectPromise;
+      });
+      promise.catch(() => {
+      });
+      docPagePointerCache.set(pageIndexValue, promise);
+      const offset = pointerMeta.dataOffset + pageIndexValue * pointerMeta.recordBytes;
+      pending.push({
+        pageIndex: pageIndexValue,
+        entry: { pack: pointerMeta.file, offset, length: pointerMeta.recordBytes },
+        resolve: resolvePointer,
+        reject: rejectPointer
+      });
+    }
+    await Promise.all(rangeGroups(pending, "docPagePointers").map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
+          item.resolve(pointer);
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          docPagePointerCache.delete(item.pageIndex);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+  }
+  async function loadDocPages(indexes, plan) {
+    await loadDocPagePointers(plan.pages);
+    const pending = [];
+    for (const pageIndexValue of plan.pages) {
+      if (docPageCache.has(pageIndexValue)) continue;
+      let resolvePage;
+      let rejectPage;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePage = resolvePromise;
+        rejectPage = rejectPromise;
+      });
+      promise.catch(() => {
+      });
+      docPageCache.set(pageIndexValue, promise);
+      const entry = await docPagePointerCache.get(pageIndexValue);
+      pending.push({ pageIndex: pageIndexValue, entry, resolve: resolvePage, reject: rejectPage });
+    }
+    await Promise.all(rangeGroups(pending, "docPages").map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`docs/page-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `doc page ${item.pageIndex}`);
+          item.resolve(JSON.parse(textDecoder2.decode(new Uint8Array(inflated))));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          docPageCache.delete(item.pageIndex);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+    return Promise.all(indexes.map(async (index) => {
+      const pageIndexValue = docPageIndex(index);
+      const page = await docPageCache.get(pageIndexValue);
+      const doc = page[index - pageIndexValue * plan.pageSize];
+      if (!doc) throw new Error(`Rangefind doc page ${pageIndexValue} is missing document ${index}.`);
+      return doc;
+    }));
+  }
+  async function loadDocs(indexes, context = {}) {
+    const plan = docPagePlan(indexes, context);
+    context.docPayloadLane = plan ? "docPages" : "packedDocs";
+    context.docPayloadPages = plan?.pages.length || 0;
+    context.docPayloadRows = indexes.length;
+    context.docPayloadOverfetchDocs = plan?.payloadDocs || indexes.length;
+    return plan ? loadDocPages(indexes, plan) : loadPackedDocs(indexes);
+  }
+  async function rowsToResults(rows, context = {}) {
+    const docs = await loadDocs(rows.map(([index]) => index), context);
     return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
   }
   function normalizeRangeValue(value, field) {
@@ -1180,22 +1499,23 @@ async function createSearch(options = {}) {
         resolveBlock = resolvePromise;
         rejectBlock = rejectPromise;
       });
+      promise.catch(() => {
+      });
       entry.blockPostings.set(blockIndex, promise);
       pending.push({ blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
     }
-    await Promise.all(groupRanges(pending).map(async (group) => {
+    await Promise.all(rangeGroups(pending, "postingBlocks").map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          const start = item.entry.offset - group.start;
-          const end = start + item.entry.length;
-          item.resolve(decodePostingBytes(await inflateGzip(compressed.slice(start, end))));
+          item.resolve(decodePostingBytes(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`)));
         }));
       } catch (error) {
         for (const item of group.items) {
           entry.blockPostings.delete(item.blockIndex);
           item.reject(error);
         }
+        throw error;
       }
     }));
     return Promise.all(wanted.map((blockIndex) => entry.blockPostings.get(blockIndex)));
@@ -1494,12 +1814,14 @@ async function createSearch(options = {}) {
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: true, preferDocPages: false };
+    const results = await rowsToResults(rows, resultContext);
     return {
       total: exhausted ? ranked.length : Math.max(ranked.length, k),
       page,
       size,
       approximate: !exhausted,
-      results: await rowsToResults(rows),
+      results,
       stats: {
         exact: exhausted,
         blocksDecoded,
@@ -1508,6 +1830,9 @@ async function createSearch(options = {}) {
         skippedBlocks: cursors.reduce((sum, cursor) => sum + cursor.skippedBlocks, 0),
         terms: terms.length,
         shards: new Set(entries.map((item) => item.shardName)).size,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         ...reranked.stats
       }
     };
@@ -1548,11 +1873,13 @@ async function createSearch(options = {}) {
     if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: !!sortPlan };
+    const results = await rowsToResults(rows, resultContext);
     return {
       total: ranked.length,
       page,
       size,
-      results: await rowsToResults(rows),
+      results,
       approximate: false,
       stats: {
         exact: true,
@@ -1563,6 +1890,9 @@ async function createSearch(options = {}) {
         postingsDecoded: entries.reduce((sum, item) => sum + item.entry.count, 0),
         postingsAccepted: ranked.length,
         skippedBlocks: 0,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         ...reranked.stats
       }
     };
@@ -1729,7 +2059,19 @@ async function createSearch(options = {}) {
       };
       const ranked = sortPlan ? selected.ranked : sortRanked(selected.ranked, codeData, sortPlan);
       const rows = ranked.slice(offset, offset + size);
-      return { total: selected.total, results: await rowsToResults(rows), page, size };
+      const resultContext = { hasTextTerms: false, preferDocPages: true };
+      const results = await rowsToResults(rows, resultContext);
+      return {
+        total: selected.total,
+        results,
+        page,
+        size,
+        stats: {
+          docPayloadLane: resultContext.docPayloadLane,
+          docPayloadPages: resultContext.docPayloadPages,
+          docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+        }
+      };
     }
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map((item) => item.term);

@@ -3,7 +3,6 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 export const DEFAULTS = {
-  docChunkSize: 100,
   docValueChunkSize: 2048,
   baseShardDepth: 3,
   maxShardDepth: 5,
@@ -14,9 +13,12 @@ export const DEFAULTS = {
   externalPostingBlockMinBytes: 1024,
   postingBlockPackBytes: 4 * 1024 * 1024,
   docPackBytes: 4 * 1024 * 1024,
+  docPageSize: 32,
+  docPagePackBytes: 4 * 1024 * 1024,
+  docPageMaxOverfetchDocs: 16,
+  docLocalityTerms: 2,
   docValuePackBytes: 4 * 1024 * 1024,
   directoryPageBytes: 64 * 1024,
-  docDirectoryPageBytes: 64 * 1024,
   facetDictionaryPackBytes: 4 * 1024 * 1024,
   blockFilterMaxFacetWords: 64,
   reduceWorkers: 1,

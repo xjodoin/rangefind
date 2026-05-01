@@ -6,9 +6,9 @@ import {
 } from "./binary.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 
-export const DIRECTORY_FORMAT = "rfdir-v1";
+export const DIRECTORY_FORMAT = "rfdir-v2";
 export const DEFAULT_DIRECTORY_PAGE_BYTES = 64 * 1024;
-const DIRECTORY_VERSION = 1;
+const DIRECTORY_VERSION = 2;
 const DEFAULT_BLOOM_BITS_PER_KEY = 10;
 
 const textEncoder = new TextEncoder();
@@ -41,7 +41,10 @@ function pageEntryLength(entry, previous) {
     + utf8Length(entry.shard.slice(prefix))
     + varintLength(entry.packIndex)
     + varintLength(entry.offset)
-    + varintLength(entry.length);
+    + varintLength(entry.length)
+    + varintLength(entry.logicalLength || 0)
+    + utf8Length(entry.checksum.algorithm)
+    + utf8Length(entry.checksum.value);
 }
 
 function normalizePackIndex(value) {
@@ -51,11 +54,17 @@ function normalizePackIndex(value) {
 }
 
 function normalizeEntry(entry) {
+  if (!entry.checksum?.value) throw new Error(`Rangefind directory entry ${entry.shard || ""} is missing a checksum.`);
   return {
     shard: String(entry.shard || ""),
     packIndex: normalizePackIndex(entry.packIndex ?? entry.pack),
-    offset: Math.max(0, Math.floor(entry.offset || 0)),
-    length: Math.max(0, Math.floor(entry.length || 0))
+    offset: Math.max(0, Math.floor(entry.offset ?? 0)),
+    length: Math.max(0, Math.floor(entry.length ?? entry.physicalLength ?? 0)),
+    logicalLength: Math.max(0, Math.floor(entry.logicalLength || 0)),
+    checksum: {
+      algorithm: entry.checksum.algorithm || "sha256",
+      value: entry.checksum.value
+    }
   };
 }
 
@@ -111,12 +120,15 @@ function buildDirectoryPage(entries) {
     pushVarint(out, entry.packIndex);
     pushVarint(out, entry.offset);
     pushVarint(out, entry.length);
+    pushVarint(out, entry.logicalLength || 0);
+    pushUtf8(out, entry.checksum.algorithm);
+    pushUtf8(out, entry.checksum.value);
     previous = entry.shard;
   }
   return Buffer.from(Uint8Array.from(out));
 }
 
-function buildDirectoryRoot(pages, entryCount, bloom) {
+export function buildDirectoryRoot(pages, entryCount, bloom) {
   const out = [...DIRECTORY_ROOT_MAGIC];
   pushVarint(out, DIRECTORY_VERSION);
   pushVarint(out, entryCount);
@@ -181,11 +193,14 @@ export function buildPagedDirectory(entries, options = {}) {
   const root = buildDirectoryRoot(pages, normalized.length, bloom);
   return {
     format: DIRECTORY_FORMAT,
+    version: DIRECTORY_VERSION,
     pageBytes,
     root,
+    bloom,
     pages,
     stats: {
       format: DIRECTORY_FORMAT,
+      version: DIRECTORY_VERSION,
       entries: normalized.length,
       page_bytes: pageBytes,
       page_files: pages.length,
@@ -230,7 +245,8 @@ export function parseDirectoryRoot(buffer) {
   };
 }
 
-export function parseDirectoryPage(buffer) {
+export function parseDirectoryPage(buffer, options = {}) {
+  const packTable = Array.isArray(options) ? options : options.packTable || options.packs || [];
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, DIRECTORY_PAGE_MAGIC, "Unsupported Rangefind directory page");
   const state = { pos: DIRECTORY_PAGE_MAGIC.length };
@@ -243,11 +259,20 @@ export function parseDirectoryPage(buffer) {
     const prefix = readVarint(bytes, state);
     const suffix = readUtf8(bytes, state);
     const shard = previous.slice(0, prefix) + suffix;
-    entries.set(shard, {
-      pack: `${String(readVarint(bytes, state)).padStart(4, "0")}.bin`,
+    const packIndex = readVarint(bytes, state);
+    const entry = {
+      pack: packTable[packIndex] || `${String(packIndex).padStart(4, "0")}.bin`,
       offset: readVarint(bytes, state),
       length: readVarint(bytes, state)
-    });
+    };
+    entry.physicalLength = entry.length;
+    const logicalLength = readVarint(bytes, state);
+    const algorithm = readUtf8(bytes, state);
+    const value = readUtf8(bytes, state);
+    if (!value) throw new Error(`Rangefind directory page entry ${shard} is missing a checksum.`);
+    entry.logicalLength = logicalLength || null;
+    entry.checksum = { algorithm: algorithm || "sha256", value };
+    entries.set(shard, entry);
     previous = shard;
   }
   return entries;

@@ -4,7 +4,8 @@ Rangefind includes a reproducible scalability fixture for French Wikipedia.
 The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
 records a local request/transfer benchmark with cold-transfer breakdowns for
-directory, term, posting-block, typo, doc-value, and document payload fetches.
+directory, term, posting-block, typo, doc-value, packed document payload, and
+doc-page payload fetches.
 The generated schema includes multi-value article tags, typed numeric fields,
 revision dates, and booleans so the scalability run also validates the typed
 filter/sort code paths.
@@ -58,11 +59,22 @@ Useful options:
 
 ## Local 50k Run
 
-Command:
+Build command, reusing the cached 50k JSONL fixture:
 
 ```bash
-/usr/bin/time -p node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
+/usr/bin/time -p node scripts/frwiki_fixture.mjs all --limit=50000 --runs=2 --reduce-workers=auto
 ```
+
+Latest cold-transfer bench command against that index:
+
+```bash
+node scripts/frwiki_fixture.mjs bench --limit=50000 --runs=2
+```
+
+The benchmark uses a fresh runtime per query row and resets the fetch meter
+after manifest initialization. Cold query rows therefore exclude the one-request
+init cost and do not share runtime caches with earlier rows. Warm columns are
+still repeated runs inside the same query row.
 
 Result:
 
@@ -70,31 +82,51 @@ Result:
 Docs indexed:        50,000
 Dump pages read:     65,687
 Body cap:            6,000 cleaned characters/article
-Build + bench time:  196.88 s real including dump streaming
 Logical shards:      15,104
-Term packs:          7
-Index files:         54
-Index bytes:         124.0 MB
-Manifest/init:       10.9 ms, 1 request, 53.1 KB
+Term packs:          8
+Index files:         78
+Index bytes:         152.8 MB (145.7 MiB)
+Manifest/init:       10.6 ms, 1 request, 99.6 KB
+Pack tables:         8 term, 5 posting-block, 8 doc, 5 doc-page, 1 doc-value, 1 facet, 13 typo
+Doc pointer table:   2.0 MB, 41-byte fixed records
+Doc ordinal table:   0.1 MB, 2-byte fixed records
+Doc page table:      64.1 KB, 1,563 fixed records, 32 docs/page
+Doc page packs:      17.6 MB
+Doc layout:          rflocal-doc-v1, 21,558 primary terms
 ```
 
 Representative cold queries:
 
 ```text
-Paris:                    55.6 ms, 20 requests, 332.1 KB, 1 block / 128 postings
-Révolution française:     64.1 ms, 39 requests, 238.3 KB, 31 blocks / 3,744 postings
-intelligence artificielle: 19.2 ms, 13 requests, 137.6 KB, 3 blocks / 257 postings
-football:                  9.9 ms, 11 requests,  12.5 KB, 1 block / 128 postings
-Québec:                    9.7 ms, 12 requests,  32.9 KB, 8 blocks / 913 postings
-typed dates sorted:       37.9 ms,  3 requests, 228.7 KB, doc-value top-k selector
-multi facet boolean:      39.5 ms,  7 requests, 148.9 KB, 0.13 KB facet dictionary range
+Paris:                    47.3 ms, 14 requests,  90.5 KB, packed docs, 1 block / 128 postings
+Révolution française:     62.9 ms, 45 requests, 245.3 KB, packed docs, 31 blocks / 3,744 postings
+intelligence artificielle: 29.2 ms, 27 requests, 281.7 KB, packed docs, 3 blocks / 257 postings
+Victor Hugo:              21.8 ms, 31 requests, 140.7 KB, packed docs, 7 blocks / 728 postings
+football:                 11.8 ms, 21 requests,  71.3 KB, packed docs, 1 block / 128 postings
+médecine:                 13.8 ms, 24 requests, 122.0 KB, packed docs, 1 block / 128 postings
+changement climatique:    47.9 ms, 53 requests, 167.6 KB, packed docs, 38 blocks / 4,737 postings
+fromage:                   5.2 ms,  7 requests,  87.7 KB, packed docs, 3 blocks / 285 postings
+Québec:                    7.3 ms, 10 requests,  98.1 KB, packed docs, 8 blocks / 913 postings
+Napoléon Bonaparte:       14.2 ms, 23 requests, 157.1 KB, packed docs, 3 blocks / 257 postings
+typed dates sorted:       44.6 ms,  4 requests, 231.2 KB, doc page lane
+dense filter browse:      17.7 ms,  3 requests,  71.4 KB, doc page lane
+multi facet boolean:      44.3 ms,  8 requests, 155.7 KB, doc page lane
+```
+
+The three browse/filter rows also run an A/B fallback with doc pages disabled:
+
+```text
+typed dates sorted:  4 requests / 231.2 KB with doc pages vs 17 requests / 288.3 KB packed-only
+dense filter browse: 3 requests /  71.4 KB with doc pages vs 17 requests / 104.2 KB packed-only
+multi facet boolean: 8 requests / 155.7 KB with doc pages vs 22 requests / 188.5 KB packed-only
 ```
 
 All rows reported `valid: true`. Every text query also reported
 `exactTopKMatch: true` against the exact retrieval path. Broad single-term
 queries now use the same block-max top-k scheduler as multi-term queries:
-`Paris` matched exact top 10 after decoding 1 of 49 posting blocks, and
-`football` matched exact top 10 after decoding 1 of 7 blocks.
+`Paris` matched exact top 10 after decoding 1 of 49 posting blocks,
+`football` matched exact top 10 after decoding 1 of 7 blocks, and
+`changement climatique` matched exact top 10 after decoding 38 of 71 blocks.
 
 Warm repeated text queries were served from the runtime cache with zero
 additional network requests and sub-millisecond to low-single-digit millisecond
@@ -104,6 +136,35 @@ documents; the 50k typed date sort dropped from about 100 ms warm to about
 21 ms warm on the same index.
 
 High-cardinality facet dictionaries are stored with the same range-directory
-and pack strategy as terms and documents. The 50k manifest is 53.1 KB; the
+and pack strategy as terms and documents. The 50k manifest is 99.6 KB; the
 large category dictionary lives in `facets/packs/*.bin` and is fetched only when
 that facet is selected or a UI asks for its values.
+
+The current index uses `rfdir-v2` directory pages, a dense `rfdocord-v1`
+document ordinal table, a layout-ordered `rfdocptr-v1` document pointer table,
+and ZFS-inspired block pointers for every compressed object. Each pointer records
+physical length, logical length, codec/kind metadata, and a SHA-256 checksum that
+the browser runtime verifies before decompression. That adds directory/manifest
+bytes versus an unchecked format, but it makes range-fetched objects
+self-verifying and catches stale or corrupt CDN/object-store responses before
+decoding.
+
+Dense doc pointers replace the previous document directory for text results.
+The ordinal table is keyed by original numeric document id and maps to a
+retrieval-local pointer ordinal. Document payloads and pointer records are
+written in the same locality order, derived from each document's strongest base
+term and impact score. Dense doc pages add a second result-payload lane for
+browse/filter/sort rows: the builder writes compressed arrays of 32 display
+payloads in original document-id order, and the runtime uses that lane only when
+the requested result ids are dense enough to keep overfetch bounded. The 50k
+A/B rows show that this cuts dense browse payload requests without hurting the
+text top-k lane, while sparse text results continue to use retrieval-local
+packed docs.
+
+Pack files, directory pages, directory roots, and the typo sidecar manifest are
+content-addressed with 24-hex-character SHA-256 name suffixes. The 50k run
+reported 113,075 exact compressed objects and no duplicate compressed objects to
+deduplicate, which is expected for real article/search shards. The dedup table
+remains useful for synthetic or repeated payloads, but the important CDN win here
+is that every heavy object can be served as immutable; only the main manifest
+needs revalidation.

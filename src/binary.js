@@ -5,6 +5,9 @@ export const CODE_MAGIC = [0x52, 0x46, 0x43, 0x42]; // RFCB
 export const DOC_VALUE_MAGIC = [0x52, 0x46, 0x56, 0x42]; // RFVB
 export const FACET_DICT_MAGIC = [0x52, 0x46, 0x46, 0x44]; // RFFD
 export const TYPO_SHARD_MAGIC = [0x52, 0x46, 0x54, 0x42]; // RFTB
+export const DOC_POINTER_PAGE_MAGIC = [0x52, 0x46, 0x50, 0x44]; // RFPD
+export const DOC_ORDINAL_TABLE_MAGIC = [0x52, 0x46, 0x44, 0x4f]; // RFDO
+export const DOC_PAGE_POINTER_MAGIC = [0x52, 0x46, 0x50, 0x47]; // RFPG
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));

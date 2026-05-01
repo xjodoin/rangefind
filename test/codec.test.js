@@ -17,10 +17,13 @@ import {
 } from "../src/codec.js";
 import {
   buildPagedDirectory,
+  DIRECTORY_FORMAT,
   findDirectoryPage,
   parseDirectoryPage,
   parseDirectoryRoot
 } from "../src/directory.js";
+
+const checksum = { algorithm: "sha256", value: "a".repeat(64) };
 
 test("term shard codec round-trips postings and block filters", () => {
   const config = {
@@ -66,30 +69,76 @@ test("term shard codec can externalize posting blocks", () => {
   const stored = [];
   const rewritten = rewriteTermShardForExternalBlocks(buffer, { block_filters: filters }, config, ({ bytes }) => {
     stored.push(bytes);
-    return { pack: "0000.bin", offset: stored.length * 10, length: bytes.length };
+    return {
+      pack: "0000.bin",
+      offset: stored.length * 10,
+      length: bytes.length,
+      logicalLength: bytes.length,
+      checksum: { algorithm: "sha256", value: "0".repeat(64) }
+    };
   });
-  const shard = parseShard(rewritten.buffer, { block_filters: filters, stats: { posting_block_storage: "range-pack-v1" } });
+  const shard = parseShard(rewritten.buffer, {
+    block_filters: filters,
+    stats: { posting_block_storage: "range-pack-v1" },
+    object_store: {
+      pointer_format: "rfbp-v1",
+      pack_table: { postingBlocks: ["0000.immutable.bin"] }
+    }
+  });
   const entry = shard.terms.get("search");
   assert.equal(entry.external, true);
   assert.equal(entry.blocks.length, 2);
-  assert.equal(entry.blocks[0].range.pack, "0000.bin");
+  assert.equal(entry.blocks[0].range.pack, "0000.immutable.bin");
+  assert.equal(entry.blocks[0].range.logicalLength, 4);
+  assert.equal(entry.blocks[0].range.checksum.value, "0".repeat(64));
   assert.deepEqual(entry.blocks[0].filters.year, { min: -1, max: 0 });
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 1 });
   assert.deepEqual([...decodePostingBytes(stored[0])], [0, 13, 1, 11]);
   assert.equal(rewritten.stats.externalBlocks, 2);
 });
 
+test("paged directory can encode checksummed block pointers", () => {
+  const directory = buildPagedDirectory([
+    { shard: "object", packIndex: 1, offset: 20, length: 30, logicalLength: 120, checksum }
+  ], { pageBytes: 1024 });
+  assert.equal(directory.format, DIRECTORY_FORMAT);
+  const root = parseDirectoryRoot(directory.root);
+  assert.equal(root.version, 2);
+  const page = findDirectoryPage(root, "object");
+  const ranges = parseDirectoryPage(directory.pages.find(item => item.file === page.file).buffer);
+  assert.deepEqual(ranges.get("object"), {
+    pack: "0001.bin",
+    offset: 20,
+    length: 30,
+    physicalLength: 30,
+    logicalLength: 120,
+    checksum
+  });
+});
+
+test("paged directory maps pack indexes through immutable pack table", () => {
+  const directory = buildPagedDirectory([
+    { shard: "object", packIndex: 1, offset: 20, length: 30, logicalLength: 40, checksum }
+  ], { pageBytes: 1024 });
+  const root = parseDirectoryRoot(directory.root);
+  const page = findDirectoryPage(root, "object");
+  const ranges = parseDirectoryPage(directory.pages.find(item => item.file === page.file).buffer, {
+    packTable: ["0000.a.bin", "0001.b.bin"]
+  });
+  assert.equal(ranges.get("object").pack, "0001.b.bin");
+});
+
 test("paged directory maps named shards to packed file offsets", () => {
   const directory = buildPagedDirectory([
-    { shard: "bbb", packIndex: 2, offset: 5, length: 30 },
-    { shard: "aaa", packIndex: 0, offset: 10, length: 50 }
+    { shard: "bbb", packIndex: 2, offset: 5, length: 30, checksum },
+    { shard: "aaa", packIndex: 0, offset: 10, length: 50, checksum }
   ], { pageBytes: 1024 });
   const root = parseDirectoryRoot(directory.root);
   const page = findDirectoryPage(root, "aaa");
   assert.ok(page);
   const ranges = parseDirectoryPage(directory.pages.find(item => item.file === page.file).buffer);
-  assert.deepEqual(ranges.get("aaa"), { pack: "0000.bin", offset: 10, length: 50 });
-  assert.deepEqual(ranges.get("bbb"), { pack: "0002.bin", offset: 5, length: 30 });
+  assert.deepEqual(ranges.get("aaa"), { pack: "0000.bin", offset: 10, length: 50, physicalLength: 50, logicalLength: null, checksum });
+  assert.deepEqual(ranges.get("bbb"), { pack: "0002.bin", offset: 5, length: 30, physicalLength: 30, logicalLength: null, checksum });
   assert.equal(findDirectoryPage(root, "zzz"), null);
 });
 

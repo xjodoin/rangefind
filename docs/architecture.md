@@ -19,37 +19,92 @@ rangefind/
   manifest.json
   doc-values/
     packs/
-      0000.bin
+      0000.<hash>.bin
   facets/
-    directory-root.bin.gz
+    directory-root.<hash>.bin.gz
     directory-pages/
-      0000.bin.gz
+      0000.<hash>.bin.gz
     packs/
-      0000.bin
+      0000.<hash>.bin
   docs/
-    directory-root.bin.gz
-    directory-pages/
-      0000.bin.gz
+    ordinals/
+      0000.<hash>.bin
+    pointers/
+      0000.<hash>.bin
+    pages/
+      0000.<hash>.bin
+    page-packs/
+      0000.<hash>.bin
     packs/
-      0000.bin
+      0000.<hash>.bin
   terms/
-    directory-root.bin.gz
+    directory-root.<hash>.bin.gz
     directory-pages/
-      0000.bin.gz
+      0000.<hash>.bin.gz
     block-packs/
-      0000.bin
+      0000.<hash>.bin
     packs/
-      0000.bin
-      0001.bin
+      0000.<hash>.bin
+      0001.<hash>.bin
+  typo/
+    manifest.<hash>.json
+    directory-root.<hash>.bin.gz
+    directory-pages/
+      0000.<hash>.bin.gz
+    packs/
+      0000.<hash>.bin
 ```
 
 `manifest.json` is small enough for page initialization. It lists schema,
-default results, compact facet counts, and pointers to the paged range
-directories. Full facet dictionaries use the same range-pack layout as terms and
-documents, so high-cardinality metadata does not inflate cold start.
+feature flags, an `object_store` descriptor, default results, compact facet
+counts, and pointers to the paged range directories. Full facet dictionaries use
+the same range-pack layout as terms and documents, so high-cardinality metadata
+does not inflate cold start.
+
+## Object Pointers
+
+New builds use ZFS-inspired immutable object pointers. Every range-packed object
+that can be fetched independently is described by the same pointer shape:
+
+```json
+{
+  "pack": "0000.<hash>.bin",
+  "offset": 12345,
+  "length": 678,
+  "physicalLength": 678,
+  "logicalLength": 2048,
+  "checksum": { "algorithm": "sha256", "value": "..." }
+}
+```
+
+Paged directory files use `rfdir-v2`, which stores those pointers next to each
+logical key. Layout-ordered doc pointer tables, doc-page pointer tables,
+doc-value chunks, and external posting blocks embed the same pointer fields in
+their owning metadata. The browser verifies the compressed range bytes against
+the SHA-256 checksum before decompression, so stale CDN objects, partial uploads,
+and corrupt deploys fail before a parser sees invalid bytes. Runtime
+verification can be disabled with `createSearch({ verifyChecksums: false })` for
+diagnostics, but the default is to verify when the index advertises
+`features.checksummedObjects`.
+
+Pack files, directory pages, and directory roots use content-addressed immutable
+names. The numeric prefix keeps deterministic pack ordering, while the SHA-256
+hash suffix changes whenever the bytes change. Directory pages keep compact
+numeric pack indexes and resolve them through a `pack_table`, so filenames are
+CDN-safe without bloating every logical entry. The optional typo sidecar
+manifest is also content-addressed and referenced from the main manifest. Hosts
+can serve every hashed object with long-lived immutable cache headers; only the
+main `manifest.json` needs revalidation or versioned publication.
+
+The pack writer also performs a narrow ZFS-style deduplication pass at build
+time. It hashes each independently compressed object and reuses the same
+pack/offset pointer for exact byte-identical objects. This is intentionally exact
+deduplication only: near-duplicate text or cross-block semantic dedup would add
+runtime indirection and extra range fetches, which is usually a bad trade for a
+latency-sensitive browser index.
 
 `facets/packs/*.bin` store independently compressed binary facet dictionaries
-addressed through `facets/directory-root.bin.gz` and
+addressed through `facets/directory-root.<hash>.bin.gz` and
 `facets/directory-pages/*.bin.gz`. The runtime lazy-loads a dictionary only when
 that facet is selected or an application asks for its values.
 
@@ -61,16 +116,34 @@ missing, false, and true. The manifest carries per-chunk summaries, so broad
 filter and sort queries can fetch only the involved columns and skip chunks that
 cannot match instead of downloading one global code table.
 
-`terms/directory-root.bin.gz` is loaded lazily on the first real term query. It
-contains page bounds and a compact Bloom filter for adaptive shard resolution.
-Only touched `terms/directory-pages/*.bin.gz` files are fetched, and each page
-maps logical shard names to `[packIndex, offset, length]` tuples.
+`docs/ordinals/*.bin` is a tiny fixed-record table keyed directly by numeric
+document id. It maps each document id to its retrieval-local layout ordinal.
+`docs/pointers/*.bin` is a dense fixed-record pointer table in that layout order.
+Result fetching no longer walks a generic string directory for documents. The
+runtime range-fetches small ordinal records, uses them to fetch nearby pointer
+records for text-local result sets, then range-fetches the referenced compressed
+document payloads from `docs/packs/*.bin`.
+
+`docs/pages/*.bin` is a second dense pointer table keyed by document-id page,
+and `docs/page-packs/*.bin` stores compressed JSON arrays of display payloads in
+original document-id order. This lane is optimized for browse, filter, and sort
+result pages where returned ids are clustered. The runtime estimates page
+overfetch before using it; sparse text top-k results stay on the retrieval-local
+doc pack lane.
+
+`terms/directory-root.<hash>.bin.gz` is loaded lazily on the first real term
+query. It contains page bounds and a compact Bloom filter for adaptive shard
+resolution. Only touched `terms/directory-pages/*.bin.gz` files are fetched, and
+each page maps logical shard names to checksummed object pointers.
 
 `terms/packs/*.bin` contain many independently compressed logical shards. The
 browser requests exactly the byte span it needs and decompresses that one shard.
 High-df posting lists can move their posting blocks into
 `terms/block-packs/*.bin`; the term shard then carries only term metadata,
 block-max scores, filter summaries, and byte ranges for external blocks.
+The runtime uses an adaptive overfetch planner for external posting blocks and
+result documents: it merges nearby byte ranges when the extra transfer is bounded
+and materially reduces request count.
 
 The builder writes temporary posting and typo runs with a compact binary record
 format instead of TSV. Runs are still partitioned by base shard, so reduction can
@@ -81,13 +154,18 @@ assembles final range packs in sorted task order so pack offsets stay
 deterministic. Set `reduceWorkers` in the config to control the worker count;
 `1` is the default, while `0` or `"auto"` uses up to four workers.
 
-Document packs contain independently compressed result-display payloads addressed
-through the same paged range-directory pattern as term shards. They contain only
-configured display fields, not necessarily the full indexed text. A display
+Document packs contain independently compressed result-display payloads written
+in retrieval-local order. The builder spools compressed payloads to disk during
+ingestion, computes a compact locality record from each document's strongest
+base terms, then assembles final packs by primary term and impact. The dense
+ordinal table preserves direct lookup by original document id. Payloads contain
+only configured display fields, not necessarily the full indexed text. A display
 object can set `maxChars` to cap a returned string field while the corresponding
 indexed field remains uncapped for scoring. This keeps random result-fetch
 traffic bounded for long documents and avoids over-fetching a whole JSON chunk
-for one result.
+for one result. The same spool is also read into fixed-size doc pages for dense
+metadata browsing; that duplicates display payload bytes, but it removes the
+ordinal and random pointer fan-out when a result page is contiguous enough.
 
 ## Retrieval Model
 

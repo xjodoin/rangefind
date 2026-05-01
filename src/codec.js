@@ -108,11 +108,17 @@ function updateSummary(summary, filters, codes, doc) {
 }
 
 function packIndexFromFile(file) {
-  return Number(String(file || "0").replace(/\D/gu, "")) || 0;
+  const match = /^(\d+)/u.exec(String(file || "0"));
+  return match ? Number(match[1]) || 0 : 0;
 }
 
 function packFileFromIndex(index) {
   return `${String(index).padStart(4, "0")}.bin`;
+}
+
+function objectPackFileFromIndex(index, manifest, kind) {
+  const table = manifest.object_store?.pack_table?.[kind] || manifest.object_store?.packs?.[kind] || [];
+  return table[index] || packFileFromIndex(index);
 }
 
 function writeBlockFilterSummary(out, filters, summary) {
@@ -216,6 +222,7 @@ export function parseShard(buffer, manifest) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, TERM_SHARD_MAGIC, "Unsupported Rangefind term shard");
   const externalBlockFormat = manifest.stats?.posting_block_storage === "range-pack-v1";
+  const objectPointers = manifest.object_store?.pointer_format === "rfbp-v1" || manifest.features?.checksummedObjects;
   const state = { pos: TERM_SHARD_MAGIC.length };
   const termCount = readVarint(bytes, state);
   const terms = new Map();
@@ -241,11 +248,21 @@ export function parseShard(buffer, manifest) {
       };
       block.filters = readBlockFilterSummary(bytes, state, manifest);
       if (entry.external) {
-        block.range = {
-          pack: packFileFromIndex(readVarint(bytes, state)),
+        const packIndex = readVarint(bytes, state);
+        const range = {
+          pack: objectPackFileFromIndex(packIndex, manifest, "postingBlocks"),
           offset: readVarint(bytes, state),
           length: readVarint(bytes, state)
         };
+        range.physicalLength = range.length;
+        if (objectPointers) {
+          const logicalLength = readVarint(bytes, state);
+          const algorithm = readUtf8(bytes, state);
+          const value = readUtf8(bytes, state);
+          range.logicalLength = logicalLength || null;
+          range.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
+        }
+        block.range = range;
       }
       entry.blocks[j] = block;
     }
@@ -328,7 +345,10 @@ export function rewriteTermShardForExternalBlocks(buffer, manifest, config, writ
           range: {
             packIndex: packIndexFromFile(range.pack),
             offset: range.offset,
-            length: range.length
+            length: range.length,
+            physicalLength: range.physicalLength || range.length,
+            logicalLength: range.logicalLength || null,
+            checksum: range.checksum || null
           }
         });
         stats.externalBlocks++;
@@ -363,6 +383,11 @@ export function rewriteTermShardForExternalBlocks(buffer, manifest, config, writ
         pushVarint(header, block.range.packIndex);
         pushVarint(header, block.range.offset);
         pushVarint(header, block.range.length);
+        if (block.range.checksum?.value) {
+          pushVarint(header, block.range.logicalLength || 0);
+          pushUtf8(header, block.range.checksum.algorithm || "sha256");
+          pushUtf8(header, block.range.checksum.value);
+        }
       }
     }
   }

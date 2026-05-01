@@ -25,3 +25,17 @@ test("groupRanges merges nearby ranges by pack", () => {
   assert.equal(groups.length, 2);
   assert.deepEqual(groups[0], { pack: "0000.bin", start: 0, end: 25, items: groups[0].items });
 });
+
+test("groupRanges limits adaptive overfetch", () => {
+  const merged = groupRanges([
+    { entry: { pack: "0000.bin", offset: 0, length: 10 } },
+    { entry: { pack: "0000.bin", offset: 90, length: 10 } }
+  ], { mergeGapBytes: 100, maxOverfetchBytes: 100, maxOverfetchRatio: 10 });
+  assert.equal(merged.length, 1);
+
+  const split = groupRanges([
+    { entry: { pack: "0000.bin", offset: 0, length: 10 } },
+    { entry: { pack: "0000.bin", offset: 90, length: 10 } }
+  ], { mergeGapBytes: 100, maxOverfetchBytes: 20, maxOverfetchRatio: 10 });
+  assert.equal(split.length, 2);
+});
