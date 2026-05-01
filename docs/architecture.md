@@ -43,10 +43,11 @@ browser requests exactly the byte span it needs and decompresses that one shard.
 The builder writes temporary posting and typo runs with a compact binary record
 format instead of TSV. Runs are still partitioned by base shard, so reduction can
 stream bounded shard groups without holding the whole corpus index in memory.
-Base-shard reduction runs in worker threads by default. Workers write compressed
-logical shard files and typo index-term run files into `_build/`; the parent then
+Base-shard reduction can run in worker threads. Workers write compressed logical
+shard files and typo index-term run files into `_build/`; the parent then
 assembles final range packs in sorted task order so pack offsets stay
-deterministic. Set `reduceWorkers` in the config to control the worker count.
+deterministic. Set `reduceWorkers` in the config to control the worker count;
+`1` is the default, while `0` or `"auto"` uses up to four workers.
 
 ## Retrieval Model
 
