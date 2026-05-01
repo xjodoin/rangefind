@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import { surfaceStemPairs } from "./analyzer.js";
 import { TYPO_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
+import { writeDirectoryFiles } from "./directory.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
 
@@ -23,6 +24,7 @@ export const TYPO_DEFAULTS = {
   targetShardCandidates: 12000,
   maxCandidatesPerDelete: 32,
   packBytes: 4 * 1024 * 1024,
+  directoryPageBytes: 64 * 1024,
   flushLines: 200000
 };
 
@@ -58,16 +60,6 @@ export function typoDeleteKeys(term, options = TYPO_DEFAULTS, maxEdits = typoMax
 
 function typoShardKey(deleteKey, options, depth = options.baseShardDepth) {
   return String(deleteKey || "").slice(0, depth).padEnd(depth, "_");
-}
-
-export function typoShardFor(deleteKey, manifest, availableShards) {
-  const maxDepth = manifest?.max_shard_depth || manifest?.base_shard_depth || TYPO_DEFAULTS.maxShardDepth;
-  const baseDepth = manifest?.base_shard_depth || TYPO_DEFAULTS.baseShardDepth;
-  for (let depth = maxDepth; depth >= baseDepth; depth--) {
-    const key = String(deleteKey || "").slice(0, depth).padEnd(depth, "_");
-    if (availableShards.has(key)) return key;
-  }
-  return String(deleteKey || "").slice(0, baseDepth).padEnd(baseDepth, "_");
 }
 
 export function createTypoRunBuffer(runsOut, options) {
@@ -287,10 +279,12 @@ export async function reduceTypoRuns(buffer, outDir) {
   }
   const shards = [...finalShards].sort();
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  const shardRanges = shards.map((shard) => {
+  const directoryEntries = shards.map((shard) => {
     const entry = packWriter.entries[shard];
-    return [packIndexes.get(entry.pack), entry.offset, entry.length];
+    return { shard, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length };
   });
+  mkdirSync(resolve(outDir, "typo"), { recursive: true });
+  const directory = writeDirectoryFiles(resolve(outDir, "typo"), directoryEntries, buffer.options.directoryPageBytes, "typo");
   const manifest = {
     version: 1,
     format: "rftypo-v1",
@@ -304,19 +298,19 @@ export async function reduceTypoRuns(buffer, outDir) {
     max_shard_depth: buffer.options.maxShardDepth,
     max_candidates_per_delete: buffer.options.maxCandidatesPerDelete,
     storage: "range-pack-v1",
+    directory,
     packs: packWriter.packs,
-    shards,
-    shard_ranges: shardRanges,
     stats: {
       terms: buffer.terms,
       delete_pairs: buffer.deletePairs,
       delete_keys: deleteKeys,
       pairs,
       candidates,
-      pack_bytes: packWriter.bytes
+      pack_bytes: packWriter.bytes,
+      directory_page_files: directory.page_files,
+      directory_bytes: directory.total_bytes
     }
   };
-  mkdirSync(resolve(outDir, "typo"), { recursive: true });
   writeFileSync(resolve(outDir, "typo", "manifest.json"), JSON.stringify(manifest));
   return manifest;
 }

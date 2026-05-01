@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { gunzipSync } from "node:zlib";
+import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "../src/directory.js";
 import {
   addTypoIndexTerm,
   addTypoSurfacePairs,
@@ -34,12 +35,18 @@ test("typo sidecar builds and parses packed delete-key shards", async () => {
   addTypoIndexTerm(buffer, "static", 10, 100);
   const manifest = await reduceTypoRuns(buffer, root);
   assert.equal(manifest.packs.length, 1);
-  const index = manifest.shards.indexOf("st");
-  assert.notEqual(index, -1);
-  const range = manifest.shard_ranges[index];
-  const pack = manifest.packs[range[0]];
+  const rootBytes = gunzipSync(await readFile(join(root, "typo", "directory-root.bin.gz")));
+  const directoryRoot = parseDirectoryRoot(rootBytes);
+  const pageMeta = findDirectoryPage(directoryRoot, "st");
+  assert.ok(pageMeta);
+  const pageBytes = gunzipSync(await readFile(join(root, "typo", "directory-pages", pageMeta.file)));
+  const directoryPage = parseDirectoryPage(pageBytes);
+  const range = directoryPage.get("st");
+  assert.ok(range);
+  const pack = manifest.packs.find(item => item.file === range.pack);
+  assert.ok(pack);
   const bytes = await readFile(join(root, "typo", "packs", pack.file));
-  const compressed = bytes.subarray(range[1], range[1] + range[2]);
+  const compressed = bytes.subarray(range.offset, range.offset + range.length);
   const shard = parseTypoShard(gunzipSync(compressed));
   const candidates = typoCandidatesForDeleteKey(shard, "stati");
   assert.ok(candidates.some(candidate => candidate.surface === "static" && candidate.term === "static"));

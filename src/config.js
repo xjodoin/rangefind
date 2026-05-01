@@ -7,6 +7,7 @@ export const DEFAULTS = {
   maxShardDepth: 5,
   targetShardPostings: 30000,
   packBytes: 4 * 1024 * 1024,
+  directoryPageBytes: 64 * 1024,
   postingFlushLines: 100000,
   maxTermsPerDoc: 160,
   maxExpansionTermsPerDoc: 12,

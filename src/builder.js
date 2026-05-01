@@ -11,10 +11,10 @@ import { tokenize } from "./analyzer.js";
 import {
   buildBlockFilters,
   buildCodesFile,
-  buildRangeFile,
   buildTermShard
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
+import { writeDirectoryFiles } from "./directory.js";
 import { eachJsonLine } from "./jsonl.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
@@ -183,12 +183,12 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
   }
   const shards = [...finalShards].sort();
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  const ranges = shards.map((shard) => {
+  const entries = shards.map((shard) => {
     const entry = packWriter.entries[shard];
-    return [packIndexes.get(entry.pack), entry.offset, entry.length];
+    return { shard, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length };
   });
-  writeFileSync(resolve(dirs.out, "terms", "ranges.bin.gz"), gzipSync(buildRangeFile(ranges), { level: 9 }));
-  return { filters, shards, packs: packWriter.packs, termCount, postingCount, packBytes: packWriter.bytes };
+  const directory = writeDirectoryFiles(resolve(dirs.out, "terms"), entries, config.directoryPageBytes, "terms");
+  return { filters, shards, directory, packs: packWriter.packs, termCount, postingCount, packBytes: packWriter.bytes };
 }
 
 export async function build({ configPath }) {
@@ -223,11 +223,12 @@ export async function build({ configPath }) {
     facets: Object.fromEntries(Object.entries(measured.dicts).map(([name, dict]) => [name, dict.values])),
     numbers: config.numbers.map(n => ({ name: n.name })),
     block_filters: reduced.filters,
-    shards: reduced.shards,
+    directory: reduced.directory,
     typo: typoManifest ? {
       format: typoManifest.format,
       compression: typoManifest.compression,
-      shards: typoManifest.shards.length,
+      directory: typoManifest.directory,
+      shards: typoManifest.directory.entries,
       packs: typoManifest.packs.length,
       stats: { ...typoManifest.stats, pack_files: typoManifest.packs.length }
     } : null,
@@ -235,7 +236,9 @@ export async function build({ configPath }) {
       terms: reduced.termCount,
       postings: reduced.postingCount,
       term_storage: "range-pack-v1",
-      term_range_format: "rfranges-v1",
+      term_directory_format: reduced.directory.format,
+      term_directory_page_files: reduced.directory.page_files,
+      term_directory_bytes: reduced.directory.total_bytes,
       term_pack_files: reduced.packs.length,
       term_pack_bytes: reduced.packBytes,
       posting_block_size: config.postingBlockSize,

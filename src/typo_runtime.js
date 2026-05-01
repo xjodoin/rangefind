@@ -26,16 +26,6 @@ export function typoDeleteKeys(term, options = {}, maxEdits = typoMaxEditsFor(te
   return keys;
 }
 
-export function typoShardFor(deleteKey, manifest, availableShards) {
-  const maxDepth = manifest?.max_shard_depth || manifest?.base_shard_depth || 3;
-  const baseDepth = manifest?.base_shard_depth || 2;
-  for (let depth = maxDepth; depth >= baseDepth; depth--) {
-    const key = String(deleteKey || "").slice(0, depth).padEnd(depth, "_");
-    if (availableShards.has(key)) return key;
-  }
-  return String(deleteKey || "").slice(0, baseDepth).padEnd(baseDepth, "_");
-}
-
 export function parseTypoShard(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, TYPO_SHARD_MAGIC, "Unsupported Rangefind typo shard");

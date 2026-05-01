@@ -72,9 +72,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
 
   await build({ configPath });
   assert.ok(await readFile(join(output, "manifest.json"), "utf8"));
-  assert.ok(await readFile(join(output, "terms", "ranges.bin.gz")));
+  assert.ok(await readFile(join(output, "terms", "directory-root.bin.gz")));
+  assert.ok(await readFile(join(output, "terms", "directory-pages", "0000.bin.gz")));
   assert.ok(await readFile(join(output, "codes.bin.gz")));
   assert.ok(await readFile(join(output, "typo", "manifest.json")));
+  assert.ok(await readFile(join(output, "typo", "directory-root.bin.gz")));
 
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());

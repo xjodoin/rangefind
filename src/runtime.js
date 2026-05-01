@@ -1,14 +1,14 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
-import { decodePostingBlock, decodePostings, parseCodes, parseRangeDirectory, parseShard } from "./codec.js";
-import { groupRanges, shardFor } from "./shards.js";
+import { decodePostingBlock, decodePostings, parseCodes, parseShard } from "./codec.js";
+import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
+import { groupRanges, shardKey } from "./shards.js";
 import {
   boundedDamerauLevenshtein,
   parseTypoShard,
   typoCandidateScore,
   typoCandidatesForDeleteKey,
   typoDeleteKeys,
-  typoMaxEditsFor,
-  typoShardFor
+  typoMaxEditsFor
 } from "./typo_runtime.js";
 
 const RERANK_CANDIDATES = 30;
@@ -53,26 +53,64 @@ function selectedFacetCodes(manifest, field, selected) {
 export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
-  const availableShards = new Set(manifest.shards || []);
+  const termDirectory = createDirectoryState(manifest.directory, "terms");
   const shardCache = new Map();
   const typoShardCache = new Map();
   const docCache = new Map();
-  let rangeDirectory = null;
-  let rangeDirectoryPromise = null;
   let typoManifest = null;
   let typoManifestPromise = null;
-  let typoShardRanges = new Map();
-  let availableTypoShards = new Set();
+  let typoDirectory = null;
   let codes = null;
   let codesPromise = null;
 
-  async function loadRanges() {
-    if (rangeDirectory) return rangeDirectory;
-    if (!rangeDirectoryPromise) {
-      rangeDirectoryPromise = fetchGzipArrayBuffer(new URL("terms/ranges.bin.gz", baseUrl)).then(buffer => parseRangeDirectory(buffer, manifest));
+  function createDirectoryState(meta, fallbackDir) {
+    const directory = meta || {};
+    return {
+      meta: {
+        root: directory.root || `${fallbackDir}/directory-root.bin.gz`,
+        pages: directory.pages || `${fallbackDir}/directory-pages/`
+      },
+      root: null,
+      rootPromise: null,
+      pages: new Map()
+    };
+  }
+
+  function directoryPagePath(state, page) {
+    return `${state.meta.pages.replace(/\/?$/u, "/")}${page.file}`;
+  }
+
+  async function loadDirectoryRoot(state) {
+    if (state.root) return state.root;
+    if (!state.rootPromise) {
+      state.rootPromise = fetchGzipArrayBuffer(new URL(state.meta.root, baseUrl)).then(parseDirectoryRoot);
     }
-    rangeDirectory = await rangeDirectoryPromise;
-    return rangeDirectory;
+    state.root = await state.rootPromise;
+    return state.root;
+  }
+
+  async function loadDirectoryPage(state, page) {
+    if (!state.pages.has(page.file)) {
+      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then(parseDirectoryPage));
+    }
+    return state.pages.get(page.file);
+  }
+
+  async function directoryEntryFromRoot(state, root, shard) {
+    const page = findDirectoryPage(root, shard);
+    if (!page) return null;
+    const entries = await loadDirectoryPage(state, page);
+    const entry = entries.get(shard);
+    return entry ? { shard, entry } : null;
+  }
+
+  async function resolveDirectoryShard(value, state, baseDepth, maxDepth) {
+    const root = await loadDirectoryRoot(state);
+    for (let depth = maxDepth; depth >= baseDepth; depth--) {
+      const resolved = await directoryEntryFromRoot(state, root, shardKey(value, depth));
+      if (resolved) return resolved;
+    }
+    return null;
   }
 
   async function loadCodes() {
@@ -90,32 +128,18 @@ export async function createSearch(options = {}) {
         .catch(() => false);
     }
     typoManifest = await typoManifestPromise;
-    availableTypoShards = new Set(typoManifest?.shards || []);
-    typoShardRanges = new Map();
-    const ranges = typoManifest?.shard_ranges || [];
-    const packs = typoManifest?.packs || [];
-    for (let i = 0; i < (typoManifest?.shards?.length || 0); i++) {
-      const range = ranges[i];
-      const pack = packs[range?.[0]];
-      if (!range || !pack) continue;
-      typoShardRanges.set(typoManifest.shards[i], {
-        pack: pack.file,
-        offset: range[1],
-        length: range[2]
-      });
-    }
+    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory, "typo");
     return typoManifest;
   }
 
   async function loadShards(shards) {
-    const ranges = await loadRanges();
     const wanted = [];
     const pending = [];
-    for (const shard of new Set(shards)) {
-      if (!availableShards.has(shard)) continue;
+    const unique = new Map();
+    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
+    for (const { shard, entry } of unique.values()) {
       wanted.push(shard);
       if (shardCache.has(shard)) continue;
-      const entry = ranges.get(shard);
       if (!entry) continue;
       let resolve;
       let reject;
@@ -157,11 +181,11 @@ export async function createSearch(options = {}) {
 
     const wanted = [];
     const pending = [];
-    for (const shard of new Set(shards)) {
-      if (!availableTypoShards.has(shard)) continue;
+    const unique = new Map();
+    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
+    for (const { shard, entry } of unique.values()) {
       wanted.push(shard);
       if (typoShardCache.has(shard)) continue;
-      const entry = typoShardRanges.get(shard);
       if (!entry) continue;
       let resolve;
       let reject;
@@ -200,18 +224,24 @@ export async function createSearch(options = {}) {
   async function termEntries(terms) {
     const byShard = new Map();
     for (const term of terms) {
-      const shard = shardFor(term, manifest, availableShards);
-      if (!byShard.has(shard)) byShard.set(shard, []);
-      byShard.get(shard).push(term);
+      const resolved = await resolveDirectoryShard(
+        term,
+        termDirectory,
+        manifest.stats?.base_shard_depth || 3,
+        manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
+      );
+      if (!resolved) continue;
+      if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, terms: [] });
+      byShard.get(resolved.shard).terms.push(term);
     }
-    const loaded = await loadShards([...byShard.keys()]);
+    const loaded = await loadShards([...byShard.values()]);
     const out = [];
-    for (const [shard, shardTerms] of byShard) {
+    for (const [shard, bucket] of byShard) {
       const data = loaded.get(shard);
       if (!data) continue;
-      for (const term of shardTerms) {
+      for (const term of bucket.terms) {
         const entry = data.terms.get(term);
-        if (entry) out.push({ term, shard: data, entry });
+        if (entry) out.push({ term, shard: data, shardName: shard, entry });
       }
     }
     return out;
@@ -479,7 +509,7 @@ export async function createSearch(options = {}) {
         postingsAccepted,
         skippedBlocks: cursors.reduce((sum, cursor) => sum + cursor.skippedBlocks, 0),
         terms: terms.length,
-        shards: new Set(entries.map(item => item.shard)).size,
+        shards: new Set(entries.map(item => item.shardName)).size,
         ...reranked.stats
       }
     };
@@ -520,7 +550,7 @@ export async function createSearch(options = {}) {
       stats: {
         exact: true,
         terms: terms.length,
-        shards: new Set(entries.map(item => item.shard)).size,
+        shards: new Set(entries.map(item => item.shardName)).size,
         postings: entries.reduce((sum, item) => sum + item.entry.count, 0),
         blocksDecoded: entries.reduce((sum, item) => sum + (item.entry.blocks?.length || 0), 0),
         postingsDecoded: entries.reduce((sum, item) => sum + item.entry.count, 0),
@@ -546,18 +576,24 @@ export async function createSearch(options = {}) {
     }, maxEdits)];
     const byShard = new Map();
     for (const key of deleteKeys) {
-      const shard = typoShardFor(key, meta, availableTypoShards);
-      if (!byShard.has(shard)) byShard.set(shard, []);
-      byShard.get(shard).push(key);
+      const resolved = await resolveDirectoryShard(
+        key,
+        typoDirectory,
+        meta.base_shard_depth || 2,
+        meta.max_shard_depth || meta.base_shard_depth || 3
+      );
+      if (!resolved) continue;
+      if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, keys: [] });
+      byShard.get(resolved.shard).keys.push(key);
     }
 
     const candidates = new Map();
-    const loaded = await loadTypoShards([...byShard.keys()]);
-    for (const [shard, keys] of byShard) {
+    const loaded = await loadTypoShards([...byShard.values()]);
+    for (const [shard, bucket] of byShard) {
       debug.shards.add(shard);
       const data = loaded.get(shard);
       if (!data) continue;
-      for (const key of keys) {
+      for (const key of bucket.keys) {
         for (const candidate of typoCandidatesForDeleteKey(data, key)) {
           if (candidate.surface === token) continue;
           const candidateKey = `${candidate.surface}\u0001${candidate.term}`;

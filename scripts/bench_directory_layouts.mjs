@@ -5,12 +5,11 @@ import { resolve } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { queryTerms } from "../src/analyzer.js";
 import { pushVarint } from "../src/binary.js";
-import { parseRangeDirectory } from "../src/codec.js";
-import { shardFor } from "../src/shards.js";
+import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "../src/directory.js";
+import { shardKey } from "../src/shards.js";
 import {
   typoDeleteKeys,
-  typoMaxEditsFor,
-  typoShardFor
+  typoMaxEditsFor
 } from "../src/typo_runtime.js";
 
 const DEFAULT_QUERIES = [
@@ -89,21 +88,63 @@ function mb(bytes) {
   return bytes / 1024 / 1024;
 }
 
-function loadTermEntries(indexRoot, manifest) {
-  const rangesPath = resolve(indexRoot, "terms", "ranges.bin.gz");
-  const compressed = readFileSync(rangesPath);
-  const ranges = parseRangeDirectory(gunzipSync(compressed), manifest);
-  return {
-    currentCompressedBytes: compressed.length,
-    entries: manifest.shards.map((shard) => {
-      const entry = ranges.get(shard);
-      return {
+function packNumber(pack) {
+  return Number(String(pack || "0").replace(/\D/gu, "")) || 0;
+}
+
+function loadDirectoryEntries(indexRoot, directory, fallbackDir) {
+  const rootPath = resolve(indexRoot, directory?.root || `${fallbackDir}/directory-root.bin.gz`);
+  const rootCompressed = readFileSync(rootPath);
+  const root = parseDirectoryRoot(gunzipSync(rootCompressed));
+  const pageBytes = new Map();
+  const entries = [];
+  for (const page of root.pages) {
+    const pagePath = resolve(indexRoot, `${(directory?.pages || `${fallbackDir}/directory-pages/`).replace(/\/?$/u, "/")}${page.file}`);
+    const compressed = readFileSync(pagePath);
+    pageBytes.set(page.file, compressed.length);
+    const parsed = parseDirectoryPage(gunzipSync(compressed));
+    for (const [shard, entry] of parsed) {
+      entries.push({
         shard,
-        pack: Number(String(entry.pack || "0").replace(/\D/gu, "")) || 0,
+        pack: packNumber(entry.pack),
         offset: entry.offset,
         length: entry.length
+      });
+    }
+  }
+  return {
+    root,
+    rootBytes: rootCompressed.length,
+    pageBytes,
+    entries: entries.sort((a, b) => a.shard.localeCompare(b.shard))
+  };
+}
+
+function loadTermEntries(indexRoot, manifest) {
+  return loadDirectoryEntries(indexRoot, manifest.directory, "terms");
+}
+
+function currentPagedDirectory(loaded) {
+  const totalPageBytes = [...loaded.pageBytes.values()].reduce((sum, bytes) => sum + bytes, 0);
+  return {
+    name: "current-paged-directory",
+    files: loaded.root.pages.length + 1,
+    rootBytes: loaded.rootBytes,
+    totalBytes: loaded.rootBytes + totalPageBytes,
+    smallFiles: [...loaded.pageBytes.values()].filter(bytes => bytes < 4096).length,
+    p50PageBytes: percentile([...loaded.pageBytes.values()], 0.5),
+    locate(shards) {
+      const files = new Map([["root", loaded.rootBytes]]);
+      for (const shard of shards) {
+        const page = findDirectoryPage(loaded.root, shard);
+        if (page) files.set(`page:${page.file}`, loaded.pageBytes.get(page.file) || 0);
+      }
+      return {
+        requests: files.size,
+        bytes: [...files.values()].reduce((sum, bytes) => sum + bytes, 0),
+        keys: [...files.entries()].map(([key, bytes]) => ({ key, bytes }))
       };
-    })
+    }
   };
 }
 
@@ -111,19 +152,7 @@ function loadTypoEntries(indexRoot) {
   const manifestPath = resolve(indexRoot, "typo", "manifest.json");
   if (!existsSync(manifestPath)) return null;
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  return {
-    manifest,
-    currentManifestBytes: statSync(manifestPath).size,
-    entries: (manifest.shards || []).map((shard, index) => {
-      const range = manifest.shard_ranges[index];
-      return {
-        shard,
-        pack: range?.[0] || 0,
-        offset: range?.[1] || 0,
-        length: range?.[2] || 0
-      };
-    })
-  };
+  return { manifest, manifestBytes: statSync(manifestPath).size, ...loadDirectoryEntries(indexRoot, manifest.directory, "typo") };
 }
 
 function scaledEntries(entries, scale) {
@@ -283,20 +312,36 @@ function summarizeLayout(layout, shardSets) {
   };
 }
 
-function termShardSets(queries, manifest) {
-  const available = new Set(manifest.shards || []);
-  return queries.map(q => new Set(queryTerms(q).map(term => shardFor(term, manifest, available))));
+function resolvedShard(value, depths, available) {
+  for (let depth = depths.max; depth >= depths.base; depth--) {
+    const candidate = shardKey(value, depth);
+    if (available.has(candidate)) return candidate;
+  }
+  return null;
 }
 
-function typoShardSets(tokens, manifest) {
-  const available = new Set(manifest.shards || []);
+function termShardSets(queries, manifest, entries) {
+  const available = new Set(entries.map(entry => entry.shard));
+  const depths = {
+    base: manifest.stats?.base_shard_depth || 3,
+    max: manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
+  };
+  return queries.map(q => new Set(queryTerms(q).map(term => resolvedShard(term, depths, available)).filter(Boolean)));
+}
+
+function typoShardSets(tokens, manifest, entries) {
+  const available = new Set(entries.map(entry => entry.shard));
+  const depths = {
+    base: manifest.base_shard_depth || 2,
+    max: manifest.max_shard_depth || manifest.base_shard_depth || 3
+  };
   return tokens.map((token) => {
     const maxEdits = typoMaxEditsFor(token, { maxEdits: manifest.max_edits || 2 });
     const keys = typoDeleteKeys(token, {
       minTermLength: manifest.min_term_length || 5,
       maxEdits: manifest.max_edits || 2
     }, maxEdits);
-    return new Set([...keys].map(key => typoShardFor(key, manifest, available)));
+    return new Set([...keys].map(key => resolvedShard(key, depths, available)).filter(Boolean));
   });
 }
 
@@ -319,20 +364,7 @@ function benchmark(entries, shardSets, args, current = {}) {
       ...args.pageBytes.map(bytes => paged(scaled, bytes))
     ];
     rowsByScale[scale] = layouts.map(layout => summarizeLayout(layout, shardSets));
-    if (scale === 1 && current.currentCompressedBytes) {
-      rowsByScale[scale].unshift({
-        name: "current-global-tuples",
-        files: 1,
-        rootKB: 0,
-        totalKB: current.currentCompressedBytes / 1024,
-        smallFiles: 0,
-        p50PageKB: 0,
-        coldAvgRequests: 1,
-        coldAvgKB: current.currentCompressedBytes / 1024,
-        sequenceRequests: 1,
-        sequenceKB: current.currentCompressedBytes / 1024
-      });
-    }
+    if (scale === 1 && current.layout) rowsByScale[scale].unshift(summarizeLayout(current.layout, shardSets));
   }
   return rowsByScale;
 }
@@ -341,9 +373,9 @@ const args = parseArgs(process.argv.slice(2));
 const indexRoot = resolve(args.index);
 const manifest = JSON.parse(readFileSync(resolve(indexRoot, "manifest.json"), "utf8"));
 const terms = loadTermEntries(indexRoot, manifest);
-const termSets = termShardSets(args.queries, manifest);
+const termSets = termShardSets(args.queries, manifest, terms.entries);
 const typo = loadTypoEntries(indexRoot);
-const typoSets = typo ? typoShardSets(args.typoTokens, typo.manifest) : [];
+const typoSets = typo ? typoShardSets(args.typoTokens, typo.manifest, typo.entries) : [];
 
 const report = {
   index: indexRoot,
@@ -351,8 +383,8 @@ const report = {
   typoShards: typo?.entries.length || 0,
   queries: args.queries,
   typoTokens: args.typoTokens,
-  terms: benchmark(terms.entries, termSets, args, terms),
-  typo: typo ? benchmark(typo.entries, typoSets, args, { currentCompressedBytes: typo.currentManifestBytes }) : null
+  terms: benchmark(terms.entries, termSets, args, { layout: currentPagedDirectory(terms) }),
+  typo: typo ? benchmark(typo.entries, typoSets, args, { layout: currentPagedDirectory(typo) }) : null
 };
 
 if (args.json) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { groupRanges, partitionEntries, shardFor, shardKey } from "../src/shards.js";
+import { groupRanges, partitionEntries, shardKey } from "../src/shards.js";
 
 test("shardKey pads short terms for stable file names", () => {
   assert.equal(shardKey("ai", 3), "ai_");
@@ -14,11 +14,6 @@ test("partitionEntries recursively splits oversized shards", () => {
   ];
   const partitions = partitionEntries(entries, { baseShardDepth: 1, maxShardDepth: 2, targetShardPostings: 2 });
   assert.deepEqual(partitions.map(item => item.name), ["al", "be"]);
-});
-
-test("shardFor picks the deepest available shard", () => {
-  const manifest = { stats: { base_shard_depth: 2, max_shard_depth: 4 } };
-  assert.equal(shardFor("static", manifest, new Set(["st", "sta", "stat"])), "stat");
 });
 
 test("groupRanges merges nearby ranges by pack", () => {

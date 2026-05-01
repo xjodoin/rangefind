@@ -11,17 +11,21 @@ rangefind/
   docs/
     0000.json
   terms/
-    ranges.bin.gz
+    directory-root.bin.gz
+    directory-pages/
+      0000.bin.gz
     packs/
       0000.bin
       0001.bin
 ```
 
-`manifest.json` is small enough for page initialization. It lists logical shard
-names, schema, dictionaries, and the default results.
+`manifest.json` is small enough for page initialization. It lists schema,
+dictionaries, default results, and pointers to the paged range directories.
 
-`terms/ranges.bin.gz` is loaded lazily on the first real term query. It maps
-logical shard names to `[packIndex, offset, length]` tuples.
+`terms/directory-root.bin.gz` is loaded lazily on the first real term query. It
+contains page bounds and a compact Bloom filter for adaptive shard resolution.
+Only touched `terms/directory-pages/*.bin.gz` files are fetched, and each page
+maps logical shard names to `[packIndex, offset, length]` tuples.
 
 `terms/packs/*.bin` contain many independently compressed logical shards. The
 browser requests exactly the byte span it needs and decompresses that one shard.

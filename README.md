@@ -19,7 +19,8 @@ a large thesis corpus.
 - Phrase signals for title/heading fields.
 - Adaptive logical term shards.
 - Independently compressed logical shards packed into `terms/packs/*.bin`.
-- Lazy binary range directory at `terms/ranges.bin.gz`.
+- Lazy paged binary range directories at `terms/directory-root.bin.gz` and
+  `terms/directory-pages/*.bin.gz`.
 - Browser runtime with coalesced HTTP `Range` fetches.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
   fetches only when an exact first-page query returns no results.

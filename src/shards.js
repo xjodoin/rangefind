@@ -28,16 +28,6 @@ export function partitionEntries(entries, config, depth = config.baseShardDepth)
     .flatMap(([, group]) => partitionEntries(group, config, depth + 1));
 }
 
-export function shardFor(term, manifest, availableShards) {
-  const maxDepth = manifest.stats?.max_shard_depth || 5;
-  const baseDepth = manifest.stats?.base_shard_depth || 3;
-  for (let depth = maxDepth; depth >= baseDepth; depth--) {
-    const key = shardKey(term, depth);
-    if (availableShards.has(key)) return key;
-  }
-  return shardKey(term, baseDepth);
-}
-
 export function groupRanges(items, mergeGapBytes = RANGE_MERGE_GAP_BYTES) {
   const byPack = new Map();
   for (const item of items) {

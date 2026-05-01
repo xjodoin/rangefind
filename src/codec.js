@@ -1,6 +1,5 @@
 import {
   CODE_MAGIC,
-  TERM_RANGE_MAGIC,
   TERM_SHARD_MAGIC,
   fixedWidth,
   pushVarint,
@@ -199,34 +198,6 @@ export function decodePostingBlock(shard, entry, blockIndex) {
   const out = Int32Array.from(rows);
   entry.blockPostings.set(blockIndex, out);
   return out;
-}
-
-export function buildRangeFile(ranges) {
-  const out = [...TERM_RANGE_MAGIC];
-  pushVarint(out, ranges.length);
-  for (const [packIndex, offset, length] of ranges) {
-    pushVarint(out, packIndex);
-    pushVarint(out, offset);
-    pushVarint(out, length);
-  }
-  return Buffer.from(Uint8Array.from(out));
-}
-
-export function parseRangeDirectory(buffer, manifest) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, TERM_RANGE_MAGIC, "Unsupported Rangefind range directory");
-  const state = { pos: TERM_RANGE_MAGIC.length };
-  const count = readVarint(bytes, state);
-  const ranges = new Map();
-  for (let i = 0; i < count && i < manifest.shards.length; i++) {
-    const pack = `${String(readVarint(bytes, state)).padStart(4, "0")}.bin`;
-    ranges.set(manifest.shards[i], {
-      pack,
-      offset: readVarint(bytes, state),
-      length: readVarint(bytes, state)
-    });
-  }
-  return ranges;
 }
 
 export function buildCodesFile(config, total, codes) {
