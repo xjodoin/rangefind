@@ -9,7 +9,7 @@ import {
   typoDeleteKeys,
   typoMaxEditsFor,
   typoShardFor
-} from "./typo.js";
+} from "./typo_runtime.js";
 
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
