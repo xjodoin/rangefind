@@ -124,11 +124,17 @@ npm run check
 npm test
 npm run test:smoke
 npm run test:all
+npm run bench:quality
+npm run bench:performance
 ```
 
 The unit tests cover analyzer normalization, binary varint/fixed-width codecs,
 config resolution, shard/range planning, term/code binary round-trips, and an
 end-to-end build plus browser-runtime query against a local HTTP `Range` server.
+
+The benchmark scripts are dependency-free and run against the example static
+site. `bench:quality` reports known-item and typo-recovery Hit@k/MRR.
+`bench:performance` reports query latency, HTTP request count, and transfer size.
 
 ## Project Direction
 
