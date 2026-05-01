@@ -218,12 +218,24 @@ function mergeTypoWorkerRuns(typoBuffer, workerTypo) {
   }
 }
 
+function sharedCodeTables(codes) {
+  const shared = {};
+  for (const [name, values] of Object.entries(codes || {})) {
+    const buffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * values.length);
+    const view = new Int32Array(buffer);
+    view.set(values);
+    shared[name] = view;
+  }
+  return shared;
+}
+
 async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, filters, workerCount) {
   const shardOutRoot = resolve(dirs.out, "_build", "term-shards");
   mkdirSync(shardOutRoot, { recursive: true });
+  const sharedCodes = sharedCodeTables(runData.codes);
   const workers = Array.from({ length: workerCount }, (_, index) => createReduceWorker({
     config,
-    codes: runData.codes,
+    codes: sharedCodes,
     filters,
     measuredTotal: measured.total,
     runsOut: dirs.runsOut,
