@@ -46,6 +46,8 @@ Useful options:
 - `--body-chars=N`: indexes only the first `N` cleaned article characters.
   Default: `6000`. Use `0` for uncapped article text.
 - `--dump-url=URL_OR_FILE`: reads another dump URL or local dump file.
+- `--force`: regenerates JSONL even when the existing metadata matches the
+  requested dump URL, limit, and body cap.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--reduce-workers=auto`: enables worker-based term reduction.
 

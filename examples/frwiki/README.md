@@ -28,6 +28,8 @@ Useful options:
 - `--limit=N`: stops after `N` indexed articles. Use `0` for the full dump.
 - `--body-chars=N`: indexes the first `N` cleaned characters per article.
   The default is `6000`; use `0` for uncapped article text.
+- `--force`: rebuilds the JSONL even when the existing generated metadata
+  matches the requested dump URL, limit, and body cap.
 - `--reduce-workers=auto`: enables Rangefind's worker reducer path.
 - `--queries=a|b|c`: overrides benchmark queries.
 

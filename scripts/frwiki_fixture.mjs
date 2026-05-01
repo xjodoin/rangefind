@@ -149,10 +149,32 @@ function waitForChild(child, name, allowSignal = false) {
   });
 }
 
+function expectedMeta(args) {
+  return {
+    dumpUrl: args.dumpUrl,
+    limit: args.limit || null,
+    bodyChars: args.bodyChars || null
+  };
+}
+
+function jsonlMatchesRun(args, out, metaPath) {
+  if (!existsSync(out) || !existsSync(metaPath)) return false;
+  try {
+    const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+    const expected = expectedMeta(args);
+    return meta.dumpUrl === expected.dumpUrl
+      && (meta.limit ?? null) === expected.limit
+      && (meta.bodyChars ?? null) === expected.bodyChars;
+  } catch {
+    return false;
+  }
+}
+
 async function writeJsonl(args) {
   const dataDir = resolve(args.root, "data");
   const out = resolve(dataDir, "frwiki.jsonl");
-  if (existsSync(out) && !args.force) return out;
+  const metaPath = resolve(dataDir, "frwiki.meta.json");
+  if (!args.force && jsonlMatchesRun(args, out, metaPath)) return out;
   mkdirSync(dataDir, { recursive: true });
 
   const sourceSpec = sourceCommand(args.dumpUrl);
@@ -181,12 +203,10 @@ async function writeJsonl(args) {
   async function finish() {
     await new Promise(resolveFinish => output.end(resolveFinish));
     await Promise.allSettled([sourceDone, streamDone]);
-    writeFileSync(resolve(dataDir, "frwiki.meta.json"), JSON.stringify({
-      dumpUrl: args.dumpUrl,
+    writeFileSync(metaPath, JSON.stringify({
+      ...expectedMeta(args),
       docs,
       pagesRead: pages,
-      limit: args.limit || null,
-      bodyChars: args.bodyChars || null,
       builtAt: new Date().toISOString()
     }, null, 2));
     return out;
