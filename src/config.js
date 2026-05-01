@@ -1,3 +1,4 @@
+import { availableParallelism } from "node:os";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
@@ -8,6 +9,7 @@ export const DEFAULTS = {
   targetShardPostings: 30000,
   packBytes: 4 * 1024 * 1024,
   directoryPageBytes: 64 * 1024,
+  reduceWorkers: 0,
   postingFlushLines: 100000,
   maxTermsPerDoc: 160,
   maxExpansionTermsPerDoc: 12,
@@ -28,9 +30,11 @@ export async function readConfig(configPath) {
   const full = resolve(configPath);
   const base = configDir(full);
   const raw = JSON.parse(await readFile(full, "utf8"));
+  const autoReduceWorkers = Math.max(1, Math.min(4, availableParallelism() - 1));
   return {
     ...DEFAULTS,
     ...raw,
+    reduceWorkers: Math.max(1, Number(raw.reduceWorkers ?? DEFAULTS.reduceWorkers) || autoReduceWorkers),
     input: resolveFrom(base, raw.input),
     output: resolveFrom(base, raw.output || "public/rangefind"),
     fields: raw.fields || [

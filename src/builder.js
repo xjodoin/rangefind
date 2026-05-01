@@ -1,11 +1,14 @@
 import {
   appendFileSync,
+  readdirSync,
+  readFileSync,
   mkdirSync,
   rmSync,
   unlinkSync,
   writeFileSync
 } from "node:fs";
 import { resolve } from "node:path";
+import { Worker } from "node:worker_threads";
 import { gzipSync } from "node:zlib";
 import { tokenize } from "./analyzer.js";
 import {
@@ -169,26 +172,124 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
   return { terms: byTerm.size, postings, shards: finalShards };
 }
 
-async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
-  const filters = buildBlockFilters(config, measured.dicts);
-  const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
-  const finalShards = new Set();
+function createReduceWorker(workerData) {
+  const worker = new Worker(new URL("./reduce_worker.js", import.meta.url), { workerData });
+  let nextId = 0;
+  const pending = new Map();
+  worker.on("message", (message) => {
+    const item = pending.get(message.id);
+    if (!item) return;
+    pending.delete(message.id);
+    if (message.ok) item.resolve(message.value);
+    else item.reject(new Error(message.error || "Rangefind reduce worker failed"));
+  });
+  worker.on("error", (error) => {
+    for (const item of pending.values()) item.reject(error);
+    pending.clear();
+  });
+  worker.on("exit", (code) => {
+    if (code === 0 || !pending.size) return;
+    const error = new Error(`Rangefind reduce worker exited with code ${code}`);
+    for (const item of pending.values()) item.reject(error);
+    pending.clear();
+  });
+  return {
+    call(message) {
+      const id = nextId++;
+      return new Promise((resolveCall, rejectCall) => {
+        pending.set(id, { resolve: resolveCall, reject: rejectCall });
+        worker.postMessage({ ...message, id });
+      });
+    },
+    terminate() {
+      return worker.terminate();
+    }
+  };
+}
+
+function mergeTypoWorkerRuns(typoBuffer, workerTypo) {
+  if (!typoBuffer || !workerTypo) return;
+  typoBuffer.terms += workerTypo.terms || 0;
+  typoBuffer.deletePairs += workerTypo.deletePairs || 0;
+  for (const shard of workerTypo.shards || []) typoBuffer.shards.add(shard);
+  for (const file of readdirSync(workerTypo.runsOut)) {
+    if (!file.endsWith(".run")) continue;
+    appendFileSync(resolve(typoBuffer.runsOut, file), readFileSync(resolve(workerTypo.runsOut, file)));
+  }
+}
+
+async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, filters, workerCount) {
+  const shardOutRoot = resolve(dirs.out, "_build", "term-shards");
+  mkdirSync(shardOutRoot, { recursive: true });
+  const workers = Array.from({ length: workerCount }, (_, index) => createReduceWorker({
+    config,
+    codes: runData.codes,
+    filters,
+    measuredTotal: measured.total,
+    runsOut: dirs.runsOut,
+    shardOut: resolve(shardOutRoot, `worker-${index}`),
+    typoOptions: typoBuffer?.options || { enabled: false },
+    typoRunsOut: resolve(dirs.out, "_build", "typo-index-runs", `worker-${index}`)
+  }));
+
+  const taskResults = [];
+  let nextTask = 0;
   let termCount = 0;
   let postingCount = 0;
-  for (let i = 0; i < runData.baseShards.length; i++) {
-    const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter, typoBuffer);
-    termCount += stats.terms;
-    postingCount += stats.postings;
-    for (const shard of stats.shards) finalShards.add(shard);
+  try {
+    await Promise.all(workers.map(async (worker) => {
+      while (nextTask < runData.baseShards.length) {
+        const order = nextTask++;
+        const stats = await worker.call({ type: "reduce", baseShard: runData.baseShards[order] });
+        termCount += stats.terms;
+        postingCount += stats.postings;
+        taskResults.push({ order, ...stats });
+      }
+    }));
+    const finishes = await Promise.all(workers.map(worker => worker.call({ type: "finish" })));
+    for (const item of finishes) mergeTypoWorkerRuns(typoBuffer, item.typo);
+  } finally {
+    await Promise.allSettled(workers.map(worker => worker.terminate()));
   }
-  const shards = [...finalShards].sort();
-  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+
+  const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
+  const finalShards = new Set();
+  for (const result of taskResults.sort((a, b) => a.order - b.order)) {
+    for (const item of result.shards.sort((a, b) => a.sequence - b.sequence)) {
+      writePackedShard(packWriter, item.shard, readFileSync(item.path));
+      finalShards.add(item.shard);
+    }
+  }
+  return { finalShards, packWriter, termCount, postingCount };
+}
+
+async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
+  const filters = buildBlockFilters(config, measured.dicts);
+  const workerCount = Math.min(runData.baseShards.length, Math.max(1, config.reduceWorkers || 1));
+  let reduced;
+  if (workerCount > 1) {
+    reduced = await reduceRunsParallel(config, measured, runData, dirs, typoBuffer, filters, workerCount);
+  } else {
+    const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
+    const finalShards = new Set();
+    let termCount = 0;
+    let postingCount = 0;
+    for (let i = 0; i < runData.baseShards.length; i++) {
+      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter, typoBuffer);
+      termCount += stats.terms;
+      postingCount += stats.postings;
+      for (const shard of stats.shards) finalShards.add(shard);
+    }
+    reduced = { finalShards, packWriter, termCount, postingCount };
+  }
+  const shards = [...reduced.finalShards].sort();
+  const packIndexes = new Map(reduced.packWriter.packs.map((pack, index) => [pack.file, index]));
   const entries = shards.map((shard) => {
-    const entry = packWriter.entries[shard];
+    const entry = reduced.packWriter.entries[shard];
     return { shard, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length };
   });
   const directory = writeDirectoryFiles(resolve(dirs.out, "terms"), entries, config.directoryPageBytes, "terms");
-  return { filters, shards, directory, packs: packWriter.packs, termCount, postingCount, packBytes: packWriter.bytes };
+  return { filters, shards, directory, packs: reduced.packWriter.packs, termCount: reduced.termCount, postingCount: reduced.postingCount, packBytes: reduced.packWriter.bytes, reduceWorkers: workerCount };
 }
 
 export async function build({ configPath }) {
@@ -241,6 +342,7 @@ export async function build({ configPath }) {
       term_directory_bytes: reduced.directory.total_bytes,
       term_pack_files: reduced.packs.length,
       term_pack_bytes: reduced.packBytes,
+      reduce_workers: reduced.reduceWorkers,
       posting_block_size: config.postingBlockSize,
       base_shard_depth: config.baseShardDepth,
       max_shard_depth: config.maxShardDepth,

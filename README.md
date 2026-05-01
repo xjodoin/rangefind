@@ -22,6 +22,7 @@ a large thesis corpus.
 - Single ESM browser runtime bundle at `dist/runtime.browser.js`.
 - Lazy paged binary range directories at `terms/directory-root.bin.gz` and
   `terms/directory-pages/*.bin.gz`.
+- Parallel build-time shard reduction with deterministic final pack assembly.
 - Browser runtime with coalesced HTTP `Range` fetches.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
   fetches only when an exact first-page query returns no results.
