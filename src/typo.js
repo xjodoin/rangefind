@@ -1,11 +1,11 @@
-import { appendFileSync, createReadStream, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { gzipSync } from "node:zlib";
 import { surfaceStemPairs } from "./analyzer.js";
 import { TYPO_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
+import { encodeRunRecord, readRunRecords } from "./runs.js";
 
 const SEPARATOR = "\u0001";
 
@@ -77,9 +77,9 @@ export function createTypoRunBuffer(runsOut, options) {
 
 export function flushTypoBuffer(buffer) {
   if (!buffer) return;
-  for (const [shard, lines] of buffer.byShard) {
-    if (!lines.length) continue;
-    appendFileSync(resolve(buffer.runsOut, `${shard}.tsv`), lines.join(""));
+  for (const [shard, records] of buffer.byShard) {
+    if (!records.length) continue;
+    appendFileSync(resolve(buffer.runsOut, `${shard}.run`), Buffer.concat(records));
   }
   buffer.byShard.clear();
   buffer.lines = 0;
@@ -88,7 +88,7 @@ export function flushTypoBuffer(buffer) {
 function bufferTypoCandidate(buffer, deleteKey, text, df) {
   const shard = typoShardKey(deleteKey, buffer.options);
   if (!buffer.byShard.has(shard)) buffer.byShard.set(shard, []);
-  buffer.byShard.get(shard).push(`${deleteKey}\t${text}\t${df}\n`);
+  buffer.byShard.get(shard).push(encodeRunRecord(["string", "string", "number"], [deleteKey, text, df]));
   buffer.shards.add(shard);
   buffer.lines++;
   buffer.deletePairs++;
@@ -243,16 +243,13 @@ function partitionTypoEntries(entries, options, depth = options.baseShardDepth) 
 }
 
 async function reduceTypoShard(baseShard, buffer, packWriter) {
-  const path = resolve(buffer.runsOut, `${baseShard}.tsv`);
+  const path = resolve(buffer.runsOut, `${baseShard}.run`);
   const byDelete = new Map();
-  const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line) continue;
-    const [deleteKey, text, dfRaw] = line.split("\t");
+  for await (const [deleteKey, text, df] of readRunRecords(path, ["string", "string", "number"])) {
     if (!deleteKey || !text) continue;
     if (!byDelete.has(deleteKey)) byDelete.set(deleteKey, new Map());
     const candidates = byDelete.get(deleteKey);
-    candidates.set(text, (candidates.get(text) || 0) + (Number(dfRaw) || 0));
+    candidates.set(text, (candidates.get(text) || 0) + df);
   }
 
   const partitions = partitionTypoEntries([...byDelete.entries()].sort((a, b) => a[0].localeCompare(b[0])), buffer.options);

@@ -1,13 +1,11 @@
 import {
   appendFileSync,
-  createReadStream,
   mkdirSync,
   rmSync,
   unlinkSync,
   writeFileSync
 } from "node:fs";
 import { resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { gzipSync } from "node:zlib";
 import { tokenize } from "./analyzer.js";
 import {
@@ -19,6 +17,7 @@ import {
 import { getPath, readConfig } from "./config.js";
 import { eachJsonLine } from "./jsonl.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
+import { encodeRunRecord, readRunRecords } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
 import { baseShardFor, partitionEntries } from "./shards.js";
 import {
@@ -67,15 +66,15 @@ async function measure(config) {
 function bufferPosting(buffer, config, term, doc, score) {
   const shard = baseShardFor(term, config);
   if (!buffer.byShard.has(shard)) buffer.byShard.set(shard, []);
-  buffer.byShard.get(shard).push(`${term}\t${doc}\t${Math.max(1, Math.round(score * 1000))}\n`);
+  buffer.byShard.get(shard).push(encodeRunRecord(["string", "number", "number"], [term, doc, Math.max(1, Math.round(score * 1000))]));
   buffer.lines++;
   if (buffer.lines >= config.postingFlushLines) flushPostingBuffer(buffer);
 }
 
 function flushPostingBuffer(buffer) {
-  for (const [shard, lines] of buffer.byShard) {
-    appendFileSync(resolve(buffer.runsOut, `${shard}.tsv`), lines.join(""));
-    lines.length = 0;
+  for (const [shard, records] of buffer.byShard) {
+    appendFileSync(resolve(buffer.runsOut, `${shard}.run`), Buffer.concat(records));
+    records.length = 0;
   }
   buffer.byShard.clear();
   buffer.lines = 0;
@@ -144,17 +143,13 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 }
 
 async function reduceShard(baseShard, config, measured, runData, filters, packWriter, typoBuffer) {
-  const path = resolve(runData.runsOut, `${baseShard}.tsv`);
+  const path = resolve(runData.runsOut, `${baseShard}.run`);
   const byTerm = new Map();
-  const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line) continue;
-    const [term, docRaw, scoreRaw] = line.split("\t");
+  for await (const [term, doc, score] of readRunRecords(path, ["string", "number", "number"])) {
     if (!term) continue;
     if (!byTerm.has(term)) byTerm.set(term, new Map());
     const rows = byTerm.get(term);
-    const doc = Number(docRaw);
-    rows.set(doc, (rows.get(doc) || 0) + Number(scoreRaw));
+    rows.set(doc, (rows.get(doc) || 0) + score);
   }
 
   const entries = [...byTerm.entries()].map(([term, rows]) => [term, [...rows.entries()]]);

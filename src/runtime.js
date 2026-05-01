@@ -1,5 +1,5 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
-import { decodePostings, parseCodes, parseRangeDirectory, parseShard } from "./codec.js";
+import { decodePostingBlock, decodePostings, parseCodes, parseRangeDirectory, parseShard } from "./codec.js";
 import { groupRanges, shardFor } from "./shards.js";
 import {
   boundedDamerauLevenshtein,
@@ -13,6 +13,7 @@ import {
 
 const RERANK_CANDIDATES = 30;
 const DEPENDENCY_SCORE_SCALE = 0.12;
+const SKIP_MAX_TERMS = 30;
 
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
@@ -306,7 +307,185 @@ export async function createSearch(options = {}) {
     return true;
   }
 
-  async function runExactSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
+  function blockFacetMatches(summary, selected) {
+    if (!selected?.size) return true;
+    const words = summary?.words || [];
+    for (const value of selected) {
+      const word = Math.floor(value / 32);
+      const bit = value % 32;
+      if (words[word] & (2 ** bit)) return true;
+    }
+    return false;
+  }
+
+  function makeBlockFilterPlan(filters) {
+    const facets = Object.entries(filters.facets || {})
+      .map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))])
+      .filter(([, selected]) => selected?.size);
+    const numbers = Object.entries(filters.numbers || {})
+      .filter(([, range]) => range?.min != null || range?.max != null);
+    return { facets, numbers, active: facets.length > 0 || numbers.length > 0 };
+  }
+
+  function blockMayPass(block, filterPlan) {
+    if (!filterPlan?.active) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      if (!blockFacetMatches(block.filters?.[field], selected)) return false;
+    }
+    for (const [field, range] of filterPlan.numbers) {
+      const summary = block.filters?.[field];
+      if (!summary || !summary.max) return false;
+      if (range.min != null && summary.max < range.min) return false;
+      if (range.max != null && summary.min > range.max) return false;
+    }
+    return true;
+  }
+
+  function minShouldMatchFor(baseTerms) {
+    return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+  }
+
+  function collectEligibleScores(scores, hits, minShouldMatch) {
+    return [...scores.entries()]
+      .filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch))
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  }
+
+  function bitIsSet(mask, bit) {
+    return (mask & (2 ** bit)) !== 0;
+  }
+
+  function advanceCursor(cursor, filterPlan) {
+    while (cursor.blockIndex < cursor.entry.blocks.length && !blockMayPass(cursor.entry.blocks[cursor.blockIndex], filterPlan)) {
+      cursor.skippedBlocks++;
+      cursor.blockIndex++;
+    }
+    return cursor.blockIndex < cursor.entry.blocks.length;
+  }
+
+  function remainingPotential(cursors, mask = 0, filterPlan = null) {
+    let potential = 0;
+    for (const cursor of cursors) {
+      if (!advanceCursor(cursor, filterPlan) || bitIsSet(mask, cursor.termIndex)) continue;
+      potential += cursor.entry.blocks[cursor.blockIndex].maxImpact;
+    }
+    return potential;
+  }
+
+  function stableTopK(scores, hits, masks, cursors, minShouldMatch, k, filterPlan) {
+    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
+    if (eligible.length < k) return null;
+
+    const top = eligible.slice(0, k);
+    const topDocs = new Set(top.map(([doc]) => doc));
+    const threshold = top[top.length - 1][1];
+    let maxOutsidePotential = remainingPotential(cursors, 0, filterPlan);
+
+    for (const [doc, score] of scores) {
+      if (topDocs.has(doc)) continue;
+      const potential = score + remainingPotential(cursors, masks.get(doc) || 0, filterPlan);
+      if (potential > maxOutsidePotential) maxOutsidePotential = potential;
+      if (maxOutsidePotential >= threshold) return null;
+    }
+
+    return top;
+  }
+
+  function applyBlockRows(cursor, rows, codeData, filters, scores, hits, masks) {
+    let accepted = 0;
+    const bit = cursor.termIndex < SKIP_MAX_TERMS ? 2 ** cursor.termIndex : 0;
+    for (let i = 0; i < rows.length; i += 2) {
+      const doc = rows[i];
+      if (codeData && !passesFilters(doc, codeData, filters)) continue;
+      scores.set(doc, (scores.get(doc) || 0) + rows[i + 1]);
+      if (bit) masks.set(doc, (masks.get(doc) || 0) | bit);
+      if (cursor.isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
+      accepted++;
+    }
+    return accepted;
+  }
+
+  async function runSkippedSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const candidateK = rerank === false ? k : Math.max(RERANK_CANDIDATES, k);
+    if (baseTerms.length < 2 || terms.length > SKIP_MAX_TERMS || k > 100) {
+      return runFullSearch({ q, page, size, filters, baseTerms, terms, rerank });
+    }
+
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
+    const filterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
+    const codeData = hasFilters ? await loadCodes() : null;
+    const entries = await termEntries(terms);
+    const baseSet = new Set(baseTerms);
+    const cursors = entries.map((item, termIndex) => ({
+      ...item,
+      termIndex,
+      isBase: baseSet.has(item.term),
+      blockIndex: 0,
+      skippedBlocks: 0
+    }));
+    if (!cursors.length) {
+      return { total: 0, page, size, results: [], approximate: false, stats: { exact: true, blocksDecoded: 0, postingsDecoded: 0, postingsAccepted: 0, skippedBlocks: 0, terms: terms.length, shards: 0 } };
+    }
+
+    const scores = new Map();
+    const hits = new Map();
+    const masks = new Map();
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    let blocksDecoded = 0;
+    let postingsDecoded = 0;
+    let postingsAccepted = 0;
+    let stable = null;
+    let exhausted = false;
+
+    while (true) {
+      const active = cursors.filter(cursor => advanceCursor(cursor, filterPlan));
+      if (!active.length) {
+        exhausted = true;
+        break;
+      }
+
+      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, filterPlan);
+      if (stable) break;
+
+      active.sort((a, b) => b.entry.blocks[b.blockIndex].maxImpact - a.entry.blocks[a.blockIndex].maxImpact);
+      const cursor = active[0];
+      const rows = decodePostingBlock(cursor.shard, cursor.entry, cursor.blockIndex);
+      cursor.blockIndex++;
+      blocksDecoded++;
+      postingsDecoded += rows.length / 2;
+      postingsAccepted += applyBlockRows(cursor, rows, codeData, filters, scores, hits, masks);
+    }
+
+    let ranked = exhausted
+      ? collectEligibleScores(scores, hits, minShouldMatch)
+      : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, k);
+    const reranked = rerank === false
+      ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
+      : await rerankWithDependencies(ranked, baseTerms, candidateK);
+    ranked = reranked.ranked;
+    const rows = ranked.slice(offset, offset + size);
+    return {
+      total: exhausted ? ranked.length : Math.max(ranked.length, k),
+      page,
+      size,
+      approximate: !exhausted,
+      results: await Promise.all(rows.map(async ([index, score]) => ({ ...(await loadDoc(index)), score }))),
+      stats: {
+        exact: exhausted,
+        blocksDecoded,
+        postingsDecoded,
+        postingsAccepted,
+        skippedBlocks: cursors.reduce((sum, cursor) => sum + cursor.skippedBlocks, 0),
+        terms: terms.length,
+        shards: new Set(entries.map(item => item.shard)).size,
+        ...reranked.stats
+      }
+    };
+  }
+
+  async function runFullSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
     const entries = await termEntries(terms);
@@ -326,10 +505,7 @@ export async function createSearch(options = {}) {
       }
     }
 
-    const minShouldMatch = baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
-    let ranked = [...scores.entries()]
-      .filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch))
-      .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    let ranked = collectEligibleScores(scores, hits, minShouldMatchFor(baseTerms));
     const reranked = rerank === false
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, Math.max(RERANK_CANDIDATES, offset + size));
@@ -340,7 +516,18 @@ export async function createSearch(options = {}) {
       page,
       size,
       results: await Promise.all(rows.map(async ([index, score]) => ({ ...(await loadDoc(index)), score }))),
-      stats: { exact: true, terms: terms.length, shards: new Set(entries.map(item => item.shard)).size, postings: entries.reduce((sum, item) => sum + item.entry.count, 0), ...reranked.stats }
+      approximate: false,
+      stats: {
+        exact: true,
+        terms: terms.length,
+        shards: new Set(entries.map(item => item.shard)).size,
+        postings: entries.reduce((sum, item) => sum + item.entry.count, 0),
+        blocksDecoded: entries.reduce((sum, item) => sum + (item.entry.blocks?.length || 0), 0),
+        postingsDecoded: entries.reduce((sum, item) => sum + item.entry.count, 0),
+        postingsAccepted: ranked.length,
+        skippedBlocks: 0,
+        ...reranked.stats
+      }
     };
   }
 
@@ -444,7 +631,7 @@ export async function createSearch(options = {}) {
 
     let best = null;
     for (const plan of correction.plans) {
-      const corrected = await runExactSearch({
+      const corrected = await runSkippedSearch({
         ...params,
         q: plan.q,
         baseTerms: plan.baseTerms,
@@ -488,7 +675,8 @@ export async function createSearch(options = {}) {
 
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map(item => item.term);
-    const response = await runExactSearch({ q, page, size, filters, baseTerms, terms: queryTerms(q), rerank: params.rerank });
+    const searchFn = params.exact ? runFullSearch : runSkippedSearch;
+    const response = await searchFn({ q, page, size, filters, baseTerms, terms: queryTerms(q), rerank: params.rerank });
     return maybeTypoFallback({ q, page, size, filters, rerank: params.rerank }, response, baseTerms, analyzedTerms);
   }
 

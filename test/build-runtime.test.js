@@ -84,6 +84,13 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(results.results[0].title, "Static range search");
   assert.ok(results.stats.shards > 0);
 
+  const exactResults = await search.search({ q: "static range search", size: 3, exact: true });
+  assert.deepEqual(
+    results.results.map(result => result.title),
+    exactResults.results.map(result => result.title)
+  );
+  assert.ok(results.stats.blocksDecoded <= exactResults.stats.blocksDecoded);
+
   const typo = await search.search({ q: "statik range search", size: 3 });
   assert.equal(typo.results[0].title, "Static range search");
   assert.equal(typo.correctedQuery, "static range search");

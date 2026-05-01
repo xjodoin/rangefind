@@ -184,6 +184,23 @@ export function decodePostings(shard, entry) {
   return out;
 }
 
+export function decodePostingBlock(shard, entry, blockIndex) {
+  const block = entry.blocks?.[blockIndex];
+  if (!block) return new Int32Array(0);
+  if (!entry.blockPostings) entry.blockPostings = new Map();
+  if (entry.blockPostings.has(blockIndex)) return entry.blockPostings.get(blockIndex);
+  const next = entry.blocks[blockIndex + 1];
+  const end = shard.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
+  const state = { pos: shard.dataStart + entry.offset + block.offset };
+  const rows = [];
+  while (state.pos < end) {
+    rows.push(readVarint(shard.bytes, state), readVarint(shard.bytes, state));
+  }
+  const out = Int32Array.from(rows);
+  entry.blockPostings.set(blockIndex, out);
+  return out;
+}
+
 export function buildRangeFile(ranges) {
   const out = [...TERM_RANGE_MAGIC];
   pushVarint(out, ranges.length);
