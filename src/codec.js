@@ -1,5 +1,7 @@
 import {
   CODE_MAGIC,
+  DOC_VALUE_MAGIC,
+  FACET_DICT_MAGIC,
   TERM_SHARD_MAGIC,
   fixedWidth,
   pushVarint,
@@ -15,6 +17,9 @@ const CODE_KIND = { facet: 1, number: 2, boolean: 3 };
 const CODE_TYPE = { keyword: 1, int: 2, long: 3, float: 4, double: 5, date: 6, boolean: 7 };
 const CODE_KIND_NAME = Object.fromEntries(Object.entries(CODE_KIND).map(([key, value]) => [value, key]));
 const CODE_TYPE_NAME = Object.fromEntries(Object.entries(CODE_TYPE).map(([key, value]) => [value, key]));
+const DOC_VALUE_FORMAT_VERSION = 1;
+const FACET_DICT_FORMAT_VERSION = 1;
+const MAX_SUMMARY_FACET_WORDS = 64;
 
 export function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
@@ -52,12 +57,13 @@ function normalizedNumberType(field) {
 }
 
 export function buildBlockFilters(config, dicts) {
+  const maxFacetWords = Math.max(0, Number(config.blockFilterMaxFacetWords ?? MAX_SUMMARY_FACET_WORDS));
   return [
     ...config.facets.map(facet => ({
       name: facet.name,
       kind: "facet",
       words: Math.max(1, Math.ceil((dicts[facet.name]?.values?.length || 1) / 32))
-    })),
+    })).filter(filter => filter.words <= maxFacetWords),
     ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number) })),
     ...(config.booleans || []).map(boolean => ({ name: boolean.name, kind: "boolean", type: "boolean" }))
   ];
@@ -401,6 +407,131 @@ function encodeIntegerField(total, values) {
   return { chunk, width, min };
 }
 
+function fieldDescriptors(config, codes = {}) {
+  return [
+    ...config.facets.map(facet => ({
+      name: facet.name,
+      kind: "facet",
+      type: "keyword",
+      words: Math.max(1, Math.ceil(((codes._dicts?.[facet.name]?.values?.length) || 1) / 32))
+    })),
+    ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number), words: 0 })),
+    ...(config.booleans || []).map(boolean => ({ name: boolean.name, kind: "boolean", type: "boolean", words: 0 }))
+  ];
+}
+
+function summarizeFacetRows(rows, words) {
+  const summary = new Array(words).fill(0);
+  for (const value of rows) {
+    const row = facetWords(value, words);
+    for (let word = 0; word < words; word++) summary[word] |= row[word] || 0;
+  }
+  return words <= MAX_SUMMARY_FACET_WORDS ? { words: summary } : { words: null };
+}
+
+function summarizeNumericRows(rows) {
+  const values = rows.filter(value => Number.isFinite(value));
+  return values.length ? { min: Math.min(...values), max: Math.max(...values) } : { min: null, max: null };
+}
+
+function summarizeBooleanRows(rows) {
+  const values = rows
+    .map(value => normalizeBooleanValue(value))
+    .filter(value => value != null)
+    .map(value => value ? 2 : 1);
+  return values.length ? { min: Math.min(...values), max: Math.max(...values) } : { min: null, max: null };
+}
+
+function encodeDocValueRows(field, rows) {
+  if (field.kind === "facet") {
+    const chunk = Buffer.alloc(rows.length * field.words * 4);
+    for (let doc = 0; doc < rows.length; doc++) {
+      const words = facetWords(rows[doc], field.words);
+      for (let word = 0; word < field.words; word++) writeFixedInt(chunk, (doc * field.words + word) * 4, 4, words[word] || 0);
+    }
+    return { chunk, width: 4, min: 0, summary: summarizeFacetRows(rows, field.words) };
+  }
+  if (field.kind === "boolean") {
+    const chunk = Buffer.alloc(rows.length);
+    for (let doc = 0; doc < rows.length; doc++) {
+      const value = normalizeBooleanValue(rows[doc]);
+      chunk[doc] = value == null ? 0 : value ? 2 : 1;
+    }
+    return { chunk, width: 1, min: 0, summary: summarizeBooleanRows(rows) };
+  }
+  if (field.type === "float" || field.type === "double") {
+    return { chunk: writeFloat64Array(rows.length, rows), width: 8, min: 0, summary: summarizeNumericRows(rows.map(Number)) };
+  }
+  const encoded = encodeIntegerField(rows.length, rows);
+  return { ...encoded, summary: summarizeNumericRows(rows.map(Number)) };
+}
+
+export function docValueFields(config, codes = {}) {
+  return fieldDescriptors(config, codes).map(field => ({ ...field }));
+}
+
+export function buildDocValueChunk(field, start, rows) {
+  const encoded = encodeDocValueRows(field, rows);
+  const header = [...DOC_VALUE_MAGIC];
+  pushVarint(header, DOC_VALUE_FORMAT_VERSION);
+  pushUtf8(header, field.name);
+  header.push(CODE_KIND[field.kind]);
+  header.push(CODE_TYPE[field.type] || CODE_TYPE.int);
+  header.push(encoded.width);
+  pushVarint(header, field.words || 0);
+  pushVarint(header, start);
+  pushVarint(header, rows.length);
+  pushFloat64(header, encoded.min || 0);
+  return {
+    buffer: Buffer.concat([Buffer.from(Uint8Array.from(header)), encoded.chunk]),
+    width: encoded.width,
+    min: encoded.min || 0,
+    summary: encoded.summary
+  };
+}
+
+export function parseDocValueChunk(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, DOC_VALUE_MAGIC, "Unsupported Rangefind doc-value chunk");
+  const state = { pos: DOC_VALUE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== DOC_VALUE_FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value chunk version ${version}`);
+  const field = {
+    name: readUtf8(bytes, state),
+    kind: CODE_KIND_NAME[bytes[state.pos++]] || "number",
+    type: CODE_TYPE_NAME[bytes[state.pos++]] || "int",
+    width: bytes[state.pos++],
+    words: readVarint(bytes, state),
+    start: readVarint(bytes, state),
+    count: readVarint(bytes, state),
+    min: readFloat64(bytes, state)
+  };
+  const values = new Array(field.count);
+  if (field.kind === "facet") {
+    for (let doc = 0; doc < field.count; doc++) {
+      const words = new Array(field.words);
+      for (let word = 0; word < field.words; word++) words[word] = readFixedInt(bytes, state.pos + (doc * field.words + word) * field.width, field.width);
+      values[doc] = words;
+    }
+  } else if (field.kind === "boolean") {
+    for (let doc = 0; doc < field.count; doc++) {
+      const value = bytes[state.pos + doc];
+      values[doc] = value === 0 ? null : value === 2;
+    }
+  } else if (field.type === "float" || field.type === "double") {
+    for (let doc = 0; doc < field.count; doc++) {
+      const value = new DataView(bytes.buffer, bytes.byteOffset + state.pos + doc * 8, 8).getFloat64(0, true);
+      values[doc] = Number.isNaN(value) ? null : value;
+    }
+  } else {
+    for (let doc = 0; doc < field.count; doc++) {
+      const encoded = readFixedInt(bytes, state.pos + doc * field.width, field.width);
+      values[doc] = encoded ? field.min + encoded - 1 : null;
+    }
+  }
+  return { ...field, values };
+}
+
 function normalizeBooleanValue(value) {
   if (value === true || value === 1 || value === "true" || value === "1") return true;
   if (value === false || value === 0 || value === "false" || value === "0") return false;
@@ -408,11 +539,7 @@ function normalizeBooleanValue(value) {
 }
 
 export function buildCodesFile(config, total, codes) {
-  const fields = [
-    ...config.facets.map(facet => ({ name: facet.name, kind: "facet", type: "keyword", words: Math.max(1, Math.ceil(((codes._dicts?.[facet.name]?.values?.length) || 1) / 32)) })),
-    ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number), words: 0 })),
-    ...(config.booleans || []).map(boolean => ({ name: boolean.name, kind: "boolean", type: "boolean", words: 0 }))
-  ];
+  const fields = fieldDescriptors(config, codes);
   const descriptors = [];
   const chunks = [];
 
@@ -529,4 +656,34 @@ export function parseCodes(buffer) {
   }
   Object.defineProperty(out, "_meta", { value: { version, total, fields }, enumerable: false });
   return out;
+}
+
+export function buildFacetDictionary(values) {
+  const out = [...FACET_DICT_MAGIC];
+  pushVarint(out, FACET_DICT_FORMAT_VERSION);
+  pushVarint(out, values.length);
+  for (const item of values) {
+    pushUtf8(out, item.value);
+    pushUtf8(out, item.label);
+    pushVarint(out, item.n || 0);
+  }
+  return Buffer.from(Uint8Array.from(out));
+}
+
+export function parseFacetDictionary(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, FACET_DICT_MAGIC, "Unsupported Rangefind facet dictionary");
+  const state = { pos: FACET_DICT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FACET_DICT_FORMAT_VERSION) throw new Error(`Unsupported Rangefind facet dictionary version ${version}`);
+  const count = readVarint(bytes, state);
+  const values = new Array(count);
+  for (let i = 0; i < count; i++) {
+    values[i] = {
+      value: readUtf8(bytes, state),
+      label: readUtf8(bytes, state),
+      n: readVarint(bytes, state)
+    };
+  }
+  return values;
 }

@@ -17,7 +17,15 @@ source modules remain the development and Node test surface.
 ```text
 rangefind/
   manifest.json
-  codes.bin.gz
+  doc-values/
+    packs/
+      0000.bin
+  facets/
+    directory-root.bin.gz
+    directory-pages/
+      0000.bin.gz
+    packs/
+      0000.bin
   docs/
     directory-root.bin.gz
     directory-pages/
@@ -36,12 +44,22 @@ rangefind/
 ```
 
 `manifest.json` is small enough for page initialization. It lists schema,
-dictionaries, default results, and pointers to the paged range directories.
+default results, compact facet counts, and pointers to the paged range
+directories. Full facet dictionaries use the same range-pack layout as terms and
+documents, so high-cardinality metadata does not inflate cold start.
 
-`codes.bin.gz` stores doc-values used by filters and sorting. Keyword facets are
-encoded as per-document bitsets, so a facet can be single-value or multi-value.
-Numeric and date fields are encoded as typed range/sort values, and booleans use
-a compact tristate representation for missing, false, and true.
+`facets/packs/*.bin` store independently compressed binary facet dictionaries
+addressed through `facets/directory-root.bin.gz` and
+`facets/directory-pages/*.bin.gz`. The runtime lazy-loads a dictionary only when
+that facet is selected or an application asks for its values.
+
+`doc-values/packs/*.bin` store range-addressed column chunks used by filters and
+sorting. Keyword facets are encoded as per-document bitsets, so a facet can be
+single-value or multi-value. Numeric and date fields are encoded as typed
+range/sort values, and booleans use a compact tristate representation for
+missing, false, and true. The manifest carries per-chunk summaries, so broad
+filter and sort queries can fetch only the involved columns and skip chunks that
+cannot match instead of downloading one global code table.
 
 `terms/directory-root.bin.gz` is loaded lazily on the first real term query. It
 contains page bounds and a compact Bloom filter for adaptive shard resolution.
@@ -78,16 +96,17 @@ then applies BM25F-style saturation before writing impact scores. Phrase terms
 can be emitted for fields such as titles.
 
 Each posting list is stored in impact order and split into blocks with max-impact
-metadata. The runtime uses those block maxima for multi-term top-k queries: it
-decodes the highest-potential blocks first and can stop once no remaining block
-can change the requested top results. Single-token queries use the direct
-posting decode path, which is faster when there is no cross-term pruning
-opportunity.
+metadata. The runtime uses those block maxima for single-term and multi-term
+top-k queries: it decodes the highest-potential blocks first and can stop once
+no remaining block can change the requested top results.
 
 For high-df terms, decoded blocks are fetched from `terms/block-packs/*.bin`
 only when the block-max scheduler chooses them. The runtime prefetches a small
 adjacent block window, so medium lists behave like range-addressed superblocks
 while very large lists can still avoid downloading their full posting payload.
+Very high-cardinality facets are omitted from posting-block summaries by
+default; exact per-document filtering still uses doc-value chunks, while block
+filters keep only compact summaries that are worth shipping on every term block.
 
 ## Why Custom Binary
 

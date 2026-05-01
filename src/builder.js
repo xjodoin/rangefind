@@ -13,8 +13,10 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import { tokenize } from "./analyzer.js";
 import {
   buildBlockFilters,
-  buildCodesFile,
+  buildDocValueChunk,
+  buildFacetDictionary,
   buildTermShard,
+  docValueFields,
   rewriteTermShardForExternalBlocks
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
@@ -190,6 +192,80 @@ function finishDocPacks(out, packWriter, total, pageBytes) {
     storage: "range-pack-v1",
     compression: "gzip-member",
     directory,
+    packs: packWriter.packs
+  };
+}
+
+function writeFacetDictionaries(out, dicts, config) {
+  const packWriter = createPackWriter(resolve(out, "facets", "packs"), config.facetDictionaryPackBytes || config.packBytes);
+  const entries = [];
+  const fields = {};
+  for (const [name, dict] of Object.entries(dicts || {})) {
+    const values = dict.values || [];
+    const source = buildFacetDictionary(values);
+    const entry = writePackedShard(packWriter, name, gzipSync(source, { level: 6 }));
+    entries.push({ shard: name, pack: entry.pack, offset: entry.offset, length: entry.length });
+    fields[name] = {
+      count: values.length,
+      source_bytes: source.length,
+      bytes: entry.length
+    };
+  }
+  const directory = writeDirectoryFiles(resolve(out, "facets"), entries, config.directoryPageBytes, "facets");
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    format: "rffacetdict-v1",
+    directory,
+    packs: "facets/packs/",
+    pack_files: packWriter.packs.length,
+    pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+    fields
+  };
+}
+
+function writeDocValuePacks(out, config, total, codes) {
+  const chunkSize = Math.max(1, Number(config.docValueChunkSize || 2048));
+  const packWriter = createPackWriter(resolve(out, "doc-values", "packs"), config.docValuePackBytes);
+  const packIndexes = () => new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const fields = {};
+  for (const field of docValueFields(config, codes)) {
+    const chunks = [];
+    for (let start = 0; start < total; start += chunkSize) {
+      const rows = (codes[field.name] || []).slice(start, Math.min(total, start + chunkSize));
+      const encoded = buildDocValueChunk(field, start, rows);
+      const key = `${field.name}\u0000${chunks.length}`;
+      const entry = writePackedShard(packWriter, key, gzipSync(encoded.buffer, { level: 6 }));
+      chunks.push({
+        start,
+        count: rows.length,
+        pack: entry.pack,
+        offset: entry.offset,
+        length: entry.length,
+        width: encoded.width,
+        min: encoded.summary?.min ?? null,
+        max: encoded.summary?.max ?? null,
+        words: encoded.summary?.words ?? null
+      });
+    }
+    fields[field.name] = {
+      name: field.name,
+      kind: field.kind,
+      type: field.type,
+      words: field.words || 0,
+      chunks
+    };
+  }
+  const indexes = packIndexes();
+  for (const field of Object.values(fields)) {
+    for (const chunk of field.chunks) chunk.packIndex = indexes.get(chunk.pack);
+  }
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    format: "rfdocvalues-v1",
+    chunk_size: chunkSize,
+    fields,
     packs: packWriter.packs
   };
 }
@@ -473,7 +549,8 @@ export async function build({ configPath }) {
   const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
   const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
   const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
-  writeFileSync(resolve(dirs.out, "codes.bin.gz"), gzipSync(buildCodesFile(config, measured.total, runData.codes), { level: 9 }));
+  const docValues = writeDocValuePacks(dirs.out, config, measured.total, runData.codes);
+  const facetDictionaries = writeFacetDictionaries(dirs.out, measured.dicts, config);
 
   const manifest = {
     version: 1,
@@ -482,9 +559,18 @@ export async function build({ configPath }) {
     total: measured.total,
     doc_chunk_size: config.docChunkSize,
     docs: runData.docs,
+    doc_values: {
+      storage: docValues.storage,
+      compression: docValues.compression,
+      format: docValues.format,
+      chunk_size: docValues.chunk_size,
+      fields: docValues.fields,
+      packs: docValues.packs.length
+    },
     initial_results: runData.initialResults,
     fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
-    facets: Object.fromEntries(Object.entries(measured.dicts).map(([name, dict]) => [name, dict.values])),
+    facets: Object.fromEntries(Object.entries(facetDictionaries.fields).map(([name, field]) => [name, { count: field.count }])),
+    facet_dictionaries: facetDictionaries,
     numbers: config.numbers.map(n => ({ name: n.name, type: normalizedNumberType(n), sortable: n.sortable !== false })),
     booleans: (config.booleans || []).map(n => ({ name: n.name, sortable: n.sortable !== false })),
     sorts: config.sorts || [],
@@ -521,6 +607,17 @@ export async function build({ configPath }) {
       doc_directory_bytes: runData.docs.directory.total_bytes,
       doc_pack_files: runData.docs.packs.length,
       doc_pack_bytes: runData.docs.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+      doc_value_storage: docValues.storage,
+      doc_value_format: docValues.format,
+      doc_value_chunk_size: docValues.chunk_size,
+      doc_value_fields: Object.keys(docValues.fields).length,
+      doc_value_pack_files: docValues.packs.length,
+      doc_value_pack_bytes: docValues.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+      facet_dictionary_storage: facetDictionaries.storage,
+      facet_dictionary_format: facetDictionaries.format,
+      facet_dictionary_page_files: facetDictionaries.directory.page_files,
+      facet_dictionary_bytes: facetDictionaries.directory.total_bytes + facetDictionaries.pack_bytes,
+      facet_dictionary_fields: Object.keys(facetDictionaries.fields).length,
       reduce_workers: reduced.reduceWorkers,
       posting_block_size: config.postingBlockSize,
       base_shard_depth: config.baseShardDepth,

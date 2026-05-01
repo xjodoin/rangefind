@@ -4,7 +4,7 @@ Rangefind includes a reproducible scalability fixture for French Wikipedia.
 The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
 records a local request/transfer benchmark with cold-transfer breakdowns for
-directory, term, posting-block, typo, code, and document payload fetches.
+directory, term, posting-block, typo, doc-value, and document payload fetches.
 The generated schema includes multi-value article tags, typed numeric fields,
 revision dates, and booleans so the scalability run also validates the typed
 filter/sort code paths.
@@ -54,50 +54,56 @@ Useful options:
   requested dump URL, limit, and body cap.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--reduce-workers=auto`: enables worker-based term reduction.
+- `--no-exact-checks`: skips the exact top-k comparison for text queries.
 
-## Local 5k Run
+## Local 50k Run
 
 Command:
 
 ```bash
-/usr/bin/time -p node scripts/frwiki_fixture.mjs all --limit=5000 --runs=3
+/usr/bin/time -p node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
 ```
 
 Result:
 
 ```text
-Docs indexed:        5,000
-Dump pages read:     5,913
+Docs indexed:        50,000
+Dump pages read:     65,687
 Body cap:            6,000 cleaned characters/article
-Build + bench time:  13.80 s real with prepared JSONL reused
-Logical shards:      7,565
-Term packs:          2
-Posting-block packs: 1
-Index files:         17
-Index bytes:         20.4 MB
-Init:                10.5 ms, 1 request, 245.1 KB
+Build + bench time:  196.88 s real including dump streaming
+Logical shards:      15,104
+Term packs:          7
+Index files:         54
+Index bytes:         124.0 MB
+Manifest/init:       10.9 ms, 1 request, 53.1 KB
 ```
 
 Representative cold queries:
 
 ```text
-Paris:                    26.0 ms, 15 requests, 126.4 KB, top Paris (homonymie)
-Révolution française:     10.9 ms, 11 requests,  36.1 KB, top Révolution française
-intelligence artificielle: 6.1 ms, 11 requests,  52.2 KB, top Intelligence artificielle
-football:                  5.1 ms, 11 requests,   6.3 KB, top Coupe du monde de football
-Québec:                    4.8 ms, 10 requests,  11.5 KB, top Système éducatif au Québec
-typed dates sorted:       20.4 ms,  2 requests,  52.1 KB, top Algèbre linéaire
-multi facet boolean:       3.1 ms,  1 request,   3.6 KB, top Antoine Meillet
+Paris:                    55.6 ms, 20 requests, 332.1 KB, 1 block / 128 postings
+Révolution française:     64.1 ms, 39 requests, 238.3 KB, 31 blocks / 3,744 postings
+intelligence artificielle: 19.2 ms, 13 requests, 137.6 KB, 3 blocks / 257 postings
+football:                  9.9 ms, 11 requests,  12.5 KB, 1 block / 128 postings
+Québec:                    9.7 ms, 12 requests,  32.9 KB, 8 blocks / 913 postings
+typed dates sorted:       37.9 ms,  3 requests, 228.7 KB, doc-value top-k selector
+multi facet boolean:      39.5 ms,  7 requests, 148.9 KB, 0.13 KB facet dictionary range
 ```
 
-All rows reported `valid: true`; the typed cases verify numeric/date range
-filters, sort order, multi-value facet filtering, and boolean filtering.
+All rows reported `valid: true`. Every text query also reported
+`exactTopKMatch: true` against the exact retrieval path. Broad single-term
+queries now use the same block-max top-k scheduler as multi-term queries:
+`Paris` matched exact top 10 after decoding 1 of 49 posting blocks, and
+`football` matched exact top 10 after decoding 1 of 7 blocks.
 
-The cold-transfer breakdown shows term pack fetches in the 0.7-68.7 KB range,
-posting-block fetches up to 3.1 KB for these queries, code-table fetches of
-44.3 KB for the typed sort case, and result document fetches in the 3.6-14.1 KB
-range. The first query also pays for the term and document range-directory
-pages, which were 87.4 KB in this run.
+Warm repeated text queries were served from the runtime cache with zero
+additional network requests and sub-millisecond to low-single-digit millisecond
+latency. Broad sorted metadata views still scan doc-value chunks, but the
+runtime keeps only the requested top-k page instead of sorting all matching
+documents; the 50k typed date sort dropped from about 100 ms warm to about
+21 ms warm on the same index.
 
-Warm repeated queries in this run were served from the runtime cache with zero
-additional network requests.
+High-cardinality facet dictionaries are stored with the same range-directory
+and pack strategy as terms and documents. The 50k manifest is 53.1 KB; the
+large category dictionary lives in `facets/packs/*.bin` and is fetched only when
+that facet is selected or a UI asks for its values.

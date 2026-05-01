@@ -52,15 +52,21 @@ test("builder output is searchable through the range-based runtime", async (t) =
     JSON.stringify({ id: "a", title: "Static range search", body: "Rangefind builds a static index with range requests.", category: "indexing", tags: ["static", "range"], year: 2026, temperature: -1, published: "2026-01-10", featured: true, url: "/a" }),
     JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", category: "baseline", tags: ["sqlite", "quality"], year: 2025, temperature: -5, published: "2025-06-01", featured: false, url: "/b" }),
     JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", tags: ["static", "runtime"], year: 2026, temperature: 0, published: "2026-03-15", featured: false, url: "/c" }),
-    JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", tags: ["typo"], year: 2026, temperature: 7, published: "2026-05-01", featured: true, url: "/d" })
+    JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", tags: ["typo"], year: 2026, temperature: 7, published: "2026-05-01", featured: true, url: "/d" }),
+    JSON.stringify({ id: "e", title: "Archived catalog entry", body: "A low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-01", featured: false, url: "/e" }),
+    JSON.stringify({ id: "f", title: "Collection note", body: "Another low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-02", featured: false, url: "/f" }),
+    JSON.stringify({ id: "g", title: "Dataset appendix", body: "A repeated low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-03", featured: false, url: "/g" }),
+    JSON.stringify({ id: "h", title: "Legacy material", body: "A final low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-04", featured: false, url: "/h" })
   ].join("\n"));
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
     output: "public/rangefind",
     docChunkSize: 2,
+    docValueChunkSize: 2,
     baseShardDepth: 2,
     maxShardDepth: 3,
     targetShardPostings: 2,
+    postingBlockSize: 2,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0,
     fields: [
@@ -81,7 +87,17 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, "terms", "directory-root.bin.gz")));
   assert.ok(await readFile(join(output, "terms", "directory-pages", "0000.bin.gz")));
   assert.ok(await readFile(join(output, "terms", "block-packs", "0000.bin")));
-  assert.ok(await readFile(join(output, "codes.bin.gz")));
+  const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.equal(manifest.doc_values.storage, "range-pack-v1");
+  assert.ok(manifest.doc_values.fields.tags);
+  assert.ok(manifest.doc_values.fields.published);
+  assert.ok(await readFile(join(output, "doc-values", "packs", "0000.bin")));
+  assert.equal(manifest.facets.category.count, 5);
+  assert.equal(manifest.facet_dictionaries.storage, "range-pack-v1");
+  assert.ok(manifest.facet_dictionaries.fields.category);
+  assert.ok(await readFile(join(output, "facets", "directory-root.bin.gz")));
+  assert.ok(await readFile(join(output, "facets", "directory-pages", "0000.bin.gz")));
+  assert.ok(await readFile(join(output, "facets", "packs", "0000.bin")));
   assert.ok(await readFile(join(output, "typo", "manifest.json")));
   assert.ok(await readFile(join(output, "typo", "directory-root.bin.gz")));
 
@@ -100,6 +116,14 @@ test("builder output is searchable through the range-based runtime", async (t) =
     exactResults.results.map(result => result.title)
   );
   assert.ok(results.stats.blocksDecoded <= exactResults.stats.blocksDecoded);
+
+  const singleTerm = await search.search({ q: "search", size: 2, rerank: false });
+  const singleTermExact = await search.search({ q: "search", size: 2, exact: true, rerank: false });
+  assert.deepEqual(
+    singleTerm.results.map(result => result.title),
+    singleTermExact.results.map(result => result.title)
+  );
+  assert.ok(singleTerm.stats.blocksDecoded < singleTermExact.stats.blocksDecoded);
 
   const typo = await search.search({ q: "statik range search", size: 3 });
   assert.equal(typo.results[0].title, "Static range search");

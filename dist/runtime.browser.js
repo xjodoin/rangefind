@@ -167,6 +167,8 @@ var TERM_SHARD_MAGIC = [82, 70, 83, 66];
 var DIRECTORY_ROOT_MAGIC = [82, 70, 68, 82];
 var DIRECTORY_PAGE_MAGIC = [82, 70, 68, 80];
 var CODE_MAGIC = [82, 70, 67, 66];
+var DOC_VALUE_MAGIC = [82, 70, 86, 66];
+var FACET_DICT_MAGIC = [82, 70, 70, 68];
 var TYPO_SHARD_MAGIC = [82, 70, 84, 66];
 function readVarint(bytes, state) {
   let value = 0;
@@ -193,6 +195,8 @@ var CODE_KIND = { facet: 1, number: 2, boolean: 3 };
 var CODE_TYPE = { keyword: 1, int: 2, long: 3, float: 4, double: 5, date: 6, boolean: 7 };
 var CODE_KIND_NAME = Object.fromEntries(Object.entries(CODE_KIND).map(([key, value]) => [value, key]));
 var CODE_TYPE_NAME = Object.fromEntries(Object.entries(CODE_TYPE).map(([key, value]) => [value, key]));
+var DOC_VALUE_FORMAT_VERSION = 1;
+var FACET_DICT_FORMAT_VERSION = 1;
 function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
     if (bytes[i] !== magic[i]) throw new Error(message);
@@ -310,6 +314,47 @@ function decodePostingBlock(shard, entry, blockIndex) {
   entry.blockPostings.set(blockIndex, out);
   return out;
 }
+function parseDocValueChunk(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, DOC_VALUE_MAGIC, "Unsupported Rangefind doc-value chunk");
+  const state = { pos: DOC_VALUE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== DOC_VALUE_FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value chunk version ${version}`);
+  const field = {
+    name: readUtf8(bytes, state),
+    kind: CODE_KIND_NAME[bytes[state.pos++]] || "number",
+    type: CODE_TYPE_NAME[bytes[state.pos++]] || "int",
+    width: bytes[state.pos++],
+    words: readVarint(bytes, state),
+    start: readVarint(bytes, state),
+    count: readVarint(bytes, state),
+    min: readFloat64(bytes, state)
+  };
+  const values = new Array(field.count);
+  if (field.kind === "facet") {
+    for (let doc = 0; doc < field.count; doc++) {
+      const words = new Array(field.words);
+      for (let word = 0; word < field.words; word++) words[word] = readFixedInt(bytes, state.pos + (doc * field.words + word) * field.width, field.width);
+      values[doc] = words;
+    }
+  } else if (field.kind === "boolean") {
+    for (let doc = 0; doc < field.count; doc++) {
+      const value = bytes[state.pos + doc];
+      values[doc] = value === 0 ? null : value === 2;
+    }
+  } else if (field.type === "float" || field.type === "double") {
+    for (let doc = 0; doc < field.count; doc++) {
+      const value = new DataView(bytes.buffer, bytes.byteOffset + state.pos + doc * 8, 8).getFloat64(0, true);
+      values[doc] = Number.isNaN(value) ? null : value;
+    }
+  } else {
+    for (let doc = 0; doc < field.count; doc++) {
+      const encoded = readFixedInt(bytes, state.pos + doc * field.width, field.width);
+      values[doc] = encoded ? field.min + encoded - 1 : null;
+    }
+  }
+  return { ...field, values };
+}
 function parseLegacyCodes(bytes) {
   const state = { pos: CODE_MAGIC.length };
   const total = readVarint(bytes, state);
@@ -379,6 +424,23 @@ function parseCodes(buffer) {
   }
   Object.defineProperty(out, "_meta", { value: { version, total, fields }, enumerable: false });
   return out;
+}
+function parseFacetDictionary(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, FACET_DICT_MAGIC, "Unsupported Rangefind facet dictionary");
+  const state = { pos: FACET_DICT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FACET_DICT_FORMAT_VERSION) throw new Error(`Unsupported Rangefind facet dictionary version ${version}`);
+  const count = readVarint(bytes, state);
+  const values = new Array(count);
+  for (let i = 0; i < count; i++) {
+    values[i] = {
+      value: readUtf8(bytes, state),
+      label: readUtf8(bytes, state),
+      n: readVarint(bytes, state)
+    };
+  }
+  return values;
 }
 
 // src/directory.js
@@ -637,7 +699,7 @@ async function fetchRange(url, offset, length) {
 }
 function selectedFacetCodes(manifest, field, selected) {
   if (!selected?.size) return null;
-  const values = manifest.facets?.[field] || [];
+  const values = Array.isArray(manifest.facets?.[field]) ? manifest.facets[field] : [];
   const out = /* @__PURE__ */ new Set();
   values.forEach((item, idx) => {
     if (selected.has(item.value) || selected.has(item.label)) out.add(idx);
@@ -661,15 +723,20 @@ async function createSearch(options = {}) {
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then((r) => r.json());
   const termDirectory = createDirectoryState(manifest.directory, "terms");
   const docDirectory = manifest.docs?.directory ? createDirectoryState(manifest.docs.directory, "docs") : null;
+  const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory, "facets") : null;
   const shardCache = /* @__PURE__ */ new Map();
   const typoShardCache = /* @__PURE__ */ new Map();
   const docCache = /* @__PURE__ */ new Map();
   const packedDocCache = /* @__PURE__ */ new Map();
+  const docValueCache = /* @__PURE__ */ new Map();
+  const facetDictionaryCache = /* @__PURE__ */ new Map();
   let typoManifest = null;
   let typoManifestPromise = null;
   let typoDirectory = null;
   let codes = null;
   let codesPromise = null;
+  const docValues = manifest.doc_values || null;
+  const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
   function createDirectoryState(meta, fallbackDir) {
@@ -724,6 +791,121 @@ async function createSearch(options = {}) {
     if (!codesPromise) codesPromise = fetchGzipArrayBuffer(new URL("codes.bin.gz", baseUrl)).then(parseCodes);
     codes = await codesPromise;
     return codes;
+  }
+  function docValueField(field) {
+    return docValues?.fields?.[field] || null;
+  }
+  async function loadFacetDictionary(field) {
+    if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
+    if (!facetDirectory || !manifest.facet_dictionaries?.fields?.[field]) return [];
+    if (!facetDictionaryCache.has(field)) {
+      facetDictionaryCache.set(field, (async () => {
+        const root = await loadDirectoryRoot(facetDirectory);
+        const resolved = await directoryEntryFromRoot(facetDirectory, root, field);
+        if (!resolved) return [];
+        const packs = manifest.facet_dictionaries.packs || "facets/packs/";
+        const buffer = await fetchRange(new URL(`${packs.replace(/\/?$/u, "/")}${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
+        const values = parseFacetDictionary(await inflateGzip(buffer));
+        if (!manifest.facets) manifest.facets = {};
+        manifest.facets[field] = values;
+        return values;
+      })());
+    }
+    return facetDictionaryCache.get(field);
+  }
+  async function ensureFacetDictionaries(filters) {
+    const fields = Object.keys(filters?.facets || {});
+    if (!fields.length) return;
+    await Promise.all(fields.map((field) => loadFacetDictionary(field)));
+  }
+  function chunkIndexForDoc(fieldMeta, doc) {
+    const chunkSize = docValues?.chunk_size || manifest.total || 1;
+    const index = Math.floor(doc / chunkSize);
+    return fieldMeta?.chunks?.[index] ? index : -1;
+  }
+  function docValueCacheKey(field, index) {
+    return `${field}\0${index}`;
+  }
+  async function loadDocValueChunks(requests) {
+    if (!docValues || !requests.length) return;
+    const pending = [];
+    for (const request of requests) {
+      const fieldMeta = docValueField(request.field);
+      const chunk = fieldMeta?.chunks?.[request.index];
+      if (!chunk) continue;
+      const key = docValueCacheKey(request.field, request.index);
+      if (docValueCache.has(key)) continue;
+      let resolve;
+      let reject;
+      const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      docValueCache.set(key, promise);
+      pending.push({ field: request.field, index: request.index, entry: chunk, resolve, reject });
+    }
+    await Promise.all(groupRanges(pending).map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const start = item.entry.offset - group.start;
+          const end = start + item.entry.length;
+          const parsed = parseDocValueChunk(await inflateGzip(compressed.slice(start, end)));
+          docValueCache.set(docValueCacheKey(item.field, item.index), parsed);
+          item.resolve(parsed);
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          docValueCache.delete(docValueCacheKey(item.field, item.index));
+          item.reject(error);
+        }
+      }
+    }));
+  }
+  async function ensureDocValuesForDocs(fields, docs) {
+    if (!docValues || !fields.length || !docs.length) return null;
+    const requests = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const field of fields) {
+      const fieldMeta = docValueField(field);
+      if (!fieldMeta) continue;
+      for (const doc of docs) {
+        const index = chunkIndexForDoc(fieldMeta, doc);
+        if (index < 0) continue;
+        const key = docValueCacheKey(field, index);
+        if (seen.has(key) || docValueCache.has(key)) continue;
+        seen.add(key);
+        requests.push({ field, index });
+      }
+    }
+    await loadDocValueChunks(requests);
+    return docValueStore;
+  }
+  async function ensureDocValueChunkIndexes(fields, indexes) {
+    if (!docValues || !fields.length || !indexes.length) return null;
+    const requests = [];
+    for (const field of fields) {
+      for (const index of indexes) requests.push({ field, index });
+    }
+    await loadDocValueChunks(requests);
+    return docValueStore;
+  }
+  function docValue(field, doc) {
+    const fieldMeta = docValueField(field);
+    const index = chunkIndexForDoc(fieldMeta, doc);
+    if (index < 0) return null;
+    const chunk = docValueCache.get(docValueCacheKey(field, index));
+    if (!chunk || typeof chunk.then === "function") return null;
+    return chunk.values[doc - chunk.start];
+  }
+  function valueForDoc(valueStore, field, doc) {
+    if (valueStore?._docValues) return docValue(field, doc);
+    return valueStore?.[field]?.[doc];
+  }
+  async function valueStoreForDocs(fields, docs) {
+    if (!fields.length) return null;
+    if (docValues) return ensureDocValuesForDocs(fields, docs);
+    return loadCodes();
   }
   async function loadTypoManifest() {
     if (typoManifest !== null) return typoManifest;
@@ -903,6 +1085,9 @@ async function createSearch(options = {}) {
       }
     };
   }
+  function candidateLimitFor(baseTerms, k, rerank = true) {
+    return rerank === false || !dependencyTerms(baseTerms).length ? k : Math.max(RERANK_CANDIDATES, k);
+  }
   async function loadChunkDoc(index) {
     const chunk = Math.floor(index / manifest.doc_chunk_size);
     const local = index - chunk * manifest.doc_chunk_size;
@@ -1051,19 +1236,33 @@ async function createSearch(options = {}) {
     }).filter(([, value]) => value != null);
     return { facets, numbers, booleans, active: facets.length > 0 || numbers.length > 0 || booleans.length > 0 };
   }
+  function filterPlanFields(filterPlan) {
+    if (!filterPlan?.active) return [];
+    return [
+      ...filterPlan.facets.map(([field]) => field),
+      ...filterPlan.numbers.map(([field]) => field),
+      ...filterPlan.booleans.map(([field]) => field)
+    ];
+  }
+  function planFields(filterPlan, sortPlan) {
+    return [.../* @__PURE__ */ new Set([
+      ...filterPlanFields(filterPlan),
+      ...sortPlan?.field ? [sortPlan.field] : []
+    ])];
+  }
   function passesFilterPlan(doc, codeData, filterPlan) {
     if (!filterPlan?.active) return true;
     for (const [field, selected] of filterPlan.facets) {
-      if (!facetCodeMatches(codeData[field]?.[doc], selected)) return false;
+      if (!facetCodeMatches(valueForDoc(codeData, field, doc), selected)) return false;
     }
     for (const [field, range] of filterPlan.numbers) {
-      const value = codeData[field]?.[doc];
+      const value = valueForDoc(codeData, field, doc);
       if (value == null) return false;
       if (range.min != null && value < range.min) return false;
       if (range.max != null && value > range.max) return false;
     }
     for (const [field, expected] of filterPlan.booleans) {
-      const value = codeData[field]?.[doc];
+      const value = valueForDoc(codeData, field, doc);
       if (value == null || value !== expected) return false;
     }
     return true;
@@ -1119,21 +1318,74 @@ async function createSearch(options = {}) {
     if (!numberFields.has(field) && !booleanFields.has(field)) return null;
     return { field, desc: order === "desc" };
   }
+  function chunkFacetMayPass(chunk, selected) {
+    if (!selected?.size || !chunk) return true;
+    if (!Array.isArray(chunk.words)) return true;
+    for (const value of selected) {
+      const word = Math.floor(value / 32);
+      const bit = value % 32;
+      if ((chunk.words[word] || 0) & 2 ** bit) return true;
+    }
+    return false;
+  }
+  function chunkMayPass(index, filterPlan) {
+    if (!docValues || !filterPlan?.active) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      if (!chunkFacetMayPass(docValueField(field)?.chunks?.[index], selected)) return false;
+    }
+    for (const [field, range] of filterPlan.numbers) {
+      const chunk = docValueField(field)?.chunks?.[index];
+      if (!chunk || chunk.min == null || chunk.max == null) return false;
+      if (range.min != null && chunk.max < range.min) return false;
+      if (range.max != null && chunk.min > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const chunk = docValueField(field)?.chunks?.[index];
+      const code = expected ? 2 : 1;
+      if (!chunk || chunk.min == null || chunk.max == null) return false;
+      if (chunk.max < code || chunk.min > code) return false;
+    }
+    return true;
+  }
+  function candidateDocValueChunks(filterPlan) {
+    if (!docValues) return [];
+    const count = Math.ceil(manifest.total / Math.max(1, docValues.chunk_size || manifest.total || 1));
+    const out = [];
+    for (let index = 0; index < count; index++) if (chunkMayPass(index, filterPlan)) out.push(index);
+    return out;
+  }
   function sortRanked(ranked, codeData, sortPlan) {
-    if (!sortPlan || !codeData?.[sortPlan.field]) return ranked;
-    const values = codeData[sortPlan.field];
-    return ranked.slice().sort((a, b) => {
-      const left = values[a[0]];
-      const right = values[b[0]];
-      const leftMissing = left == null;
-      const rightMissing = right == null;
-      if (leftMissing || rightMissing) {
-        if (leftMissing && rightMissing) return b[1] - a[1] || a[0] - b[0];
-        return leftMissing ? 1 : -1;
+    if (!sortPlan || !codeData) return ranked;
+    return ranked.slice().sort((a, b) => compareRankedRows(a, b, codeData, sortPlan));
+  }
+  function compareRankedRows(a, b, codeData, sortPlan) {
+    const left = valueForDoc(codeData, sortPlan.field, a[0]);
+    const right = valueForDoc(codeData, sortPlan.field, b[0]);
+    const leftMissing = left == null;
+    const rightMissing = right == null;
+    if (leftMissing || rightMissing) {
+      if (leftMissing && rightMissing) return b[1] - a[1] || a[0] - b[0];
+      return leftMissing ? 1 : -1;
+    }
+    if (left !== right) return sortPlan.desc ? Number(right) - Number(left) : Number(left) - Number(right);
+    return b[1] - a[1] || a[0] - b[0];
+  }
+  function selectSortedTopK(candidates, codeData, sortPlan, k, filterPlan = null) {
+    const top = [];
+    let total = 0;
+    for (const row of candidates) {
+      if (filterPlan && !passesFilterPlan(row[0], codeData, filterPlan)) continue;
+      total++;
+      if (top.length < k) {
+        top.push(row);
+        if (top.length === k) top.sort((a, b) => compareRankedRows(a, b, codeData, sortPlan));
+      } else if (compareRankedRows(row, top[top.length - 1], codeData, sortPlan) < 0) {
+        top[top.length - 1] = row;
+        top.sort((a, b) => compareRankedRows(a, b, codeData, sortPlan));
       }
-      if (left !== right) return sortPlan.desc ? Number(right) - Number(left) : Number(left) - Number(right);
-      return b[1] - a[1] || a[0] - b[0];
-    });
+    }
+    if (top.length < k) top.sort((a, b) => compareRankedRows(a, b, codeData, sortPlan));
+    return { total, ranked: top };
   }
   function bitIsSet(mask, bit) {
     return (mask & 2 ** bit) !== 0;
@@ -1181,18 +1433,25 @@ async function createSearch(options = {}) {
     }
     return accepted;
   }
+  function postingDocs(rows) {
+    const docs = [];
+    for (let i = 0; i < rows.length; i += 2) docs.push(rows[i]);
+    return docs;
+  }
   async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const k = offset + size;
-    const candidateK = rerank === false ? k : Math.max(RERANK_CANDIDATES, k);
+    const candidateK = candidateLimitFor(baseTerms, k, rerank);
     const sortPlan = makeSortPlan(sort);
-    if (sortPlan || baseTerms.length < 2 || terms.length > SKIP_MAX_TERMS || k > 100) {
+    if (sortPlan || !baseTerms.length || terms.length > SKIP_MAX_TERMS || k > 100) {
       return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank });
     }
+    await ensureFacetDictionaries(filters);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const codeData = hasFilters ? await loadCodes() : null;
+    const filterFields = filterPlanFields(docFilterPlan);
+    const fallbackCodeData = hasFilters && !docValues ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
     const cursors = entries.map((item, termIndex) => ({
@@ -1226,6 +1485,7 @@ async function createSearch(options = {}) {
       const cursor = active[0];
       const rows2 = await decodeEntryBlock(cursor.shard, cursor.entry, cursor.blockIndex);
       cursor.blockIndex++;
+      const codeData = hasFilters && docValues ? await valueStoreForDocs(filterFields, postingDocs(rows2)) : fallbackCodeData;
       blocksDecoded++;
       postingsDecoded += rows2.length / 2;
       postingsAccepted += applyBlockRows(cursor, rows2, codeData, docFilterPlan, scores, hits, masks);
@@ -1255,13 +1515,24 @@ async function createSearch(options = {}) {
   async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
+    await ensureFacetDictionaries(filters);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     const entries = await termEntries(terms);
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     const baseSet = new Set(baseTerms);
-    const codeData = hasFilters || sortPlan ? await loadCodes() : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const filterFields = filterPlanFields(docFilterPlan);
+    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    let codeData = fallbackCodeData;
+    if (hasFilters && docValues) {
+      const docs = /* @__PURE__ */ new Set();
+      for (const { shard, entry } of entries) {
+        const postings = await decodeEntryPostings(shard, entry);
+        for (let i = 0; i < postings.length; i += 2) docs.add(postings[i]);
+      }
+      codeData = await valueStoreForDocs(filterFields, [...docs]);
+    }
     for (const { term, shard, entry } of entries) {
       const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
@@ -1273,7 +1544,8 @@ async function createSearch(options = {}) {
       }
     }
     let ranked = collectEligibleScores(scores, hits, minShouldMatchFor(baseTerms));
-    const reranked = rerank === false || sortPlan ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, Math.max(RERANK_CANDIDATES, offset + size));
+    const reranked = rerank === false || sortPlan ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
+    if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
     return {
@@ -1433,15 +1705,31 @@ async function createSearch(options = {}) {
         const docs = manifest.initial_results.slice(offset, offset + size);
         return { total: manifest.total, results: docs, page, size };
       }
-      const codeData = await loadCodes();
+      await ensureFacetDictionaries(filters);
       const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-      const ranked = sortRanked(
-        Array.from({ length: manifest.total }, (_, index) => [index, 0]).filter(([index]) => !hasFilters || passesFilterPlan(index, codeData, docFilterPlan)),
-        codeData,
-        sortPlan
-      );
+      let codeData;
+      let candidates;
+      if (docValues) {
+        const chunkIndexes = candidateDocValueChunks(docFilterPlan);
+        codeData = await ensureDocValueChunkIndexes(planFields(docFilterPlan, sortPlan), chunkIndexes);
+        candidates = [];
+        const chunkSize = Math.max(1, docValues.chunk_size || manifest.total || 1);
+        for (const chunkIndex of chunkIndexes) {
+          const start = chunkIndex * chunkSize;
+          const end = Math.min(manifest.total, start + chunkSize);
+          for (let index = start; index < end; index++) candidates.push([index, 0]);
+        }
+      } else {
+        codeData = await loadCodes();
+        candidates = Array.from({ length: manifest.total }, (_, index) => [index, 0]);
+      }
+      const selected = sortPlan ? selectSortedTopK(candidates, codeData, sortPlan, offset + size, hasFilters ? docFilterPlan : null) : {
+        total: candidates.filter(([index]) => !hasFilters || passesFilterPlan(index, codeData, docFilterPlan)).length,
+        ranked: candidates.filter(([index]) => !hasFilters || passesFilterPlan(index, codeData, docFilterPlan))
+      };
+      const ranked = sortPlan ? selected.ranked : sortRanked(selected.ranked, codeData, sortPlan);
       const rows = ranked.slice(offset, offset + size);
-      return { total: ranked.length, results: await rowsToResults(rows), page, size };
+      return { total: selected.total, results: await rowsToResults(rows), page, size };
     }
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map((item) => item.term);

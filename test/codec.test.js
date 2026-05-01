@@ -3,10 +3,15 @@ import test from "node:test";
 import {
   buildBlockFilters,
   buildCodesFile,
+  buildDocValueChunk,
+  buildFacetDictionary,
   buildTermShard,
+  docValueFields,
   decodePostingBytes,
   decodePostings,
   parseCodes,
+  parseDocValueChunk,
+  parseFacetDictionary,
   parseShard,
   rewriteTermShardForExternalBlocks
 } from "../src/codec.js";
@@ -109,4 +114,38 @@ test("code table codec round-trips facet and numeric columns", () => {
     rating: [1.5, 2.25, null],
     featured: [true, false, null]
   });
+});
+
+test("doc-value chunks round-trip typed column slices", () => {
+  const config = {
+    facets: [{ name: "category" }],
+    numbers: [{ name: "published", type: "date" }, { name: "rating", type: "double" }],
+    booleans: [{ name: "featured" }]
+  };
+  const fields = docValueFields(config, {
+    _dicts: { category: { values: [{ value: "" }, { value: "docs" }, { value: "api" }] } }
+  });
+  const byName = Object.fromEntries(fields.map(field => [field.name, field]));
+  const facet = buildDocValueChunk(byName.category, 2, [[6], [4]]);
+  assert.deepEqual(facet.summary.words, [6]);
+  assert.deepEqual(parseDocValueChunk(facet.buffer).values, [[6], [4]]);
+
+  const dates = buildDocValueChunk(byName.published, 2, [Date.parse("2026-01-01"), null]);
+  assert.deepEqual(parseDocValueChunk(dates.buffer).values, [Date.parse("2026-01-01"), null]);
+
+  const rating = buildDocValueChunk(byName.rating, 2, [1.25, null]);
+  assert.deepEqual(parseDocValueChunk(rating.buffer).values, [1.25, null]);
+
+  const bool = buildDocValueChunk(byName.featured, 2, [false, true]);
+  assert.deepEqual(bool.summary, { min: 1, max: 2 });
+  assert.deepEqual(parseDocValueChunk(bool.buffer).values, [false, true]);
+});
+
+test("facet dictionary codec round-trips labels and counts", () => {
+  const values = [
+    { value: "", label: "", n: 0 },
+    { value: "science", label: "Science", n: 42 },
+    { value: "santé", label: "Santé", n: 7 }
+  ];
+  assert.deepEqual(parseFacetDictionary(buildFacetDictionary(values)), values);
 });

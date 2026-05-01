@@ -24,12 +24,14 @@ a large thesis corpus.
   `terms/directory-pages/*.bin.gz`.
 - Range-packed result payloads with capped display fields.
 - Range-addressable posting-block sidecar for high-df terms.
+- Range-packed binary facet dictionaries for high-cardinality metadata.
 - Parallel build-time shard reduction with deterministic final pack assembly.
 - Browser runtime with coalesced HTTP `Range` fetches.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
   fetches only when an exact first-page query returns no results.
-- Multi-value keyword facets.
-- Typed numeric, date, and boolean doc-values for filters and sorting.
+- Multi-value keyword facets with lazy dictionary loading.
+- Range-addressed typed numeric, date, and boolean doc-values for filters and
+  sorting.
 - Tiny runnable example.
 
 ## Why This Exists
@@ -65,11 +67,13 @@ latency, request count, and transfer size:
 
 ```bash
 npm run build:browser
-node scripts/frwiki_fixture.mjs all --limit=5000
+node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
 ```
 
 Use `--limit=0` to run against the full dump. The generated site lives at
-`examples/frwiki/public/`.
+`examples/frwiki/public/`. The fixture validates text query top-k against the
+exact retrieval path by default and records cold request counts, transfer bytes,
+runtime posting-block stats, and typed filter/sort validation.
 
 ## Build A Custom Index
 
@@ -134,7 +138,7 @@ const result = await engine.search({ q: "static search", size: 10 });
 console.log(result.results);
 ```
 
-Filters and sort use the code table:
+Filters and sort use range-addressed doc-value columns:
 
 ```js
 const result = await engine.search({
@@ -192,7 +196,6 @@ guiding format decisions.
 
 This is the first standalone extraction. The next milestones are:
 
-- typo-tolerance sidecar extraction,
 - Pagefind/Lucene/SQLite benchmark package,
 - build-time sparse expansion hooks,
 - WASM-free and WASM-assisted runtime comparisons,

@@ -41,6 +41,7 @@ function parseArgs(argv) {
     size: 10,
     bodyChars: Number(process.env.FRWIKI_BODY_CHARS || 6000),
     force: false,
+    exactChecks: process.env.FRWIKI_EXACT_CHECKS !== "0",
     reduceWorkers: process.env.RANGEFIND_REDUCE_WORKERS || ""
   };
   for (const arg of argv.slice(1)) {
@@ -53,6 +54,8 @@ function parseArgs(argv) {
     else if (arg.startsWith("--size=")) args.size = Number(arg.slice("--size=".length)) || args.size;
     else if (arg.startsWith("--body-chars=")) args.bodyChars = Number(arg.slice("--body-chars=".length)) || 0;
     else if (arg.startsWith("--reduce-workers=")) args.reduceWorkers = arg.slice("--reduce-workers=".length);
+    else if (arg === "--exact-checks") args.exactChecks = true;
+    else if (arg === "--no-exact-checks") args.exactChecks = false;
   }
   return args;
 }
@@ -366,6 +369,8 @@ function networkBucket(url) {
   if (path.includes("/directory-")) return "directory";
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
+  if (path.includes("/facets/packs/")) return "facetDictionaries";
+  if (path.includes("/doc-values/")) return "docValues";
   if (path.includes("/typo/")) return "typo";
   if (path.includes("/docs/")) return "docs";
   if (path.endsWith("/codes.bin.gz")) return "codes";
@@ -394,7 +399,8 @@ function normalizeComparable(value, type = "number") {
 }
 
 function commonFacetValue(manifest, field) {
-  return (manifest.facets?.[field] || [])
+  const values = Array.isArray(manifest.facets?.[field]) ? manifest.facets[field] : [];
+  return values
     .filter(item => item.value)
     .sort((a, b) => (b.n || 0) - (a.n || 0))[0]?.value || null;
 }
@@ -414,8 +420,8 @@ function typedCases(manifest) {
       sort: { field: "bodyLength", order: "desc" }
     }
   ];
-  const tagValues = manifest.facets?.articleTags || [];
-  const tag = tagValues.some(item => item.value === "has-categories")
+  const tagValues = Array.isArray(manifest.facets?.articleTags) ? manifest.facets.articleTags : [];
+  const tag = !tagValues.length || tagValues.some(item => item.value === "has-categories")
     ? "has-categories"
     : commonFacetValue(manifest, "articleTags");
   if (tag) {
@@ -480,6 +486,57 @@ function validateResponse(item, response, manifest) {
   return [...new Set(errors)];
 }
 
+function compactRuntimeStats(stats = {}) {
+  return {
+    exact: Boolean(stats.exact),
+    blocksDecoded: stats.blocksDecoded || 0,
+    postingsDecoded: stats.postingsDecoded || 0,
+    postingsAccepted: stats.postingsAccepted || 0,
+    skippedBlocks: stats.skippedBlocks || 0,
+    terms: stats.terms || 0,
+    shards: stats.shards || 0,
+    rerankCandidates: stats.rerankCandidates || 0,
+    dependencyFeatures: stats.dependencyFeatures || 0,
+    dependencyTermsMatched: stats.dependencyTermsMatched || 0,
+    dependencyPostingsScanned: stats.dependencyPostingsScanned || 0,
+    dependencyCandidateMatches: stats.dependencyCandidateMatches || 0,
+    typoApplied: Boolean(stats.typoApplied)
+  };
+}
+
+function sameIds(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+async function addExactChecks(args, serverUrl, rows, cases) {
+  if (!args.exactChecks) return;
+  const exactEngine = await createSearch({ baseUrl: new URL("rangefind/", serverUrl) });
+  const rowsByLabel = new Map(rows.map(row => [row.q, row]));
+  for (const item of cases) {
+    if (!item.q || item.sort) continue;
+    const row = rowsByLabel.get(item.label);
+    if (!row) continue;
+    const start = performance.now();
+    const response = await exactEngine.search({
+      q: item.q,
+      filters: item.filters,
+      sort: item.sort,
+      size: item.size || args.size,
+      exact: true
+    });
+    const exactIds = response.results.map(result => result.id);
+    const match = sameIds(row.resultIds, exactIds);
+    row.exactTopKMatch = match;
+    row.exactTotal = response.total;
+    row.exactMs = performance.now() - start;
+    row.exactStats = compactRuntimeStats(response.stats);
+    if (!match) {
+      row.valid = false;
+      row.validationErrors = [...new Set([...(row.validationErrors || []), "exact top-k mismatch"])];
+    }
+  }
+}
+
 async function benchFixture(args) {
   const root = resolve(args.root, "public");
   const server = await serveStatic(root);
@@ -491,13 +548,16 @@ async function benchFixture(args) {
     const initMs = performance.now() - initStart;
     const initNetwork = meter.snapshot();
     const rows = [];
-    for (const item of benchmarkCases(args, engine.manifest)) {
+    const cases = benchmarkCases(args, engine.manifest);
+    for (const item of cases) {
       const times = [];
       const requests = [];
       const bytes = [];
       const networks = [];
       let total = 0;
       let top = "";
+      let resultIds = [];
+      let coldStats = {};
       let validationErrors = [];
       for (let i = 0; i < args.runs; i++) {
         meter.reset();
@@ -510,15 +570,21 @@ async function benchFixture(args) {
         bytes.push(network.bytes);
         total = response.total;
         top = response.results[0]?.title || "";
-        if (i === 0) validationErrors = validateResponse(item, response, engine.manifest);
+        if (i === 0) {
+          resultIds = response.results.map(result => result.id);
+          coldStats = compactRuntimeStats(response.stats);
+          validationErrors = validateResponse(item, response, engine.manifest);
+        }
       }
       rows.push({
         q: item.label,
         request: { q: item.q, filters: item.filters || null, sort: item.sort || null },
         total,
         top,
+        resultIds,
         valid: validationErrors.length === 0,
         validationErrors,
+        coldStats,
         coldMs: times[0] || 0,
         coldRequests: requests[0] || 0,
         coldKb: kb(bytes[0] || 0),
@@ -532,6 +598,7 @@ async function benchFixture(args) {
         avgKb: kb(mean(bytes))
       });
     }
+    await addExactChecks(args, server.url, rows, cases);
     const report = {
       fixture: "frwiki",
       root,
