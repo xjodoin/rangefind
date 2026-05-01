@@ -525,6 +525,7 @@ function compactRuntimeStats(stats = {}) {
     docPayloadLane: stats.docPayloadLane || "",
     docPayloadPages: stats.docPayloadPages || 0,
     docPayloadOverfetchDocs: stats.docPayloadOverfetchDocs || 0,
+    docPayloadAdaptive: Boolean(stats.docPayloadAdaptive),
     docValuePruning: Boolean(stats.docValuePruning),
     docValuePruneField: stats.docValuePruneField || "",
     docValueDirectoryPages: stats.docValueDirectoryPages || 0,
@@ -537,7 +538,12 @@ function compactRuntimeStats(stats = {}) {
     docValueChunkPruning: Boolean(stats.docValueChunkPruning),
     docValueChunksVisited: stats.docValueChunksVisited || 0,
     docValueChunksPruned: stats.docValueChunksPruned || 0,
-    typoApplied: Boolean(stats.typoApplied)
+    surfaceFallbackAttempted: Boolean(stats.surfaceFallbackAttempted),
+    surfaceFallbackApplied: Boolean(stats.surfaceFallbackApplied),
+    surfaceFallbackTerms: stats.surfaceFallbackTerms || [],
+    typoAttempted: Boolean(stats.typoAttempted),
+    typoApplied: Boolean(stats.typoApplied),
+    typoSkippedReason: stats.typoSkippedReason || ""
   };
 }
 
@@ -717,6 +723,9 @@ function summarizeScaleRow(row) {
     docValueChunkPruning: row.coldStats?.docValueChunkPruning || false,
     docValueChunksVisited: row.coldStats?.docValueChunksVisited || 0,
     docValueChunksPruned: row.coldStats?.docValueChunksPruned || 0,
+    surfaceFallbackApplied: row.coldStats?.surfaceFallbackApplied || false,
+    typoAttempted: row.coldStats?.typoAttempted || false,
+    typoApplied: row.coldStats?.typoApplied || false,
     exactTopKMatch: row.exactTopKMatch ?? null,
     exactTotal: row.exactTotal ?? null
   };

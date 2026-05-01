@@ -61,7 +61,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
     JSON.stringify({ id: "e", title: "Archived catalog entry", body: "A low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-01", featured: false, url: "/e" }),
     JSON.stringify({ id: "f", title: "Collection note", body: "Another low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-02", featured: false, url: "/f" }),
     JSON.stringify({ id: "g", title: "Dataset appendix", body: "A repeated low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-03", featured: false, url: "/g" }),
-    JSON.stringify({ id: "h", title: "Legacy material", body: "A final low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-04", featured: false, url: "/h" })
+    JSON.stringify({ id: "h", title: "Legacy material", body: "A final low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-04", featured: false, url: "/h" }),
+    JSON.stringify({ id: "i", title: "Pariser cannon", body: "Surface exact fallback should prefer indexed raw terms before typo lookup.", category: "archive", tags: ["filler"], year: 2023, temperature: 2, published: "2023-01-04", featured: false, url: "/i" })
   ].join("\n"));
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
@@ -155,6 +156,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(results.results[0].title, "Static range search");
   assert.equal(results.results[0].bodySnippet, "Rangefind builds");
   assert.ok(results.stats.shards > 0);
+  assert.equal(results.stats.docPayloadLane, "docPages");
+  assert.equal(results.stats.docPayloadAdaptive, true);
 
   const exactResults = await search.search({ q: "static range search", size: 3, exact: true });
   assert.deepEqual(
@@ -180,6 +183,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const stemmedTypo = await search.search({ q: "elecrtified winding insulation", size: 3 });
   assert.equal(stemmedTypo.results[0].title, "Electrified winding insulation");
   assert.equal(stemmedTypo.stats.typoApplied, true);
+
+  const surfaceFallback = await search.search({ q: "paris", size: 3 });
+  assert.equal(surfaceFallback.results[0].title, "Pariser cannon");
+  assert.equal(surfaceFallback.stats.surfaceFallbackApplied, true);
+  assert.equal(surfaceFallback.stats.typoAttempted, false);
 
   const filtered = await search.search({
     q: "search",
@@ -230,7 +238,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const corrupted = Buffer.from(await readFile(docPack));
   corrupted[firstDocPointer.offset] ^= 0xff;
   await writeFile(docPack, corrupted);
-  const corruptSearch = await createSearch({ baseUrl: server.baseUrl });
+  const corruptSearch = await createSearch({ baseUrl: server.baseUrl, textDocPageHydration: false });
   await assert.rejects(
     () => corruptSearch.search({ q: "static range search", size: 1 }),
     /checksum mismatch/

@@ -1647,15 +1647,29 @@ async function createSearch(options = {}) {
     return decodeDocPageColumns(inflated, docPages.fields || [], pageIndexValue * docPageSize());
   }
   function docPagePlan(indexes, context = {}) {
-    if (!docPages?.pointers?.file || !context.preferDocPages) return null;
+    const forced = context.preferDocPages === true;
+    const adaptive = options.textDocPageHydration !== false && (context.preferDocPages === "auto" || context.preferDocPages == null && context.hasTextTerms);
+    if (!docPages?.pointers?.file || !forced && !adaptive) return null;
     const unique = [...new Set(indexes)];
     if (!unique.length) return null;
     const pages = [...new Set(unique.map(docPageIndex))].sort((a, b) => a - b);
     const payloadDocs = pages.length * docPageSize();
-    const maxOverfetchDocs = Math.max(1, Number(docPages.max_overfetch_docs || 16));
+    const configuredMaxOverfetchDocs = Math.max(1, Number(docPages.max_overfetch_docs || 16));
+    const maxOverfetchDocs = forced ? configuredMaxOverfetchDocs : Math.max(1, Number(options.textDocPageMaxOverfetchDocs || configuredMaxOverfetchDocs));
     const maxPayloadDocs = Math.max(docPageSize(), unique.length * maxOverfetchDocs);
     if (payloadDocs > maxPayloadDocs) return null;
-    return { pages, pageSize: docPageSize(), payloadDocs, uniqueDocs: unique.length };
+    if (!forced) {
+      const pageFetchEstimate = pages.length * 2;
+      const packedFetchEstimate = unique.length * 3;
+      if (pageFetchEstimate >= packedFetchEstimate) return null;
+    }
+    return {
+      pages,
+      pageSize: docPageSize(),
+      payloadDocs,
+      uniqueDocs: unique.length,
+      adaptive: !forced
+    };
   }
   async function loadDocPagePointers(pageIndexes) {
     const pointerMeta = docPages?.pointers;
@@ -1744,6 +1758,7 @@ async function createSearch(options = {}) {
     context.docPayloadPages = plan?.pages.length || 0;
     context.docPayloadRows = indexes.length;
     context.docPayloadOverfetchDocs = plan?.payloadDocs || indexes.length;
+    context.docPayloadAdaptive = Boolean(plan?.adaptive);
     return plan ? loadDocPages(indexes, plan) : loadPackedDocs(indexes);
   }
   async function rowsToResults(rows, context = {}) {
@@ -2367,7 +2382,7 @@ async function createSearch(options = {}) {
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
-    const resultContext = { hasTextTerms: true, preferDocPages: false };
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
     const results = await rowsToResults(rows, resultContext);
     return {
       total: exhausted ? ranked.length : Math.max(ranked.length, k),
@@ -2393,6 +2408,7 @@ async function createSearch(options = {}) {
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
         ...reranked.stats
       }
     };
@@ -2433,7 +2449,7 @@ async function createSearch(options = {}) {
     if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
-    const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: !!sortPlan };
+    const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: sortPlan ? true : "auto" };
     const results = await rowsToResults(rows, resultContext);
     return {
       total: ranked.length,
@@ -2453,6 +2469,7 @@ async function createSearch(options = {}) {
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
         ...reranked.stats
       }
     };
@@ -2545,8 +2562,50 @@ async function createSearch(options = {}) {
       stats: { typoCandidateTerms: debug.candidates, typoShardLookups: debug.shards.size }
     };
   }
+  function rawSurfaceFallbackTerms(baseTerms, analyzedTerms, presentTerms) {
+    let changed = false;
+    const terms = baseTerms.map((term, index) => {
+      const raw = analyzedTerms[index]?.raw;
+      if (raw && raw !== term && presentTerms.has(raw)) {
+        changed = true;
+        return raw;
+      }
+      return term;
+    });
+    return changed ? terms : null;
+  }
+  async function maybeSurfaceExactFallback(params, response, baseTerms, analyzedTerms) {
+    if (params.page !== 1 || response.total > 0) return null;
+    if (!analyzedTerms.some((item) => item.raw && item.raw !== item.term)) return null;
+    const rawTerms = [...new Set(analyzedTerms.map((item) => item.raw).filter(Boolean))];
+    const presentTerms = new Map((await termEntries(rawTerms)).map((item) => [item.term, item.entry.df || 0]));
+    const fallbackBaseTerms = rawSurfaceFallbackTerms(baseTerms, analyzedTerms, presentTerms);
+    if (!fallbackBaseTerms) return null;
+    const fallback = await runSkippedSearch({
+      ...params,
+      q: fallbackBaseTerms.join(" "),
+      baseTerms: fallbackBaseTerms,
+      terms: expandedTermsFromBaseTerms(fallbackBaseTerms)
+    });
+    if (fallback.total <= response.total) return null;
+    return {
+      ...fallback,
+      surfaceFallbackQuery: fallbackBaseTerms.join(" "),
+      stats: {
+        ...fallback.stats || {},
+        surfaceFallbackAttempted: true,
+        surfaceFallbackApplied: true,
+        surfaceFallbackTerms: fallbackBaseTerms,
+        typoAttempted: false,
+        typoApplied: false,
+        typoSkippedReason: "surface-exact"
+      }
+    };
+  }
   async function maybeTypoFallback(params, response, baseTerms, analyzedTerms) {
     if (params.page !== 1 || response.total > 0) return response;
+    const surfaceFallback = await maybeSurfaceExactFallback(params, response, baseTerms, analyzedTerms);
+    if (surfaceFallback) return surfaceFallback;
     const correction = await correctedTypoQuery(baseTerms, analyzedTerms);
     if (!correction) {
       return { ...response, stats: { ...response.stats || {}, typoAttempted: true, typoApplied: false } };
