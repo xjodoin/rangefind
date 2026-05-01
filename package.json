@@ -22,6 +22,7 @@
     "examples/basic/docs.jsonl",
     "examples/basic/rangefind.config.json",
     "examples/basic/public/index.html",
+    "examples/frwiki/README.md",
     "README.md",
     "LICENSE"
   ],
@@ -32,6 +33,7 @@
     "bench:quality": "npm run build:example && node scripts/bench_quality.mjs",
     "bench:performance": "npm run build:example && node scripts/bench_performance.mjs",
     "bench:directories": "node scripts/bench_directory_layouts.mjs",
+    "bench:frwiki": "node scripts/frwiki_fixture.mjs all",
     "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js dist/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
     "test": "node --test",
     "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",

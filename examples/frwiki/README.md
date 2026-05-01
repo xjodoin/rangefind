@@ -1,0 +1,35 @@
+# French Wikipedia Scalability Fixture
+
+This fixture builds a static Rangefind site from French Wikipedia article data.
+It streams the official Wikimedia dump, converts pages to JSONL, builds the
+index, and runs a local search benchmark with request and transfer counts.
+
+Quick bounded run:
+
+```bash
+npm run build:browser
+node scripts/frwiki_fixture.mjs all --limit=5000
+node scripts/serve.mjs examples/frwiki/public 5180
+```
+
+Full dump run:
+
+```bash
+node scripts/frwiki_fixture.mjs all --limit=0
+```
+
+Requirements: `curl` plus the matching decompressor for the dump extension
+(`bzip2` for the default `.bz2` file, `gzip` for `.gz` inputs).
+
+Useful options:
+
+- `--dump-url=URL_OR_FILE`: defaults to the official `frwiki/latest`
+  `pages-articles.xml.bz2` dump.
+- `--limit=N`: stops after `N` indexed articles. Use `0` for the full dump.
+- `--body-chars=N`: indexes the first `N` cleaned characters per article.
+  The default is `6000`; use `0` for uncapped article text.
+- `--reduce-workers=auto`: enables Rangefind's worker reducer path.
+- `--queries=a|b|c`: overrides benchmark queries.
+
+Generated data, public assets, config, and benchmark JSON are intentionally
+ignored by git.

@@ -54,6 +54,20 @@ npm run serve:example
 
 Open `http://localhost:5178/`.
 
+## French Wikipedia Scalability Fixture
+
+Rangefind includes a reproducible French Wikipedia fixture that streams the
+official Wikimedia article dump, builds a static site, and benchmarks query
+latency, request count, and transfer size:
+
+```bash
+npm run build:browser
+node scripts/frwiki_fixture.mjs all --limit=5000
+```
+
+Use `--limit=0` to run against the full dump. The generated site lives at
+`examples/frwiki/public/`.
+
 ## Build A Custom Index
 
 Create newline-delimited JSON:
