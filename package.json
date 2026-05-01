@@ -28,6 +28,7 @@
     "serve:example": "node scripts/serve.mjs examples/basic/public 5178",
     "bench:quality": "npm run build:example && node scripts/bench_quality.mjs",
     "bench:performance": "npm run build:example && node scripts/bench_performance.mjs",
+    "bench:directories": "node scripts/bench_directory_layouts.mjs",
     "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js; do node --check \"$f\"; done",
     "test": "node --test",
     "test:smoke": "npm run build:example && node scripts/smoke.mjs",

@@ -126,6 +126,7 @@ npm run test:smoke
 npm run test:all
 npm run bench:quality
 npm run bench:performance
+npm run bench:directories -- --index=/path/to/public/rangefind
 ```
 
 The unit tests cover analyzer normalization, binary varint/fixed-width codecs,
@@ -135,6 +136,8 @@ end-to-end build plus browser-runtime query against a local HTTP `Range` server.
 The benchmark scripts are dependency-free and run against the example static
 site. `bench:quality` reports known-item and typo-recovery Hit@k/MRR.
 `bench:performance` reports query latency, HTTP request count, and transfer size.
+`bench:directories` compares global, naive prefix, and paged range-directory
+layouts against an existing built index.
 
 ## Project Direction
 
