@@ -3,7 +3,7 @@
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { resolve, extname } from "node:path";
-import { createSearch } from "../src/runtime.js";
+import { createSearch } from "../dist/runtime.browser.js";
 
 const root = resolve("examples/basic/public");
 const server = createServer(async (req, res) => {

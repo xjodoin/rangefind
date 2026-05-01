@@ -9,11 +9,13 @@
   },
   "exports": {
     ".": "./src/runtime.js",
+    "./browser": "./dist/runtime.browser.js",
     "./builder": "./src/builder.js",
     "./analyzer": "./src/analyzer.js"
   },
   "files": [
     "bin/",
+    "dist/",
     "src/",
     "docs/",
     "scripts/",
@@ -24,15 +26,18 @@
     "LICENSE"
   ],
   "scripts": {
+    "build:browser": "node scripts/build_browser_bundle.mjs",
     "build:example": "node bin/rangefind.js build --config examples/basic/rangefind.config.json",
     "serve:example": "node scripts/serve.mjs examples/basic/public 5178",
     "bench:quality": "npm run build:example && node scripts/bench_quality.mjs",
     "bench:performance": "npm run build:example && node scripts/bench_performance.mjs",
     "bench:directories": "node scripts/bench_directory_layouts.mjs",
-    "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js; do node --check \"$f\"; done",
+    "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js dist/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
     "test": "node --test",
-    "test:smoke": "npm run build:example && node scripts/smoke.mjs",
-    "test:all": "npm run check && npm test && npm run test:smoke"
+    "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",
+    "test:all": "npm run build:browser && npm run check && npm test && npm run test:smoke"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "esbuild": "^0.25.12"
+  }
 }

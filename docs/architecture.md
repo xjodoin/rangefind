@@ -4,6 +4,16 @@ Rangefind separates logical retrieval units from physical deployment files.
 
 ## Build Output
 
+The package ships one browser entrypoint:
+
+```text
+dist/runtime.browser.js
+```
+
+That file bundles the query runtime and browser-safe codecs into a single ESM
+module. Hosts should import it directly instead of copying `src/*.js`; the
+source modules remain the development and Node test surface.
+
 ```text
 rangefind/
   manifest.json

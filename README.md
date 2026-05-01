@@ -19,6 +19,7 @@ a large thesis corpus.
 - Phrase signals for title/heading fields.
 - Adaptive logical term shards.
 - Independently compressed logical shards packed into `terms/packs/*.bin`.
+- Single ESM browser runtime bundle at `dist/runtime.browser.js`.
 - Lazy paged binary range directories at `terms/directory-root.bin.gz` and
   `terms/directory-pages/*.bin.gz`.
 - Browser runtime with coalesced HTTP `Range` fetches.

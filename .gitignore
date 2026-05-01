@@ -1,5 +1,7 @@
 node_modules/
-dist/
+dist/*
+!dist/
+!dist/runtime.browser.js
 examples/basic/public/rangefind/
 .DS_Store
 *.log
