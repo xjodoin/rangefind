@@ -80,6 +80,55 @@ export function buildDocPointerTable(entries, packIndexes, options = {}) {
   return { buffer, meta };
 }
 
+export function buildDocPointerTableFromReader(count, packIndexes, readEntry, options = {}) {
+  let maxPack = 0;
+  let maxOffset = 0;
+  let maxLength = 0;
+  let maxLogicalLength = 0;
+  for (let i = 0; i < count; i++) {
+    const entry = readEntry(i);
+    const packIndex = packIndexes.get(entry.pack);
+    if (!Number.isFinite(packIndex)) throw new Error(`Rangefind doc pointer references unknown pack ${entry.pack}.`);
+    maxPack = Math.max(maxPack, packIndex);
+    maxOffset = Math.max(maxOffset, entry.offset || 0);
+    maxLength = Math.max(maxLength, entry.length || 0);
+    maxLogicalLength = Math.max(maxLogicalLength, entry.logicalLength || 0);
+  }
+  const widths = {
+    pack: fixedWidth([maxPack]),
+    offset: fixedWidth([maxOffset]),
+    length: fixedWidth([maxLength]),
+    logicalLength: fixedWidth([maxLogicalLength])
+  };
+  const recordBytes = widths.pack + widths.offset + widths.length + widths.logicalLength + SHA256_BYTES;
+  const meta = {
+    format: options.format || DOC_POINTER_FORMAT,
+    version: options.version || DOC_POINTER_VERSION,
+    count,
+    checksum_bytes: SHA256_BYTES,
+    recordBytes,
+    widths
+  };
+  const header = headerBytes(meta, options.magic || DOC_POINTER_PAGE_MAGIC);
+  meta.dataOffset = header.length;
+  const buffer = Buffer.alloc(meta.dataOffset + count * recordBytes);
+  buffer.set(header, 0);
+  for (let i = 0; i < count; i++) {
+    const entry = readEntry(i);
+    let offset = meta.dataOffset + i * recordBytes;
+    writeFixedInt(buffer, offset, widths.pack, packIndexes.get(entry.pack));
+    offset += widths.pack;
+    writeFixedInt(buffer, offset, widths.offset, entry.offset);
+    offset += widths.offset;
+    writeFixedInt(buffer, offset, widths.length, entry.length);
+    offset += widths.length;
+    writeFixedInt(buffer, offset, widths.logicalLength, entry.logicalLength || 0);
+    offset += widths.logicalLength;
+    buffer.set(checksumToBytes(entry.checksum), offset);
+  }
+  return { buffer, meta };
+}
+
 export function parseDocPointerHeader(buffer, options = {}) {
   const bytes = new Uint8Array(buffer);
   const magic = options.magic || DOC_POINTER_PAGE_MAGIC;

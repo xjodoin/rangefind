@@ -2,58 +2,50 @@ import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { gzipSync } from "node:zlib";
+import { openCodeStore } from "./build_store.js";
 import { buildTermShard } from "./codec.js";
 import { createTypoRunBuffer, addTypoIndexTerm, flushTypoBuffer } from "./typo.js";
-import { readRunRecords } from "./runs.js";
-import { partitionEntries } from "./shards.js";
+import { reduceRunToPartitions } from "./reduce_stream.js";
 
 const {
   config,
-  codes,
+  codes: codeDescriptor,
   filters,
   measuredTotal,
   runsOut,
   shardOut,
+  sortOut,
   typoOptions,
   typoRunsOut
 } = workerData;
 
 mkdirSync(shardOut, { recursive: true });
+const codes = openCodeStore(codeDescriptor);
 const typoBuffer = typoOptions?.enabled ? createTypoRunBuffer(typoRunsOut, typoOptions) : null;
 
 async function reduceBaseShard(baseShard) {
   const path = resolve(runsOut, `${baseShard}.run`);
-  const byTerm = new Map();
-  for await (const [term, doc, score] of readRunRecords(path, ["string", "number", "number"])) {
-    if (!term) continue;
-    if (!byTerm.has(term)) byTerm.set(term, new Map());
-    const rows = byTerm.get(term);
-    rows.set(doc, (rows.get(doc) || 0) + score);
-  }
-
-  const entries = [...byTerm.entries()].map(([term, rows]) => [term, [...rows.entries()]]);
-  const partitions = partitionEntries(entries, config);
-  const shards = [];
-  let postings = 0;
-  let sequence = 0;
-  for (const [term, rows] of byTerm) {
-    postings += rows.size;
-    addTypoIndexTerm(typoBuffer, term, rows.size, measuredTotal);
-  }
-  for (const partition of partitions) {
-    const encoded = buildTermShard(partition.entries, measuredTotal, codes, filters, config);
-    const compressed = gzipSync(encoded, { level: 6 });
-    const file = `${encodeURIComponent(partition.name)}.bin`;
-    const out = resolve(shardOut, file);
-    writeFileSync(out, compressed);
-    shards.push({ shard: partition.name, path: out, length: compressed.length, sequence: sequence++ });
-  }
+  const stats = await reduceRunToPartitions({
+    runPath: path,
+    scratchDir: resolve(sortOut, encodeURIComponent(baseShard)),
+    config,
+    onTerm: (term, df) => addTypoIndexTerm(typoBuffer, term, df, measuredTotal),
+    onPartition: (partition, sequence) => {
+      const encoded = buildTermShard(partition.entries, measuredTotal, codes, filters, config);
+      const compressed = gzipSync(encoded, { level: 6 });
+      const file = `${encodeURIComponent(partition.name)}.bin`;
+      const out = resolve(shardOut, file);
+      writeFileSync(out, compressed);
+      return { shard: partition.name, path: out, length: compressed.length, sequence };
+    }
+  });
   unlinkSync(path);
-  return { terms: byTerm.size, postings, shards };
+  return { terms: stats.terms, postings: stats.postings, shards: stats.partitions };
 }
 
 async function finish() {
   flushTypoBuffer(typoBuffer);
+  codes?.close?.();
   return {
     typo: typoBuffer ? {
       runsOut: typoRunsOut,

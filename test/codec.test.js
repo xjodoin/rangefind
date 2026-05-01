@@ -175,9 +175,9 @@ test("doc-value chunks round-trip typed column slices", () => {
     _dicts: { category: { values: [{ value: "" }, { value: "docs" }, { value: "api" }] } }
   });
   const byName = Object.fromEntries(fields.map(field => [field.name, field]));
-  const facet = buildDocValueChunk(byName.category, 2, [[6], [4]]);
+  const facet = buildDocValueChunk(byName.category, 2, [{ codes: [1, 2] }, { codes: [2] }]);
   assert.deepEqual(facet.summary.words, [6]);
-  assert.deepEqual(parseDocValueChunk(facet.buffer).values, [[6], [4]]);
+  assert.deepEqual(parseDocValueChunk(facet.buffer).values, [{ codes: [1, 2] }, { codes: [2] }]);
 
   const dates = buildDocValueChunk(byName.published, 2, [Date.parse("2026-01-01"), null]);
   assert.deepEqual(parseDocValueChunk(dates.buffer).values, [Date.parse("2026-01-01"), null]);
@@ -188,6 +188,16 @@ test("doc-value chunks round-trip typed column slices", () => {
   const bool = buildDocValueChunk(byName.featured, 2, [false, true]);
   assert.deepEqual(bool.summary, { min: 1, max: 2 });
   assert.deepEqual(parseDocValueChunk(bool.buffer).values, [false, true]);
+});
+
+test("sparse facet doc-value chunks do not allocate dense high-cardinality summaries", () => {
+  const values = Array.from({ length: 3000 }, (_, index) => ({ value: String(index) }));
+  const [field] = docValueFields({ facets: [{ name: "tag" }], numbers: [], booleans: [] }, {
+    _dicts: { tag: { values } }
+  });
+  const chunk = buildDocValueChunk(field, 0, [{ codes: [12, 2048] }, { codes: [2999] }]);
+  assert.equal(chunk.summary.words, null);
+  assert.deepEqual(parseDocValueChunk(chunk.buffer).values, [{ codes: [12, 2048] }, { codes: [2999] }]);
 });
 
 test("facet dictionary codec round-trips labels and counts", () => {

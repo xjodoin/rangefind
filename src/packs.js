@@ -16,6 +16,7 @@ export function createPackWriter(outDir, targetBytes, options = {}) {
     outDir,
     targetBytes,
     dedupe: options.dedupe !== false,
+    keepEntries: options.keepEntries !== false,
     objects: new Map(),
     dedupedObjects: 0,
     dedupedBytes: 0,
@@ -55,7 +56,7 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
     }
     writer.dedupedObjects++;
     writer.dedupedBytes += compressed.length;
-    writer.entries[shard] = {
+    const entry = {
       pack: existing.pack,
       offset: existing.offset,
       length: existing.length,
@@ -66,11 +67,12 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
       compression: metadata.compression || existing.compression || "gzip-member",
       checksum
     };
-    return writer.entries[shard];
+    if (writer.keepEntries) writer.entries[shard] = entry;
+    return entry;
   }
   if (!writer.file || (writer.offset > 0 && writer.offset + compressed.length > writer.targetBytes)) openPack(writer);
   appendFileSync(writer.path, compressed);
-  writer.entries[shard] = {
+  const entry = {
     pack: writer.file,
     offset: writer.offset,
     length: compressed.length,
@@ -81,7 +83,8 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
     compression: metadata.compression || "gzip-member",
     checksum
   };
-  writer.objects.set(checksum.value, writer.entries[shard]);
+  if (writer.keepEntries) writer.entries[shard] = entry;
+  if (writer.dedupe) writer.objects.set(checksum.value, entry);
   writer.offset += compressed.length;
   writer.bytes += compressed.length;
   const pack = writer.packs[writer.packs.length - 1];
@@ -89,7 +92,7 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
   pack.shards++;
   pack.objects++;
   pack.references++;
-  return writer.entries[shard];
+  return entry;
 }
 
 export function finalizePackWriter(writer) {
@@ -114,6 +117,7 @@ export function finalizePackWriter(writer) {
   for (const entry of Object.values(writer.entries)) {
     entry.pack = nameMap.get(entry.pack) || entry.pack;
   }
+  writer.packNameMap = nameMap;
   writer.file = writer.packs.at(-1)?.file || "";
   writer.path = writer.packs.at(-1)?.path || "";
   writer.finalized = true;

@@ -1,11 +1,13 @@
 import {
   appendFileSync,
+  createReadStream,
   readdirSync,
   readFileSync,
   mkdirSync,
   openSync,
   closeSync,
   readSync,
+  statSync,
   rmSync,
   unlinkSync,
   writeSync,
@@ -15,7 +17,9 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { gzipSync, gunzipSync } from "node:zlib";
+import { createInterface } from "node:readline";
 import { tokenize } from "./analyzer.js";
+import { createCodeStore } from "./build_store.js";
 import {
   buildBlockFilters,
   buildDocValueChunk,
@@ -25,7 +29,7 @@ import {
   rewriteTermShardForExternalBlocks
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
-import { docLayoutRecord, orderDocIdsByLocality, summarizeDocLayout } from "./doc_layout.js";
+import { DOC_LAYOUT_FORMAT, docLayoutRecord } from "./doc_layout.js";
 import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, encodeDocPageColumns } from "./doc_pages.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
 import {
@@ -34,13 +38,14 @@ import {
   encodeDocValueSortDirectory,
   encodeDocValueSortPage
 } from "./doc_value_tree.js";
-import { buildDocOrdinalTable, buildDocPointerTable } from "./doc_pointers.js";
+import { buildDocOrdinalTable, buildDocPointerTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
-import { encodeRunRecord, readRunRecords } from "./runs.js";
+import { reduceRunToPartitions } from "./reduce_stream.js";
+import { encodeRunRecord } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
-import { baseShardFor, partitionEntries } from "./shards.js";
+import { baseShardFor } from "./shards.js";
 import {
   addTypoIndexTerm,
   addTypoSurfacePairs,
@@ -107,20 +112,6 @@ function facetValues(doc, facet) {
     value,
     label: labels[index] ?? value
   }));
-}
-
-function addBit(words, value) {
-  if (value <= 0) return;
-  const word = Math.floor(value / 32);
-  const bit = value % 32;
-  words[word] |= 2 ** bit;
-}
-
-function facetBits(dict, values) {
-  const words = Math.max(1, Math.ceil(dict.values.length / 32));
-  const out = new Array(words).fill(0);
-  for (const value of values) addBit(out, value);
-  return out;
 }
 
 async function measure(config) {
@@ -208,35 +199,73 @@ function hashedFile(prefix, hash, suffix) {
   return `${prefix}.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}${suffix}`;
 }
 
+const DOC_SPOOL_ENTRY_BYTES = 24;
+const PACKED_DOC_ENTRY_BYTES = 60;
+
 function createDocSpool(outDir) {
   mkdirSync(outDir, { recursive: true });
   const path = resolve(outDir, "payloads.bin");
+  const entryPath = resolve(outDir, "payloads.idx");
+  const layoutPath = resolve(outDir, "layout.jsonl");
   return {
     path,
+    entryPath,
+    layoutPath,
     fd: openSync(path, "w"),
+    entryFd: openSync(entryPath, "w"),
+    layoutFd: openSync(layoutPath, "w"),
     offset: 0,
     bytes: 0,
-    entries: [],
-    layout: []
+    layoutDocs: 0
   };
 }
 
 function closeDocSpool(spool) {
-  if (spool.fd == null) return;
-  closeSync(spool.fd);
-  spool.fd = null;
+  for (const key of ["fd", "entryFd", "layoutFd"]) {
+    if (spool[key] == null) continue;
+    closeSync(spool[key]);
+    spool[key] = null;
+  }
+}
+
+function writeBigUInt(buffer, offset, value) {
+  buffer.writeBigUInt64LE(BigInt(Math.max(0, Math.floor(value || 0))), offset);
+}
+
+function readBigUInt(buffer, offset) {
+  return Number(buffer.readBigUInt64LE(offset));
+}
+
+function writeDocSpoolEntry(spool, index, entry) {
+  const buffer = Buffer.alloc(DOC_SPOOL_ENTRY_BYTES);
+  writeBigUInt(buffer, 0, entry.offset);
+  writeBigUInt(buffer, 8, entry.length);
+  writeBigUInt(buffer, 16, entry.logicalLength);
+  writeSync(spool.entryFd, buffer, 0, buffer.length, index * DOC_SPOOL_ENTRY_BYTES);
+}
+
+function readDocSpoolEntry(fd, index) {
+  const buffer = Buffer.alloc(DOC_SPOOL_ENTRY_BYTES);
+  const bytesRead = readSync(fd, buffer, 0, buffer.length, index * DOC_SPOOL_ENTRY_BYTES);
+  if (bytesRead !== buffer.length) throw new Error(`Rangefind doc spool is missing document ${index}.`);
+  return {
+    offset: readBigUInt(buffer, 0),
+    length: readBigUInt(buffer, 8),
+    logicalLength: readBigUInt(buffer, 16)
+  };
 }
 
 function writeSpooledDoc(spool, payload, index, layoutRecord) {
   const bytes = Buffer.from(JSON.stringify(payload));
   const compressed = gzipSync(bytes, { level: 6 });
   writeSync(spool.fd, compressed, 0, compressed.length, spool.offset);
-  spool.entries[index] = {
+  writeDocSpoolEntry(spool, index, {
     offset: spool.offset,
     length: compressed.length,
     logicalLength: bytes.length
-  };
-  spool.layout[index] = layoutRecord;
+  });
+  writeSync(spool.layoutFd, `${JSON.stringify(layoutRecord)}\n`);
+  spool.layoutDocs++;
   spool.offset += compressed.length;
   spool.bytes += compressed.length;
 }
@@ -248,33 +277,175 @@ function readSpooledDoc(fd, entry) {
   return buffer;
 }
 
-function finishDocPacks(out, spool, total, config) {
-  const packWriter = createPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
-  const order = orderDocIdsByLocality(spool.layout, total);
-  const entriesByDoc = new Array(total);
+function compareLayoutRecords(a, b) {
+  if (!!a.primary !== !!b.primary) return a.primary ? -1 : 1;
+  return String(a.shard || "").localeCompare(String(b.shard || ""))
+    || String(a.primary || "").localeCompare(String(b.primary || ""))
+    || (Number(b.score) || 0) - (Number(a.score) || 0)
+    || String(a.secondary || "").localeCompare(String(b.secondary || ""))
+    || (Number(a.index) || 0) - (Number(b.index) || 0);
+}
+
+function layoutTermLimit(config) {
+  return Math.max(1, Math.floor(Number(config.docLocalityTerms || 2) || 2));
+}
+
+function layoutShardDepth(config) {
+  return Math.max(1, Math.floor(Number(config.docLocalityShardDepth || config.baseShardDepth || 1) || 1));
+}
+
+function layoutSummary(total, config, stats) {
+  return {
+    format: DOC_LAYOUT_FORMAT,
+    strategy: "primary-base-term-impact",
+    terms: layoutTermLimit(config),
+    shard_depth: layoutShardDepth(config),
+    docs: total,
+    docs_without_terms: stats.docsWithoutTerms,
+    primary_terms: stats.primaryTerms
+  };
+}
+
+function writeLayoutChunk(rows, outDir, chunkIndex) {
+  rows.sort(compareLayoutRecords);
+  const file = resolve(outDir, `layout-${String(chunkIndex).padStart(5, "0")}.jsonl`);
+  writeFileSync(file, rows.map(row => `${JSON.stringify(row)}\n`).join(""));
+  rows.length = 0;
+  return file;
+}
+
+async function nextLayoutRow(reader) {
+  const item = await reader.iterator.next();
+  return item.done ? null : JSON.parse(item.value);
+}
+
+async function createLayoutReader(file) {
+  const input = createReadStream(file);
+  const rl = createInterface({ input, crlfDelay: Infinity });
+  const reader = { input, rl, iterator: rl[Symbol.asyncIterator]() };
+  reader.row = await nextLayoutRow(reader);
+  return reader;
+}
+
+async function sortedLayoutOrder(spool, total, config) {
+  const chunkDocs = Math.max(1, Math.floor(Number(config.docLayoutSortChunkDocs || 100000)));
+  const rows = [];
+  const chunks = [];
+  const rl = createInterface({ input: createReadStream(spool.layoutPath), crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line) continue;
+    rows.push(JSON.parse(line));
+    if (rows.length >= chunkDocs) chunks.push(writeLayoutChunk(rows, resolve(config.output, "_build", "docs"), chunks.length));
+  }
+  if (rows.length) chunks.push(writeLayoutChunk(rows, resolve(config.output, "_build", "docs"), chunks.length));
+
+  const readers = await Promise.all(chunks.map(createLayoutReader));
+  const order = [];
+  const stats = { docsWithoutTerms: 0, primaryTerms: 0 };
+  let lastPrimary = null;
+  while (readers.some(reader => reader.row)) {
+    let best = -1;
+    for (let i = 0; i < readers.length; i++) {
+      if (!readers[i].row) continue;
+      if (best < 0 || compareLayoutRecords(readers[i].row, readers[best].row) < 0) best = i;
+    }
+    const row = readers[best].row;
+    order.push(row.index);
+    if (row.primary) {
+      if (row.primary !== lastPrimary) stats.primaryTerms++;
+      lastPrimary = row.primary;
+    } else {
+      stats.docsWithoutTerms++;
+    }
+    readers[best].row = await nextLayoutRow(readers[best]);
+  }
+  for (const reader of readers) {
+    reader.rl.close();
+    reader.input.destroy();
+  }
+  if (order.length !== total) throw new Error(`Rangefind doc layout expected ${total} docs but sorted ${order.length}.`);
+  return { order, summary: layoutSummary(total, config, stats) };
+}
+
+function hexToBytes(hex) {
+  const buffer = Buffer.alloc(32);
+  for (let i = 0; i < buffer.length; i++) buffer[i] = Number.parseInt(String(hex).slice(i * 2, i * 2 + 2), 16);
+  return buffer;
+}
+
+function bytesToHex(buffer, offset) {
+  let out = "";
+  for (let i = 0; i < 32; i++) out += buffer[offset + i].toString(16).padStart(2, "0");
+  return out;
+}
+
+function tempPackIndex(file) {
+  const match = /^(\d+)/u.exec(String(file || "0"));
+  return match ? Number(match[1]) || 0 : 0;
+}
+
+function writePackedDocEntry(fd, doc, entry) {
+  const buffer = Buffer.alloc(PACKED_DOC_ENTRY_BYTES);
+  buffer.writeUInt32LE(tempPackIndex(entry.pack), 0);
+  writeBigUInt(buffer, 4, entry.offset);
+  writeBigUInt(buffer, 12, entry.length);
+  writeBigUInt(buffer, 20, entry.logicalLength || 0);
+  buffer.set(hexToBytes(entry.checksum.value), 28);
+  writeSync(fd, buffer, 0, buffer.length, doc * PACKED_DOC_ENTRY_BYTES);
+}
+
+function readPackedDocEntry(fd, doc, packFiles) {
+  const buffer = Buffer.alloc(PACKED_DOC_ENTRY_BYTES);
+  const bytesRead = readSync(fd, buffer, 0, buffer.length, doc * PACKED_DOC_ENTRY_BYTES);
+  if (bytesRead !== buffer.length) throw new Error(`Rangefind packed doc entry is missing document ${doc}.`);
+  const packIndex = buffer.readUInt32LE(0);
+  return {
+    pack: packFiles[packIndex],
+    offset: readBigUInt(buffer, 4),
+    length: readBigUInt(buffer, 12),
+    physicalLength: readBigUInt(buffer, 12),
+    logicalLength: readBigUInt(buffer, 20),
+    checksum: { algorithm: "sha256", value: bytesToHex(buffer, 28) }
+  };
+}
+
+async function finishDocPacks(out, spool, total, config) {
+  const layout = await sortedLayoutOrder(spool, total, config);
+  const packWriter = createPackWriter(resolve(out, "docs", "packs"), config.docPackBytes, { keepEntries: false, dedupe: false });
+  const entryPath = resolve(out, "_build", "docs", "doc-pack-entries.bin");
+  const entryOutFd = openSync(entryPath, "w");
   const fd = openSync(spool.path, "r");
+  const spoolEntryFd = openSync(spool.entryPath, "r");
   try {
-    for (const index of order) {
-      const entry = spool.entries[index];
-      if (!entry) throw new Error(`Rangefind doc spool is missing document ${index}.`);
-      writePackedShard(packWriter, docIndexKey(index), readSpooledDoc(fd, entry), {
+    for (const index of layout.order) {
+      const entry = readDocSpoolEntry(spoolEntryFd, index);
+      const packed = writePackedShard(packWriter, docIndexKey(index), readSpooledDoc(fd, entry), {
         kind: "doc",
         codec: "json-v1",
         logicalLength: entry.logicalLength
       });
-      entriesByDoc[index] = packWriter.entries[docIndexKey(index)];
+      writePackedDocEntry(entryOutFd, index, packed);
     }
   } finally {
     closeSync(fd);
+    closeSync(spoolEntryFd);
+    closeSync(entryOutFd);
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  const pointerTable = buildDocPointerTable(order.map(index => entriesByDoc[index]), packIndexes);
+  const packFiles = packTable(packWriter.packs);
+  const entryInFd = openSync(entryPath, "r");
+  let pointerTable;
+  try {
+    pointerTable = buildDocPointerTableFromReader(layout.order.length, packIndexes, ordinal => readPackedDocEntry(entryInFd, layout.order[ordinal], packFiles));
+  } finally {
+    closeSync(entryInFd);
+  }
   const hash = sha256Hex(pointerTable.buffer);
   const file = `docs/pointers/${hashedFile("0000", hash, ".bin")}`;
   mkdirSync(resolve(out, "docs", "pointers"), { recursive: true });
   writeFileSync(resolve(out, file), pointerTable.buffer);
-  const ordinalTable = buildDocOrdinalTable(order, total);
+  const ordinalTable = buildDocOrdinalTable(layout.order, total);
   const ordinalHash = sha256Hex(ordinalTable.buffer);
   const ordinalFile = `docs/ordinals/${hashedFile("0000", ordinalHash, ".bin")}`;
   mkdirSync(resolve(out, "docs", "ordinals"), { recursive: true });
@@ -283,7 +454,7 @@ function finishDocPacks(out, spool, total, config) {
     storage: "range-pack-v1",
     compression: "gzip-member",
     layout: {
-      ...summarizeDocLayout(spool.layout, total, config),
+      ...layout.summary,
       spool_bytes: spool.bytes
     },
     pointers: {
@@ -312,13 +483,13 @@ function finishDocPages(out, spool, total, config) {
   const packWriter = createPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
   const entries = [];
   const fd = openSync(spool.path, "r");
+  const spoolEntryFd = openSync(spool.entryPath, "r");
   try {
     for (let pageStart = 0, pageIndex = 0; pageStart < total; pageStart += pageSize, pageIndex++) {
       const pageEnd = Math.min(total, pageStart + pageSize);
       const docs = [];
       for (let index = pageStart; index < pageEnd; index++) {
-        const entry = spool.entries[index];
-        if (!entry) throw new Error(`Rangefind doc spool is missing document ${index}.`);
+        const entry = readDocSpoolEntry(spoolEntryFd, index);
         docs.push(JSON.parse(gunzipSync(readSpooledDoc(fd, entry)).toString("utf8")));
       }
       const source = encodeDocPageColumns(docs, fields);
@@ -331,6 +502,7 @@ function finishDocPages(out, spool, total, config) {
     }
   } finally {
     closeSync(fd);
+    closeSync(spoolEntryFd);
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
@@ -405,7 +577,7 @@ function writeDocValuePacks(out, config, total, codes) {
   for (const field of docValueFields(config, codes)) {
     const chunks = [];
     for (let start = 0; start < total; start += chunkSize) {
-      const rows = (codes[field.name] || []).slice(start, Math.min(total, start + chunkSize));
+      const rows = codeRows(codes, field.name, start, Math.min(total, start + chunkSize));
       const encoded = buildDocValueChunk(field, start, rows);
       const key = `${field.name}\u0000${chunks.length}`;
       const entry = writePackedShard(packWriter, key, gzipSync(encoded.buffer, { level: 6 }), {
@@ -478,14 +650,25 @@ function sortableDocValue(field, value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function codeValue(codes, name, doc) {
+  if (codes && typeof codes.get === "function") return codes.get(name, doc);
+  const values = codes?.[name] || [];
+  return values[doc];
+}
+
+function codeRows(codes, name, start, end) {
+  const count = Math.max(0, end - start);
+  if (codes && typeof codes.chunk === "function") return codes.chunk(name, start, count);
+  return (codes?.[name] || []).slice(start, end);
+}
+
 function summarizeDocValuePage(summaryFields, codes, docs) {
   const summaries = {};
   for (const field of summaryFields) {
     let min = null;
     let max = null;
-    const values = codes[field.name] || [];
     for (const doc of docs) {
-      const value = sortableDocValue(field, values[doc]);
+      const value = sortableDocValue(field, codeValue(codes, field.name, doc));
       if (!Number.isFinite(value)) continue;
       min = min == null ? value : Math.min(min, value);
       max = max == null ? value : Math.max(max, value);
@@ -511,11 +694,14 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
   const pagesByField = new Map();
 
   for (const field of sourceFields) {
-    const values = codes[field.name] || [];
     const rows = [];
-    for (let doc = 0; doc < total; doc++) {
-      const value = sortableDocValue(field, values[doc]);
-      if (Number.isFinite(value)) rows.push({ doc, value });
+    const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
+    for (let start = 0; start < total; start += readChunkSize) {
+      const values = codeRows(codes, field.name, start, Math.min(total, start + readChunkSize));
+      for (let row = 0; row < values.length; row++) {
+        const value = sortableDocValue(field, values[row]);
+        if (Number.isFinite(value)) rows.push({ doc: start + row, value });
+      }
     }
     rows.sort((a, b) => a.value - b.value || a.doc - b.doc);
     const pages = [];
@@ -640,11 +826,7 @@ function externalizeTermShard(encoded, config, filters, blockPackWriter) {
 }
 
 async function writePostingRuns(config, measured, dirs, typoBuffer) {
-  const codes = {};
-  for (const facet of config.facets) codes[facet.name] = new Array(measured.total);
-  for (const number of config.numbers) codes[number.name] = new Array(measured.total);
-  for (const boolean of config.booleans || []) codes[boolean.name] = new Array(measured.total);
-  codes._dicts = measured.dicts;
+  const codes = createCodeStore(resolve(dirs.out, "_build", "codes"), config, measured.total, measured.dicts);
 
   const initialResults = [];
   const buffer = { byShard: new Map(), lines: 0, runsOut: dirs.runsOut };
@@ -674,10 +856,10 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
           const code = addDict(measured.dicts[facet.name], item.value, item.label);
           values.push(code);
         }
-        codes[facet.name][index] = facetBits(measured.dicts[facet.name], values);
+        codes.set(facet.name, index, { codes: values });
       }
-      for (const number of config.numbers) codes[number.name][index] = numericValue(doc, number);
-      for (const boolean of config.booleans || []) codes[boolean.name][index] = booleanValue(doc, boolean);
+      for (const number of config.numbers) codes.set(number.name, index, numericValue(doc, number));
+      for (const boolean of config.booleans || []) codes.set(boolean.name, index, booleanValue(doc, boolean));
       addTypoSurfacePairs(typoBuffer, surfacePairsForFields(doc, config.fields, fieldText));
 
       const payload = docPayload(doc, config, index);
@@ -698,40 +880,34 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 
 async function reduceShard(baseShard, config, measured, runData, filters, packWriter, blockPackWriter, typoBuffer) {
   const path = resolve(runData.runsOut, `${baseShard}.run`);
-  const byTerm = new Map();
-  for await (const [term, doc, score] of readRunRecords(path, ["string", "number", "number"])) {
-    if (!term) continue;
-    if (!byTerm.has(term)) byTerm.set(term, new Map());
-    const rows = byTerm.get(term);
-    rows.set(doc, (rows.get(doc) || 0) + score);
-  }
-
-  const entries = [...byTerm.entries()].map(([term, rows]) => [term, [...rows.entries()]]);
-  const partitions = partitionEntries(entries, config);
-  const finalShards = [];
   const blockStats = emptyPostingBlockStats();
-  let postings = 0;
-  for (const [term, rows] of byTerm) {
-    postings += rows.size;
-    addTypoIndexTerm(typoBuffer, term, rows.size, measured.total);
-  }
-  for (const partition of partitions) {
-    const encoded = buildTermShard(partition.entries, measured.total, runData.codes, filters, config);
-    const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
-    addPostingBlockStats(blockStats, externalized.stats);
-    writePackedShard(packWriter, partition.name, gzipSync(externalized.buffer, { level: 6 }), {
-      kind: "term-shard",
-      codec: "rfterm-v1",
-      logicalLength: externalized.buffer.length
-    });
-    finalShards.push(partition.name);
-  }
+  const stats = await reduceRunToPartitions({
+    runPath: path,
+    scratchDir: resolve(runData.reduceSortOut, encodeURIComponent(baseShard)),
+    config,
+    onTerm: (term, df) => addTypoIndexTerm(typoBuffer, term, df, measured.total),
+    onPartition: (partition) => {
+      const encoded = buildTermShard(partition.entries, measured.total, runData.codes, filters, config);
+      const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
+      addPostingBlockStats(blockStats, externalized.stats);
+      writePackedShard(packWriter, partition.name, gzipSync(externalized.buffer, { level: 6 }), {
+        kind: "term-shard",
+        codec: "rfterm-v1",
+        logicalLength: externalized.buffer.length
+      });
+      return partition.name;
+    }
+  });
   unlinkSync(path);
-  return { terms: byTerm.size, postings, shards: finalShards, blockStats };
+  return { terms: stats.terms, postings: stats.postings, shards: stats.partitions, blockStats };
 }
 
 function createReduceWorker(workerData) {
-  const worker = new Worker(new URL("./reduce_worker.js", import.meta.url), { workerData });
+  const heapMb = Math.max(0, Math.floor(Number(workerData.config?.reduceWorkerHeapMb || 0)));
+  const worker = new Worker(new URL("./reduce_worker.js", import.meta.url), {
+    workerData,
+    ...(heapMb > 0 ? { resourceLimits: { maxOldGenerationSizeMb: heapMb } } : {})
+  });
   let nextId = 0;
   const pending = new Map();
   worker.on("message", (message) => {
@@ -772,11 +948,31 @@ function mergeTypoWorkerRuns(typoBuffer, workerTypo) {
   for (const shard of workerTypo.shards || []) typoBuffer.shards.add(shard);
   for (const file of readdirSync(workerTypo.runsOut)) {
     if (!file.endsWith(".run")) continue;
-    appendFileSync(resolve(typoBuffer.runsOut, file), readFileSync(resolve(workerTypo.runsOut, file)));
+    appendFileRange(resolve(typoBuffer.runsOut, file), resolve(workerTypo.runsOut, file));
+  }
+}
+
+function appendFileRange(targetPath, sourcePath) {
+  const sourceFd = openSync(sourcePath, "r");
+  const targetFd = openSync(targetPath, "a");
+  const buffer = Buffer.alloc(1024 * 1024);
+  let offset = 0;
+  const size = statSync(sourcePath).size;
+  try {
+    while (offset < size) {
+      const bytesRead = readSync(sourceFd, buffer, 0, Math.min(buffer.length, size - offset), offset);
+      if (!bytesRead) break;
+      writeSync(targetFd, buffer, 0, bytesRead);
+      offset += bytesRead;
+    }
+  } finally {
+    closeSync(sourceFd);
+    closeSync(targetFd);
   }
 }
 
 function workerCodeTables(codes) {
+  if (codes && typeof codes.descriptor === "function") return codes.descriptor();
   const cloned = {};
   for (const [name, values] of Object.entries(codes || {})) {
     if (name === "_dicts") continue;
@@ -796,24 +992,37 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
     measuredTotal: measured.total,
     runsOut: dirs.runsOut,
     shardOut: resolve(shardOutRoot, `worker-${index}`),
+    sortOut: resolve(dirs.out, "_build", "reduce-sort", `worker-${index}`),
     typoOptions: typoBuffer?.options || { enabled: false },
     typoRunsOut: resolve(dirs.out, "_build", "typo-index-runs", `worker-${index}`)
   }));
 
   const taskResults = [];
-  let nextTask = 0;
+  const largeRunBytes = Math.max(0, Math.floor(Number(config.reduceLargeRunBytes || 0)));
+  const tasks = runData.baseShards.map((baseShard, order) => {
+    const path = resolve(dirs.runsOut, `${baseShard}.run`);
+    const bytes = statSync(path).size;
+    return { order, baseShard, bytes };
+  });
+  const smallTasks = tasks.filter(task => task.bytes < largeRunBytes);
+  const largeTasks = tasks.filter(task => task.bytes >= largeRunBytes).sort((a, b) => b.bytes - a.bytes || a.order - b.order);
+  let nextSmallTask = 0;
   let termCount = 0;
   let postingCount = 0;
+  async function runTask(worker, task) {
+    const stats = await worker.call({ type: "reduce", baseShard: task.baseShard });
+    termCount += stats.terms;
+    postingCount += stats.postings;
+    taskResults.push({ order: task.order, ...stats });
+  }
   try {
     await Promise.all(workers.map(async (worker) => {
-      while (nextTask < runData.baseShards.length) {
-        const order = nextTask++;
-        const stats = await worker.call({ type: "reduce", baseShard: runData.baseShards[order] });
-        termCount += stats.terms;
-        postingCount += stats.postings;
-        taskResults.push({ order, ...stats });
+      while (nextSmallTask < smallTasks.length) {
+        const task = smallTasks[nextSmallTask++];
+        await runTask(worker, task);
       }
     }));
+    for (const task of largeTasks) await runTask(workers[0], task);
     const finishes = await Promise.all(workers.map(worker => worker.call({ type: "finish" })));
     for (const item of finishes) mergeTypoWorkerRuns(typoBuffer, item.typo);
   } finally {
@@ -860,7 +1069,7 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
     let termCount = 0;
     let postingCount = 0;
     for (let i = 0; i < runData.baseShards.length; i++) {
-      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter, blockPackWriter, typoBuffer);
+      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut, reduceSortOut: resolve(dirs.out, "_build", "reduce-sort") }, filters, packWriter, blockPackWriter, typoBuffer);
       termCount += stats.terms;
       postingCount += stats.postings;
       addPostingBlockStats(blockStats, stats.blockStats);
@@ -910,7 +1119,7 @@ export async function build({ configPath }) {
   const typoBuffer = typo.enabled ? createTypoRunBuffer(dirs.typoRunsOut, typo) : null;
   const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
   const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
-  const docs = finishDocPacks(dirs.out, runData.docSpool, measured.total, config);
+  const docs = await finishDocPacks(dirs.out, runData.docSpool, measured.total, config);
   docs.pages = finishDocPages(dirs.out, runData.docSpool, measured.total, config);
   const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
   const docValues = writeDocValuePacks(dirs.out, config, measured.total, runData.codes);
@@ -1078,6 +1287,7 @@ export async function build({ configPath }) {
     }
   };
   writeFileSync(resolve(dirs.out, "manifest.json"), JSON.stringify(manifest));
+  runData.codes.close?.();
   rmSync(resolve(dirs.out, "_build"), { recursive: true, force: true });
   console.log(`Rangefind: built ${measured.total.toLocaleString()} docs, ${reduced.shards.length.toLocaleString()} logical shards, ${reduced.packs.length.toLocaleString()} packs`);
 }

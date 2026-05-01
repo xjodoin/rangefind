@@ -198,7 +198,9 @@ var CODE_KIND = { facet: 1, number: 2, boolean: 3 };
 var CODE_TYPE = { keyword: 1, int: 2, long: 3, float: 4, double: 5, date: 6, boolean: 7 };
 var CODE_KIND_NAME = Object.fromEntries(Object.entries(CODE_KIND).map(([key, value]) => [value, key]));
 var CODE_TYPE_NAME = Object.fromEntries(Object.entries(CODE_TYPE).map(([key, value]) => [value, key]));
-var DOC_VALUE_FORMAT_VERSION = 1;
+var DOC_VALUE_FORMAT_VERSION = 2;
+var DOC_VALUE_ENCODING_DENSE = 0;
+var DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 var FACET_DICT_FORMAT_VERSION = 1;
 function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
@@ -337,19 +339,37 @@ function parseDocValueChunk(buffer) {
   assertMagic(bytes, DOC_VALUE_MAGIC, "Unsupported Rangefind doc-value chunk");
   const state = { pos: DOC_VALUE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== DOC_VALUE_FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value chunk version ${version}`);
+  if (version !== 1 && version !== DOC_VALUE_FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value chunk version ${version}`);
   const field = {
     name: readUtf8(bytes, state),
     kind: CODE_KIND_NAME[bytes[state.pos++]] || "number",
     type: CODE_TYPE_NAME[bytes[state.pos++]] || "int",
     width: bytes[state.pos++],
     words: readVarint(bytes, state),
+    encoding: version >= 2 ? bytes[state.pos++] : DOC_VALUE_ENCODING_DENSE,
     start: readVarint(bytes, state),
     count: readVarint(bytes, state),
     min: readFloat64(bytes, state)
   };
   const values = new Array(field.count);
-  if (field.kind === "facet") {
+  if (field.kind === "facet" && field.encoding === DOC_VALUE_ENCODING_SPARSE_FACET) {
+    const offsets = new Array(field.count + 1);
+    for (let doc = 0; doc <= field.count; doc++) offsets[doc] = readFixedInt(bytes, state.pos + doc * field.width, field.width);
+    const dataStart = state.pos + offsets.length * field.width;
+    for (let doc = 0; doc < field.count; doc++) {
+      const cursor = { pos: dataStart + offsets[doc] };
+      const end = dataStart + offsets[doc + 1];
+      const codeCount = readVarint(bytes, cursor);
+      const codes = [];
+      let previous = 0;
+      for (let i = 0; i < codeCount && cursor.pos <= end; i++) {
+        previous += readVarint(bytes, cursor);
+        codes.push(previous);
+      }
+      values[doc] = { codes };
+    }
+    state.pos = dataStart + offsets[field.count];
+  } else if (field.kind === "facet") {
     for (let doc = 0; doc < field.count; doc++) {
       const words = new Array(field.words);
       for (let word = 0; word < field.words; word++) words[word] = readFixedInt(bytes, state.pos + (doc * field.words + word) * field.width, field.width);
@@ -1017,6 +1037,10 @@ function selectedFacetCodes(manifest, field, selected) {
 }
 function facetCodeMatches(words, selected) {
   if (!selected?.size) return true;
+  if (Array.isArray(words?.codes)) {
+    for (const code of words.codes) if (selected.has(code)) return true;
+    return false;
+  }
   if (Array.isArray(words)) {
     for (const value of selected) {
       const word = Math.floor(value / 32);

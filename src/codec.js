@@ -17,7 +17,9 @@ const CODE_KIND = { facet: 1, number: 2, boolean: 3 };
 const CODE_TYPE = { keyword: 1, int: 2, long: 3, float: 4, double: 5, date: 6, boolean: 7 };
 const CODE_KIND_NAME = Object.fromEntries(Object.entries(CODE_KIND).map(([key, value]) => [value, key]));
 const CODE_TYPE_NAME = Object.fromEntries(Object.entries(CODE_TYPE).map(([key, value]) => [value, key]));
-const DOC_VALUE_FORMAT_VERSION = 1;
+const DOC_VALUE_FORMAT_VERSION = 2;
+const DOC_VALUE_ENCODING_DENSE = 0;
+const DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 const FACET_DICT_FORMAT_VERSION = 1;
 const MAX_SUMMARY_FACET_WORDS = 64;
 
@@ -76,17 +78,30 @@ function addBit(words, value) {
   words[word] |= 2 ** bit;
 }
 
+function facetCodes(value) {
+  if (value?.codes) return value.codes.map(Number).filter(Number.isFinite);
+  return null;
+}
+
 function emptySummary(filters) {
   return filters.map(filter => filter.kind === "facet" ? { words: new Array(filter.words).fill(0) } : { min: null, max: null });
+}
+
+function codeValue(codes, name, doc) {
+  if (codes && typeof codes.get === "function") return codes.get(name, doc);
+  const values = codes?.[name];
+  return values ? values[doc] : null;
 }
 
 function updateSummary(summary, filters, codes, doc) {
   for (let i = 0; i < filters.length; i++) {
     const filter = filters[i];
-    const values = codes[filter.name];
-    const value = values ? values[doc] : null;
+    const value = codeValue(codes, filter.name, doc);
     if (filter.kind === "facet") {
-      if (Array.isArray(value)) {
+      const codesForDoc = facetCodes(value);
+      if (codesForDoc) {
+        for (const item of codesForDoc) addBit(summary[i].words, item);
+      } else if (Array.isArray(value)) {
         if (value.length === summary[i].words.length) {
           for (let w = 0; w < summary[i].words.length; w++) summary[i].words[w] |= value[w] || 0;
         } else {
@@ -402,6 +417,12 @@ export function rewriteTermShardForExternalBlocks(buffer, manifest, config, writ
 }
 
 function facetWords(value, words) {
+  const codes = facetCodes(value);
+  if (codes) {
+    const out = new Array(words).fill(0);
+    for (const item of codes) addBit(out, Number(item) || 0);
+    return out;
+  }
   if (Array.isArray(value) && value.length === words) return value;
   const out = new Array(words).fill(0);
   const values = Array.isArray(value) ? value : [value];
@@ -433,11 +454,13 @@ function encodeIntegerField(total, values) {
 }
 
 function fieldDescriptors(config, codes = {}) {
+  if (Array.isArray(codes._fields)) return codes._fields.map(field => ({ ...field }));
   return [
     ...config.facets.map(facet => ({
       name: facet.name,
       kind: "facet",
       type: "keyword",
+      encoding: "sparse-set",
       words: Math.max(1, Math.ceil(((codes._dicts?.[facet.name]?.values?.length) || 1) / 32))
     })),
     ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number), words: 0 })),
@@ -446,12 +469,13 @@ function fieldDescriptors(config, codes = {}) {
 }
 
 function summarizeFacetRows(rows, words) {
+  if (words > MAX_SUMMARY_FACET_WORDS) return { words: null };
   const summary = new Array(words).fill(0);
   for (const value of rows) {
     const row = facetWords(value, words);
     for (let word = 0; word < words; word++) summary[word] |= row[word] || 0;
   }
-  return words <= MAX_SUMMARY_FACET_WORDS ? { words: summary } : { words: null };
+  return { words: summary };
 }
 
 function summarizeNumericRows(rows) {
@@ -469,12 +493,29 @@ function summarizeBooleanRows(rows) {
 
 function encodeDocValueRows(field, rows) {
   if (field.kind === "facet") {
-    const chunk = Buffer.alloc(rows.length * field.words * 4);
-    for (let doc = 0; doc < rows.length; doc++) {
-      const words = facetWords(rows[doc], field.words);
-      for (let word = 0; word < field.words; word++) writeFixedInt(chunk, (doc * field.words + word) * 4, 4, words[word] || 0);
+    const offsets = [];
+    const data = [];
+    for (const row of rows) {
+      offsets.push(data.length);
+      const codes = [...new Set(facetCodes(row) || [])].sort((a, b) => a - b);
+      pushVarint(data, codes.length);
+      let previous = 0;
+      for (const code of codes) {
+        pushVarint(data, code - previous);
+        previous = code;
+      }
     }
-    return { chunk, width: 4, min: 0, summary: summarizeFacetRows(rows, field.words) };
+    offsets.push(data.length);
+    const width = fixedWidth(offsets);
+    const offsetBytes = Buffer.alloc(offsets.length * width);
+    for (let i = 0; i < offsets.length; i++) writeFixedInt(offsetBytes, i * width, width, offsets[i]);
+    return {
+      chunk: Buffer.concat([offsetBytes, Buffer.from(Uint8Array.from(data))]),
+      width,
+      min: 0,
+      encoding: DOC_VALUE_ENCODING_SPARSE_FACET,
+      summary: summarizeFacetRows(rows, field.words)
+    };
   }
   if (field.kind === "boolean") {
     const chunk = Buffer.alloc(rows.length);
@@ -504,6 +545,7 @@ export function buildDocValueChunk(field, start, rows) {
   header.push(CODE_TYPE[field.type] || CODE_TYPE.int);
   header.push(encoded.width);
   pushVarint(header, field.words || 0);
+  header.push(encoded.encoding || DOC_VALUE_ENCODING_DENSE);
   pushVarint(header, start);
   pushVarint(header, rows.length);
   pushFloat64(header, encoded.min || 0);
@@ -520,19 +562,37 @@ export function parseDocValueChunk(buffer) {
   assertMagic(bytes, DOC_VALUE_MAGIC, "Unsupported Rangefind doc-value chunk");
   const state = { pos: DOC_VALUE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== DOC_VALUE_FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value chunk version ${version}`);
+  if (version !== 1 && version !== DOC_VALUE_FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value chunk version ${version}`);
   const field = {
     name: readUtf8(bytes, state),
     kind: CODE_KIND_NAME[bytes[state.pos++]] || "number",
     type: CODE_TYPE_NAME[bytes[state.pos++]] || "int",
     width: bytes[state.pos++],
     words: readVarint(bytes, state),
+    encoding: version >= 2 ? bytes[state.pos++] : DOC_VALUE_ENCODING_DENSE,
     start: readVarint(bytes, state),
     count: readVarint(bytes, state),
     min: readFloat64(bytes, state)
   };
   const values = new Array(field.count);
-  if (field.kind === "facet") {
+  if (field.kind === "facet" && field.encoding === DOC_VALUE_ENCODING_SPARSE_FACET) {
+    const offsets = new Array(field.count + 1);
+    for (let doc = 0; doc <= field.count; doc++) offsets[doc] = readFixedInt(bytes, state.pos + doc * field.width, field.width);
+    const dataStart = state.pos + offsets.length * field.width;
+    for (let doc = 0; doc < field.count; doc++) {
+      const cursor = { pos: dataStart + offsets[doc] };
+      const end = dataStart + offsets[doc + 1];
+      const codeCount = readVarint(bytes, cursor);
+      const codes = [];
+      let previous = 0;
+      for (let i = 0; i < codeCount && cursor.pos <= end; i++) {
+        previous += readVarint(bytes, cursor);
+        codes.push(previous);
+      }
+      values[doc] = { codes };
+    }
+    state.pos = dataStart + offsets[field.count];
+  } else if (field.kind === "facet") {
     for (let doc = 0; doc < field.count; doc++) {
       const words = new Array(field.words);
       for (let word = 0; word < field.words; word++) words[word] = readFixedInt(bytes, state.pos + (doc * field.words + word) * field.width, field.width);

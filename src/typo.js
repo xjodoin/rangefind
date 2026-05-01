@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -220,53 +220,193 @@ function buildTypoShard(byDelete, options) {
   };
 }
 
-function typoEntryCandidateCount(entries, options) {
-  return entries.reduce((sum, [, candidates]) => sum + Math.min(options.maxCandidatesPerDelete, candidates.size), 0);
+function compareTypoRecords(left, right) {
+  return left[0].localeCompare(right[0]) || left[1].localeCompare(right[1]) || left[2] - right[2];
 }
 
-function partitionTypoEntries(entries, options, depth = options.baseShardDepth) {
-  if (!entries.length) return [];
-  if (typoEntryCandidateCount(entries, options) <= options.targetShardCandidates || depth >= options.maxShardDepth) {
-    return [{ name: typoShardKey(entries[0][0], options, depth), entries }];
-  }
-  const groups = new Map();
-  for (const entry of entries) {
-    const key = typoShardKey(entry[0], options, depth + 1);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(entry);
-  }
-  return [...groups.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .flatMap(([, group]) => partitionTypoEntries(group, options, depth + 1));
+function typoSortLimits(options) {
+  return {
+    records: Math.max(1, Math.floor(Number(options.sortChunkRecords || 25000))),
+    bytes: Math.max(1024, Math.floor(Number(options.sortChunkBytes || 4 * 1024 * 1024)))
+  };
 }
 
-async function reduceTypoShard(baseShard, buffer, packWriter) {
+function estimateTypoRecordBytes(record) {
+  return String(record[0] || "").length + String(record[1] || "").length + 16;
+}
+
+function writeSortedTypoChunk(records, outDir, index) {
+  records.sort(compareTypoRecords);
+  const path = resolve(outDir, `${String(index).padStart(5, "0")}.run`);
+  const fd = openSync(path, "w");
+  try {
+    for (const record of records) {
+      const bytes = encodeRunRecord(["string", "string", "number"], record);
+      writeSync(fd, bytes, 0, bytes.length);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  records.length = 0;
+  return path;
+}
+
+async function writeSortedTypoChunks(path, scratchDir, options) {
+  mkdirSync(scratchDir, { recursive: true });
+  const limits = typoSortLimits(options);
+  const records = [];
+  const chunks = [];
+  let bytes = 0;
+  for await (const record of readRunRecords(path, ["string", "string", "number"])) {
+    if (!record[0] || !record[1]) continue;
+    records.push(record);
+    bytes += estimateTypoRecordBytes(record);
+    if (records.length >= limits.records || bytes >= limits.bytes) {
+      chunks.push(writeSortedTypoChunk(records, scratchDir, chunks.length));
+      bytes = 0;
+    }
+  }
+  if (records.length) chunks.push(writeSortedTypoChunk(records, scratchDir, chunks.length));
+  return chunks;
+}
+
+async function createTypoChunkReader(path) {
+  const iterator = readRunRecords(path, ["string", "string", "number"])[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  return { iterator, record: first.done ? null : first.value };
+}
+
+async function* mergeSortedTypoChunks(chunks) {
+  const readers = await Promise.all(chunks.map(createTypoChunkReader));
+  try {
+    while (readers.some(reader => reader.record)) {
+      let best = -1;
+      for (let i = 0; i < readers.length; i++) {
+        if (!readers[i].record) continue;
+        if (best < 0 || compareTypoRecords(readers[i].record, readers[best].record) < 0) best = i;
+      }
+      const record = readers[best].record;
+      const next = await readers[best].iterator.next();
+      readers[best].record = next.done ? null : next.value;
+      yield record;
+    }
+  } finally {
+    await Promise.allSettled(readers.map(reader => reader.iterator.return?.()));
+  }
+}
+
+async function* reducedDeleteKeys(chunks, options = {}) {
+  const emitCandidates = options.emitCandidates !== false;
+  let currentDeleteKey = null;
+  let currentText = null;
+  let currentDf = 0;
+  let candidates = new Map();
+  let candidateCount = 0;
+
+  function finishCandidate() {
+    if (!currentText) return;
+    candidateCount++;
+    if (emitCandidates) candidates.set(currentText, currentDf);
+  }
+
+  function finishDeleteKey() {
+    if (!currentDeleteKey) return null;
+    finishCandidate();
+    const item = emitCandidates
+      ? { deleteKey: currentDeleteKey, candidates }
+      : { deleteKey: currentDeleteKey, candidateCount };
+    candidates = new Map();
+    candidateCount = 0;
+    currentText = null;
+    currentDf = 0;
+    return item;
+  }
+
+  for await (const [deleteKey, text, df] of mergeSortedTypoChunks(chunks)) {
+    if (deleteKey !== currentDeleteKey) {
+      const item = finishDeleteKey();
+      if (item) yield item;
+      currentDeleteKey = deleteKey;
+      currentText = text;
+      currentDf = df;
+      continue;
+    }
+    if (text !== currentText) {
+      finishCandidate();
+      currentText = text;
+      currentDf = df;
+      continue;
+    }
+    currentDf += df;
+  }
+  const item = finishDeleteKey();
+  if (item) yield item;
+}
+
+function typoPrefixKey(deleteKey, options, depth) {
+  return `${depth}\u0000${typoShardKey(deleteKey, options, depth)}`;
+}
+
+function addTypoPrefixCounts(prefixCounts, deleteKey, candidateCount, options) {
+  const baseDepth = Math.max(1, Math.floor(Number(options.baseShardDepth || 1)));
+  const maxDepth = Math.max(baseDepth, Math.floor(Number(options.maxShardDepth || baseDepth)));
+  const effective = Math.min(options.maxCandidatesPerDelete, candidateCount);
+  for (let depth = baseDepth; depth <= maxDepth; depth++) {
+    const key = typoPrefixKey(deleteKey, options, depth);
+    prefixCounts.set(key, (prefixCounts.get(key) || 0) + effective);
+  }
+}
+
+function typoPartitionNameForKey(deleteKey, prefixCounts, options) {
+  const target = Math.max(1, Math.floor(Number(options.targetShardCandidates || 1)));
+  const baseDepth = Math.max(1, Math.floor(Number(options.baseShardDepth || 1)));
+  const maxDepth = Math.max(baseDepth, Math.floor(Number(options.maxShardDepth || baseDepth)));
+  let depth = baseDepth;
+  while (depth < maxDepth && (prefixCounts.get(typoPrefixKey(deleteKey, options, depth)) || 0) > target) depth++;
+  return typoShardKey(deleteKey, options, depth);
+}
+
+async function reduceTypoShard(baseShard, buffer, packWriter, scratchRoot) {
   const path = resolve(buffer.runsOut, `${baseShard}.run`);
-  const byDelete = new Map();
-  for await (const [deleteKey, text, df] of readRunRecords(path, ["string", "string", "number"])) {
-    if (!deleteKey || !text) continue;
-    if (!byDelete.has(deleteKey)) byDelete.set(deleteKey, new Map());
-    const candidates = byDelete.get(deleteKey);
-    candidates.set(text, (candidates.get(text) || 0) + df);
-  }
-
-  const partitions = partitionTypoEntries([...byDelete.entries()].sort((a, b) => a[0].localeCompare(b[0])), buffer.options);
+  const scratchDir = resolve(scratchRoot, encodeURIComponent(baseShard));
+  const chunks = await writeSortedTypoChunks(path, scratchDir, buffer.options);
+  const prefixCounts = new Map();
   const finalShards = [];
   let deleteKeys = 0;
   let pairs = 0;
   let candidates = 0;
-  for (const partition of partitions) {
-    const encoded = buildTypoShard(new Map(partition.entries), buffer.options);
-    if (!encoded.stats.deleteKeys) continue;
-    writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }), {
-      kind: "typo-shard",
-      codec: "rftypo-v1",
-      logicalLength: encoded.buffer.length
-    });
-    finalShards.push(partition.name);
-    deleteKeys += encoded.stats.deleteKeys;
-    pairs += encoded.stats.pairs;
-    candidates += encoded.stats.candidates;
+  try {
+    for await (const item of reducedDeleteKeys(chunks, { emitCandidates: false })) {
+      addTypoPrefixCounts(prefixCounts, item.deleteKey, item.candidateCount, buffer.options);
+    }
+
+    let currentPartition = null;
+    let entries = [];
+    function flushPartition() {
+      if (!currentPartition || !entries.length) return;
+      const encoded = buildTypoShard(new Map(entries), buffer.options);
+      entries = [];
+      if (!encoded.stats.deleteKeys) return;
+      writePackedShard(packWriter, currentPartition, gzipSync(encoded.buffer, { level: 6 }), {
+        kind: "typo-shard",
+        codec: "rftypo-v1",
+        logicalLength: encoded.buffer.length
+      });
+      finalShards.push(currentPartition);
+      deleteKeys += encoded.stats.deleteKeys;
+      pairs += encoded.stats.pairs;
+      candidates += encoded.stats.candidates;
+    }
+
+    for await (const item of reducedDeleteKeys(chunks, { emitCandidates: true })) {
+      const partition = typoPartitionNameForKey(item.deleteKey, prefixCounts, buffer.options);
+      if (currentPartition && partition !== currentPartition) flushPartition();
+      currentPartition = partition;
+      entries.push([item.deleteKey, item.candidates]);
+    }
+    flushPartition();
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
   }
   unlinkSync(path);
   return { shards: finalShards, deleteKeys, pairs, candidates };
@@ -277,11 +417,12 @@ export async function reduceTypoRuns(buffer, outDir) {
   flushTypoBuffer(buffer);
   const packWriter = createPackWriter(resolve(outDir, "typo", "packs"), buffer.options.packBytes);
   const finalShards = new Set();
+  const scratchRoot = resolve(outDir, "_build", "typo-reduce-sort");
   let deleteKeys = 0;
   let pairs = 0;
   let candidates = 0;
   for (const shard of [...buffer.shards].sort()) {
-    const stats = await reduceTypoShard(shard, buffer, packWriter);
+    const stats = await reduceTypoShard(shard, buffer, packWriter, scratchRoot);
     deleteKeys += stats.deleteKeys;
     pairs += stats.pairs;
     candidates += stats.candidates;

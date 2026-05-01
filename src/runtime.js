@@ -59,6 +59,10 @@ function selectedFacetCodes(manifest, field, selected) {
 
 function facetCodeMatches(words, selected) {
   if (!selected?.size) return true;
+  if (Array.isArray(words?.codes)) {
+    for (const code of words.codes) if (selected.has(code)) return true;
+    return false;
+  }
   if (Array.isArray(words)) {
     for (const value of selected) {
       const word = Math.floor(value / 32);
