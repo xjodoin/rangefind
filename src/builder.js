@@ -14,7 +14,7 @@ import {
   buildTermShard
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
-import { writeDirectoryFiles } from "./directory.js";
+import { writeDirectoryFiles } from "./directory_writer.js";
 import { eachJsonLine } from "./jsonl.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";

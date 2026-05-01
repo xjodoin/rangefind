@@ -4,7 +4,7 @@ import { gzipSync } from "node:zlib";
 import { surfaceStemPairs } from "./analyzer.js";
 import { TYPO_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
-import { writeDirectoryFiles } from "./directory.js";
+import { writeDirectoryFiles } from "./directory_writer.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
 
