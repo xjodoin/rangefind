@@ -158,9 +158,14 @@ browser requests exactly the byte span it needs and decompresses that one shard.
 High-df posting lists can move their posting blocks into
 `terms/block-packs/*.bin`; the term shard then carries only term metadata,
 block-max scores, filter summaries, and byte ranges for external blocks.
-The runtime uses an adaptive overfetch planner for external posting blocks and
-result documents: it merges nearby byte ranges when the extra transfer is bounded
-and materially reduces request count.
+The text top-k runtime schedules a small frontier of the highest-impact active
+cursors, then batches external posting-block misses across those cursors before
+issuing range requests. Each cursor keeps a contiguous cached posting window and
+only refills the next window when the cached run is almost exhausted, so broad
+terms behave like dynamic superblocks instead of one range request per logical
+block. The same adaptive overfetch planner is used for external posting blocks
+and result documents: nearby byte ranges are merged when the extra transfer is
+bounded and materially reduces request count.
 
 The builder writes temporary posting and typo runs with a compact binary record
 format instead of TSV. Runs are still partitioned by base shard, so reduction can

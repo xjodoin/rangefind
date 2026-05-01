@@ -36,8 +36,10 @@ compact.
 The next format step is now implemented for high-df terms: eligible posting
 blocks are stored in `terms/block-packs/*.bin` and referenced from the term-shard
 metadata. The runtime applies the existing block-max schedule before fetching
-those blocks, with a small adjacent prefetch window that behaves like a dynamic
-superblock for medium lists.
+those blocks, with a batched frontier of high-impact cursors and a refillable
+contiguous posting-block cache window. That turns long high-df scans into a few
+dynamic superblock range requests while preserving exact top-k agreement against
+the exhaustive retrieval path in the frwiki bench.
 
 The metadata browse path now uses the same pruning principle. Sorted numeric,
 date, and boolean fields get `rfdocvaluesortdir-v1` directories plus

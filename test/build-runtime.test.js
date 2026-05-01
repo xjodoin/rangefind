@@ -10,9 +10,11 @@ import { parseDocOrdinalTable, parseDocPointerPage } from "../src/doc_pointers.j
 import { createSearch } from "../src/runtime.js";
 
 async function serveStatic(root) {
+  const requests = [];
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url, "http://localhost");
+      requests.push({ pathname: url.pathname, range: request.headers.range || "" });
       const path = resolve(root, `.${decodeURIComponent(url.pathname)}`);
       if (!path.startsWith(resolve(root))) {
         response.writeHead(403).end();
@@ -41,6 +43,7 @@ async function serveStatic(root) {
   const { port } = server.address();
   return {
     baseUrl: `http://127.0.0.1:${port}/rangefind/`,
+    requests,
     close: () => new Promise(resolveClose => server.close(resolveClose))
   };
 }
@@ -232,4 +235,46 @@ test("builder output is searchable through the range-based runtime", async (t) =
     () => corruptSearch.search({ q: "static range search", size: 1 }),
     /checksum mismatch/
   );
+});
+
+test("runtime refills high-df posting block windows in batches", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-frontier-"));
+  const docsPath = join(root, "docs.jsonl");
+  const configPath = join(root, "rangefind.config.json");
+  const docs = Array.from({ length: 40 }, (_, index) => JSON.stringify({
+    id: String(index),
+    title: `Common document ${String(index).padStart(2, "0")}`,
+    body: "common marker text",
+    url: `/${index}`
+  }));
+  await writeFile(docsPath, docs.join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    baseShardDepth: 1,
+    maxShardDepth: 1,
+    targetShardPostings: 1000,
+    postingBlockSize: 1,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0,
+    fields: [
+      { name: "title", path: "title", weight: 2.0 },
+      { name: "body", path: "body", weight: 1.0 }
+    ],
+    display: ["title", "url"]
+  }));
+
+  await build({ configPath });
+  const server = await serveStatic(join(root, "public"));
+  t.after(() => server.close());
+  const search = await createSearch({ baseUrl: server.baseUrl });
+  server.requests.length = 0;
+
+  const results = await search.search({ q: "common", size: 40, rerank: false });
+  const postingBlockRequests = server.requests.filter(request => request.pathname.includes("/terms/block-packs/"));
+  assert.equal(results.results.length, 40);
+  assert.equal(results.stats.blocksDecoded, 40);
+  assert.equal(results.stats.postingBlockFrontierFetchedBlocks, 40);
+  assert.equal(results.stats.postingBlockFrontierFetchGroups, 3);
+  assert.equal(postingBlockRequests.length, 3);
 });

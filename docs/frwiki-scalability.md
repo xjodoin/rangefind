@@ -87,7 +87,7 @@ Logical shards:      15,104
 Term packs:          8
 Index files:         85
 Index bytes:         153.0 MB (145.9 MiB)
-Manifest/init:       11.2 ms, 1 request, 104.7 KB
+Manifest/init:       11.6 ms, 1 request, 104.7 KB
 Pack tables:         8 term, 5 posting-block, 8 doc, 5 doc-page, 1 doc-value, 1 sorted doc-value, 1 facet, 13 typo
 Doc pointer table:   2.0 MB, 41-byte fixed records
 Doc ordinal table:   0.1 MB, 2-byte fixed records
@@ -100,19 +100,19 @@ Doc layout:          rflocal-doc-v1, 21,558 primary terms
 Representative cold queries:
 
 ```text
-Paris:                    47.3 ms, 14 requests,  90.5 KB, packed docs, 1 block / 128 postings
-Révolution française:     62.9 ms, 45 requests, 245.3 KB, packed docs, 31 blocks / 3,744 postings
-intelligence artificielle: 29.2 ms, 27 requests, 281.7 KB, packed docs, 3 blocks / 257 postings
-Victor Hugo:              21.8 ms, 31 requests, 140.7 KB, packed docs, 7 blocks / 728 postings
-football:                 11.8 ms, 21 requests,  71.3 KB, packed docs, 1 block / 128 postings
-médecine:                 13.8 ms, 24 requests, 122.0 KB, packed docs, 1 block / 128 postings
-changement climatique:    47.9 ms, 53 requests, 167.6 KB, packed docs, 38 blocks / 4,737 postings
-fromage:                   5.2 ms,  7 requests,  87.7 KB, packed docs, 3 blocks / 285 postings
-Québec:                    7.3 ms, 10 requests,  98.1 KB, packed docs, 8 blocks / 913 postings
+Paris:                    44.0 ms, 14 requests,  90.5 KB, packed docs, 1 block / 128 postings
+Révolution française:     44.1 ms, 28 requests, 244.5 KB, packed docs, 31 blocks / 3,744 postings
+intelligence artificielle: 29.7 ms, 27 requests, 281.7 KB, packed docs, 3 blocks / 257 postings
+Victor Hugo:              21.0 ms, 31 requests, 140.7 KB, packed docs, 7 blocks / 728 postings
+football:                  9.4 ms, 21 requests,  71.3 KB, packed docs, 1 block / 128 postings
+médecine:                 12.5 ms, 24 requests, 122.0 KB, packed docs, 1 block / 128 postings
+changement climatique:    37.1 ms, 30 requests, 167.6 KB, packed docs, 60 blocks / 7,472 postings
+fromage:                   6.3 ms,  7 requests,  87.7 KB, packed docs, 3 blocks / 285 postings
+Québec:                    7.5 ms, 10 requests,  98.1 KB, packed docs, 8 blocks / 913 postings
 Napoléon Bonaparte:       14.2 ms, 23 requests, 157.1 KB, packed docs, 3 blocks / 257 postings
-typed dates sorted:        4.4 ms,  4 requests,  18.8 KB, sorted doc-value + doc page lane
-dense filter browse:       2.2 ms,  3 requests,  11.6 KB, doc-value chunk early stop + doc page lane
-multi facet boolean:       5.3 ms, 10 requests,  21.6 KB, sorted doc-value + facet/doc-value checks
+typed dates sorted:       12.1 ms,  4 requests,  18.8 KB, sorted doc-value + doc page lane
+dense filter browse:       3.2 ms,  3 requests,  11.6 KB, doc-value chunk early stop + doc page lane
+multi facet boolean:       6.1 ms, 10 requests,  21.6 KB, sorted doc-value + facet/doc-value checks
 ```
 
 All rows reported `valid: true`. Every text query also reported
@@ -120,7 +120,10 @@ All rows reported `valid: true`. Every text query also reported
 queries now use the same block-max top-k scheduler as multi-term queries:
 `Paris` matched exact top 10 after decoding 1 of 49 posting blocks,
 `football` matched exact top 10 after decoding 1 of 7 blocks, and
-`changement climatique` matched exact top 10 after decoding 38 of 71 blocks.
+`changement climatique` matched exact top 10 after decoding 60 of 71 blocks.
+High-df phrase-style rows now batch posting-block frontier refills:
+`Révolution française` used 3 posting-block range requests instead of the
+previous 20, and `changement climatique` used 4 instead of 27.
 
 Warm repeated text queries were served from the runtime cache with zero
 additional network requests and sub-millisecond to low-single-digit millisecond
@@ -170,22 +173,24 @@ Latest scale result:
 
 ```text
 Docs        Index      Files  Init             Bytes/doc  Text avg        Browse avg      Exact
-50,000      145.9 MiB     85  1 req / 104.7 KB  3061 B    25.5 req / 146 KB  5.7 req / 17 KB  10/10
-100,000     267.0 MiB    122  1 req / 169.3 KB  2800 B    31.1 req / 171 KB  5.7 req / 22 KB  10/10
+50,000      145.9 MiB     85  1 req / 104.7 KB  3061 B    21.5 req / 146 KB  5.7 req / 17 KB  10/10
+100,000     267.0 MiB    122  1 req / 169.3 KB  2800 B    22.1 req / 172 KB  5.7 req / 22 KB  10/10
 ```
 
 Selected rows:
 
 ```text
 Paris:                 50k 14 req /  90.5 KB, 100k 16 req / 101.3 KB
-Révolution française:  50k 45 req / 245.3 KB, 100k 43 req / 278.0 KB
+Révolution française:  50k 28 req / 244.5 KB, 100k 28 req / 278.0 KB
 typed dates sorted:    50k  4 req /  18.8 KB, 100k  4 req /  24.6 KB
 dense filter browse:   50k  3 req /  11.6 KB, 100k  3 req /  11.6 KB
 ```
 
 The scale result is now strong for both text and metadata retrieval. Text
 request counts and transfer grow slowly while exact top-k agreement remains
-10/10 at both sizes. Metadata browse is flat enough for a static browser index:
+10/10 at both sizes. The selected high-df `Révolution française` row stays at
+3 posting-block fetch groups and 28 total cold requests at both 50k and 100k.
+Metadata browse is flat enough for a static browser index:
 sorted top-k grows from 18.8 KB to 24.6 KB when the corpus doubles, and dense
 unsorted range browse stays at 3 requests / 11.6 KB because it stops after one
 matching doc-value chunk and one doc page.

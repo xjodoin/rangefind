@@ -7,7 +7,7 @@
   "runs": 2,
   "bodyChars": 6000,
   "exactChecks": true,
-  "generatedAt": "2026-05-01T14:45:22.729Z",
+  "generatedAt": "2026-05-01T15:16:38.939Z",
   "points": [
     {
       "limit": 50000,
@@ -16,7 +16,7 @@
       "indexBytes": 153034218,
       "bytesPerDoc": 3060.68436,
       "init": {
-        "ms": 12.140833000012208,
+        "ms": 11.614875000028405,
         "requests": 1,
         "kb": 104.7451171875,
         "by": {
@@ -51,9 +51,9 @@
       "docValuePackBytes": 688049,
       "docValueSortedDirectoryBytes": 29150,
       "docValueSortedPackBytes": 682688,
-      "avgTextColdRequests": 25.5,
-      "avgTextColdKb": 146.198046875,
-      "maxTextColdRequests": 53,
+      "avgTextColdRequests": 21.5,
+      "avgTextColdKb": 146.112890625,
+      "maxTextColdRequests": 31,
       "avgBrowseColdRequests": 5.666666666666667,
       "avgBrowseColdKb": 17.306640625,
       "textExactMatches": 10,
@@ -64,7 +64,7 @@
           "total": 10,
           "top": "Paris (homonymie)",
           "valid": true,
-          "coldMs": 56.37099999998463,
+          "coldMs": 54.985625000001164,
           "coldRequests": 14,
           "coldKb": 90.5380859375,
           "coldBy": {
@@ -94,6 +94,10 @@
             }
           },
           "lane": "packedDocs",
+          "postingBlockFrontierBatches": 1,
+          "postingBlockFrontierBlocks": 1,
+          "postingBlockFrontierFetchGroups": 1,
+          "postingBlockFrontierWantedBlocks": 16,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -110,9 +114,9 @@
           "total": 10,
           "top": "Révolution française",
           "valid": true,
-          "coldMs": 83.08366699999897,
-          "coldRequests": 45,
-          "coldKb": 245.3076171875,
+          "coldMs": 59.63704199998756,
+          "coldRequests": 28,
+          "coldKb": 244.4560546875,
           "coldBy": {
             "directory": {
               "requests": 3,
@@ -123,8 +127,8 @@
               "kb": 109.8671875
             },
             "postingBlocks": {
-              "requests": 20,
-              "kb": 18.48046875
+              "requests": 3,
+              "kb": 17.62890625
             },
             "docOrdinals": {
               "requests": 5,
@@ -140,6 +144,10 @@
             }
           },
           "lane": "packedDocs",
+          "postingBlockFrontierBatches": 19,
+          "postingBlockFrontierBlocks": 31,
+          "postingBlockFrontierFetchGroups": 3,
+          "postingBlockFrontierWantedBlocks": 71,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -156,7 +164,7 @@
           "total": 10,
           "top": "Algèbre linéaire",
           "valid": true,
-          "coldMs": 10.923833000008017,
+          "coldMs": 11.200042000011308,
           "coldRequests": 4,
           "coldKb": 18.7578125,
           "coldBy": {
@@ -174,6 +182,10 @@
             }
           },
           "lane": "docPages",
+          "postingBlockFrontierBatches": 0,
+          "postingBlockFrontierBlocks": 0,
+          "postingBlockFrontierFetchGroups": 0,
+          "postingBlockFrontierWantedBlocks": 0,
           "docValuePruning": true,
           "docValuePruneField": "bodyLength",
           "docValuePagesVisited": 1,
@@ -190,7 +202,7 @@
           "total": 10,
           "top": "Antoine Meillet",
           "valid": true,
-          "coldMs": 2.8267500000074506,
+          "coldMs": 2.501542000012705,
           "coldRequests": 3,
           "coldKb": 11.58984375,
           "coldBy": {
@@ -208,6 +220,10 @@
             }
           },
           "lane": "docPages",
+          "postingBlockFrontierBatches": 0,
+          "postingBlockFrontierBlocks": 0,
+          "postingBlockFrontierFetchGroups": 0,
+          "postingBlockFrontierWantedBlocks": 0,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -229,7 +245,7 @@
       "indexBytes": 280011295,
       "bytesPerDoc": 2800.11295,
       "init": {
-        "ms": 3.5841249999357387,
+        "ms": 7.808541000005789,
         "requests": 1,
         "kb": 169.287109375,
         "by": {
@@ -264,9 +280,9 @@
       "docValuePackBytes": 1616515,
       "docValueSortedDirectoryBytes": 54188,
       "docValueSortedPackBytes": 1389526,
-      "avgTextColdRequests": 31.1,
-      "avgTextColdKb": 171.31845703125,
-      "maxTextColdRequests": 110,
+      "avgTextColdRequests": 22.1,
+      "avgTextColdKb": 172.003125,
+      "maxTextColdRequests": 35,
       "avgBrowseColdRequests": 5.666666666666667,
       "avgBrowseColdKb": 21.661458333333332,
       "textExactMatches": 10,
@@ -277,7 +293,7 @@
           "total": 10,
           "top": "Paris (homonymie)",
           "valid": true,
-          "coldMs": 39.451958000077866,
+          "coldMs": 40.37387500004843,
           "coldRequests": 16,
           "coldKb": 101.3037109375,
           "coldBy": {
@@ -307,6 +323,10 @@
             }
           },
           "lane": "packedDocs",
+          "postingBlockFrontierBatches": 1,
+          "postingBlockFrontierBlocks": 1,
+          "postingBlockFrontierFetchGroups": 1,
+          "postingBlockFrontierWantedBlocks": 16,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -323,8 +343,8 @@
           "total": 10,
           "top": "Révolution française",
           "valid": true,
-          "coldMs": 108.49266700004227,
-          "coldRequests": 43,
+          "coldMs": 81.31158300000243,
+          "coldRequests": 28,
           "coldKb": 277.9619140625,
           "coldBy": {
             "directory": {
@@ -336,7 +356,7 @@
               "kb": 120.9638671875
             },
             "postingBlocks": {
-              "requests": 18,
+              "requests": 3,
               "kb": 20.9453125
             },
             "docOrdinals": {
@@ -353,6 +373,10 @@
             }
           },
           "lane": "packedDocs",
+          "postingBlockFrontierBatches": 17,
+          "postingBlockFrontierBlocks": 35,
+          "postingBlockFrontierFetchGroups": 3,
+          "postingBlockFrontierWantedBlocks": 82,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -369,7 +393,7 @@
           "total": 10,
           "top": "Algèbre linéaire",
           "valid": true,
-          "coldMs": 11.505791999981739,
+          "coldMs": 10.459166999906301,
           "coldRequests": 4,
           "coldKb": 24.5712890625,
           "coldBy": {
@@ -387,6 +411,10 @@
             }
           },
           "lane": "docPages",
+          "postingBlockFrontierBatches": 0,
+          "postingBlockFrontierBlocks": 0,
+          "postingBlockFrontierFetchGroups": 0,
+          "postingBlockFrontierWantedBlocks": 0,
           "docValuePruning": true,
           "docValuePruneField": "bodyLength",
           "docValuePagesVisited": 1,
@@ -403,7 +431,7 @@
           "total": 10,
           "top": "Antoine Meillet",
           "valid": true,
-          "coldMs": 2.255875000031665,
+          "coldMs": 2.023083999985829,
           "coldRequests": 3,
           "coldKb": 11.58984375,
           "coldBy": {
@@ -421,6 +449,10 @@
             }
           },
           "lane": "docPages",
+          "postingBlockFrontierBatches": 0,
+          "postingBlockFrontierBlocks": 0,
+          "postingBlockFrontierFetchGroups": 0,
+          "postingBlockFrontierWantedBlocks": 0,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,

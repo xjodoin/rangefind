@@ -19,6 +19,7 @@ const RERANK_CANDIDATES = 30;
 const DEPENDENCY_SCORE_SCALE = 0.12;
 const SKIP_MAX_TERMS = 30;
 const EXTERNAL_POSTING_BLOCK_PREFETCH = 16;
+const POSTING_BLOCK_FRONTIER = 4;
 const textDecoder = new TextDecoder();
 
 async function inflateGzip(responseOrBuffer) {
@@ -107,8 +108,10 @@ export async function createSearch(options = {}) {
     docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     docValueSortPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
+    postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     ...(options.rangePlans || {})
   };
+  const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
 
   function rangeGroups(items, kind = "default") {
     return groupRanges(items, rangePlans[kind] || rangePlans.default);
@@ -838,16 +841,18 @@ export async function createSearch(options = {}) {
     return null;
   }
 
-  async function loadExternalPostingBlocks(entry, blockIndexes) {
-    if (!entry.blockPostings) entry.blockPostings = new Map();
+  async function loadPostingBlockBatch(requests, rangePlan = "postingBlocks") {
     const pending = [];
-    const wanted = [];
-    for (const blockIndex of blockIndexes) {
-      wanted.push(blockIndex);
-      if (entry.blockPostings.has(blockIndex)) continue;
-      const block = entry.blocks?.[blockIndex];
+    let wanted = 0;
+    for (const request of requests) {
+      const owner = request.entry;
+      const blockIndex = request.blockIndex;
+      if (!owner.blockPostings) owner.blockPostings = new Map();
+      wanted++;
+      if (owner.blockPostings.has(blockIndex)) continue;
+      const block = owner.blocks?.[blockIndex];
       if (!block?.range) {
-        entry.blockPostings.set(blockIndex, Promise.resolve(new Int32Array(0)));
+        owner.blockPostings.set(blockIndex, Promise.resolve(new Int32Array(0)));
         continue;
       }
       let resolveBlock;
@@ -857,11 +862,12 @@ export async function createSearch(options = {}) {
         rejectBlock = rejectPromise;
       });
       promise.catch(() => {});
-      entry.blockPostings.set(blockIndex, promise);
-      pending.push({ blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
+      owner.blockPostings.set(blockIndex, promise);
+      pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
     }
 
-    await Promise.all(rangeGroups(pending, "postingBlocks").map(async (group) => {
+    const groups = rangeGroups(pending, rangePlan);
+    await Promise.all(groups.map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
@@ -869,25 +875,54 @@ export async function createSearch(options = {}) {
         }));
       } catch (error) {
         for (const item of group.items) {
-          entry.blockPostings.delete(item.blockIndex);
+          item.owner.blockPostings.delete(item.blockIndex);
           item.reject(error);
         }
         throw error;
       }
     }));
 
-    return Promise.all(wanted.map(blockIndex => entry.blockPostings.get(blockIndex)));
+    return { wanted, fetched: pending.length, groups: groups.length };
+  }
+
+  async function loadExternalPostingBlocks(entry, blockIndexes) {
+    await loadPostingBlockBatch(blockIndexes.map(blockIndex => ({ entry, blockIndex })));
+    return Promise.all(blockIndexes.map(blockIndex => entry.blockPostings.get(blockIndex)));
+  }
+
+  function postingBlockPrefetchIndexes(entry, blockIndex, prefetch) {
+    const total = entry.blocks?.length || 0;
+    if (blockIndex < 0 || blockIndex >= total) return [];
+    const blockPostings = entry.blockPostings;
+    const out = [blockIndex];
+    const addMissingRange = (start, count) => {
+      const limit = Math.min(total, start + count);
+      for (let i = start; i < limit; i++) {
+        if (i !== blockIndex && !blockPostings?.has(i)) out.push(i);
+      }
+    };
+
+    if (total <= prefetch * 2) {
+      addMissingRange(blockIndex + 1, total - blockIndex - 1);
+      return out;
+    }
+
+    if (!blockPostings?.has(blockIndex)) {
+      addMissingRange(blockIndex + 1, prefetch - 1);
+      return out;
+    }
+
+    let contiguousEnd = blockIndex + 1;
+    while (contiguousEnd < total && blockPostings.has(contiguousEnd)) contiguousEnd++;
+    const cachedAhead = contiguousEnd - blockIndex;
+    const refillThreshold = Math.max(2, Math.floor(prefetch / 4));
+    if (cachedAhead <= refillThreshold) addMissingRange(contiguousEnd, prefetch);
+    return out;
   }
 
   async function decodeEntryBlock(shard, entry, blockIndex) {
     if (!entry.external) return decodePostingBlock(shard, entry, blockIndex);
-    const prefetchLimit = entry.blocks.length <= EXTERNAL_POSTING_BLOCK_PREFETCH * 2
-      ? entry.blocks.length
-      : blockIndex + EXTERNAL_POSTING_BLOCK_PREFETCH;
-    const blockIndexes = [];
-    for (let i = blockIndex; i < Math.min(entry.blocks.length, prefetchLimit); i++) {
-      blockIndexes.push(i);
-    }
+    const blockIndexes = postingBlockPrefetchIndexes(entry, blockIndex, EXTERNAL_POSTING_BLOCK_PREFETCH);
     const rows = await loadExternalPostingBlocks(entry, blockIndexes);
     return rows[0] || new Int32Array(0);
   }
@@ -1379,6 +1414,45 @@ export async function createSearch(options = {}) {
     return docs;
   }
 
+  function cursorImpact(cursor) {
+    return cursor.entry.blocks[cursor.blockIndex]?.maxImpact || 0;
+  }
+
+  function frontierPrefetchSize() {
+    return EXTERNAL_POSTING_BLOCK_PREFETCH;
+  }
+
+  async function decodeCursorFrontier(frontier) {
+    const prefetch = frontierPrefetchSize();
+    const requests = [];
+    const blocks = new Array(frontier.length);
+    for (let index = 0; index < frontier.length; index++) {
+      const cursor = frontier[index];
+      if (!cursor.entry.external) {
+        blocks[index] = { cursor, rows: decodePostingBlock(cursor.shard, cursor.entry, cursor.blockIndex) };
+        continue;
+      }
+      for (const blockIndex of postingBlockPrefetchIndexes(cursor.entry, cursor.blockIndex, prefetch)) {
+        requests.push({ entry: cursor.entry, blockIndex });
+      }
+    }
+
+    const batch = await loadPostingBlockBatch(requests, "postingBlockFrontier");
+    for (let index = 0; index < frontier.length; index++) {
+      const cursor = frontier[index];
+      if (!cursor.entry.external) continue;
+      const rows = await cursor.entry.blockPostings.get(cursor.blockIndex);
+      blocks[index] = { cursor, rows: rows || new Int32Array(0) };
+    }
+
+    return {
+      blocks: blocks.filter(Boolean),
+      fetchedBlocks: batch.fetched,
+      fetchGroups: batch.groups,
+      wantedBlocks: batch.wanted
+    };
+  }
+
   async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const k = offset + size;
@@ -1416,6 +1490,12 @@ export async function createSearch(options = {}) {
     let postingsAccepted = 0;
     let stable = null;
     let exhausted = false;
+    let frontierBatches = 0;
+    let frontierBlocks = 0;
+    let frontierFetchedBlocks = 0;
+    let frontierFetchGroups = 0;
+    let frontierWantedBlocks = 0;
+    let frontierMax = 0;
 
     while (true) {
       const active = cursors.filter(cursor => advanceCursor(cursor, blockFilterPlan));
@@ -1427,16 +1507,27 @@ export async function createSearch(options = {}) {
       stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan);
       if (stable) break;
 
-      active.sort((a, b) => b.entry.blocks[b.blockIndex].maxImpact - a.entry.blocks[a.blockIndex].maxImpact);
-      const cursor = active[0];
-      const rows = await decodeEntryBlock(cursor.shard, cursor.entry, cursor.blockIndex);
-      cursor.blockIndex++;
-      const codeData = hasFilters && docValues
-        ? await valueStoreForDocs(filterFields, postingDocs(rows))
-        : fallbackCodeData;
-      blocksDecoded++;
-      postingsDecoded += rows.length / 2;
-      postingsAccepted += applyBlockRows(cursor, rows, codeData, docFilterPlan, scores, hits, masks);
+      active.sort((a, b) => cursorImpact(b) - cursorImpact(a));
+      const frontier = active.slice(0, postingBlockFrontier);
+      frontierBatches++;
+      frontierBlocks += frontier.length;
+      frontierMax = Math.max(frontierMax, frontier.length);
+      const decoded = await decodeCursorFrontier(frontier);
+      frontierFetchedBlocks += decoded.fetchedBlocks;
+      frontierFetchGroups += decoded.fetchGroups;
+      frontierWantedBlocks += decoded.wantedBlocks;
+      for (const { cursor, rows } of decoded.blocks) {
+        cursor.blockIndex++;
+        const codeData = hasFilters && docValues
+          ? await valueStoreForDocs(filterFields, postingDocs(rows))
+          : fallbackCodeData;
+        blocksDecoded++;
+        postingsDecoded += rows.length / 2;
+        postingsAccepted += applyBlockRows(cursor, rows, codeData, docFilterPlan, scores, hits, masks);
+        stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan);
+        if (stable) break;
+      }
+      if (stable) break;
     }
 
     let ranked = exhausted
@@ -1463,6 +1554,13 @@ export async function createSearch(options = {}) {
         skippedBlocks: cursors.reduce((sum, cursor) => sum + cursor.skippedBlocks, 0),
         terms: terms.length,
         shards: new Set(entries.map(item => item.shardName)).size,
+        postingBlockFrontier: postingBlockFrontier,
+        postingBlockFrontierBatches: frontierBatches,
+        postingBlockFrontierBlocks: frontierBlocks,
+        postingBlockFrontierMax: frontierMax,
+        postingBlockFrontierFetchedBlocks: frontierFetchedBlocks,
+        postingBlockFrontierFetchGroups: frontierFetchGroups,
+        postingBlockFrontierWantedBlocks: frontierWantedBlocks,
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
