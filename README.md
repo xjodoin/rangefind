@@ -40,6 +40,8 @@ they optimize for smaller sites. Rangefind is for the case where you want:
 
 ## Quick Start
 
+Demo: https://xjodoin.github.io/rangefind/
+
 ```bash
 npm install
 npm run build:example
