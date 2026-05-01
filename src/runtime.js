@@ -1,6 +1,8 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parseShard } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
+import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
+import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
 import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.js";
 import { verifyBlockPointer } from "./object_store.js";
 import { groupRanges, shardKey } from "./shards.js";
@@ -71,7 +73,6 @@ export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
-  const useDocPages = options.useDocPages !== false;
   const termDirectory = createDirectoryState(manifest.directory);
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
@@ -84,6 +85,8 @@ export async function createSearch(options = {}) {
   const docPagePointerCache = new Map();
   const docPageCache = new Map();
   const docValueCache = new Map();
+  const docValueSortDirectoryCache = new Map();
+  const docValueSortPageCache = new Map();
   const facetDictionaryCache = new Map();
   let typoManifest = null;
   let typoManifestPromise = null;
@@ -91,6 +94,7 @@ export async function createSearch(options = {}) {
   let codes = null;
   let codesPromise = null;
   const docValues = manifest.doc_values || null;
+  const docValueSorted = manifest.doc_value_sorted || null;
   const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
@@ -101,6 +105,7 @@ export async function createSearch(options = {}) {
     docs: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
     docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    docValueSortPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
     ...(options.rangePlans || {})
   };
@@ -183,6 +188,14 @@ export async function createSearch(options = {}) {
     return docValues?.fields?.[field] || null;
   }
 
+  function docValueSortField(field) {
+    return docValueSorted?.fields?.[field] || null;
+  }
+
+  function docValueSortPageCacheKey(field, pageIndexValue) {
+    return `${field}\u0000${pageIndexValue}`;
+  }
+
   async function loadFacetDictionary(field) {
     if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
     if (!facetDirectory || !manifest.facet_dictionaries?.fields?.[field]) return [];
@@ -257,6 +270,58 @@ export async function createSearch(options = {}) {
         throw error;
       }
     }));
+  }
+
+  async function loadDocValueSortDirectory(field) {
+    const meta = docValueSortField(field);
+    if (!meta?.directory?.file) return null;
+    if (!docValueSortDirectoryCache.has(field)) {
+      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseDocValueSortDirectory);
+      promise.catch(() => {
+        docValueSortDirectoryCache.delete(field);
+      });
+      docValueSortDirectoryCache.set(field, promise);
+    }
+    return docValueSortDirectoryCache.get(field);
+  }
+
+  async function loadDocValueSortPages(field, directory, pageIndexes) {
+    const wanted = [];
+    const pending = [];
+    for (const pageIndexValue of [...new Set(pageIndexes)]) {
+      const page = directory.pages[pageIndexValue];
+      if (!page) continue;
+      wanted.push(pageIndexValue);
+      const key = docValueSortPageCacheKey(field, pageIndexValue);
+      if (docValueSortPageCache.has(key)) continue;
+      let resolvePage;
+      let rejectPage;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePage = resolvePromise;
+        rejectPage = rejectPromise;
+      });
+      promise.catch(() => {});
+      docValueSortPageCache.set(key, promise);
+      pending.push({ field, pageIndex: pageIndexValue, entry: page, resolve: resolvePage, reject: rejectPage });
+    }
+
+    await Promise.all(rangeGroups(pending, "docValueSortPages").map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`doc-values/sorted-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `doc-value sort page ${item.field}:${item.pageIndex}`);
+          item.resolve(decodeDocValueSortPage(inflated, { name: item.field }));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          docValueSortPageCache.delete(docValueSortPageCacheKey(item.field, item.pageIndex));
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    return Promise.all(wanted.map(pageIndexValue => docValueSortPageCache.get(docValueSortPageCacheKey(field, pageIndexValue))));
   }
 
   async function ensureDocValuesForDocs(fields, docs) {
@@ -642,8 +707,13 @@ export async function createSearch(options = {}) {
     return Math.floor(index / docPageSize());
   }
 
+  function decodeDocPagePayload(inflated, pageIndexValue) {
+    if (docPages.encoding !== DOC_PAGE_ENCODING) throw new Error(`Unsupported Rangefind doc page encoding ${docPages.encoding || "unknown"}.`);
+    return decodeDocPageColumns(inflated, docPages.fields || [], pageIndexValue * docPageSize());
+  }
+
   function docPagePlan(indexes, context = {}) {
-    if (!useDocPages || !docPages?.pointers?.file || !context.preferDocPages) return null;
+    if (!docPages?.pointers?.file || !context.preferDocPages) return null;
     const unique = [...new Set(indexes)];
     if (!unique.length) return null;
     const pages = [...new Set(unique.map(docPageIndex))].sort((a, b) => a - b);
@@ -718,7 +788,7 @@ export async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`docs/page-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc page ${item.pageIndex}`);
-          item.resolve(JSON.parse(textDecoder.decode(new Uint8Array(inflated))));
+          item.resolve(decodeDocPagePayload(inflated, item.pageIndex));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -890,6 +960,33 @@ export async function createSearch(options = {}) {
     return true;
   }
 
+  function knownValueForDoc(known, field) {
+    return Object.prototype.hasOwnProperty.call(known || {}, field) ? known[field] : undefined;
+  }
+
+  function valueForDocWithKnown(codeData, field, doc, known) {
+    const knownValue = knownValueForDoc(known, field);
+    return knownValue !== undefined ? knownValue : valueForDoc(codeData, field, doc);
+  }
+
+  function passesFilterPlanWithKnown(doc, codeData, filterPlan, known = {}) {
+    if (!filterPlan?.active) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      if (!facetCodeMatches(valueForDocWithKnown(codeData, field, doc, known), selected)) return false;
+    }
+    for (const [field, range] of filterPlan.numbers) {
+      const value = valueForDocWithKnown(codeData, field, doc, known);
+      if (value == null) return false;
+      if (range.min != null && value < range.min) return false;
+      if (range.max != null && value > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const value = valueForDocWithKnown(codeData, field, doc, known);
+      if (value == null || value !== expected) return false;
+    }
+    return true;
+  }
+
   function blockFacetMatches(summary, selected) {
     if (!selected?.size) return true;
     const words = summary?.words || [];
@@ -994,6 +1091,196 @@ export async function createSearch(options = {}) {
     const out = [];
     for (let index = 0; index < count; index++) if (chunkMayPass(index, filterPlan)) out.push(index);
     return out;
+  }
+
+  function booleanSummaryCode(value) {
+    return value ? 2 : 1;
+  }
+
+  function pageSummaryForField(page, field, sortedField) {
+    if (Object.prototype.hasOwnProperty.call(page.summaries || {}, field)) return page.summaries[field];
+    return field === sortedField && Number.isFinite(page.min) && Number.isFinite(page.max) ? { min: page.min, max: page.max } : null;
+  }
+
+  function pageMayPassDocValueFilter(page, filterPlan, sortedField) {
+    if (!filterPlan?.active) return true;
+    for (const [field, range] of filterPlan.numbers) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (range.min != null && summary.max < range.min) return false;
+      if (range.max != null && summary.min > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      const code = booleanSummaryCode(expected);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (summary.max < code || summary.min > code) return false;
+    }
+    return true;
+  }
+
+  function pageDefinitelyPassesDocValueFilter(page, filterPlan, sortedField) {
+    if (!filterPlan?.active) return true;
+    if (filterPlan.facets.length) return false;
+    for (const [field, range] of filterPlan.numbers) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (range.min != null && summary.min < range.min) return false;
+      if (range.max != null && summary.max > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      const code = booleanSummaryCode(expected);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (summary.min !== code || summary.max !== code) return false;
+    }
+    return true;
+  }
+
+  function sortedDirectoryPages(directory, desc, filterPlan) {
+    return directory.pages
+      .filter(page => pageMayPassDocValueFilter(page, filterPlan, directory.field.name))
+      .sort((a, b) => (
+        desc
+          ? b.max - a.max || a.rankStart - b.rankStart
+          : a.min - b.min || a.rankStart - b.rankStart
+      ));
+  }
+
+  function sortedPageRows(page, desc) {
+    return page.rows.slice().sort((a, b) => (
+      desc
+        ? b.sortValue - a.sortValue || a.doc - b.doc
+        : a.sortValue - b.sortValue || a.doc - b.doc
+    ));
+  }
+
+  async function runDocValueBrowse({ page, size, filters, sortPlan, hasFilters }) {
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const field = sortPlan?.field || null;
+    if (!field || !docValueSortField(field)) return null;
+    const directory = await loadDocValueSortDirectory(field);
+    if (!directory?.pages?.length) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const desc = !!sortPlan?.desc;
+    const pages = sortedDirectoryPages(directory, desc, docFilterPlan);
+    const collected = [];
+    const filterFields = filterPlanFields(docFilterPlan).filter(item => item !== field);
+    let pagesVisited = 0;
+    let rowsScanned = 0;
+    let rowsAccepted = 0;
+    let definitelyPassedPages = 0;
+    let stoppedEarly = false;
+
+    for (const candidatePage of pages) {
+      const [loadedPage] = await loadDocValueSortPages(field, directory, [candidatePage.index]);
+      pagesVisited++;
+      const rows = sortedPageRows(loadedPage, desc);
+      rowsScanned += rows.length;
+      const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
+      if (definite) definitelyPassedPages++;
+      const codeData = definite || !filterFields.length
+        ? null
+        : await valueStoreForDocs(filterFields, rows.map(row => row.doc));
+      for (const row of rows) {
+        const known = { [field]: row.value };
+        if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+        collected.push([row.doc, 0]);
+        rowsAccepted++;
+        if (collected.length >= k) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      if (stoppedEarly) break;
+    }
+
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(collected.slice(offset, offset + size), resultContext);
+    const exactTotal = !stoppedEarly;
+    return {
+      total: !hasFilters ? manifest.total : exactTotal ? collected.length : Math.max(collected.length, k),
+      results,
+      page,
+      size,
+      approximate: !exactTotal && hasFilters,
+      stats: {
+        exact: exactTotal,
+        docValuePruning: true,
+        docValuePruneField: field,
+        docValueSortDirection: desc ? "desc" : "asc",
+        docValueDirectoryPages: directory.pages.length,
+        docValueCandidatePages: pages.length,
+        docValuePagesPruned: directory.pages.length - pages.length,
+        docValuePagesVisited: pagesVisited,
+        docValueRowsScanned: rowsScanned,
+        docValueRowsAccepted: rowsAccepted,
+        docValueDefinitePages: definitelyPassedPages,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
+
+  async function runDocValueChunkBrowse({ page, size, filters, hasFilters }) {
+    if (!docValues || !hasFilters) return null;
+    const docFilterPlan = makeDocFilterPlan(filters);
+    if (!docFilterPlan?.active) return null;
+    const fields = filterPlanFields(docFilterPlan);
+    if (!fields.length) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const chunkIndexes = candidateDocValueChunks(docFilterPlan);
+    const chunkSize = Math.max(1, docValues.chunk_size || manifest.total || 1);
+    const collected = [];
+    let chunksVisited = 0;
+    let rowsScanned = 0;
+    let rowsAccepted = 0;
+    let stoppedEarly = false;
+
+    for (const chunkIndex of chunkIndexes) {
+      const codeData = await ensureDocValueChunkIndexes(fields, [chunkIndex]);
+      chunksVisited++;
+      const start = chunkIndex * chunkSize;
+      const end = Math.min(manifest.total, start + chunkSize);
+      for (let index = start; index < end; index++) {
+        rowsScanned++;
+        if (!passesFilterPlan(index, codeData, docFilterPlan)) continue;
+        collected.push([index, 0]);
+        rowsAccepted++;
+        if (collected.length >= k) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      if (stoppedEarly) break;
+    }
+
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(collected.slice(offset, offset + size), resultContext);
+    const exactTotal = !stoppedEarly;
+    return {
+      total: exactTotal ? collected.length : Math.max(collected.length, k),
+      results,
+      page,
+      size,
+      approximate: !exactTotal,
+      stats: {
+        exact: exactTotal,
+        docValueChunkPruning: true,
+        docValueChunksTotal: Math.ceil(manifest.total / chunkSize),
+        docValueCandidateChunks: chunkIndexes.length,
+        docValueChunksPruned: Math.ceil(manifest.total / chunkSize) - chunkIndexes.length,
+        docValueChunksVisited: chunksVisited,
+        docValueRowsScanned: rowsScanned,
+        docValueRowsAccepted: rowsAccepted,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
   }
 
   function sortRanked(ranked, codeData, sortPlan) {
@@ -1403,6 +1690,14 @@ export async function createSearch(options = {}) {
       }
       await ensureFacetDictionaries(filters);
       const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+      if (!sortPlan && hasFilters && docValues) {
+        const chunkPruned = await runDocValueChunkBrowse({ page, size, filters, hasFilters });
+        if (chunkPruned) return chunkPruned;
+      }
+      if (docValueSorted && sortPlan) {
+        const pruned = await runDocValueBrowse({ page, size, filters, sortPlan, hasFilters });
+        if (pruned) return pruned;
+      }
       let codeData;
       let candidates;
       if (docValues) {

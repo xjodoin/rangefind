@@ -4,8 +4,8 @@ Rangefind includes a reproducible scalability fixture for French Wikipedia.
 The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
 records a local request/transfer benchmark with cold-transfer breakdowns for
-directory, term, posting-block, typo, doc-value, packed document payload, and
-doc-page payload fetches.
+directory, term, posting-block, typo, doc-value, sorted doc-value, packed
+document payload, and doc-page payload fetches.
 The generated schema includes multi-value article tags, typed numeric fields,
 revision dates, and booleans so the scalability run also validates the typed
 filter/sort code paths.
@@ -55,6 +55,7 @@ Useful options:
   requested dump URL, limit, and body cap.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--reduce-workers=auto`: enables worker-based term reduction.
+- `--scale-limits=50000,100000`: controls the `scale` command document counts.
 - `--no-exact-checks`: skips the exact top-k comparison for text queries.
 
 ## Local 50k Run
@@ -84,14 +85,15 @@ Dump pages read:     65,687
 Body cap:            6,000 cleaned characters/article
 Logical shards:      15,104
 Term packs:          8
-Index files:         78
-Index bytes:         152.8 MB (145.7 MiB)
-Manifest/init:       10.6 ms, 1 request, 99.6 KB
-Pack tables:         8 term, 5 posting-block, 8 doc, 5 doc-page, 1 doc-value, 1 facet, 13 typo
+Index files:         85
+Index bytes:         153.0 MB (145.9 MiB)
+Manifest/init:       11.2 ms, 1 request, 104.7 KB
+Pack tables:         8 term, 5 posting-block, 8 doc, 5 doc-page, 1 doc-value, 1 sorted doc-value, 1 facet, 13 typo
 Doc pointer table:   2.0 MB, 41-byte fixed records
 Doc ordinal table:   0.1 MB, 2-byte fixed records
 Doc page table:      64.1 KB, 1,563 fixed records, 32 docs/page
-Doc page packs:      17.6 MB
+Doc page packs:      17.1 MB, rfdocpagecols-v1 binary columns
+Sorted doc-values:   29.2 KB directories, 0.7 MB packed value pages
 Doc layout:          rflocal-doc-v1, 21,558 primary terms
 ```
 
@@ -108,17 +110,9 @@ changement climatique:    47.9 ms, 53 requests, 167.6 KB, packed docs, 38 blocks
 fromage:                   5.2 ms,  7 requests,  87.7 KB, packed docs, 3 blocks / 285 postings
 Québec:                    7.3 ms, 10 requests,  98.1 KB, packed docs, 8 blocks / 913 postings
 Napoléon Bonaparte:       14.2 ms, 23 requests, 157.1 KB, packed docs, 3 blocks / 257 postings
-typed dates sorted:       44.6 ms,  4 requests, 231.2 KB, doc page lane
-dense filter browse:      17.7 ms,  3 requests,  71.4 KB, doc page lane
-multi facet boolean:      44.3 ms,  8 requests, 155.7 KB, doc page lane
-```
-
-The three browse/filter rows also run an A/B fallback with doc pages disabled:
-
-```text
-typed dates sorted:  4 requests / 231.2 KB with doc pages vs 17 requests / 288.3 KB packed-only
-dense filter browse: 3 requests /  71.4 KB with doc pages vs 17 requests / 104.2 KB packed-only
-multi facet boolean: 8 requests / 155.7 KB with doc pages vs 22 requests / 188.5 KB packed-only
+typed dates sorted:        4.4 ms,  4 requests,  18.8 KB, sorted doc-value + doc page lane
+dense filter browse:       2.2 ms,  3 requests,  11.6 KB, doc-value chunk early stop + doc page lane
+multi facet boolean:       5.3 ms, 10 requests,  21.6 KB, sorted doc-value + facet/doc-value checks
 ```
 
 All rows reported `valid: true`. Every text query also reported
@@ -130,13 +124,15 @@ queries now use the same block-max top-k scheduler as multi-term queries:
 
 Warm repeated text queries were served from the runtime cache with zero
 additional network requests and sub-millisecond to low-single-digit millisecond
-latency. Broad sorted metadata views still scan doc-value chunks, but the
-runtime keeps only the requested top-k page instead of sorting all matching
-documents; the 50k typed date sort dropped from about 100 ms warm to about
-21 ms warm on the same index.
+latency. Broad sorted metadata views now use `rfdocvaluesortdir-v1` directories
+and `rfdocvaluesortpage-v1` value pages: the 50k typed date/body-length sort
+fetches one value page, scans 2,048 sorted rows, and accepts the first 10
+matches. Broad unsorted range browsing keeps document order and stops after the
+first matching doc-value chunk, so the result ids stay dense enough to use one
+binary doc page.
 
 High-cardinality facet dictionaries are stored with the same range-directory
-and pack strategy as terms and documents. The 50k manifest is 99.6 KB; the
+and pack strategy as terms and documents. The 50k manifest is 104.7 KB; the
 large category dictionary lives in `facets/packs/*.bin` and is fetched only when
 that facet is selected or a UI asks for its values.
 
@@ -154,16 +150,49 @@ The ordinal table is keyed by original numeric document id and maps to a
 retrieval-local pointer ordinal. Document payloads and pointer records are
 written in the same locality order, derived from each document's strongest base
 term and impact score. Dense doc pages add a second result-payload lane for
-browse/filter/sort rows: the builder writes compressed arrays of 32 display
-payloads in original document-id order, and the runtime uses that lane only when
-the requested result ids are dense enough to keep overfetch bounded. The 50k
-A/B rows show that this cuts dense browse payload requests without hurting the
-text top-k lane, while sparse text results continue to use retrieval-local
-packed docs.
+browse/filter/sort rows: the builder writes compressed binary column pages of 32
+display payloads in original document-id order, and the runtime uses that lane
+only when the requested result ids are dense enough to keep overfetch bounded.
+The measured rows show that this keeps dense browse payload requests low without
+hurting the text top-k lane, while sparse text results continue to use
+retrieval-local packed docs.
+
+## Scale Run
+
+The scale command builds isolated fixtures for each requested limit and writes a
+combined report to `examples/frwiki/frwiki-scale-bench.json`:
+
+```bash
+node scripts/frwiki_fixture.mjs scale --scale-limits=50000,100000 --runs=2 --reduce-workers=auto
+```
+
+Latest scale result:
+
+```text
+Docs        Index      Files  Init             Bytes/doc  Text avg        Browse avg      Exact
+50,000      145.9 MiB     85  1 req / 104.7 KB  3061 B    25.5 req / 146 KB  5.7 req / 17 KB  10/10
+100,000     267.0 MiB    122  1 req / 169.3 KB  2800 B    31.1 req / 171 KB  5.7 req / 22 KB  10/10
+```
+
+Selected rows:
+
+```text
+Paris:                 50k 14 req /  90.5 KB, 100k 16 req / 101.3 KB
+Révolution française:  50k 45 req / 245.3 KB, 100k 43 req / 278.0 KB
+typed dates sorted:    50k  4 req /  18.8 KB, 100k  4 req /  24.6 KB
+dense filter browse:   50k  3 req /  11.6 KB, 100k  3 req /  11.6 KB
+```
+
+The scale result is now strong for both text and metadata retrieval. Text
+request counts and transfer grow slowly while exact top-k agreement remains
+10/10 at both sizes. Metadata browse is flat enough for a static browser index:
+sorted top-k grows from 18.8 KB to 24.6 KB when the corpus doubles, and dense
+unsorted range browse stays at 3 requests / 11.6 KB because it stops after one
+matching doc-value chunk and one doc page.
 
 Pack files, directory pages, directory roots, and the typo sidecar manifest are
 content-addressed with 24-hex-character SHA-256 name suffixes. The 50k run
-reported 113,075 exact compressed objects and no duplicate compressed objects to
+reported 114,972 exact compressed objects and no duplicate compressed objects to
 deduplicate, which is expected for real article/search shards. The dedup table
 remains useful for synthetic or repeated payloads, but the important CDN win here
 is that every heavy object can be served as immutable; only the main manifest

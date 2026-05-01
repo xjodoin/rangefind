@@ -170,6 +170,9 @@ var CODE_MAGIC = [82, 70, 67, 66];
 var DOC_VALUE_MAGIC = [82, 70, 86, 66];
 var FACET_DICT_MAGIC = [82, 70, 70, 68];
 var TYPO_SHARD_MAGIC = [82, 70, 84, 66];
+var DOC_PAGE_PAYLOAD_MAGIC = [82, 70, 80, 67];
+var DOC_VALUE_SORT_DIRECTORY_MAGIC = [82, 70, 68, 84];
+var DOC_VALUE_SORT_PAGE_MAGIC = [82, 70, 68, 86];
 function readVarint(bytes, state) {
   let value = 0;
   let multiplier = 1;
@@ -599,6 +602,197 @@ function decodeDocOrdinalRecord(buffer, offset, meta) {
   return readFixedInt(new Uint8Array(buffer), offset, meta.width);
 }
 
+// src/doc_pages.js
+var DOC_PAGE_ENCODING = "rfdocpagecols-v1";
+var DOC_PAGE_VERSION = 1;
+var VALUE_NULL = 0;
+var VALUE_FALSE = 1;
+var VALUE_TRUE = 2;
+var VALUE_NUMBER = 3;
+var VALUE_STRING = 4;
+var VALUE_STRING_ARRAY = 5;
+var VALUE_JSON = 6;
+var textEncoder3 = new TextEncoder();
+var textDecoder2 = new TextDecoder();
+function readBytes(bytes, state) {
+  const length = readVarint(bytes, state);
+  const start = state.pos;
+  state.pos += length;
+  if (state.pos > bytes.length) throw new Error("Rangefind doc page payload ended inside a value.");
+  return bytes.subarray(start, state.pos);
+}
+function decodeString(bytes, state) {
+  return textDecoder2.decode(readBytes(bytes, state));
+}
+function decodeNumber(bytes, state) {
+  if (state.pos + 8 > bytes.length) throw new Error("Rangefind doc page payload ended inside a number.");
+  const value = new DataView(bytes.buffer, bytes.byteOffset + state.pos, 8).getFloat64(0, true);
+  state.pos += 8;
+  return value;
+}
+function decodeValue(bytes, state) {
+  const type = bytes[state.pos++];
+  if (type === VALUE_NULL) return null;
+  if (type === VALUE_FALSE) return false;
+  if (type === VALUE_TRUE) return true;
+  if (type === VALUE_NUMBER) return decodeNumber(bytes, state);
+  if (type === VALUE_STRING) return decodeString(bytes, state);
+  if (type === VALUE_STRING_ARRAY) {
+    const count = readVarint(bytes, state);
+    const out = new Array(count);
+    for (let i = 0; i < count; i++) out[i] = decodeString(bytes, state);
+    return out;
+  }
+  if (type === VALUE_JSON) return JSON.parse(decodeString(bytes, state));
+  throw new Error(`Unsupported Rangefind doc page value type ${type}.`);
+}
+function decodeDocPageColumns(buffer, fields, startIndex = 0) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, DOC_PAGE_PAYLOAD_MAGIC, "Unsupported Rangefind doc page payload");
+  const state = { pos: DOC_PAGE_PAYLOAD_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== DOC_PAGE_VERSION) throw new Error(`Unsupported Rangefind doc page payload version ${version}`);
+  const count = readVarint(bytes, state);
+  const fieldCount = readVarint(bytes, state);
+  if (fieldCount !== fields.length) throw new Error("Rangefind doc page field count does not match the manifest.");
+  const docs = new Array(count);
+  for (let row = 0; row < count; row++) docs[row] = { index: startIndex + row };
+  for (const field of fields) {
+    for (let row = 0; row < count; row++) {
+      const value = decodeValue(bytes, state);
+      if (value !== null && value !== void 0) docs[row][field] = value;
+    }
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind doc page payload has trailing bytes.");
+  return docs;
+}
+
+// src/doc_value_tree.js
+var DOC_VALUE_SORT_DIRECTORY_FORMAT = "rfdocvaluesortdir-v1";
+var DOC_VALUE_SORT_PAGE_FORMAT = "rfdocvaluesortpage-v1";
+var FORMAT_VERSION = 1;
+var VALUE_FLOAT64 = 1;
+var VALUE_INT_DELTA = 2;
+function readFloat642(bytes, state) {
+  if (state.pos + 8 > bytes.length) throw new Error("Rangefind doc-value sort payload ended inside a float64.");
+  const value = new DataView(bytes.buffer, bytes.byteOffset + state.pos, 8).getFloat64(0, true);
+  state.pos += 8;
+  return value;
+}
+function runtimeValue(field, value) {
+  if (field.kind === "boolean") return value === 2;
+  return value;
+}
+function decodeDocValueSortPage(buffer, expected = {}) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, DOC_VALUE_SORT_PAGE_MAGIC, "Unsupported Rangefind doc-value sort page");
+  const state = { pos: DOC_VALUE_SORT_PAGE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value sort page version ${version}`);
+  const field = {
+    name: readUtf8(bytes, state),
+    kind: readUtf8(bytes, state),
+    type: readUtf8(bytes, state)
+  };
+  if (expected.name && expected.name !== field.name) throw new Error(`Rangefind doc-value sort page field mismatch: ${field.name}`);
+  const rankStart = readVarint(bytes, state);
+  const count = readVarint(bytes, state);
+  const valueEncoding = bytes[state.pos++];
+  const valueWidth = bytes[state.pos++];
+  const docWidth = bytes[state.pos++];
+  const min = readFloat642(bytes, state);
+  const values = new Array(count);
+  if (valueEncoding === VALUE_FLOAT64) {
+    for (let i = 0; i < count; i++) values[i] = new DataView(bytes.buffer, bytes.byteOffset + state.pos + i * 8, 8).getFloat64(0, true);
+    state.pos += count * 8;
+  } else if (valueEncoding === VALUE_INT_DELTA) {
+    for (let i = 0; i < count; i++) values[i] = min + readFixedInt(bytes, state.pos + i * valueWidth, valueWidth);
+    state.pos += count * valueWidth;
+  } else {
+    throw new Error(`Unsupported Rangefind doc-value sort value encoding ${valueEncoding}`);
+  }
+  const rows = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const doc = readFixedInt(bytes, state.pos + i * docWidth, docWidth);
+    rows[i] = {
+      doc,
+      value: runtimeValue(field, values[i]),
+      sortValue: values[i],
+      rank: rankStart + i
+    };
+  }
+  state.pos += count * docWidth;
+  if (state.pos !== bytes.length) throw new Error("Rangefind doc-value sort page has trailing bytes.");
+  return { ...field, rankStart, count, rows };
+}
+function parseDocValueSortDirectory(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, DOC_VALUE_SORT_DIRECTORY_MAGIC, "Unsupported Rangefind doc-value sort directory");
+  const state = { pos: DOC_VALUE_SORT_DIRECTORY_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION) throw new Error(`Unsupported Rangefind doc-value sort directory version ${version}`);
+  const field = {
+    name: readUtf8(bytes, state),
+    kind: readUtf8(bytes, state),
+    type: readUtf8(bytes, state)
+  };
+  const pageSize = readVarint(bytes, state);
+  const total = readVarint(bytes, state);
+  const packCount = readVarint(bytes, state);
+  const packTable = new Array(packCount);
+  for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
+  const summaryFieldCount = readVarint(bytes, state);
+  const summaryFields = new Array(summaryFieldCount);
+  for (let i = 0; i < summaryFieldCount; i++) {
+    summaryFields[i] = {
+      name: readUtf8(bytes, state),
+      kind: readUtf8(bytes, state),
+      type: readUtf8(bytes, state)
+    };
+  }
+  const pageCount = readVarint(bytes, state);
+  const pages = new Array(pageCount);
+  for (let i = 0; i < pageCount; i++) {
+    const rankStart = readVarint(bytes, state);
+    const count = readVarint(bytes, state);
+    const min = readFloat642(bytes, state);
+    const max = readFloat642(bytes, state);
+    const packIndex = readVarint(bytes, state);
+    const page = {
+      index: i,
+      rankStart,
+      count,
+      min,
+      max,
+      pack: packTable[packIndex],
+      offset: readVarint(bytes, state),
+      length: readVarint(bytes, state),
+      physicalLength: readVarint(bytes, state),
+      logicalLength: readVarint(bytes, state) || null
+    };
+    const algorithm = readUtf8(bytes, state);
+    const value = readUtf8(bytes, state);
+    page.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
+    page.summaries = {};
+    for (const summaryField of summaryFields) {
+      const hasValues = bytes[state.pos++] === 1;
+      page.summaries[summaryField.name] = hasValues ? { min: readFloat642(bytes, state), max: readFloat642(bytes, state) } : { min: null, max: null };
+    }
+    pages[i] = page;
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind doc-value sort directory has trailing bytes.");
+  return {
+    format: DOC_VALUE_SORT_DIRECTORY_FORMAT,
+    pageFormat: DOC_VALUE_SORT_PAGE_FORMAT,
+    field,
+    pageSize,
+    total,
+    packTable,
+    summaryFields,
+    pages
+  };
+}
+
 // src/object_store.js
 var OBJECT_CHECKSUM_ALGORITHM = "sha256";
 function bytesView(value) {
@@ -790,7 +984,7 @@ var RERANK_CANDIDATES = 30;
 var DEPENDENCY_SCORE_SCALE = 0.12;
 var SKIP_MAX_TERMS = 30;
 var EXTERNAL_POSTING_BLOCK_PREFETCH = 16;
-var textDecoder2 = new TextDecoder();
+var textDecoder3 = new TextDecoder();
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
     throw new Error("Rangefind requires DecompressionStream for compressed static index files.");
@@ -836,7 +1030,6 @@ async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then((r) => r.json());
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
-  const useDocPages = options.useDocPages !== false;
   const termDirectory = createDirectoryState(manifest.directory);
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
@@ -849,6 +1042,8 @@ async function createSearch(options = {}) {
   const docPagePointerCache = /* @__PURE__ */ new Map();
   const docPageCache = /* @__PURE__ */ new Map();
   const docValueCache = /* @__PURE__ */ new Map();
+  const docValueSortDirectoryCache = /* @__PURE__ */ new Map();
+  const docValueSortPageCache = /* @__PURE__ */ new Map();
   const facetDictionaryCache = /* @__PURE__ */ new Map();
   let typoManifest = null;
   let typoManifestPromise = null;
@@ -856,6 +1051,7 @@ async function createSearch(options = {}) {
   let codes = null;
   let codesPromise = null;
   const docValues = manifest.doc_values || null;
+  const docValueSorted = manifest.doc_value_sorted || null;
   const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
@@ -866,6 +1062,7 @@ async function createSearch(options = {}) {
     docs: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
     docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    docValueSortPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
     ...options.rangePlans || {}
   };
@@ -935,6 +1132,12 @@ async function createSearch(options = {}) {
   }
   function docValueField(field) {
     return docValues?.fields?.[field] || null;
+  }
+  function docValueSortField(field) {
+    return docValueSorted?.fields?.[field] || null;
+  }
+  function docValueSortPageCacheKey(field, pageIndexValue) {
+    return `${field}\0${pageIndexValue}`;
   }
   async function loadFacetDictionary(field) {
     if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
@@ -1007,6 +1210,55 @@ async function createSearch(options = {}) {
         throw error;
       }
     }));
+  }
+  async function loadDocValueSortDirectory(field) {
+    const meta = docValueSortField(field);
+    if (!meta?.directory?.file) return null;
+    if (!docValueSortDirectoryCache.has(field)) {
+      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseDocValueSortDirectory);
+      promise.catch(() => {
+        docValueSortDirectoryCache.delete(field);
+      });
+      docValueSortDirectoryCache.set(field, promise);
+    }
+    return docValueSortDirectoryCache.get(field);
+  }
+  async function loadDocValueSortPages(field, directory, pageIndexes) {
+    const wanted = [];
+    const pending = [];
+    for (const pageIndexValue of [...new Set(pageIndexes)]) {
+      const page = directory.pages[pageIndexValue];
+      if (!page) continue;
+      wanted.push(pageIndexValue);
+      const key = docValueSortPageCacheKey(field, pageIndexValue);
+      if (docValueSortPageCache.has(key)) continue;
+      let resolvePage;
+      let rejectPage;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePage = resolvePromise;
+        rejectPage = rejectPromise;
+      });
+      promise.catch(() => {
+      });
+      docValueSortPageCache.set(key, promise);
+      pending.push({ field, pageIndex: pageIndexValue, entry: page, resolve: resolvePage, reject: rejectPage });
+    }
+    await Promise.all(rangeGroups(pending, "docValueSortPages").map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`doc-values/sorted-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `doc-value sort page ${item.field}:${item.pageIndex}`);
+          item.resolve(decodeDocValueSortPage(inflated, { name: item.field }));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          docValueSortPageCache.delete(docValueSortPageCacheKey(item.field, item.pageIndex));
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+    return Promise.all(wanted.map((pageIndexValue) => docValueSortPageCache.get(docValueSortPageCacheKey(field, pageIndexValue))));
   }
   async function ensureDocValuesForDocs(fields, docs) {
     if (!docValues || !fields.length || !docs.length) return null;
@@ -1345,7 +1597,7 @@ async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc ${item.index}`);
-          item.resolve(JSON.parse(textDecoder2.decode(new Uint8Array(inflated))));
+          item.resolve(JSON.parse(textDecoder3.decode(new Uint8Array(inflated))));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -1363,8 +1615,12 @@ async function createSearch(options = {}) {
   function docPageIndex(index) {
     return Math.floor(index / docPageSize());
   }
+  function decodeDocPagePayload(inflated, pageIndexValue) {
+    if (docPages.encoding !== DOC_PAGE_ENCODING) throw new Error(`Unsupported Rangefind doc page encoding ${docPages.encoding || "unknown"}.`);
+    return decodeDocPageColumns(inflated, docPages.fields || [], pageIndexValue * docPageSize());
+  }
   function docPagePlan(indexes, context = {}) {
-    if (!useDocPages || !docPages?.pointers?.file || !context.preferDocPages) return null;
+    if (!docPages?.pointers?.file || !context.preferDocPages) return null;
     const unique = [...new Set(indexes)];
     if (!unique.length) return null;
     const pages = [...new Set(unique.map(docPageIndex))].sort((a, b) => a - b);
@@ -1437,7 +1693,7 @@ async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`docs/page-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc page ${item.pageIndex}`);
-          item.resolve(JSON.parse(textDecoder2.decode(new Uint8Array(inflated))));
+          item.resolve(decodeDocPagePayload(inflated, item.pageIndex));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -1587,6 +1843,30 @@ async function createSearch(options = {}) {
     }
     return true;
   }
+  function knownValueForDoc(known, field) {
+    return Object.prototype.hasOwnProperty.call(known || {}, field) ? known[field] : void 0;
+  }
+  function valueForDocWithKnown(codeData, field, doc, known) {
+    const knownValue = knownValueForDoc(known, field);
+    return knownValue !== void 0 ? knownValue : valueForDoc(codeData, field, doc);
+  }
+  function passesFilterPlanWithKnown(doc, codeData, filterPlan, known = {}) {
+    if (!filterPlan?.active) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      if (!facetCodeMatches(valueForDocWithKnown(codeData, field, doc, known), selected)) return false;
+    }
+    for (const [field, range] of filterPlan.numbers) {
+      const value = valueForDocWithKnown(codeData, field, doc, known);
+      if (value == null) return false;
+      if (range.min != null && value < range.min) return false;
+      if (range.max != null && value > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const value = valueForDocWithKnown(codeData, field, doc, known);
+      if (value == null || value !== expected) return false;
+    }
+    return true;
+  }
   function blockFacetMatches(summary, selected) {
     if (!selected?.size) return true;
     const words = summary?.words || [];
@@ -1673,6 +1953,172 @@ async function createSearch(options = {}) {
     const out = [];
     for (let index = 0; index < count; index++) if (chunkMayPass(index, filterPlan)) out.push(index);
     return out;
+  }
+  function booleanSummaryCode(value) {
+    return value ? 2 : 1;
+  }
+  function pageSummaryForField(page, field, sortedField) {
+    if (Object.prototype.hasOwnProperty.call(page.summaries || {}, field)) return page.summaries[field];
+    return field === sortedField && Number.isFinite(page.min) && Number.isFinite(page.max) ? { min: page.min, max: page.max } : null;
+  }
+  function pageMayPassDocValueFilter(page, filterPlan, sortedField) {
+    if (!filterPlan?.active) return true;
+    for (const [field, range] of filterPlan.numbers) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (range.min != null && summary.max < range.min) return false;
+      if (range.max != null && summary.min > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      const code = booleanSummaryCode(expected);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (summary.max < code || summary.min > code) return false;
+    }
+    return true;
+  }
+  function pageDefinitelyPassesDocValueFilter(page, filterPlan, sortedField) {
+    if (!filterPlan?.active) return true;
+    if (filterPlan.facets.length) return false;
+    for (const [field, range] of filterPlan.numbers) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (range.min != null && summary.min < range.min) return false;
+      if (range.max != null && summary.max > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const summary = pageSummaryForField(page, field, sortedField);
+      const code = booleanSummaryCode(expected);
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (summary.min !== code || summary.max !== code) return false;
+    }
+    return true;
+  }
+  function sortedDirectoryPages(directory, desc, filterPlan) {
+    return directory.pages.filter((page) => pageMayPassDocValueFilter(page, filterPlan, directory.field.name)).sort((a, b) => desc ? b.max - a.max || a.rankStart - b.rankStart : a.min - b.min || a.rankStart - b.rankStart);
+  }
+  function sortedPageRows(page, desc) {
+    return page.rows.slice().sort((a, b) => desc ? b.sortValue - a.sortValue || a.doc - b.doc : a.sortValue - b.sortValue || a.doc - b.doc);
+  }
+  async function runDocValueBrowse({ page, size, filters, sortPlan, hasFilters }) {
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const field = sortPlan?.field || null;
+    if (!field || !docValueSortField(field)) return null;
+    const directory = await loadDocValueSortDirectory(field);
+    if (!directory?.pages?.length) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const desc = !!sortPlan?.desc;
+    const pages = sortedDirectoryPages(directory, desc, docFilterPlan);
+    const collected = [];
+    const filterFields = filterPlanFields(docFilterPlan).filter((item) => item !== field);
+    let pagesVisited = 0;
+    let rowsScanned = 0;
+    let rowsAccepted = 0;
+    let definitelyPassedPages = 0;
+    let stoppedEarly = false;
+    for (const candidatePage of pages) {
+      const [loadedPage] = await loadDocValueSortPages(field, directory, [candidatePage.index]);
+      pagesVisited++;
+      const rows = sortedPageRows(loadedPage, desc);
+      rowsScanned += rows.length;
+      const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
+      if (definite) definitelyPassedPages++;
+      const codeData = definite || !filterFields.length ? null : await valueStoreForDocs(filterFields, rows.map((row) => row.doc));
+      for (const row of rows) {
+        const known = { [field]: row.value };
+        if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+        collected.push([row.doc, 0]);
+        rowsAccepted++;
+        if (collected.length >= k) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      if (stoppedEarly) break;
+    }
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(collected.slice(offset, offset + size), resultContext);
+    const exactTotal = !stoppedEarly;
+    return {
+      total: !hasFilters ? manifest.total : exactTotal ? collected.length : Math.max(collected.length, k),
+      results,
+      page,
+      size,
+      approximate: !exactTotal && hasFilters,
+      stats: {
+        exact: exactTotal,
+        docValuePruning: true,
+        docValuePruneField: field,
+        docValueSortDirection: desc ? "desc" : "asc",
+        docValueDirectoryPages: directory.pages.length,
+        docValueCandidatePages: pages.length,
+        docValuePagesPruned: directory.pages.length - pages.length,
+        docValuePagesVisited: pagesVisited,
+        docValueRowsScanned: rowsScanned,
+        docValueRowsAccepted: rowsAccepted,
+        docValueDefinitePages: definitelyPassedPages,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
+  async function runDocValueChunkBrowse({ page, size, filters, hasFilters }) {
+    if (!docValues || !hasFilters) return null;
+    const docFilterPlan = makeDocFilterPlan(filters);
+    if (!docFilterPlan?.active) return null;
+    const fields = filterPlanFields(docFilterPlan);
+    if (!fields.length) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const chunkIndexes = candidateDocValueChunks(docFilterPlan);
+    const chunkSize = Math.max(1, docValues.chunk_size || manifest.total || 1);
+    const collected = [];
+    let chunksVisited = 0;
+    let rowsScanned = 0;
+    let rowsAccepted = 0;
+    let stoppedEarly = false;
+    for (const chunkIndex of chunkIndexes) {
+      const codeData = await ensureDocValueChunkIndexes(fields, [chunkIndex]);
+      chunksVisited++;
+      const start = chunkIndex * chunkSize;
+      const end = Math.min(manifest.total, start + chunkSize);
+      for (let index = start; index < end; index++) {
+        rowsScanned++;
+        if (!passesFilterPlan(index, codeData, docFilterPlan)) continue;
+        collected.push([index, 0]);
+        rowsAccepted++;
+        if (collected.length >= k) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      if (stoppedEarly) break;
+    }
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(collected.slice(offset, offset + size), resultContext);
+    const exactTotal = !stoppedEarly;
+    return {
+      total: exactTotal ? collected.length : Math.max(collected.length, k),
+      results,
+      page,
+      size,
+      approximate: !exactTotal,
+      stats: {
+        exact: exactTotal,
+        docValueChunkPruning: true,
+        docValueChunksTotal: Math.ceil(manifest.total / chunkSize),
+        docValueCandidateChunks: chunkIndexes.length,
+        docValueChunksPruned: Math.ceil(manifest.total / chunkSize) - chunkIndexes.length,
+        docValueChunksVisited: chunksVisited,
+        docValueRowsScanned: rowsScanned,
+        docValueRowsAccepted: rowsAccepted,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
   }
   function sortRanked(ranked, codeData, sortPlan) {
     if (!sortPlan || !codeData) return ranked;
@@ -2037,6 +2483,14 @@ async function createSearch(options = {}) {
       }
       await ensureFacetDictionaries(filters);
       const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+      if (!sortPlan && hasFilters && docValues) {
+        const chunkPruned = await runDocValueChunkBrowse({ page, size, filters, hasFilters });
+        if (chunkPruned) return chunkPruned;
+      }
+      if (docValueSorted && sortPlan) {
+        const pruned = await runDocValueBrowse({ page, size, filters, sortPlan, hasFilters });
+        if (pruned) return pruned;
+      }
       let codeData;
       let candidates;
       if (docValues) {

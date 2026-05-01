@@ -26,8 +26,14 @@ import {
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
 import { docLayoutRecord, orderDocIdsByLocality, summarizeDocLayout } from "./doc_layout.js";
-import { buildDocPagePointerTable, DOC_PAGE_FORMAT } from "./doc_pages.js";
+import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, encodeDocPageColumns } from "./doc_pages.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
+import {
+  DOC_VALUE_SORT_DIRECTORY_FORMAT,
+  DOC_VALUE_SORT_PAGE_FORMAT,
+  encodeDocValueSortDirectory,
+  encodeDocValueSortPage
+} from "./doc_value_tree.js";
 import { buildDocOrdinalTable, buildDocPointerTable } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
@@ -179,6 +185,13 @@ function docPayload(doc, config, index) {
   return payload;
 }
 
+function docPayloadFieldNames(config) {
+  const fields = ["id"];
+  for (const item of config.display) fields.push(typeof item === "string" ? item : item.name);
+  fields.push("title", "url");
+  return [...new Set(fields)].filter(field => field && field !== "index");
+}
+
 function docIndexKey(index) {
   return String(index).padStart(8, "0");
 }
@@ -295,26 +308,24 @@ function finishDocPacks(out, spool, total, config) {
 
 function finishDocPages(out, spool, total, config) {
   const pageSize = Math.max(1, Math.floor(Number(config.docPageSize || 32)));
+  const fields = docPayloadFieldNames(config);
   const packWriter = createPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
   const entries = [];
   const fd = openSync(spool.path, "r");
   try {
     for (let pageStart = 0, pageIndex = 0; pageStart < total; pageStart += pageSize, pageIndex++) {
       const pageEnd = Math.min(total, pageStart + pageSize);
-      const parts = [];
-      let logicalLength = 2;
+      const docs = [];
       for (let index = pageStart; index < pageEnd; index++) {
         const entry = spool.entries[index];
         if (!entry) throw new Error(`Rangefind doc spool is missing document ${index}.`);
-        const payload = gunzipSync(readSpooledDoc(fd, entry)).toString("utf8");
-        parts.push(payload);
-        logicalLength += Buffer.byteLength(payload) + (parts.length > 1 ? 1 : 0);
+        docs.push(JSON.parse(gunzipSync(readSpooledDoc(fd, entry)).toString("utf8")));
       }
-      const source = Buffer.from(`[${parts.join(",")}]`);
+      const source = encodeDocPageColumns(docs, fields);
       const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
         kind: "doc-page",
         codec: DOC_PAGE_FORMAT,
-        logicalLength
+        logicalLength: source.length
       });
       entries[pageIndex] = packed;
     }
@@ -331,7 +342,9 @@ function finishDocPages(out, spool, total, config) {
   return {
     storage: "range-pack-v1",
     format: DOC_PAGE_FORMAT,
+    encoding: DOC_PAGE_ENCODING,
     compression: "gzip-member",
+    fields,
     page_size: pageSize,
     max_overfetch_docs: Math.max(1, Math.floor(Number(config.docPageMaxOverfetchDocs || 16))),
     pointers: {
@@ -448,6 +461,138 @@ function writeDocValuePacks(out, config, total, codes) {
     chunk_size: chunkSize,
     fields,
     packs: packWriter.packs
+  };
+}
+
+function safeObjectName(value) {
+  return String(value || "field").replace(/[^A-Za-z0-9_-]+/gu, "_").replace(/^_+|_+$/gu, "") || "field";
+}
+
+function sortableDocValue(field, value) {
+  if (field.kind === "boolean") {
+    if (value === true || value === 1 || value === "true" || value === "1") return 2;
+    if (value === false || value === 0 || value === "false" || value === "0") return 1;
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function summarizeDocValuePage(summaryFields, codes, docs) {
+  const summaries = {};
+  for (const field of summaryFields) {
+    let min = null;
+    let max = null;
+    const values = codes[field.name] || [];
+    for (const doc of docs) {
+      const value = sortableDocValue(field, values[doc]);
+      if (!Number.isFinite(value)) continue;
+      min = min == null ? value : Math.min(min, value);
+      max = max == null ? value : Math.max(max, value);
+    }
+    summaries[field.name] = { min, max };
+  }
+  return summaries;
+}
+
+function nextSortPageEnd(rows, start, pageSize) {
+  let end = Math.min(rows.length, start + pageSize);
+  const maxEnd = Math.min(rows.length, start + pageSize * 4);
+  while (end < maxEnd && rows[end]?.value === rows[end - 1]?.value) end++;
+  return end;
+}
+
+function writeDocValueSortedIndexes(out, config, total, codes) {
+  const pageSize = Math.max(1, Math.floor(Number(config.docValueSortedPageSize || 512)));
+  const packWriter = createPackWriter(resolve(out, "doc-values", "sorted-packs"), config.docValueSortedPackBytes || config.docValuePackBytes);
+  const fields = {};
+  const sourceFields = docValueFields(config, codes).filter(field => field.kind !== "facet");
+  const summaryFields = sourceFields.map(field => ({ name: field.name, kind: field.kind, type: field.type }));
+  const pagesByField = new Map();
+
+  for (const field of sourceFields) {
+    const values = codes[field.name] || [];
+    const rows = [];
+    for (let doc = 0; doc < total; doc++) {
+      const value = sortableDocValue(field, values[doc]);
+      if (Number.isFinite(value)) rows.push({ doc, value });
+    }
+    rows.sort((a, b) => a.value - b.value || a.doc - b.doc);
+    const pages = [];
+    for (let start = 0, pageIndex = 0; start < rows.length; pageIndex++) {
+      const end = nextSortPageEnd(rows, start, pageSize);
+      const pageRows = rows.slice(start, end);
+      const encoded = encodeDocValueSortPage(field, start, pageRows);
+      const entry = writePackedShard(packWriter, `${field.name}\u0000${pageIndex}`, gzipSync(encoded.buffer, { level: 6 }), {
+        kind: "doc-value-sort-page",
+        codec: DOC_VALUE_SORT_PAGE_FORMAT,
+        logicalLength: encoded.buffer.length
+      });
+      pages.push({
+        ...encoded.meta,
+        entry,
+        summaries: summarizeDocValuePage(summaryFields, codes, pageRows.map(row => row.doc))
+      });
+      start = end;
+    }
+    pagesByField.set(field.name, { field, pages, total: rows.length });
+  }
+
+  finalizePackWriter(packWriter);
+  const packFiles = packTable(packWriter.packs);
+  const packIndexes = new Map(packFiles.map((file, index) => [file, index]));
+  let directoryBytes = 0;
+  let directoryLogicalBytes = 0;
+  mkdirSync(resolve(out, "doc-values", "sorted"), { recursive: true });
+
+  for (const { field, pages, total: fieldTotal } of pagesByField.values()) {
+    const directory = encodeDocValueSortDirectory({
+      field,
+      pageSize,
+      total: fieldTotal,
+      pages,
+      summaryFields,
+      packTable: packFiles,
+      packIndexes
+    });
+    const compressed = gzipSync(directory.buffer, { level: 6 });
+    const hash = sha256Hex(compressed);
+    const file = `doc-values/sorted/${hashedFile(safeObjectName(field.name), hash, ".bin.gz")}`;
+    writeFileSync(resolve(out, file), compressed);
+    directoryBytes += compressed.length;
+    directoryLogicalBytes += directory.buffer.length;
+    fields[field.name] = {
+      name: field.name,
+      kind: field.kind,
+      type: field.type,
+      total: fieldTotal,
+      page_size: pageSize,
+      pages: pages.length,
+      directory: {
+        format: DOC_VALUE_SORT_DIRECTORY_FORMAT,
+        compression: "gzip-member",
+        file,
+        content_hash: hash,
+        immutable: true,
+        bytes: compressed.length,
+        logical_bytes: directory.buffer.length
+      },
+      summary_fields: summaryFields.map(item => ({ name: item.name, kind: item.kind, type: item.type }))
+    };
+  }
+
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    directory_format: DOC_VALUE_SORT_DIRECTORY_FORMAT,
+    page_format: DOC_VALUE_SORT_PAGE_FORMAT,
+    page_size: pageSize,
+    fields,
+    packs: packWriter.packs,
+    pack_table: packFiles,
+    directory_bytes: directoryBytes,
+    directory_logical_bytes: directoryLogicalBytes,
+    pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0)
   };
 }
 
@@ -769,6 +914,7 @@ export async function build({ configPath }) {
   docs.pages = finishDocPages(dirs.out, runData.docSpool, measured.total, config);
   const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
   const docValues = writeDocValuePacks(dirs.out, config, measured.total, runData.codes);
+  const docValueSorted = writeDocValueSortedIndexes(dirs.out, config, measured.total, runData.codes);
   const facetDictionaries = writeFacetDictionaries(dirs.out, measured.dicts, config);
 
   const manifest = {
@@ -784,6 +930,7 @@ export async function build({ configPath }) {
       docPages: true,
       rangeDirectoryV2: true,
       docValues: true,
+      docValueSorted: true,
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
       typoSidecar: !!typoManifest
@@ -804,6 +951,7 @@ export async function build({ configPath }) {
         docs: packTable(docs.packs),
         docPages: packTable(docs.pages.packs),
         docValues: packTable(docValues.packs),
+        docValueSorted: packTable(docValueSorted.packs),
         facets: packTable(facetDictionaries.pack_objects),
         typo: packTable(typoManifest?.packs)
       },
@@ -813,6 +961,7 @@ export async function build({ configPath }) {
         docs.packs,
         docs.pages.packs,
         docValues.packs,
+        docValueSorted.packs,
         facetDictionaries.pack_objects,
         typoManifest?.packs || []
       ),
@@ -836,6 +985,16 @@ export async function build({ configPath }) {
       chunk_size: docValues.chunk_size,
       fields: docValues.fields,
       packs: docValues.packs.length
+    },
+    doc_value_sorted: {
+      storage: docValueSorted.storage,
+      compression: docValueSorted.compression,
+      directory_format: docValueSorted.directory_format,
+      page_format: docValueSorted.page_format,
+      page_size: docValueSorted.page_size,
+      fields: docValueSorted.fields,
+      packs: docValueSorted.packs.length,
+      pack_table: docValueSorted.pack_table
     },
     initial_results: runData.initialResults,
     fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
@@ -894,6 +1053,15 @@ export async function build({ configPath }) {
       doc_value_fields: Object.keys(docValues.fields).length,
       doc_value_pack_files: docValues.packs.length,
       doc_value_pack_bytes: docValues.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+      doc_value_sorted_storage: docValueSorted.storage,
+      doc_value_sorted_directory_format: docValueSorted.directory_format,
+      doc_value_sorted_page_format: docValueSorted.page_format,
+      doc_value_sorted_page_size: docValueSorted.page_size,
+      doc_value_sorted_fields: Object.keys(docValueSorted.fields).length,
+      doc_value_sorted_directory_bytes: docValueSorted.directory_bytes,
+      doc_value_sorted_directory_logical_bytes: docValueSorted.directory_logical_bytes,
+      doc_value_sorted_pack_files: docValueSorted.packs.length,
+      doc_value_sorted_pack_bytes: docValueSorted.pack_bytes,
       facet_dictionary_storage: facetDictionaries.storage,
       facet_dictionary_format: facetDictionaries.format,
       facet_dictionary_page_files: facetDictionaries.directory.page_files,

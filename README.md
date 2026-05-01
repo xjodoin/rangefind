@@ -27,8 +27,8 @@ a large thesis corpus.
 - Exact compressed-object deduplication during index construction.
 - Locality-ordered doc packs with a tiny doc-id ordinal table and dense pointer
   records for low-transfer result fetching.
-- Dense doc-page payload packs for browse, filter, and sort result pages where
-  original document ids are clustered.
+- Dense binary doc-page payload packs for browse, filter, and sort result pages
+  where original document ids are clustered.
 - Range-packed result payloads with capped display fields.
 - Range-addressable posting-block sidecar for high-df terms.
 - Range-packed binary facet dictionaries for high-cardinality metadata.
@@ -39,6 +39,8 @@ a large thesis corpus.
 - Multi-value keyword facets with lazy dictionary loading.
 - Range-addressed typed numeric, date, and boolean doc-values for filters and
   sorting.
+- Lazy binary sorted doc-value trees for range-pruned top-k sort and doc-order
+  early-stop browsing.
 - Tiny runnable example.
 
 ## Why This Exists
@@ -80,8 +82,8 @@ node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
 Use `--limit=0` to run against the full dump. The generated site lives at
 `examples/frwiki/public/`. The fixture validates text query top-k against the
 exact retrieval path by default and records cold request counts, transfer bytes,
-runtime posting-block stats, typed filter/sort validation, and an A/B packed-doc
-fallback for doc-page browse rows.
+runtime posting-block stats, typed filter/sort validation, and scale reports
+across multiple Wikipedia sample sizes.
 
 ## Build A Custom Index
 

@@ -18,6 +18,8 @@ export const DEFAULTS = {
   docPageMaxOverfetchDocs: 16,
   docLocalityTerms: 2,
   docValuePackBytes: 4 * 1024 * 1024,
+  docValueSortedPageSize: 512,
+  docValueSortedPackBytes: 4 * 1024 * 1024,
   directoryPageBytes: 64 * 1024,
   facetDictionaryPackBytes: 4 * 1024 * 1024,
   blockFilterMaxFacetWords: 64,

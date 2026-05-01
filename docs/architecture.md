@@ -20,6 +20,10 @@ rangefind/
   doc-values/
     packs/
       0000.<hash>.bin
+    sorted/
+      bodyLength.<hash>.bin.gz
+    sorted-packs/
+      0000.<hash>.bin
   facets/
     directory-root.<hash>.bin.gz
     directory-pages/
@@ -116,6 +120,17 @@ missing, false, and true. The manifest carries per-chunk summaries, so broad
 filter and sort queries can fetch only the involved columns and skip chunks that
 cannot match instead of downloading one global code table.
 
+`doc-values/sorted/*.bin.gz` stores a lazy binary directory per numeric/date/
+boolean field. Each directory points into `doc-values/sorted-packs/*.bin`, where
+`rfdocvaluesortpage-v1` pages keep value-sorted `(value, docId)` rows plus
+per-page min/max summaries for every sortable/filterable typed field. Sorted
+top-k browse loads the directory for the requested sort field, fetches only the
+next value page in sort order, and stops once the requested page is full.
+Unsorted filter browsing keeps document order instead: it walks doc-value
+chunks in doc-id order and stops after enough matches, preserving the dense
+doc-page payload lane. This gives both value-order pruning for sorted views and
+low-request dense browsing for broad filters.
+
 `docs/ordinals/*.bin` is a tiny fixed-record table keyed directly by numeric
 document id. It maps each document id to its retrieval-local layout ordinal.
 `docs/pointers/*.bin` is a dense fixed-record pointer table in that layout order.
@@ -125,8 +140,10 @@ records for text-local result sets, then range-fetches the referenced compressed
 document payloads from `docs/packs/*.bin`.
 
 `docs/pages/*.bin` is a second dense pointer table keyed by document-id page,
-and `docs/page-packs/*.bin` stores compressed JSON arrays of display payloads in
-original document-id order. This lane is optimized for browse, filter, and sort
+and `docs/page-packs/*.bin` stores `rfdocpagecols-v1` binary column pages in
+original document-id order. The format stores the page field list once in the
+manifest, writes typed column values for each page, and treats `index` as an
+implicit document-id offset. This lane is optimized for browse, filter, and sort
 result pages where returned ids are clustered. The runtime estimates page
 overfetch before using it; sparse text top-k results stay on the retrieval-local
 doc pack lane.
@@ -185,6 +202,13 @@ while very large lists can still avoid downloading their full posting payload.
 Very high-cardinality facets are omitted from posting-block summaries by
 default; exact per-document filtering still uses doc-value chunks, while block
 filters keep only compact summaries that are worth shipping on every term block.
+
+For no-query metadata views, the runtime now uses doc-value pruning instead of
+materializing every candidate chunk. Sort requests use the sorted doc-value tree
+for the sort field and evaluate filters with page summaries before touching
+per-document chunks. Filter-only browse requests use doc-id chunk summaries and
+early stop as soon as `offset + size` matching documents are found, which keeps
+the returned ids dense enough for binary doc pages.
 
 ## Why Custom Binary
 

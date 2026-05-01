@@ -20,6 +20,10 @@ anchors for the next performance work:
   superblock selection can prune groups of blocks before child blocks are
   visited, which maps naturally to Rangefind's static range-fetch model.
   https://arxiv.org/abs/2504.17045
+- Column-store zone maps and PageIndex-style min/max metadata: page-level
+  summaries let range predicates skip whole compression units before fetching
+  column payload bytes. Rangefind applies the same idea to browser doc-values
+  with lazy sorted directories and per-page summaries.
 
 Current implementation consequence: Rangefind already stores block-max metadata
 for posting pruning, but browser cold-query cost also includes random result
@@ -34,3 +38,10 @@ blocks are stored in `terms/block-packs/*.bin` and referenced from the term-shar
 metadata. The runtime applies the existing block-max schedule before fetching
 those blocks, with a small adjacent prefetch window that behaves like a dynamic
 superblock for medium lists.
+
+The metadata browse path now uses the same pruning principle. Sorted numeric,
+date, and boolean fields get `rfdocvaluesortdir-v1` directories plus
+`rfdocvaluesortpage-v1` value pages. Sorted top-k views fetch only the next
+value page in sort order and stop when the result page is full. Unsorted range
+browsing uses doc-id chunk summaries and early stop so broad filters can keep
+the dense doc-page payload lane.

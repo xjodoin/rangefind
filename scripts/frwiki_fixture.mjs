@@ -54,9 +54,11 @@ function parseArgs(argv) {
     else if (arg.startsWith("--size=")) args.size = Number(arg.slice("--size=".length)) || args.size;
     else if (arg.startsWith("--body-chars=")) args.bodyChars = Number(arg.slice("--body-chars=".length)) || 0;
     else if (arg.startsWith("--reduce-workers=")) args.reduceWorkers = arg.slice("--reduce-workers=".length);
+    else if (arg.startsWith("--scale-limits=")) args.scaleLimits = arg.slice("--scale-limits=".length).split(",").map(value => Number(value.trim())).filter(Boolean);
     else if (arg === "--exact-checks") args.exactChecks = true;
     else if (arg === "--no-exact-checks") args.exactChecks = false;
   }
+  args.scaleLimits ||= [10000, 25000, 50000, 100000];
   return args;
 }
 
@@ -369,6 +371,7 @@ function networkBucket(url) {
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/facets/packs/")) return "facetDictionaries";
+  if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
   if (path.includes("/docs/ordinals/")) return "docOrdinals";
   if (path.includes("/docs/pointers/")) return "docPointers";
@@ -515,6 +518,18 @@ function compactRuntimeStats(stats = {}) {
     docPayloadLane: stats.docPayloadLane || "",
     docPayloadPages: stats.docPayloadPages || 0,
     docPayloadOverfetchDocs: stats.docPayloadOverfetchDocs || 0,
+    docValuePruning: Boolean(stats.docValuePruning),
+    docValuePruneField: stats.docValuePruneField || "",
+    docValueDirectoryPages: stats.docValueDirectoryPages || 0,
+    docValueCandidatePages: stats.docValueCandidatePages || 0,
+    docValuePagesPruned: stats.docValuePagesPruned || 0,
+    docValuePagesVisited: stats.docValuePagesVisited || 0,
+    docValueRowsScanned: stats.docValueRowsScanned || 0,
+    docValueRowsAccepted: stats.docValueRowsAccepted || 0,
+    docValueDefinitePages: stats.docValueDefinitePages || 0,
+    docValueChunkPruning: Boolean(stats.docValueChunkPruning),
+    docValueChunksVisited: stats.docValueChunksVisited || 0,
+    docValueChunksPruned: stats.docValueChunksPruned || 0,
     typoApplied: Boolean(stats.typoApplied)
   };
 }
@@ -552,7 +567,7 @@ async function addExactChecks(args, serverUrl, rows, cases) {
   }
 }
 
-async function benchFixture(args) {
+async function benchFixture(args, options = {}) {
   const root = resolve(args.root, "public");
   const server = await serveStatic(root);
   const meter = createFetchMeter(/\/(rangefind|runtime\.browser\.js)/u, networkBucket);
@@ -575,7 +590,6 @@ async function benchFixture(args) {
       let resultIds = [];
       let coldStats = {};
       let validationErrors = [];
-      let withoutDocPages = null;
       for (let i = 0; i < args.runs; i++) {
         meter.reset();
         const start = performance.now();
@@ -592,22 +606,6 @@ async function benchFixture(args) {
           coldStats = compactRuntimeStats(response.stats);
           validationErrors = validateResponse(item, response, caseEngine.manifest);
         }
-      }
-      if (coldStats.docPayloadLane === "docPages") {
-        const fallbackEngine = await createSearch({ baseUrl: new URL("rangefind/", server.url), useDocPages: false });
-        meter.reset();
-        const start = performance.now();
-        const response = await fallbackEngine.search({ q: item.q, filters: item.filters, sort: item.sort, size: item.size || args.size });
-        const network = meter.snapshot();
-        const fallbackErrors = validateResponse(item, response, fallbackEngine.manifest);
-        if (fallbackErrors.length) validationErrors = [...new Set([...validationErrors, ...fallbackErrors.map(error => `withoutDocPages: ${error}`)])];
-        withoutDocPages = {
-          ms: performance.now() - start,
-          requests: network.requests,
-          kb: kb(network.bytes),
-          by: networkKbBy(network),
-          stats: compactRuntimeStats(response.stats)
-        };
       }
       rows.push({
         q: item.label,
@@ -628,8 +626,7 @@ async function benchFixture(args) {
         p50Ms: quantile(times, 0.5),
         p95Ms: quantile(times, 0.95),
         avgRequests: mean(requests),
-        avgKb: kb(mean(bytes)),
-        withoutDocPages
+        avgKb: kb(mean(bytes))
       });
     }
     await addExactChecks(args, server.url, rows, cases);
@@ -637,6 +634,25 @@ async function benchFixture(args) {
       fixture: "frwiki",
       root,
       index: dirStats(resolve(root, "rangefind")),
+      rangefindStats: engine.manifest.stats,
+      docPages: engine.manifest.docs?.pages ? {
+        format: engine.manifest.docs.pages.format,
+        encoding: engine.manifest.docs.pages.encoding,
+        pageSize: engine.manifest.docs.pages.page_size,
+        fields: engine.manifest.docs.pages.fields?.length || 0,
+        pointerBytes: engine.manifest.docs.pages.pointers?.bytes || 0,
+        packFiles: engine.manifest.docs.pages.packs?.length || 0,
+        packBytes: (engine.manifest.docs.pages.packs || []).reduce((sum, pack) => sum + (pack.bytes || 0), 0)
+      } : null,
+      docValueSorted: engine.manifest.doc_value_sorted ? {
+        directoryFormat: engine.manifest.doc_value_sorted.directory_format,
+        pageFormat: engine.manifest.doc_value_sorted.page_format,
+        pageSize: engine.manifest.doc_value_sorted.page_size,
+        fields: Object.keys(engine.manifest.doc_value_sorted.fields || {}).length,
+        directoryBytes: engine.manifest.stats?.doc_value_sorted_directory_bytes || 0,
+        packFiles: engine.manifest.doc_value_sorted.packs || 0,
+        packBytes: engine.manifest.stats?.doc_value_sorted_pack_bytes || 0
+      } : null,
       meta: existsSync(resolve(args.root, "data", "frwiki.meta.json")) ? JSON.parse(readFileSync(resolve(args.root, "data", "frwiki.meta.json"), "utf8")) : null,
       benchmark: {
         coldEnginePerCase: true,
@@ -649,8 +665,9 @@ async function benchFixture(args) {
     if (invalid.length) report.validationErrors = invalid.map(row => ({ q: row.q, errors: row.validationErrors }));
     const reportPath = resolve(args.root, "frwiki-bench.json");
     writeFileSync(reportPath, JSON.stringify(report, null, 2));
-    console.log(JSON.stringify(report, null, 2));
+    if (!options.quiet) console.log(JSON.stringify(report, null, 2));
     if (invalid.length) throw new Error(`frwiki typed bench validation failed for ${invalid.map(row => row.q).join(", ")}`);
+    return report;
   } finally {
     meter.restore();
     await server.close();
@@ -662,6 +679,107 @@ function clean(args) {
   rmSync(resolve(args.root, "public"), { recursive: true, force: true });
   rmSync(resolve(args.root, "rangefind.config.json"), { force: true });
   rmSync(resolve(args.root, "frwiki-bench.json"), { force: true });
+  rmSync(resolve(args.root, "scale"), { recursive: true, force: true });
+}
+
+function rowByLabel(report, label) {
+  return report.rows.find(row => row.q === label) || null;
+}
+
+function summarizeScaleRow(row) {
+  if (!row) return null;
+  return {
+    total: row.total,
+    top: row.top,
+    valid: row.valid,
+    coldMs: row.coldMs,
+    coldRequests: row.coldRequests,
+    coldKb: row.coldKb,
+    coldBy: row.coldBy,
+    lane: row.coldStats?.docPayloadLane || "",
+    docValuePruning: row.coldStats?.docValuePruning || false,
+    docValuePruneField: row.coldStats?.docValuePruneField || "",
+    docValuePagesVisited: row.coldStats?.docValuePagesVisited || 0,
+    docValuePagesPruned: row.coldStats?.docValuePagesPruned || 0,
+    docValueRowsScanned: row.coldStats?.docValueRowsScanned || 0,
+    docValueRowsAccepted: row.coldStats?.docValueRowsAccepted || 0,
+    docValueChunkPruning: row.coldStats?.docValueChunkPruning || false,
+    docValueChunksVisited: row.coldStats?.docValueChunksVisited || 0,
+    docValueChunksPruned: row.coldStats?.docValueChunksPruned || 0,
+    exactTopKMatch: row.exactTopKMatch ?? null,
+    exactTotal: row.exactTotal ?? null
+  };
+}
+
+function scalePoint(limit, report) {
+  const textRows = report.rows.filter(row => row.request?.q);
+  const browseRows = report.rows.filter(row => row.coldStats?.docPayloadLane === "docPages");
+  return {
+    limit,
+    docs: report.meta?.docs || limit,
+    indexFiles: report.index.files,
+    indexBytes: report.index.bytes,
+    bytesPerDoc: report.index.bytes / Math.max(1, report.meta?.docs || limit),
+    init: report.init,
+    docPages: report.docPages,
+    docValueSorted: report.docValueSorted,
+    termPackBytes: report.rangefindStats?.term_pack_bytes || 0,
+    postingBlockPackBytes: report.rangefindStats?.posting_block_pack_bytes || 0,
+    docPackBytes: report.rangefindStats?.doc_pack_bytes || 0,
+    docPagePackBytes: report.rangefindStats?.doc_page_pack_bytes || 0,
+    docValuePackBytes: report.rangefindStats?.doc_value_pack_bytes || 0,
+    docValueSortedDirectoryBytes: report.rangefindStats?.doc_value_sorted_directory_bytes || 0,
+    docValueSortedPackBytes: report.rangefindStats?.doc_value_sorted_pack_bytes || 0,
+    avgTextColdRequests: mean(textRows.map(row => row.coldRequests)),
+    avgTextColdKb: kb(mean(textRows.map(row => row.coldKb * 1024))),
+    maxTextColdRequests: Math.max(0, ...textRows.map(row => row.coldRequests)),
+    avgBrowseColdRequests: mean(browseRows.map(row => row.coldRequests)),
+    avgBrowseColdKb: kb(mean(browseRows.map(row => row.coldKb * 1024))),
+    textExactMatches: textRows.filter(row => row.exactTopKMatch === true).length,
+    textRows: textRows.length,
+    browseRows: browseRows.length,
+    selectedRows: {
+      paris: summarizeScaleRow(rowByLabel(report, "Paris")),
+      revolution: summarizeScaleRow(rowByLabel(report, "Révolution française")),
+      typedDates: summarizeScaleRow(rowByLabel(report, "typed dates sorted")),
+      denseBrowse: summarizeScaleRow(rowByLabel(report, "dense filter browse"))
+    }
+  };
+}
+
+async function scaleFixture(args) {
+  const baseRoot = resolve(args.root, "scale");
+  mkdirSync(baseRoot, { recursive: true });
+  const points = [];
+  for (const limit of args.scaleLimits) {
+    const pointArgs = {
+      ...args,
+      command: "all",
+      limit,
+      root: resolve(baseRoot, String(limit)),
+      runs: args.runs,
+      exactChecks: args.exactChecks
+    };
+    const docs = await writeJsonl(pointArgs);
+    writeSite(pointArgs, docs);
+    await buildFixture(pointArgs);
+    const report = await benchFixture(pointArgs, { quiet: true });
+    points.push(scalePoint(limit, report));
+    console.error(`frwiki scale: ${limit.toLocaleString()} docs, ${(report.index.bytes / 1024 / 1024).toFixed(1)} MiB, init ${report.init.requests} req ${report.init.kb.toFixed(1)} KB`);
+  }
+  const scaleReport = {
+    fixture: "frwiki-scale",
+    limits: args.scaleLimits,
+    runs: args.runs,
+    bodyChars: args.bodyChars,
+    exactChecks: args.exactChecks,
+    generatedAt: new Date().toISOString(),
+    points
+  };
+  const reportPath = resolve(args.root, "frwiki-scale-bench.json");
+  writeFileSync(reportPath, JSON.stringify(scaleReport, null, 2));
+  console.log(JSON.stringify(scaleReport, null, 2));
+  return scaleReport;
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -675,6 +793,8 @@ if (args.command === "clean") {
   await buildFixture(args);
 } else if (args.command === "bench") {
   await benchFixture(args);
+} else if (args.command === "scale") {
+  await scaleFixture(args);
 } else if (args.command === "all") {
   const docs = await writeJsonl(args);
   writeSite(args, docs);

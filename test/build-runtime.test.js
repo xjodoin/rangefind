@@ -89,6 +89,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.features.denseDocPointers, true);
   assert.equal(manifest.features.docLocalityLayout, true);
   assert.equal(manifest.features.docPages, true);
+  assert.equal(manifest.features.docValueSorted, true);
   assert.equal(manifest.object_store.pointer_format, "rfbp-v1");
   assert.equal(manifest.object_store.immutable_names, true);
   assert.equal(manifest.docs.layout.format, "rflocal-doc-v1");
@@ -98,6 +99,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.docs.pointers.order, "layout");
   assert.equal(manifest.docs.pointers.ordinals.format, "rfdocord-v1");
   assert.equal(manifest.docs.pages.format, "rfdocpage-v1");
+  assert.equal(manifest.docs.pages.encoding, "rfdocpagecols-v1");
+  assert.deepEqual(manifest.docs.pages.fields, ["id", "title", "url", "category", "tags", "year", "temperature", "published", "featured", "bodySnippet"]);
   assert.equal(manifest.docs.pages.pointers.format, "rfdocpageptr-v1");
   assert.equal(manifest.docs.pages.pointers.order, "doc-id-page");
   assert.equal(manifest.docs.pages.page_size, 32);
@@ -122,6 +125,14 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.doc_values.fields.tags.chunks[0].checksum.value);
   assert.match(manifest.doc_values.fields.tags.chunks[0].pack, /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.ok(await readFile(join(output, "doc-values", "packs", manifest.doc_values.fields.tags.chunks[0].pack)));
+  assert.equal(manifest.doc_value_sorted.storage, "range-pack-v1");
+  assert.equal(manifest.doc_value_sorted.directory_format, "rfdocvaluesortdir-v1");
+  assert.equal(manifest.doc_value_sorted.page_format, "rfdocvaluesortpage-v1");
+  assert.ok(manifest.doc_value_sorted.fields.published);
+  assert.ok(manifest.doc_value_sorted.fields.featured);
+  assert.match(manifest.doc_value_sorted.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.ok(await readFile(join(output, manifest.doc_value_sorted.fields.published.directory.file)));
+  assert.ok(await readFile(join(output, "doc-values", "sorted-packs", manifest.doc_value_sorted.pack_table[0])));
   assert.equal(manifest.facets.category.count, 5);
   assert.equal(manifest.facet_dictionaries.storage, "range-pack-v1");
   assert.equal(manifest.facet_dictionaries.directory.format, "rfdir-v2");
@@ -199,11 +210,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const sortedInitial = await search.search({ q: "", sort: "-year", size: 2 });
   assert.deepEqual(sortedInitial.results.map(result => result.id), ["a", "c"]);
   assert.equal(sortedInitial.stats.docPayloadLane, "docPages");
-
-  const packedOnlySearch = await createSearch({ baseUrl: server.baseUrl, useDocPages: false });
-  const packedSortedInitial = await packedOnlySearch.search({ q: "", sort: "-year", size: 2 });
-  assert.deepEqual(packedSortedInitial.results.map(result => result.id), ["a", "c"]);
-  assert.equal(packedSortedInitial.stats.docPayloadLane, "packedDocs");
+  assert.equal(sortedInitial.stats.docValuePruning, true);
+  assert.equal(sortedInitial.stats.docValuePruneField, "year");
 
   const pageTable = parseDocPagePointerPage(await readFile(join(output, manifest.docs.pages.pointers.file)), {
     packTable: manifest.docs.pages.pointers.pack_table

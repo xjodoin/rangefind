@@ -3,6 +3,9 @@ import test from "node:test";
 import {
   buildDocPagePointerTable,
   decodeDocPagePointerRecord,
+  decodeDocPageColumns,
+  encodeDocPageColumns,
+  DOC_PAGE_ENCODING,
   DOC_PAGE_POINTER_FORMAT,
   parseDocPagePointerHeader,
   parseDocPagePointerPage
@@ -26,4 +29,17 @@ test("doc page pointer table uses a distinct generic display-page format", () =>
   const parsed = parseDocPagePointerPage(buffer, { packTable: ["0000.hash.bin"] });
   assert.equal(parsed.format, DOC_PAGE_POINTER_FORMAT);
   assert.equal(parsed.entries[0].logicalLength, 1024);
+});
+
+test("doc page column encoding round-trips display payloads with implicit indexes", () => {
+  const fields = ["id", "title", "url", "featured"];
+  const encoded = encodeDocPageColumns([
+    { id: "a", index: 32, title: "Alpha", url: "/a", featured: true },
+    { id: "b", index: 33, title: "Beta", url: "/b", featured: false }
+  ], fields);
+  assert.equal(DOC_PAGE_ENCODING, "rfdocpagecols-v1");
+  assert.deepEqual(decodeDocPageColumns(encoded, fields, 32), [
+    { id: "a", index: 32, title: "Alpha", url: "/a", featured: true },
+    { id: "b", index: 33, title: "Beta", url: "/b", featured: false }
+  ]);
 });
