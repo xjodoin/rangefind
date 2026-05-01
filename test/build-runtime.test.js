@@ -73,6 +73,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, "manifest.json"), "utf8"));
   assert.ok(await readFile(join(output, "terms", "ranges.bin.gz")));
   assert.ok(await readFile(join(output, "codes.bin.gz")));
+  assert.ok(await readFile(join(output, "typo", "manifest.json")));
 
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());
@@ -81,6 +82,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const results = await search.search({ q: "static range search", size: 3 });
   assert.equal(results.results[0].title, "Static range search");
   assert.ok(results.stats.shards > 0);
+
+  const typo = await search.search({ q: "statik range search", size: 3 });
+  assert.equal(typo.results[0].title, "Static range search");
+  assert.equal(typo.correctedQuery, "static range search");
+  assert.deepEqual(typo.corrections.map(item => item.to), ["static"]);
+  assert.equal(typo.stats.typoApplied, true);
 
   const filtered = await search.search({
     q: "search",

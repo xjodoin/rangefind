@@ -21,6 +21,8 @@ a large thesis corpus.
 - Independently compressed logical shards packed into `terms/packs/*.bin`.
 - Lazy binary range directory at `terms/ranges.bin.gz`.
 - Browser runtime with coalesced HTTP `Range` fetches.
+- Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
+  fetches only when an exact first-page query returns no results.
 - Facet and numeric code table foundation.
 - Tiny runnable example.
 
@@ -74,7 +76,11 @@ Create `rangefind.config.json`:
   ],
   "numbers": [
     { "name": "year", "path": "year" }
-  ]
+  ],
+  "typo": {
+    "enabled": true,
+    "maxEdits": 2
+  }
 }
 ```
 
@@ -92,6 +98,16 @@ import { createSearch } from "rangefind";
 const engine = await createSearch({ baseUrl: "/rangefind/" });
 const result = await engine.search({ q: "static search", size: 10 });
 console.log(result.results);
+```
+
+Typo fallback is automatic. For example, if `statik search` has no exact
+first-page hits but `static search` does, the response includes:
+
+```js
+{
+  correctedQuery: "static search",
+  corrections: [{ from: "statik", to: "static", surface: "static" }]
+}
 ```
 
 ## Static Hosting Requirement

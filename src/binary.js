@@ -1,6 +1,7 @@
 export const TERM_SHARD_MAGIC = [0x52, 0x46, 0x53, 0x42]; // RFSB
 export const TERM_RANGE_MAGIC = [0x52, 0x46, 0x52, 0x47]; // RFRG
 export const CODE_MAGIC = [0x52, 0x46, 0x43, 0x42]; // RFCB
+export const TYPO_SHARD_MAGIC = [0x52, 0x46, 0x54, 0x42]; // RFTB
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));

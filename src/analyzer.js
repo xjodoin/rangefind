@@ -69,6 +69,21 @@ export function surfaceStemPairs(text, options = {}) {
   return pairs;
 }
 
+export function analyzeTerms(text, options = {}) {
+  const minLength = options.minLength ?? 2;
+  const stopwords = options.stopwords || DEFAULT_STOPWORDS;
+  const out = [];
+  const seen = new Set();
+  for (const raw of fold(text).split(/[^a-z0-9]+/u)) {
+    if ((raw.length < minLength && !/^\d$/.test(raw)) || stopwords.has(raw)) continue;
+    const term = stem(raw);
+    if ((term.length < minLength && !/^\d$/.test(term)) || stopwords.has(term) || seen.has(term)) continue;
+    seen.add(term);
+    out.push({ raw, term });
+  }
+  return out;
+}
+
 export function queryTerms(text) {
   const terms = tokenize(text);
   const expanded = [...terms];

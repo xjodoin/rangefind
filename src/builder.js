@@ -21,6 +21,14 @@ import { eachJsonLine } from "./jsonl.js";
 import { createPackWriter, writePackedShard } from "./packs.js";
 import { addFieldScores, bm25fScores, fieldText, topTerms } from "./scoring.js";
 import { baseShardFor, partitionEntries } from "./shards.js";
+import {
+  addTypoIndexTerm,
+  addTypoSurfacePairs,
+  createTypoRunBuffer,
+  reduceTypoRuns,
+  surfacePairsForFields,
+  typoOptions
+} from "./typo.js";
 
 function addDict(dict, value, label = value) {
   const key = String(value || "");
@@ -90,7 +98,7 @@ function writeDocChunk(out, docs, index) {
   writeFileSync(resolve(out, "docs", file), JSON.stringify(docs));
 }
 
-async function writePostingRuns(config, measured, dirs) {
+async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const codes = {};
   for (const facet of config.facets) codes[facet.name] = new Array(measured.total);
   for (const number of config.numbers) codes[number.name] = new Array(measured.total);
@@ -113,6 +121,7 @@ async function writePostingRuns(config, measured, dirs) {
       codes[facet.name][index] = addDict(measured.dicts[facet.name], getPath(doc, facet.path), getPath(doc, facet.labelPath || facet.path));
     }
     for (const number of config.numbers) codes[number.name][index] = Number(getPath(doc, number.path, 0)) || 0;
+    addTypoSurfacePairs(typoBuffer, surfacePairsForFields(doc, config.fields, fieldText));
 
     const payload = docPayload(doc, config, index);
     if (initialResults.length < config.initialResultLimit) initialResults.push(payload);
@@ -127,7 +136,7 @@ async function writePostingRuns(config, measured, dirs) {
   return { codes, initialResults, baseShards: [...baseShards].sort() };
 }
 
-async function reduceShard(baseShard, config, measured, runData, filters, packWriter) {
+async function reduceShard(baseShard, config, measured, runData, filters, packWriter, typoBuffer) {
   const path = resolve(runData.runsOut, `${baseShard}.tsv`);
   const byTerm = new Map();
   const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
@@ -145,7 +154,10 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
   const partitions = partitionEntries(entries, config);
   const finalShards = [];
   let postings = 0;
-  for (const rows of byTerm.values()) postings += rows.size;
+  for (const [term, rows] of byTerm) {
+    postings += rows.size;
+    addTypoIndexTerm(typoBuffer, term, rows.size, measured.total);
+  }
   for (const partition of partitions) {
     const encoded = buildTermShard(partition.entries, measured.total, runData.codes, filters, config);
     writePackedShard(packWriter, partition.name, gzipSync(encoded, { level: 6 }));
@@ -155,14 +167,14 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
   return { terms: byTerm.size, postings, shards: finalShards };
 }
 
-async function reduceRuns(config, measured, runData, dirs) {
+async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
   const filters = buildBlockFilters(config, measured.dicts);
   const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
   const finalShards = new Set();
   let termCount = 0;
   let postingCount = 0;
   for (let i = 0; i < runData.baseShards.length; i++) {
-    const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter);
+    const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter, typoBuffer);
     termCount += stats.terms;
     postingCount += stats.postings;
     for (const shard of stats.shards) finalShards.add(shard);
@@ -181,7 +193,8 @@ export async function build({ configPath }) {
   const config = await readConfig(configPath);
   const dirs = {
     out: config.output,
-    runsOut: resolve(config.output, "_build", "runs")
+    runsOut: resolve(config.output, "_build", "runs"),
+    typoRunsOut: resolve(config.output, "_build", "typo-runs")
   };
   rmSync(dirs.out, { recursive: true, force: true });
   mkdirSync(resolve(dirs.out, "docs"), { recursive: true });
@@ -190,8 +203,11 @@ export async function build({ configPath }) {
 
   console.log(`Rangefind: reading ${config.input}`);
   const measured = await measure(config);
-  const runData = await writePostingRuns(config, measured, dirs);
-  const reduced = await reduceRuns(config, measured, runData, dirs);
+  const typo = typoOptions(config);
+  const typoBuffer = typo.enabled ? createTypoRunBuffer(dirs.typoRunsOut, typo) : null;
+  const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
+  const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
+  const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
   writeFileSync(resolve(dirs.out, "codes.bin.gz"), gzipSync(buildCodesFile(config, measured.total, runData.codes), { level: 9 }));
 
   const manifest = {
@@ -206,6 +222,13 @@ export async function build({ configPath }) {
     numbers: config.numbers.map(n => ({ name: n.name })),
     block_filters: reduced.filters,
     shards: reduced.shards,
+    typo: typoManifest ? {
+      format: typoManifest.format,
+      compression: typoManifest.compression,
+      shards: typoManifest.shards.length,
+      packs: typoManifest.packs.length,
+      stats: typoManifest.stats
+    } : null,
     stats: {
       terms: reduced.termCount,
       postings: reduced.postingCount,
