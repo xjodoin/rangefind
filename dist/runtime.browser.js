@@ -188,6 +188,11 @@ function readFixedInt(bytes, offset, width) {
 // src/codec.js
 var textEncoder = new TextEncoder();
 var textDecoder = new TextDecoder();
+var CODE_FORMAT_VERSION = 2;
+var CODE_KIND = { facet: 1, number: 2, boolean: 3 };
+var CODE_TYPE = { keyword: 1, int: 2, long: 3, float: 4, double: 5, date: 6, boolean: 7 };
+var CODE_KIND_NAME = Object.fromEntries(Object.entries(CODE_KIND).map(([key, value]) => [value, key]));
+var CODE_TYPE_NAME = Object.fromEntries(Object.entries(CODE_TYPE).map(([key, value]) => [value, key]));
 function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
     if (bytes[i] !== magic[i]) throw new Error(message);
@@ -199,6 +204,11 @@ function readUtf8(bytes, state) {
   state.pos += len;
   return textDecoder.decode(bytes.subarray(start, state.pos));
 }
+function readFloat64(bytes, state) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset + state.pos, 8);
+  state.pos += 8;
+  return view.getFloat64(0, true);
+}
 function packFileFromIndex(index) {
   return `${String(index).padStart(4, "0")}.bin`;
 }
@@ -209,6 +219,9 @@ function readBlockFilterSummary(bytes, state, manifest) {
       const words = new Array(filter.words);
       for (let w = 0; w < filter.words; w++) words[w] = readVarint(bytes, state);
       filters[filter.name] = { words };
+    } else if (filter.kind === "number") {
+      const hasValues = bytes[state.pos++] === 1;
+      filters[filter.name] = hasValues ? { min: readFloat64(bytes, state), max: readFloat64(bytes, state) } : { min: null, max: null };
     } else {
       filters[filter.name] = {
         min: readVarint(bytes, state),
@@ -297,9 +310,7 @@ function decodePostingBlock(shard, entry, blockIndex) {
   entry.blockPostings.set(blockIndex, out);
   return out;
 }
-function parseCodes(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, CODE_MAGIC, "Unsupported Rangefind code table");
+function parseLegacyCodes(bytes) {
   const state = { pos: CODE_MAGIC.length };
   const total = readVarint(bytes, state);
   const fieldCount = readVarint(bytes, state);
@@ -314,6 +325,59 @@ function parseCodes(buffer) {
     state.pos += total * field.width;
     out[field.name] = values;
   }
+  return out;
+}
+function parseCodes(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, CODE_MAGIC, "Unsupported Rangefind code table");
+  const state = { pos: CODE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== CODE_FORMAT_VERSION) return parseLegacyCodes(bytes);
+  const total = readVarint(bytes, state);
+  const fieldCount = readVarint(bytes, state);
+  const fields = [];
+  for (let i = 0; i < fieldCount; i++) {
+    fields.push({
+      name: readUtf8(bytes, state),
+      kind: CODE_KIND_NAME[bytes[state.pos++]] || "number",
+      type: CODE_TYPE_NAME[bytes[state.pos++]] || "int",
+      width: bytes[state.pos++],
+      words: readVarint(bytes, state),
+      min: readFloat64(bytes, state)
+    });
+  }
+  const out = {};
+  for (const field of fields) {
+    const values = new Array(total);
+    if (field.kind === "facet") {
+      for (let doc = 0; doc < total; doc++) {
+        const words = new Array(field.words);
+        for (let word = 0; word < field.words; word++) words[word] = readFixedInt(bytes, state.pos + (doc * field.words + word) * field.width, field.width);
+        values[doc] = words;
+      }
+      state.pos += total * field.words * field.width;
+    } else if (field.kind === "boolean") {
+      for (let doc = 0; doc < total; doc++) {
+        const value = bytes[state.pos + doc];
+        values[doc] = value === 0 ? null : value === 2;
+      }
+      state.pos += total;
+    } else if (field.type === "float" || field.type === "double") {
+      for (let doc = 0; doc < total; doc++) {
+        const value = new DataView(bytes.buffer, bytes.byteOffset + state.pos + doc * 8, 8).getFloat64(0, true);
+        values[doc] = Number.isNaN(value) ? null : value;
+      }
+      state.pos += total * 8;
+    } else {
+      for (let doc = 0; doc < total; doc++) {
+        const encoded = readFixedInt(bytes, state.pos + doc * field.width, field.width);
+        values[doc] = encoded ? field.min + encoded - 1 : null;
+      }
+      state.pos += total * field.width;
+    }
+    out[field.name] = values;
+  }
+  Object.defineProperty(out, "_meta", { value: { version, total, fields }, enumerable: false });
   return out;
 }
 
@@ -580,6 +644,18 @@ function selectedFacetCodes(manifest, field, selected) {
   });
   return out;
 }
+function facetCodeMatches(words, selected) {
+  if (!selected?.size) return true;
+  if (Array.isArray(words)) {
+    for (const value of selected) {
+      const word = Math.floor(value / 32);
+      const bit = value % 32;
+      if ((words[word] || 0) & 2 ** bit) return true;
+    }
+    return false;
+  }
+  return selected.has(words);
+}
 async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then((r) => r.json());
@@ -594,6 +670,8 @@ async function createSearch(options = {}) {
   let typoDirectory = null;
   let codes = null;
   let codesPromise = null;
+  const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
+  const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
   function createDirectoryState(meta, fallbackDir) {
     const directory = meta || {};
     return {
@@ -885,6 +963,20 @@ async function createSearch(options = {}) {
     const docs = await loadDocs(rows.map(([index]) => index));
     return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
   }
+  function normalizeRangeValue(value, field) {
+    if (value == null || value === "") return null;
+    if (field?.type === "date") {
+      const time = typeof value === "number" ? value : Date.parse(String(value));
+      return Number.isFinite(time) ? time : null;
+    }
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  function booleanCode(value) {
+    if (value === true || value === 1 || value === "true" || value === "1") return 2;
+    if (value === false || value === 0 || value === "false" || value === "0") return 1;
+    return null;
+  }
   async function loadExternalPostingBlocks(entry, blockIndexes) {
     if (!entry.blockPostings) entry.blockPostings = /* @__PURE__ */ new Map();
     const pending = [];
@@ -947,15 +1039,32 @@ async function createSearch(options = {}) {
     entry.postings = out;
     return out;
   }
-  function passesFilters(doc, codeData, filters) {
-    for (const [field, values] of Object.entries(filters.facets || {})) {
-      const selected = selectedFacetCodes(manifest, field, new Set(values));
-      if (selected && !selected.has(codeData[field]?.[doc])) return false;
+  function makeDocFilterPlan(filters) {
+    const facets = Object.entries(filters.facets || {}).map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))]).filter(([, selected]) => selected?.size);
+    const numbers = Object.entries(filters.numbers || {}).map(([field, range]) => [field, {
+      min: normalizeRangeValue(range?.min, numberFields.get(field)),
+      max: normalizeRangeValue(range?.max, numberFields.get(field))
+    }]).filter(([, range]) => range.min != null || range.max != null);
+    const booleans = Object.entries(filters.booleans || {}).map(([field, expected]) => {
+      const code = booleanCode(expected);
+      return [field, code === 2 ? true : code === 1 ? false : null];
+    }).filter(([, value]) => value != null);
+    return { facets, numbers, booleans, active: facets.length > 0 || numbers.length > 0 || booleans.length > 0 };
+  }
+  function passesFilterPlan(doc, codeData, filterPlan) {
+    if (!filterPlan?.active) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      if (!facetCodeMatches(codeData[field]?.[doc], selected)) return false;
     }
-    for (const [field, range] of Object.entries(filters.numbers || {})) {
-      const value = codeData[field]?.[doc] || 0;
+    for (const [field, range] of filterPlan.numbers) {
+      const value = codeData[field]?.[doc];
+      if (value == null) return false;
       if (range.min != null && value < range.min) return false;
       if (range.max != null && value > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const value = codeData[field]?.[doc];
+      if (value == null || value !== expected) return false;
     }
     return true;
   }
@@ -971,8 +1080,12 @@ async function createSearch(options = {}) {
   }
   function makeBlockFilterPlan(filters) {
     const facets = Object.entries(filters.facets || {}).map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))]).filter(([, selected]) => selected?.size);
-    const numbers = Object.entries(filters.numbers || {}).filter(([, range]) => range?.min != null || range?.max != null);
-    return { facets, numbers, active: facets.length > 0 || numbers.length > 0 };
+    const numbers = Object.entries(filters.numbers || {}).map(([field, range]) => [field, {
+      min: normalizeRangeValue(range?.min, numberFields.get(field)),
+      max: normalizeRangeValue(range?.max, numberFields.get(field))
+    }]).filter(([, range]) => range.min != null || range.max != null);
+    const booleans = Object.entries(filters.booleans || {}).map(([field, value]) => [field, booleanCode(value)]).filter(([, value]) => value != null);
+    return { facets, numbers, booleans, active: facets.length > 0 || numbers.length > 0 || booleans.length > 0 };
   }
   function blockMayPass(block, filterPlan) {
     if (!filterPlan?.active) return true;
@@ -981,9 +1094,14 @@ async function createSearch(options = {}) {
     }
     for (const [field, range] of filterPlan.numbers) {
       const summary = block.filters?.[field];
-      if (!summary || !summary.max) return false;
+      if (!summary || summary.min == null || summary.max == null) return false;
       if (range.min != null && summary.max < range.min) return false;
       if (range.max != null && summary.min > range.max) return false;
+    }
+    for (const [field, value] of filterPlan.booleans) {
+      const summary = block.filters?.[field];
+      if (!summary || !summary.max) return false;
+      if (summary.max < value || summary.min > value) return false;
     }
     return true;
   }
@@ -992,6 +1110,30 @@ async function createSearch(options = {}) {
   }
   function collectEligibleScores(scores, hits, minShouldMatch) {
     return [...scores.entries()].filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch)).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  }
+  function makeSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field) return null;
+    const order = typeof sort === "string" && sort.startsWith("-") ? "desc" : String(sort.order || sort.direction || "asc").toLowerCase();
+    if (!numberFields.has(field) && !booleanFields.has(field)) return null;
+    return { field, desc: order === "desc" };
+  }
+  function sortRanked(ranked, codeData, sortPlan) {
+    if (!sortPlan || !codeData?.[sortPlan.field]) return ranked;
+    const values = codeData[sortPlan.field];
+    return ranked.slice().sort((a, b) => {
+      const left = values[a[0]];
+      const right = values[b[0]];
+      const leftMissing = left == null;
+      const rightMissing = right == null;
+      if (leftMissing || rightMissing) {
+        if (leftMissing && rightMissing) return b[1] - a[1] || a[0] - b[0];
+        return leftMissing ? 1 : -1;
+      }
+      if (left !== right) return sortPlan.desc ? Number(right) - Number(left) : Number(left) - Number(right);
+      return b[1] - a[1] || a[0] - b[0];
+    });
   }
   function bitIsSet(mask, bit) {
     return (mask & 2 ** bit) !== 0;
@@ -1026,12 +1168,12 @@ async function createSearch(options = {}) {
     }
     return top;
   }
-  function applyBlockRows(cursor, rows, codeData, filters, scores, hits, masks) {
+  function applyBlockRows(cursor, rows, codeData, filterPlan, scores, hits, masks) {
     let accepted = 0;
     const bit = cursor.termIndex < SKIP_MAX_TERMS ? 2 ** cursor.termIndex : 0;
     for (let i = 0; i < rows.length; i += 2) {
       const doc = rows[i];
-      if (codeData && !passesFilters(doc, codeData, filters)) continue;
+      if (codeData && !passesFilterPlan(doc, codeData, filterPlan)) continue;
       scores.set(doc, (scores.get(doc) || 0) + rows[i + 1]);
       if (bit) masks.set(doc, (masks.get(doc) || 0) | bit);
       if (cursor.isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
@@ -1039,15 +1181,17 @@ async function createSearch(options = {}) {
     }
     return accepted;
   }
-  async function runSkippedSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
+  async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const candidateK = rerank === false ? k : Math.max(RERANK_CANDIDATES, k);
-    if (baseTerms.length < 2 || terms.length > SKIP_MAX_TERMS || k > 100) {
-      return runFullSearch({ q, page, size, filters, baseTerms, terms, rerank });
+    const sortPlan = makeSortPlan(sort);
+    if (sortPlan || baseTerms.length < 2 || terms.length > SKIP_MAX_TERMS || k > 100) {
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank });
     }
-    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
-    const filterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const codeData = hasFilters ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
@@ -1071,12 +1215,12 @@ async function createSearch(options = {}) {
     let stable = null;
     let exhausted = false;
     while (true) {
-      const active = cursors.filter((cursor2) => advanceCursor(cursor2, filterPlan));
+      const active = cursors.filter((cursor2) => advanceCursor(cursor2, blockFilterPlan));
       if (!active.length) {
         exhausted = true;
         break;
       }
-      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, filterPlan);
+      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan);
       if (stable) break;
       active.sort((a, b) => b.entry.blocks[b.blockIndex].maxImpact - a.entry.blocks[a.blockIndex].maxImpact);
       const cursor = active[0];
@@ -1084,7 +1228,7 @@ async function createSearch(options = {}) {
       cursor.blockIndex++;
       blocksDecoded++;
       postingsDecoded += rows2.length / 2;
-      postingsAccepted += applyBlockRows(cursor, rows2, codeData, filters, scores, hits, masks);
+      postingsAccepted += applyBlockRows(cursor, rows2, codeData, docFilterPlan, scores, hits, masks);
     }
     let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, k);
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
@@ -1108,27 +1252,29 @@ async function createSearch(options = {}) {
       }
     };
   }
-  async function runFullSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
+  async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
-    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
+    const sortPlan = makeSortPlan(sort);
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     const entries = await termEntries(terms);
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     const baseSet = new Set(baseTerms);
-    const codeData = hasFilters ? await loadCodes() : null;
+    const codeData = hasFilters || sortPlan ? await loadCodes() : null;
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     for (const { term, shard, entry } of entries) {
       const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
       for (let i = 0; i < postings.length; i += 2) {
         const doc = postings[i];
-        if (codeData && !passesFilters(doc, codeData, filters)) continue;
+        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         scores.set(doc, (scores.get(doc) || 0) + postings[i + 1]);
         if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
       }
     }
     let ranked = collectEligibleScores(scores, hits, minShouldMatchFor(baseTerms));
-    const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, Math.max(RERANK_CANDIDATES, offset + size));
-    ranked = reranked.ranked;
+    const reranked = rerank === false || sortPlan ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, Math.max(RERANK_CANDIDATES, offset + size));
+    ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
     return {
       total: ranked.length,
@@ -1279,15 +1425,29 @@ async function createSearch(options = {}) {
     const size = Math.max(1, Math.min(100, Number(params.size || 10)));
     const offset = (page - 1) * size;
     const filters = params.filters || {};
+    const sort = params.sort || null;
+    const sortPlan = makeSortPlan(sort);
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     if (!q) {
-      const docs = manifest.initial_results.slice(offset, offset + size);
-      return { total: manifest.total, results: docs, page, size };
+      if (!sortPlan && !hasFilters) {
+        const docs = manifest.initial_results.slice(offset, offset + size);
+        return { total: manifest.total, results: docs, page, size };
+      }
+      const codeData = await loadCodes();
+      const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+      const ranked = sortRanked(
+        Array.from({ length: manifest.total }, (_, index) => [index, 0]).filter(([index]) => !hasFilters || passesFilterPlan(index, codeData, docFilterPlan)),
+        codeData,
+        sortPlan
+      );
+      const rows = ranked.slice(offset, offset + size);
+      return { total: ranked.length, results: await rowsToResults(rows), page, size };
     }
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map((item) => item.term);
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;
-    const response = await searchFn({ q, page, size, filters, baseTerms, terms: queryTerms(q), rerank: params.rerank });
-    return maybeTypoFallback({ q, page, size, filters, rerank: params.rerank }, response, baseTerms, analyzedTerms);
+    const response = await searchFn({ q, page, size, filters, sort, baseTerms, terms: queryTerms(q), rerank: params.rerank });
+    return maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
   }
   return {
     manifest,

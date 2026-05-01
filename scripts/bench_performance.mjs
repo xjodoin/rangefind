@@ -13,14 +13,48 @@ import {
   serveStatic
 } from "./bench_support.mjs";
 
+const DEFAULT_CASES = [
+  { label: "(empty)", q: "" },
+  { label: "range static search", q: "range static search" },
+  { label: "statik range search", q: "statik range search" },
+  { label: "pagefind comparison", q: "pagefind comparison" },
+  {
+    label: "facet numeric filters",
+    q: "facet numeric filters",
+    filters: {
+      facets: { category: ["filters"] },
+      numbers: { year: { min: 2025 } }
+    }
+  },
+  {
+    label: "typed filters and sort",
+    q: "",
+    filters: {
+      facets: { tags: ["range"] },
+      numbers: { published: { min: "2026-01-01" } },
+      booleans: { featured: true }
+    },
+    sort: { field: "published", order: "desc" }
+  },
+  {
+    label: "signed numeric boolean",
+    q: "facet numeric filters",
+    filters: {
+      numbers: { temperature: { min: -10, max: 0 } },
+      booleans: { featured: false }
+    }
+  }
+];
+
 const args = parseArgs(process.argv.slice(2), {
   root: "examples/basic/public",
   basePath: "rangefind/",
   runs: 5,
   size: 10,
-  queries: ["", "range static search", "statik range search", "pagefind comparison", "facet numeric filters"],
+  queries: null,
   json: false
 });
+const cases = args.queries ? args.queries.map(q => ({ label: q || "(empty)", q })) : DEFAULT_CASES;
 
 const server = await serveStatic(args.root);
 const meter = createFetchMeter(/\/rangefind\//u);
@@ -34,7 +68,7 @@ try {
   const indexStats = dirStats(resolve(args.root, args.basePath));
 
   const rows = [];
-  for (const q of args.queries) {
+  for (const item of cases) {
     const times = [];
     const requests = [];
     const bytes = [];
@@ -44,7 +78,7 @@ try {
     for (let i = 0; i < args.runs; i++) {
       meter.reset();
       const start = performance.now();
-      const response = await engine.search({ q, size: args.size });
+      const response = await engine.search({ q: item.q, filters: item.filters, sort: item.sort, size: args.size });
       times.push(performance.now() - start);
       const network = meter.snapshot();
       requests.push(network.requests);
@@ -54,7 +88,7 @@ try {
       firstTitle = response.results[0]?.title || "";
     }
     rows.push({
-      q,
+      q: item.label,
       total,
       firstTitle,
       correctedQuery,
@@ -81,7 +115,7 @@ try {
     console.log("| Query | Total | P50 ms | P95 ms | Avg req | Avg KB | Corrected | Top result |");
     console.log("| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |");
     for (const row of rows) {
-      console.log(`| ${row.q || "(empty)"} | ${row.total} | ${row.p50Ms.toFixed(1)} | ${row.p95Ms.toFixed(1)} | ${row.avgRequests.toFixed(1)} | ${row.avgKb.toFixed(1)} | ${row.correctedQuery || ""} | ${row.firstTitle} |`);
+      console.log(`| ${row.q} | ${row.total} | ${row.p50Ms.toFixed(1)} | ${row.p95Ms.toFixed(1)} | ${row.avgRequests.toFixed(1)} | ${row.avgKb.toFixed(1)} | ${row.correctedQuery || ""} | ${row.firstTitle} |`);
     }
   }
 } finally {

@@ -43,6 +43,69 @@ function addDict(dict, value, label = value) {
   return id;
 }
 
+function rawPath(object, path, fallback = "") {
+  if (!path) return fallback;
+  let value = object;
+  for (const part of String(path).split(".")) {
+    if (value == null) return fallback;
+    value = value[part];
+  }
+  return value ?? fallback;
+}
+
+function valueList(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === "") return [];
+  return [value];
+}
+
+function normalizedNumberType(field) {
+  return String(field.type || "int").toLowerCase();
+}
+
+function numericValue(doc, field) {
+  const value = rawPath(doc, field.path);
+  if (value == null || value === "") return null;
+  const type = normalizedNumberType(field);
+  if (type === "date") {
+    const time = value instanceof Date ? value.getTime() : Date.parse(String(value));
+    return Number.isFinite(time) ? time : null;
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  if (type === "float" || type === "double") return number;
+  return Math.round(number);
+}
+
+function booleanValue(doc, field) {
+  const value = rawPath(doc, field.path);
+  if (value === true || value === 1 || value === "true" || value === "1") return true;
+  if (value === false || value === 0 || value === "false" || value === "0") return false;
+  return null;
+}
+
+function facetValues(doc, facet) {
+  const labels = valueList(rawPath(doc, facet.labelPath || facet.path));
+  return valueList(rawPath(doc, facet.path)).map((value, index) => ({
+    value,
+    label: labels[index] ?? value
+  }));
+}
+
+function addBit(words, value) {
+  if (value <= 0) return;
+  const word = Math.floor(value / 32);
+  const bit = value % 32;
+  words[word] |= 2 ** bit;
+}
+
+function facetBits(dict, values) {
+  const words = Math.max(1, Math.ceil(dict.values.length / 32));
+  const out = new Array(words).fill(0);
+  for (const value of values) addBit(out, value);
+  return out;
+}
+
 async function measure(config) {
   const fieldTotals = Object.fromEntries(config.fields.map(field => [field.name, 0]));
   const dicts = Object.fromEntries(config.facets.map(facet => [facet.name, { ids: new Map(), values: [{ value: "", label: "", n: 0 }] }]));
@@ -53,8 +116,10 @@ async function measure(config) {
       fieldTotals[field.name] += tokenize(fieldText(doc, field), { unique: false }).length;
     }
     for (const facet of config.facets) {
-      const code = addDict(dicts[facet.name], getPath(doc, facet.path), getPath(doc, facet.labelPath || facet.path));
-      dicts[facet.name].values[code].n++;
+      for (const item of facetValues(doc, facet)) {
+        const code = addDict(dicts[facet.name], item.value, item.label);
+        dicts[facet.name].values[code].n++;
+      }
     }
   });
   return {
@@ -157,6 +222,8 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const codes = {};
   for (const facet of config.facets) codes[facet.name] = new Array(measured.total);
   for (const number of config.numbers) codes[number.name] = new Array(measured.total);
+  for (const boolean of config.booleans || []) codes[boolean.name] = new Array(measured.total);
+  codes._dicts = measured.dicts;
 
   const initialResults = [];
   const buffer = { byShard: new Map(), lines: 0, runsOut: dirs.runsOut };
@@ -179,9 +246,15 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     }
 
     for (const facet of config.facets) {
-      codes[facet.name][index] = addDict(measured.dicts[facet.name], getPath(doc, facet.path), getPath(doc, facet.labelPath || facet.path));
+      const values = [];
+      for (const item of facetValues(doc, facet)) {
+        const code = addDict(measured.dicts[facet.name], item.value, item.label);
+        values.push(code);
+      }
+      codes[facet.name][index] = facetBits(measured.dicts[facet.name], values);
     }
-    for (const number of config.numbers) codes[number.name][index] = Number(getPath(doc, number.path, 0)) || 0;
+    for (const number of config.numbers) codes[number.name][index] = numericValue(doc, number);
+    for (const boolean of config.booleans || []) codes[boolean.name][index] = booleanValue(doc, boolean);
     addTypoSurfacePairs(typoBuffer, surfacePairsForFields(doc, config.fields, fieldText));
 
     const payload = docPayload(doc, config, index);
@@ -273,21 +346,19 @@ function mergeTypoWorkerRuns(typoBuffer, workerTypo) {
   }
 }
 
-function sharedCodeTables(codes) {
-  const shared = {};
+function workerCodeTables(codes) {
+  const cloned = {};
   for (const [name, values] of Object.entries(codes || {})) {
-    const buffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * values.length);
-    const view = new Int32Array(buffer);
-    view.set(values);
-    shared[name] = view;
+    if (name === "_dicts") continue;
+    cloned[name] = values;
   }
-  return shared;
+  return cloned;
 }
 
 async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, filters, workerCount) {
   const shardOutRoot = resolve(dirs.out, "_build", "term-shards");
   mkdirSync(shardOutRoot, { recursive: true });
-  const sharedCodes = sharedCodeTables(runData.codes);
+  const sharedCodes = workerCodeTables(runData.codes);
   const workers = Array.from({ length: workerCount }, (_, index) => createReduceWorker({
     config,
     codes: sharedCodes,
@@ -414,7 +485,9 @@ export async function build({ configPath }) {
     initial_results: runData.initialResults,
     fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
     facets: Object.fromEntries(Object.entries(measured.dicts).map(([name, dict]) => [name, dict.values])),
-    numbers: config.numbers.map(n => ({ name: n.name })),
+    numbers: config.numbers.map(n => ({ name: n.name, type: normalizedNumberType(n), sortable: n.sortable !== false })),
+    booleans: (config.booleans || []).map(n => ({ name: n.name, sortable: n.sortable !== false })),
+    sorts: config.sorts || [],
     block_filters: reduced.filters,
     directory: reduced.directory,
     typo: typoManifest ? {

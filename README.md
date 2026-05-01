@@ -28,7 +28,8 @@ a large thesis corpus.
 - Browser runtime with coalesced HTTP `Range` fetches.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
   fetches only when an exact first-page query returns no results.
-- Facet and numeric code table foundation.
+- Multi-value keyword facets.
+- Typed numeric, date, and boolean doc-values for filters and sorting.
 - Tiny runnable example.
 
 ## Why This Exists
@@ -75,8 +76,8 @@ Use `--limit=0` to run against the full dump. The generated site lives at
 Create newline-delimited JSON:
 
 ```json
-{"id":"1","url":"/a","title":"Static search","body":"Search without a server","category":"docs","year":2026}
-{"id":"2","url":"/b","title":"Range packs","body":"Use HTTP byte ranges","category":"index","year":2026}
+{"id":"1","url":"/a","title":"Static search","body":"Search without a server","category":"docs","tags":["static","range"],"year":2026,"published":"2026-01-10","featured":true}
+{"id":"2","url":"/b","title":"Range packs","body":"Use HTTP byte ranges","category":"index","tags":["range"],"year":2026,"published":"2026-02-01","featured":false}
 ```
 
 Create `rangefind.config.json`:
@@ -87,16 +88,21 @@ Create `rangefind.config.json`:
   "output": "public/rangefind",
   "idPath": "id",
   "urlPath": "url",
-  "display": ["id", "url", "title", "body", "category", "year"],
+  "display": ["id", "url", "title", "body", "category", "tags", "year", "published", "featured"],
   "fields": [
     { "name": "title", "path": "title", "weight": 4.5, "b": 0.55, "phrase": true },
     { "name": "body", "path": "body", "weight": 1.0, "b": 0.75 }
   ],
   "facets": [
-    { "name": "category", "path": "category" }
+    { "name": "category", "path": "category" },
+    { "name": "tags", "path": "tags" }
   ],
   "numbers": [
-    { "name": "year", "path": "year" }
+    { "name": "year", "path": "year", "type": "int" },
+    { "name": "published", "path": "published", "type": "date" }
+  ],
+  "booleans": [
+    { "name": "featured", "path": "featured" }
   ],
   "typo": {
     "enabled": true,
@@ -126,6 +132,20 @@ import { createSearch } from "rangefind";
 const engine = await createSearch({ baseUrl: "/rangefind/" });
 const result = await engine.search({ q: "static search", size: 10 });
 console.log(result.results);
+```
+
+Filters and sort use the code table:
+
+```js
+const result = await engine.search({
+  q: "static search",
+  filters: {
+    facets: { tags: ["range"] },
+    numbers: { published: { min: "2026-01-01" } },
+    booleans: { featured: true }
+  },
+  sort: { field: "published", order: "desc" }
+});
 ```
 
 Typo fallback is automatic. For example, if `statik search` has no exact
@@ -160,7 +180,8 @@ config resolution, shard/range planning, term/code binary round-trips, and an
 end-to-end build plus browser-runtime query against a local HTTP `Range` server.
 
 The benchmark scripts are dependency-free and run against the example static
-site. `bench:quality` reports known-item and typo-recovery Hit@k/MRR.
+site. `bench:quality` reports known-item and typo-recovery Hit@k/MRR plus
+structured filter/sort checks for facets, dates, booleans, and signed numbers.
 `bench:performance` reports query latency, HTTP request count, and transfer size.
 `bench:directories` compares global, naive prefix, and paged range-directory
 layouts against an existing built index.

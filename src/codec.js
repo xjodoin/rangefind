@@ -10,6 +10,11 @@ import {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const CODE_FORMAT_VERSION = 2;
+const CODE_KIND = { facet: 1, number: 2, boolean: 3 };
+const CODE_TYPE = { keyword: 1, int: 2, long: 3, float: 4, double: 5, date: 6, boolean: 7 };
+const CODE_KIND_NAME = Object.fromEntries(Object.entries(CODE_KIND).map(([key, value]) => [value, key]));
+const CODE_TYPE_NAME = Object.fromEntries(Object.entries(CODE_TYPE).map(([key, value]) => [value, key]));
 
 export function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
@@ -30,6 +35,22 @@ export function readUtf8(bytes, state) {
   return textDecoder.decode(bytes.subarray(start, state.pos));
 }
 
+function pushFloat64(out, value) {
+  const buffer = new ArrayBuffer(8);
+  new DataView(buffer).setFloat64(0, Number(value || 0), true);
+  for (const byte of new Uint8Array(buffer)) out.push(byte);
+}
+
+function readFloat64(bytes, state) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset + state.pos, 8);
+  state.pos += 8;
+  return view.getFloat64(0, true);
+}
+
+function normalizedNumberType(field) {
+  return String(field.type || "int").toLowerCase();
+}
+
 export function buildBlockFilters(config, dicts) {
   return [
     ...config.facets.map(facet => ({
@@ -37,7 +58,8 @@ export function buildBlockFilters(config, dicts) {
       kind: "facet",
       words: Math.max(1, Math.ceil((dicts[facet.name]?.values?.length || 1) / 32))
     })),
-    ...config.numbers.map(number => ({ name: number.name, kind: "number" }))
+    ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number) })),
+    ...(config.booleans || []).map(boolean => ({ name: boolean.name, kind: "boolean", type: "boolean" }))
   ];
 }
 
@@ -49,17 +71,32 @@ function addBit(words, value) {
 }
 
 function emptySummary(filters) {
-  return filters.map(filter => filter.kind === "facet" ? { words: new Array(filter.words).fill(0) } : { min: 0, max: 0 });
+  return filters.map(filter => filter.kind === "facet" ? { words: new Array(filter.words).fill(0) } : { min: null, max: null });
 }
 
 function updateSummary(summary, filters, codes, doc) {
   for (let i = 0; i < filters.length; i++) {
     const filter = filters[i];
-    const value = codes[filter.name]?.[doc] || 0;
-    if (filter.kind === "facet") addBit(summary[i].words, value);
-    else if (value) {
-      summary[i].min = summary[i].min ? Math.min(summary[i].min, value) : value;
-      summary[i].max = Math.max(summary[i].max, value);
+    const values = codes[filter.name];
+    const value = values ? values[doc] : null;
+    if (filter.kind === "facet") {
+      if (Array.isArray(value)) {
+        if (value.length === summary[i].words.length) {
+          for (let w = 0; w < summary[i].words.length; w++) summary[i].words[w] |= value[w] || 0;
+        } else {
+          for (const item of value) addBit(summary[i].words, item);
+        }
+      } else {
+        addBit(summary[i].words, value);
+      }
+    } else {
+      const numeric = filter.kind === "boolean"
+        ? (value === true ? 2 : value === false ? 1 : Number(value))
+        : Number(value);
+      if (Number.isFinite(numeric)) {
+        summary[i].min = summary[i].min == null ? numeric : Math.min(summary[i].min, numeric);
+        summary[i].max = summary[i].max == null ? numeric : Math.max(summary[i].max, numeric);
+      }
     }
   }
 }
@@ -78,6 +115,13 @@ function writeBlockFilterSummary(out, filters, summary) {
     const item = Array.isArray(summary) ? summary[i] : summary?.[filter.name];
     if (filter.kind === "facet") {
       for (const word of item?.words || []) pushVarint(out, word);
+    } else if (filter.kind === "number") {
+      const hasValues = Number.isFinite(item?.min) && Number.isFinite(item?.max);
+      out.push(hasValues ? 1 : 0);
+      if (hasValues) {
+        pushFloat64(out, item.min);
+        pushFloat64(out, item.max);
+      }
     } else {
       pushVarint(out, item?.min || 0);
       pushVarint(out, item?.max || 0);
@@ -92,6 +136,11 @@ function readBlockFilterSummary(bytes, state, manifest) {
       const words = new Array(filter.words);
       for (let w = 0; w < filter.words; w++) words[w] = readVarint(bytes, state);
       filters[filter.name] = { words };
+    } else if (filter.kind === "number") {
+      const hasValues = bytes[state.pos++] === 1;
+      filters[filter.name] = hasValues
+        ? { min: readFloat64(bytes, state), max: readFloat64(bytes, state) }
+        : { min: null, max: null };
     } else {
       filters[filter.name] = {
         min: readVarint(bytes, state),
@@ -321,27 +370,96 @@ export function rewriteTermShardForExternalBlocks(buffer, manifest, config, writ
   };
 }
 
+function facetWords(value, words) {
+  if (Array.isArray(value) && value.length === words) return value;
+  const out = new Array(words).fill(0);
+  const values = Array.isArray(value) ? value : [value];
+  for (const item of values) addBit(out, Number(item) || 0);
+  return out;
+}
+
+function finiteValues(values) {
+  return values.filter(value => Number.isFinite(value));
+}
+
+function writeFloat64Array(total, values) {
+  const chunk = Buffer.alloc(total * 8);
+  for (let i = 0; i < total; i++) {
+    const value = values[i] == null ? Number.NaN : Number(values[i]);
+    chunk.writeDoubleLE(Number.isFinite(value) ? value : Number.NaN, i * 8);
+  }
+  return chunk;
+}
+
+function encodeIntegerField(total, values) {
+  const present = finiteValues(values);
+  const min = present.length ? Math.min(...present) : 0;
+  const encoded = values.map(value => Number.isFinite(value) ? Math.max(1, Math.round(value - min + 1)) : 0);
+  const width = fixedWidth(encoded);
+  const chunk = Buffer.alloc(total * width);
+  for (let i = 0; i < total; i++) writeFixedInt(chunk, i * width, width, encoded[i] || 0);
+  return { chunk, width, min };
+}
+
+function normalizeBooleanValue(value) {
+  if (value === true || value === 1 || value === "true" || value === "1") return true;
+  if (value === false || value === 0 || value === "false" || value === "0") return false;
+  return null;
+}
+
 export function buildCodesFile(config, total, codes) {
-  const fields = [...config.facets.map(f => ({ name: f.name })), ...config.numbers.map(n => ({ name: n.name }))];
-  const header = [...CODE_MAGIC];
+  const fields = [
+    ...config.facets.map(facet => ({ name: facet.name, kind: "facet", type: "keyword", words: Math.max(1, Math.ceil(((codes._dicts?.[facet.name]?.values?.length) || 1) / 32)) })),
+    ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number), words: 0 })),
+    ...(config.booleans || []).map(boolean => ({ name: boolean.name, kind: "boolean", type: "boolean", words: 0 }))
+  ];
+  const descriptors = [];
   const chunks = [];
-  pushVarint(header, total);
-  pushVarint(header, fields.length);
+
   for (const field of fields) {
     const values = codes[field.name] || [];
-    const width = fixedWidth(values);
+    if (field.kind === "facet") {
+      const chunk = Buffer.alloc(total * field.words * 4);
+      for (let doc = 0; doc < total; doc++) {
+        const words = facetWords(values[doc], field.words);
+        for (let word = 0; word < field.words; word++) writeFixedInt(chunk, (doc * field.words + word) * 4, 4, words[word] || 0);
+      }
+      descriptors.push({ ...field, width: 4, min: 0 });
+      chunks.push(chunk);
+    } else if (field.kind === "boolean") {
+      const chunk = Buffer.alloc(total);
+      for (let doc = 0; doc < total; doc++) {
+        const value = normalizeBooleanValue(values[doc]);
+        chunk[doc] = value == null ? 0 : value ? 2 : 1;
+      }
+      descriptors.push({ ...field, width: 1, min: 0 });
+      chunks.push(chunk);
+    } else if (field.type === "float" || field.type === "double") {
+      descriptors.push({ ...field, width: 8, min: 0 });
+      chunks.push(writeFloat64Array(total, values));
+    } else {
+      const encoded = encodeIntegerField(total, values);
+      descriptors.push({ ...field, width: encoded.width, min: encoded.min });
+      chunks.push(encoded.chunk);
+    }
+  }
+
+  const header = [...CODE_MAGIC];
+  pushVarint(header, CODE_FORMAT_VERSION);
+  pushVarint(header, total);
+  pushVarint(header, descriptors.length);
+  for (const field of descriptors) {
     pushUtf8(header, field.name);
-    header.push(width);
-    const chunk = Buffer.alloc(total * width);
-    for (let i = 0; i < total; i++) writeFixedInt(chunk, i * width, width, values[i] || 0);
-    chunks.push(chunk);
+    header.push(CODE_KIND[field.kind]);
+    header.push(CODE_TYPE[field.type] || CODE_TYPE.int);
+    header.push(field.width);
+    pushVarint(header, field.words || 0);
+    pushFloat64(header, field.min || 0);
   }
   return Buffer.concat([Buffer.from(Uint8Array.from(header)), ...chunks]);
 }
 
-export function parseCodes(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, CODE_MAGIC, "Unsupported Rangefind code table");
+function parseLegacyCodes(bytes) {
   const state = { pos: CODE_MAGIC.length };
   const total = readVarint(bytes, state);
   const fieldCount = readVarint(bytes, state);
@@ -356,5 +474,59 @@ export function parseCodes(buffer) {
     state.pos += total * field.width;
     out[field.name] = values;
   }
+  return out;
+}
+
+export function parseCodes(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, CODE_MAGIC, "Unsupported Rangefind code table");
+  const state = { pos: CODE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== CODE_FORMAT_VERSION) return parseLegacyCodes(bytes);
+  const total = readVarint(bytes, state);
+  const fieldCount = readVarint(bytes, state);
+  const fields = [];
+  for (let i = 0; i < fieldCount; i++) {
+    fields.push({
+      name: readUtf8(bytes, state),
+      kind: CODE_KIND_NAME[bytes[state.pos++]] || "number",
+      type: CODE_TYPE_NAME[bytes[state.pos++]] || "int",
+      width: bytes[state.pos++],
+      words: readVarint(bytes, state),
+      min: readFloat64(bytes, state)
+    });
+  }
+  const out = {};
+  for (const field of fields) {
+    const values = new Array(total);
+    if (field.kind === "facet") {
+      for (let doc = 0; doc < total; doc++) {
+        const words = new Array(field.words);
+        for (let word = 0; word < field.words; word++) words[word] = readFixedInt(bytes, state.pos + (doc * field.words + word) * field.width, field.width);
+        values[doc] = words;
+      }
+      state.pos += total * field.words * field.width;
+    } else if (field.kind === "boolean") {
+      for (let doc = 0; doc < total; doc++) {
+        const value = bytes[state.pos + doc];
+        values[doc] = value === 0 ? null : value === 2;
+      }
+      state.pos += total;
+    } else if (field.type === "float" || field.type === "double") {
+      for (let doc = 0; doc < total; doc++) {
+        const value = new DataView(bytes.buffer, bytes.byteOffset + state.pos + doc * 8, 8).getFloat64(0, true);
+        values[doc] = Number.isNaN(value) ? null : value;
+      }
+      state.pos += total * 8;
+    } else {
+      for (let doc = 0; doc < total; doc++) {
+        const encoded = readFixedInt(bytes, state.pos + doc * field.width, field.width);
+        values[doc] = encoded ? field.min + encoded - 1 : null;
+      }
+      state.pos += total * field.width;
+    }
+    out[field.name] = values;
+  }
+  Object.defineProperty(out, "_meta", { value: { version, total, fields }, enumerable: false });
   return out;
 }

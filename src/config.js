@@ -52,6 +52,8 @@ export async function readConfig(configPath) {
     ],
     facets: raw.facets || [],
     numbers: raw.numbers || [],
+    booleans: raw.booleans || [],
+    sorts: raw.sorts || [],
     display: raw.display || ["title", "url"]
   };
 }

@@ -38,6 +38,11 @@ rangefind/
 `manifest.json` is small enough for page initialization. It lists schema,
 dictionaries, default results, and pointers to the paged range directories.
 
+`codes.bin.gz` stores doc-values used by filters and sorting. Keyword facets are
+encoded as per-document bitsets, so a facet can be single-value or multi-value.
+Numeric and date fields are encoded as typed range/sort values, and booleans use
+a compact tristate representation for missing, false, and true.
+
 `terms/directory-root.bin.gz` is loaded lazily on the first real term query. It
 contains page bounds and a compact Bloom filter for adaptive shard resolution.
 Only touched `terms/directory-pages/*.bin.gz` files are fetched, and each page

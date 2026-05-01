@@ -16,6 +16,7 @@ import {
 } from "./bench_support.mjs";
 
 const DEFAULT_DUMP_URL = "https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pages-articles.xml.bz2";
+const FRWIKI_SCHEMA_VERSION = 3;
 const DEFAULT_QUERIES = [
   "Paris",
   "Révolution française",
@@ -85,6 +86,15 @@ function categoriesFromWikitext(text) {
   return out;
 }
 
+function articleTags(title, body, categories) {
+  return [
+    categories.length ? "has-categories" : "uncategorized",
+    categories.length >= 4 ? "many-categories" : "few-categories",
+    body.length >= 5000 ? "long-body" : "short-body",
+    title.length >= 24 ? "long-title" : "short-title"
+  ];
+}
+
 function stripWikitext(text) {
   return String(text || "")
     .replace(/<ref\b[\s\S]*?<\/ref>/giu, " ")
@@ -113,17 +123,27 @@ function pageToDoc(page, index, args) {
   const id = tag(page, "id").trim() || String(index + 1);
   const redirect = /<redirect\b/iu.test(page);
   const raw = tag(page, "text");
+  const timestamp = tag(page, "timestamp");
   let body = stripWikitext(raw);
   if (args.bodyChars > 0 && body.length > args.bodyChars) body = body.slice(0, args.bodyChars);
   if (!title || redirect || body.length < 80) return null;
   const categories = categoriesFromWikitext(raw);
+  const revisionTime = Date.parse(timestamp);
   return {
     id,
+    articleId: Number(id) || index + 1,
     title,
+    titleLength: title.length,
     url: titleToUrl(title),
     body,
+    bodyLength: body.length,
     categories: categories.join(" "),
+    categoryList: categories,
+    articleTags: articleTags(title, body, categories),
     category: categories[0] || "",
+    categoryCount: categories.length,
+    hasCategories: categories.length > 0,
+    revisionDate: Number.isFinite(revisionTime) ? new Date(revisionTime).toISOString().slice(0, 10) : "",
     source: "frwiki"
   };
 }
@@ -151,6 +171,7 @@ function waitForChild(child, name, allowSignal = false) {
 
 function expectedMeta(args) {
   return {
+    schemaVersion: FRWIKI_SCHEMA_VERSION,
     dumpUrl: args.dumpUrl,
     limit: args.limit || null,
     bodyChars: args.bodyChars || null
@@ -162,7 +183,8 @@ function jsonlMatchesRun(args, out, metaPath) {
   try {
     const meta = JSON.parse(readFileSync(metaPath, "utf8"));
     const expected = expectedMeta(args);
-    return meta.dumpUrl === expected.dumpUrl
+    return meta.schemaVersion === expected.schemaVersion
+      && meta.dumpUrl === expected.dumpUrl
       && (meta.limit ?? null) === expected.limit
       && (meta.bodyChars ?? null) === expected.bodyChars;
   } catch {
@@ -265,8 +287,35 @@ function writeSite(args, docsPath) {
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
       { name: "body", path: "body", weight: 1.0, b: 0.75, typo: false }
     ],
-    facets: [{ name: "category", path: "category" }],
-    display: ["id", "title", "url", { name: "body", path: "body", maxChars: 640 }, "category"]
+    facets: [
+      { name: "category", path: "category" },
+      { name: "articleTags", path: "articleTags" }
+    ],
+    numbers: [
+      { name: "articleId", path: "articleId", type: "int" },
+      { name: "titleLength", path: "titleLength", type: "int" },
+      { name: "bodyLength", path: "bodyLength", type: "int" },
+      { name: "categoryCount", path: "categoryCount", type: "int" },
+      { name: "revisionDate", path: "revisionDate", type: "date" }
+    ],
+    booleans: [
+      { name: "hasCategories", path: "hasCategories" }
+    ],
+    display: [
+      "id",
+      "articleId",
+      "title",
+      "titleLength",
+      "url",
+      { name: "body", path: "body", maxChars: 640 },
+      "bodyLength",
+      "category",
+      "categoryList",
+      "articleTags",
+      "categoryCount",
+      "hasCategories",
+      "revisionDate"
+    ]
   };
   writeFileSync(configPath, JSON.stringify(config, null, 2));
   writeFileSync(resolve(publicDir, "index.html"), `<!doctype html>
@@ -295,7 +344,7 @@ async function run(){
   const t0 = performance.now();
   const res = await engine.search({ q: q.value, size: 10 });
   meta.textContent = res.total + " results in " + (performance.now() - t0).toFixed(1) + " ms";
-  out.innerHTML = res.results.map(item => '<article><h2><a href="'+item.url+'">'+item.title+'</a></h2><small>'+ (item.category || '') +' · score '+ item.score +'</small><p class="body">'+(item.body || '').slice(0, 420)+'</p></article>').join("");
+  out.innerHTML = res.results.map(item => '<article><h2><a href="'+item.url+'">'+item.title+'</a></h2><small>'+ (item.category || '') +' · '+ (item.revisionDate || '') +' · '+ (item.bodyLength || 0) +' chars · score '+ item.score +'</small><p class="body">'+(item.body || '').slice(0, 420)+'</p></article>').join("");
 }
 document.querySelector("#form").addEventListener("submit", event => { event.preventDefault(); run(); });
 run();
@@ -330,6 +379,107 @@ function networkKbBy(snapshot) {
   }]));
 }
 
+function fieldType(manifest, field) {
+  return (manifest.numbers || []).find(item => item.name === field)?.type || "number";
+}
+
+function normalizeComparable(value, type = "number") {
+  if (value == null || value === "") return null;
+  if (type === "date") {
+    const time = typeof value === "number" ? value : Date.parse(String(value));
+    return Number.isFinite(time) ? time : null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function commonFacetValue(manifest, field) {
+  return (manifest.facets?.[field] || [])
+    .filter(item => item.value)
+    .sort((a, b) => (b.n || 0) - (a.n || 0))[0]?.value || null;
+}
+
+function typedCases(manifest) {
+  const cases = [
+    {
+      label: "typed dates sorted",
+      q: "",
+      filters: {
+        numbers: {
+          titleLength: { min: 1 },
+          bodyLength: { min: 80 },
+          revisionDate: { min: "2001-01-01" }
+        }
+      },
+      sort: { field: "bodyLength", order: "desc" }
+    }
+  ];
+  const tagValues = manifest.facets?.articleTags || [];
+  const tag = tagValues.some(item => item.value === "has-categories")
+    ? "has-categories"
+    : commonFacetValue(manifest, "articleTags");
+  if (tag) {
+    const expectsCategories = tag !== "uncategorized";
+    cases.push({
+      label: `multi facet boolean (${tag})`,
+      q: "",
+      filters: {
+        facets: { articleTags: [tag] },
+        numbers: { categoryCount: { min: expectsCategories ? 1 : 0 } },
+        booleans: { hasCategories: expectsCategories }
+      },
+      sort: { field: "articleId", order: "asc" }
+    });
+  }
+  return cases;
+}
+
+function benchmarkCases(args, manifest) {
+  return [
+    ...args.queries.map(q => ({ label: q, q })),
+    ...typedCases(manifest)
+  ];
+}
+
+function resultMatchesFacet(result, field, selected) {
+  const value = result[field];
+  if (Array.isArray(value)) return value.some(item => selected.includes(item));
+  return selected.some(item => String(value || "").includes(item));
+}
+
+function validateResponse(item, response, manifest) {
+  const errors = [];
+  for (const result of response.results) {
+    for (const [field, selected] of Object.entries(item.filters?.facets || {})) {
+      if (!resultMatchesFacet(result, field, selected)) errors.push(`${field} missing selected facet`);
+    }
+    for (const [field, range] of Object.entries(item.filters?.numbers || {})) {
+      const type = fieldType(manifest, field);
+      const value = normalizeComparable(result[field], type);
+      const min = normalizeComparable(range.min, type);
+      const max = normalizeComparable(range.max, type);
+      if (value == null) errors.push(`${field} missing numeric value`);
+      if (min != null && value < min) errors.push(`${field} below min`);
+      if (max != null && value > max) errors.push(`${field} above max`);
+    }
+    for (const [field, expected] of Object.entries(item.filters?.booleans || {})) {
+      if (Boolean(result[field]) !== Boolean(expected)) errors.push(`${field} boolean mismatch`);
+    }
+  }
+  const sort = item.sort;
+  if (sort?.field && response.results.length > 1) {
+    const type = fieldType(manifest, sort.field);
+    const values = response.results.map(result => normalizeComparable(result[sort.field], type)).filter(value => value != null);
+    for (let i = 1; i < values.length; i++) {
+      if (sort.order === "desc" ? values[i - 1] < values[i] : values[i - 1] > values[i]) {
+        errors.push(`${sort.field} sort order mismatch`);
+        break;
+      }
+    }
+  }
+  return [...new Set(errors)];
+}
+
 async function benchFixture(args) {
   const root = resolve(args.root, "public");
   const server = await serveStatic(root);
@@ -341,17 +491,18 @@ async function benchFixture(args) {
     const initMs = performance.now() - initStart;
     const initNetwork = meter.snapshot();
     const rows = [];
-    for (const q of args.queries) {
+    for (const item of benchmarkCases(args, engine.manifest)) {
       const times = [];
       const requests = [];
       const bytes = [];
       const networks = [];
       let total = 0;
       let top = "";
+      let validationErrors = [];
       for (let i = 0; i < args.runs; i++) {
         meter.reset();
         const start = performance.now();
-        const response = await engine.search({ q, size: args.size });
+        const response = await engine.search({ q: item.q, filters: item.filters, sort: item.sort, size: item.size || args.size });
         times.push(performance.now() - start);
         const network = meter.snapshot();
         networks.push(network);
@@ -359,11 +510,15 @@ async function benchFixture(args) {
         bytes.push(network.bytes);
         total = response.total;
         top = response.results[0]?.title || "";
+        if (i === 0) validationErrors = validateResponse(item, response, engine.manifest);
       }
       rows.push({
-        q,
+        q: item.label,
+        request: { q: item.q, filters: item.filters || null, sort: item.sort || null },
         total,
         top,
+        valid: validationErrors.length === 0,
+        validationErrors,
         coldMs: times[0] || 0,
         coldRequests: requests[0] || 0,
         coldKb: kb(bytes[0] || 0),
@@ -385,9 +540,12 @@ async function benchFixture(args) {
       init: { ms: initMs, requests: initNetwork.requests, kb: kb(initNetwork.bytes), by: networkKbBy(initNetwork) },
       rows
     };
+    const invalid = rows.filter(row => !row.valid);
+    if (invalid.length) report.validationErrors = invalid.map(row => ({ q: row.q, errors: row.validationErrors }));
     const reportPath = resolve(args.root, "frwiki-bench.json");
     writeFileSync(reportPath, JSON.stringify(report, null, 2));
     console.log(JSON.stringify(report, null, 2));
+    if (invalid.length) throw new Error(`frwiki typed bench validation failed for ${invalid.map(row => row.q).join(", ")}`);
   } finally {
     meter.restore();
     await server.close();

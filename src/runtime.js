@@ -53,6 +53,19 @@ function selectedFacetCodes(manifest, field, selected) {
   return out;
 }
 
+function facetCodeMatches(words, selected) {
+  if (!selected?.size) return true;
+  if (Array.isArray(words)) {
+    for (const value of selected) {
+      const word = Math.floor(value / 32);
+      const bit = value % 32;
+      if ((words[word] || 0) & (2 ** bit)) return true;
+    }
+    return false;
+  }
+  return selected.has(words);
+}
+
 export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
@@ -67,6 +80,8 @@ export async function createSearch(options = {}) {
   let typoDirectory = null;
   let codes = null;
   let codesPromise = null;
+  const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
+  const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
 
   function createDirectoryState(meta, fallbackDir) {
     const directory = meta || {};
@@ -390,6 +405,22 @@ export async function createSearch(options = {}) {
     return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
   }
 
+  function normalizeRangeValue(value, field) {
+    if (value == null || value === "") return null;
+    if (field?.type === "date") {
+      const time = typeof value === "number" ? value : Date.parse(String(value));
+      return Number.isFinite(time) ? time : null;
+    }
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function booleanCode(value) {
+    if (value === true || value === 1 || value === "true" || value === "1") return 2;
+    if (value === false || value === 0 || value === "false" || value === "0") return 1;
+    return null;
+  }
+
   async function loadExternalPostingBlocks(entry, blockIndexes) {
     if (!entry.blockPostings) entry.blockPostings = new Map();
     const pending = [];
@@ -459,15 +490,39 @@ export async function createSearch(options = {}) {
     return out;
   }
 
-  function passesFilters(doc, codeData, filters) {
-    for (const [field, values] of Object.entries(filters.facets || {})) {
-      const selected = selectedFacetCodes(manifest, field, new Set(values));
-      if (selected && !selected.has(codeData[field]?.[doc])) return false;
+  function makeDocFilterPlan(filters) {
+    const facets = Object.entries(filters.facets || {})
+      .map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))])
+      .filter(([, selected]) => selected?.size);
+    const numbers = Object.entries(filters.numbers || {})
+      .map(([field, range]) => [field, {
+        min: normalizeRangeValue(range?.min, numberFields.get(field)),
+        max: normalizeRangeValue(range?.max, numberFields.get(field))
+      }])
+      .filter(([, range]) => range.min != null || range.max != null);
+    const booleans = Object.entries(filters.booleans || {})
+      .map(([field, expected]) => {
+        const code = booleanCode(expected);
+        return [field, code === 2 ? true : code === 1 ? false : null];
+      })
+      .filter(([, value]) => value != null);
+    return { facets, numbers, booleans, active: facets.length > 0 || numbers.length > 0 || booleans.length > 0 };
+  }
+
+  function passesFilterPlan(doc, codeData, filterPlan) {
+    if (!filterPlan?.active) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      if (!facetCodeMatches(codeData[field]?.[doc], selected)) return false;
     }
-    for (const [field, range] of Object.entries(filters.numbers || {})) {
-      const value = codeData[field]?.[doc] || 0;
+    for (const [field, range] of filterPlan.numbers) {
+      const value = codeData[field]?.[doc];
+      if (value == null) return false;
       if (range.min != null && value < range.min) return false;
       if (range.max != null && value > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const value = codeData[field]?.[doc];
+      if (value == null || value !== expected) return false;
     }
     return true;
   }
@@ -488,8 +543,15 @@ export async function createSearch(options = {}) {
       .map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))])
       .filter(([, selected]) => selected?.size);
     const numbers = Object.entries(filters.numbers || {})
-      .filter(([, range]) => range?.min != null || range?.max != null);
-    return { facets, numbers, active: facets.length > 0 || numbers.length > 0 };
+      .map(([field, range]) => [field, {
+        min: normalizeRangeValue(range?.min, numberFields.get(field)),
+        max: normalizeRangeValue(range?.max, numberFields.get(field))
+      }])
+      .filter(([, range]) => range.min != null || range.max != null);
+    const booleans = Object.entries(filters.booleans || {})
+      .map(([field, value]) => [field, booleanCode(value)])
+      .filter(([, value]) => value != null);
+    return { facets, numbers, booleans, active: facets.length > 0 || numbers.length > 0 || booleans.length > 0 };
   }
 
   function blockMayPass(block, filterPlan) {
@@ -499,9 +561,14 @@ export async function createSearch(options = {}) {
     }
     for (const [field, range] of filterPlan.numbers) {
       const summary = block.filters?.[field];
-      if (!summary || !summary.max) return false;
+      if (!summary || summary.min == null || summary.max == null) return false;
       if (range.min != null && summary.max < range.min) return false;
       if (range.max != null && summary.min > range.max) return false;
+    }
+    for (const [field, value] of filterPlan.booleans) {
+      const summary = block.filters?.[field];
+      if (!summary || !summary.max) return false;
+      if (summary.max < value || summary.min > value) return false;
     }
     return true;
   }
@@ -514,6 +581,34 @@ export async function createSearch(options = {}) {
     return [...scores.entries()]
       .filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch))
       .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  }
+
+  function makeSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field) return null;
+    const order = typeof sort === "string" && sort.startsWith("-")
+      ? "desc"
+      : String(sort.order || sort.direction || "asc").toLowerCase();
+    if (!numberFields.has(field) && !booleanFields.has(field)) return null;
+    return { field, desc: order === "desc" };
+  }
+
+  function sortRanked(ranked, codeData, sortPlan) {
+    if (!sortPlan || !codeData?.[sortPlan.field]) return ranked;
+    const values = codeData[sortPlan.field];
+    return ranked.slice().sort((a, b) => {
+      const left = values[a[0]];
+      const right = values[b[0]];
+      const leftMissing = left == null;
+      const rightMissing = right == null;
+      if (leftMissing || rightMissing) {
+        if (leftMissing && rightMissing) return b[1] - a[1] || a[0] - b[0];
+        return leftMissing ? 1 : -1;
+      }
+      if (left !== right) return sortPlan.desc ? Number(right) - Number(left) : Number(left) - Number(right);
+      return b[1] - a[1] || a[0] - b[0];
+    });
   }
 
   function bitIsSet(mask, bit) {
@@ -556,12 +651,12 @@ export async function createSearch(options = {}) {
     return top;
   }
 
-  function applyBlockRows(cursor, rows, codeData, filters, scores, hits, masks) {
+  function applyBlockRows(cursor, rows, codeData, filterPlan, scores, hits, masks) {
     let accepted = 0;
     const bit = cursor.termIndex < SKIP_MAX_TERMS ? 2 ** cursor.termIndex : 0;
     for (let i = 0; i < rows.length; i += 2) {
       const doc = rows[i];
-      if (codeData && !passesFilters(doc, codeData, filters)) continue;
+      if (codeData && !passesFilterPlan(doc, codeData, filterPlan)) continue;
       scores.set(doc, (scores.get(doc) || 0) + rows[i + 1]);
       if (bit) masks.set(doc, (masks.get(doc) || 0) | bit);
       if (cursor.isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
@@ -570,16 +665,18 @@ export async function createSearch(options = {}) {
     return accepted;
   }
 
-  async function runSkippedSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
+  async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const candidateK = rerank === false ? k : Math.max(RERANK_CANDIDATES, k);
-    if (baseTerms.length < 2 || terms.length > SKIP_MAX_TERMS || k > 100) {
-      return runFullSearch({ q, page, size, filters, baseTerms, terms, rerank });
+    const sortPlan = makeSortPlan(sort);
+    if (sortPlan || baseTerms.length < 2 || terms.length > SKIP_MAX_TERMS || k > 100) {
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank });
     }
 
-    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
-    const filterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const codeData = hasFilters ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
@@ -605,13 +702,13 @@ export async function createSearch(options = {}) {
     let exhausted = false;
 
     while (true) {
-      const active = cursors.filter(cursor => advanceCursor(cursor, filterPlan));
+      const active = cursors.filter(cursor => advanceCursor(cursor, blockFilterPlan));
       if (!active.length) {
         exhausted = true;
         break;
       }
 
-      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, filterPlan);
+      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan);
       if (stable) break;
 
       active.sort((a, b) => b.entry.blocks[b.blockIndex].maxImpact - a.entry.blocks[a.blockIndex].maxImpact);
@@ -620,7 +717,7 @@ export async function createSearch(options = {}) {
       cursor.blockIndex++;
       blocksDecoded++;
       postingsDecoded += rows.length / 2;
-      postingsAccepted += applyBlockRows(cursor, rows, codeData, filters, scores, hits, masks);
+      postingsAccepted += applyBlockRows(cursor, rows, codeData, docFilterPlan, scores, hits, masks);
     }
 
     let ranked = exhausted
@@ -650,31 +747,33 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function runFullSearch({ q, page, size, filters, baseTerms, terms, rerank = true }) {
+  async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
-    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length;
+    const sortPlan = makeSortPlan(sort);
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     const entries = await termEntries(terms);
     const scores = new Map();
     const hits = new Map();
     const baseSet = new Set(baseTerms);
-    const codeData = hasFilters ? await loadCodes() : null;
+    const codeData = hasFilters || sortPlan ? await loadCodes() : null;
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
 
     for (const { term, shard, entry } of entries) {
       const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
       for (let i = 0; i < postings.length; i += 2) {
         const doc = postings[i];
-        if (codeData && !passesFilters(doc, codeData, filters)) continue;
+        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         scores.set(doc, (scores.get(doc) || 0) + postings[i + 1]);
         if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
       }
     }
 
     let ranked = collectEligibleScores(scores, hits, minShouldMatchFor(baseTerms));
-    const reranked = rerank === false
+    const reranked = rerank === false || sortPlan
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, Math.max(RERANK_CANDIDATES, offset + size));
-    ranked = reranked.ranked;
+    ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
     return {
       total: ranked.length,
@@ -838,17 +937,32 @@ export async function createSearch(options = {}) {
     const size = Math.max(1, Math.min(100, Number(params.size || 10)));
     const offset = (page - 1) * size;
     const filters = params.filters || {};
+    const sort = params.sort || null;
+    const sortPlan = makeSortPlan(sort);
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
 
     if (!q) {
-      const docs = manifest.initial_results.slice(offset, offset + size);
-      return { total: manifest.total, results: docs, page, size };
+      if (!sortPlan && !hasFilters) {
+        const docs = manifest.initial_results.slice(offset, offset + size);
+        return { total: manifest.total, results: docs, page, size };
+      }
+      const codeData = await loadCodes();
+      const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+      const ranked = sortRanked(
+        Array.from({ length: manifest.total }, (_, index) => [index, 0])
+          .filter(([index]) => !hasFilters || passesFilterPlan(index, codeData, docFilterPlan)),
+        codeData,
+        sortPlan
+      );
+      const rows = ranked.slice(offset, offset + size);
+      return { total: ranked.length, results: await rowsToResults(rows), page, size };
     }
 
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map(item => item.term);
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;
-    const response = await searchFn({ q, page, size, filters, baseTerms, terms: queryTerms(q), rerank: params.rerank });
-    return maybeTypoFallback({ q, page, size, filters, rerank: params.rerank }, response, baseTerms, analyzedTerms);
+    const response = await searchFn({ q, page, size, filters, sort, baseTerms, terms: queryTerms(q), rerank: params.rerank });
+    return maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
   }
 
   return {

@@ -5,6 +5,9 @@ The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
 records a local request/transfer benchmark with cold-transfer breakdowns for
 directory, term, posting-block, typo, code, and document payload fetches.
+The generated schema includes multi-value article tags, typed numeric fields,
+revision dates, and booleans so the scalability run also validates the typed
+filter/sort code paths.
 
 ## Data Source
 
@@ -66,29 +69,35 @@ Result:
 Docs indexed:        5,000
 Dump pages read:     5,913
 Body cap:            6,000 cleaned characters/article
-Build + bench time:  12.89 s real with prepared JSONL reused
+Build + bench time:  13.80 s real with prepared JSONL reused
 Logical shards:      7,565
 Term packs:          2
 Posting-block packs: 1
 Index files:         17
-Index bytes:         18.4 MB
-Init:                11.3 ms, 1 request, 238.5 KB
+Index bytes:         20.4 MB
+Init:                10.5 ms, 1 request, 245.1 KB
 ```
 
 Representative cold queries:
 
 ```text
-Paris:                    30.1 ms, 15 requests, 115.6 KB, top Paris (homonymie)
-Révolution française:      8.4 ms, 11 requests,  27.2 KB, top Révolution française
-intelligence artificielle: 7.7 ms, 11 requests,  38.1 KB, top Intelligence artificielle
-football:                  5.7 ms, 11 requests,   5.1 KB, top Coupe du monde de football
-Québec:                    6.2 ms, 10 requests,   8.8 KB, top Système éducatif au Québec
+Paris:                    26.0 ms, 15 requests, 126.4 KB, top Paris (homonymie)
+Révolution française:     10.9 ms, 11 requests,  36.1 KB, top Révolution française
+intelligence artificielle: 6.1 ms, 11 requests,  52.2 KB, top Intelligence artificielle
+football:                  5.1 ms, 11 requests,   6.3 KB, top Coupe du monde de football
+Québec:                    4.8 ms, 10 requests,  11.5 KB, top Système éducatif au Québec
+typed dates sorted:       20.4 ms,  2 requests,  52.1 KB, top Algèbre linéaire
+multi facet boolean:       3.1 ms,  1 request,   3.6 KB, top Antoine Meillet
 ```
 
-The cold-transfer breakdown shows term pack fetches in the 0.5-48.5 KB range,
-posting-block fetches up to 3.1 KB for these queries, and result document
-fetches in the 3.5-11.2 KB range. The first query also pays for the term and
-document range-directory pages, which were 85.6 KB in this run.
+All rows reported `valid: true`; the typed cases verify numeric/date range
+filters, sort order, multi-value facet filtering, and boolean filtering.
+
+The cold-transfer breakdown shows term pack fetches in the 0.7-68.7 KB range,
+posting-block fetches up to 3.1 KB for these queries, code-table fetches of
+44.3 KB for the typed sort case, and result document fetches in the 3.6-14.1 KB
+range. The first query also pays for the term and document range-directory
+pages, which were 87.4 KB in this run.
 
 Warm repeated queries in this run were served from the runtime cache with zero
 additional network requests.

@@ -49,10 +49,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const output = join(root, "public", "rangefind");
   const configPath = join(root, "rangefind.config.json");
   await writeFile(docsPath, [
-    JSON.stringify({ id: "a", title: "Static range search", body: "Rangefind builds a static index with range requests.", category: "indexing", year: 2026, url: "/a" }),
-    JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", category: "baseline", year: 2025, url: "/b" }),
-    JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", year: 2026, url: "/c" }),
-    JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", year: 2026, url: "/d" })
+    JSON.stringify({ id: "a", title: "Static range search", body: "Rangefind builds a static index with range requests.", category: "indexing", tags: ["static", "range"], year: 2026, temperature: -1, published: "2026-01-10", featured: true, url: "/a" }),
+    JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", category: "baseline", tags: ["sqlite", "quality"], year: 2025, temperature: -5, published: "2025-06-01", featured: false, url: "/b" }),
+    JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", tags: ["static", "runtime"], year: 2026, temperature: 0, published: "2026-03-15", featured: false, url: "/c" }),
+    JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", tags: ["typo"], year: 2026, temperature: 7, published: "2026-05-01", featured: true, url: "/d" })
   ].join("\n"));
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
@@ -67,9 +67,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
       { name: "title", path: "title", weight: 4.5, b: 0.55, phrase: true },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
-    facets: [{ name: "category", path: "category" }],
-    numbers: [{ name: "year", path: "year" }],
-    display: ["title", "url", "category", "year", { name: "bodySnippet", path: "body", maxChars: 16 }]
+    facets: [{ name: "category", path: "category" }, { name: "tags", path: "tags" }],
+    numbers: [{ name: "year", path: "year" }, { name: "temperature", path: "temperature" }, { name: "published", path: "published", type: "date" }],
+    booleans: [{ name: "featured", path: "featured" }],
+    display: ["title", "url", "category", "tags", "year", "temperature", "published", "featured", { name: "bodySnippet", path: "body", maxChars: 16 }]
   }));
 
   await build({ configPath });
@@ -113,9 +114,32 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const filtered = await search.search({
     q: "search",
     filters: {
-      facets: { category: ["indexing"] },
-      numbers: { year: { min: 2026 } }
+      facets: { tags: ["static"] },
+      numbers: { year: { min: 2026 } },
+      booleans: { featured: true }
     }
   });
   assert.deepEqual(filtered.results.map(result => result.id), ["a"]);
+
+  const signedNumericFiltered = await search.search({
+    q: "client search runtime",
+    filters: {
+      numbers: { temperature: { min: -1, max: 0 } },
+      booleans: { featured: false }
+    }
+  });
+  assert.deepEqual(signedNumericFiltered.results.map(result => result.id), ["c"]);
+
+  const dateFiltered = await search.search({
+    q: "",
+    filters: {
+      facets: { category: ["runtime"] },
+      numbers: { published: { min: "2026-03-01", max: "2026-12-31" } }
+    },
+    sort: { field: "published", order: "desc" }
+  });
+  assert.deepEqual(dateFiltered.results.map(result => result.id), ["d", "c"]);
+
+  const sortedInitial = await search.search({ q: "", sort: "-year", size: 2 });
+  assert.deepEqual(sortedInitial.results.map(result => result.id), ["a", "c"]);
 });

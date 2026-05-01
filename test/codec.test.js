@@ -21,6 +21,7 @@ test("term shard codec round-trips postings and block filters", () => {
   const config = {
     facets: [{ name: "category" }],
     numbers: [{ name: "year" }],
+    booleans: [{ name: "featured" }],
     postingBlockSize: 2
   };
   const dicts = {
@@ -28,7 +29,8 @@ test("term shard codec round-trips postings and block filters", () => {
   };
   const codes = {
     category: [1, 1, 0],
-    year: [2024, 2026, 0]
+    year: [0, -5, 10],
+    featured: [false, true, null]
   };
   const filters = buildBlockFilters(config, dicts);
   const buffer = buildTermShard([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
@@ -37,19 +39,25 @@ test("term shard codec round-trips postings and block filters", () => {
   assert.equal(entry.count, 3);
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0).sort(), [0, 1, 2]);
   assert.deepEqual(entry.blocks[0].filters.category.words, [2]);
-  assert.deepEqual(entry.blocks[0].filters.year, { min: 2024, max: 2026 });
+  assert.deepEqual(entry.blocks[0].filters.year, { min: -5, max: 0 });
+  assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 2 });
 });
 
 test("term shard codec can externalize posting blocks", () => {
   const config = {
     facets: [],
-    numbers: [],
+    numbers: [{ name: "year" }],
+    booleans: [{ name: "featured" }],
     postingBlockSize: 2,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0
   };
   const filters = buildBlockFilters(config, {});
-  const buffer = buildTermShard([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, {}, filters, config);
+  const codes = {
+    year: [-1, 0, 1],
+    featured: [false, false, true]
+  };
+  const buffer = buildTermShard([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
   const stored = [];
   const rewritten = rewriteTermShardForExternalBlocks(buffer, { block_filters: filters }, config, ({ bytes }) => {
     stored.push(bytes);
@@ -60,6 +68,8 @@ test("term shard codec can externalize posting blocks", () => {
   assert.equal(entry.external, true);
   assert.equal(entry.blocks.length, 2);
   assert.equal(entry.blocks[0].range.pack, "0000.bin");
+  assert.deepEqual(entry.blocks[0].filters.year, { min: -1, max: 0 });
+  assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 1 });
   assert.deepEqual([...decodePostingBytes(stored[0])], [0, 13, 1, 11]);
   assert.equal(rewritten.stats.externalBlocks, 2);
 });
@@ -81,8 +91,22 @@ test("paged directory maps named shards to packed file offsets", () => {
 test("code table codec round-trips facet and numeric columns", () => {
   const config = {
     facets: [{ name: "category" }],
-    numbers: [{ name: "year" }]
+    numbers: [{ name: "year" }, { name: "published", type: "date" }, { name: "rating", type: "double" }],
+    booleans: [{ name: "featured" }]
   };
-  const buffer = buildCodesFile(config, 3, { category: [1, 2, 1], year: [2024, 2025, 2026] });
-  assert.deepEqual(parseCodes(buffer), { category: [1, 2, 1], year: [2024, 2025, 2026] });
+  const buffer = buildCodesFile(config, 3, {
+    _dicts: { category: { values: [{ value: "" }, { value: "docs" }, { value: "api" }] } },
+    category: [[6], [4], [2]],
+    year: [2024, 2025, 2026],
+    published: [Date.parse("2024-01-01"), null, Date.parse("2026-05-01")],
+    rating: [1.5, 2.25, null],
+    featured: [true, false, null]
+  });
+  assert.deepEqual(parseCodes(buffer), {
+    category: [[6], [4], [2]],
+    year: [2024, 2025, 2026],
+    published: [Date.parse("2024-01-01"), null, Date.parse("2026-05-01")],
+    rating: [1.5, 2.25, null],
+    featured: [true, false, null]
+  });
 });

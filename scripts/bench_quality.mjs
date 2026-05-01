@@ -69,6 +69,58 @@ function metrics(ranks) {
   };
 }
 
+function ids(results) {
+  return results.map(result => String(result.id));
+}
+
+function sameIds(actual, expected) {
+  return actual.length === expected.length && expected.every((id, index) => actual[index] === String(id));
+}
+
+async function structuredChecks(engine) {
+  const checks = [
+    {
+      name: "multi-value facet",
+      request: { q: "", filters: { facets: { tags: ["range"] } }, size: 10 },
+      expected: ["1", "2", "3"]
+    },
+    {
+      name: "typed date sort",
+      request: {
+        q: "",
+        filters: { numbers: { published: { min: "2026-01-01" } } },
+        sort: { field: "published", order: "desc" },
+        size: 3
+      },
+      expected: ["4", "2", "1"]
+    },
+    {
+      name: "signed numeric boolean",
+      request: {
+        q: "facet numeric filters",
+        filters: {
+          numbers: { temperature: { min: -10, max: 0 } },
+          booleans: { featured: false }
+        },
+        size: 3
+      },
+      expected: ["3"]
+    }
+  ];
+  const rows = [];
+  for (const check of checks) {
+    const response = await engine.search(check.request);
+    const actual = ids(response.results);
+    rows.push({
+      name: check.name,
+      expected: check.expected,
+      actual,
+      pass: sameIds(actual, check.expected)
+    });
+  }
+  return rows;
+}
+
 function pct(value) {
   return `${(value * 100).toFixed(1)}%`;
 }
@@ -97,6 +149,7 @@ try {
       typoApplied: !!response.stats?.typoApplied
     });
   }
+  const filterChecks = await structuredChecks(engine);
 
   const report = {
     engine: "rangefind",
@@ -108,6 +161,11 @@ try {
       metrics: metrics(typoRows.map(row => row.rank)),
       appliedRate: typoRows.length ? typoRows.filter(row => row.typoApplied).length / typoRows.length : 0,
       examples: typoRows.filter(row => !row.rank || !row.typoApplied).slice(0, 10)
+    },
+    structuredFilters: {
+      passed: filterChecks.filter(check => check.pass).length,
+      total: filterChecks.length,
+      checks: filterChecks
     }
   };
 
@@ -119,6 +177,7 @@ try {
     console.log(`Known item: n=${k.n} Hit@1 ${pct(k.hit1)} Hit@3 ${pct(k.hit3)} Hit@10 ${pct(k.hit10)} MRR@10 ${k.mrr10.toFixed(3)}`);
     const t = report.typoRecovery.metrics;
     console.log(`Typo recovery: n=${t.n} Hit@1 ${pct(t.hit1)} Hit@3 ${pct(t.hit3)} Hit@10 ${pct(t.hit10)} MRR@10 ${t.mrr10.toFixed(3)} Applied ${pct(report.typoRecovery.appliedRate)}`);
+    console.log(`Structured filters: ${report.structuredFilters.passed}/${report.structuredFilters.total} passed`);
   }
 } finally {
   await server.close();

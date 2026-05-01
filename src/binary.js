@@ -30,13 +30,17 @@ export function fixedWidth(values) {
   for (const value of values) if (value > max) max = value;
   if (max <= 0xff) return 1;
   if (max <= 0xffff) return 2;
-  return 4;
+  if (max <= 0xffffffff) return 4;
+  if (max <= 0xffffffffffff) return 6;
+  return 8;
 }
 
 export function writeFixedInt(buffer, offset, width, value) {
-  if (width === 1) buffer[offset] = value;
-  else if (width === 2) buffer.writeUInt16LE(value, offset);
-  else buffer.writeUInt32LE(value, offset);
+  let remaining = BigInt(Math.max(0, Math.floor(value || 0)));
+  for (let i = 0; i < width; i++) {
+    buffer[offset + i] = Number(remaining & 0xffn);
+    remaining >>= 8n;
+  }
 }
 
 export function readFixedInt(bytes, offset, width) {

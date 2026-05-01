@@ -27,7 +27,7 @@
     out.innerHTML = `<p>${result.total} results</p>` + result.results.map(item => `
       <article>
         <h2>${item.title}</h2>
-        <small>${item.category} · ${item.year} · score ${item.score}</small>
+        <small>${item.category} · ${item.tags || ""} · ${item.year} · ${item.published} · featured ${item.featured} · score ${item.score}</small>
         <p>${item.body}</p>
       </article>
     `).join("");
