@@ -61,6 +61,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
     baseShardDepth: 2,
     maxShardDepth: 3,
     targetShardPostings: 2,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0,
     fields: [
       { name: "title", path: "title", weight: 4.5, b: 0.55, phrase: true },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
@@ -77,6 +79,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, "docs", "packs", "0000.bin")));
   assert.ok(await readFile(join(output, "terms", "directory-root.bin.gz")));
   assert.ok(await readFile(join(output, "terms", "directory-pages", "0000.bin.gz")));
+  assert.ok(await readFile(join(output, "terms", "block-packs", "0000.bin")));
   assert.ok(await readFile(join(output, "codes.bin.gz")));
   assert.ok(await readFile(join(output, "typo", "manifest.json")));
   assert.ok(await readFile(join(output, "typo", "directory-root.bin.gz")));

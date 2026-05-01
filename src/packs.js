@@ -24,4 +24,5 @@ export function writePackedShard(writer, shard, compressed) {
   const pack = writer.packs[writer.packs.length - 1];
   pack.bytes += compressed.length;
   pack.shards++;
+  return writer.entries[shard];
 }

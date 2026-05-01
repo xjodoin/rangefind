@@ -1,5 +1,5 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
-import { decodePostingBlock, decodePostings, parseCodes, parseShard } from "./codec.js";
+import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseShard } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { groupRanges, shardKey } from "./shards.js";
 import {
@@ -14,6 +14,7 @@ import {
 const RERANK_CANDIDATES = 30;
 const DEPENDENCY_SCORE_SCALE = 0.12;
 const SKIP_MAX_TERMS = 30;
+const EXTERNAL_POSTING_BLOCK_PREFETCH = 4;
 const DOC_INDEX_KEY_WIDTH = 8;
 const textDecoder = new TextDecoder();
 
@@ -294,7 +295,7 @@ export async function createSearch(options = {}) {
       const weight = featureWeights.get(term) || 0;
       if (!weight) continue;
       dependencyTermsMatched++;
-      const postings = decodePostings(shard, entry);
+      const postings = await decodeEntryPostings(shard, entry);
       dependencyPostingsScanned += postings.length / 2;
       for (let i = 0; i < postings.length; i += 2) {
         const candidate = candidateScores.get(postings[i]);
@@ -387,6 +388,75 @@ export async function createSearch(options = {}) {
   async function rowsToResults(rows) {
     const docs = await loadDocs(rows.map(([index]) => index));
     return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
+  }
+
+  async function loadExternalPostingBlocks(entry, blockIndexes) {
+    if (!entry.blockPostings) entry.blockPostings = new Map();
+    const pending = [];
+    const wanted = [];
+    for (const blockIndex of blockIndexes) {
+      wanted.push(blockIndex);
+      if (entry.blockPostings.has(blockIndex)) continue;
+      const block = entry.blocks?.[blockIndex];
+      if (!block?.range) {
+        entry.blockPostings.set(blockIndex, Promise.resolve(new Int32Array(0)));
+        continue;
+      }
+      let resolveBlock;
+      let rejectBlock;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveBlock = resolvePromise;
+        rejectBlock = rejectPromise;
+      });
+      entry.blockPostings.set(blockIndex, promise);
+      pending.push({ blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
+    }
+
+    await Promise.all(groupRanges(pending).map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const start = item.entry.offset - group.start;
+          const end = start + item.entry.length;
+          item.resolve(decodePostingBytes(await inflateGzip(compressed.slice(start, end))));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          entry.blockPostings.delete(item.blockIndex);
+          item.reject(error);
+        }
+      }
+    }));
+
+    return Promise.all(wanted.map(blockIndex => entry.blockPostings.get(blockIndex)));
+  }
+
+  async function decodeEntryBlock(shard, entry, blockIndex) {
+    if (!entry.external) return decodePostingBlock(shard, entry, blockIndex);
+    const prefetchLimit = entry.blocks.length <= EXTERNAL_POSTING_BLOCK_PREFETCH * 2
+      ? entry.blocks.length
+      : blockIndex + EXTERNAL_POSTING_BLOCK_PREFETCH;
+    const blockIndexes = [];
+    for (let i = blockIndex; i < Math.min(entry.blocks.length, prefetchLimit); i++) {
+      blockIndexes.push(i);
+    }
+    const rows = await loadExternalPostingBlocks(entry, blockIndexes);
+    return rows[0] || new Int32Array(0);
+  }
+
+  async function decodeEntryPostings(shard, entry) {
+    if (!entry.external) return decodePostings(shard, entry);
+    if (entry.postings) return entry.postings;
+    const blocks = await loadExternalPostingBlocks(entry, entry.blocks.map((_, index) => index));
+    const length = blocks.reduce((sum, rows) => sum + rows.length, 0);
+    const out = new Int32Array(length);
+    let offset = 0;
+    for (const rows of blocks) {
+      out.set(rows, offset);
+      offset += rows.length;
+    }
+    entry.postings = out;
+    return out;
   }
 
   function passesFilters(doc, codeData, filters) {
@@ -546,7 +616,7 @@ export async function createSearch(options = {}) {
 
       active.sort((a, b) => b.entry.blocks[b.blockIndex].maxImpact - a.entry.blocks[a.blockIndex].maxImpact);
       const cursor = active[0];
-      const rows = decodePostingBlock(cursor.shard, cursor.entry, cursor.blockIndex);
+      const rows = await decodeEntryBlock(cursor.shard, cursor.entry, cursor.blockIndex);
       cursor.blockIndex++;
       blocksDecoded++;
       postingsDecoded += rows.length / 2;
@@ -590,7 +660,7 @@ export async function createSearch(options = {}) {
     const codeData = hasFilters ? await loadCodes() : null;
 
     for (const { term, shard, entry } of entries) {
-      const postings = decodePostings(shard, entry);
+      const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
       for (let i = 0; i < postings.length; i += 2) {
         const doc = postings[i];

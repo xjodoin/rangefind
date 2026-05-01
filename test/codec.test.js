@@ -4,9 +4,11 @@ import {
   buildBlockFilters,
   buildCodesFile,
   buildTermShard,
+  decodePostingBytes,
   decodePostings,
   parseCodes,
-  parseShard
+  parseShard,
+  rewriteTermShardForExternalBlocks
 } from "../src/codec.js";
 import {
   buildPagedDirectory,
@@ -36,6 +38,30 @@ test("term shard codec round-trips postings and block filters", () => {
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0).sort(), [0, 1, 2]);
   assert.deepEqual(entry.blocks[0].filters.category.words, [2]);
   assert.deepEqual(entry.blocks[0].filters.year, { min: 2024, max: 2026 });
+});
+
+test("term shard codec can externalize posting blocks", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    postingBlockSize: 2,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0
+  };
+  const filters = buildBlockFilters(config, {});
+  const buffer = buildTermShard([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, {}, filters, config);
+  const stored = [];
+  const rewritten = rewriteTermShardForExternalBlocks(buffer, { block_filters: filters }, config, ({ bytes }) => {
+    stored.push(bytes);
+    return { pack: "0000.bin", offset: stored.length * 10, length: bytes.length };
+  });
+  const shard = parseShard(rewritten.buffer, { block_filters: filters, stats: { posting_block_storage: "range-pack-v1" } });
+  const entry = shard.terms.get("search");
+  assert.equal(entry.external, true);
+  assert.equal(entry.blocks.length, 2);
+  assert.equal(entry.blocks[0].range.pack, "0000.bin");
+  assert.deepEqual([...decodePostingBytes(stored[0])], [0, 13, 1, 11]);
+  assert.equal(rewritten.stats.externalBlocks, 2);
 });
 
 test("paged directory maps named shards to packed file offsets", () => {

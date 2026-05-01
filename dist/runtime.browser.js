@@ -199,9 +199,29 @@ function readUtf8(bytes, state) {
   state.pos += len;
   return textDecoder.decode(bytes.subarray(start, state.pos));
 }
+function packFileFromIndex(index) {
+  return `${String(index).padStart(4, "0")}.bin`;
+}
+function readBlockFilterSummary(bytes, state, manifest) {
+  const filters = {};
+  for (const filter of manifest.block_filters || []) {
+    if (filter.kind === "facet") {
+      const words = new Array(filter.words);
+      for (let w = 0; w < filter.words; w++) words[w] = readVarint(bytes, state);
+      filters[filter.name] = { words };
+    } else {
+      filters[filter.name] = {
+        min: readVarint(bytes, state),
+        max: readVarint(bytes, state)
+      };
+    }
+  }
+  return filters;
+}
 function parseShard(buffer, manifest) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, TERM_SHARD_MAGIC, "Unsupported Rangefind term shard");
+  const externalBlockFormat = manifest.stats?.posting_block_storage === "range-pack-v1";
   const state = { pos: TERM_SHARD_MAGIC.length };
   const termCount = readVarint(bytes, state);
   const terms = /* @__PURE__ */ new Map();
@@ -217,6 +237,7 @@ function parseShard(buffer, manifest) {
       postings: null
     };
     const blockCount = readVarint(bytes, state);
+    entry.external = externalBlockFormat && readVarint(bytes, state) === 1;
     entry.blocks = new Array(blockCount);
     for (let j = 0; j < blockCount; j++) {
       const block = {
@@ -224,17 +245,13 @@ function parseShard(buffer, manifest) {
         maxImpact: readVarint(bytes, state),
         filters: {}
       };
-      for (const filter of manifest.block_filters || []) {
-        if (filter.kind === "facet") {
-          const words = new Array(filter.words);
-          for (let w = 0; w < filter.words; w++) words[w] = readVarint(bytes, state);
-          block.filters[filter.name] = { words };
-        } else {
-          block.filters[filter.name] = {
-            min: readVarint(bytes, state),
-            max: readVarint(bytes, state)
-          };
-        }
+      block.filters = readBlockFilterSummary(bytes, state, manifest);
+      if (entry.external) {
+        block.range = {
+          pack: packFileFromIndex(readVarint(bytes, state)),
+          offset: readVarint(bytes, state),
+          length: readVarint(bytes, state)
+        };
       }
       entry.blocks[j] = block;
     }
@@ -243,6 +260,7 @@ function parseShard(buffer, manifest) {
   return { bytes, dataStart: state.pos, terms };
 }
 function decodePostings(shard, entry) {
+  if (entry.external) throw new Error("External posting blocks require async runtime loading.");
   if (entry.postings) return entry.postings;
   const state = { pos: shard.dataStart + entry.offset };
   const out = new Int32Array(entry.count * 2);
@@ -253,9 +271,19 @@ function decodePostings(shard, entry) {
   entry.postings = out;
   return out;
 }
+function decodePostingBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  while (state.pos < source.length) {
+    rows.push(readVarint(source, state), readVarint(source, state));
+  }
+  return Int32Array.from(rows);
+}
 function decodePostingBlock(shard, entry, blockIndex) {
   const block = entry.blocks?.[blockIndex];
   if (!block) return new Int32Array(0);
+  if (entry.external) throw new Error("External posting blocks require async runtime loading.");
   if (!entry.blockPostings) entry.blockPostings = /* @__PURE__ */ new Map();
   if (entry.blockPostings.has(blockIndex)) return entry.blockPostings.get(blockIndex);
   const next = entry.blocks[blockIndex + 1];
@@ -520,6 +548,7 @@ function typoCandidateScore(token, surface, df, distance) {
 var RERANK_CANDIDATES = 30;
 var DEPENDENCY_SCORE_SCALE = 0.12;
 var SKIP_MAX_TERMS = 30;
+var EXTERNAL_POSTING_BLOCK_PREFETCH = 4;
 var DOC_INDEX_KEY_WIDTH = 8;
 var textDecoder2 = new TextDecoder();
 async function inflateGzip(responseOrBuffer) {
@@ -770,7 +799,7 @@ async function createSearch(options = {}) {
       const weight = featureWeights.get(term) || 0;
       if (!weight) continue;
       dependencyTermsMatched++;
-      const postings = decodePostings(shard, entry);
+      const postings = await decodeEntryPostings(shard, entry);
       dependencyPostingsScanned += postings.length / 2;
       for (let i = 0; i < postings.length; i += 2) {
         const candidate = candidateScores.get(postings[i]);
@@ -855,6 +884,68 @@ async function createSearch(options = {}) {
   async function rowsToResults(rows) {
     const docs = await loadDocs(rows.map(([index]) => index));
     return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
+  }
+  async function loadExternalPostingBlocks(entry, blockIndexes) {
+    if (!entry.blockPostings) entry.blockPostings = /* @__PURE__ */ new Map();
+    const pending = [];
+    const wanted = [];
+    for (const blockIndex of blockIndexes) {
+      wanted.push(blockIndex);
+      if (entry.blockPostings.has(blockIndex)) continue;
+      const block = entry.blocks?.[blockIndex];
+      if (!block?.range) {
+        entry.blockPostings.set(blockIndex, Promise.resolve(new Int32Array(0)));
+        continue;
+      }
+      let resolveBlock;
+      let rejectBlock;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveBlock = resolvePromise;
+        rejectBlock = rejectPromise;
+      });
+      entry.blockPostings.set(blockIndex, promise);
+      pending.push({ blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
+    }
+    await Promise.all(groupRanges(pending).map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const start = item.entry.offset - group.start;
+          const end = start + item.entry.length;
+          item.resolve(decodePostingBytes(await inflateGzip(compressed.slice(start, end))));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          entry.blockPostings.delete(item.blockIndex);
+          item.reject(error);
+        }
+      }
+    }));
+    return Promise.all(wanted.map((blockIndex) => entry.blockPostings.get(blockIndex)));
+  }
+  async function decodeEntryBlock(shard, entry, blockIndex) {
+    if (!entry.external) return decodePostingBlock(shard, entry, blockIndex);
+    const prefetchLimit = entry.blocks.length <= EXTERNAL_POSTING_BLOCK_PREFETCH * 2 ? entry.blocks.length : blockIndex + EXTERNAL_POSTING_BLOCK_PREFETCH;
+    const blockIndexes = [];
+    for (let i = blockIndex; i < Math.min(entry.blocks.length, prefetchLimit); i++) {
+      blockIndexes.push(i);
+    }
+    const rows = await loadExternalPostingBlocks(entry, blockIndexes);
+    return rows[0] || new Int32Array(0);
+  }
+  async function decodeEntryPostings(shard, entry) {
+    if (!entry.external) return decodePostings(shard, entry);
+    if (entry.postings) return entry.postings;
+    const blocks = await loadExternalPostingBlocks(entry, entry.blocks.map((_, index) => index));
+    const length = blocks.reduce((sum, rows) => sum + rows.length, 0);
+    const out = new Int32Array(length);
+    let offset = 0;
+    for (const rows of blocks) {
+      out.set(rows, offset);
+      offset += rows.length;
+    }
+    entry.postings = out;
+    return out;
   }
   function passesFilters(doc, codeData, filters) {
     for (const [field, values] of Object.entries(filters.facets || {})) {
@@ -989,7 +1080,7 @@ async function createSearch(options = {}) {
       if (stable) break;
       active.sort((a, b) => b.entry.blocks[b.blockIndex].maxImpact - a.entry.blocks[a.blockIndex].maxImpact);
       const cursor = active[0];
-      const rows2 = decodePostingBlock(cursor.shard, cursor.entry, cursor.blockIndex);
+      const rows2 = await decodeEntryBlock(cursor.shard, cursor.entry, cursor.blockIndex);
       cursor.blockIndex++;
       blocksDecoded++;
       postingsDecoded += rows2.length / 2;
@@ -1026,7 +1117,7 @@ async function createSearch(options = {}) {
     const baseSet = new Set(baseTerms);
     const codeData = hasFilters ? await loadCodes() : null;
     for (const { term, shard, entry } of entries) {
-      const postings = decodePostings(shard, entry);
+      const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
       for (let i = 0; i < postings.length; i += 2) {
         const doc = postings[i];

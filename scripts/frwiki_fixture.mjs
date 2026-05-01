@@ -315,6 +315,7 @@ function networkBucket(url) {
   if (path.endsWith("/runtime.browser.js")) return "runtime";
   if (path.endsWith("/manifest.json")) return "manifest";
   if (path.includes("/directory-")) return "directory";
+  if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/typo/")) return "typo";
   if (path.includes("/docs/")) return "docs";

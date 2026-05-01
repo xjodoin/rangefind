@@ -9,12 +9,13 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
-import { gzipSync } from "node:zlib";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { tokenize } from "./analyzer.js";
 import {
   buildBlockFilters,
   buildCodesFile,
-  buildTermShard
+  buildTermShard,
+  rewriteTermShardForExternalBlocks
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
@@ -128,6 +129,30 @@ function finishDocPacks(out, packWriter, total, pageBytes) {
   };
 }
 
+function emptyPostingBlockStats() {
+  return {
+    externalBlocks: 0,
+    externalTerms: 0,
+    externalPostings: 0,
+    externalPostingBytes: 0,
+    inlinePostingBytes: 0
+  };
+}
+
+function addPostingBlockStats(target, source) {
+  for (const key of Object.keys(target)) target[key] += source?.[key] || 0;
+}
+
+function externalizeTermShard(encoded, config, filters, blockPackWriter) {
+  if (!blockPackWriter || config.externalPostingBlocks === false) {
+    return { buffer: encoded, stats: emptyPostingBlockStats() };
+  }
+  return rewriteTermShardForExternalBlocks(encoded, { block_filters: filters }, config, ({ term, blockIndex, bytes }) => {
+    const key = `${term}\u0000${blockIndex}\u0000${blockPackWriter.bytes}`;
+    return writePackedShard(blockPackWriter, key, gzipSync(Buffer.from(bytes), { level: 6 }));
+  });
+}
+
 async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const codes = {};
   for (const facet of config.facets) codes[facet.name] = new Array(measured.total);
@@ -172,7 +197,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
   };
 }
 
-async function reduceShard(baseShard, config, measured, runData, filters, packWriter, typoBuffer) {
+async function reduceShard(baseShard, config, measured, runData, filters, packWriter, blockPackWriter, typoBuffer) {
   const path = resolve(runData.runsOut, `${baseShard}.run`);
   const byTerm = new Map();
   for await (const [term, doc, score] of readRunRecords(path, ["string", "number", "number"])) {
@@ -185,6 +210,7 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
   const entries = [...byTerm.entries()].map(([term, rows]) => [term, [...rows.entries()]]);
   const partitions = partitionEntries(entries, config);
   const finalShards = [];
+  const blockStats = emptyPostingBlockStats();
   let postings = 0;
   for (const [term, rows] of byTerm) {
     postings += rows.size;
@@ -192,11 +218,13 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
   }
   for (const partition of partitions) {
     const encoded = buildTermShard(partition.entries, measured.total, runData.codes, filters, config);
-    writePackedShard(packWriter, partition.name, gzipSync(encoded, { level: 6 }));
+    const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
+    addPostingBlockStats(blockStats, externalized.stats);
+    writePackedShard(packWriter, partition.name, gzipSync(externalized.buffer, { level: 6 }));
     finalShards.push(partition.name);
   }
   unlinkSync(path);
-  return { terms: byTerm.size, postings, shards: finalShards };
+  return { terms: byTerm.size, postings, shards: finalShards, blockStats };
 }
 
 function createReduceWorker(workerData) {
@@ -292,14 +320,21 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
   }
 
   const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
+  const blockPackWriter = config.externalPostingBlocks === false
+    ? null
+    : createPackWriter(resolve(dirs.out, "terms", "block-packs"), config.postingBlockPackBytes);
   const finalShards = new Set();
+  const blockStats = emptyPostingBlockStats();
   for (const result of taskResults.sort((a, b) => a.order - b.order)) {
     for (const item of result.shards.sort((a, b) => a.sequence - b.sequence)) {
-      writePackedShard(packWriter, item.shard, readFileSync(item.path));
+      const encoded = gunzipSync(readFileSync(item.path));
+      const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
+      addPostingBlockStats(blockStats, externalized.stats);
+      writePackedShard(packWriter, item.shard, gzipSync(externalized.buffer, { level: 6 }));
       finalShards.add(item.shard);
     }
   }
-  return { finalShards, packWriter, termCount, postingCount };
+  return { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount };
 }
 
 async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
@@ -310,16 +345,21 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
     reduced = await reduceRunsParallel(config, measured, runData, dirs, typoBuffer, filters, workerCount);
   } else {
     const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
+    const blockPackWriter = config.externalPostingBlocks === false
+      ? null
+      : createPackWriter(resolve(dirs.out, "terms", "block-packs"), config.postingBlockPackBytes);
     const finalShards = new Set();
+    const blockStats = emptyPostingBlockStats();
     let termCount = 0;
     let postingCount = 0;
     for (let i = 0; i < runData.baseShards.length; i++) {
-      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter, typoBuffer);
+      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut }, filters, packWriter, blockPackWriter, typoBuffer);
       termCount += stats.terms;
       postingCount += stats.postings;
+      addPostingBlockStats(blockStats, stats.blockStats);
       for (const shard of stats.shards) finalShards.add(shard);
     }
-    reduced = { finalShards, packWriter, termCount, postingCount };
+    reduced = { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount };
   }
   const shards = [...reduced.finalShards].sort();
   const packIndexes = new Map(reduced.packWriter.packs.map((pack, index) => [pack.file, index]));
@@ -328,7 +368,19 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
     return { shard, packIndex: packIndexes.get(entry.pack), offset: entry.offset, length: entry.length };
   });
   const directory = writeDirectoryFiles(resolve(dirs.out, "terms"), entries, config.directoryPageBytes, "terms");
-  return { filters, shards, directory, packs: reduced.packWriter.packs, termCount: reduced.termCount, postingCount: reduced.postingCount, packBytes: reduced.packWriter.bytes, reduceWorkers: workerCount };
+  return {
+    filters,
+    shards,
+    directory,
+    packs: reduced.packWriter.packs,
+    blockPacks: reduced.blockPackWriter?.packs || [],
+    blockStats: reduced.blockStats || emptyPostingBlockStats(),
+    termCount: reduced.termCount,
+    postingCount: reduced.postingCount,
+    packBytes: reduced.packWriter.bytes,
+    blockPackBytes: reduced.blockPackWriter?.bytes || 0,
+    reduceWorkers: workerCount
+  };
 }
 
 export async function build({ configPath }) {
@@ -377,11 +429,19 @@ export async function build({ configPath }) {
       terms: reduced.termCount,
       postings: reduced.postingCount,
       term_storage: "range-pack-v1",
+      posting_block_storage: config.externalPostingBlocks === false ? "inline" : "range-pack-v1",
       term_directory_format: reduced.directory.format,
       term_directory_page_files: reduced.directory.page_files,
       term_directory_bytes: reduced.directory.total_bytes,
       term_pack_files: reduced.packs.length,
       term_pack_bytes: reduced.packBytes,
+      posting_block_pack_files: reduced.blockPacks.length,
+      posting_block_pack_bytes: reduced.blockPackBytes,
+      external_posting_blocks: reduced.blockStats.externalBlocks,
+      external_posting_terms: reduced.blockStats.externalTerms,
+      external_posting_postings: reduced.blockStats.externalPostings,
+      external_posting_source_bytes: reduced.blockStats.externalPostingBytes,
+      inline_posting_source_bytes: reduced.blockStats.inlinePostingBytes,
       doc_storage: runData.docs.storage,
       doc_directory_format: runData.docs.directory.format,
       doc_directory_page_files: runData.docs.directory.page_files,

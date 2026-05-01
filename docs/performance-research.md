@@ -29,7 +29,8 @@ gzip members, and `display[].maxChars` caps returned fields independently from
 indexed text so large pages can be fully indexed while search results stay
 compact.
 
-Next format-level candidate: split posting payloads into independently ranged
-block or superblock segments for hot terms. That would let the runtime apply the
-existing block-max schedule before downloading all posting bytes for a logical
-term shard.
+The next format step is now implemented for high-df terms: eligible posting
+blocks are stored in `terms/block-packs/*.bin` and referenced from the term-shard
+metadata. The runtime applies the existing block-max schedule before fetching
+those blocks, with a small adjacent prefetch window that behaves like a dynamic
+superblock for medium lists.

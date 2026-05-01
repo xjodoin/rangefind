@@ -4,7 +4,7 @@ Rangefind includes a reproducible scalability fixture for French Wikipedia.
 The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
 records a local request/transfer benchmark with cold-transfer breakdowns for
-directory, term, typo, code, and document payload fetches.
+directory, term, posting-block, typo, code, and document payload fetches.
 
 ## Data Source
 
@@ -66,27 +66,29 @@ Result:
 Docs indexed:        5,000
 Dump pages read:     5,913
 Body cap:            6,000 cleaned characters/article
-Build + bench time:  12.62 s real with prepared JSONL reused
+Build + bench time:  12.89 s real with prepared JSONL reused
 Logical shards:      7,565
 Term packs:          2
-Index files:         16
+Posting-block packs: 1
+Index files:         17
 Index bytes:         18.4 MB
-Init:                11.2 ms, 1 request, 238.3 KB
+Init:                11.3 ms, 1 request, 238.5 KB
 ```
 
 Representative cold queries:
 
 ```text
-Paris:                    25.0 ms, 14 requests, 122.6 KB, top Paris (homonymie)
-Révolution française:      9.3 ms, 10 requests,  32.3 KB, top Révolution française
-intelligence artificielle: 6.1 ms, 11 requests,  44.7 KB, top Intelligence artificielle
-football:                  4.5 ms, 11 requests,   5.1 KB, top Coupe du monde de football
-Québec:                    3.7 ms, 10 requests,   8.8 KB, top Système éducatif au Québec
+Paris:                    30.1 ms, 15 requests, 115.6 KB, top Paris (homonymie)
+Révolution française:      8.4 ms, 11 requests,  27.2 KB, top Révolution française
+intelligence artificielle: 7.7 ms, 11 requests,  38.1 KB, top Intelligence artificielle
+football:                  5.7 ms, 11 requests,   5.1 KB, top Coupe du monde de football
+Québec:                    6.2 ms, 10 requests,   8.8 KB, top Système éducatif au Québec
 ```
 
-The cold-transfer breakdown shows term pack fetches in the 0.5-54.3 KB range
-and result document fetches in the 3.5-11.2 KB range. The first query also pays
-for the term and document range-directory pages, which were 86.4 KB in this run.
+The cold-transfer breakdown shows term pack fetches in the 0.5-48.5 KB range,
+posting-block fetches up to 3.1 KB for these queries, and result document
+fetches in the 3.5-11.2 KB range. The first query also pays for the term and
+document range-directory pages, which were 85.6 KB in this run.
 
 Warm repeated queries in this run were served from the runtime cache with zero
 additional network requests.

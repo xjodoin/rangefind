@@ -23,6 +23,7 @@ a large thesis corpus.
 - Lazy paged binary range directories at `terms/directory-root.bin.gz` and
   `terms/directory-pages/*.bin.gz`.
 - Range-packed result payloads with capped display fields.
+- Range-addressable posting-block sidecar for high-df terms.
 - Parallel build-time shard reduction with deterministic final pack assembly.
 - Browser runtime with coalesced HTTP `Range` fetches.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`

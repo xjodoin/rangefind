@@ -64,6 +64,44 @@ function updateSummary(summary, filters, codes, doc) {
   }
 }
 
+function packIndexFromFile(file) {
+  return Number(String(file || "0").replace(/\D/gu, "")) || 0;
+}
+
+function packFileFromIndex(index) {
+  return `${String(index).padStart(4, "0")}.bin`;
+}
+
+function writeBlockFilterSummary(out, filters, summary) {
+  for (let i = 0; i < filters.length; i++) {
+    const filter = filters[i];
+    const item = Array.isArray(summary) ? summary[i] : summary?.[filter.name];
+    if (filter.kind === "facet") {
+      for (const word of item?.words || []) pushVarint(out, word);
+    } else {
+      pushVarint(out, item?.min || 0);
+      pushVarint(out, item?.max || 0);
+    }
+  }
+}
+
+function readBlockFilterSummary(bytes, state, manifest) {
+  const filters = {};
+  for (const filter of manifest.block_filters || []) {
+    if (filter.kind === "facet") {
+      const words = new Array(filter.words);
+      for (let w = 0; w < filter.words; w++) words[w] = readVarint(bytes, state);
+      filters[filter.name] = { words };
+    } else {
+      filters[filter.name] = {
+        min: readVarint(bytes, state),
+        max: readVarint(bytes, state)
+      };
+    }
+  }
+  return filters;
+}
+
 function encodePostings(rows, total, codes, filters, config) {
   const df = rows.length;
   const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
@@ -109,15 +147,7 @@ export function buildTermShard(entries, total, codes, filters, config) {
     for (const block of entry.postings.blocks) {
       pushVarint(header, block.offset);
       pushVarint(header, block.maxImpact);
-      for (let i = 0; i < filters.length; i++) {
-        const filter = filters[i];
-        const summary = block.filters[i];
-        if (filter.kind === "facet") for (const word of summary.words) pushVarint(header, word);
-        else {
-          pushVarint(header, summary.min);
-          pushVarint(header, summary.max);
-        }
-      }
+      writeBlockFilterSummary(header, filters, block.filters);
     }
   }
 
@@ -130,6 +160,7 @@ export function buildTermShard(entries, total, codes, filters, config) {
 export function parseShard(buffer, manifest) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, TERM_SHARD_MAGIC, "Unsupported Rangefind term shard");
+  const externalBlockFormat = manifest.stats?.posting_block_storage === "range-pack-v1";
   const state = { pos: TERM_SHARD_MAGIC.length };
   const termCount = readVarint(bytes, state);
   const terms = new Map();
@@ -145,6 +176,7 @@ export function parseShard(buffer, manifest) {
       postings: null
     };
     const blockCount = readVarint(bytes, state);
+    entry.external = externalBlockFormat && readVarint(bytes, state) === 1;
     entry.blocks = new Array(blockCount);
     for (let j = 0; j < blockCount; j++) {
       const block = {
@@ -152,17 +184,13 @@ export function parseShard(buffer, manifest) {
         maxImpact: readVarint(bytes, state),
         filters: {}
       };
-      for (const filter of manifest.block_filters || []) {
-        if (filter.kind === "facet") {
-          const words = new Array(filter.words);
-          for (let w = 0; w < filter.words; w++) words[w] = readVarint(bytes, state);
-          block.filters[filter.name] = { words };
-        } else {
-          block.filters[filter.name] = {
-            min: readVarint(bytes, state),
-            max: readVarint(bytes, state)
-          };
-        }
+      block.filters = readBlockFilterSummary(bytes, state, manifest);
+      if (entry.external) {
+        block.range = {
+          pack: packFileFromIndex(readVarint(bytes, state)),
+          offset: readVarint(bytes, state),
+          length: readVarint(bytes, state)
+        };
       }
       entry.blocks[j] = block;
     }
@@ -172,6 +200,7 @@ export function parseShard(buffer, manifest) {
 }
 
 export function decodePostings(shard, entry) {
+  if (entry.external) throw new Error("External posting blocks require async runtime loading.");
   if (entry.postings) return entry.postings;
   const state = { pos: shard.dataStart + entry.offset };
   const out = new Int32Array(entry.count * 2);
@@ -183,9 +212,20 @@ export function decodePostings(shard, entry) {
   return out;
 }
 
+export function decodePostingBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  while (state.pos < source.length) {
+    rows.push(readVarint(source, state), readVarint(source, state));
+  }
+  return Int32Array.from(rows);
+}
+
 export function decodePostingBlock(shard, entry, blockIndex) {
   const block = entry.blocks?.[blockIndex];
   if (!block) return new Int32Array(0);
+  if (entry.external) throw new Error("External posting blocks require async runtime loading.");
   if (!entry.blockPostings) entry.blockPostings = new Map();
   if (entry.blockPostings.has(blockIndex)) return entry.blockPostings.get(blockIndex);
   const next = entry.blocks[blockIndex + 1];
@@ -198,6 +238,87 @@ export function decodePostingBlock(shard, entry, blockIndex) {
   const out = Int32Array.from(rows);
   entry.blockPostings.set(blockIndex, out);
   return out;
+}
+
+export function rewriteTermShardForExternalBlocks(buffer, manifest, config, writeBlock) {
+  const source = parseShard(buffer, { block_filters: manifest.block_filters || [] });
+  const minBlocks = Math.max(1, Number(config.externalPostingBlockMinBlocks || 0));
+  const minBytes = Math.max(0, Number(config.externalPostingBlockMinBytes || 0));
+  const header = [...TERM_SHARD_MAGIC];
+  const chunks = [];
+  const directory = [];
+  let postingOffset = 0;
+  const stats = {
+    externalBlocks: 0,
+    externalTerms: 0,
+    externalPostings: 0,
+    externalPostingBytes: 0,
+    inlinePostingBytes: 0
+  };
+
+  for (const [term, entry] of source.terms) {
+    const external = !!writeBlock && entry.blocks.length >= minBlocks && entry.byteLength >= minBytes;
+    const blocks = [];
+    if (external) {
+      stats.externalTerms++;
+      for (let i = 0; i < entry.blocks.length; i++) {
+        const block = entry.blocks[i];
+        const next = entry.blocks[i + 1];
+        const start = source.dataStart + entry.offset + block.offset;
+        const end = source.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
+        const bytes = source.bytes.subarray(start, end);
+        const range = writeBlock({ term, blockIndex: i, bytes });
+        blocks.push({
+          ...block,
+          range: {
+            packIndex: packIndexFromFile(range.pack),
+            offset: range.offset,
+            length: range.length
+          }
+        });
+        stats.externalBlocks++;
+        stats.externalPostings += Math.min(entry.blockSize, entry.count - i * entry.blockSize);
+        stats.externalPostingBytes += bytes.length;
+      }
+      directory.push({ term, entry, offset: 0, byteLength: 0, external: true, blocks });
+    } else {
+      const bytes = source.bytes.subarray(source.dataStart + entry.offset, source.dataStart + entry.offset + entry.byteLength);
+      chunks.push(bytes);
+      stats.inlinePostingBytes += bytes.length;
+      directory.push({ term, entry, offset: postingOffset, byteLength: bytes.length, external: false, blocks: entry.blocks });
+      postingOffset += bytes.length;
+    }
+  }
+
+  pushVarint(header, directory.length);
+  for (const item of directory) {
+    pushUtf8(header, item.term);
+    pushVarint(header, item.entry.df);
+    pushVarint(header, item.entry.count);
+    pushVarint(header, item.offset);
+    pushVarint(header, item.byteLength);
+    pushVarint(header, item.entry.blockSize);
+    pushVarint(header, item.blocks.length);
+    pushVarint(header, item.external ? 1 : 0);
+    for (const block of item.blocks) {
+      pushVarint(header, block.offset);
+      pushVarint(header, block.maxImpact);
+      writeBlockFilterSummary(header, manifest.block_filters || [], block.filters);
+      if (item.external) {
+        pushVarint(header, block.range.packIndex);
+        pushVarint(header, block.range.offset);
+        pushVarint(header, block.range.length);
+      }
+    }
+  }
+
+  return {
+    buffer: Buffer.concat([
+      Buffer.from(Uint8Array.from(header)),
+      ...chunks.map(chunk => Buffer.from(chunk))
+    ]),
+    stats
+  };
 }
 
 export function buildCodesFile(config, total, codes) {

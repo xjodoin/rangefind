@@ -28,6 +28,8 @@ rangefind/
     directory-root.bin.gz
     directory-pages/
       0000.bin.gz
+    block-packs/
+      0000.bin
     packs/
       0000.bin
       0001.bin
@@ -43,6 +45,9 @@ maps logical shard names to `[packIndex, offset, length]` tuples.
 
 `terms/packs/*.bin` contain many independently compressed logical shards. The
 browser requests exactly the byte span it needs and decompresses that one shard.
+High-df posting lists can move their posting blocks into
+`terms/block-packs/*.bin`; the term shard then carries only term metadata,
+block-max scores, filter summaries, and byte ranges for external blocks.
 
 The builder writes temporary posting and typo runs with a compact binary record
 format instead of TSV. Runs are still partitioned by base shard, so reduction can
@@ -73,6 +78,11 @@ decodes the highest-potential blocks first and can stop once no remaining block
 can change the requested top results. Single-token queries use the direct
 posting decode path, which is faster when there is no cross-term pruning
 opportunity.
+
+For high-df terms, decoded blocks are fetched from `terms/block-packs/*.bin`
+only when the block-max scheduler chooses them. The runtime prefetches a small
+adjacent block window, so medium lists behave like range-addressed superblocks
+while very large lists can still avoid downloading their full posting payload.
 
 ## Why Custom Binary
 
