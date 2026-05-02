@@ -176,11 +176,29 @@ bounded and materially reduces request count.
 The builder writes temporary posting and typo runs with a compact binary record
 format instead of TSV. Runs are still partitioned by base shard, so reduction can
 stream bounded shard groups without holding the whole corpus index in memory.
-Base-shard reduction can run in worker threads. Workers write compressed logical
-shard files and typo index-term run files into `_build/`; the parent then
-assembles final range packs in sorted task order so pack offsets stay
-deterministic. Set `reduceWorkers` in the config to control the worker count;
-`1` is the default, while `0` or `"auto"` uses up to four workers.
+The posting reducer first sorts bounded chunks, then performs a heap-based
+k-way merge into a reduced-term spool. That single spool is reused for prefix
+statistics and final partition emission, avoiding the older double merge over
+the same sorted chunks. Each reduced term is encoded as a compact binary record:
+term, df, and `(docId, impact)` rows.
+
+The first ingestion pass also writes two extra file-backed spools. A
+selected-term spool stores each document's final selected scoring terms and
+scaled impacts, so query-bundle construction can stream precomputed scoring
+signals instead of re-reading and re-tokenizing the JSONL corpus. Document
+payloads are stored in both compressed and raw spools: retrieval-local doc packs
+reuse the compressed payload spool, while dense doc-page construction reads the
+raw spool directly and avoids a build-time gzip/decompress loop.
+
+Base-shard reduction can run in worker threads. Workers write raw logical shard
+bytes and typo index-term run files into `_build/`; the parent then externalizes
+posting blocks, compresses each final object once, and assembles final range
+packs in sorted task order so pack offsets stay deterministic. Set
+`reduceWorkers` in the config to control the worker count; `1` is the default,
+while `0` or `"auto"` uses up to four workers. Every build manifest includes
+`build.format = "rfbuildtelemetry-v1"` with phase timings, memory snapshots, peak
+RSS, and spool byte counters so large-corpus regressions can be compared from
+the emitted index alone.
 
 Authority fields use the same file-backed run/reduce pattern as postings. Each
 configured title, entity-name, slug, or alias value emits surface-exact,

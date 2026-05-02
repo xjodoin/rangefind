@@ -34,6 +34,8 @@ a large thesis corpus.
 - Optional authority sidecar for exact title/entity/alias rescue without
   changing the main inverted index.
 - Range-packed binary facet dictionaries for high-cardinality metadata.
+- File-backed build pipeline with binary run spools, selected-term spools,
+  raw/compressed document spools, heap-based reduction, and build telemetry.
 - Parallel build-time shard reduction with deterministic final pack assembly.
 - Browser runtime with adaptive HTTP `Range` coalescing and bounded overfetch.
 - Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
@@ -86,6 +88,8 @@ Use `--limit=0` to run against the full dump. The generated site lives at
 exact retrieval path by default and records cold request counts, transfer bytes,
 runtime posting-block stats, typed filter/sort validation, and scale reports
 across multiple Wikipedia sample sizes.
+Each generated `manifest.json` also records `build` telemetry with phase
+timings, peak RSS, and key spool byte counters for comparing indexing changes.
 
 ## Build A Custom Index
 
@@ -204,6 +208,8 @@ npm run bench:directories -- --index=/path/to/public/rangefind
 The unit tests cover analyzer normalization, binary varint/fixed-width codecs,
 config resolution, shard/range planning, term/code binary round-trips, and an
 end-to-end build plus browser-runtime query against a local HTTP `Range` server.
+The end-to-end build test also verifies emitted build telemetry and file-backed
+spool counters in the manifest.
 
 The benchmark scripts are dependency-free and run against the example static
 site. `bench:quality` reports known-item and typo-recovery Hit@k/MRR plus

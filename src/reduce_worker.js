@@ -1,7 +1,6 @@
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
-import { gzipSync } from "node:zlib";
 import { openCodeStore } from "./build_store.js";
 import { buildTermShard } from "./codec.js";
 import { createTypoRunBuffer, addTypoIndexTerm, flushTypoBuffer } from "./typo.js";
@@ -38,11 +37,10 @@ async function reduceBaseShard(baseShard) {
     },
     onPartition: (partition, sequence) => {
       const encoded = buildTermShard(partition.entries, measuredTotal, codes, filters, config);
-      const compressed = gzipSync(encoded, { level: 6 });
       const file = `${encodeURIComponent(partition.name)}.bin`;
       const out = resolve(shardOut, file);
-      writeFileSync(out, compressed);
-      return { shard: partition.name, path: out, length: compressed.length, sequence };
+      writeFileSync(out, encoded);
+      return { shard: partition.name, path: out, length: encoded.length, compression: "identity", sequence };
     }
   });
   unlinkSync(path);

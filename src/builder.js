@@ -16,10 +16,11 @@ import {
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms, tokenize } from "./analyzer.js";
 import { addAuthorityDoc, createAuthorityRunBuffer, finishAuthorityRuns, reduceAuthorityRuns } from "./authority_index.js";
+import { addBuildCounter, createBuildTelemetry, finishBuildTelemetry, timeBuildPhase } from "./build_telemetry.js";
 import { createCodeStore } from "./build_store.js";
 import {
   buildBlockFilters,
@@ -45,7 +46,7 @@ import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORM
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { reduceRunToPartitions } from "./reduce_stream.js";
-import { encodeRunRecord } from "./runs.js";
+import { encodeRunRecord, tryReadVarint, varintLength, writeVarint } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
 import { baseShardFor } from "./shards.js";
 import {
@@ -56,6 +57,9 @@ import {
   surfacePairsForFields,
   typoOptions
 } from "./typo.js";
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 function addDict(dict, value, label = value) {
   const key = String(value || "");
@@ -285,22 +289,30 @@ function createDocSpool(outDir) {
   mkdirSync(outDir, { recursive: true });
   const path = resolve(outDir, "payloads.bin");
   const entryPath = resolve(outDir, "payloads.idx");
+  const rawPath = resolve(outDir, "payloads.raw.bin");
+  const rawEntryPath = resolve(outDir, "payloads.raw.idx");
   const layoutPath = resolve(outDir, "layout.jsonl");
   return {
     path,
     entryPath,
+    rawPath,
+    rawEntryPath,
     layoutPath,
     fd: openSync(path, "w"),
     entryFd: openSync(entryPath, "w"),
+    rawFd: openSync(rawPath, "w"),
+    rawEntryFd: openSync(rawEntryPath, "w"),
     layoutFd: openSync(layoutPath, "w"),
     offset: 0,
+    rawOffset: 0,
     bytes: 0,
+    rawBytes: 0,
     layoutDocs: 0
   };
 }
 
 function closeDocSpool(spool) {
-  for (const key of ["fd", "entryFd", "layoutFd"]) {
+  for (const key of ["fd", "entryFd", "rawFd", "rawEntryFd", "layoutFd"]) {
     if (spool[key] == null) continue;
     closeSync(spool[key]);
     spool[key] = null;
@@ -315,12 +327,13 @@ function readBigUInt(buffer, offset) {
   return Number(buffer.readBigUInt64LE(offset));
 }
 
-function writeDocSpoolEntry(spool, index, entry) {
+function writeDocSpoolEntry(spoolOrFd, index, entry) {
+  const fd = typeof spoolOrFd === "number" ? spoolOrFd : spoolOrFd.entryFd;
   const buffer = Buffer.alloc(DOC_SPOOL_ENTRY_BYTES);
   writeBigUInt(buffer, 0, entry.offset);
   writeBigUInt(buffer, 8, entry.length);
   writeBigUInt(buffer, 16, entry.logicalLength);
-  writeSync(spool.entryFd, buffer, 0, buffer.length, index * DOC_SPOOL_ENTRY_BYTES);
+  writeSync(fd, buffer, 0, buffer.length, index * DOC_SPOOL_ENTRY_BYTES);
 }
 
 function readDocSpoolEntry(fd, index) {
@@ -336,6 +349,12 @@ function readDocSpoolEntry(fd, index) {
 
 function writeSpooledDoc(spool, payload, index, layoutRecord) {
   const bytes = Buffer.from(JSON.stringify(payload));
+  writeSync(spool.rawFd, bytes, 0, bytes.length, spool.rawOffset);
+  writeDocSpoolEntry(spool.rawEntryFd, index, {
+    offset: spool.rawOffset,
+    length: bytes.length,
+    logicalLength: bytes.length
+  });
   const compressed = gzipSync(bytes, { level: 6 });
   writeSync(spool.fd, compressed, 0, compressed.length, spool.offset);
   writeDocSpoolEntry(spool, index, {
@@ -345,6 +364,8 @@ function writeSpooledDoc(spool, payload, index, layoutRecord) {
   });
   writeSync(spool.layoutFd, `${JSON.stringify(layoutRecord)}\n`);
   spool.layoutDocs++;
+  spool.rawOffset += bytes.length;
+  spool.rawBytes += bytes.length;
   spool.offset += compressed.length;
   spool.bytes += compressed.length;
 }
@@ -354,6 +375,93 @@ function readSpooledDoc(fd, entry) {
   const bytesRead = readSync(fd, buffer, 0, entry.length, entry.offset);
   if (bytesRead !== entry.length) throw new Error("Rangefind doc spool ended before a payload could be read.");
   return buffer;
+}
+
+function createSelectedTermSpool(outDir) {
+  mkdirSync(outDir, { recursive: true });
+  const path = resolve(outDir, "selected-terms.bin");
+  return {
+    path,
+    fd: openSync(path, "w"),
+    docs: 0,
+    terms: 0,
+    bytes: 0
+  };
+}
+
+function closeSelectedTermSpool(spool) {
+  if (!spool || spool.fd == null) return;
+  closeSync(spool.fd);
+  spool.fd = null;
+}
+
+function encodeSelectedTerms(selectedTerms) {
+  const terms = selectedTerms.map(([term, score]) => [String(term || ""), Math.max(1, Math.round(score * 1000))]);
+  let bytes = varintLength(terms.length);
+  const encodedTerms = terms.map(([term, score]) => {
+    const termBytes = textEncoder.encode(term);
+    bytes += varintLength(termBytes.length) + termBytes.length + varintLength(score);
+    return [termBytes, score];
+  });
+  const out = Buffer.allocUnsafe(bytes);
+  let pos = writeVarint(out, 0, encodedTerms.length);
+  for (const [termBytes, score] of encodedTerms) {
+    pos = writeVarint(out, pos, termBytes.length);
+    out.set(termBytes, pos);
+    pos += termBytes.length;
+    pos = writeVarint(out, pos, score);
+  }
+  return out;
+}
+
+function writeSelectedTerms(spool, selectedTerms) {
+  const bytes = encodeSelectedTerms(selectedTerms);
+  writeSync(spool.fd, bytes, 0, bytes.length);
+  spool.docs++;
+  spool.terms += selectedTerms.length;
+  spool.bytes += bytes.length;
+}
+
+function selectedTermsFromBytes(bytes, state) {
+  const start = state.pos;
+  const count = tryReadVarint(bytes, state);
+  if (count == null) {
+    state.pos = start;
+    return null;
+  }
+  const terms = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const length = tryReadVarint(bytes, state);
+    if (length == null || state.pos + length > bytes.length) {
+      state.pos = start;
+      return null;
+    }
+    const term = textDecoder.decode(bytes.subarray(state.pos, state.pos + length));
+    state.pos += length;
+    const score = tryReadVarint(bytes, state);
+    if (score == null) {
+      state.pos = start;
+      return null;
+    }
+    terms[i] = [term, score];
+  }
+  return terms;
+}
+
+async function* readSelectedTermSpool(path) {
+  let pending = Buffer.alloc(0);
+  let doc = 0;
+  for await (const chunk of createReadStream(path)) {
+    const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+    const state = { pos: 0 };
+    while (state.pos < bytes.length) {
+      const selectedTerms = selectedTermsFromBytes(bytes, state);
+      if (!selectedTerms) break;
+      yield { doc: doc++, selectedTerms };
+    }
+    pending = state.pos < bytes.length ? bytes.subarray(state.pos) : Buffer.alloc(0);
+  }
+  if (pending.length) throw new Error(`Truncated Rangefind selected term spool: ${path}`);
 }
 
 function compareLayoutRecords(a, b) {
@@ -534,7 +642,8 @@ async function finishDocPacks(out, spool, total, config) {
     compression: "gzip-member",
     layout: {
       ...layout.summary,
-      spool_bytes: spool.bytes
+      spool_bytes: spool.bytes,
+      raw_spool_bytes: spool.rawBytes
     },
     pointers: {
       ...pointerTable.meta,
@@ -561,15 +670,15 @@ function finishDocPages(out, spool, total, config) {
   const fields = docPayloadFieldNames(config);
   const packWriter = createPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
   const entries = [];
-  const fd = openSync(spool.path, "r");
-  const spoolEntryFd = openSync(spool.entryPath, "r");
+  const fd = openSync(spool.rawPath, "r");
+  const spoolEntryFd = openSync(spool.rawEntryPath, "r");
   try {
     for (let pageStart = 0, pageIndex = 0; pageStart < total; pageStart += pageSize, pageIndex++) {
       const pageEnd = Math.min(total, pageStart + pageSize);
       const docs = [];
       for (let index = pageStart; index < pageEnd; index++) {
         const entry = readDocSpoolEntry(spoolEntryFd, index);
-        docs.push(JSON.parse(gunzipSync(readSpooledDoc(fd, entry)).toString("utf8")));
+        docs.push(JSON.parse(readSpooledDoc(fd, entry).toString("utf8")));
       }
       const source = encodeDocPageColumns(docs, fields);
       const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
@@ -912,6 +1021,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const queryBundleSeedBuffer = createQueryBundleSeedBuffer(config);
   const authorityBuffer = createAuthorityRunBuffer(config, dirs.authorityRunsOut);
   const docSpool = createDocSpool(resolve(dirs.out, "_build", "docs"));
+  const selectedTermSpool = createSelectedTermSpool(resolve(dirs.out, "_build", "terms"));
   const baseShards = new Set();
 
   try {
@@ -926,6 +1036,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
         config.maxTermsPerDoc,
         config.maxExpansionTermsPerDoc
       );
+      writeSelectedTerms(selectedTermSpool, selectedTerms);
       for (const [term, score] of selectedTerms) {
         bufferPosting(buffer, config, term, index, score);
         baseShards.add(baseShardFor(term, config));
@@ -951,6 +1062,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     });
   } finally {
     closeDocSpool(docSpool);
+    closeSelectedTermSpool(selectedTermSpool);
   }
   flushPostingBuffer(buffer);
   const authorityBaseShards = finishAuthorityRuns(authorityBuffer);
@@ -960,6 +1072,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     initialResults,
     baseShards: [...baseShards].sort(),
     docSpool,
+    selectedTermSpool,
     queryBundleSeeds,
     queryBundleTerms: queryBundleTerms(queryBundleSeeds),
     authorityBaseShards
@@ -1097,9 +1210,10 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
     const bytes = statSync(path).size;
     return { order, baseShard, bytes };
   });
-  const smallTasks = tasks.filter(task => task.bytes < largeRunBytes);
-  const largeTasks = tasks.filter(task => task.bytes >= largeRunBytes).sort((a, b) => b.bytes - a.bytes || a.order - b.order);
-  let nextSmallTask = 0;
+  const prioritizedTasks = tasks
+    .map(task => ({ ...task, large: largeRunBytes > 0 && task.bytes >= largeRunBytes }))
+    .sort((a, b) => Number(b.large) - Number(a.large) || b.bytes - a.bytes || a.order - b.order);
+  let nextTask = 0;
   let termCount = 0;
   let postingCount = 0;
   const bundleDfs = new Map();
@@ -1112,12 +1226,11 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
   }
   try {
     await Promise.all(workers.map(async (worker) => {
-      while (nextSmallTask < smallTasks.length) {
-        const task = smallTasks[nextSmallTask++];
+      while (nextTask < prioritizedTasks.length) {
+        const task = prioritizedTasks[nextTask++];
         await runTask(worker, task);
       }
     }));
-    for (const task of largeTasks) await runTask(workers[0], task);
     const finishes = await Promise.all(workers.map(worker => worker.call({ type: "finish" })));
     for (const item of finishes) mergeTypoWorkerRuns(typoBuffer, item.typo);
   } finally {
@@ -1132,7 +1245,7 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
   const blockStats = emptyPostingBlockStats();
   for (const result of taskResults.sort((a, b) => a.order - b.order)) {
     for (const item of result.shards.sort((a, b) => a.sequence - b.sequence)) {
-      const encoded = gunzipSync(readFileSync(item.path));
+      const encoded = readFileSync(item.path);
       const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
       addPostingBlockStats(blockStats, externalized.stats);
       writePackedShard(packWriter, item.shard, gzipSync(externalized.buffer, { level: 6 }), {
@@ -1201,7 +1314,10 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
 }
 
 function impactForBundleScore(score, df, total) {
-  const scoreInt = Math.max(1, Math.round(score * 1000));
+  return impactForBundleScoreInt(Math.max(1, Math.round(score * 1000)), df, total);
+}
+
+function impactForBundleScoreInt(scoreInt, df, total) {
   const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
   return Math.max(1, Math.round(scoreInt * idf / 10));
 }
@@ -1222,9 +1338,10 @@ function queryBundleSeedIndex(seeds, termDfs) {
   return byPivot;
 }
 
-function emitQueryBundleRows(collector, seedIndex, termDfs, total, selectedTerms, doc) {
+function emitQueryBundleRows(collector, seedIndex, termDfs, total, selectedTerms, doc, options = {}) {
   const selected = new Map(selectedTerms);
   const seenKeys = new Set();
+  const scaledScores = options.scaledScores === true;
 
   function emitSeed(seed) {
     if (!seed || seenKeys.has(seed.key) || !seed.baseTerms.every(base => selected.has(base))) return;
@@ -1234,7 +1351,9 @@ function emitQueryBundleRows(collector, seedIndex, termDfs, total, selectedTerms
       if (!selected.has(scoringTerm)) continue;
       const df = termDfs.get(scoringTerm);
       if (!df) continue;
-      score += impactForBundleScore(selected.get(scoringTerm), df, total);
+      score += scaledScores
+        ? impactForBundleScoreInt(selected.get(scoringTerm), df, total)
+        : impactForBundleScore(selected.get(scoringTerm), df, total);
     }
     addQueryBundleRow(collector, seed.key, doc, score);
   }
@@ -1245,24 +1364,14 @@ function emitQueryBundleRows(collector, seedIndex, termDfs, total, selectedTerms
   }
 }
 
-async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs) {
+async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, selectedTermSpool) {
   if (!queryBundlesEnabled(config) || !seeds?.length || !termDfs?.size) return null;
   const seedIndex = queryBundleSeedIndex(seeds, termDfs);
   const collector = createQueryBundleCollector(seeds, config.queryBundleMaxRows);
 
-  await eachJsonLine(config.input, async (doc, index) => {
-    const weighted = new Map();
-    const expansion = new Map();
-    for (const field of config.fields) addFieldScores(doc, field, measured.avgLens[field.name], weighted);
-    for (const field of config.fields) addFieldExpansionScores(doc, field, expansion);
-    const selectedTerms = selectDocTerms(
-      bm25fScores(weighted, config.bm25fK1),
-      expansion,
-      config.maxTermsPerDoc,
-      config.maxExpansionTermsPerDoc
-    );
-    emitQueryBundleRows(collector, seedIndex, termDfs, measured.total, selectedTerms, index);
-  });
+  for await (const { doc, selectedTerms } of readSelectedTermSpool(selectedTermSpool.path)) {
+    emitQueryBundleRows(collector, seedIndex, termDfs, measured.total, selectedTerms, doc, { scaledScores: true });
+  }
   const bundles = queryBundleCollectorResults(collector);
   if (!bundles.length) return null;
   return writeQueryBundleObjects({
@@ -1275,6 +1384,7 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs) {
 
 export async function build({ configPath }) {
   const config = await readConfig(configPath);
+  const telemetry = createBuildTelemetry();
   const dirs = {
     out: config.output,
     runsOut: resolve(config.output, "_build", "runs"),
@@ -1288,19 +1398,24 @@ export async function build({ configPath }) {
   mkdirSync(dirs.authorityRunsOut, { recursive: true });
 
   console.log(`Rangefind: reading ${config.input}`);
-  const measured = await measure(config);
+  const measured = await timeBuildPhase(telemetry, "measure", () => measure(config));
   const typo = typoOptions(config);
   const typoBuffer = typo.enabled ? createTypoRunBuffer(dirs.typoRunsOut, typo) : null;
-  const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
-  const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
-  const queryBundles = await buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs);
-  const authority = await reduceAuthorityRuns(config, dirs, runData.authorityBaseShards);
-  const docs = await finishDocPacks(dirs.out, runData.docSpool, measured.total, config);
-  docs.pages = finishDocPages(dirs.out, runData.docSpool, measured.total, config);
-  const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
-  const docValues = writeDocValuePacks(dirs.out, config, measured.total, runData.codes);
-  const docValueSorted = writeDocValueSortedIndexes(dirs.out, config, measured.total, runData.codes);
-  const facetDictionaries = writeFacetDictionaries(dirs.out, measured.dicts, config);
+  const runData = await timeBuildPhase(telemetry, "scan-and-spool", () => writePostingRuns(config, measured, dirs, typoBuffer));
+  addBuildCounter(telemetry, "selected_term_spool_bytes", runData.selectedTermSpool.bytes);
+  addBuildCounter(telemetry, "selected_term_spool_terms", runData.selectedTermSpool.terms);
+  addBuildCounter(telemetry, "doc_raw_spool_bytes", runData.docSpool.rawBytes);
+  addBuildCounter(telemetry, "doc_gzip_spool_bytes", runData.docSpool.bytes);
+  const reduced = await timeBuildPhase(telemetry, "reduce-postings", () => reduceRuns(config, measured, runData, dirs, typoBuffer));
+  const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool));
+  const authority = await timeBuildPhase(telemetry, "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
+  const docs = await timeBuildPhase(telemetry, "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
+  docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
+  const typoManifest = await timeBuildPhase(telemetry, "typo", () => reduceTypoRuns(typoBuffer, dirs.out));
+  const docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, runData.codes));
+  const docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, runData.codes));
+  const facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
+  const buildTelemetry = finishBuildTelemetry(telemetry);
 
   const manifest = {
     version: 1,
@@ -1369,6 +1484,7 @@ export async function build({ configPath }) {
       }
     },
     built_at: new Date().toISOString(),
+    build: buildTelemetry,
     total: measured.total,
     docs,
     doc_values: {
@@ -1448,6 +1564,12 @@ export async function build({ configPath }) {
     stats: {
       terms: reduced.termCount,
       postings: reduced.postingCount,
+      build_total_ms: Math.round(buildTelemetry.total_ms),
+      build_peak_rss: buildTelemetry.peak_rss,
+      selected_term_spool_bytes: runData.selectedTermSpool.bytes,
+      selected_term_spool_terms: runData.selectedTermSpool.terms,
+      doc_raw_spool_bytes: runData.docSpool.rawBytes,
+      doc_gzip_spool_bytes: runData.docSpool.bytes,
       term_storage: "range-pack-v1",
       posting_block_storage: config.externalPostingBlocks === false ? "inline" : "range-pack-v1",
       term_directory_format: reduced.directory.format,

@@ -132,6 +132,13 @@ and peaked at about 2.39 GB RSS. The main remaining build bottleneck was the
 pre-existing typo-sidecar merge/reduction path; rebuilding only the authority
 sidecar from the same 500k JSONL took about 14 seconds.
 
+Newer indexes include `manifest.build` (`rfbuildtelemetry-v1`) with phase
+timings, peak RSS, selected-term spool bytes, raw document spool bytes, and
+compressed document spool bytes. Use those manifest counters alongside
+`/usr/bin/time` when comparing builder changes, because they identify whether a
+run moved time between ingestion, posting reduction, query bundles, typo
+reduction, document packs, and doc pages.
+
 ## Local 50k Run
 
 Build command, reusing the cached 50k JSONL fixture:

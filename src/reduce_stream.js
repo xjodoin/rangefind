@@ -1,9 +1,11 @@
-import { closeSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
+import { closeSync, createReadStream, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
-import { encodeRunRecord, readRunRecords } from "./runs.js";
+import { encodeRunRecord, readRunRecords, tryReadVarint, varintLength, writeVarint } from "./runs.js";
 import { shardKey } from "./shards.js";
 
 const RUN_SCHEMA = ["string", "number", "number"];
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 function compareTerms(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -63,24 +65,74 @@ async function writeSortedChunks(runPath, scratchDir, config) {
   return chunks;
 }
 
-async function createChunkReader(path) {
+class MinHeap {
+  constructor(compare) {
+    this.compare = compare;
+    this.items = [];
+  }
+
+  push(item) {
+    const items = this.items;
+    items.push(item);
+    let index = items.length - 1;
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (this.compare(items[parent], items[index]) <= 0) break;
+      const value = items[parent];
+      items[parent] = items[index];
+      items[index] = value;
+      index = parent;
+    }
+  }
+
+  pop() {
+    const items = this.items;
+    if (!items.length) return null;
+    const out = items[0];
+    const last = items.pop();
+    if (items.length) {
+      items[0] = last;
+      let index = 0;
+      while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        let best = index;
+        if (left < items.length && this.compare(items[left], items[best]) < 0) best = left;
+        if (right < items.length && this.compare(items[right], items[best]) < 0) best = right;
+        if (best === index) break;
+        const value = items[index];
+        items[index] = items[best];
+        items[best] = value;
+        index = best;
+      }
+    }
+    return out;
+  }
+
+  get size() {
+    return this.items.length;
+  }
+}
+
+async function createChunkReader(path, index) {
   const iterator = readRunRecords(path, RUN_SCHEMA)[Symbol.asyncIterator]();
   const first = await iterator.next();
-  return { iterator, record: first.done ? null : first.value };
+  return { index, iterator, record: first.done ? null : first.value };
 }
 
 async function* mergeSortedChunks(chunks) {
-  const readers = await Promise.all(chunks.map(createChunkReader));
+  const readers = await Promise.all(chunks.map((path, index) => createChunkReader(path, index)));
+  const heap = new MinHeap((left, right) => compareRecords(left.record, right.record) || left.reader - right.reader);
   try {
-    while (readers.some(reader => reader.record)) {
-      let best = -1;
-      for (let i = 0; i < readers.length; i++) {
-        if (!readers[i].record) continue;
-        if (best < 0 || compareRecords(readers[i].record, readers[best].record) < 0) best = i;
-      }
-      const record = readers[best].record;
-      const next = await readers[best].iterator.next();
-      readers[best].record = next.done ? null : next.value;
+    for (const reader of readers) {
+      if (reader.record) heap.push({ reader: reader.index, record: reader.record });
+    }
+    while (heap.size) {
+      const item = heap.pop();
+      const reader = readers[item.reader];
+      const record = item.record;
+      const next = await reader.iterator.next();
+      if (!next.done) heap.push({ reader: reader.index, record: next.value });
       yield record;
     }
   } finally {
@@ -88,24 +140,97 @@ async function* mergeSortedChunks(chunks) {
   }
 }
 
-async function* reducedTerms(chunks, options = {}) {
-  const emitRows = options.emitRows !== false;
+function encodeReducedTerm(term, rows, df) {
+  const termBytes = textEncoder.encode(String(term || ""));
+  let bytes = varintLength(termBytes.length) + termBytes.length + varintLength(df) + varintLength(rows.length);
+  for (const [doc, score] of rows) bytes += varintLength(doc) + varintLength(score);
+  const out = Buffer.allocUnsafe(bytes);
+  let pos = writeVarint(out, 0, termBytes.length);
+  out.set(termBytes, pos);
+  pos += termBytes.length;
+  pos = writeVarint(out, pos, df);
+  pos = writeVarint(out, pos, rows.length);
+  for (const [doc, score] of rows) {
+    pos = writeVarint(out, pos, doc);
+    pos = writeVarint(out, pos, score);
+  }
+  return out;
+}
+
+function reducedTermFromBytes(bytes, state) {
+  const start = state.pos;
+  const termLength = tryReadVarint(bytes, state);
+  if (termLength == null || state.pos + termLength > bytes.length) {
+    state.pos = start;
+    return null;
+  }
+  const term = textDecoder.decode(bytes.subarray(state.pos, state.pos + termLength));
+  state.pos += termLength;
+  const df = tryReadVarint(bytes, state);
+  if (df == null) {
+    state.pos = start;
+    return null;
+  }
+  const rowCount = tryReadVarint(bytes, state);
+  if (rowCount == null) {
+    state.pos = start;
+    return null;
+  }
+  const rows = new Array(rowCount);
+  for (let i = 0; i < rowCount; i++) {
+    const doc = tryReadVarint(bytes, state);
+    const score = tryReadVarint(bytes, state);
+    if (doc == null || score == null) {
+      state.pos = start;
+      return null;
+    }
+    rows[i] = [doc, score];
+  }
+  return { term, df, rows };
+}
+
+async function* readReducedTerms(path) {
+  let pending = Buffer.alloc(0);
+  for await (const chunk of createReadStream(path)) {
+    const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+    const state = { pos: 0 };
+    while (state.pos < bytes.length) {
+      const item = reducedTermFromBytes(bytes, state);
+      if (!item) break;
+      yield item;
+    }
+    pending = state.pos < bytes.length ? bytes.subarray(state.pos) : Buffer.alloc(0);
+  }
+  if (pending.length) throw new Error(`Truncated Rangefind reduced term file: ${path}`);
+}
+
+async function reduceChunksToTermSpool(chunks, reducedPath, options = {}) {
   let currentTerm = null;
   let currentDoc = null;
   let currentScore = 0;
   let rows = [];
   let df = 0;
+  let terms = 0;
+  let postings = 0;
+  const prefixCounts = new Map();
+  const fd = openSync(reducedPath, "w");
 
   function finishDoc() {
     if (currentDoc == null) return;
     df++;
-    if (emitRows) rows.push([currentDoc, currentScore]);
+    rows.push([currentDoc, currentScore]);
   }
 
   function finishTerm() {
     if (currentTerm == null) return null;
     finishDoc();
-    const item = emitRows ? { term: currentTerm, rows, df } : { term: currentTerm, df };
+    const item = { term: currentTerm, rows, df };
+    const encoded = encodeReducedTerm(item.term, item.rows, item.df);
+    writeSync(fd, encoded, 0, encoded.length);
+    terms++;
+    postings += item.df;
+    addPrefixCounts(prefixCounts, item.term, item.df, options.config);
+    options.onTerm?.(item.term, item.df);
     rows = [];
     df = 0;
     currentDoc = null;
@@ -113,25 +238,28 @@ async function* reducedTerms(chunks, options = {}) {
     return item;
   }
 
-  for await (const [term, doc, score] of mergeSortedChunks(chunks)) {
-    if (term !== currentTerm) {
-      const item = finishTerm();
-      if (item) yield item;
-      currentTerm = term;
-      currentDoc = doc;
-      currentScore = score;
-      continue;
+  try {
+    for await (const [term, doc, score] of mergeSortedChunks(chunks)) {
+      if (term !== currentTerm) {
+        finishTerm();
+        currentTerm = term;
+        currentDoc = doc;
+        currentScore = score;
+        continue;
+      }
+      if (doc !== currentDoc) {
+        finishDoc();
+        currentDoc = doc;
+        currentScore = score;
+        continue;
+      }
+      currentScore += score;
     }
-    if (doc !== currentDoc) {
-      finishDoc();
-      currentDoc = doc;
-      currentScore = score;
-      continue;
-    }
-    currentScore += score;
+    finishTerm();
+  } finally {
+    closeSync(fd);
   }
-  const item = finishTerm();
-  if (item) yield item;
+  return { terms, postings, prefixCounts };
 }
 
 function prefixKey(term, depth) {
@@ -165,23 +293,16 @@ export async function reduceRunToPartitions(options) {
     onPartition
   } = options;
   const chunks = await writeSortedChunks(runPath, scratchDir, config);
-  const prefixCounts = new Map();
-  let terms = 0;
-  let postings = 0;
+  const reducedPath = resolve(scratchDir, "reduced-terms.run");
   let sequence = 0;
   try {
-    for await (const { term, df } of reducedTerms(chunks, { emitRows: false })) {
-      terms++;
-      postings += df;
-      addPrefixCounts(prefixCounts, term, df, config);
-      onTerm?.(term, df);
-    }
+    const reduced = await reduceChunksToTermSpool(chunks, reducedPath, { config, onTerm });
 
     const partitions = [];
     let currentName = null;
     let entries = [];
-    for await (const { term, rows } of reducedTerms(chunks, { emitRows: true })) {
-      const name = partitionNameForTerm(term, prefixCounts, config);
+    for await (const { term, rows } of readReducedTerms(reducedPath)) {
+      const name = partitionNameForTerm(term, reduced.prefixCounts, config);
       if (currentName && name !== currentName) {
         partitions.push(await onPartition({ name: currentName, entries }, sequence++));
         entries = [];
@@ -190,7 +311,7 @@ export async function reduceRunToPartitions(options) {
       entries.push([term, rows]);
     }
     if (currentName) partitions.push(await onPartition({ name: currentName, entries }, sequence++));
-    return { terms, postings, partitions };
+    return { terms: reduced.terms, postings: reduced.postings, partitions };
   } finally {
     rmSync(scratchDir, { recursive: true, force: true });
   }
