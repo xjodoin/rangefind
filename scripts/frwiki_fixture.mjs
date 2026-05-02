@@ -416,6 +416,7 @@ function typedCases(manifest) {
   const cases = [
     {
       label: "typed dates sorted",
+      category: "sort",
       q: "",
       filters: {
         numbers: {
@@ -424,16 +425,42 @@ function typedCases(manifest) {
           revisionDate: { min: "2001-01-01" }
         }
       },
-      sort: { field: "bodyLength", order: "desc" }
+      sort: { field: "bodyLength", order: "desc" },
+      expect: { docValuePruning: true, docPayloadLane: "docPages" }
     },
     {
       label: "dense filter browse",
+      category: "filter",
       q: "",
       filters: {
         numbers: {
           bodyLength: { min: 80 }
         }
-      }
+      },
+      expect: { docPayloadLane: "docPages" }
+    },
+    {
+      label: "selective long-body browse",
+      category: "filter",
+      q: "",
+      filters: {
+        numbers: {
+          bodyLength: { min: 5000 }
+        }
+      },
+      expect: { totalMin: 1, docPayloadLane: "docPages" }
+    },
+    {
+      label: "recent article sort",
+      category: "sort",
+      q: "",
+      filters: {
+        numbers: {
+          revisionDate: { min: "2001-01-01" }
+        }
+      },
+      sort: { field: "revisionDate", order: "desc" },
+      expect: { docValuePruning: true }
     }
   ];
   const tagValues = Array.isArray(manifest.facets?.articleTags) ? manifest.facets.articleTags : [];
@@ -444,21 +471,119 @@ function typedCases(manifest) {
     const expectsCategories = tag !== "uncategorized";
     cases.push({
       label: `multi facet boolean (${tag})`,
+      category: "facet-boolean-sort",
       q: "",
       filters: {
         facets: { articleTags: [tag] },
         numbers: { categoryCount: { min: expectsCategories ? 1 : 0 } },
         booleans: { hasCategories: expectsCategories }
       },
-      sort: { field: "articleId", order: "asc" }
+      sort: { field: "articleId", order: "asc" },
+      expect: { docValuePruning: true, docPayloadLane: "docPages" }
+    });
+    cases.push({
+      label: `facet browse (${tag})`,
+      category: "facet",
+      q: "",
+      filters: {
+        facets: { articleTags: [tag] }
+      },
+      expect: { totalMin: 1, docPayloadLane: "docPages" }
+    });
+  }
+  const category = commonFacetValue(manifest, "category");
+  if (category) {
+    cases.push({
+      label: `category facet (${category})`,
+      category: "facet",
+      q: "",
+      filters: {
+        facets: { category: [category] }
+      },
+      expect: { totalMin: 1, docPayloadLane: "docPages" }
     });
   }
   return cases;
 }
 
+function textScenarioCases(args) {
+  const base = args.queries.map(q => ({ label: q, category: "text", q }));
+  return [
+    ...base,
+    {
+      label: "changement climatique page 2",
+      category: "pagination",
+      q: "changement climatique",
+      page: 2,
+      expect: { totalMin: 11, topKProven: true }
+    },
+    {
+      label: "Révolution française size 25",
+      category: "large-page",
+      q: "Révolution française",
+      size: 25,
+      expect: { totalMin: 25, topKProven: true }
+    },
+    {
+      label: "zero result nonsense",
+      category: "zero-result",
+      q: "zzzzrangefindaucunresultatzzzz",
+      exactCheck: true,
+      expect: { totalMax: 0, plannerLane: "empty", topKProven: true }
+    },
+    {
+      label: "typo Paris",
+      category: "typo",
+      q: "Pxris",
+      exactCheck: false,
+      expect: { totalMin: 1, typoApplied: true }
+    },
+    {
+      label: "typo changement climatique",
+      category: "typo",
+      q: "changment climatiqe",
+      exactCheck: false,
+      expect: { totalMin: 1, typoApplied: true }
+    },
+    {
+      label: "filtered Paris has categories",
+      category: "text-filter",
+      q: "Paris",
+      filters: {
+        facets: { articleTags: ["has-categories"] }
+      },
+      expect: { totalMin: 1, topKProven: true }
+    },
+    {
+      label: "filtered changement climatique long body",
+      category: "text-filter",
+      q: "changement climatique",
+      filters: {
+        numbers: { bodyLength: { min: 1000 } }
+      },
+      expect: { totalMin: 1, topKProven: true }
+    },
+    {
+      label: "Paris sorted by revision date",
+      category: "text-sort",
+      q: "Paris",
+      sort: { field: "revisionDate", order: "desc" },
+      exactCheck: false,
+      expect: { totalMin: 1 }
+    },
+    {
+      label: "common term rerank disabled",
+      category: "no-rerank",
+      q: "Paris",
+      options: { rerank: false },
+      expect: { totalMin: 1, topKProven: true }
+    }
+  ];
+}
+
 function benchmarkCases(args, manifest) {
   return [
-    ...args.queries.map(q => ({ label: q, q })),
+    ...textScenarioCases(args),
     ...typedCases(manifest)
   ];
 }
@@ -497,6 +622,16 @@ function validateResponse(item, response, manifest) {
         errors.push(`${sort.field} sort order mismatch`);
         break;
       }
+    }
+  }
+  const expect = item.expect || {};
+  if (expect.totalMin != null && response.total < expect.totalMin) errors.push(`total below expected minimum ${expect.totalMin}`);
+  if (expect.totalMax != null && response.total > expect.totalMax) errors.push(`total above expected maximum ${expect.totalMax}`);
+  if (expect.plannerLane && response.stats?.plannerLane !== expect.plannerLane) errors.push(`planner lane expected ${expect.plannerLane}`);
+  if (expect.docPayloadLane && response.stats?.docPayloadLane !== expect.docPayloadLane) errors.push(`doc payload lane expected ${expect.docPayloadLane}`);
+  for (const field of ["queryBundleHit", "typoApplied", "typoAttempted", "docValuePruning", "topKProven"]) {
+    if (expect[field] != null && Boolean(response.stats?.[field]) !== Boolean(expect[field])) {
+      errors.push(`${field} expected ${Boolean(expect[field])}`);
     }
   }
   return [...new Set(errors)];
@@ -567,15 +702,17 @@ async function addExactChecks(args, serverUrl, rows, cases) {
   const exactEngine = await createSearch({ baseUrl: new URL("rangefind/", serverUrl) });
   const rowsByLabel = new Map(rows.map(row => [row.q, row]));
   for (const item of cases) {
-    if (!item.q || item.sort) continue;
+    if (item.exactCheck === false || !item.q || item.sort) continue;
     const row = rowsByLabel.get(item.label);
     if (!row) continue;
     const start = performance.now();
     const response = await exactEngine.search({
       q: item.q,
+      page: item.page || 1,
       filters: item.filters,
       sort: item.sort,
       size: item.size || args.size,
+      ...(item.options || {}),
       exact: true
     });
     const exactIds = response.results.map(result => result.id);
@@ -617,7 +754,14 @@ async function benchFixture(args, options = {}) {
       for (let i = 0; i < args.runs; i++) {
         meter.reset();
         const start = performance.now();
-        const response = await caseEngine.search({ q: item.q, filters: item.filters, sort: item.sort, size: item.size || args.size });
+        const response = await caseEngine.search({
+          q: item.q,
+          page: item.page || 1,
+          filters: item.filters,
+          sort: item.sort,
+          size: item.size || args.size,
+          ...(item.options || {})
+        });
         times.push(performance.now() - start);
         const network = meter.snapshot();
         networks.push(network);
@@ -633,7 +777,15 @@ async function benchFixture(args, options = {}) {
       }
       rows.push({
         q: item.label,
-        request: { q: item.q, filters: item.filters || null, sort: item.sort || null },
+        category: item.category || "default",
+        request: {
+          q: item.q,
+          page: item.page || 1,
+          size: item.size || args.size,
+          filters: item.filters || null,
+          sort: item.sort || null,
+          options: item.options || null
+        },
         total,
         top,
         resultIds,

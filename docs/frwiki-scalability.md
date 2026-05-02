@@ -58,6 +58,33 @@ Useful options:
 - `--scale-limits=50000,100000`: controls the `scale` command document counts.
 - `--no-exact-checks`: skips the exact top-k comparison for text queries.
 
+## Benchmark Coverage
+
+The `bench` command now exercises a broader set of cold-query lanes instead of
+only the default text queries. Each row records a `category`, the full request
+shape, cold request/KB breakdowns, compact runtime stats, validation status, and
+exact top-k agreement where an exact comparison is meaningful.
+
+Covered scenarios include:
+
+- default text queries from `--queries`
+- query-bundle phrase retrieval and page-2 pagination
+- larger top-k windows
+- zero-result exact queries
+- typo recovery cases
+- filtered text queries
+- text sorted by typed doc values
+- rerank-disabled text retrieval
+- numeric/date browse filters
+- sorted doc-value browse
+- facet-only browse
+- facet + boolean + numeric sorted browse
+
+Rows with typo correction or external sort can skip exact top-k comparison when
+the exact exhaustive scorer is not the same final behavior being measured, but
+they still validate expected result counts, selected filters, sort order, and
+runtime-lane flags.
+
 ## Local 50k Run
 
 Build command, reusing the cached 50k JSONL fixture:
