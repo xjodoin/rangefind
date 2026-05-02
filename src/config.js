@@ -29,6 +29,12 @@ export const DEFAULTS = {
   queryBundleMaxTerms: 3,
   queryBundleSeedMaxFieldTokens: 160,
   queryBundlePackBytes: 4 * 1024 * 1024,
+  authority: [],
+  authorityMaxRowsPerKey: 16,
+  authorityPackBytes: 4 * 1024 * 1024,
+  authorityTargetShardRows: 4096,
+  authorityMaxShardDepth: 8,
+  authorityDirectoryPageBytes: 16 * 1024,
   facetDictionaryPackBytes: 4 * 1024 * 1024,
   blockFilterMaxFacetWords: 64,
   reduceWorkers: 1,
@@ -76,7 +82,8 @@ export async function readConfig(configPath) {
     numbers: raw.numbers || [],
     booleans: raw.booleans || [],
     sorts: raw.sorts || [],
-    display: raw.display || ["title", "url"]
+    display: raw.display || ["title", "url"],
+    authority: raw.authority || DEFAULTS.authority
   };
 }
 

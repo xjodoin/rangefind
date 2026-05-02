@@ -291,6 +291,9 @@ function writeSite(args, docsPath) {
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
       { name: "body", path: "body", weight: 1.0, b: 0.75, typo: false }
     ],
+    authority: [
+      { name: "title", path: "title", weight: 1000000, exactWeight: 1000000, tokenWeight: 800000 }
+    ],
     facets: [
       { name: "category", path: "category" },
       { name: "articleTags", path: "articleTags" }
@@ -369,6 +372,7 @@ function networkBucket(url) {
   if (/\/manifest(?:\.[0-9a-f]+)?\.json$/u.test(path)) return "manifest";
   if (path.includes("/directory-")) return "directory";
   if (path.includes("/bundles/packs/")) return "queryBundles";
+  if (path.includes("/authority/packs/")) return "authority";
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/facets/packs/")) return "facetDictionaries";
@@ -629,7 +633,7 @@ function validateResponse(item, response, manifest) {
   if (expect.totalMax != null && response.total > expect.totalMax) errors.push(`total above expected maximum ${expect.totalMax}`);
   if (expect.plannerLane && response.stats?.plannerLane !== expect.plannerLane) errors.push(`planner lane expected ${expect.plannerLane}`);
   if (expect.docPayloadLane && response.stats?.docPayloadLane !== expect.docPayloadLane) errors.push(`doc payload lane expected ${expect.docPayloadLane}`);
-  for (const field of ["queryBundleHit", "typoApplied", "typoAttempted", "docValuePruning", "topKProven"]) {
+  for (const field of ["queryBundleHit", "authorityApplied", "typoApplied", "typoAttempted", "docValuePruning", "topKProven"]) {
     if (expect[field] != null && Boolean(response.stats?.[field]) !== Boolean(expect[field])) {
       errors.push(`${field} expected ${Boolean(expect[field])}`);
     }
@@ -684,6 +688,13 @@ function compactRuntimeStats(stats = {}) {
     queryBundleTotal: stats.queryBundleTotal || 0,
     queryBundleBytes: stats.queryBundleBytes || 0,
     queryBundleComplete: Boolean(stats.queryBundleComplete),
+    authorityAttempted: Boolean(stats.authorityAttempted),
+    authorityApplied: Boolean(stats.authorityApplied),
+    authorityComplete: Boolean(stats.authorityComplete),
+    authorityKeys: stats.authorityKeys || 0,
+    authorityEntries: stats.authorityEntries || 0,
+    authorityRows: stats.authorityRows || 0,
+    authorityInjected: stats.authorityInjected || 0,
     surfaceFallbackAttempted: Boolean(stats.surfaceFallbackAttempted),
     surfaceFallbackApplied: Boolean(stats.surfaceFallbackApplied),
     surfaceFallbackTerms: stats.surfaceFallbackTerms || [],
@@ -882,6 +893,10 @@ function summarizeScaleRow(row) {
     totalExact: row.coldStats?.totalExact || false,
     queryBundleHit: row.coldStats?.queryBundleHit || false,
     queryBundleBytes: row.coldStats?.queryBundleBytes || 0,
+    authorityAttempted: row.coldStats?.authorityAttempted || false,
+    authorityApplied: row.coldStats?.authorityApplied || false,
+    authorityRows: row.coldStats?.authorityRows || 0,
+    authorityInjected: row.coldStats?.authorityInjected || 0,
     docValuePruning: row.coldStats?.docValuePruning || false,
     docValuePruneField: row.coldStats?.docValuePruneField || "",
     docValuePagesVisited: row.coldStats?.docValuePagesVisited || 0,
@@ -918,6 +933,8 @@ function scalePoint(limit, report) {
     docValuePackBytes: report.rangefindStats?.doc_value_pack_bytes || 0,
     docValueSortedDirectoryBytes: report.rangefindStats?.doc_value_sorted_directory_bytes || 0,
     docValueSortedPackBytes: report.rangefindStats?.doc_value_sorted_pack_bytes || 0,
+    authorityDirectoryBytes: report.rangefindStats?.authority_directory_bytes || 0,
+    authorityPackBytes: report.rangefindStats?.authority_pack_bytes || 0,
     avgTextColdRequests: mean(textRows.map(row => row.coldRequests)),
     avgTextColdKb: kb(mean(textRows.map(row => row.coldKb * 1024))),
     maxTextColdRequests: Math.max(0, ...textRows.map(row => row.coldRequests)),

@@ -31,6 +31,8 @@ a large thesis corpus.
   where original document ids are clustered.
 - Range-packed result payloads with capped display fields.
 - Range-addressable posting-block sidecar for high-df terms.
+- Optional authority sidecar for exact title/entity/alias rescue without
+  changing the main inverted index.
 - Range-packed binary facet dictionaries for high-cardinality metadata.
 - Parallel build-time shard reduction with deterministic final pack assembly.
 - Browser runtime with adaptive HTTP `Range` coalescing and bounded overfetch.
@@ -107,6 +109,10 @@ Create `rangefind.config.json`:
     { "name": "title", "path": "title", "weight": 4.5, "b": 0.55, "phrase": true },
     { "name": "body", "path": "body", "weight": 1.0, "b": 0.75 }
   ],
+  "authority": [
+    { "name": "title", "path": "title" },
+    { "name": "aliases", "path": "aliases" }
+  ],
   "facets": [
     { "name": "category", "path": "category" },
     { "name": "tags", "path": "tags" }
@@ -131,6 +137,12 @@ can stay long while returned fields are capped, for example:
 ```json
 { "name": "body", "path": "body", "maxChars": 640 }
 ```
+
+`authority` fields build a separate packed sidecar for canonical labels such as
+titles, entity names, product names, slugs, and aliases. The runtime first tries
+a diacritic-preserving surface-exact key, then falls back to folded exact and
+token keys only when needed, so common title rescue stays precise and cheap
+without forcing all label logic into the BM25 posting lists.
 
 Build:
 

@@ -19,6 +19,7 @@ import { Worker } from "node:worker_threads";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms, tokenize } from "./analyzer.js";
+import { addAuthorityDoc, createAuthorityRunBuffer, finishAuthorityRuns, reduceAuthorityRuns } from "./authority_index.js";
 import { createCodeStore } from "./build_store.js";
 import {
   buildBlockFilters,
@@ -909,6 +910,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const initialResults = [];
   const buffer = { byShard: new Map(), lines: 0, runsOut: dirs.runsOut };
   const queryBundleSeedBuffer = createQueryBundleSeedBuffer(config);
+  const authorityBuffer = createAuthorityRunBuffer(config, dirs.authorityRunsOut);
   const docSpool = createDocSpool(resolve(dirs.out, "_build", "docs"));
   const baseShards = new Set();
 
@@ -929,6 +931,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
         baseShards.add(baseShardFor(term, config));
       }
       addQueryBundleSeeds(queryBundleSeedBuffer, selectedTerms, config, doc);
+      addAuthorityDoc(authorityBuffer, config, doc, index);
 
       for (const facet of config.facets) {
         const values = [];
@@ -950,6 +953,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     closeDocSpool(docSpool);
   }
   flushPostingBuffer(buffer);
+  const authorityBaseShards = finishAuthorityRuns(authorityBuffer);
   const queryBundleSeeds = finalizeQueryBundleSeeds(queryBundleSeedBuffer, config);
   return {
     codes,
@@ -957,7 +961,8 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     baseShards: [...baseShards].sort(),
     docSpool,
     queryBundleSeeds,
-    queryBundleTerms: queryBundleTerms(queryBundleSeeds)
+    queryBundleTerms: queryBundleTerms(queryBundleSeeds),
+    authorityBaseShards
   };
 }
 
@@ -1273,12 +1278,14 @@ export async function build({ configPath }) {
   const dirs = {
     out: config.output,
     runsOut: resolve(config.output, "_build", "runs"),
-    typoRunsOut: resolve(config.output, "_build", "typo-runs")
+    typoRunsOut: resolve(config.output, "_build", "typo-runs"),
+    authorityRunsOut: resolve(config.output, "_build", "authority-runs")
   };
   rmSync(dirs.out, { recursive: true, force: true });
   mkdirSync(resolve(dirs.out, "docs"), { recursive: true });
   mkdirSync(resolve(dirs.out, "terms"), { recursive: true });
   mkdirSync(dirs.runsOut, { recursive: true });
+  mkdirSync(dirs.authorityRunsOut, { recursive: true });
 
   console.log(`Rangefind: reading ${config.input}`);
   const measured = await measure(config);
@@ -1287,6 +1294,7 @@ export async function build({ configPath }) {
   const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
   const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
   const queryBundles = await buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs);
+  const authority = await reduceAuthorityRuns(config, dirs, runData.authorityBaseShards);
   const docs = await finishDocPacks(dirs.out, runData.docSpool, measured.total, config);
   docs.pages = finishDocPages(dirs.out, runData.docSpool, measured.total, config);
   const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
@@ -1311,6 +1319,7 @@ export async function build({ configPath }) {
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
       queryBundles: !!queryBundles,
+      authority: !!authority,
       typoSidecar: !!typoManifest
     },
     object_store: {
@@ -1332,6 +1341,7 @@ export async function build({ configPath }) {
         docValueSorted: packTable(docValueSorted.packs),
         facets: packTable(facetDictionaries.pack_objects),
         queryBundles: packTable(queryBundles?.packs),
+        authority: packTable(authority?.packs),
         typo: packTable(typoManifest?.packs)
       },
       dedupe: summarizeDedup(
@@ -1343,12 +1353,14 @@ export async function build({ configPath }) {
         docValueSorted.packs,
         facetDictionaries.pack_objects,
         queryBundles?.packs || [],
+        authority?.packs || [],
         typoManifest?.packs || []
       ),
       directories: {
         terms: reduced.directory,
         facets: facetDictionaries.directory,
         queryBundles: queryBundles?.directory || null,
+        authority: authority?.directory || null,
         typo: typoManifest?.directory || null
       },
       pointers: {
@@ -1401,6 +1413,26 @@ export async function build({ configPath }) {
         pack_files: queryBundles.packs.length,
         pack_bytes: queryBundles.pack_bytes,
         directory_bytes: queryBundles.directory_bytes
+      }
+    } : null,
+    authority: authority ? {
+      storage: authority.storage,
+      compression: authority.compression,
+      format: authority.format,
+      fields: authority.fields,
+      max_rows_per_key: authority.max_rows_per_key,
+      base_shard_depth: authority.base_shard_depth,
+      max_shard_depth: authority.max_shard_depth,
+      target_shard_rows: authority.target_shard_rows,
+      keys: authority.keys,
+      rows: authority.rows,
+      shards: authority.shards,
+      directory: authority.directory,
+      packs: authority.packs.length,
+      stats: {
+        pack_files: authority.packs.length,
+        pack_bytes: authority.pack_bytes,
+        directory_bytes: authority.directory_bytes
       }
     } : null,
     typo: typoManifest ? {
@@ -1473,6 +1505,15 @@ export async function build({ configPath }) {
       query_bundle_directory_bytes: queryBundles?.directory_bytes || 0,
       query_bundle_pack_files: queryBundles?.packs.length || 0,
       query_bundle_pack_bytes: queryBundles?.pack_bytes || 0,
+      authority_format: authority?.format || "",
+      authority_fields: authority?.fields.length || 0,
+      authority_keys: authority?.keys || 0,
+      authority_rows: authority?.rows || 0,
+      authority_shards: authority?.shards || 0,
+      authority_target_shard_rows: authority?.target_shard_rows || 0,
+      authority_directory_bytes: authority?.directory_bytes || 0,
+      authority_pack_files: authority?.packs.length || 0,
+      authority_pack_bytes: authority?.pack_bytes || 0,
       reduce_workers: reduced.reduceWorkers,
       posting_block_size: config.postingBlockSize,
       base_shard_depth: config.baseShardDepth,

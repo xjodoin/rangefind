@@ -1,4 +1,5 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms, queryTerms, tokenize } from "./analyzer.js";
+import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parseShard } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
@@ -81,11 +82,13 @@ export async function createSearch(options = {}) {
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
   const termDirectory = createDirectoryState(manifest.directory);
   const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
+  const authorityDirectory = manifest.authority?.directory ? createDirectoryState(manifest.authority.directory) : null;
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
   const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
   const shardCache = new Map();
   const queryBundleCache = new Map();
+  const authorityShardCache = new Map();
   const typoShardCache = new Map();
   const docOrdinalCache = new Map();
   const docPointerCache = new Map();
@@ -114,6 +117,7 @@ export async function createSearch(options = {}) {
     docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     docValueSortPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    authority: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     ...(options.rangePlans || {})
@@ -443,6 +447,49 @@ export async function createSearch(options = {}) {
     return out;
   }
 
+  async function loadAuthorityShards(shards) {
+    const wanted = [];
+    const pending = [];
+    const unique = new Map();
+    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
+    for (const { shard, entry } of unique.values()) {
+      wanted.push(shard);
+      if (authorityShardCache.has(shard)) continue;
+      if (!entry) continue;
+      let resolveAuthority;
+      let rejectAuthority;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveAuthority = resolvePromise;
+        rejectAuthority = rejectPromise;
+      });
+      promise.catch(() => {});
+      authorityShardCache.set(shard, promise);
+      pending.push({ shard, entry, resolve: resolveAuthority, reject: rejectAuthority });
+    }
+
+    await Promise.all(rangeGroups(pending, "authority").map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`authority/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          item.resolve(parseAuthorityShard(await inflateGroupItem(compressed, group.start, item, `authority shard ${item.shard}`)));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          authorityShardCache.delete(item.shard);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    const out = new Map();
+    await Promise.all(wanted.map(async (shard) => {
+      const data = await authorityShardCache.get(shard);
+      if (data) out.set(shard, data);
+    }));
+    return out;
+  }
+
   async function loadTypoShards(shards) {
     const meta = await loadTypoManifest();
     if (!meta) return new Map();
@@ -510,6 +557,33 @@ export async function createSearch(options = {}) {
       for (const term of bucket.terms) {
         const entry = data.terms.get(term);
         if (entry) out.push({ term, shard: data, shardName: shard, entry });
+      }
+    }
+    return out;
+  }
+
+  async function authorityEntries(keys) {
+    if (!authorityDirectory || options.authority === false || !keys.length) return [];
+    const byShard = new Map();
+    for (const key of keys) {
+      const resolved = await resolveDirectoryShard(
+        key,
+        authorityDirectory,
+        manifest.authority?.base_shard_depth || manifest.stats?.base_shard_depth || 3,
+        manifest.authority?.max_shard_depth || manifest.stats?.max_shard_depth || manifest.authority?.base_shard_depth || 5
+      );
+      if (!resolved) continue;
+      if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, keys: [] });
+      byShard.get(resolved.shard).keys.push(key);
+    }
+    const loaded = await loadAuthorityShards([...byShard.values()]);
+    const out = [];
+    for (const [shard, bucket] of byShard) {
+      const data = loaded.get(shard);
+      if (!data) continue;
+      for (const key of bucket.keys) {
+        const entry = data.entries.get(key);
+        if (entry) out.push({ key, shardName: shard, entry });
       }
     }
     return out;
@@ -1942,6 +2016,122 @@ export async function createSearch(options = {}) {
     };
   }
 
+  function resultTitleMatchesQuery(result, query) {
+    const title = authorityNormalizeSurface(result?.title || "");
+    const surface = authorityNormalizeSurface(query);
+    return !!title && !!surface && title === surface;
+  }
+
+  async function maybeAuthorityRerank(params, response) {
+    const stats = response.stats || {};
+    if (!authorityDirectory || options.authority === false || params.authority === false) return response;
+    if (params.page !== 1 || params.sort) return response;
+    const filters = params.filters || {};
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters) return response;
+    const authorityQuery = String(response.correctedQuery || response.surfaceFallbackQuery || params.q || "").trim();
+    if (!authorityQuery || resultTitleMatchesQuery(response.results?.[0], authorityQuery)) return response;
+
+    const authorityTerms = analyzeTerms(authorityQuery).map(item => item.term);
+    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms).filter(item => item.key);
+    const surfaceKeys = [...new Set(keyPlans.filter(item => item.kind === "surface").map(item => item.key))];
+    const exactKeys = [...new Set(keyPlans.filter(item => item.kind === "exact").map(item => item.key))];
+    const tokenKeys = [...new Set(keyPlans.filter(item => item.kind === "tokens").map(item => item.key))];
+    if (!surfaceKeys.length && !exactKeys.length && !tokenKeys.length) return response;
+
+    let loadedKeys = surfaceKeys;
+    let entries = await authorityEntries(surfaceKeys);
+    if (!authorityEntryRows(entries) && exactKeys.length) {
+      loadedKeys = exactKeys;
+      entries = await authorityEntries(exactKeys);
+    }
+    if (!authorityEntryRows(entries) && (response.total || 0) === 0 && tokenKeys.length) {
+      loadedKeys = tokenKeys;
+      entries = await authorityEntries(tokenKeys);
+    }
+    const rowsByDoc = new Map();
+    for (const result of response.results || []) {
+      if (result?.index == null) continue;
+      rowsByDoc.set(result.index, {
+        doc: result.index,
+        score: Number(result.score || 0),
+        baseline: true,
+        authority: 0
+      });
+    }
+
+    let authorityRows = 0;
+    let authorityTotal = 0;
+    let authorityComplete = true;
+    for (const { entry } of entries) {
+      authorityTotal = Math.max(authorityTotal, entry.total || 0);
+      authorityComplete = authorityComplete && entry.complete !== false;
+      for (const [doc, score] of entry.rows || []) {
+        authorityRows++;
+        const current = rowsByDoc.get(doc) || { doc, score: 0, baseline: false, authority: 0 };
+        current.authority += score;
+        current.score += score;
+        rowsByDoc.set(doc, current);
+      }
+    }
+
+    const ranked = [...rowsByDoc.values()]
+      .sort((left, right) => right.score - left.score || left.doc - right.doc);
+    const size = Math.max(1, Math.min(100, Number(params.size || response.size || 10)));
+    const pageRows = ranked.slice(0, size).map(item => [item.doc, item.score]);
+    const authorityInjected = pageRows.filter(([doc]) => !response.results?.some(result => result.index === doc)).length;
+
+    if (!authorityRows || (!authorityInjected && sameDocOrder(pageRows, response.results || []))) {
+      return {
+        ...response,
+        stats: {
+          ...stats,
+          authorityAttempted: true,
+          authorityApplied: false,
+          authorityKeys: loadedKeys.length,
+          authorityRows
+        }
+      };
+    }
+
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+    const results = await rowsToResults(pageRows, resultContext);
+    return {
+      ...response,
+      total: Math.max(response.total || 0, authorityTotal || pageRows.length),
+      results,
+      stats: {
+        ...stats,
+        topKProven: Boolean(stats.topKProven && authorityComplete),
+        authorityAttempted: true,
+        authorityApplied: true,
+        authorityComplete,
+        authorityKeys: loadedKeys.length,
+        authorityEntries: entries.length,
+        authorityRows,
+        authorityInjected,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive
+      }
+    };
+  }
+
+  function sameDocOrder(rows, results) {
+    if (rows.length !== results.length) return false;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i][0] !== results[i]?.index) return false;
+    }
+    return true;
+  }
+
+  function authorityEntryRows(entries) {
+    let rows = 0;
+    for (const { entry } of entries || []) rows += entry.rows?.length || 0;
+    return rows;
+  }
+
   async function search(params = {}) {
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
@@ -2010,7 +2200,8 @@ export async function createSearch(options = {}) {
     const baseTerms = analyzedTerms.map(item => item.term);
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;
     const response = await searchFn({ q, page, size, filters, sort, baseTerms, terms: queryTerms(q), rerank: params.rerank });
-    return maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
+    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
+    return maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, authority: params.authority }, typoResponse);
   }
 
   return {

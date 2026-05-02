@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { authorityKeysForValue, buildAuthorityShard, parseAuthorityShard } from "../src/authority_codec.js";
 import {
   buildBlockFilters,
   buildCodesFile,
@@ -119,6 +120,30 @@ test("query bundle codec round-trips proof metadata and rows", () => {
   assert.deepEqual(bundle.rows, [[2062, 50], [9405, 44]]);
 });
 
+test("authority shard codec round-trips exact and token rows", () => {
+  const shard = parseAuthorityShard(buildAuthorityShard([
+    ["t|paris", [[3, 800000], [1, 400000]]],
+    ["x|paris", [[1, 1000000]]]
+  ], { maxRows: 1 }));
+  assert.equal(shard.format, "rfauth-v1");
+  assert.equal(shard.entries.get("t|paris").total, 2);
+  assert.equal(shard.entries.get("t|paris").complete, false);
+  assert.deepEqual(shard.entries.get("t|paris").rows, [[3, 800000]]);
+  assert.equal(shard.entries.get("x|paris").complete, true);
+  assert.deepEqual(shard.entries.get("x|paris").rows, [[1, 1000000]]);
+});
+
+test("authority keys keep surface-exact accents separate from folded exact lookup", () => {
+  assert.deepEqual(
+    authorityKeysForValue("Paris").map(item => item.key),
+    ["r|paris", "x|paris", "t|pari"]
+  );
+  assert.deepEqual(
+    authorityKeysForValue("Pâris").map(item => item.key),
+    ["r|pâris", "x|paris", "t|pari"]
+  );
+});
+
 test("paged directory can encode checksummed block pointers", () => {
   const directory = buildPagedDirectory([
     { shard: "object", packIndex: 1, offset: 20, length: 30, logicalLength: 120, checksum }
@@ -162,6 +187,19 @@ test("paged directory maps named shards to packed file offsets", () => {
   assert.deepEqual(ranges.get("aaa"), { pack: "0000.bin", offset: 10, length: 50, physicalLength: 50, logicalLength: null, checksum });
   assert.deepEqual(ranges.get("bbb"), { pack: "0002.bin", offset: 5, length: 30, physicalLength: 30, logicalLength: null, checksum });
   assert.equal(findDirectoryPage(root, "zzz"), null);
+});
+
+test("paged directory uses binary key order for lookup bounds", () => {
+  const directory = buildPagedDirectory([
+    { shard: "r|p", packIndex: 0, offset: 10, length: 20, checksum },
+    { shard: "r|â", packIndex: 0, offset: 30, length: 20, checksum },
+    { shard: "x|p", packIndex: 0, offset: 50, length: 20, checksum }
+  ], { pageBytes: 1024 });
+  const root = parseDirectoryRoot(directory.root);
+  const page = findDirectoryPage(root, "r|p");
+  assert.ok(page);
+  const ranges = parseDirectoryPage(directory.pages.find(item => item.file === page.file).buffer);
+  assert.deepEqual(ranges.get("r|p"), { pack: "0000.bin", offset: 10, length: 20, physicalLength: 20, logicalLength: null, checksum });
 });
 
 test("code table codec round-trips facet and numeric columns", () => {

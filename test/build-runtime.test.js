@@ -55,7 +55,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const configPath = join(root, "rangefind.config.json");
   await writeFile(docsPath, [
     JSON.stringify({ id: "a", title: "Static range search", body: "Rangefind builds a static index with range requests.", category: "indexing", tags: ["static", "range"], year: 2026, temperature: -1, published: "2026-01-10", featured: true, url: "/a" }),
-    JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", category: "baseline", tags: ["sqlite", "quality"], year: 2025, temperature: -5, published: "2025-06-01", featured: false, url: "/b" }),
+    JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", aliases: ["authoritative alias"], category: "baseline", tags: ["sqlite", "quality"], year: 2025, temperature: -5, published: "2025-06-01", featured: false, url: "/b" }),
     JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", tags: ["static", "runtime"], year: 2026, temperature: 0, published: "2026-03-15", featured: false, url: "/c" }),
     JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", tags: ["typo"], year: 2026, temperature: 7, published: "2026-05-01", featured: true, url: "/d" }),
     JSON.stringify({ id: "e", title: "Archived catalog entry", body: "A low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-01", featured: false, url: "/e" }),
@@ -79,6 +79,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
       { name: "title", path: "title", weight: 4.5, b: 0.55, phrase: true },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
+    authority: [
+      { name: "title", path: "title" },
+      { name: "aliases", path: "aliases" }
+    ],
     facets: [{ name: "category", path: "category" }, { name: "tags", path: "tags" }],
     numbers: [{ name: "year", path: "year" }, { name: "temperature", path: "temperature" }, { name: "published", path: "published", type: "date" }],
     booleans: [{ name: "featured", path: "featured" }],
@@ -96,6 +100,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.features.docPages, true);
   assert.equal(manifest.features.docValueSorted, true);
   assert.equal(manifest.features.queryBundles, true);
+  assert.equal(manifest.features.authority, true);
   assert.equal(manifest.object_store.pointer_format, "rfbp-v1");
   assert.equal(manifest.object_store.immutable_names, true);
   assert.equal(manifest.docs.layout.format, "rflocal-doc-v1");
@@ -131,6 +136,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.query_bundles.keys > 0);
   assert.ok(await readFile(join(output, manifest.query_bundles.directory.root)));
   assert.ok(await readFile(join(output, "bundles", "packs", manifest.object_store.pack_table.queryBundles[0])));
+  assert.ok(manifest.authority);
+  assert.equal(manifest.authority.format, "rfauth-v1");
+  assert.equal(manifest.authority.fields.length, 2);
+  assert.ok(manifest.authority.keys > 0);
+  assert.ok(await readFile(join(output, manifest.authority.directory.root)));
+  assert.ok(await readFile(join(output, "authority", "packs", manifest.object_store.pack_table.authority[0])));
   assert.equal(manifest.doc_values.storage, "range-pack-v1");
   assert.ok(manifest.doc_values.fields.tags);
   assert.ok(manifest.doc_values.fields.published);
@@ -193,6 +204,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(bundled.stats.totalExact, true);
   assert.equal(bundled.stats.blocksDecoded, 0);
   assert.equal(bundled.stats.postingsDecoded, 0);
+
+  const authority = await search.search({ q: "authoritative alias", size: 3 });
+  assert.equal(authority.results[0].title, "SQLite retrieval baseline");
+  assert.equal(authority.stats.authorityApplied, true);
+  assert.equal(authority.stats.authorityInjected, 1);
 
   const typo = await search.search({ q: "statik range search", size: 3 });
   assert.equal(typo.results[0].title, "Static range search");

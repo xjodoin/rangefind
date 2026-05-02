@@ -50,6 +50,12 @@ rangefind/
     packs/
       0000.<hash>.bin
       0001.<hash>.bin
+  authority/
+    directory-root.<hash>.bin.gz
+    directory-pages/
+      0000.<hash>.bin.gz
+    packs/
+      0000.<hash>.bin
   typo/
     manifest.<hash>.json
     directory-root.<hash>.bin.gz
@@ -175,6 +181,23 @@ shard files and typo index-term run files into `_build/`; the parent then
 assembles final range packs in sorted task order so pack offsets stay
 deterministic. Set `reduceWorkers` in the config to control the worker count;
 `1` is the default, while `0` or `"auto"` uses up to four workers.
+
+Authority fields use the same file-backed run/reduce pattern as postings. Each
+configured title, entity-name, slug, or alias value emits surface-exact,
+folded-exact, and token authority keys into temporary run files. The reducer
+writes `rfauth-v1` shards into immutable `authority/packs/*.bin` objects and a
+paged range directory. Authority has its own shard budget
+(`authorityTargetShardRows`) and deeper max shard depth
+(`authorityMaxShardDepth`) and smaller directory pages
+(`authorityDirectoryPageBytes`) because label lookups are point reads; they
+should not inherit the larger posting-list shard and directory budgets used by
+normal term shards.
+The browser probes the surface-exact key first, which keeps accent-sensitive
+matches such as `Paris` and `Pâris` distinct. It only falls back to folded or
+token keys when the stronger key cannot rescue the first page. Authority scores
+are additive with the normal text score, but the sidecar is independent from the
+main posting lists, so projects can add canonical-label quality without
+bloating every text query.
 
 Document packs contain independently compressed result-display payloads written
 in retrieval-local order. The builder spools compressed payloads to disk during

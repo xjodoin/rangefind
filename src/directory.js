@@ -35,6 +35,10 @@ function commonPrefixLength(a, b) {
   return i;
 }
 
+function compareKeys(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function pageEntryLength(entry, previous) {
   const prefix = commonPrefixLength(previous, entry.shard);
   return varintLength(prefix)
@@ -156,7 +160,7 @@ export function buildPagedDirectory(entries, options = {}) {
   const normalized = entries
     .map(normalizeEntry)
     .filter(entry => entry.shard)
-    .sort((a, b) => a.shard.localeCompare(b.shard));
+    .sort((a, b) => compareKeys(a.shard, b.shard));
   const pages = [];
   let current = [];
   let rawBytes = DIRECTORY_PAGE_MAGIC.length + varintLength(DIRECTORY_VERSION);

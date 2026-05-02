@@ -85,6 +85,53 @@ the exact exhaustive scorer is not the same final behavior being measured, but
 they still validate expected result counts, selected filters, sort order, and
 runtime-lane flags.
 
+The Lucene quality comparison builds a local Lucene BM25 index over the same
+JSONL fixture and compares known-title and typo judgments against Rangefind:
+
+```bash
+npm run bench:frwiki:lucene-quality -- --root=/tmp/rangefind-frwiki-500k-current
+```
+
+The report is written to `frwiki-lucene-quality.json` in the fixture root. It
+contains Rangefind, Lucene OR, Lucene AND, and Lucene exact-title-boosted rows
+with Hit@1/Hit@3/Hit@10/MRR@10 metrics.
+
+Latest 500k quality run with the authority sidecar:
+
+```text
+Rangefind known titles:       Hit@1 7/7, Hit@10 7/7, MRR@10 1.000
+Lucene title-boost known:     Hit@1 7/7, Hit@10 7/7, MRR@10 1.000
+Lucene BM25 OR/AND known:     Hit@1 6/7, Hit@10 7/7, MRR@10 0.893
+
+Rangefind typo judgments:     Hit@1 2/4, Hit@10 3/4, MRR@10 0.550
+Lucene title-boost typo:      Hit@1 1/4, Hit@10 1/4, MRR@10 0.250
+```
+
+The known-title improvement comes from a generic authority sidecar over
+configured label fields, not from Wikipedia-specific rules. On the 500k fixture
+it indexes the `title` field into 1.49M authority rows, split into 7,018
+point-read shards with a 4,096-row target, 15.0 MB of authority packs, and a
+359 KB paged directory. The runtime probes a diacritic-preserving surface key
+first, so `Paris`, `Médecine`, `Victor Hugo`, and `Québec` rank above
+homonymy/partial-title pages. Query bundles still short-circuit exact phrase
+queries such as `changement climatique` without touching authority.
+
+Latest 500k cold-query rows after authority sharding:
+
+```text
+Paris:                  Paris,        40 requests, 176.1 KB, authority 34.0 KB
+Médecine:               Médecine,     26 requests, 171.2 KB, authority 18.3 KB
+Victor Hugo:            Victor Hugo,  37 requests, 289.3 KB, authority  6.2 KB
+Québec:                 Québec,       28 requests, 212.1 KB, authority 18.0 KB
+changement climatique:  unchanged,    28 requests,  76.8 KB, authority skipped
+fromage:                unchanged,    19 requests, 239.5 KB, authority miss 9.6 KB
+```
+
+The full 500k build took 3,642 seconds wall time with `--reduce-workers=auto`
+and peaked at about 2.39 GB RSS. The main remaining build bottleneck was the
+pre-existing typo-sidecar merge/reduction path; rebuilding only the authority
+sidecar from the same 500k JSONL took about 14 seconds.
+
 ## Local 50k Run
 
 Build command, reusing the cached 50k JSONL fixture:
