@@ -2206,7 +2206,8 @@ export async function createSearch(options = {}) {
 
   return {
     manifest,
-    search
+    search,
+    loadFacetValues: loadFacetDictionary
   };
 }
 

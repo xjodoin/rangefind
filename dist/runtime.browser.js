@@ -3081,7 +3081,8 @@ async function createSearch(options = {}) {
   }
   return {
     manifest,
-    search
+    search,
+    loadFacetValues: loadFacetDictionary
   };
 }
 var runtime_default = createSearch;
