@@ -22,6 +22,7 @@ import {
   parseDirectoryPage,
   parseDirectoryRoot
 } from "../src/directory.js";
+import { buildQueryBundle, parseQueryBundle } from "../src/query_bundle_codec.js";
 
 const checksum = { algorithm: "sha256", value: "a".repeat(64) };
 
@@ -95,6 +96,27 @@ test("term shard codec can externalize posting blocks", () => {
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 1 });
   assert.deepEqual([...decodePostingBytes(stored[0])], [0, 13, 1, 11]);
   assert.equal(rewritten.stats.externalBlocks, 2);
+});
+
+test("query bundle codec round-trips proof metadata and rows", () => {
+  const bundle = parseQueryBundle(buildQueryBundle({
+    key: "exact-expanded-v1|chang climat",
+    baseTerms: ["chang", "climat"],
+    expandedTerms: ["chang", "climat", "chang_climat"],
+    total: 68,
+    complete: false,
+    nextScoreBound: 41,
+    nextTieDoc: 812,
+    rows: [{ doc: 2062, score: 50 }, { doc: 9405, score: 44 }]
+  }));
+  assert.equal(bundle.key, "exact-expanded-v1|chang climat");
+  assert.deepEqual(bundle.baseTerms, ["chang", "climat"]);
+  assert.deepEqual(bundle.expandedTerms, ["chang", "climat", "chang_climat"]);
+  assert.equal(bundle.total, 68);
+  assert.equal(bundle.complete, false);
+  assert.equal(bundle.nextScoreBound, 41);
+  assert.equal(bundle.nextTieDoc, 812);
+  assert.deepEqual(bundle.rows, [[2062, 50], [9405, 44]]);
 });
 
 test("paged directory can encode checksummed block pointers", () => {

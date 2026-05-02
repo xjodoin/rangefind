@@ -89,6 +89,25 @@ export function queryTerms(text) {
   return expandedTermsFromBaseTerms(terms);
 }
 
+export function queryBundleKeyFromBaseTerms(baseTerms) {
+  const terms = [...new Set((baseTerms || []).map(term => String(term || "")).filter(Boolean))];
+  if (terms.length < 2 || terms.length > 3) return "";
+  return `exact-expanded-v1|${terms.join(" ")}`;
+}
+
+export function queryBundleKeysFromBaseTerms(baseTerms) {
+  const terms = [...new Set((baseTerms || []).map(term => String(term || "")).filter(Boolean))];
+  const out = [];
+  for (let n = Math.min(3, terms.length); n >= 2; n--) {
+    for (let i = 0; i <= terms.length - n; i++) {
+      const base = terms.slice(i, i + n);
+      const key = queryBundleKeyFromBaseTerms(base);
+      if (key) out.push({ key, baseTerms: base, expandedTerms: expandedTermsFromBaseTerms(base) });
+    }
+  }
+  return out;
+}
+
 export function expandedTermsFromBaseTerms(terms) {
   const expanded = [...terms];
   for (const n of [2, 3]) {

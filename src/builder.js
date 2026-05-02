@@ -18,7 +18,7 @@ import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
-import { tokenize } from "./analyzer.js";
+import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms, tokenize } from "./analyzer.js";
 import { createCodeStore } from "./build_store.js";
 import {
   buildBlockFilters,
@@ -42,6 +42,7 @@ import { buildDocOrdinalTable, buildDocPointerTable, buildDocPointerTableFromRea
 import { eachJsonLine } from "./jsonl.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
+import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { reduceRunToPartitions } from "./reduce_stream.js";
 import { encodeRunRecord } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
@@ -155,6 +156,83 @@ function flushPostingBuffer(buffer) {
   }
   buffer.byShard.clear();
   buffer.lines = 0;
+}
+
+function queryBundlesEnabled(config) {
+  return config.queryBundles !== false && Math.max(0, Number(config.queryBundleMaxKeys || 0)) > 0;
+}
+
+function isBundlePhraseTerm(term, config) {
+  if (!term || term.startsWith("n_") || !term.includes("_")) return false;
+  const parts = term.split("_").filter(Boolean);
+  const maxTerms = Math.max(2, Math.min(3, Math.floor(Number(config.queryBundleMaxTerms || 3))));
+  return parts.length >= 2 && parts.length <= maxTerms && parts.every(part => part && !part.includes("_"));
+}
+
+function createQueryBundleSeedBuffer(config) {
+  const maxKeys = Math.max(0, Math.floor(Number(config.queryBundleMaxKeys || 0)));
+  const factor = Math.max(1, Number(config.queryBundleSeedCandidateFactor || 4));
+  return queryBundlesEnabled(config)
+    ? { counts: new Map(), seeds: new Map(), enabled: true, maxSeedCandidates: Math.max(maxKeys, Math.floor(maxKeys * factor)) }
+    : { counts: new Map(), seeds: new Map(), enabled: false, maxSeedCandidates: 0 };
+}
+
+function addQueryBundleSeed(buffer, baseTerms, selected, docKeys) {
+  if (!baseTerms.every(base => selected.has(base))) return;
+  const key = queryBundleKeyFromBaseTerms(baseTerms);
+  if (!key || docKeys.has(key)) return;
+  docKeys.add(key);
+  if (!buffer.seeds.has(key)) {
+    if (buffer.seeds.size >= buffer.maxSeedCandidates) return;
+    buffer.seeds.set(key, {
+      key,
+      baseTerms,
+      expandedTerms: expandedTermsFromBaseTerms(baseTerms)
+    });
+  }
+  buffer.counts.set(key, (buffer.counts.get(key) || 0) + 1);
+}
+
+function addQueryBundleSeeds(buffer, selectedTerms, config, doc) {
+  if (!buffer.enabled) return;
+  const selected = new Set(selectedTerms.map(([term]) => term));
+  const docKeys = new Set();
+  const maxTerms = Math.max(2, Math.min(3, Math.floor(Number(config.queryBundleMaxTerms || 3))));
+  for (const [term] of selectedTerms) {
+    if (!isBundlePhraseTerm(term, config)) continue;
+    addQueryBundleSeed(buffer, term.split("_"), selected, docKeys);
+  }
+  for (const field of config.fields) {
+    const limit = Math.max(0, Math.floor(Number(field.queryBundleSeedMaxTokens ?? config.queryBundleSeedMaxFieldTokens ?? 512)));
+    if (!limit || field.queryBundles === false) continue;
+    const terms = tokenize(fieldText(doc, field), { unique: false }).slice(0, limit);
+    for (let n = 2; n <= maxTerms; n++) {
+      for (let i = 0; i <= terms.length - n; i++) {
+        const baseTerms = terms.slice(i, i + n);
+        if (new Set(baseTerms).size !== baseTerms.length) continue;
+        addQueryBundleSeed(buffer, baseTerms, selected, docKeys);
+      }
+    }
+  }
+}
+
+function finalizeQueryBundleSeeds(buffer, config) {
+  if (!buffer.enabled || !buffer.seeds.size) return [];
+  const minDocs = Math.max(1, Math.floor(Number(config.queryBundleMinSeedDocs || 1)));
+  const maxKeys = Math.max(0, Math.floor(Number(config.queryBundleMaxKeys || 0)));
+  return [...buffer.seeds.values()]
+    .map(seed => ({ ...seed, seedDocs: buffer.counts.get(seed.key) || 0 }))
+    .filter(seed => seed.seedDocs >= minDocs)
+    .sort((a, b) => b.seedDocs - a.seedDocs || a.key.localeCompare(b.key))
+    .slice(0, maxKeys);
+}
+
+function queryBundleTerms(seeds) {
+  const terms = new Set();
+  for (const seed of seeds || []) {
+    for (const term of seed.expandedTerms || []) terms.add(term);
+  }
+  return [...terms].sort();
 }
 
 function docPayload(doc, config, index) {
@@ -830,6 +908,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 
   const initialResults = [];
   const buffer = { byShard: new Map(), lines: 0, runsOut: dirs.runsOut };
+  const queryBundleSeedBuffer = createQueryBundleSeedBuffer(config);
   const docSpool = createDocSpool(resolve(dirs.out, "_build", "docs"));
   const baseShards = new Set();
 
@@ -849,6 +928,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
         bufferPosting(buffer, config, term, index, score);
         baseShards.add(baseShardFor(term, config));
       }
+      addQueryBundleSeeds(queryBundleSeedBuffer, selectedTerms, config, doc);
 
       for (const facet of config.facets) {
         const values = [];
@@ -870,22 +950,29 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     closeDocSpool(docSpool);
   }
   flushPostingBuffer(buffer);
+  const queryBundleSeeds = finalizeQueryBundleSeeds(queryBundleSeedBuffer, config);
   return {
     codes,
     initialResults,
     baseShards: [...baseShards].sort(),
-    docSpool
+    docSpool,
+    queryBundleSeeds,
+    queryBundleTerms: queryBundleTerms(queryBundleSeeds)
   };
 }
 
-async function reduceShard(baseShard, config, measured, runData, filters, packWriter, blockPackWriter, typoBuffer) {
+async function reduceShard(baseShard, config, measured, runData, filters, packWriter, blockPackWriter, typoBuffer, bundleTermSet) {
   const path = resolve(runData.runsOut, `${baseShard}.run`);
   const blockStats = emptyPostingBlockStats();
+  const bundleDfs = [];
   const stats = await reduceRunToPartitions({
     runPath: path,
     scratchDir: resolve(runData.reduceSortOut, encodeURIComponent(baseShard)),
     config,
-    onTerm: (term, df) => addTypoIndexTerm(typoBuffer, term, df, measured.total),
+    onTerm: (term, df) => {
+      addTypoIndexTerm(typoBuffer, term, df, measured.total);
+      if (bundleTermSet?.has(term)) bundleDfs.push([term, df]);
+    },
     onPartition: (partition) => {
       const encoded = buildTermShard(partition.entries, measured.total, runData.codes, filters, config);
       const externalized = externalizeTermShard(encoded, config, filters, blockPackWriter);
@@ -899,7 +986,7 @@ async function reduceShard(baseShard, config, measured, runData, filters, packWr
     }
   });
   unlinkSync(path);
-  return { terms: stats.terms, postings: stats.postings, shards: stats.partitions, blockStats };
+  return { terms: stats.terms, postings: stats.postings, shards: stats.partitions, blockStats, bundleDfs };
 }
 
 function createReduceWorker(workerData) {
@@ -993,6 +1080,7 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
     runsOut: dirs.runsOut,
     shardOut: resolve(shardOutRoot, `worker-${index}`),
     sortOut: resolve(dirs.out, "_build", "reduce-sort", `worker-${index}`),
+    bundleTerms: runData.queryBundleTerms || [],
     typoOptions: typoBuffer?.options || { enabled: false },
     typoRunsOut: resolve(dirs.out, "_build", "typo-index-runs", `worker-${index}`)
   }));
@@ -1009,10 +1097,12 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
   let nextSmallTask = 0;
   let termCount = 0;
   let postingCount = 0;
+  const bundleDfs = new Map();
   async function runTask(worker, task) {
     const stats = await worker.call({ type: "reduce", baseShard: task.baseShard });
     termCount += stats.terms;
     postingCount += stats.postings;
+    for (const [term, df] of stats.bundleDfs || []) bundleDfs.set(term, df);
     taskResults.push({ order: task.order, ...stats });
   }
   try {
@@ -1050,7 +1140,7 @@ async function reduceRunsParallel(config, measured, runData, dirs, typoBuffer, f
   }
   if (blockPackWriter) finalizePackWriter(blockPackWriter);
   finalizePackWriter(packWriter);
-  return { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount };
+  return { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount, bundleDfs };
 }
 
 async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
@@ -1066,18 +1156,21 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       : createPackWriter(resolve(dirs.out, "terms", "block-packs"), config.postingBlockPackBytes);
     const finalShards = new Set();
     const blockStats = emptyPostingBlockStats();
+    const bundleDfs = new Map();
     let termCount = 0;
     let postingCount = 0;
+    const bundleTermSet = new Set(runData.queryBundleTerms || []);
     for (let i = 0; i < runData.baseShards.length; i++) {
-      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut, reduceSortOut: resolve(dirs.out, "_build", "reduce-sort") }, filters, packWriter, blockPackWriter, typoBuffer);
+      const stats = await reduceShard(runData.baseShards[i], config, measured, { ...runData, runsOut: dirs.runsOut, reduceSortOut: resolve(dirs.out, "_build", "reduce-sort") }, filters, packWriter, blockPackWriter, typoBuffer, bundleTermSet);
       termCount += stats.terms;
       postingCount += stats.postings;
+      for (const [term, df] of stats.bundleDfs || []) bundleDfs.set(term, df);
       addPostingBlockStats(blockStats, stats.blockStats);
       for (const shard of stats.shards) finalShards.add(shard);
     }
     if (blockPackWriter) finalizePackWriter(blockPackWriter);
     finalizePackWriter(packWriter);
-    reduced = { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount };
+    reduced = { finalShards, packWriter, blockPackWriter, blockStats, termCount, postingCount, bundleDfs };
   }
   const shards = [...reduced.finalShards].sort();
   const packIndexes = new Map(reduced.packWriter.packs.map((pack, index) => [pack.file, index]));
@@ -1095,10 +1188,84 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
     blockStats: reduced.blockStats || emptyPostingBlockStats(),
     termCount: reduced.termCount,
     postingCount: reduced.postingCount,
+    bundleDfs: reduced.bundleDfs || new Map(),
     packBytes: reduced.packWriter.bytes,
     blockPackBytes: reduced.blockPackWriter?.bytes || 0,
     reduceWorkers: workerCount
   };
+}
+
+function impactForBundleScore(score, df, total) {
+  const scoreInt = Math.max(1, Math.round(score * 1000));
+  const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
+  return Math.max(1, Math.round(scoreInt * idf / 10));
+}
+
+function queryBundlePivot(seed, termDfs) {
+  return seed.baseTerms
+    .slice()
+    .sort((a, b) => (termDfs.get(a) || Infinity) - (termDfs.get(b) || Infinity) || a.localeCompare(b))[0] || seed.baseTerms[0];
+}
+
+function queryBundleSeedIndex(seeds, termDfs) {
+  const byPivot = new Map();
+  for (const seed of seeds || []) {
+    const pivot = queryBundlePivot(seed, termDfs);
+    if (!byPivot.has(pivot)) byPivot.set(pivot, []);
+    byPivot.get(pivot).push(seed);
+  }
+  return byPivot;
+}
+
+function emitQueryBundleRows(collector, seedIndex, termDfs, total, selectedTerms, doc) {
+  const selected = new Map(selectedTerms);
+  const seenKeys = new Set();
+
+  function emitSeed(seed) {
+    if (!seed || seenKeys.has(seed.key) || !seed.baseTerms.every(base => selected.has(base))) return;
+    seenKeys.add(seed.key);
+    let score = 0;
+    for (const scoringTerm of seed.expandedTerms) {
+      if (!selected.has(scoringTerm)) continue;
+      const df = termDfs.get(scoringTerm);
+      if (!df) continue;
+      score += impactForBundleScore(selected.get(scoringTerm), df, total);
+    }
+    addQueryBundleRow(collector, seed.key, doc, score);
+  }
+
+  for (const [term] of selectedTerms) {
+    if (term.includes("_")) continue;
+    for (const seed of seedIndex.get(term) || []) emitSeed(seed);
+  }
+}
+
+async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs) {
+  if (!queryBundlesEnabled(config) || !seeds?.length || !termDfs?.size) return null;
+  const seedIndex = queryBundleSeedIndex(seeds, termDfs);
+  const collector = createQueryBundleCollector(seeds, config.queryBundleMaxRows);
+
+  await eachJsonLine(config.input, async (doc, index) => {
+    const weighted = new Map();
+    const expansion = new Map();
+    for (const field of config.fields) addFieldScores(doc, field, measured.avgLens[field.name], weighted);
+    for (const field of config.fields) addFieldExpansionScores(doc, field, expansion);
+    const selectedTerms = selectDocTerms(
+      bm25fScores(weighted, config.bm25fK1),
+      expansion,
+      config.maxTermsPerDoc,
+      config.maxExpansionTermsPerDoc
+    );
+    emitQueryBundleRows(collector, seedIndex, termDfs, measured.total, selectedTerms, index);
+  });
+  const bundles = queryBundleCollectorResults(collector);
+  if (!bundles.length) return null;
+  return writeQueryBundleObjects({
+    outDir: dirs.out,
+    config,
+    bundles,
+    coverage: "all-base-docs"
+  });
 }
 
 export async function build({ configPath }) {
@@ -1119,6 +1286,7 @@ export async function build({ configPath }) {
   const typoBuffer = typo.enabled ? createTypoRunBuffer(dirs.typoRunsOut, typo) : null;
   const runData = await writePostingRuns(config, measured, dirs, typoBuffer);
   const reduced = await reduceRuns(config, measured, runData, dirs, typoBuffer);
+  const queryBundles = await buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs);
   const docs = await finishDocPacks(dirs.out, runData.docSpool, measured.total, config);
   docs.pages = finishDocPages(dirs.out, runData.docSpool, measured.total, config);
   const typoManifest = await reduceTypoRuns(typoBuffer, dirs.out);
@@ -1142,6 +1310,7 @@ export async function build({ configPath }) {
       docValueSorted: true,
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
+      queryBundles: !!queryBundles,
       typoSidecar: !!typoManifest
     },
     object_store: {
@@ -1162,6 +1331,7 @@ export async function build({ configPath }) {
         docValues: packTable(docValues.packs),
         docValueSorted: packTable(docValueSorted.packs),
         facets: packTable(facetDictionaries.pack_objects),
+        queryBundles: packTable(queryBundles?.packs),
         typo: packTable(typoManifest?.packs)
       },
       dedupe: summarizeDedup(
@@ -1172,11 +1342,13 @@ export async function build({ configPath }) {
         docValues.packs,
         docValueSorted.packs,
         facetDictionaries.pack_objects,
+        queryBundles?.packs || [],
         typoManifest?.packs || []
       ),
       directories: {
         terms: reduced.directory,
         facets: facetDictionaries.directory,
+        queryBundles: queryBundles?.directory || null,
         typo: typoManifest?.directory || null
       },
       pointers: {
@@ -1214,6 +1386,23 @@ export async function build({ configPath }) {
     sorts: config.sorts || [],
     block_filters: reduced.filters,
     directory: reduced.directory,
+    query_bundles: queryBundles ? {
+      storage: queryBundles.storage,
+      compression: queryBundles.compression,
+      format: queryBundles.format,
+      coverage: queryBundles.coverage,
+      max_rows: queryBundles.max_rows,
+      keys: queryBundles.keys,
+      directory: queryBundles.directory,
+      packs: queryBundles.packs.length,
+      stats: {
+        seed_keys: runData.queryBundleSeeds.length,
+        seed_terms: runData.queryBundleTerms.length,
+        pack_files: queryBundles.packs.length,
+        pack_bytes: queryBundles.pack_bytes,
+        directory_bytes: queryBundles.directory_bytes
+      }
+    } : null,
     typo: typoManifest ? {
       format: typoManifest.format,
       compression: typoManifest.compression,
@@ -1276,6 +1465,14 @@ export async function build({ configPath }) {
       facet_dictionary_page_files: facetDictionaries.directory.page_files,
       facet_dictionary_bytes: facetDictionaries.directory.total_bytes + facetDictionaries.pack_bytes,
       facet_dictionary_fields: Object.keys(facetDictionaries.fields).length,
+      query_bundle_format: queryBundles?.format || "",
+      query_bundle_seed_keys: runData.queryBundleSeeds.length,
+      query_bundle_seed_terms: runData.queryBundleTerms.length,
+      query_bundle_keys: queryBundles?.keys || 0,
+      query_bundle_max_rows: queryBundles?.max_rows || 0,
+      query_bundle_directory_bytes: queryBundles?.directory_bytes || 0,
+      query_bundle_pack_files: queryBundles?.packs.length || 0,
+      query_bundle_pack_bytes: queryBundles?.pack_bytes || 0,
       reduce_workers: reduced.reduceWorkers,
       posting_block_size: config.postingBlockSize,
       base_shard_depth: config.baseShardDepth,

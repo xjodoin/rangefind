@@ -20,7 +20,7 @@ export function addFieldScores(doc, field, avgLen, scores) {
   }
 
   if (field.phrase) {
-    const terms = tokenize(fieldText(doc, field));
+    const terms = tokenize(fieldText(doc, field), { unique: false });
     for (const n of [2, 3]) {
       for (let i = 0; i <= terms.length - n; i++) {
         addWeighted(scores, terms.slice(i, i + n).join("_"), field.phraseWeight ?? 8);
@@ -31,7 +31,7 @@ export function addFieldScores(doc, field, avgLen, scores) {
 
 export function addFieldExpansionScores(doc, field, scores) {
   if (!field.proximity && !field.proximityWeight) return;
-  const terms = tokenize(fieldText(doc, field)).slice(0, field.maxProximityTokens ?? 96);
+  const terms = tokenize(fieldText(doc, field), { unique: false }).slice(0, field.maxProximityTokens ?? 96);
   const window = field.proximityWindow ?? 5;
   const weight = field.proximityWeight ?? 3.5;
   const seen = new Set();

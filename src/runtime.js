@@ -1,10 +1,11 @@
-import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryTerms, tokenize } from "./analyzer.js";
+import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms, queryTerms, tokenize } from "./analyzer.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parseShard } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
 import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.js";
 import { verifyBlockPointer } from "./object_store.js";
+import { parseQueryBundle } from "./query_bundle_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
 import {
   boundedDamerauLevenshtein,
@@ -79,10 +80,12 @@ export async function createSearch(options = {}) {
   const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
   const termDirectory = createDirectoryState(manifest.directory);
+  const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
   const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
   const shardCache = new Map();
+  const queryBundleCache = new Map();
   const typoShardCache = new Map();
   const docOrdinalCache = new Map();
   const docPointerCache = new Map();
@@ -510,6 +513,95 @@ export async function createSearch(options = {}) {
       }
     }
     return out;
+  }
+
+  async function loadQueryBundle(key) {
+    if (!queryBundleDirectory || options.queryBundles === false) return null;
+    if (!queryBundleCache.has(key)) {
+      const promise = (async () => {
+        const root = await loadDirectoryRoot(queryBundleDirectory);
+        const resolved = await directoryEntryFromRoot(queryBundleDirectory, root, key);
+        if (!resolved) return null;
+        const buffer = await fetchRange(new URL(`bundles/packs/${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
+        return {
+          bundle: parseQueryBundle(await inflateObject(buffer, resolved.entry, `query bundle ${key}`)),
+          bytes: resolved.entry.length
+        };
+      })();
+      promise.catch(() => {
+        queryBundleCache.delete(key);
+      });
+      queryBundleCache.set(key, promise);
+    }
+    return queryBundleCache.get(key);
+  }
+
+  function bundleProvesTopK(bundle, k) {
+    if (!bundle) return false;
+    if (bundle.complete) return true;
+    if (k > bundle.rows.length || !bundle.rows.length) return false;
+    const boundary = bundle.rows[k - 1];
+    if (!boundary) return false;
+    if ((bundle.nextScoreBound || 0) < boundary[1]) return true;
+    return (bundle.nextScoreBound || 0) === boundary[1]
+      && bundle.nextTieDoc != null
+      && bundle.nextTieDoc > boundary[0];
+  }
+
+  async function tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank }) {
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters || sortPlan || !baseTerms.length || k > (manifest.query_bundles?.max_rows || 0)) return null;
+    if (manifest.query_bundles?.coverage !== "all-base-docs") return null;
+    if (rerank !== false && dependencyTerms(baseTerms).length) return null;
+
+    let lookups = 0;
+    for (const plan of queryBundleKeysFromBaseTerms(baseTerms)) {
+      lookups++;
+      const loaded = await loadQueryBundle(plan.key);
+      const bundle = loaded?.bundle;
+      if (!bundle || !bundleProvesTopK(bundle, k)) continue;
+      const rows = bundle.rows.slice(offset, offset + size);
+      const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+      const results = await rowsToResults(rows, resultContext);
+      return {
+        total: bundle.total,
+        page,
+        size,
+        approximate: false,
+        results,
+        stats: {
+          exact: true,
+          plannerLane: "queryBundleExact",
+          topKProven: true,
+          totalExact: true,
+          tailExhausted: false,
+          blocksDecoded: 0,
+          postingsDecoded: 0,
+          postingsAccepted: 0,
+          skippedBlocks: 0,
+          terms: plan.expandedTerms.length,
+          shards: 0,
+          queryBundleLookups: lookups,
+          queryBundleHit: true,
+          queryBundleRows: bundle.rows.length,
+          queryBundleTotal: bundle.total,
+          queryBundleBytes: loaded.bytes || 0,
+          queryBundleComplete: bundle.complete,
+          docPayloadLane: resultContext.docPayloadLane,
+          docPayloadPages: resultContext.docPayloadPages,
+          docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+          docPayloadAdaptive: resultContext.docPayloadAdaptive,
+          rerankCandidates: 0,
+          dependencyFeatures: 0,
+          dependencyTermsMatched: 0,
+          dependencyPostingsScanned: 0,
+          dependencyCandidateMatches: 0
+        }
+      };
+    }
+    return null;
   }
 
   function dependencyTerms(baseTerms) {
@@ -1484,8 +1576,11 @@ export async function createSearch(options = {}) {
       return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank });
     }
 
-    await ensureFacetDictionaries(filters);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank });
+    if (bundleResponse) return bundleResponse;
+
+    await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
@@ -1500,7 +1595,7 @@ export async function createSearch(options = {}) {
       skippedBlocks: 0
     }));
     if (!cursors.length) {
-      return { total: 0, page, size, results: [], approximate: false, stats: { exact: true, blocksDecoded: 0, postingsDecoded: 0, postingsAccepted: 0, skippedBlocks: 0, terms: terms.length, shards: 0 } };
+      return { total: 0, page, size, results: [], approximate: false, stats: { exact: true, plannerLane: "empty", topKProven: true, totalExact: true, tailExhausted: true, blocksDecoded: 0, postingsDecoded: 0, postingsAccepted: 0, skippedBlocks: 0, terms: terms.length, shards: 0 } };
     }
 
     const scores = new Map();
@@ -1570,6 +1665,10 @@ export async function createSearch(options = {}) {
       results,
       stats: {
         exact: exhausted,
+        plannerLane: exhausted ? "fullFallback" : "tailProof",
+        topKProven: Boolean(stable || exhausted),
+        totalExact: exhausted,
+        tailExhausted: exhausted,
         blocksDecoded,
         postingsDecoded,
         postingsAccepted,
@@ -1643,6 +1742,10 @@ export async function createSearch(options = {}) {
       approximate: false,
       stats: {
         exact: true,
+        plannerLane: "fullFallback",
+        topKProven: true,
+        totalExact: true,
+        tailExhausted: true,
         terms: terms.length,
         shards: new Set(entries.map(item => item.shardName)).size,
         postings: entries.reduce((sum, item) => sum + item.entry.count, 0),

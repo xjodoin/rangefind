@@ -74,6 +74,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
     postingBlockSize: 2,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0,
+    queryBundleMinSeedDocs: 1,
     fields: [
       { name: "title", path: "title", weight: 4.5, b: 0.55, phrase: true },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
@@ -94,6 +95,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.features.docLocalityLayout, true);
   assert.equal(manifest.features.docPages, true);
   assert.equal(manifest.features.docValueSorted, true);
+  assert.equal(manifest.features.queryBundles, true);
   assert.equal(manifest.object_store.pointer_format, "rfbp-v1");
   assert.equal(manifest.object_store.immutable_names, true);
   assert.equal(manifest.docs.layout.format, "rflocal-doc-v1");
@@ -123,6 +125,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, "docs", "page-packs", manifest.docs.pages.pointers.pack_table[0])));
   assert.ok(await readFile(join(output, manifest.directory.root)));
   assert.ok(await readFile(join(output, "terms", "block-packs", manifest.object_store.pack_table.postingBlocks[0])));
+  assert.ok(manifest.query_bundles);
+  assert.equal(manifest.query_bundles.format, "rfqbundle-v1");
+  assert.equal(manifest.query_bundles.coverage, "all-base-docs");
+  assert.ok(manifest.query_bundles.keys > 0);
+  assert.ok(await readFile(join(output, manifest.query_bundles.directory.root)));
+  assert.ok(await readFile(join(output, "bundles", "packs", manifest.object_store.pack_table.queryBundles[0])));
   assert.equal(manifest.doc_values.storage, "range-pack-v1");
   assert.ok(manifest.doc_values.fields.tags);
   assert.ok(manifest.doc_values.fields.published);
@@ -173,6 +181,18 @@ test("builder output is searchable through the range-based runtime", async (t) =
     singleTermExact.results.map(result => result.title)
   );
   assert.ok(singleTerm.stats.blocksDecoded < singleTermExact.stats.blocksDecoded);
+
+  const bundled = await search.search({ q: "static range", size: 2, rerank: false });
+  const bundledExact = await search.search({ q: "static range", size: 2, exact: true, rerank: false });
+  assert.deepEqual(
+    bundled.results.map(result => result.title),
+    bundledExact.results.map(result => result.title)
+  );
+  assert.equal(bundled.stats.plannerLane, "queryBundleExact");
+  assert.equal(bundled.stats.topKProven, true);
+  assert.equal(bundled.stats.totalExact, true);
+  assert.equal(bundled.stats.blocksDecoded, 0);
+  assert.equal(bundled.stats.postingsDecoded, 0);
 
   const typo = await search.search({ q: "statik range search", size: 3 });
   assert.equal(typo.results[0].title, "Static range search");

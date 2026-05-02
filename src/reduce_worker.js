@@ -15,6 +15,7 @@ const {
   runsOut,
   shardOut,
   sortOut,
+  bundleTerms,
   typoOptions,
   typoRunsOut
 } = workerData;
@@ -22,14 +23,19 @@ const {
 mkdirSync(shardOut, { recursive: true });
 const codes = openCodeStore(codeDescriptor);
 const typoBuffer = typoOptions?.enabled ? createTypoRunBuffer(typoRunsOut, typoOptions) : null;
+const bundleTermSet = new Set(bundleTerms || []);
 
 async function reduceBaseShard(baseShard) {
   const path = resolve(runsOut, `${baseShard}.run`);
+  const bundleDfs = [];
   const stats = await reduceRunToPartitions({
     runPath: path,
     scratchDir: resolve(sortOut, encodeURIComponent(baseShard)),
     config,
-    onTerm: (term, df) => addTypoIndexTerm(typoBuffer, term, df, measuredTotal),
+    onTerm: (term, df) => {
+      addTypoIndexTerm(typoBuffer, term, df, measuredTotal);
+      if (bundleTermSet.has(term)) bundleDfs.push([term, df]);
+    },
     onPartition: (partition, sequence) => {
       const encoded = buildTermShard(partition.entries, measuredTotal, codes, filters, config);
       const compressed = gzipSync(encoded, { level: 6 });
@@ -40,7 +46,7 @@ async function reduceBaseShard(baseShard) {
     }
   });
   unlinkSync(path);
-  return { terms: stats.terms, postings: stats.postings, shards: stats.partitions };
+  return { terms: stats.terms, postings: stats.postings, shards: stats.partitions, bundleDfs };
 }
 
 async function finish() {

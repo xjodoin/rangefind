@@ -11,6 +11,7 @@ export const DOC_PAGE_POINTER_MAGIC = [0x52, 0x46, 0x50, 0x47]; // RFPG
 export const DOC_PAGE_PAYLOAD_MAGIC = [0x52, 0x46, 0x50, 0x43]; // RFPC
 export const DOC_VALUE_SORT_DIRECTORY_MAGIC = [0x52, 0x46, 0x44, 0x54]; // RFDT
 export const DOC_VALUE_SORT_PAGE_MAGIC = [0x52, 0x46, 0x44, 0x56]; // RFDV
+export const QUERY_BUNDLE_MAGIC = [0x52, 0x46, 0x51, 0x42]; // RFQB
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));

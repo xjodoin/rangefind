@@ -368,6 +368,7 @@ function networkBucket(url) {
   if (path.endsWith("/runtime.browser.js")) return "runtime";
   if (/\/manifest(?:\.[0-9a-f]+)?\.json$/u.test(path)) return "manifest";
   if (path.includes("/directory-")) return "directory";
+  if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/facets/packs/")) return "facetDictionaries";
@@ -504,6 +505,10 @@ function validateResponse(item, response, manifest) {
 function compactRuntimeStats(stats = {}) {
   return {
     exact: Boolean(stats.exact),
+    plannerLane: stats.plannerLane || "",
+    topKProven: Boolean(stats.topKProven),
+    totalExact: Boolean(stats.totalExact),
+    tailExhausted: Boolean(stats.tailExhausted),
     blocksDecoded: stats.blocksDecoded || 0,
     postingsDecoded: stats.postingsDecoded || 0,
     postingsAccepted: stats.postingsAccepted || 0,
@@ -538,6 +543,12 @@ function compactRuntimeStats(stats = {}) {
     docValueChunkPruning: Boolean(stats.docValueChunkPruning),
     docValueChunksVisited: stats.docValueChunksVisited || 0,
     docValueChunksPruned: stats.docValueChunksPruned || 0,
+    queryBundleLookups: stats.queryBundleLookups || 0,
+    queryBundleHit: Boolean(stats.queryBundleHit),
+    queryBundleRows: stats.queryBundleRows || 0,
+    queryBundleTotal: stats.queryBundleTotal || 0,
+    queryBundleBytes: stats.queryBundleBytes || 0,
+    queryBundleComplete: Boolean(stats.queryBundleComplete),
     surfaceFallbackAttempted: Boolean(stats.surfaceFallbackAttempted),
     surfaceFallbackApplied: Boolean(stats.surfaceFallbackApplied),
     surfaceFallbackTerms: stats.surfaceFallbackTerms || [],
@@ -714,6 +725,11 @@ function summarizeScaleRow(row) {
     postingBlockFrontierBlocks: row.coldStats?.postingBlockFrontierBlocks || 0,
     postingBlockFrontierFetchGroups: row.coldStats?.postingBlockFrontierFetchGroups || 0,
     postingBlockFrontierWantedBlocks: row.coldStats?.postingBlockFrontierWantedBlocks || 0,
+    plannerLane: row.coldStats?.plannerLane || "",
+    topKProven: row.coldStats?.topKProven || false,
+    totalExact: row.coldStats?.totalExact || false,
+    queryBundleHit: row.coldStats?.queryBundleHit || false,
+    queryBundleBytes: row.coldStats?.queryBundleBytes || 0,
     docValuePruning: row.coldStats?.docValuePruning || false,
     docValuePruneField: row.coldStats?.docValuePruneField || "",
     docValuePagesVisited: row.coldStats?.docValuePagesVisited || 0,
