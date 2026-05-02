@@ -222,10 +222,15 @@ guiding format decisions.
 
 ## Project Direction
 
-This is the first standalone extraction. The next milestones are:
+Planned next milestones:
 
 - Pagefind/Lucene/SQLite benchmark package,
 - build-time sparse expansion hooks,
 - WASM-free and WASM-assisted runtime comparisons,
-- CI release workflow,
-- published npm package.
+- CI release workflow + published npm package.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE) © Xavier Jodoin

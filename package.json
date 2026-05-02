@@ -4,6 +4,29 @@
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",
+  "author": "Xavier Jodoin <xavier@jodoin.me>",
+  "homepage": "https://github.com/xjodoin/rangefind#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xjodoin/rangefind.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xjodoin/rangefind/issues"
+  },
+  "keywords": [
+    "search",
+    "static-site",
+    "static-search",
+    "inverted-index",
+    "bm25",
+    "range-requests",
+    "client-side-search",
+    "browser-search",
+    "serverless"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
     "rangefind": "./bin/rangefind.js"
   },
@@ -24,7 +47,8 @@
     "examples/basic/public/index.html",
     "examples/frwiki/README.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CONTRIBUTING.md"
   ],
   "scripts": {
     "build:browser": "node scripts/build_browser_bundle.mjs",
