@@ -233,12 +233,31 @@ the paged term directory. This removes the old dependency on a retained
 directory page payloads at once.
 
 When `partitionReducerWorkers` or `builderWorkerCount` enables reducer workers,
-posting partitions are encoded in worker threads. Workers write term packs and
-external posting-block packs into the shared numeric pack directories through
-atomic pack-index counters, so posting segment headers can keep stable numeric
-block-pack indexes. The main thread still owns final directory assembly, which
-keeps range lookup deterministic while moving partition encoding off the main
-event loop.
+posting partitions are represented as byte ranges into the binary reduced-term
+spool. The main thread sends workers only partition descriptors: shard name,
+byte range, term count, row count, and estimated input bytes. Workers stream
+those ranges back from disk, so large posting arrays are not structured-cloned
+between heaps and the builder does not duplicate the reduced term stream. A
+reducer scheduler accounts active partition bytes with
+`partitionReducerInFlightBytes`; if it is unset, the limit is derived from
+`builderMemoryBudgetBytes`, or from reducer worker count and pack target size
+when no global budget is configured. Workers write term packs and external
+posting-block packs into the shared numeric pack directories through atomic
+pack-index counters, so posting segment headers can keep stable numeric
+block-pack indexes. Worker pack finalization is staggered to avoid simultaneous
+completion peaks. Posting-segment objects are emitted as header/body chunks.
+Small partitions use fast buffered gzip; partitions at or above
+`postingSegmentStreamMinBytes` gzip directly into append-only packs while
+hashing the compressed stream, which avoids retaining both a full raw segment
+buffer and a full compressed buffer for large partitions. The main thread still
+owns final directory assembly, which keeps range lookup deterministic while
+moving partition encoding off the main event loop.
+
+Large posting lists whose doc ids are already sorted use impact-bucket ordering
+instead of a JavaScript comparator sort when the quantized impact range fits
+`postingImpactBucketOrderMaxBuckets`. This keeps impact-ordered block-max output
+but turns the common high-df reducer path into linear counting/bucket placement
+rather than `O(n log n)` object-array sorting.
 
 The first ingestion pass also writes two extra file-backed spools. A
 selected-term spool stores each document's final selected scoring terms and
@@ -255,8 +274,10 @@ and filter bitmaps now consume the same typed row source. Numeric, date,
 boolean, single facet, and multi-facet rows are therefore extracted once during
 scan instead of re-reading the source corpus for every downstream artifact.
 Reducer workers use `codeStoreWorkerCacheChunks` to cap their file-backed
-field-row caches independently from the main build process, which keeps worker
-parallelism from multiplying the full main-thread code-store cache.
+field-row caches independently from the main build process. When it is `0`, the
+builder chooses enough chunks to cover the corpus up to
+`codeStoreWorkerMaxAutoCacheChunks`, which avoids repeated random re-reads on
+large high-df posting lists while still bounding worker memory.
 
 The final pack writer still emits immutable range-pack objects in deterministic
 term order, and externalizes large posting blocks into `terms/block-packs/`.

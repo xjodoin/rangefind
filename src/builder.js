@@ -22,7 +22,7 @@ import {
   buildBlockFilters,
   buildDocValueChunk,
   buildFacetDictionary,
-  buildPostingSegment,
+  buildPostingSegmentChunks,
   docValueFields,
   POSTING_SEGMENT_FORMAT
 } from "./codec.js";
@@ -43,8 +43,8 @@ import { eachJsonLine } from "./jsonl.js";
 import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
 import { buildIndexOptimizerReport, INDEX_OPTIMIZER_PATH } from "./optimizer.js";
-import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard } from "./packs.js";
-import { postingRowCount } from "./posting_rows.js";
+import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard, writePackedShardChunks } from "./packs.js";
+import { partitionInputBytes, partitionTermEntries } from "./reduced_terms.js";
 import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
@@ -1118,7 +1118,9 @@ function emptyPostingSegmentStats() {
     blockCodecSelectedBytes: 0,
     blockCodecImpactRunCandidateBytes: 0,
     blockCodecImpactBitsetCandidateBytes: 0,
-    blockCodecPartitionedDeltaCandidateBytes: 0
+    blockCodecPartitionedDeltaCandidateBytes: 0,
+    impactBucketOrderTerms: 0,
+    impactBucketOrderPostings: 0
   };
 }
 
@@ -1126,7 +1128,7 @@ function addPostingSegmentStats(target, source) {
   for (const key of Object.keys(target)) target[key] += source?.[key] || 0;
 }
 
-function buildFinalPostingSegment(entries, total, codes, filters, config, blockPackWriter) {
+function buildFinalPostingSegmentChunks(entries, total, codes, filters, config, blockPackWriter) {
   const writeBlock = !blockPackWriter || config.externalPostingBlocks === false ? null : ({ term, blockIndex, bytes }) => {
     const key = `${term}\u0000${blockIndex}\u0000${blockPackWriter.bytes}`;
     return writePackedShard(blockPackWriter, key, gzipSync(bytes, { level: 6 }), {
@@ -1135,7 +1137,7 @@ function buildFinalPostingSegment(entries, total, codes, filters, config, blockP
       logicalLength: bytes.length
     });
   };
-  return buildPostingSegment(entries, total, codes, filters, config, writeBlock);
+  return buildPostingSegmentChunks(entries, total, codes, filters, config, writeBlock);
 }
 
 function scanWorkerCount(config) {
@@ -1150,7 +1152,11 @@ function partitionReducerWorkerCount(config) {
 
 function codeStoreDescriptorForPartitionWorkers(codes, config) {
   const descriptor = codes.descriptor();
-  const cacheChunks = Math.max(1, Math.floor(Number(config.codeStoreWorkerCacheChunks || descriptor.cacheChunks || 1)));
+  const explicit = Math.max(0, Math.floor(Number(config.codeStoreWorkerCacheChunks || 0)));
+  const cacheDocs = Math.max(1, Math.floor(Number(descriptor.cacheDocs || config.codeStoreCacheDocs || 1)));
+  const totalChunks = Math.max(1, Math.ceil(Math.max(0, Number(descriptor.total || 0)) / cacheDocs));
+  const maxAuto = Math.max(1, Math.floor(Number(config.codeStoreWorkerMaxAutoCacheChunks || 64)));
+  const cacheChunks = explicit || Math.min(maxAuto, totalChunks);
   return {
     ...descriptor,
     cacheChunks
@@ -1436,6 +1442,11 @@ function createPartitionReducerPool(config) {
   const count = partitionReducerWorkerCount(config);
   const termPackCounterBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const blockPackCounterBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const explicitCredit = Math.max(0, Math.floor(Number(config.partitionReducerInFlightBytes || 0)));
+  const memoryBudget = Math.max(0, Math.floor(Number(config.builderMemoryBudgetBytes || 0)));
+  const packBudget = Math.max(Number(config.packBytes || 0), Number(config.postingBlockPackBytes || 0), 4 * 1024 * 1024);
+  const autoCredit = Math.max(32 * 1024 * 1024, Math.floor(count * packBudget * 4));
+  const creditLimitBytes = explicitCredit || (memoryBudget ? Math.max(8 * 1024 * 1024, Math.floor(memoryBudget / 2)) : autoCredit);
   const workers = Array.from({ length: count }, (_, index) => ({
     index,
     worker: new Worker(new URL("./reduce_partition_worker.js", import.meta.url), { type: "module" }),
@@ -1443,14 +1454,34 @@ function createPartitionReducerPool(config) {
     inputBytes: 0,
     reduceMs: 0,
     finishMs: 0,
-    mode: "worker-thread"
+    mode: "worker-thread",
+    closed: false
   }));
   const available = workers.slice();
   const active = new Set();
   let nextId = 0;
+  let activeInputBytes = 0;
+  let maxActiveInputBytes = 0;
+  let creditWaitMs = 0;
+  let creditWaits = 0;
 
-  async function waitForWorker() {
-    while (!available.length) await Promise.race(active);
+  function hasCredit(inputBytes) {
+    return !Number.isFinite(creditLimitBytes) || activeInputBytes === 0 || activeInputBytes + inputBytes <= creditLimitBytes;
+  }
+
+  async function checkoutWorker(inputBytes) {
+    const started = performance.now();
+    let waited = false;
+    while (!available.length || !hasCredit(inputBytes)) {
+      waited = true;
+      await Promise.race(active);
+    }
+    if (waited) {
+      creditWaits++;
+      creditWaitMs += performance.now() - started;
+    }
+    activeInputBytes += inputBytes;
+    maxActiveInputBytes = Math.max(maxActiveInputBytes, activeInputBytes);
     return available.pop();
   }
 
@@ -1459,17 +1490,18 @@ function createPartitionReducerPool(config) {
     termPackCounterBuffer,
     blockPackCounterBuffer,
     async reduce(partition, message) {
-      const entry = await waitForWorker();
+      const inputBytes = partitionInputBytes(partition);
+      const entry = await checkoutWorker(inputBytes);
       const id = nextId++;
-      const inputBytes = partition.entries.reduce((sum, [term, rows]) => sum + String(term).length + postingRowCount(rows) * 8, 0);
       const promise = postReducePartition(entry.worker, { ...message, id, partition })
         .then((result) => {
           entry.tasks++;
-          entry.inputBytes += inputBytes;
+          entry.inputBytes += result.inputBytes || inputBytes;
           entry.reduceMs += result.ms || 0;
           return { ...result, worker: entry.index };
         })
         .finally(() => {
+          activeInputBytes -= inputBytes;
           active.delete(promise);
           available.push(entry);
         });
@@ -1486,13 +1518,25 @@ function createPartitionReducerPool(config) {
         mode: entry.mode
       }));
     },
+    schedulerStats() {
+      return {
+        creditLimitBytes: Number.isFinite(creditLimitBytes) ? creditLimitBytes : 0,
+        maxActiveInputBytes,
+        creditWaitMs,
+        creditWaits,
+        finishMode: "staggered"
+      };
+    },
     async finish() {
       while (active.size) await Promise.race(active);
-      const results = await Promise.all(workers.map(async (entry) => {
+      const results = [];
+      for (const entry of workers) {
         const result = await postReducePartition(entry.worker, { id: nextId++, kind: "finish" });
         entry.finishMs += result.ms || 0;
-        return result;
-      }));
+        await entry.worker.terminate();
+        entry.closed = true;
+        results.push(result);
+      }
       return {
         packs: results.flatMap(result => result.packs || []),
         packBytes: results.reduce((sum, result) => sum + (result.packBytes || 0), 0),
@@ -1501,7 +1545,7 @@ function createPartitionReducerPool(config) {
       };
     },
     async close() {
-      await Promise.allSettled(workers.map(entry => entry.worker.terminate()));
+      await Promise.allSettled(workers.filter(entry => !entry.closed).map(entry => entry.worker.terminate()));
     }
   };
 }
@@ -1602,12 +1646,13 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
           finalShards.add(partition.name);
           return partition.name;
         }
-        const encoded = buildFinalPostingSegment(partition.entries, measured.total, runData.codes, filters, config, blockPackWriter);
+        const encoded = buildFinalPostingSegmentChunks(partitionTermEntries(partition), measured.total, runData.codes, filters, config, blockPackWriter);
         addPostingSegmentStats(blockStats, encoded.stats);
-        const entry = writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }), {
+        const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
           kind: "posting-segment",
           codec: encoded.format || POSTING_SEGMENT_FORMAT,
-          logicalLength: encoded.buffer.length
+          logicalLength: encoded.logicalLength,
+          streamMinBytes: config.postingSegmentStreamMinBytes
         });
         appendDirectoryEntry(directorySpool, partition.name, entry);
         finalShards.add(partition.name);
@@ -1635,6 +1680,7 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
     termCount: stats.terms,
     postingCount: stats.postings,
     bundleDfs,
+    workerCodeStoreCacheChunks: workerCodesDescriptor?.cacheChunks || 0,
     workerStats: usePartitionWorkers ? partitionPool.stats() : [{
       worker: 0,
       tasks: runData.segments.length,
@@ -1643,7 +1689,16 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       finishMs: 0,
       mode: "main-thread"
     }],
-    reduceTimings: { finalPackAssemblyMs: 0 }
+    reduceTimings: {
+      finalPackAssemblyMs: 0,
+      partitionScheduler: usePartitionWorkers ? partitionPool.schedulerStats() : {
+        creditLimitBytes: 0,
+        maxActiveInputBytes: 0,
+        creditWaitMs: 0,
+        creditWaits: 0,
+        finishMode: "main-thread"
+      }
+    }
   };
   const packIndexes = new Map(reduced.packs.map((pack, index) => [pack.file, index]));
   const entries = sortedDirectoryEntrySpool(reduced.directorySpool, {
@@ -1670,6 +1725,7 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
     segmentSummary: runData.segmentSummary,
     mergeTiers: stats.mergeTiers || [],
     mergePolicy: stats.mergePolicy || null,
+    workerCodeStoreCacheChunks: reduced.workerCodeStoreCacheChunks || 0,
     workerStats: reduced.workerStats || [],
     reduceTimings: {
       ...(reduced.reduceTimings || {}),
@@ -1678,6 +1734,8 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       segmentPartitionAssemblyMs: stats.timings?.partitionAssemblyMs || 0
     },
     reducedSpoolBytes: stats.reducedSpoolBytes || 0,
+    partitionSpoolBytes: stats.partitionSpoolBytes || 0,
+    partitionSpoolEntries: stats.partitionSpoolEntries || 0,
     typoIndexTerms
   };
 }
@@ -1912,6 +1970,8 @@ export async function build({ configPath }) {
       segment_reduced_spool_ms: reduced.reduceTimings.segmentReducedSpoolMs || 0,
       segment_partition_assembly_ms: reduced.reduceTimings.segmentPartitionAssemblyMs || 0,
       segment_reduced_spool_bytes: reduced.reducedSpoolBytes || 0,
+      segment_partition_spool_bytes: reduced.partitionSpoolBytes || 0,
+      segment_partition_spool_entries: reduced.partitionSpoolEntries || 0,
       segment_directory_spool_bytes: reduced.directorySpoolBytes || 0,
       segment_directory_spool_entries: reduced.directorySpoolEntries || 0,
       segment_merge_policy: reduced.mergePolicy?.policy || "",
@@ -1925,6 +1985,11 @@ export async function build({ configPath }) {
       segment_merge_tier_outputs: reduced.mergeTiers.map(tier => tier.output_segments),
       partition_reducer_workers: reduced.workerStats.length,
       partition_reducer_worker_mode: reduced.workerStats.some(worker => worker.mode === "worker-thread") ? "worker-thread-owned-packs" : "main-thread",
+      partition_reducer_credit_limit_bytes: reduced.reduceTimings.partitionScheduler?.creditLimitBytes || 0,
+      partition_reducer_max_active_input_bytes: reduced.reduceTimings.partitionScheduler?.maxActiveInputBytes || 0,
+      partition_reducer_credit_wait_ms: reduced.reduceTimings.partitionScheduler?.creditWaitMs || 0,
+      partition_reducer_credit_waits: reduced.reduceTimings.partitionScheduler?.creditWaits || 0,
+      partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
       typo_index_terms: reduced.typoIndexTerms || 0
     });
     const segmentManifest = await timeBuildPhase(telemetry, "segment-manifest", () => writeSegmentManifest(dirs.out, {
@@ -2158,6 +2223,7 @@ export async function build({ configPath }) {
       posting_segment_directory_bytes: reduced.directory.total_bytes,
       posting_segment_pack_files: reduced.packs.length,
       posting_segment_pack_bytes: reduced.packBytes,
+      posting_segment_stream_min_bytes: config.postingSegmentStreamMinBytes,
       posting_segment_block_pack_files: reduced.blockPacks.length,
       posting_segment_block_pack_bytes: reduced.blockPackBytes,
       external_posting_segment_blocks: reduced.blockStats.externalBlocks,
@@ -2182,6 +2248,8 @@ export async function build({ configPath }) {
       posting_segment_block_codec_impact_bitset_candidate_bytes: reduced.blockStats.blockCodecImpactBitsetCandidateBytes,
       posting_segment_block_codec_partitioned_delta_candidate_bytes: reduced.blockStats.blockCodecPartitionedDeltaCandidateBytes,
       posting_segment_block_codec_bytes_saved: Math.max(0, reduced.blockStats.blockCodecBaselineBytes - reduced.blockStats.blockCodecSelectedBytes),
+      posting_segment_impact_bucket_order_terms: reduced.blockStats.impactBucketOrderTerms,
+      posting_segment_impact_bucket_order_postings: reduced.blockStats.impactBucketOrderPostings,
       doc_storage: docs.storage,
       doc_layout_format: docs.layout.format,
       doc_layout_primary_terms: docs.layout.primary_terms,
@@ -2255,9 +2323,17 @@ export async function build({ configPath }) {
       segment_merge_workers: 1,
       partition_reducer_workers: reduced.workerStats.length,
       partition_reducer_worker_mode: reduced.workerStats.some(worker => worker.mode === "worker-thread") ? "worker-thread-owned-packs" : "main-thread",
+      partition_reducer_credit_limit_bytes: reduced.reduceTimings.partitionScheduler?.creditLimitBytes || 0,
+      partition_reducer_max_active_input_bytes: reduced.reduceTimings.partitionScheduler?.maxActiveInputBytes || 0,
+      partition_reducer_credit_wait_ms: Math.round(reduced.reduceTimings.partitionScheduler?.creditWaitMs || 0),
+      partition_reducer_credit_waits: reduced.reduceTimings.partitionScheduler?.creditWaits || 0,
+      partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
+      code_store_worker_cache_chunks: reduced.workerCodeStoreCacheChunks || 0,
       segment_merge_fan_in: config.segmentMergeFanIn,
       segment_merge_tiers: reduced.mergeTiers.length,
       segment_reduced_spool_bytes: reduced.reducedSpoolBytes || 0,
+      segment_partition_spool_bytes: reduced.partitionSpoolBytes || 0,
+      segment_partition_spool_entries: reduced.partitionSpoolEntries || 0,
       segment_directory_spool_bytes: reduced.directorySpoolBytes || 0,
       segment_directory_spool_entries: reduced.directorySpoolEntries || 0,
       segment_merge_policy: reduced.mergePolicy?.policy || "",

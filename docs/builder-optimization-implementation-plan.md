@@ -242,6 +242,21 @@ This keeps future generic fields from adding more full-corpus passes.
         concatenating full term posting byte streams first.
   - [x] Let reducer workers keep external posting blocks enabled by writing
         term packs and block packs through shared atomic pack-index counters.
+  - [x] Replace reducer partition JS-object handoff with byte-range
+        descriptors over the binary reduced-term spool, so workers stream
+        partition rows from disk instead of receiving cloned posting arrays.
+  - [x] Add reducer input-byte credits and staggered worker finalization to
+        bound in-flight partition memory during large builds.
+  - [x] Use a hybrid posting-segment pack writer: fast buffered gzip for small
+        partitions and direct chunk streaming for large partitions, so reducers
+        avoid raw-plus-compressed buffer spikes without paying stream overhead
+        on tiny shards.
+  - [x] Replace large sorted posting-list comparator sorts with impact-bucket
+        ordering when quantized impact ranges are bounded, preserving
+        impact-ordered block-max layout with linear construction.
+  - [x] Make reducer worker code-store caches adaptive, so large corpora can
+        reuse field-code chunks across high-df posting blocks instead of
+        thrashing random file-backed reads with a fixed small cache.
 
 - [x] Shared field row pipeline
   - [x] Create a typed field-row spool in scan.
@@ -298,15 +313,58 @@ This keeps future generic fields from adding more full-corpus passes.
 - 100k builder-only run after bounding reducer worker code-store caches
   completed on 2026-05-03: 190.9s build time, 60.9s reducer time, 2.17 GB peak
   RSS, 351.2 MB index, 278 files, and 16 pack files.
+- 50k builder-only run after zero-copy reducer partition descriptors completed
+  on 2026-05-03: 90.8s build time, 22.4s reducer time, 1.91 GB peak RSS,
+  1.78 GB reducer peak RSS, 188.2 MB index, 179 files, 10 pack files,
+  41,395,452 partition range bytes over the existing reduced-term spool,
+  67,108,864 reducer credit-limit bytes, 673,912 max active reducer input
+  bytes, and no reducer credit waits.
+- 50k runtime-only bench against that rebuilt index completed on 2026-05-03:
+  25/25 rows valid, 16/16 exact-check rows passed, 10/10 default text rows
+  matched exact top-k, and average default text cold cost was 24.10 requests /
+  176.62 KB.
+- 50k builder-only run after streaming posting-segment pack writes completed on
+  2026-05-03: 92.8s build time, 22.6s reducer time, 1.78 GB peak RSS,
+  188.2 MB index, 180 files, and 11 pack files.
+- 100k builder-only run after streaming posting-segment pack writes completed
+  on 2026-05-03: 193.0s build time, 62.1s reducer time, 2.15 GB peak RSS,
+  351.2 MB index, 281 files, and 19 pack files. This reduces the reducer
+  completion peak versus the 2.34 GB zero-copy-descriptor run and is slightly
+  below the earlier 2.17 GB bounded-worker-cache baseline.
+- 100k runtime-only bench against that rebuilt index completed on 2026-05-03:
+  25/25 rows valid, 16/16 exact-check rows passed, 16/16 exact text rows
+  matched exact top-k, average text cold cost was 29.37 requests / 199.06 KB,
+  and average all-query cold cost was 24.76 requests / 162.06 KB.
+- 100k builder-only run after the final hybrid writer, impact-bucket ordering,
+  and adaptive reducer code-store cache completed on 2026-05-03: 181.3s build
+  time, 59.1s reducer time, 2.34 GB peak RSS, 351.2 MB index, 279 files, and
+  17 term pack files. Runtime-only reuse stayed valid: 25/25 rows valid,
+  16/16 exact-check rows passed, average text cold cost 29.37 requests /
+  199.05 KB, and average all-query cold cost 24.76 requests / 162.05 KB.
+- 500k builder-only run after the final hybrid writer, impact-bucket ordering,
+  and adaptive reducer code-store cache completed on 2026-05-03: 1,316.5s
+  build time, 767.3s reducer time, 3.57 GB peak RSS, 1.51 GB index, 956 files,
+  62 term pack files, and 37 posting-block pack files. Reducer workers auto-used
+  31 code-store cache chunks; impact-bucket ordering covered 4,506 terms and
+  48,461,049 postings. Runtime-only reuse stayed valid: 25/25 rows valid,
+  16/16 exact-check rows passed, average text cold cost 32.84 requests /
+  290.32 KB, and average all-query cold cost 27.40 requests / 259.60 KB.
 
 ### Acceptance Follow-Up
 
-- The implementation checklist is complete, but the 500k wall-time target is
-  not met yet. The latest 500k full build is 2,277.4s versus the previous
-  roughly 2,400s baseline, not the target 30 percent reduction.
-- Worker-safe external block packs and bounded worker code-store caches now
-  validate at 50k and 100k. The next acceptance step is reducing the reducer
-  completion peak before rerunning the reusable 500k builder/full bench.
+- The implementation checklist is complete, and the 500k wall-time target is
+  now met: 1,316.5s versus the previous 2,277.4s tracked 500k build-time note.
+  That is roughly a 42 percent reduction.
+- Worker-safe external block packs, byte-range reducer descriptors, hybrid
+  posting-segment pack writes, impact-bucket ordering, and adaptive worker
+  code-store caches validate at 100k and 500k with runtime correctness intact.
+- Reducer partition descriptors over the reduced-term spool, byte-credit
+  scheduling, staggered worker finalization, and streaming posting-segment pack
+  writes are now implemented. Peak RSS improved from the previous 3.96 GB 500k
+  run and the reducer completion peak dropped from the prior 3.69 GB note to
+  about 3.32 GB, but this does not yet meet the aspirational 40 percent peak-RSS
+  reduction target. The next target is scan/reducer finalization memory, not
+  reducer throughput.
 
 ## Acceptance Targets
 

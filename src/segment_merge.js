@@ -1,13 +1,10 @@
-import { closeSync, createReadStream, mkdirSync, openSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, rmSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { createPostingRowBuffer, appendPostingRow, postingRowCount, postingRowDoc, postingRowScore, resetPostingRows } from "./posting_rows.js";
+import { createPostingRowBuffer, appendPostingRow, resetPostingRows } from "./posting_rows.js";
+import { readReducedTermRanges, writeReducedTerm } from "./reduced_terms.js";
 import { readSegmentDirectory, readSegmentRowsFromFdInto, writeSegmentFromTermRows } from "./segment_builder.js";
 import { shardKey } from "./shards.js";
-import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
-
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 class MinHeap {
   constructor(compare) {
@@ -52,73 +49,6 @@ class MinHeap {
   get size() {
     return this.items.length;
   }
-}
-
-function encodeReducedTerm(term, rows, df) {
-  const termBytes = textEncoder.encode(String(term || ""));
-  const rowCount = postingRowCount(rows);
-  let bytes = varintLength(termBytes.length) + termBytes.length + varintLength(df) + varintLength(rowCount);
-  for (let i = 0; i < rowCount; i++) {
-    bytes += varintLength(postingRowDoc(rows, i)) + varintLength(postingRowScore(rows, i));
-  }
-  const out = Buffer.allocUnsafe(bytes);
-  let pos = writeVarint(out, 0, termBytes.length);
-  out.set(termBytes, pos);
-  pos += termBytes.length;
-  pos = writeVarint(out, pos, df);
-  pos = writeVarint(out, pos, rowCount);
-  for (let i = 0; i < rowCount; i++) {
-    pos = writeVarint(out, pos, postingRowDoc(rows, i));
-    pos = writeVarint(out, pos, postingRowScore(rows, i));
-  }
-  return out;
-}
-
-function reducedTermFromBytes(bytes, state) {
-  const start = state.pos;
-  const termLength = tryReadVarint(bytes, state);
-  if (termLength == null || state.pos + termLength > bytes.length) {
-    state.pos = start;
-    return null;
-  }
-  const term = textDecoder.decode(bytes.subarray(state.pos, state.pos + termLength));
-  state.pos += termLength;
-  const df = tryReadVarint(bytes, state);
-  if (df == null) {
-    state.pos = start;
-    return null;
-  }
-  const rowCount = tryReadVarint(bytes, state);
-  if (rowCount == null) {
-    state.pos = start;
-    return null;
-  }
-  const rows = createPostingRowBuffer(rowCount);
-  for (let i = 0; i < rowCount; i++) {
-    const doc = tryReadVarint(bytes, state);
-    const score = tryReadVarint(bytes, state);
-    if (doc == null || score == null) {
-      state.pos = start;
-      return null;
-    }
-    appendPostingRow(rows, doc, score);
-  }
-  return { term, df, rows };
-}
-
-async function* readReducedTerms(path) {
-  let pending = Buffer.alloc(0);
-  for await (const chunk of createReadStream(path)) {
-    const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    const state = { pos: 0 };
-    while (state.pos < bytes.length) {
-      const item = reducedTermFromBytes(bytes, state);
-      if (!item) break;
-      yield item;
-    }
-    pending = state.pos < bytes.length ? bytes.subarray(state.pos) : Buffer.alloc(0);
-  }
-  if (pending.length) throw new Error(`Truncated Rangefind merged segment file: ${path}`);
 }
 
 function segmentReaders(segments) {
@@ -228,8 +158,7 @@ async function mergeSegmentsToReducedSpool(segments, reducedPath, config, onTerm
   try {
     for await (const { term, rows } of mergedSegmentTermRows(segments, onTerm)) {
       const df = rows.length;
-      const encoded = encodeReducedTerm(term, rows, df);
-      writeSync(fd, encoded, 0, encoded.length);
+      writeReducedTerm(fd, term, rows, df);
       terms++;
       postings += df;
       addPrefixCounts(prefixCounts, term, df, config);
@@ -415,6 +344,8 @@ export async function mergeSegmentsToPartitions(options) {
   const reducedPath = resolve(scratchDir, "reduced-terms.run");
   let sequence = 0;
   const maxConcurrency = Math.max(1, Math.floor(Number(partitionConcurrency || 1)));
+  let partitionSpoolBytes = 0;
+  let partitionSpoolEntries = 0;
   try {
     const tierStart = performance.now();
     const tiered = await tierMergeSegments(segments, scratchDir, config);
@@ -439,18 +370,41 @@ export async function mergeSegmentsToPartitions(options) {
       promise.finally(() => activePartitions.delete(promise));
       while (activePartitions.size >= maxConcurrency) await Promise.race(activePartitions);
     }
-    let currentName = null;
-    let entries = [];
-    for await (const { term, rows } of readReducedTerms(reducedPath)) {
-      const name = partitionNameForTerm(term, reduced.prefixCounts, config);
-      if (currentName && name !== currentName) {
-        await queuePartition({ name: currentName, entries });
-        entries = [];
-      }
-      currentName = name;
-      entries.push([term, rows]);
+    function newPartition(name, offset) {
+      return {
+        format: "rfreducerpartition-v1",
+        name,
+        path: reducedPath,
+        offset,
+        length: 0,
+        terms: 0,
+        rows: 0,
+        inputBytes: 0,
+        firstTerm: "",
+        lastTerm: ""
+      };
     }
-    if (currentName) await queuePartition({ name: currentName, entries });
+    function addPartitionTerm(partition, item) {
+      partition.length += item.length;
+      partition.inputBytes += item.length;
+      partition.terms++;
+      partition.rows += item.df;
+      partitionSpoolEntries++;
+      if (!partition.firstTerm) partition.firstTerm = item.term;
+      partition.lastTerm = item.term;
+    }
+    let current = null;
+    for await (const item of readReducedTermRanges(reducedPath, { includeRows: false })) {
+      const name = partitionNameForTerm(item.term, reduced.prefixCounts, config);
+      if (current && name !== current.name) {
+        await queuePartition(current);
+        current = null;
+      }
+      if (!current) current = newPartition(name, item.offset);
+      addPartitionTerm(current, item);
+    }
+    if (current) await queuePartition(current);
+    partitionSpoolBytes = reducedSpoolBytes;
     await Promise.all(pendingPartitions);
     return {
       terms: reduced.terms,
@@ -463,7 +417,9 @@ export async function mergeSegmentsToPartitions(options) {
         reducedSpoolMs,
         partitionAssemblyMs: performance.now() - partitionStart
       },
-      reducedSpoolBytes
+      reducedSpoolBytes,
+      partitionSpoolBytes,
+      partitionSpoolEntries
     };
   } finally {
     rmSync(scratchDir, { recursive: true, force: true });

@@ -3,9 +3,9 @@ import { parentPort } from "node:worker_threads";
 import { performance } from "node:perf_hooks";
 import { gzipSync } from "node:zlib";
 import { openCodeStore } from "./build_store.js";
-import { buildPostingSegment, POSTING_SEGMENT_FORMAT } from "./codec.js";
-import { createAppendOnlyPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard } from "./packs.js";
-import { postingRowCount } from "./posting_rows.js";
+import { buildPostingSegmentChunks, POSTING_SEGMENT_FORMAT } from "./codec.js";
+import { createAppendOnlyPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard, writePackedShardChunks } from "./packs.js";
+import { partitionInputBytes, partitionRowCount, partitionTermCount, partitionTermEntries } from "./reduced_terms.js";
 
 let activeCodes = null;
 let activeCodesKey = "";
@@ -62,15 +62,19 @@ function writeBlockWith(writer) {
 
 function finishActiveWriters(id) {
   const started = performance.now();
-  if (activeBlockWriter) finalizePackWriter(activeBlockWriter);
-  if (activeTermWriter) finalizePackWriter(activeTermWriter);
+  const termWriter = activeTermWriter;
+  const blockWriter = activeBlockWriter;
+  if (blockWriter) finalizePackWriter(blockWriter);
+  if (termWriter) finalizePackWriter(termWriter);
+  activeTermWriter = null;
+  activeBlockWriter = null;
   closeActiveCodes();
   return {
     id,
-    packs: activeTermWriter?.packs || [],
-    packBytes: activeTermWriter?.bytes || 0,
-    blockPacks: activeBlockWriter?.packs || [],
-    blockPackBytes: activeBlockWriter?.bytes || 0,
+    packs: termWriter?.packs || [],
+    packBytes: termWriter?.bytes || 0,
+    blockPacks: blockWriter?.packs || [],
+    blockPackBytes: blockWriter?.bytes || 0,
     ms: performance.now() - started
   };
 }
@@ -94,19 +98,21 @@ async function reducePartition(message) {
   const codes = codeStoreForDescriptor(codesDescriptor);
   const packWriter = termWriterFor(termsOutDir, targetBytes, sharedCounter(termPackCounter));
   const blockWriter = blockWriterFor(config, blockOutDir, blockTargetBytes, sharedCounter(blockPackCounter));
-  const encoded = buildPostingSegment(partition.entries, total, codes, filters, config, writeBlockWith(blockWriter));
-  const entry = writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }), {
+  const encoded = buildPostingSegmentChunks(partitionTermEntries(partition), total, codes, filters, config, writeBlockWith(blockWriter));
+  const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
     kind: "posting-segment",
     codec: encoded.format || POSTING_SEGMENT_FORMAT,
-    logicalLength: encoded.buffer.length
+    logicalLength: encoded.logicalLength,
+    streamMinBytes: config.postingSegmentStreamMinBytes
   });
   return {
     id,
     name: partition.name,
     entry: resolvePackEntry(packWriter, entry),
     stats: encoded.stats,
-    rows: partition.entries.reduce((sum, [, rows]) => sum + postingRowCount(rows), 0),
-    terms: partition.entries.length,
+    inputBytes: partitionInputBytes(partition),
+    rows: partitionRowCount(partition),
+    terms: partitionTermCount(partition),
     ms: performance.now() - started
   };
 }

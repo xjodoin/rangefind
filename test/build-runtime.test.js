@@ -590,6 +590,12 @@ test("builder can reduce posting partitions in worker-owned packs", async (t) =>
   assert.ok(manifest.stats.external_posting_segment_blocks > 0);
   assert.equal(manifest.stats.partition_reducer_workers, 2);
   assert.equal(manifest.stats.partition_reducer_worker_mode, "worker-thread-owned-packs");
+  assert.ok(manifest.stats.segment_partition_spool_bytes > 0);
+  assert.ok(manifest.stats.segment_partition_spool_entries > 0);
+  assert.ok(manifest.stats.partition_reducer_credit_limit_bytes > 0);
+  assert.ok(manifest.stats.partition_reducer_max_active_input_bytes > 0);
+  assert.equal(manifest.stats.partition_reducer_finish_mode, "staggered");
+  assert.ok(manifest.stats.code_store_worker_cache_chunks > 0);
 
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());

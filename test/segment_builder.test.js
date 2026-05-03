@@ -13,6 +13,7 @@ import {
   shouldFlushSegment
 } from "../src/segment_builder.js";
 import { mergeSegmentsToPartitions } from "../src/segment_merge.js";
+import { partitionTermEntries } from "../src/reduced_terms.js";
 import { postingRowCount, postingRowDoc, postingRowScore } from "../src/posting_rows.js";
 
 function entriesToPairs(entries) {
@@ -103,6 +104,7 @@ test("segment merge combines terms and emits deterministic partitions", async ()
   const segments = finishSegmentBuilder(builder);
   const seenTerms = [];
   const partitions = [];
+  const partitionPairs = [];
 
   const stats = await mergeSegmentsToPartitions({
     segments,
@@ -110,7 +112,15 @@ test("segment merge combines terms and emits deterministic partitions", async ()
     config: { baseShardDepth: 1, maxShardDepth: 2, targetShardPostings: 10 },
     onTerm: (term, df) => seenTerms.push([term, df]),
     onPartition: (partition) => {
-      partitions.push(partition);
+      partitions.push({
+        name: partition.name,
+        length: partition.length,
+        terms: partition.terms,
+        rows: partition.rows,
+        inputBytes: partition.inputBytes,
+        entries: partition.entries
+      });
+      partitionPairs.push(...entriesToPairs([...partitionTermEntries(partition)]));
       return partition.name;
     }
   });
@@ -119,9 +129,13 @@ test("segment merge combines terms and emits deterministic partitions", async ()
   assert.equal(stats.terms, 3);
   assert.equal(stats.postings, 4);
   assert.ok(stats.reducedSpoolBytes > 0);
+  assert.ok(stats.partitionSpoolBytes > 0);
+  assert.equal(stats.partitionSpoolEntries, 3);
   assert.ok(stats.timings.reducedSpoolMs >= 0);
   assert.ok(stats.timings.partitionAssemblyMs >= 0);
-  assert.deepEqual(entriesToPairs(partitions.flatMap(partition => partition.entries)), [
+  assert.ok(partitions.every(partition => partition.entries == null));
+  assert.ok(partitions.every(partition => partition.length > 0 && partition.inputBytes === partition.length));
+  assert.deepEqual(partitionPairs, [
     ["alpha", [[1, 2], [4, 7]]],
     ["beta", [[3, 5]]],
     ["gamma", [[5, 11]]]
@@ -142,14 +156,14 @@ test("segment merge writes intermediate tiers before final partitioning", async 
     flushSegment(builder);
   }
   const segments = finishSegmentBuilder(builder);
-  const partitions = [];
+  const partitionPairs = [];
 
   const stats = await mergeSegmentsToPartitions({
     segments,
     scratchDir: join(root, "merge"),
     config: { baseShardDepth: 1, maxShardDepth: 2, targetShardPostings: 10, segmentMergeFanIn: 2 },
     onPartition: (partition) => {
-      partitions.push(partition);
+      partitionPairs.push(...entriesToPairs([...partitionTermEntries(partition)]));
       return partition.name;
     }
   });
@@ -166,7 +180,7 @@ test("segment merge writes intermediate tiers before final partitioning", async 
   assert.ok(stats.mergeTiers.every(tier => tier.batches.every(batch => batch.input_bytes > 0 && batch.output_bytes > 0)));
   assert.equal(stats.terms, 3);
   assert.equal(stats.postings, 5);
-  assert.deepEqual(entriesToPairs(partitions.flatMap(partition => partition.entries)), [
+  assert.deepEqual(partitionPairs, [
     ["alpha", [[1, 2], [3, 5]]],
     ["beta", [[2, 3], [5, 11]]],
     ["gamma", [[4, 7]]]

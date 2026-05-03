@@ -74,6 +74,31 @@ test("posting segment codec round-trips postings and block filters", () => {
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 2 });
 });
 
+test("posting segment codec bucket-orders large sorted posting lists by impact", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 64,
+    postingSuperblockSize: 4,
+    postingImpactBucketOrderMinRows: 128,
+    postingImpactBucketOrderMaxBuckets: 65536
+  };
+  const rows = Array.from({ length: 512 }, (_, doc) => [doc, doc % 7 === 0 ? 2000 : 500]);
+  const filters = buildBlockFilters(config, {});
+  const segment = buildPostingSegment([["common", rows]], 1024, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("common");
+  const decoded = decodePostings(shard, entry);
+  const docs = [];
+  for (let i = 0; i < decoded.length; i += 2) docs.push(decoded[i]);
+
+  assert.equal(segment.stats.impactBucketOrderTerms, 1);
+  assert.equal(segment.stats.impactBucketOrderPostings, 512);
+  assert.equal(entry.blocks[0].maxImpactDoc, 0);
+  assert.deepEqual([...docs].sort((a, b) => a - b), rows.map(([doc]) => doc));
+});
+
 test("posting segment codec writes external posting blocks directly", () => {
   const config = {
     facets: [],

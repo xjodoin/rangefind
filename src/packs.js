@@ -1,6 +1,8 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { resolve } from "node:path";
+import { createGzip, gzipSync } from "node:zlib";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH } from "./object_store.js";
 
 export function createPackWriter(outDir, targetBytes, options = {}) {
@@ -119,6 +121,81 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
   writer.bytes += compressed.length;
   const pack = writer.packs[writer.packs.length - 1];
   pack.bytes += compressed.length;
+  pack.shards++;
+  pack.objects++;
+  pack.references++;
+  return entry;
+}
+
+function chunksByteLength(chunks) {
+  let total = 0;
+  for (const chunk of chunks || []) total += chunk?.length || 0;
+  return total;
+}
+
+export async function writePackedShardChunks(writer, shard, chunks, metadata = {}) {
+  if (writer.finalized) throw new Error("Cannot write to finalized Rangefind pack writer.");
+  const logicalLength = metadata.logicalLength ?? chunksByteLength(chunks);
+  const streamMinBytes = Math.max(0, Math.floor(Number(metadata.streamMinBytes ?? 64 * 1024)));
+  if (logicalLength < streamMinBytes) {
+    const source = Buffer.concat(Array.from(chunks || [], chunk => Buffer.from(chunk)), logicalLength);
+    return writePackedShard(writer, shard, gzipSync(source, { level: metadata.gzipLevel ?? 6 }), {
+      ...metadata,
+      logicalLength
+    });
+  }
+  if (writer.dedupe) {
+    throw new Error("Streaming Rangefind pack writes require an append-only writer without dedupe.");
+  }
+  if (!writer.file || (writer.offset > 0 && writer.offset + logicalLength > writer.targetBytes)) openPack(writer);
+
+  const checksum = {
+    algorithm: metadata.checksumAlgorithm || OBJECT_CHECKSUM_ALGORITHM,
+    value: ""
+  };
+  const hash = createHash(checksum.algorithm);
+  const out = createWriteStream(writer.path, { flags: "a" });
+  const gzip = createGzip({ level: metadata.gzipLevel ?? 6 });
+  let physicalLength = 0;
+  const finished = new Promise((resolveDone, rejectDone) => {
+    const reject = (error) => {
+      gzip.destroy();
+      out.destroy();
+      rejectDone(error);
+    };
+    gzip.once("error", reject);
+    out.once("error", reject);
+    out.once("finish", resolveDone);
+  });
+  gzip.on("data", chunk => {
+    physicalLength += chunk.length;
+    hash.update(chunk);
+  });
+  gzip.pipe(out);
+  for (const chunk of chunks || []) {
+    if (!gzip.write(chunk)) await once(gzip, "drain");
+  }
+  gzip.end();
+  await finished;
+  checksum.value = hash.digest("hex");
+
+  const entry = {
+    pack: writer.file,
+    offset: writer.offset,
+    length: physicalLength,
+    physicalLength,
+    logicalLength,
+    kind: metadata.kind || null,
+    codec: metadata.codec || null,
+    compression: metadata.compression || "gzip-member",
+    checksum
+  };
+  writer.entryCount++;
+  if (writer.keepEntries) writer.entries[shard] = entry;
+  writer.offset += physicalLength;
+  writer.bytes += physicalLength;
+  const pack = writer.packs[writer.packs.length - 1];
+  pack.bytes += physicalLength;
   pack.shards++;
   pack.objects++;
   pack.references++;

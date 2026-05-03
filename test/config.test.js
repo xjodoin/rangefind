@@ -18,8 +18,13 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.directorySortChunkEntries, 16384);
   assert.equal(config.builderWorkerCount, 1);
   assert.equal(config.partitionReducerWorkers, 0);
+  assert.equal(config.partitionReducerInFlightBytes, 0);
   assert.equal(config.builderMemoryBudgetBytes, 0);
-  assert.equal(config.codeStoreWorkerCacheChunks, 8);
+  assert.equal(config.postingSegmentStreamMinBytes, 64 * 1024);
+  assert.equal(config.postingImpactBucketOrderMinRows, 2048);
+  assert.equal(config.postingImpactBucketOrderMaxBuckets, 65536);
+  assert.equal(config.codeStoreWorkerCacheChunks, 0);
+  assert.equal(config.codeStoreWorkerMaxAutoCacheChunks, 64);
   assert.equal(config.segmentFlushDocs, 0);
   assert.equal(config.segmentFlushBytes, 0);
   assert.equal(config.segmentMergePolicy, "tiered-log");

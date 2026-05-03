@@ -257,13 +257,18 @@ function encodePostings(rows, total, codes, filters, config) {
   const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
   const docs = new Int32Array(df);
   const impacts = new Int32Array(df);
-  const order = new Array(df);
+  let maxImpact = 0;
+  let docsSorted = true;
+  let previousDoc = -1;
   for (let i = 0; i < df; i++) {
     docs[i] = postingRowDoc(rows, i);
     impacts[i] = Math.max(1, Math.round(postingRowScore(rows, i) * idf / 10));
-    order[i] = i;
+    maxImpact = Math.max(maxImpact, impacts[i]);
+    if (docs[i] < previousDoc) docsSorted = false;
+    previousDoc = docs[i];
   }
-  order.sort((a, b) => impacts[b] - impacts[a] || docs[a] - docs[b]);
+  const orderPlan = postingImpactOrder(docs, impacts, maxImpact, docsSorted, config);
+  const order = orderPlan.order;
   const chunks = [];
   const blocks = [];
   let offset = 0;
@@ -297,7 +302,31 @@ function encodePostings(rows, total, codes, filters, config) {
     chunks.push(encodedBlock.bytes);
     offset += encodedBlock.bytes.length;
   }
-  return { df, count: order.length, byteLength: offset, chunks, blocks };
+  return { df, count: order.length, byteLength: offset, chunks, blocks, orderCodec: orderPlan.codec };
+}
+
+function postingImpactOrder(docs, impacts, maxImpact, docsSorted, config) {
+  const count = docs.length;
+  const minRows = Math.max(0, Math.floor(Number(config.postingImpactBucketOrderMinRows ?? 2048)));
+  const maxBuckets = Math.max(1, Math.floor(Number(config.postingImpactBucketOrderMaxBuckets ?? 65536)));
+  if (docsSorted && count >= minRows && maxImpact > 0 && maxImpact <= maxBuckets) {
+    const counts = new Int32Array(maxImpact + 1);
+    for (let i = 0; i < count; i++) counts[impacts[i]]++;
+    const starts = new Int32Array(maxImpact + 1);
+    let cursor = 0;
+    for (let impact = maxImpact; impact >= 0; impact--) {
+      starts[impact] = cursor;
+      cursor += counts[impact];
+    }
+    const next = new Int32Array(starts);
+    const order = new Int32Array(count);
+    for (let i = 0; i < count; i++) order[next[impacts[i]]++] = i;
+    return { order, codec: "impact-bucket" };
+  }
+  const order = new Array(count);
+  for (let i = 0; i < count; i++) order[i] = i;
+  order.sort((a, b) => impacts[b] - impacts[a] || docs[a] - docs[b]);
+  return { order, codec: "impact-sort" };
 }
 
 function concatUint8(chunks, total) {
@@ -531,11 +560,12 @@ function addPostingBlockCodecStats(stats, block) {
   stats.blockCodecPartitionedDeltaCandidateBytes += block.partitionedDeltaBytes || 0;
 }
 
-export function buildPostingSegment(entries, total, codes, filters, config, writeBlock) {
+export function buildPostingSegmentChunks(entries, total, codes, filters, config, writeBlock) {
   const minBlocks = Math.max(1, Number(config.externalPostingBlockMinBlocks || 0));
   const minBytes = Math.max(0, Number(config.externalPostingBlockMinBytes || 0));
   const header = [...POSTING_SEGMENT_MAGIC];
   const chunks = [];
+  let chunkBytes = 0;
   const directory = [];
   let postingOffset = 0;
   const stats = {
@@ -555,11 +585,20 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
     blockCodecSelectedBytes: 0,
     blockCodecImpactRunCandidateBytes: 0,
     blockCodecImpactBitsetCandidateBytes: 0,
-    blockCodecPartitionedDeltaCandidateBytes: 0
+    blockCodecPartitionedDeltaCandidateBytes: 0,
+    impactBucketOrderTerms: 0,
+    impactBucketOrderPostings: 0
   };
 
-  for (const [term, rows] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
+  const orderedEntries = Array.isArray(entries)
+    ? entries.slice().sort((a, b) => a[0].localeCompare(b[0]))
+    : entries;
+  for (const [term, rows] of orderedEntries) {
     const postings = encodePostings(rows, total, codes, filters, config);
+    if (postings.orderCodec === "impact-bucket") {
+      stats.impactBucketOrderTerms++;
+      stats.impactBucketOrderPostings += postings.count;
+    }
     const external = !!writeBlock && postings.blocks.length >= minBlocks && postings.byteLength >= minBytes;
     const blocks = [];
 
@@ -594,6 +633,7 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
     } else {
       const bytes = concatUint8(postings.chunks, postings.byteLength);
       chunks.push(bytes);
+      chunkBytes += bytes.length;
       stats.inlinePostingBytes += bytes.length;
       for (let i = 0; i < postings.blocks.length; i++) {
         const block = postings.blocks[i];
@@ -652,13 +692,21 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
     }
   }
 
+  const headerBuffer = Buffer.from(Uint8Array.from(header));
   return {
     format: POSTING_SEGMENT_FORMAT,
-    buffer: Buffer.concat([
-      Buffer.from(Uint8Array.from(header)),
-      ...chunks.map(chunk => Buffer.from(chunk))
-    ]),
+    chunks: [headerBuffer, ...chunks],
+    logicalLength: headerBuffer.length + chunkBytes,
     stats
+  };
+}
+
+export function buildPostingSegment(entries, total, codes, filters, config, writeBlock) {
+  const segment = buildPostingSegmentChunks(entries, total, codes, filters, config, writeBlock);
+  return {
+    format: segment.format,
+    buffer: Buffer.concat(segment.chunks.map(chunk => Buffer.from(chunk)), segment.logicalLength),
+    stats: segment.stats
   };
 }
 

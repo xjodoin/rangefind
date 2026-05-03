@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { gunzipSync } from "node:zlib";
 import { OBJECT_NAME_HASH_LENGTH } from "../src/object_store.js";
-import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard } from "../src/packs.js";
+import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard, writePackedShardChunks } from "../src/packs.js";
 
 function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -59,6 +60,26 @@ test("append-only pack writer returns pointers without retaining an entry map", 
   assert.equal(writer.objects.size, 0);
   assert.equal(resolvePackEntry(writer, first).pack, writer.packs[0].file);
   assert.equal(resolvePackEntry(writer, second).pack, writer.packs[0].file);
+});
+
+test("append-only pack writer can gzip chunks directly into a pack", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-packs-stream-"));
+  const writer = createAppendOnlyPackWriter(root, 1024);
+  const chunks = [Buffer.from("streamed "), Buffer.from("compressed "), Buffer.from("object")];
+  const entry = await writePackedShardChunks(writer, "streamed", chunks, {
+    kind: "unit",
+    codec: "chunked",
+    logicalLength: 26,
+    streamMinBytes: 0
+  });
+  finalizePackWriter(writer);
+
+  const compressed = readFileSync(join(root, writer.packs[0].file)).subarray(entry.offset, entry.offset + entry.length);
+  assert.equal(gunzipSync(compressed).toString("utf8"), "streamed compressed object");
+  assert.equal(entry.logicalLength, 26);
+  assert.equal(entry.length, compressed.length);
+  assert.equal(entry.checksum.value, sha256Hex(compressed));
+  assert.equal(resolvePackEntry(writer, entry).pack, writer.packs[0].file);
 });
 
 test("pack writers can share an atomic pack index counter", async () => {
