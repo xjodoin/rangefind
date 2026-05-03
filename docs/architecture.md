@@ -123,7 +123,9 @@ latency-sensitive browser index.
 `facets/packs/*.bin` store independently compressed binary facet dictionaries
 addressed through `facets/directory-root.<hash>.bin.gz` and
 `facets/directory-pages/*.bin.gz`. The runtime lazy-loads a dictionary only when
-that facet is selected or an application asks for its values.
+that facet is selected or an application asks for its values. The small facet
+directory manifest is lazy at `facets/manifest.json.gz`, so filtered paths do
+not need `manifest.full.json` just to resolve facet codes.
 
 `doc-values/packs/*.bin` store range-addressed column chunks used by filters and
 sorting. Keyword facets are encoded as per-document bitsets, so a facet can be
@@ -139,6 +141,9 @@ boolean field. Each directory points into `doc-values/sorted-packs/*.bin`, where
 per-page min/max summaries for every sortable/filterable typed field. Sorted
 top-k browse loads the directory for the requested sort field, fetches only the
 next value page in sort order, and stops once the requested page is full.
+The small sorted-field manifest is lazy at
+`doc-values/sorted/manifest.json.gz`, so cold sort paths avoid
+`manifest.full.json`.
 Unsorted filter browsing keeps document order instead: it walks doc-value
 chunks in doc-id order and stops after enough matches, preserving the dense
 doc-page payload lane. This gives both value-order pruning for sorted views and

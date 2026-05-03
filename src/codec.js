@@ -21,9 +21,28 @@ const DOC_VALUE_FORMAT_VERSION = 2;
 const DOC_VALUE_ENCODING_DENSE = 0;
 const DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 const FACET_DICT_FORMAT_VERSION = 1;
-export const POSTING_SEGMENT_FORMAT = "rfsegpost-v1";
-const POSTING_SEGMENT_FORMAT_VERSION = 1;
+export const POSTING_SEGMENT_FORMAT = "rfsegpost-v3";
+const POSTING_SEGMENT_FORMAT_VERSION = 3;
 const MAX_SUMMARY_FACET_WORDS = 64;
+export const POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
+export const POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
+export const POSTING_BLOCK_CODEC_IMPACT_BITSET = "impact-bitset-v1";
+export const POSTING_BLOCK_CODEC_PARTITIONED_DELTAS = "partitioned-deltas-v1";
+const POSTING_BLOCK_CODEC_CODES = {
+  [POSTING_BLOCK_CODEC_PAIR_VARINT]: 0,
+  [POSTING_BLOCK_CODEC_IMPACT_RUNS]: 1,
+  [POSTING_BLOCK_CODEC_IMPACT_BITSET]: 2,
+  [POSTING_BLOCK_CODEC_PARTITIONED_DELTAS]: 3
+};
+const POSTING_BLOCK_CODECS = Object.fromEntries(Object.entries(POSTING_BLOCK_CODEC_CODES).map(([name, code]) => [code, name]));
+
+function postingBlockCodecCode(codec) {
+  return POSTING_BLOCK_CODEC_CODES[codec] ?? POSTING_BLOCK_CODEC_CODES[POSTING_BLOCK_CODEC_PAIR_VARINT];
+}
+
+function postingBlockCodecName(code) {
+  return POSTING_BLOCK_CODECS[code] || POSTING_BLOCK_CODEC_PAIR_VARINT;
+}
 
 export function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
@@ -124,6 +143,52 @@ function updateSummary(summary, filters, codes, doc) {
   }
 }
 
+function mergeBlockFilterSummary(target, filters, source) {
+  for (let i = 0; i < filters.length; i++) {
+    const filter = filters[i];
+    const targetItem = target[i];
+    const sourceItem = Array.isArray(source) ? source[i] : source?.[filter.name];
+    if (!sourceItem) continue;
+    if (filter.kind === "facet") {
+      for (let w = 0; w < filter.words; w++) targetItem.words[w] |= sourceItem.words?.[w] || 0;
+    } else {
+      const min = sourceItem.min;
+      const max = sourceItem.max;
+      if (min != null) targetItem.min = targetItem.min == null ? min : Math.min(targetItem.min, min);
+      if (max != null) targetItem.max = targetItem.max == null ? max : Math.max(targetItem.max, max);
+    }
+  }
+}
+
+function postingSuperblockSize(config) {
+  return Math.max(1, Math.floor(Number(config.postingSuperblockSize || 16)));
+}
+
+function buildPostingSuperblocks(blocks, filters, config) {
+  const size = postingSuperblockSize(config);
+  const superblocks = [];
+  for (let firstBlock = 0; firstBlock < blocks.length; firstBlock += size) {
+    const blockCount = Math.min(size, blocks.length - firstBlock);
+    const summary = emptySummary(filters);
+    let rowCount = 0;
+    let maxImpact = 0;
+    let maxImpactDoc = 0;
+    for (let i = firstBlock; i < firstBlock + blockCount; i++) {
+      const block = blocks[i];
+      rowCount += block.rowCount || 0;
+      if (block.maxImpact > maxImpact) {
+        maxImpact = block.maxImpact;
+        maxImpactDoc = block.maxImpactDoc || 0;
+      } else if (block.maxImpact === maxImpact && (block.maxImpactDoc || 0) < maxImpactDoc) {
+        maxImpactDoc = block.maxImpactDoc || 0;
+      }
+      mergeBlockFilterSummary(summary, filters, block.filters);
+    }
+    superblocks.push({ firstBlock, blockCount, rowCount, maxImpact, maxImpactDoc, filters: summary });
+  }
+  return superblocks;
+}
+
 function packIndexFromFile(file) {
   const match = /^(\d+)/u.exec(String(file || "0"));
   return match ? Number(match[1]) || 0 : 0;
@@ -192,18 +257,266 @@ function encodePostings(rows, total, codes, filters, config) {
   const encoded = rows
     .map(([doc, score]) => [doc, Math.max(1, Math.round(score * idf / 10))])
     .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
-  const bytes = [];
+  const chunks = [];
   const blocks = [];
-  for (let i = 0; i < encoded.length; i++) {
-    const [doc, impact] = encoded[i];
-    if (i % config.postingBlockSize === 0) {
-      blocks.push({ offset: bytes.length, maxImpact: impact, filters: emptySummary(filters) });
-    }
-    updateSummary(blocks[blocks.length - 1].filters, filters, codes, doc);
+  let offset = 0;
+  for (let start = 0; start < encoded.length; start += config.postingBlockSize) {
+    const blockRows = encoded.slice(start, Math.min(encoded.length, start + config.postingBlockSize));
+    if (!blockRows.length) continue;
+    const [maxImpactDoc, maxImpact] = blockRows[0];
+    const block = {
+      offset,
+      maxImpact,
+      maxImpactDoc,
+      rowCount: blockRows.length,
+      filters: emptySummary(filters)
+    };
+    for (const [doc] of blockRows) updateSummary(block.filters, filters, codes, doc);
+    const encodedBlock = encodePostingBlockRows(blockRows, config);
+    block.codec = encodedBlock.codec;
+    block.bytes = encodedBlock.bytes;
+    block.baselineBytes = encodedBlock.baselineBytes;
+    block.encodedBytes = encodedBlock.bytes.length;
+    block.alternateBytes = encodedBlock.alternateBytes;
+    block.impactRunBytes = encodedBlock.impactRunBytes;
+    block.impactBitsetBytes = encodedBlock.impactBitsetBytes;
+    block.partitionedDeltaBytes = encodedBlock.partitionedDeltaBytes;
+    blocks.push(block);
+    chunks.push(encodedBlock.bytes);
+    offset += encodedBlock.bytes.length;
+  }
+  return { df, count: encoded.length, bytes: concatUint8(chunks, offset), blocks };
+}
+
+function concatUint8(chunks, total) {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+function encodePairVarintRows(rows) {
+  const bytes = [];
+  for (const [doc, impact] of rows) {
     pushVarint(bytes, doc);
     pushVarint(bytes, impact);
   }
-  return { df, count: encoded.length, bytes: Uint8Array.from(bytes), blocks };
+  return Uint8Array.from(bytes);
+}
+
+function encodeImpactRunRows(rows) {
+  const bytes = [];
+  let groupCount = 0;
+  const groups = [];
+  for (let i = 0; i < rows.length;) {
+    const impact = rows[i][1];
+    const docs = [];
+    while (i < rows.length && rows[i][1] === impact) {
+      docs.push(rows[i][0]);
+      i++;
+    }
+    groups.push({ impact, docs });
+    groupCount++;
+  }
+  pushVarint(bytes, groupCount);
+  for (const group of groups) {
+    pushVarint(bytes, group.impact);
+    pushVarint(bytes, group.docs.length);
+    let previous = -1;
+    for (const doc of group.docs) {
+      pushVarint(bytes, doc - previous);
+      previous = doc;
+    }
+  }
+  return Uint8Array.from(bytes);
+}
+
+function impactGroups(rows) {
+  const groups = [];
+  for (let i = 0; i < rows.length;) {
+    const impact = rows[i][1];
+    const docs = [];
+    while (i < rows.length && rows[i][1] === impact) {
+      docs.push(rows[i][0]);
+      i++;
+    }
+    groups.push({ impact, docs });
+  }
+  return groups;
+}
+
+function encodeImpactBitsetRows(rows) {
+  const bytes = [];
+  const groups = impactGroups(rows);
+  pushVarint(bytes, groups.length);
+  for (const group of groups) {
+    const minDoc = group.docs[0] || 0;
+    const maxDoc = group.docs[group.docs.length - 1] || minDoc;
+    const span = maxDoc - minDoc + 1;
+    const bitBytes = new Uint8Array(Math.ceil(span / 8));
+    for (const doc of group.docs) {
+      const bit = doc - minDoc;
+      bitBytes[Math.floor(bit / 8)] |= 1 << (bit % 8);
+    }
+    pushVarint(bytes, group.impact);
+    pushVarint(bytes, minDoc);
+    pushVarint(bytes, span);
+    pushVarint(bytes, bitBytes.length);
+    for (const byte of bitBytes) bytes.push(byte);
+  }
+  return Uint8Array.from(bytes);
+}
+
+function bitWidth(value) {
+  return value <= 0 ? 0 : Math.ceil(Math.log2(value + 1));
+}
+
+function pushPackedUnsigned(out, values, width) {
+  if (!values.length || width <= 0) return;
+  let current = 0;
+  let filled = 0;
+  for (const value of values) {
+    let consumed = 0;
+    while (consumed < width) {
+      const take = Math.min(8 - filled, width - consumed);
+      const chunk = Math.floor(value / (2 ** consumed)) % (2 ** take);
+      current += chunk * (2 ** filled);
+      filled += take;
+      consumed += take;
+      if (filled === 8) {
+        out.push(current);
+        current = 0;
+        filled = 0;
+      }
+    }
+  }
+  if (filled > 0) out.push(current);
+}
+
+function readPackedUnsigned(source, state, count, width, byteLength) {
+  const start = state.pos;
+  state.pos += byteLength;
+  if (!count) return [];
+  if (width <= 0) return new Array(count).fill(0);
+  const values = [];
+  let byteOffset = start;
+  let current = source[byteOffset++] || 0;
+  let consumedFromByte = 0;
+  for (let i = 0; i < count; i++) {
+    let value = 0;
+    let filled = 0;
+    while (filled < width) {
+      const available = 8 - consumedFromByte;
+      const take = Math.min(available, width - filled);
+      const chunk = Math.floor(current / (2 ** consumedFromByte)) % (2 ** take);
+      value += chunk * (2 ** filled);
+      consumedFromByte += take;
+      filled += take;
+      if (consumedFromByte === 8 && filled < width) {
+        current = source[byteOffset++] || 0;
+        consumedFromByte = 0;
+      }
+    }
+    values.push(value);
+    if (consumedFromByte === 8 && i < count - 1) {
+      current = source[byteOffset++] || 0;
+      consumedFromByte = 0;
+    }
+  }
+  return values;
+}
+
+function encodePartitionedDeltaRows(rows) {
+  const bytes = [];
+  const groups = impactGroups(rows);
+  pushVarint(bytes, groups.length);
+  for (const group of groups) {
+    const deltas = [];
+    let previous = group.docs[0] || 0;
+    for (let i = 1; i < group.docs.length; i++) {
+      const delta = group.docs[i] - previous;
+      deltas.push(delta);
+      previous = group.docs[i];
+    }
+    const width = bitWidth(Math.max(0, ...deltas));
+    if (width > 30) return null;
+    const packed = [];
+    pushPackedUnsigned(packed, deltas, width);
+    pushVarint(bytes, group.impact);
+    pushVarint(bytes, group.docs.length);
+    pushVarint(bytes, group.docs[0] || 0);
+    pushVarint(bytes, width);
+    pushVarint(bytes, packed.length);
+    for (const byte of packed) bytes.push(byte);
+  }
+  return Uint8Array.from(bytes);
+}
+
+function encodePostingBlockRows(rows, config) {
+  const baseline = encodePairVarintRows(rows);
+  const mode = String(config.codecs?.mode || "auto").toLowerCase();
+  if (mode === "off" || mode === "pair" || mode === "pairs" || mode === "pair-varint" || mode === "varint") {
+    return {
+      codec: POSTING_BLOCK_CODEC_PAIR_VARINT,
+      bytes: baseline,
+      baselineBytes: baseline.length,
+      alternateBytes: baseline.length
+    };
+  }
+  const impactRuns = encodeImpactRunRows(rows);
+  const impactBitset = encodeImpactBitsetRows(rows);
+  const partitionedDeltas = encodePartitionedDeltaRows(rows);
+  const candidates = [
+    {
+      codec: POSTING_BLOCK_CODEC_PAIR_VARINT,
+      bytes: baseline
+    },
+    {
+      codec: POSTING_BLOCK_CODEC_IMPACT_RUNS,
+      bytes: impactRuns,
+    },
+    {
+      codec: POSTING_BLOCK_CODEC_IMPACT_BITSET,
+      bytes: impactBitset
+    }
+  ];
+  if (partitionedDeltas) {
+    candidates.push({
+      codec: POSTING_BLOCK_CODEC_PARTITIONED_DELTAS,
+      bytes: partitionedDeltas
+    });
+  }
+  let selected = candidates[0];
+  if (mode === "impact-runs" || mode === "compact-impact") selected = candidates[1];
+  else if (mode === "impact-bitset" || mode === "dense-bitset") selected = candidates[2];
+  else if ((mode === "partitioned-deltas" || mode === "partitioned-ef") && partitionedDeltas) selected = candidates[candidates.length - 1];
+  else if (mode === "auto") {
+    selected = candidates.reduce((best, candidate) => candidate.bytes.length < best.bytes.length ? candidate : best, candidates[0]);
+  }
+  return {
+    codec: selected.codec,
+    bytes: selected.bytes,
+    baselineBytes: baseline.length,
+    alternateBytes: Math.min(impactRuns.length, impactBitset.length, partitionedDeltas?.length || Infinity),
+    impactRunBytes: impactRuns.length,
+    impactBitsetBytes: impactBitset.length,
+    partitionedDeltaBytes: partitionedDeltas?.length || 0
+  };
+}
+
+function addPostingBlockCodecStats(stats, block) {
+  if (block.codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) stats.impactRunBlocks++;
+  else if (block.codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) stats.impactBitsetBlocks++;
+  else if (block.codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) stats.partitionedDeltaBlocks++;
+  else stats.pairVarintBlocks++;
+  stats.blockCodecBaselineBytes += block.baselineBytes || block.encodedBytes || 0;
+  stats.blockCodecSelectedBytes += block.encodedBytes || 0;
+  stats.blockCodecImpactRunCandidateBytes += block.alternateBytes || 0;
+  stats.blockCodecImpactBitsetCandidateBytes += block.impactBitsetBytes || 0;
+  stats.blockCodecPartitionedDeltaCandidateBytes += block.partitionedDeltaBytes || 0;
 }
 
 export function buildPostingSegment(entries, total, codes, filters, config, writeBlock) {
@@ -218,7 +531,19 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
     externalTerms: 0,
     externalPostings: 0,
     externalPostingBytes: 0,
-    inlinePostingBytes: 0
+    inlinePostingBytes: 0,
+    superblocks: 0,
+    superblockTerms: 0,
+    superblockBlocks: 0,
+    pairVarintBlocks: 0,
+    impactRunBlocks: 0,
+    impactBitsetBlocks: 0,
+    partitionedDeltaBlocks: 0,
+    blockCodecBaselineBytes: 0,
+    blockCodecSelectedBytes: 0,
+    blockCodecImpactRunCandidateBytes: 0,
+    blockCodecImpactBitsetCandidateBytes: 0,
+    blockCodecPartitionedDeltaCandidateBytes: 0
   };
 
   for (const [term, rows] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
@@ -247,11 +572,16 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
             checksum: range.checksum || null
           }
         });
+        addPostingBlockCodecStats(stats, block);
         stats.externalBlocks++;
         stats.externalPostings += Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize);
         stats.externalPostingBytes += bytes.length;
       }
-      directory.push({ term, postings, offset: 0, byteLength: 0, external: true, blocks });
+      const superblocks = buildPostingSuperblocks(blocks, filters, config);
+      stats.superblocks += superblocks.length;
+      stats.superblockTerms += superblocks.length > 0 ? 1 : 0;
+      stats.superblockBlocks += blocks.length;
+      directory.push({ term, postings, offset: 0, byteLength: 0, external: true, blocks, superblocks });
     } else {
       chunks.push(postings.bytes);
       stats.inlinePostingBytes += postings.bytes.length;
@@ -261,8 +591,13 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
           ...block,
           rowCount: Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize)
         });
+        addPostingBlockCodecStats(stats, block);
       }
-      directory.push({ term, postings, offset: postingOffset, byteLength: postings.bytes.length, external: false, blocks });
+      const superblocks = buildPostingSuperblocks(blocks, filters, config);
+      stats.superblocks += superblocks.length;
+      stats.superblockTerms += superblocks.length > 0 ? 1 : 0;
+      stats.superblockBlocks += blocks.length;
+      directory.push({ term, postings, offset: postingOffset, byteLength: postings.bytes.length, external: false, blocks, superblocks });
       postingOffset += postings.bytes.length;
     }
   }
@@ -282,6 +617,8 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
       pushVarint(header, block.offset);
       pushVarint(header, block.rowCount);
       pushVarint(header, block.maxImpact);
+      pushVarint(header, block.maxImpactDoc || 0);
+      pushVarint(header, postingBlockCodecCode(block.codec));
       writeBlockFilterSummary(header, filters, block.filters);
       if (item.external) {
         pushVarint(header, block.range.packIndex);
@@ -293,6 +630,15 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
           pushUtf8(header, block.range.checksum.value);
         }
       }
+    }
+    pushVarint(header, item.superblocks.length);
+    for (const superblock of item.superblocks) {
+      pushVarint(header, superblock.firstBlock);
+      pushVarint(header, superblock.blockCount);
+      pushVarint(header, superblock.rowCount);
+      pushVarint(header, superblock.maxImpact);
+      pushVarint(header, superblock.maxImpactDoc || 0);
+      writeBlockFilterSummary(header, filters, superblock.filters);
     }
   }
 
@@ -324,6 +670,7 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
       byteLength: readVarint(bytes, state),
       blockSize: readVarint(bytes, state),
       blocks: null,
+      superblocks: null,
       postings: null
     };
     const blockCount = readVarint(bytes, state);
@@ -334,6 +681,8 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         offset: readVarint(bytes, state),
         rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
+        maxImpactDoc: readVarint(bytes, state),
+        codec: postingBlockCodecName(readVarint(bytes, state)),
         filters: {}
       };
       block.filters = readBlockFilterSummary(bytes, state, manifest);
@@ -356,6 +705,18 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
       }
       entry.blocks[j] = block;
     }
+    const superblockCount = readVarint(bytes, state);
+    entry.superblocks = new Array(superblockCount);
+    for (let j = 0; j < superblockCount; j++) {
+      entry.superblocks[j] = {
+        firstBlock: readVarint(bytes, state),
+        blockCount: readVarint(bytes, state),
+        rowCount: readVarint(bytes, state),
+        maxImpact: readVarint(bytes, state),
+        maxImpactDoc: readVarint(bytes, state),
+        filters: readBlockFilterSummary(bytes, state, manifest)
+      };
+    }
     terms.set(term, entry);
   }
   return { format: POSTING_SEGMENT_FORMAT, bytes, dataStart: state.pos, terms };
@@ -368,17 +729,18 @@ export function parsePostingSegment(buffer, manifest = {}) {
 export function decodePostings(shard, entry) {
   if (entry.external) throw new Error("External posting blocks require async runtime loading.");
   if (entry.postings) return entry.postings;
-  const state = { pos: shard.dataStart + entry.offset };
-  const out = new Int32Array(entry.count * 2);
-  for (let i = 0; i < entry.count; i++) {
-    out[i * 2] = readVarint(shard.bytes, state);
-    out[i * 2 + 1] = readVarint(shard.bytes, state);
+  const blocks = entry.blocks.map((_, index) => decodePostingBlock(shard, entry, index));
+  const out = new Int32Array(blocks.reduce((sum, rows) => sum + rows.length, 0));
+  let offset = 0;
+  for (const rows of blocks) {
+    out.set(rows, offset);
+    offset += rows.length;
   }
   entry.postings = out;
   return out;
 }
 
-export function decodePostingBytes(bytes) {
+function decodePairVarintBytes(bytes) {
   const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const state = { pos: 0 };
   const rows = [];
@@ -386,6 +748,71 @@ export function decodePostingBytes(bytes) {
     rows.push(readVarint(source, state), readVarint(source, state));
   }
   return Int32Array.from(rows);
+}
+
+function decodeImpactRunBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let previous = -1;
+    for (let i = 0; i < count; i++) {
+      const doc = previous + readVarint(source, state);
+      rows.push(doc, impact);
+      previous = doc;
+    }
+  }
+  return Int32Array.from(rows);
+}
+
+function decodeImpactBitsetBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const minDoc = readVarint(source, state);
+    const span = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    const start = state.pos;
+    state.pos += byteLength;
+    for (let bit = 0; bit < span; bit++) {
+      if (source[start + Math.floor(bit / 8)] & (1 << (bit % 8))) rows.push(minDoc + bit, impact);
+    }
+  }
+  return Int32Array.from(rows);
+}
+
+function decodePartitionedDeltaBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let doc = readVarint(source, state);
+    const width = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    rows.push(doc, impact);
+    for (const delta of readPackedUnsigned(source, state, Math.max(0, count - 1), width, byteLength)) {
+      doc += delta;
+      rows.push(doc, impact);
+    }
+  }
+  return Int32Array.from(rows);
+}
+
+export function decodePostingBytes(bytes, block = null) {
+  const codec = block?.codec || POSTING_BLOCK_CODEC_PAIR_VARINT;
+  if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return decodePartitionedDeltaBytes(bytes);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return decodeImpactBitsetBytes(bytes);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return decodeImpactRunBytes(bytes);
+  return decodePairVarintBytes(bytes);
 }
 
 export function decodePostingBlock(shard, entry, blockIndex) {
@@ -396,12 +823,8 @@ export function decodePostingBlock(shard, entry, blockIndex) {
   if (entry.blockPostings.has(blockIndex)) return entry.blockPostings.get(blockIndex);
   const next = entry.blocks[blockIndex + 1];
   const end = shard.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
-  const state = { pos: shard.dataStart + entry.offset + block.offset };
-  const rows = [];
-  while (state.pos < end) {
-    rows.push(readVarint(shard.bytes, state), readVarint(shard.bytes, state));
-  }
-  const out = Int32Array.from(rows);
+  const start = shard.dataStart + entry.offset + block.offset;
+  const out = decodePostingBytes(shard.bytes.subarray(start, end), block);
   entry.blockPostings.set(blockIndex, out);
   return out;
 }

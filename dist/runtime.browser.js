@@ -222,8 +222,22 @@ var DOC_VALUE_FORMAT_VERSION = 2;
 var DOC_VALUE_ENCODING_DENSE = 0;
 var DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 var FACET_DICT_FORMAT_VERSION = 1;
-var POSTING_SEGMENT_FORMAT = "rfsegpost-v1";
-var POSTING_SEGMENT_FORMAT_VERSION = 1;
+var POSTING_SEGMENT_FORMAT = "rfsegpost-v3";
+var POSTING_SEGMENT_FORMAT_VERSION = 3;
+var POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
+var POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
+var POSTING_BLOCK_CODEC_IMPACT_BITSET = "impact-bitset-v1";
+var POSTING_BLOCK_CODEC_PARTITIONED_DELTAS = "partitioned-deltas-v1";
+var POSTING_BLOCK_CODEC_CODES = {
+  [POSTING_BLOCK_CODEC_PAIR_VARINT]: 0,
+  [POSTING_BLOCK_CODEC_IMPACT_RUNS]: 1,
+  [POSTING_BLOCK_CODEC_IMPACT_BITSET]: 2,
+  [POSTING_BLOCK_CODEC_PARTITIONED_DELTAS]: 3
+};
+var POSTING_BLOCK_CODECS = Object.fromEntries(Object.entries(POSTING_BLOCK_CODEC_CODES).map(([name, code]) => [code, name]));
+function postingBlockCodecName(code) {
+  return POSTING_BLOCK_CODECS[code] || POSTING_BLOCK_CODEC_PAIR_VARINT;
+}
 function assertMagic(bytes, magic, message) {
   for (let i = 0; i < magic.length; i++) {
     if (bytes[i] !== magic[i]) throw new Error(message);
@@ -266,6 +280,38 @@ function readBlockFilterSummary(bytes, state, manifest) {
   }
   return filters;
 }
+function readPackedUnsigned(source, state, count, width, byteLength) {
+  const start = state.pos;
+  state.pos += byteLength;
+  if (!count) return [];
+  if (width <= 0) return new Array(count).fill(0);
+  const values = [];
+  let byteOffset = start;
+  let current = source[byteOffset++] || 0;
+  let consumedFromByte = 0;
+  for (let i = 0; i < count; i++) {
+    let value = 0;
+    let filled = 0;
+    while (filled < width) {
+      const available = 8 - consumedFromByte;
+      const take = Math.min(available, width - filled);
+      const chunk = Math.floor(current / 2 ** consumedFromByte) % 2 ** take;
+      value += chunk * 2 ** filled;
+      consumedFromByte += take;
+      filled += take;
+      if (consumedFromByte === 8 && filled < width) {
+        current = source[byteOffset++] || 0;
+        consumedFromByte = 0;
+      }
+    }
+    values.push(value);
+    if (consumedFromByte === 8 && i < count - 1) {
+      current = source[byteOffset++] || 0;
+      consumedFromByte = 0;
+    }
+  }
+  return values;
+}
 function parsePostingSegmentBytes(bytes, manifest = {}) {
   assertMagic(bytes, POSTING_SEGMENT_MAGIC, "Unsupported Rangefind posting segment");
   const objectPointers = manifest.object_store?.pointer_format === "rfbp-v1" || manifest.features?.checksummedObjects;
@@ -284,6 +330,7 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
       byteLength: readVarint(bytes, state),
       blockSize: readVarint(bytes, state),
       blocks: null,
+      superblocks: null,
       postings: null
     };
     const blockCount = readVarint(bytes, state);
@@ -294,6 +341,8 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         offset: readVarint(bytes, state),
         rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
+        maxImpactDoc: readVarint(bytes, state),
+        codec: postingBlockCodecName(readVarint(bytes, state)),
         filters: {}
       };
       block.filters = readBlockFilterSummary(bytes, state, manifest);
@@ -316,6 +365,18 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
       }
       entry.blocks[j] = block;
     }
+    const superblockCount = readVarint(bytes, state);
+    entry.superblocks = new Array(superblockCount);
+    for (let j = 0; j < superblockCount; j++) {
+      entry.superblocks[j] = {
+        firstBlock: readVarint(bytes, state),
+        blockCount: readVarint(bytes, state),
+        rowCount: readVarint(bytes, state),
+        maxImpact: readVarint(bytes, state),
+        maxImpactDoc: readVarint(bytes, state),
+        filters: readBlockFilterSummary(bytes, state, manifest)
+      };
+    }
     terms.set(term, entry);
   }
   return { format: POSTING_SEGMENT_FORMAT, bytes, dataStart: state.pos, terms };
@@ -326,16 +387,17 @@ function parsePostingSegment(buffer, manifest = {}) {
 function decodePostings(shard, entry) {
   if (entry.external) throw new Error("External posting blocks require async runtime loading.");
   if (entry.postings) return entry.postings;
-  const state = { pos: shard.dataStart + entry.offset };
-  const out = new Int32Array(entry.count * 2);
-  for (let i = 0; i < entry.count; i++) {
-    out[i * 2] = readVarint(shard.bytes, state);
-    out[i * 2 + 1] = readVarint(shard.bytes, state);
+  const blocks = entry.blocks.map((_, index) => decodePostingBlock(shard, entry, index));
+  const out = new Int32Array(blocks.reduce((sum, rows) => sum + rows.length, 0));
+  let offset = 0;
+  for (const rows of blocks) {
+    out.set(rows, offset);
+    offset += rows.length;
   }
   entry.postings = out;
   return out;
 }
-function decodePostingBytes(bytes) {
+function decodePairVarintBytes(bytes) {
   const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const state = { pos: 0 };
   const rows = [];
@@ -343,6 +405,67 @@ function decodePostingBytes(bytes) {
     rows.push(readVarint(source, state), readVarint(source, state));
   }
   return Int32Array.from(rows);
+}
+function decodeImpactRunBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let previous = -1;
+    for (let i = 0; i < count; i++) {
+      const doc = previous + readVarint(source, state);
+      rows.push(doc, impact);
+      previous = doc;
+    }
+  }
+  return Int32Array.from(rows);
+}
+function decodeImpactBitsetBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const minDoc = readVarint(source, state);
+    const span = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    const start = state.pos;
+    state.pos += byteLength;
+    for (let bit = 0; bit < span; bit++) {
+      if (source[start + Math.floor(bit / 8)] & 1 << bit % 8) rows.push(minDoc + bit, impact);
+    }
+  }
+  return Int32Array.from(rows);
+}
+function decodePartitionedDeltaBytes(bytes) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let doc = readVarint(source, state);
+    const width = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    rows.push(doc, impact);
+    for (const delta of readPackedUnsigned(source, state, Math.max(0, count - 1), width, byteLength)) {
+      doc += delta;
+      rows.push(doc, impact);
+    }
+  }
+  return Int32Array.from(rows);
+}
+function decodePostingBytes(bytes, block = null) {
+  const codec = block?.codec || POSTING_BLOCK_CODEC_PAIR_VARINT;
+  if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return decodePartitionedDeltaBytes(bytes);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return decodeImpactBitsetBytes(bytes);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return decodeImpactRunBytes(bytes);
+  return decodePairVarintBytes(bytes);
 }
 function decodePostingBlock(shard, entry, blockIndex) {
   const block = entry.blocks?.[blockIndex];
@@ -352,12 +475,8 @@ function decodePostingBlock(shard, entry, blockIndex) {
   if (entry.blockPostings.has(blockIndex)) return entry.blockPostings.get(blockIndex);
   const next = entry.blocks[blockIndex + 1];
   const end = shard.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
-  const state = { pos: shard.dataStart + entry.offset + block.offset };
-  const rows = [];
-  while (state.pos < end) {
-    rows.push(readVarint(shard.bytes, state), readVarint(shard.bytes, state));
-  }
-  const out = Int32Array.from(rows);
+  const start = shard.dataStart + entry.offset + block.offset;
+  const out = decodePostingBytes(shard.bytes.subarray(start, end), block);
   entry.blockPostings.set(blockIndex, out);
   return out;
 }
@@ -1221,7 +1340,9 @@ async function createSearch(options = {}) {
   const authorityDirectory = manifest.authority?.directory ? createDirectoryState(manifest.authority.directory) : null;
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
-  let facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
+  let facetDictionaries = manifest.facet_dictionaries || null;
+  let facetDictionaryManifestPromise = null;
+  let facetDirectory = facetDictionaries?.directory ? createDirectoryState(facetDictionaries.directory) : null;
   const shardCache = /* @__PURE__ */ new Map();
   const queryBundleCache = /* @__PURE__ */ new Map();
   const authorityShardCache = /* @__PURE__ */ new Map();
@@ -1246,12 +1367,16 @@ async function createSearch(options = {}) {
   let fullManifestLoaded = !manifest.lazy_manifests?.full;
   let buildTelemetry = manifest.build || null;
   let buildTelemetryPromise = null;
+  let indexOptimizer = null;
+  let indexOptimizerPromise = null;
   let docValues = manifest.doc_values || null;
   let docValuesPromise = null;
   let docValueSorted = manifest.doc_value_sorted || null;
+  let docValueSortedPromise = null;
   const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
+  let blockFilterFields = new Set((manifest.block_filters || []).map((filter) => filter.name));
   const rangePlans = {
     default: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: 4 },
     docOrdinals: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 4 * 1024, maxOverfetchRatio: Infinity },
@@ -1273,7 +1398,9 @@ async function createSearch(options = {}) {
         Object.assign(manifest, full);
         docValues = manifest.doc_values || null;
         docValueSorted = manifest.doc_value_sorted || null;
-        facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
+        facetDictionaries = manifest.facet_dictionaries || null;
+        facetDirectory = facetDictionaries?.directory ? createDirectoryState(facetDictionaries.directory) : null;
+        blockFilterFields = new Set((manifest.block_filters || []).map((filter) => filter.name));
         fullManifestLoaded = true;
         return manifest;
       });
@@ -1293,6 +1420,35 @@ async function createSearch(options = {}) {
     }
     return docValuesPromise;
   }
+  async function ensureDocValueSortedManifest() {
+    if (docValueSorted) return docValueSorted;
+    const path = manifest.lazy_manifests?.doc_value_sorted;
+    if (!path) return null;
+    if (!docValueSortedPromise) {
+      docValueSortedPromise = fetchManifestJsonIfOk(path).then((meta) => {
+        docValueSorted = meta || null;
+        if (docValueSorted) manifest.doc_value_sorted = docValueSorted;
+        return docValueSorted;
+      });
+    }
+    return docValueSortedPromise;
+  }
+  async function ensureFacetDictionaryManifest() {
+    if (facetDictionaries) return facetDictionaries;
+    const path = manifest.lazy_manifests?.facet_dictionaries;
+    if (!path) return null;
+    if (!facetDictionaryManifestPromise) {
+      facetDictionaryManifestPromise = fetchManifestJsonIfOk(path).then((meta) => {
+        facetDictionaries = meta || null;
+        if (facetDictionaries) {
+          manifest.facet_dictionaries = facetDictionaries;
+          facetDirectory = facetDictionaries.directory ? createDirectoryState(facetDictionaries.directory) : null;
+        }
+        return facetDictionaries;
+      });
+    }
+    return facetDictionaryManifestPromise;
+  }
   async function loadBuildTelemetry() {
     if (buildTelemetry) return buildTelemetry;
     const path = manifest.lazy_manifests?.build;
@@ -1300,6 +1456,14 @@ async function createSearch(options = {}) {
     if (!buildTelemetryPromise) buildTelemetryPromise = fetchJsonIfOk(path);
     buildTelemetry = await buildTelemetryPromise;
     return buildTelemetry;
+  }
+  async function loadIndexOptimizer() {
+    if (indexOptimizer) return indexOptimizer;
+    const path = manifest.lazy_manifests?.optimizer || manifest.optimizer?.path;
+    if (!path) return null;
+    if (!indexOptimizerPromise) indexOptimizerPromise = fetchJsonIfOk(path);
+    indexOptimizer = await indexOptimizerPromise;
+    return indexOptimizer;
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
   function rangeGroups(items, kind = "default") {
@@ -1377,14 +1541,15 @@ async function createSearch(options = {}) {
   }
   async function loadFacetDictionary(field) {
     if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
+    if (!facetDirectory && manifest.lazy_manifests?.facet_dictionaries) await ensureFacetDictionaryManifest();
     if (!facetDirectory && manifest.lazy_manifests?.full) await ensureFullManifest();
-    if (!facetDirectory || !manifest.facet_dictionaries?.fields?.[field]) return [];
+    if (!facetDirectory || !facetDictionaries?.fields?.[field]) return [];
     if (!facetDictionaryCache.has(field)) {
       const promise = (async () => {
         const root = await loadDirectoryRoot(facetDirectory);
         const resolved = await directoryEntryFromRoot(facetDirectory, root, field);
         if (!resolved) return [];
-        const packs = manifest.facet_dictionaries.packs || "facets/packs/";
+        const packs = facetDictionaries.packs || "facets/packs/";
         const buffer = await fetchRange(new URL(`${packs.replace(/\/?$/u, "/")}${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
         const values = parseFacetDictionary(await inflateObject(buffer, resolved.entry, `facet dictionary ${field}`));
         if (!manifest.facets) manifest.facets = {};
@@ -2237,7 +2402,10 @@ async function createSearch(options = {}) {
       try {
         const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          item.resolve(decodePostingBytes(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`)));
+          item.resolve(decodePostingBytes(
+            await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`),
+            item.owner.blocks?.[item.blockIndex]
+          ));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2253,8 +2421,9 @@ async function createSearch(options = {}) {
     await loadPostingBlockBatch(blockIndexes.map((blockIndex) => ({ entry, blockIndex })));
     return Promise.all(blockIndexes.map((blockIndex) => entry.blockPostings.get(blockIndex)));
   }
-  function postingBlockPrefetchIndexes(entry, blockIndex, prefetch) {
-    const total = entry.blocks?.length || 0;
+  function postingBlockPrefetchIndexes(entry, blockIndex, prefetch, maxBlockExclusive = null) {
+    const available = entry.blocks?.length || 0;
+    const total = Math.min(available, maxBlockExclusive == null ? available : maxBlockExclusive);
     if (blockIndex < 0 || blockIndex >= total) return [];
     const blockPostings = entry.blockPostings;
     const out = [blockIndex];
@@ -2377,28 +2546,54 @@ async function createSearch(options = {}) {
     return false;
   }
   function makeBlockFilterPlan(filters) {
-    const facets = Object.entries(filters.facets || {}).map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))]).filter(([, selected]) => selected?.size);
-    const numbers = Object.entries(filters.numbers || {}).map(([field, range]) => [field, {
-      min: normalizeRangeValue(range?.min, numberFields.get(field)),
-      max: normalizeRangeValue(range?.max, numberFields.get(field))
-    }]).filter(([, range]) => range.min != null || range.max != null);
-    const booleans = Object.entries(filters.booleans || {}).map(([field, value]) => [field, booleanCode(value)]).filter(([, value]) => value != null);
-    return { facets, numbers, booleans, active: facets.length > 0 || numbers.length > 0 || booleans.length > 0 };
+    const facets = [];
+    const numbers = [];
+    const booleans = [];
+    const unknownFields = [];
+    for (const [field, values] of Object.entries(filters.facets || {})) {
+      const selected = selectedFacetCodes(manifest, field, new Set(values));
+      if (!selected?.size) continue;
+      if (blockFilterFields.has(field)) facets.push([field, selected]);
+      else unknownFields.push(field);
+    }
+    for (const [field, range] of Object.entries(filters.numbers || {})) {
+      const normalized = {
+        min: normalizeRangeValue(range?.min, numberFields.get(field)),
+        max: normalizeRangeValue(range?.max, numberFields.get(field))
+      };
+      if (normalized.min == null && normalized.max == null) continue;
+      if (blockFilterFields.has(field)) numbers.push([field, normalized]);
+      else unknownFields.push(field);
+    }
+    for (const [field, value] of Object.entries(filters.booleans || {})) {
+      const code = booleanCode(value);
+      if (code == null) continue;
+      if (blockFilterFields.has(field)) booleans.push([field, code]);
+      else unknownFields.push(field);
+    }
+    return {
+      facets,
+      numbers,
+      booleans,
+      unknownFields,
+      active: facets.length > 0 || numbers.length > 0 || booleans.length > 0
+    };
   }
   function blockMayPass(block, filterPlan) {
     if (!filterPlan?.active) return true;
     for (const [field, selected] of filterPlan.facets) {
-      if (!blockFacetMatches(block.filters?.[field], selected)) return false;
+      const summary = block.filters?.[field];
+      if (summary && !blockFacetMatches(summary, selected)) return false;
     }
     for (const [field, range] of filterPlan.numbers) {
       const summary = block.filters?.[field];
-      if (!summary || summary.min == null || summary.max == null) return false;
+      if (!summary || summary.min == null || summary.max == null) continue;
       if (range.min != null && summary.max < range.min) return false;
       if (range.max != null && summary.min > range.max) return false;
     }
     for (const [field, value] of filterPlan.booleans) {
       const summary = block.filters?.[field];
-      if (!summary || !summary.max) return false;
+      if (!summary || !summary.max) continue;
       if (summary.max < value || summary.min > value) return false;
     }
     return true;
@@ -2414,7 +2609,7 @@ async function createSearch(options = {}) {
     }
     for (const [field, expected] of filterPlan.booleans) {
       const summary = block.filters?.[field];
-      const code = expected ? 2 : 1;
+      const code = expected === true ? 2 : expected === false ? 1 : expected;
       if (!summary || summary.min !== code || summary.max !== code) return false;
     }
     return true;
@@ -2538,9 +2733,26 @@ async function createSearch(options = {}) {
   function sortedPageRows(page, desc) {
     return page.rows.slice().sort((a, b) => desc ? b.sortValue - a.sortValue || a.doc - b.doc : a.sortValue - b.sortValue || a.doc - b.doc);
   }
+  function compareKnownSortRows(a, b, sortPlan, sortValues) {
+    const left = sortValues.get(a[0]);
+    const right = sortValues.get(b[0]);
+    const leftMissing = left == null;
+    const rightMissing = right == null;
+    if (leftMissing || rightMissing) {
+      if (leftMissing && rightMissing) return b[1] - a[1] || a[0] - b[0];
+      return leftMissing ? 1 : -1;
+    }
+    if (left !== right) return sortPlan.desc ? right - left : left - right;
+    return b[1] - a[1] || a[0] - b[0];
+  }
+  function nextSortPageCanTie(page, boundarySortValue, desc) {
+    if (!page || boundarySortValue == null) return false;
+    return desc ? page.max >= boundarySortValue : page.min <= boundarySortValue;
+  }
   async function runDocValueBrowse({ page, size, filters, sortPlan, hasFilters }) {
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const field = sortPlan?.field || null;
+    if (field && !docValueSorted) await ensureDocValueSortedManifest();
     if (!field || !docValueSortField(field)) return null;
     const directory = await loadDocValueSortDirectory(field);
     if (!directory?.pages?.length) return null;
@@ -2599,6 +2811,133 @@ async function createSearch(options = {}) {
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
+  async function runSortedTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
+    const field = sortPlan?.field || null;
+    if (field && !docValueSorted) await ensureDocValueSortedManifest();
+    if (!field || !docValueSortField(field) || !baseTerms.length || terms.length > SKIP_MAX_TERMS) return null;
+    if (rerank !== false && dependencyTerms(baseTerms).length) return null;
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters) await ensureDocValuesManifest();
+    await ensureFacetDictionaries(filters);
+    const directory = await loadDocValueSortDirectory(field);
+    if (!directory?.pages?.length) return null;
+    const entries = await termEntries(terms);
+    const baseSet = new Set(baseTerms);
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const presentBaseTerms = new Set(entries.filter((item) => baseSet.has(item.term)).map((item) => item.term));
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextSearchResponse({
+        page,
+        size,
+        terms,
+        entries,
+        missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
+      });
+    }
+    const scores = /* @__PURE__ */ new Map();
+    const hits = /* @__PURE__ */ new Map();
+    let postingsDecoded = 0;
+    let blocksDecoded = 0;
+    for (const { term, shard, entry } of entries) {
+      const postings = await decodeEntryPostings(shard, entry);
+      const isBase = baseSet.has(term);
+      blocksDecoded += entry.blocks?.length || 0;
+      postingsDecoded += postings.length / 2;
+      for (let i = 0; i < postings.length; i += 2) {
+        const doc = postings[i];
+        scores.set(doc, (scores.get(doc) || 0) + postings[i + 1]);
+        if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
+      }
+    }
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const filterFields = filterPlanFields(docFilterPlan).filter((item) => item !== field);
+    const desc = !!sortPlan.desc;
+    const candidatePages = sortedDirectoryPages(directory, desc, docFilterPlan);
+    const collected = [];
+    const sortValues = /* @__PURE__ */ new Map();
+    let pagesVisited = 0;
+    let rowsScanned = 0;
+    let rowsAccepted = 0;
+    let definitelyPassedPages = 0;
+    let stoppedBySortBound = false;
+    for (let pageIndex = 0; pageIndex < candidatePages.length; pageIndex++) {
+      const candidatePage = candidatePages[pageIndex];
+      const [loadedPage] = await loadDocValueSortPages(field, directory, [candidatePage.index]);
+      pagesVisited++;
+      const rows2 = sortedPageRows(loadedPage, desc);
+      rowsScanned += rows2.length;
+      const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
+      if (definite) definitelyPassedPages++;
+      const codeData = definite || !filterFields.length ? null : await valueStoreForDocs(filterFields, rows2.map((row) => row.doc));
+      for (const row of rows2) {
+        const score = scores.get(row.doc);
+        if (score == null || (hits.get(row.doc) || 0) < Math.max(1, minShouldMatch)) continue;
+        const known = { [field]: row.value };
+        if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+        sortValues.set(row.doc, row.sortValue);
+        collected.push([row.doc, score]);
+        rowsAccepted++;
+      }
+      collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
+      if (collected.length >= k) {
+        const boundarySortValue = sortValues.get(collected[k - 1][0]);
+        if (!nextSortPageCanTie(candidatePages[pageIndex + 1], boundarySortValue, desc)) {
+          stoppedBySortBound = true;
+          break;
+        }
+      }
+    }
+    collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
+    const rows = collected.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: true, preferDocPages: true };
+    const results = await rowsToResults(rows, resultContext);
+    const totalExact = !stoppedBySortBound;
+    return {
+      total: totalExact ? collected.length : Math.max(collected.length, k),
+      page,
+      size,
+      results,
+      approximate: !totalExact,
+      stats: {
+        exact: true,
+        plannerLane: "sortPageText",
+        topKProven: true,
+        totalExact,
+        tailExhausted: totalExact,
+        terms: terms.length,
+        shards: new Set(entries.map((item) => item.shardName)).size,
+        blocksDecoded,
+        postingsDecoded,
+        postingsAccepted: rowsAccepted,
+        skippedBlocks: 0,
+        docValueSortText: true,
+        docValuePruning: true,
+        docValuePruneField: field,
+        docValueSortDirection: desc ? "desc" : "asc",
+        docValueDirectoryPages: directory.pages.length,
+        docValueCandidatePages: candidatePages.length,
+        docValuePagesPruned: directory.pages.length - candidatePages.length,
+        docValuePagesVisited: pagesVisited,
+        docValueRowsScanned: rowsScanned,
+        docValueRowsAccepted: rowsAccepted,
+        docValueDefinitePages: definitelyPassedPages,
+        sortSummaryStopReason: stoppedBySortBound ? "sort_bound" : "exhausted",
+        plannerFallbackReason: "",
+        ...topKProofStatsObject(createTopKProofStats({ hasFilters, sortPlan }), ""),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        rerankCandidates: 0,
+        dependencyFeatures: 0,
+        dependencyTermsMatched: 0,
+        dependencyPostingsScanned: 0,
+        dependencyCandidateMatches: 0
       }
     };
   }
@@ -2694,34 +3033,217 @@ async function createSearch(options = {}) {
   function bitIsSet(mask, bit) {
     return (mask & 2 ** bit) !== 0;
   }
+  function createTopKProofStats({ hasFilters = false, sortPlan = null, blockFilterPlan = null } = {}) {
+    return {
+      attempts: 0,
+      successes: 0,
+      failures: /* @__PURE__ */ new Map(),
+      lastFailureReason: "",
+      lastThreshold: 0,
+      lastMaxOutsidePotential: 0,
+      lastRemainingTerms: 0,
+      lastRemainingTermUpperBound: 0,
+      filterAware: Boolean(hasFilters),
+      sortAware: Boolean(sortPlan),
+      filterUnknown: Boolean(blockFilterPlan?.unknownFields?.length),
+      unknownFilterFields: blockFilterPlan?.unknownFields || []
+    };
+  }
+  function recordTopKProofFailure(stats, reason, detail = {}) {
+    if (!stats) return;
+    stats.failures.set(reason, (stats.failures.get(reason) || 0) + 1);
+    stats.lastFailureReason = reason;
+    if (detail.threshold != null) stats.lastThreshold = detail.threshold;
+    if (detail.maxOutsidePotential != null) stats.lastMaxOutsidePotential = detail.maxOutsidePotential;
+    if (detail.remainingTerms != null) stats.lastRemainingTerms = detail.remainingTerms;
+    if (detail.remainingTermUpperBound != null) stats.lastRemainingTermUpperBound = detail.remainingTermUpperBound;
+  }
+  function recordTopKProofSuccess(stats, detail = {}) {
+    if (!stats) return;
+    stats.successes++;
+    stats.lastFailureReason = "";
+    if (detail.threshold != null) stats.lastThreshold = detail.threshold;
+    if (detail.maxOutsidePotential != null) stats.lastMaxOutsidePotential = detail.maxOutsidePotential;
+    if (detail.remainingTerms != null) stats.lastRemainingTerms = detail.remainingTerms;
+    if (detail.remainingTermUpperBound != null) stats.lastRemainingTermUpperBound = detail.remainingTermUpperBound;
+  }
+  function topKProofStatsObject(stats, fallbackReason = "") {
+    if (!stats) {
+      return {
+        topKProofAttempts: 0,
+        topKProofSuccesses: 0,
+        topKProofFailureReason: fallbackReason,
+        topKProofFailureCandidateCount: 0,
+        topKProofFailureScoreBound: 0,
+        topKProofFailureTieBound: 0,
+        topKProofThreshold: 0,
+        topKProofMaxOutsidePotential: 0,
+        topKProofRemainingTerms: 0,
+        topKProofRemainingTermUpperBound: 0,
+        topKProofFilterAware: false,
+        topKProofSortAware: false,
+        topKProofFilterUnknown: false,
+        topKProofUnknownFilterFields: ""
+      };
+    }
+    return {
+      topKProofAttempts: stats.attempts,
+      topKProofSuccesses: stats.successes,
+      topKProofFailureReason: fallbackReason || stats.lastFailureReason || "",
+      topKProofFailureCandidateCount: stats.failures.get("candidate_count") || 0,
+      topKProofFailureScoreBound: stats.failures.get("score_bound") || 0,
+      topKProofFailureTieBound: stats.failures.get("tie_bound") || 0,
+      topKProofThreshold: stats.lastThreshold,
+      topKProofMaxOutsidePotential: stats.lastMaxOutsidePotential,
+      topKProofRemainingTerms: stats.lastRemainingTerms,
+      topKProofRemainingTermUpperBound: stats.lastRemainingTermUpperBound,
+      topKProofFilterAware: stats.filterAware,
+      topKProofSortAware: stats.sortAware,
+      topKProofFilterUnknown: stats.filterUnknown,
+      topKProofUnknownFilterFields: stats.unknownFilterFields.join(",")
+    };
+  }
+  function cursorSuperblock(cursor) {
+    const superblocks = cursor.entry.superblocks || [];
+    if (!superblocks.length) return null;
+    let index = Math.max(0, Math.min(cursor.superblockIndex || 0, superblocks.length - 1));
+    while (index < superblocks.length && cursor.blockIndex >= superblocks[index].firstBlock + superblocks[index].blockCount) index++;
+    while (index > 0 && cursor.blockIndex < superblocks[index].firstBlock) index--;
+    cursor.superblockIndex = index;
+    const superblock = superblocks[index];
+    return superblock && cursor.blockIndex >= superblock.firstBlock && cursor.blockIndex < superblock.firstBlock + superblock.blockCount ? superblock : null;
+  }
+  function markSuperblockConsidered(cursor, superblock) {
+    if (!superblock) return;
+    if (!cursor.superblocksSeen) cursor.superblocksSeen = /* @__PURE__ */ new Set();
+    if (!cursor.superblocksSeen.has(cursor.superblockIndex)) {
+      cursor.superblocksSeen.add(cursor.superblockIndex);
+      cursor.superblocksConsidered++;
+    }
+  }
+  function markSuperblockDecoded(cursor) {
+    const superblock = cursorSuperblock(cursor);
+    if (!superblock) return false;
+    if (!cursor.superblocksDecodedSet) cursor.superblocksDecodedSet = /* @__PURE__ */ new Set();
+    if (!cursor.superblocksDecodedSet.has(cursor.superblockIndex)) {
+      cursor.superblocksDecodedSet.add(cursor.superblockIndex);
+      cursor.superblocksDecoded++;
+      return true;
+    }
+    return false;
+  }
   function advanceCursor(cursor, filterPlan) {
-    while (cursor.blockIndex < cursor.entry.blocks.length && !blockMayPass(cursor.entry.blocks[cursor.blockIndex], filterPlan)) {
+    while (cursor.blockIndex < cursor.entry.blocks.length) {
+      const superblock = cursorSuperblock(cursor);
+      if (superblock) {
+        markSuperblockConsidered(cursor, superblock);
+        if (!blockMayPass(superblock, filterPlan)) {
+          const end = Math.min(cursor.entry.blocks.length, superblock.firstBlock + superblock.blockCount);
+          cursor.skippedBlocks += Math.max(0, end - cursor.blockIndex);
+          cursor.skippedSuperblocks++;
+          cursor.blockIndex = end;
+          cursor.superblockIndex++;
+          continue;
+        }
+      }
+      if (blockMayPass(cursor.entry.blocks[cursor.blockIndex], filterPlan)) return true;
       cursor.skippedBlocks++;
       cursor.blockIndex++;
     }
-    return cursor.blockIndex < cursor.entry.blocks.length;
+    return false;
   }
-  function remainingPotential(cursors, mask = 0, filterPlan = null) {
+  function remainingPotentialInfo(cursors, mask = 0, filterPlan = null) {
     let potential = 0;
+    let tieDocLowerBound = 0;
+    let hasRemaining = false;
+    let terms = 0;
+    let baseTerms = 0;
     for (const cursor of cursors) {
       if (!advanceCursor(cursor, filterPlan) || bitIsSet(mask, cursor.termIndex)) continue;
-      potential += cursor.entry.blocks[cursor.blockIndex].maxImpact;
+      const block = cursor.entry.blocks[cursor.blockIndex];
+      if (!block) continue;
+      potential += block.maxImpact;
+      tieDocLowerBound = Math.max(tieDocLowerBound, block.maxImpactDoc ?? 0);
+      hasRemaining = true;
+      terms++;
+      if (cursor.isBase) baseTerms++;
     }
-    return potential;
+    return {
+      potential,
+      tieDocLowerBound: hasRemaining ? tieDocLowerBound : Infinity,
+      terms,
+      baseTerms
+    };
   }
-  function stableTopK(scores, hits, masks, cursors, minShouldMatch, k, filterPlan) {
+  function stableTopK(scores, hits, masks, cursors, minShouldMatch, k, filterPlan, proofStats = null) {
+    if (proofStats) proofStats.attempts++;
     const eligible = collectEligibleScores(scores, hits, minShouldMatch);
-    if (eligible.length < k) return null;
+    if (eligible.length < k) {
+      recordTopKProofFailure(proofStats, "candidate_count");
+      return null;
+    }
     const top = eligible.slice(0, k);
     const topDocs = new Set(top.map(([doc]) => doc));
     const threshold = top[top.length - 1][1];
-    let maxOutsidePotential = remainingPotential(cursors, 0, filterPlan);
+    const boundaryDoc = top[top.length - 1][0];
+    const unseen = remainingPotentialInfo(cursors, 0, filterPlan);
+    let maxOutsidePotential = unseen.potential;
+    let maxOutsideTieDoc = unseen.tieDocLowerBound;
+    let maxRemainingTerms = unseen.terms;
+    let maxRemainingTermUpperBound = unseen.potential;
     for (const [doc, score] of scores) {
       if (topDocs.has(doc)) continue;
-      const potential = score + remainingPotential(cursors, masks.get(doc) || 0, filterPlan);
-      if (potential > maxOutsidePotential) maxOutsidePotential = potential;
-      if (maxOutsidePotential >= threshold) return null;
+      const remaining = remainingPotentialInfo(cursors, masks.get(doc) || 0, filterPlan);
+      const potential = score + remaining.potential;
+      if (potential > maxOutsidePotential || potential === maxOutsidePotential && doc < maxOutsideTieDoc) {
+        maxOutsidePotential = potential;
+        maxOutsideTieDoc = doc;
+        maxRemainingTerms = remaining.terms;
+        maxRemainingTermUpperBound = remaining.potential;
+      }
+      if (potential > threshold) {
+        recordTopKProofFailure(proofStats, "score_bound", {
+          threshold,
+          maxOutsidePotential: potential,
+          remainingTerms: remaining.terms,
+          remainingTermUpperBound: remaining.potential
+        });
+        return null;
+      }
+      if (potential === threshold && doc < boundaryDoc) {
+        recordTopKProofFailure(proofStats, "tie_bound", {
+          threshold,
+          maxOutsidePotential: potential,
+          remainingTerms: remaining.terms,
+          remainingTermUpperBound: remaining.potential
+        });
+        return null;
+      }
     }
+    if (maxOutsidePotential > threshold) {
+      recordTopKProofFailure(proofStats, "score_bound", {
+        threshold,
+        maxOutsidePotential,
+        remainingTerms: maxRemainingTerms,
+        remainingTermUpperBound: maxRemainingTermUpperBound
+      });
+      return null;
+    }
+    if (maxOutsidePotential === threshold && maxOutsideTieDoc <= boundaryDoc) {
+      recordTopKProofFailure(proofStats, "tie_bound", {
+        threshold,
+        maxOutsidePotential,
+        remainingTerms: maxRemainingTerms,
+        remainingTermUpperBound: maxRemainingTermUpperBound
+      });
+      return null;
+    }
+    recordTopKProofSuccess(proofStats, {
+      threshold,
+      maxOutsidePotential,
+      remainingTerms: maxRemainingTerms,
+      remainingTermUpperBound: maxRemainingTermUpperBound
+    });
     return top;
   }
   function applyBlockRows(cursor, rows, codeData, filterPlan, scores, hits, masks) {
@@ -2745,6 +3267,9 @@ async function createSearch(options = {}) {
   function cursorImpact(cursor) {
     return cursor.entry.blocks[cursor.blockIndex]?.maxImpact || 0;
   }
+  function cursorSuperblockImpact(cursor) {
+    return cursorSuperblock(cursor)?.maxImpact || cursorImpact(cursor);
+  }
   function frontierPrefetchSize() {
     return EXTERNAL_POSTING_BLOCK_PREFETCH;
   }
@@ -2758,7 +3283,9 @@ async function createSearch(options = {}) {
         blocks[index] = { cursor, rows: decodePostingBlock(cursor.shard, cursor.entry, cursor.blockIndex) };
         continue;
       }
-      for (const blockIndex of postingBlockPrefetchIndexes(cursor.entry, cursor.blockIndex, prefetch)) {
+      const superblock = cursorSuperblock(cursor);
+      const maxBlockExclusive = superblock ? superblock.firstBlock + superblock.blockCount : null;
+      for (const blockIndex of postingBlockPrefetchIndexes(cursor.entry, cursor.blockIndex, prefetch, maxBlockExclusive)) {
         requests.push({ entry: cursor.entry, blockIndex });
       }
     }
@@ -2781,13 +3308,19 @@ async function createSearch(options = {}) {
     const k = offset + size;
     const candidateK = candidateLimitFor(baseTerms, k, rerank);
     const sortPlan = makeSortPlan(sort);
-    if (sortPlan || !baseTerms.length || terms.length > SKIP_MAX_TERMS || k > 100) {
-      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank });
+    if (sortPlan) {
+      const sortedText = await runSortedTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank });
+      if (sortedText) return sortedText;
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason: "sort_requested" });
+    }
+    if (!baseTerms.length || terms.length > SKIP_MAX_TERMS || k > 100) {
+      const plannerFallbackReason = !baseTerms.length ? "no_text_terms" : terms.length > SKIP_MAX_TERMS ? "too_many_terms" : "top_k_limit";
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason });
     }
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank });
     if (bundleResponse) return bundleResponse;
-    if (hasFilters) await ensureFullManifest();
+    if (hasFilters) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
@@ -2811,7 +3344,11 @@ async function createSearch(options = {}) {
       termIndex,
       isBase: baseSet.has(item.term),
       blockIndex: 0,
-      skippedBlocks: 0
+      superblockIndex: 0,
+      skippedBlocks: 0,
+      skippedSuperblocks: 0,
+      superblocksConsidered: 0,
+      superblocksDecoded: 0
     }));
     if (!cursors.length) {
       return emptyTextSearchResponse({ page, size, terms });
@@ -2830,15 +3367,17 @@ async function createSearch(options = {}) {
     let frontierFetchGroups = 0;
     let frontierWantedBlocks = 0;
     let frontierMax = 0;
+    let filterSummaryProofBlocks = 0;
+    const proofStats = createTopKProofStats({ hasFilters, blockFilterPlan });
     while (true) {
       const active = cursors.filter((cursor) => advanceCursor(cursor, blockFilterPlan));
       if (!active.length) {
         exhausted = true;
         break;
       }
-      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan);
+      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
       if (stable) break;
-      active.sort((a, b) => cursorImpact(b) - cursorImpact(a));
+      active.sort((a, b) => cursorSuperblockImpact(b) - cursorSuperblockImpact(a) || cursorImpact(b) - cursorImpact(a));
       const frontier = active.slice(0, postingBlockFrontier);
       frontierBatches++;
       frontierBlocks += frontier.length;
@@ -2848,12 +3387,16 @@ async function createSearch(options = {}) {
       frontierFetchGroups += decoded.fetchGroups;
       frontierWantedBlocks += decoded.wantedBlocks;
       for (const { cursor, rows: rows2 } of decoded.blocks) {
+        const block = cursor.entry.blocks[cursor.blockIndex];
+        const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
+        if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
+        markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && docValues ? await valueStoreForDocs(filterFields, postingDocs(rows2)) : fallbackCodeData;
+        const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForDocs(filterFields, postingDocs(rows2)) : filterSummaryProvesBlock ? null : fallbackCodeData;
         blocksDecoded++;
         postingsDecoded += rows2.length / 2;
-        postingsAccepted += applyBlockRows(cursor, rows2, codeData, docFilterPlan, scores, hits, masks);
-        stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan);
+        postingsAccepted += applyBlockRows(cursor, rows2, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
+        stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
         if (stable) break;
       }
       if (stable) break;
@@ -2889,6 +3432,14 @@ async function createSearch(options = {}) {
         postingBlockFrontierFetchedBlocks: frontierFetchedBlocks,
         postingBlockFrontierFetchGroups: frontierFetchGroups,
         postingBlockFrontierWantedBlocks: frontierWantedBlocks,
+        postingSuperblockScheduler: cursors.some((cursor) => cursor.entry.superblocks?.length),
+        postingSuperblocks: entries.reduce((sum, item) => sum + (item.entry.superblocks?.length || 0), 0),
+        postingSuperblocksConsidered: cursors.reduce((sum, cursor) => sum + cursor.superblocksConsidered, 0),
+        postingSuperblocksSkipped: cursors.reduce((sum, cursor) => sum + cursor.skippedSuperblocks, 0),
+        postingSuperblocksDecoded: cursors.reduce((sum, cursor) => sum + cursor.superblocksDecoded, 0),
+        filterSummaryProofBlocks,
+        plannerFallbackReason: exhausted ? "tail_exhausted" : "",
+        ...topKProofStatsObject(proofStats, exhausted ? "tail_exhausted" : ""),
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
@@ -2897,11 +3448,11 @@ async function createSearch(options = {}) {
       }
     };
   }
-  async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
+  async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "full_scan" }) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters || sortPlan) await ensureFullManifest();
+    if (hasFilters || sortPlan) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
@@ -2966,6 +3517,8 @@ async function createSearch(options = {}) {
         postingsDecoded: entries.reduce((sum, item) => sum + item.entry.count, 0),
         postingsAccepted: ranked.length,
         skippedBlocks: 0,
+        plannerFallbackReason,
+        ...topKProofStatsObject(null, plannerFallbackReason),
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
@@ -3343,12 +3896,13 @@ async function createSearch(options = {}) {
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     if (!q) {
-      if (hasFilters || sortPlan) await ensureFullManifest();
+      if (sortPlan) await ensureDocValueSortedManifest();
+      if (hasFilters) await ensureDocValuesManifest();
+      await ensureFacetDictionaries(filters);
       if (!sortPlan && !hasFilters) {
         const docs = manifest.initial_results.slice(offset, offset + size);
         return { total: manifest.total, results: docs, page, size };
       }
-      await ensureFacetDictionaries(filters);
       const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
       if (!sortPlan && hasFilters && docValues) {
         const chunkPruned = await runDocValueChunkBrowse({ page, size, filters, hasFilters });
@@ -3396,9 +3950,20 @@ async function createSearch(options = {}) {
     }
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map((item) => item.term);
-    if (sortPlan || params.exact) await ensureFullManifest();
+    if (params.exact) await ensureFullManifest();
+    else if (sortPlan) await ensureDocValueSortedManifest();
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;
-    const response = await searchFn({ q, page, size, filters, sort, baseTerms, terms: queryTerms(q), rerank: params.rerank });
+    const response = await searchFn({
+      q,
+      page,
+      size,
+      filters,
+      sort,
+      baseTerms,
+      terms: queryTerms(q),
+      rerank: params.rerank,
+      plannerFallbackReason: params.exact ? "exact_requested" : "full_scan"
+    });
     const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
     return maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, authority: params.authority }, typoResponse);
   }
@@ -3406,6 +3971,7 @@ async function createSearch(options = {}) {
     manifest,
     search,
     loadBuildTelemetry,
+    loadIndexOptimizer,
     loadFacetValues: loadFacetDictionary
   };
 }

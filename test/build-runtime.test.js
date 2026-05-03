@@ -68,6 +68,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
     input: "docs.jsonl",
     output: "public/rangefind",
     docValueChunkSize: 2,
+    docValueSortedPageSize: 2,
     buildTelemetrySampleMs: 5,
     buildTelemetryPath: "build-telemetry.json",
     scanWorkers: 2,
@@ -99,12 +100,26 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const minimalManifest = JSON.parse(await readFile(join(output, "manifest.min.json"), "utf8"));
   assert.equal(minimalManifest.lazy_manifests.full, "manifest.full.json");
   assert.equal(minimalManifest.lazy_manifests.build, "debug/build-telemetry.json");
+  assert.equal(minimalManifest.lazy_manifests.optimizer, "debug/index-optimizer.json");
   assert.equal(minimalManifest.lazy_manifests.doc_values, "doc-values/manifest.json.gz");
+  assert.equal(minimalManifest.lazy_manifests.doc_value_sorted, "doc-values/sorted/manifest.json.gz");
+  assert.equal(minimalManifest.lazy_manifests.facet_dictionaries, "facets/manifest.json.gz");
   assert.ok(await readFile(join(output, "manifest.full.json"), "utf8"));
   assert.ok(await readFile(join(output, "doc-values", "manifest.json.gz")));
+  assert.ok(await readFile(join(output, "doc-values", "sorted", "manifest.json.gz")));
+  assert.ok(await readFile(join(output, "facets", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "debug", "build-telemetry.json"), "utf8"));
+  const optimizerReport = JSON.parse(await readFile(join(output, "debug", "index-optimizer.json"), "utf8"));
+  assert.equal(optimizerReport.format, "rfoptimizer-v1");
+  assert.equal(optimizerReport.policy, "core-first");
+  assert.equal(optimizerReport.summary.path, "debug/index-optimizer.json");
+  assert.ok(optimizerReport.budget.bytes >= 0);
+  assert.ok(optimizerReport.core.some(item => item.kind === "top-k-proof" && item.status === "instrumented"));
+  assert.ok(optimizerReport.core.some(item => item.kind === "posting-superblocks" && item.status === "current" && item.scheduler_status === "current"));
+  assert.ok(optimizerReport.deferred.some(item => item.kind === "champion-window"));
   assert.equal(minimalManifest.build, undefined);
   assert.equal(minimalManifest.doc_values, undefined);
+  assert.equal(minimalManifest.optimizer.path, "debug/index-optimizer.json");
   assert.ok(minimalManifest.block_filters);
   assert.equal(minimalManifest.typo.directory, undefined);
   assert.equal(minimalManifest.facets.category.count, 5);
@@ -117,6 +132,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.features.docValueSorted, true);
   assert.equal(manifest.features.queryBundles, true);
   assert.equal(manifest.features.authority, true);
+  assert.equal(manifest.optimizer.format, "rfoptimizer-v1");
+  assert.equal(manifest.optimizer.policy, "core-first");
   assert.equal(manifest.object_store.pointer_format, "rfbp-v1");
   assert.equal(manifest.object_store.immutable_names, true);
   assert.equal(manifest.docs.layout.format, "rflocal-doc-v1");
@@ -165,9 +182,15 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.selected_term_spool_terms > 0);
   assert.ok(manifest.stats.doc_raw_spool_bytes > 0);
   assert.ok(manifest.stats.doc_gzip_spool_bytes > 0);
-  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v1");
+  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v3");
   assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
   assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
+  assert.ok(manifest.stats.posting_segment_superblocks > 0);
+  assert.ok(manifest.stats.posting_segment_superblock_terms > 0);
+  assert.ok(manifest.stats.posting_segment_superblock_blocks >= manifest.stats.posting_segment_superblocks);
+  assert.equal(manifest.stats.posting_segment_superblock_size, 16);
+  assert.ok(manifest.stats.posting_segment_block_codec_pair_varint_blocks > 0);
+  assert.ok(manifest.stats.posting_segment_block_codec_baseline_bytes >= manifest.stats.posting_segment_block_codec_selected_bytes);
   assert.equal(manifest.stats.term_storage, undefined);
   assert.equal(manifest.stats.posting_block_storage, undefined);
   assert.equal(manifest.stats.segment_format, "rfsegment-v1");
@@ -233,9 +256,23 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(server.requests.some(request => request.pathname.endsWith("/manifest.min.json")));
   assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
   assert.equal(server.requests.some(request => request.pathname.endsWith("/debug/build-telemetry.json")), false);
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/debug/index-optimizer.json")), false);
   const lazyTelemetry = await search.loadBuildTelemetry();
   assert.equal(lazyTelemetry.format, "rfbuildtelemetry-v1");
   assert.ok(server.requests.some(request => request.pathname.endsWith("/debug/build-telemetry.json")));
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/debug/index-optimizer.json")), false);
+  const lazyOptimizer = await search.loadIndexOptimizer();
+  assert.equal(lazyOptimizer.format, "rfoptimizer-v1");
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/debug/index-optimizer.json")));
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
+
+  const sortOnlySearch = await createSearch({ baseUrl: server.baseUrl });
+  const sortOnlyInitial = await sortOnlySearch.search({ q: "", sort: "-year", size: 2 });
+  assert.deepEqual(sortOnlyInitial.results.map(result => result.id), ["a", "c"]);
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/doc-values/sorted/manifest.json.gz")));
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
+  const sortOnlyText = await sortOnlySearch.search({ q: "search", sort: "-year", size: 2, rerank: false });
+  assert.equal(sortOnlyText.stats.plannerLane, "sortPageText");
   assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
 
   const results = await search.search({ q: "static range search", size: 3 });
@@ -250,6 +287,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
     results.results.map(result => result.title),
     exactResults.results.map(result => result.title)
   );
+  assert.equal(exactResults.stats.plannerFallbackReason, "exact_requested");
   assert.ok(results.stats.blocksDecoded <= exactResults.stats.blocksDecoded);
 
   const singleTerm = await search.search({ q: "search", size: 2, rerank: false });
@@ -259,6 +297,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
     singleTermExact.results.map(result => result.title)
   );
   assert.ok(singleTerm.stats.blocksDecoded < singleTermExact.stats.blocksDecoded);
+  assert.ok(singleTerm.stats.topKProofAttempts > 0);
+  assert.ok(singleTerm.stats.topKProofSuccesses > 0);
+  assert.equal(singleTerm.stats.topKProofFailureReason, "");
+  assert.equal(singleTerm.stats.topKProofSortAware, false);
 
   const missingBaseTerm = await search.search({ q: "static zzzzzrangefindaucunresultatzzzzextra", size: 2, rerank: false });
   assert.equal(missingBaseTerm.total, 0);
@@ -286,6 +328,19 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(filteredBundled.stats.queryBundleRowGroupsScanned <= filteredBundled.stats.queryBundleRowGroups);
   assert.ok(filteredBundled.stats.docValueRowsScanned <= filteredBundled.stats.queryBundleRows);
   assert.equal(filteredBundled.stats.blocksDecoded, 0);
+
+  const fullRequestsBeforeLazyFilter = server.requests.filter(request => request.pathname.endsWith("/manifest.full.json")).length;
+  const lazyFilterSearch = await createSearch({ baseUrl: server.baseUrl });
+  const lazyFilteredBundled = await lazyFilterSearch.search({
+    q: "static range",
+    size: 2,
+    rerank: false,
+    filters: { facets: { tags: ["static"] }, booleans: { featured: true } }
+  });
+  assert.deepEqual(lazyFilteredBundled.results.map(result => result.id), ["a"]);
+  assert.equal(server.requests.filter(request => request.pathname.endsWith("/manifest.full.json")).length, fullRequestsBeforeLazyFilter);
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/facets/manifest.json.gz")));
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/doc-values/manifest.json.gz")));
 
   const bundledExact = await search.search({ q: "static range", size: 2, exact: true, rerank: false });
   assert.deepEqual(
@@ -355,6 +410,17 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(sortedInitial.stats.docValuePruning, true);
   assert.equal(sortedInitial.stats.docValuePruneField, "year");
 
+  const sortedText = await search.search({ q: "search", sort: "-year", size: 2, rerank: false });
+  const sortedTextExact = await search.search({ q: "search", sort: "-year", size: 2, exact: true, rerank: false });
+  assert.deepEqual(
+    sortedText.results.map(result => result.id),
+    sortedTextExact.results.map(result => result.id)
+  );
+  assert.equal(sortedText.stats.plannerLane, "sortPageText");
+  assert.equal(sortedText.stats.docValueSortText, true);
+  assert.equal(sortedText.stats.topKProofSortAware, true);
+  assert.ok(sortedText.stats.docValuePagesVisited < sortedText.stats.docValueDirectoryPages);
+
   const pageTable = parseDocPagePointerPage(await readFile(join(output, manifest.docs.pages.pointers.file)), {
     packTable: manifest.docs.pages.pointers.pack_table
   });
@@ -402,6 +468,44 @@ test("failed builds write diagnostics and clean partial scratch state", async ()
   assert.ok(failedTelemetry.error.message);
 });
 
+test("builder resolves auto posting layout into manifest and optimizer report", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-auto-layout-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, Array.from({ length: 12 }, (_, index) => JSON.stringify({
+    id: String(index),
+    title: `Auto layout document ${index}`,
+    body: "common auto layout corpus statistics",
+    url: `/${index}`
+  })).join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    postingBlockSize: "auto",
+    postingSuperblockSize: "auto",
+    queryBundles: false,
+    fields: [
+      { name: "title", path: "title", weight: 2.0 },
+      { name: "body", path: "body", weight: 1.0 }
+    ],
+    display: ["title", "url"]
+  }));
+
+  await build({ configPath });
+  const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  const optimizerReport = JSON.parse(await readFile(join(output, "debug", "index-optimizer.json"), "utf8"));
+  const codecLayout = optimizerReport.core.find(item => item.kind === "codec-layout");
+  assert.equal(manifest.stats.posting_segment_block_size_source, "auto");
+  assert.equal(manifest.stats.posting_segment_superblock_size_source, "auto");
+  assert.ok(manifest.stats.posting_segment_block_size > 0);
+  assert.ok(manifest.stats.posting_segment_superblock_size > 0);
+  assert.equal(codecLayout.mode, "auto");
+  assert.equal(codecLayout.block_size_source, "auto");
+  assert.equal(codecLayout.superblock_size_source, "auto");
+  assert.equal(codecLayout.selected_codec, "mixed-auto-block-codec");
+});
+
 test("runtime refills high-df posting block windows in batches", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-frontier-"));
   const docsPath = join(root, "docs.jsonl");
@@ -410,6 +514,10 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
     id: String(index),
     title: `Common document ${String(index).padStart(2, "0")}`,
     body: "common marker text",
+    category: index % 2 === 0 ? "even" : "odd",
+    bucket: index < 20 ? "head" : "tail",
+    unique: `u${index}`,
+    tail: index >= 20,
     url: `/${index}`
   }));
   await writeFile(docsPath, docs.join("\n"));
@@ -420,13 +528,17 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
     maxShardDepth: 1,
     targetShardPostings: 1000,
     postingBlockSize: 1,
+    blockFilterMaxFacetWords: 1,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0,
+    queryBundles: false,
     fields: [
       { name: "title", path: "title", weight: 2.0 },
       { name: "body", path: "body", weight: 1.0 }
     ],
-    display: ["title", "url"]
+    facets: [{ name: "category", path: "category" }, { name: "bucket", path: "bucket" }, { name: "unique", path: "unique" }],
+    booleans: [{ name: "tail", path: "tail" }],
+    display: ["title", "url", "category", "bucket", "unique", "tail"]
   }));
 
   await build({ configPath });
@@ -441,5 +553,81 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
   assert.equal(results.stats.blocksDecoded, 40);
   assert.equal(results.stats.postingBlockFrontierFetchedBlocks, 40);
   assert.equal(results.stats.postingBlockFrontierFetchGroups, 3);
+  assert.equal(results.stats.postingSuperblockScheduler, true);
+  assert.ok(results.stats.postingSuperblocks > 0);
+  assert.equal(results.stats.postingSuperblocksSkipped, 0);
+  assert.ok(results.stats.postingSuperblocksDecoded > 0);
   assert.equal(postingBlockRequests.length, 3);
+  assert.equal(results.stats.plannerFallbackReason, "");
+  assert.equal(results.stats.topKProofFailureReason, "");
+  assert.ok(results.stats.topKProofSuccesses > 0);
+  assert.ok(results.stats.topKProofFailureCandidateCount > 0);
+
+  const tieProof = await search.search({ q: "common", size: 5, rerank: false });
+  assert.equal(tieProof.results.length, 5);
+  assert.deepEqual(tieProof.results.map(result => result.id), ["0", "1", "2", "3", "4"]);
+  assert.equal(tieProof.stats.blocksDecoded, 5);
+  assert.equal(tieProof.stats.topKProofFailureReason, "");
+  assert.equal(tieProof.stats.topKProofFailureTieBound, 0);
+  assert.equal(tieProof.stats.topKProofMaxOutsidePotential, tieProof.stats.topKProofThreshold);
+  assert.ok(tieProof.stats.topKProofRemainingTerms > 0);
+  assert.ok(tieProof.stats.topKProofRemainingTermUpperBound > 0);
+
+  const exhausted = await search.search({ q: "common", size: 41, rerank: false });
+  assert.equal(exhausted.stats.plannerFallbackReason, "tail_exhausted");
+  assert.equal(exhausted.stats.topKProofFailureReason, "tail_exhausted");
+
+  const multiTerm = await search.search({ q: "common marker", size: 5, rerank: false });
+  assert.ok(multiTerm.stats.terms > 1);
+  assert.ok(multiTerm.stats.topKProofAttempts > 0);
+  assert.equal(multiTerm.stats.topKProofSortAware, false);
+
+  const filtered = await search.search({
+    q: "common",
+    size: 5,
+    rerank: false,
+    filters: { facets: { category: ["even"] } }
+  });
+  assert.equal(filtered.results.length, 5);
+  assert.ok(filtered.results.every(result => Number(result.id) % 2 === 0));
+  assert.equal(filtered.stats.topKProofFilterAware, true);
+
+  const tailFiltered = await search.search({
+    q: "common",
+    size: 5,
+    rerank: false,
+    filters: { facets: { bucket: ["tail"] } }
+  });
+  assert.equal(tailFiltered.results.length, 5);
+  assert.ok(tailFiltered.results.every(result => result.bucket === "tail"));
+  assert.ok(tailFiltered.stats.postingSuperblocksConsidered > 0);
+  assert.ok(tailFiltered.stats.postingSuperblocksSkipped > 0);
+  assert.ok(tailFiltered.stats.skippedBlocks >= 16);
+
+  const booleanSummaryFiltered = await search.search({
+    q: "common",
+    size: 5,
+    rerank: false,
+    filters: { booleans: { tail: true } }
+  });
+  assert.equal(booleanSummaryFiltered.results.length, 5);
+  assert.ok(booleanSummaryFiltered.results.every(result => result.tail === true));
+  assert.ok(booleanSummaryFiltered.stats.filterSummaryProofBlocks > 0);
+
+  const unknownFiltered = await search.search({
+    q: "common",
+    size: 5,
+    rerank: false,
+    filters: { facets: { unique: ["u22"] } }
+  });
+  assert.deepEqual(unknownFiltered.results.map(result => result.id), ["22"]);
+  assert.equal(unknownFiltered.stats.topKProofFilterAware, true);
+  assert.equal(unknownFiltered.stats.topKProofFilterUnknown, true);
+  assert.equal(unknownFiltered.stats.topKProofUnknownFilterFields, "unique");
+
+  const largePageFallback = await search.search({ q: "common", page: 2, size: 100, rerank: false });
+  assert.equal(largePageFallback.stats.plannerLane, "fullFallback");
+  assert.equal(largePageFallback.stats.plannerFallbackReason, "top_k_limit");
+  assert.equal(largePageFallback.stats.topKProofFailureReason, "top_k_limit");
+  assert.equal(largePageFallback.stats.topKProofAttempts, 0);
 });

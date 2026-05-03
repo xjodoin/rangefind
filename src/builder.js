@@ -39,6 +39,7 @@ import {
 import { buildDocOrdinalTable, buildDocPointerTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
+import { buildIndexOptimizerReport, INDEX_OPTIMIZER_PATH } from "./optimizer.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
@@ -971,7 +972,19 @@ function emptyPostingSegmentStats() {
     externalTerms: 0,
     externalPostings: 0,
     externalPostingBytes: 0,
-    inlinePostingBytes: 0
+    inlinePostingBytes: 0,
+    superblocks: 0,
+    superblockTerms: 0,
+    superblockBlocks: 0,
+    pairVarintBlocks: 0,
+    impactRunBlocks: 0,
+    impactBitsetBlocks: 0,
+    partitionedDeltaBlocks: 0,
+    blockCodecBaselineBytes: 0,
+    blockCodecSelectedBytes: 0,
+    blockCodecImpactRunCandidateBytes: 0,
+    blockCodecImpactBitsetCandidateBytes: 0,
+    blockCodecPartitionedDeltaCandidateBytes: 0
   };
 }
 
@@ -997,6 +1010,60 @@ function scanWorkerCount(config) {
 
 function scanBatchDocs(config) {
   return Math.max(1, Math.floor(Number(config.scanBatchDocs || 128)));
+}
+
+function positiveIntegerOption(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function choosePostingBlockSize(totalDocs, totalPostings, termCount) {
+  const avgPostings = totalPostings / Math.max(1, termCount);
+  if (totalDocs >= 500000 || avgPostings >= 4096) return 256;
+  if (totalDocs >= 100000 || avgPostings >= 1024) return 128;
+  if (avgPostings <= 16) return 32;
+  return 64;
+}
+
+function choosePostingSuperblockSize(postingBlockSize) {
+  if (postingBlockSize <= 32) return 32;
+  if (postingBlockSize >= 256) return 8;
+  return 16;
+}
+
+function applyAutoPostingLayout(config, measured, runData) {
+  const codecMode = String(config.codecs?.mode || "auto").toLowerCase();
+  const postingBlockAuto = config.postingBlockSize === "auto";
+  const postingSuperblockAuto = config.postingSuperblockSize === "auto";
+  const selectedPostingBlockSize = postingBlockAuto
+    ? choosePostingBlockSize(measured.total, runData.segmentSummary.postings, runData.selectedTermSpool.terms)
+    : positiveIntegerOption(config.postingBlockSize, 128);
+  const selectedPostingSuperblockSize = postingSuperblockAuto
+    ? choosePostingSuperblockSize(selectedPostingBlockSize)
+    : positiveIntegerOption(config.postingSuperblockSize, 16);
+  config.postingBlockSize = selectedPostingBlockSize;
+  config.postingSuperblockSize = selectedPostingSuperblockSize;
+  config._layoutDecisions = {
+    codecs: {
+      mode: codecMode,
+      selected_posting_codec: codecMode === "auto" ? "mixed-auto-block-codec" : "varint-impact-gzip-member",
+      candidate_codecs: ["varint-impact-gzip-member", "partitioned-elias-fano", "dense-bitset-container", "compact-impact-array"]
+    },
+    posting_block_size: {
+      source: postingBlockAuto ? "auto" : "configured",
+      value: selectedPostingBlockSize
+    },
+    posting_superblock_size: {
+      source: postingSuperblockAuto ? "auto" : "configured",
+      value: selectedPostingSuperblockSize
+    },
+    corpus: {
+      docs: measured.total,
+      postings: runData.segmentSummary.postings,
+      terms: runData.selectedTermSpool.terms,
+      avg_postings_per_term: runData.segmentSummary.postings / Math.max(1, runData.selectedTermSpool.terms)
+    }
+  };
 }
 
 function analyzeDocForScan(doc, index, config, avgLens) {
@@ -1428,7 +1495,10 @@ function minimalManifest(manifest) {
     lazy_manifests: {
       full: "manifest.full.json",
       build: "debug/build-telemetry.json",
-      doc_values: "doc-values/manifest.json.gz"
+      optimizer: INDEX_OPTIMIZER_PATH,
+      doc_values: "doc-values/manifest.json.gz",
+      doc_value_sorted: "doc-values/sorted/manifest.json.gz",
+      facet_dictionaries: "facets/manifest.json.gz"
     },
     total: manifest.total,
     docs: manifest.docs,
@@ -1442,6 +1512,7 @@ function minimalManifest(manifest) {
     directory: manifest.directory,
     query_bundles: manifest.query_bundles,
     authority: manifest.authority,
+    optimizer: manifest.optimizer,
     typo: manifest.typo ? {
       manifest: manifest.typo.manifest,
       manifest_hash: manifest.typo.manifest_hash
@@ -1529,6 +1600,7 @@ export async function build({ configPath }) {
     addBuildCounter(telemetry, "doc_gzip_spool_bytes", runData.docSpool.bytes);
     addBuildCounter(telemetry, "segment_files", runData.segments.length);
     addBuildCounter(telemetry, "segment_postings", runData.segmentSummary.postings);
+    applyAutoPostingLayout(config, measured, runData);
     const reduced = await timeBuildPhase(telemetry, "reduce-postings", () => reduceRuns(config, measured, runData, dirs, typoBuffer));
     recordBuildWorkers(telemetry, "reduce-postings", reduced.workerStats, {
       final_pack_assembly_ms: reduced.reduceTimings.finalPackAssemblyMs || 0,
@@ -1735,6 +1807,23 @@ export async function build({ configPath }) {
       external_posting_segment_postings: reduced.blockStats.externalPostings,
       external_posting_segment_source_bytes: reduced.blockStats.externalPostingBytes,
       inline_posting_segment_source_bytes: reduced.blockStats.inlinePostingBytes,
+      posting_segment_superblocks: reduced.blockStats.superblocks,
+      posting_segment_superblock_terms: reduced.blockStats.superblockTerms,
+      posting_segment_superblock_blocks: reduced.blockStats.superblockBlocks,
+      posting_segment_superblock_size: config.postingSuperblockSize,
+      posting_segment_superblock_size_source: config._layoutDecisions?.posting_superblock_size?.source || "configured",
+      posting_segment_codec_mode: config._layoutDecisions?.codecs?.mode || "auto",
+      posting_segment_codec: config._layoutDecisions?.codecs?.selected_posting_codec || "varint-impact-gzip-member",
+      posting_segment_block_codec_pair_varint_blocks: reduced.blockStats.pairVarintBlocks,
+      posting_segment_block_codec_impact_run_blocks: reduced.blockStats.impactRunBlocks,
+      posting_segment_block_codec_impact_bitset_blocks: reduced.blockStats.impactBitsetBlocks,
+      posting_segment_block_codec_partitioned_delta_blocks: reduced.blockStats.partitionedDeltaBlocks,
+      posting_segment_block_codec_baseline_bytes: reduced.blockStats.blockCodecBaselineBytes,
+      posting_segment_block_codec_selected_bytes: reduced.blockStats.blockCodecSelectedBytes,
+      posting_segment_block_codec_impact_run_candidate_bytes: reduced.blockStats.blockCodecImpactRunCandidateBytes,
+      posting_segment_block_codec_impact_bitset_candidate_bytes: reduced.blockStats.blockCodecImpactBitsetCandidateBytes,
+      posting_segment_block_codec_partitioned_delta_candidate_bytes: reduced.blockStats.blockCodecPartitionedDeltaCandidateBytes,
+      posting_segment_block_codec_bytes_saved: Math.max(0, reduced.blockStats.blockCodecBaselineBytes - reduced.blockStats.blockCodecSelectedBytes),
       doc_storage: docs.storage,
       doc_layout_format: docs.layout.format,
       doc_layout_primary_terms: docs.layout.primary_terms,
@@ -1803,6 +1892,7 @@ export async function build({ configPath }) {
       segment_terms: reduced.segmentSummary.terms,
       segment_postings: reduced.segmentSummary.postings,
       posting_segment_block_size: config.postingBlockSize,
+      posting_segment_block_size_source: config._layoutDecisions?.posting_block_size?.source || "configured",
       base_shard_depth: config.baseShardDepth,
       max_shard_depth: config.maxShardDepth,
       target_shard_postings: config.targetShardPostings,
@@ -1811,10 +1901,17 @@ export async function build({ configPath }) {
       scoring: "rangefind-bm25f-phrase-proximity-v2"
     }
   };
+  const optimizerReport = buildIndexOptimizerReport({ config, manifest });
+  manifest.optimizer = optimizerReport.summary;
   mkdirSync(resolve(dirs.out, "debug"), { recursive: true });
   mkdirSync(resolve(dirs.out, "doc-values"), { recursive: true });
+  mkdirSync(resolve(dirs.out, "doc-values", "sorted"), { recursive: true });
+  mkdirSync(resolve(dirs.out, "facets"), { recursive: true });
   writeFileSync(resolve(dirs.out, "debug", "build-telemetry.json"), JSON.stringify(buildTelemetry, null, 2));
+  writeFileSync(resolve(dirs.out, INDEX_OPTIMIZER_PATH), JSON.stringify(optimizerReport, null, 2));
   writeFileSync(resolve(dirs.out, "doc-values", "manifest.json.gz"), gzipSync(JSON.stringify(docValues), { level: 6 }));
+  writeFileSync(resolve(dirs.out, "doc-values", "sorted", "manifest.json.gz"), gzipSync(JSON.stringify(manifest.doc_value_sorted), { level: 6 }));
+  writeFileSync(resolve(dirs.out, "facets", "manifest.json.gz"), gzipSync(JSON.stringify(facetDictionaries), { level: 6 }));
   writeFileSync(resolve(dirs.out, "manifest.full.json"), JSON.stringify(manifest));
   writeFileSync(resolve(dirs.out, "manifest.min.json"), JSON.stringify(minimalManifest(manifest)));
   writeFileSync(resolve(dirs.out, "manifest.json"), JSON.stringify(manifest));

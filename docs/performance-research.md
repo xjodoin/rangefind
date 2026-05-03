@@ -35,7 +35,7 @@ compact.
 
 The next format step is now implemented for high-df terms: eligible posting
 blocks are stored in `terms/block-packs/*.bin` and referenced from
-`rfsegpost-v1` posting-segment metadata. The runtime applies the existing
+`rfsegpost-v3` posting-segment metadata. The runtime applies the existing
 block-max schedule before fetching
 those blocks, with a batched frontier of high-impact cursors and a refillable
 contiguous posting-block cache window. That turns long high-df scans into a few

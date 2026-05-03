@@ -49,6 +49,10 @@ export const DEFAULTS = {
   maxExpansionTermsPerDoc: 12,
   initialResultLimit: 20,
   postingBlockSize: 128,
+  postingSuperblockSize: 16,
+  codecs: { mode: "auto" },
+  optimizationBudgetRatio: 0.08,
+  optimizationBudgetMaxBytes: 50 * 1024 * 1024,
   bm25fK1: 1.2,
   buildTelemetrySampleMs: 1000,
   buildTelemetryPath: ""
@@ -80,6 +84,7 @@ export async function readConfig(configPath) {
   return {
     ...DEFAULTS,
     ...activeRaw,
+    codecs: { ...DEFAULTS.codecs, ...(raw.codecs || {}) },
     input: resolveFrom(base, raw.input),
     output: resolveFrom(base, raw.output || "public/rangefind"),
     buildTelemetryPath: raw.buildTelemetryPath ? resolveFrom(base, raw.buildTelemetryPath) : "",

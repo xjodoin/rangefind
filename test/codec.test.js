@@ -31,7 +31,8 @@ test("posting segment codec round-trips postings and block filters", () => {
     facets: [{ name: "category" }],
     numbers: [{ name: "year" }],
     booleans: [{ name: "featured" }],
-    postingBlockSize: 2
+    postingBlockSize: 2,
+    postingSuperblockSize: 2
   };
   const dicts = {
     category: { values: [{ value: "", label: "", n: 0 }, { value: "docs", label: "Docs", n: 2 }] }
@@ -45,12 +46,27 @@ test("posting segment codec round-trips postings and block filters", () => {
   const segment = buildPostingSegment([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
   const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
   const entry = shard.terms.get("search");
-  assert.equal(segment.format, "rfsegpost-v1");
-  assert.equal(shard.format, "rfsegpost-v1");
-  assert.equal(entry.format, "rfsegpost-v1");
+  assert.equal(segment.format, "rfsegpost-v3");
+  assert.equal(shard.format, "rfsegpost-v3");
+  assert.equal(entry.format, "rfsegpost-v3");
   assert.equal(entry.count, 3);
   assert.equal(entry.blocks[0].rowCount, 2);
   assert.equal(entry.blocks[1].rowCount, 1);
+  assert.equal(entry.blocks[0].maxImpactDoc, 0);
+  assert.equal(entry.blocks[1].maxImpactDoc, 2);
+  assert.deepEqual(entry.superblocks.map(item => ({
+    firstBlock: item.firstBlock,
+    blockCount: item.blockCount,
+    rowCount: item.rowCount,
+    maxImpact: item.maxImpact,
+    maxImpactDoc: item.maxImpactDoc
+  })), [{ firstBlock: 0, blockCount: 2, rowCount: 3, maxImpact: 13, maxImpactDoc: 0 }]);
+  assert.deepEqual(entry.superblocks[0].filters.category.words, [3]);
+  assert.deepEqual(entry.superblocks[0].filters.year, { min: -5, max: 10 });
+  assert.deepEqual(entry.superblocks[0].filters.featured, { min: 0, max: 2 });
+  assert.equal(segment.stats.superblocks, 1);
+  assert.equal(segment.stats.superblockTerms, 1);
+  assert.equal(segment.stats.superblockBlocks, 2);
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0).sort(), [0, 1, 2]);
   assert.deepEqual(entry.blocks[0].filters.category.words, [2]);
   assert.deepEqual(entry.blocks[0].filters.year, { min: -5, max: 0 });
@@ -63,6 +79,7 @@ test("posting segment codec writes external posting blocks directly", () => {
     numbers: [{ name: "year" }],
     booleans: [{ name: "featured" }],
     postingBlockSize: 2,
+    postingSuperblockSize: 1,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0
   };
@@ -90,20 +107,89 @@ test("posting segment codec writes external posting blocks directly", () => {
     }
   });
   const entry = shard.terms.get("search");
-  assert.equal(segment.format, "rfsegpost-v1");
+  assert.equal(segment.format, "rfsegpost-v3");
   assert.equal(entry.external, true);
   assert.equal(entry.blocks.length, 2);
   assert.equal(entry.blocks[0].rowCount, 2);
   assert.equal(entry.blocks[1].rowCount, 1);
+  assert.equal(entry.blocks[0].maxImpactDoc, 0);
+  assert.equal(entry.blocks[1].maxImpactDoc, 2);
+  assert.equal(entry.superblocks.length, 2);
+  assert.deepEqual(entry.superblocks[0].filters.year, { min: -1, max: 0 });
+  assert.deepEqual(entry.superblocks[1].filters.featured, { min: 2, max: 2 });
   assert.equal(entry.blocks[0].range.pack, "0000.immutable.bin");
   assert.equal(entry.blocks[0].range.logicalLength, 4);
   assert.equal(entry.blocks[0].range.checksum.value, checksum.value);
   assert.deepEqual(entry.blocks[0].filters.year, { min: -1, max: 0 });
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 1 });
-  assert.deepEqual([...decodePostingBytes(stored[0])], [0, 13, 1, 11]);
+  assert.deepEqual([...decodePostingBytes(stored[0], entry.blocks[0])], [0, 13, 1, 11]);
   assert.equal(segment.stats.externalBlocks, 2);
   assert.equal(segment.stats.externalTerms, 1);
   assert.equal(segment.stats.inlinePostingBytes, 0);
+  assert.equal(segment.stats.superblocks, 2);
+  assert.equal(segment.stats.superblockTerms, 1);
+  assert.equal(segment.stats.superblockBlocks, 2);
+});
+
+test("posting segment codec selects compact impact runs when measured smaller", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 4,
+    postingSuperblockSize: 2,
+    codecs: { mode: "auto" }
+  };
+  const filters = buildBlockFilters(config, {});
+  const segment = buildPostingSegment([["common", [[0, 1000], [100, 1000], [200, 1000], [300, 1000]]]], 301, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("common");
+  assert.equal(entry.blocks[0].codec, "impact-runs-v1");
+  assert.equal(segment.stats.impactRunBlocks, 1);
+  assert.equal(segment.stats.pairVarintBlocks, 0);
+  assert.ok(segment.stats.blockCodecSelectedBytes < segment.stats.blockCodecBaselineBytes);
+  assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0), [0, 100, 200, 300]);
+});
+
+test("posting segment codec selects dense impact bitsets when measured smaller", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 32,
+    postingSuperblockSize: 2,
+    codecs: { mode: "auto" }
+  };
+  const filters = buildBlockFilters(config, {});
+  const rows = Array.from({ length: 32 }, (_, doc) => [doc, 1000]);
+  const segment = buildPostingSegment([["dense", rows]], 32, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("dense");
+  assert.equal(entry.blocks[0].codec, "impact-bitset-v1");
+  assert.equal(segment.stats.impactBitsetBlocks, 1);
+  assert.equal(segment.stats.impactRunBlocks, 0);
+  assert.ok(segment.stats.blockCodecSelectedBytes < segment.stats.blockCodecBaselineBytes);
+  assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0), Array.from({ length: 32 }, (_, doc) => doc));
+});
+
+test("posting segment codec selects partitioned deltas for sparse regular doc ids", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 32,
+    postingSuperblockSize: 2,
+    codecs: { mode: "auto" }
+  };
+  const filters = buildBlockFilters(config, {});
+  const docs = Array.from({ length: 32 }, (_, index) => index * 10);
+  const segment = buildPostingSegment([["regular", docs.map(doc => [doc, 1000])]], 311, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("regular");
+  assert.equal(entry.blocks[0].codec, "partitioned-deltas-v1");
+  assert.equal(segment.stats.partitionedDeltaBlocks, 1);
+  assert.ok(segment.stats.blockCodecSelectedBytes < segment.stats.blockCodecBaselineBytes);
+  assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0), docs);
 });
 
 test("query bundle codec round-trips proof metadata and rows", () => {
