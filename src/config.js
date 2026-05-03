@@ -3,6 +3,10 @@ import { dirname, resolve } from "node:path";
 
 export const DEFAULTS = {
   docValueChunkSize: 2048,
+  docValueLookupChunkSize: 2048,
+  filterBitmaps: true,
+  filterBitmapMaxFacetValues: 64,
+  filterBitmapPackBytes: 4 * 1024 * 1024,
   baseShardDepth: 3,
   maxShardDepth: 5,
   targetShardPostings: 30000,

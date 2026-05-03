@@ -4,6 +4,72 @@ import { assertMagic, pushUtf8, readBlockFilterSummary, readUtf8, writeBlockFilt
 export const QUERY_BUNDLE_FORMAT = "rfqbundle-v1";
 const QUERY_BUNDLE_VERSION = 1;
 
+function pushFloat64(out, value) {
+  const buffer = new ArrayBuffer(8);
+  new DataView(buffer).setFloat64(0, Number(value || 0), true);
+  for (const byte of new Uint8Array(buffer)) out.push(byte);
+}
+
+function readFloat64(bytes, state) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset + state.pos, 8);
+  state.pos += 8;
+  return view.getFloat64(0, true);
+}
+
+function pushSignedVarint(out, value) {
+  const n = Math.round(Number(value || 0));
+  pushVarint(out, n < 0 ? (-n * 2) - 1 : n * 2);
+}
+
+function readSignedVarint(bytes, state) {
+  const n = readVarint(bytes, state);
+  return n % 2 ? -((n + 1) / 2) : n / 2;
+}
+
+function writeFilterValue(out, filter, value) {
+  if (filter.kind === "facet") {
+    const codes = Array.isArray(value?.codes)
+      ? value.codes
+      : Array.isArray(value)
+        ? value
+        : value == null
+          ? []
+          : [value];
+    pushVarint(out, codes.length);
+    for (const code of codes) pushVarint(out, code);
+    return;
+  }
+  if (filter.kind === "boolean") {
+    pushVarint(out, value == null ? 0 : value === true ? 2 : 1);
+    return;
+  }
+  if (value == null || !Number.isFinite(Number(value))) {
+    pushVarint(out, 0);
+    return;
+  }
+  pushVarint(out, 1);
+  if (String(filter.type || "int").toLowerCase() === "float") pushFloat64(out, value);
+  else pushSignedVarint(out, value);
+}
+
+function readFilterValue(bytes, state, filter) {
+  if (filter.kind === "facet") {
+    const count = readVarint(bytes, state);
+    const codes = new Array(count);
+    for (let i = 0; i < count; i++) codes[i] = readVarint(bytes, state);
+    return { codes };
+  }
+  if (filter.kind === "boolean") {
+    const code = readVarint(bytes, state);
+    return code === 0 ? null : code === 2;
+  }
+  const present = readVarint(bytes, state);
+  if (!present) return null;
+  return String(filter.type || "int").toLowerCase() === "float"
+    ? readFloat64(bytes, state)
+    : readSignedVarint(bytes, state);
+}
+
 export function buildQueryBundle(bundle, manifest = {}) {
   const out = [...QUERY_BUNDLE_MAGIC];
   pushVarint(out, QUERY_BUNDLE_VERSION);
@@ -36,6 +102,17 @@ export function buildQueryBundle(bundle, manifest = {}) {
     pushVarint(out, group.docMin || 0);
     pushVarint(out, group.docMax || 0);
     writeBlockFilterSummary(out, manifest.block_filters || [], group.filters);
+  }
+  const filters = manifest.block_filters || [];
+  const filterValues = bundle.filterValues || {};
+  const valueFields = filters
+    .map((filter, index) => ({ filter, index }))
+    .filter(({ filter }) => Object.prototype.hasOwnProperty.call(filterValues, filter.name));
+  pushVarint(out, valueFields.length);
+  for (const { filter, index } of valueFields) {
+    pushVarint(out, index);
+    const values = filterValues[filter.name] || [];
+    for (let i = 0; i < bundle.rows.length; i++) writeFilterValue(out, filter, values[i]);
   }
   return Uint8Array.from(out);
 }
@@ -74,5 +151,17 @@ export function parseQueryBundle(buffer, manifest = {}) {
       filters: readBlockFilterSummary(bytes, state, manifest)
     };
   }
-  return { key, baseTerms, expandedTerms, total, complete, nextScoreBound, nextTieDoc, rows, rowGroups };
+  const filterValues = {};
+  const filters = manifest.block_filters || [];
+  const filterValueFieldCount = state.pos < bytes.length ? readVarint(bytes, state) : 0;
+  for (let fieldIndex = 0; fieldIndex < filterValueFieldCount; fieldIndex++) {
+    const filter = filters[readVarint(bytes, state)];
+    const valuesByDoc = {};
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+      const value = filter ? readFilterValue(bytes, state, filter) : null;
+      if (filter) valuesByDoc[rows[rowIndex][0]] = value;
+    }
+    if (filter) filterValues[filter.name] = valuesByDoc;
+  }
+  return { key, baseTerms, expandedTerms, total, complete, nextScoreBound, nextTieDoc, rows, rowGroups, filterValues };
 }

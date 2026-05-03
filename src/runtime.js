@@ -5,6 +5,7 @@ import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./dir
 import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
 import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.js";
+import { filterBitmapHas, parseFilterBitmap } from "./filter_bitmaps.js";
 import { verifyBlockPointer } from "./object_store.js";
 import { parseQueryBundle } from "./query_bundle_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
@@ -23,6 +24,7 @@ const DEPENDENCY_SCORE_SCALE = 0.12;
 const SKIP_MAX_TERMS = 30;
 const EXTERNAL_POSTING_BLOCK_PREFETCH = 16;
 const POSTING_BLOCK_FRONTIER = 4;
+const FILTER_BITMAP_SPARSE_DOC_LIMIT = 256;
 const TYPO_CORRECTION_CANDIDATES_PER_TOKEN = 2;
 const TYPO_CORRECTION_PLAN_LIMIT = 6;
 const TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
@@ -138,7 +140,10 @@ export async function createSearch(options = {}) {
   let docValuesPromise = null;
   let docValueSorted = manifest.doc_value_sorted || null;
   let docValueSortedPromise = null;
+  let filterBitmaps = manifest.filter_bitmaps || null;
+  let filterBitmapsPromise = null;
   const docValueStore = { _docValues: true };
+  const filterBitmapCache = new Map();
   const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
   let blockFilterFields = new Set((manifest.block_filters || []).map(filter => filter.name));
@@ -165,6 +170,7 @@ export async function createSearch(options = {}) {
           Object.assign(manifest, full);
           docValues = manifest.doc_values || null;
           docValueSorted = manifest.doc_value_sorted || null;
+          filterBitmaps = manifest.filter_bitmaps || null;
           facetDictionaries = manifest.facet_dictionaries || null;
           facetDirectory = facetDictionaries?.directory ? createDirectoryState(facetDictionaries.directory) : null;
           blockFilterFields = new Set((manifest.block_filters || []).map(filter => filter.name));
@@ -201,6 +207,20 @@ export async function createSearch(options = {}) {
       });
     }
     return docValueSortedPromise;
+  }
+
+  async function ensureFilterBitmapManifest() {
+    if (filterBitmaps) return filterBitmaps;
+    const path = manifest.lazy_manifests?.filter_bitmaps;
+    if (!path) return null;
+    if (!filterBitmapsPromise) {
+      filterBitmapsPromise = fetchManifestJsonIfOk(path).then(meta => {
+        filterBitmaps = meta || null;
+        if (filterBitmaps) manifest.filter_bitmaps = filterBitmaps;
+        return filterBitmaps;
+      });
+    }
+    return filterBitmapsPromise;
   }
 
   async function ensureFacetDictionaryManifest() {
@@ -362,8 +382,20 @@ export async function createSearch(options = {}) {
     return fieldMeta?.chunks?.[index] ? index : -1;
   }
 
-  function docValueCacheKey(field, index) {
-    return `${field}\u0000${index}`;
+  function docValueLookupIndexForDoc(fieldMeta, doc) {
+    const chunks = fieldMeta?.lookup_chunks || null;
+    if (!chunks?.length) return -1;
+    const chunkSize = docValues?.lookup_chunk_size || docValues?.chunk_size || manifest.total || 1;
+    const index = Math.floor(doc / chunkSize);
+    return chunks[index] ? index : -1;
+  }
+
+  function docValueChunkForRequest(fieldMeta, request) {
+    return request.lookup ? fieldMeta?.lookup_chunks?.[request.index] : fieldMeta?.chunks?.[request.index];
+  }
+
+  function docValueCacheKey(field, index, lookup = false) {
+    return `${field}\u0000${lookup ? "lookup" : "chunk"}\u0000${index}`;
   }
 
   async function loadDocValueChunks(requests) {
@@ -371,9 +403,9 @@ export async function createSearch(options = {}) {
     const pending = [];
     for (const request of requests) {
       const fieldMeta = docValueField(request.field);
-      const chunk = fieldMeta?.chunks?.[request.index];
+      const chunk = docValueChunkForRequest(fieldMeta, request);
       if (!chunk) continue;
-      const key = docValueCacheKey(request.field, request.index);
+      const key = docValueCacheKey(request.field, request.index, request.lookup);
       if (docValueCache.has(key)) continue;
       let resolve;
       let reject;
@@ -383,19 +415,19 @@ export async function createSearch(options = {}) {
       });
       promise.catch(() => {});
       docValueCache.set(key, promise);
-      pending.push({ field: request.field, index: request.index, entry: chunk, resolve, reject });
+      pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
     }
     await Promise.all(rangeGroups(pending).map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const parsed = parseDocValueChunk(await inflateGroupItem(compressed, group.start, item, `doc-value ${item.field}:${item.index}`));
-          docValueCache.set(docValueCacheKey(item.field, item.index), parsed);
+          docValueCache.set(docValueCacheKey(item.field, item.index, item.lookup), parsed);
           item.resolve(parsed);
         }));
       } catch (error) {
         for (const item of group.items) {
-          docValueCache.delete(docValueCacheKey(item.field, item.index));
+          docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
           item.reject(error);
         }
         throw error;
@@ -464,12 +496,13 @@ export async function createSearch(options = {}) {
       const fieldMeta = docValueField(field);
       if (!fieldMeta) continue;
       for (const doc of docs) {
-        const index = chunkIndexForDoc(fieldMeta, doc);
+        const lookup = !!fieldMeta.lookup_chunks?.length;
+        const index = lookup ? docValueLookupIndexForDoc(fieldMeta, doc) : chunkIndexForDoc(fieldMeta, doc);
         if (index < 0) continue;
-        const key = docValueCacheKey(field, index);
+        const key = docValueCacheKey(field, index, lookup);
         if (seen.has(key) || docValueCache.has(key)) continue;
         seen.add(key);
-        requests.push({ field, index });
+        requests.push({ field, index, lookup });
       }
     }
     await loadDocValueChunks(requests);
@@ -487,8 +520,80 @@ export async function createSearch(options = {}) {
     return docValueStore;
   }
 
+  function filterBitmapField(field) {
+    return filterBitmaps?.fields?.[field] || null;
+  }
+
+  function filterBitmapCacheKey(field, value) {
+    return `${field}\u0000${value}`;
+  }
+
+  async function loadFilterBitmap(field, value) {
+    if (!filterBitmaps) await ensureFilterBitmapManifest();
+    const entry = filterBitmapField(field)?.values?.[String(value)];
+    if (!entry) return null;
+    const key = filterBitmapCacheKey(field, value);
+    if (!filterBitmapCache.has(key)) {
+      const promise = fetchRange(new URL(`filter-bitmaps/packs/${entry.pack}`, baseUrl), entry.offset, entry.length)
+        .then(buffer => inflateObject(buffer, entry, `filter bitmap ${field}:${value}`))
+        .then(parseFilterBitmap);
+      promise.catch(() => {
+        filterBitmapCache.delete(key);
+      });
+      filterBitmapCache.set(key, promise);
+    }
+    return filterBitmapCache.get(key);
+  }
+
+  async function filterBitmapStoreForPlan(filterPlan) {
+    if (!filterPlan?.active) return null;
+    if (!filterPlan.facets.length && !filterPlan.booleans.length) return null;
+    if (!filterBitmaps) await ensureFilterBitmapManifest();
+    if (!filterBitmaps?.fields) return null;
+    const facets = new Map();
+    const booleans = new Map();
+    const covered = new Set();
+    for (const [field, selected] of filterPlan.facets) {
+      if (filterBitmapField(field)?.kind !== "facet") continue;
+      const bitmaps = (await Promise.all([...selected].map(code => loadFilterBitmap(field, String(code))))).filter(Boolean);
+      if (!bitmaps.length) continue;
+      facets.set(field, bitmaps);
+      covered.add(field);
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      if (filterBitmapField(field)?.kind !== "boolean") continue;
+      const bitmap = await loadFilterBitmap(field, expected ? "true" : "false");
+      if (!bitmap) continue;
+      booleans.set(field, bitmap);
+      covered.add(field);
+    }
+    return covered.size ? { _filterBitmaps: true, facets, booleans, covered } : null;
+  }
+
+  function mergeValueStores(primary, bitmapStore) {
+    if (!bitmapStore) return primary;
+    if (!primary) return bitmapStore;
+    return { ...primary, _filterBitmaps: bitmapStore };
+  }
+
+  async function valueStoreForFilterPlan(filterPlan, docs, omittedFields = []) {
+    if (!filterPlan?.active) return null;
+    const bitmapStore = docs.length <= FILTER_BITMAP_SPARSE_DOC_LIMIT
+      ? await filterBitmapStoreForPlan(filterPlan)
+      : null;
+    const omitted = new Set(omittedFields);
+    const bitmapCovered = bitmapStore?.covered || new Set();
+    const fields = filterPlanFields(filterPlan).filter(field => !omitted.has(field) && !bitmapCovered.has(field));
+    return mergeValueStores(await valueStoreForDocs(fields, docs), bitmapStore);
+  }
+
   function docValue(field, doc) {
     const fieldMeta = docValueField(field);
+    const lookupIndex = docValueLookupIndexForDoc(fieldMeta, doc);
+    if (lookupIndex >= 0) {
+      const lookupChunk = docValueCache.get(docValueCacheKey(field, lookupIndex, true));
+      if (lookupChunk && typeof lookupChunk.then !== "function") return lookupChunk.values[doc - lookupChunk.start];
+    }
     const index = chunkIndexForDoc(fieldMeta, doc);
     if (index < 0) return null;
     const chunk = docValueCache.get(docValueCacheKey(field, index));
@@ -499,6 +604,22 @@ export async function createSearch(options = {}) {
   function valueForDoc(valueStore, field, doc) {
     if (valueStore?._docValues) return docValue(field, doc);
     return valueStore?.[field]?.[doc];
+  }
+
+  function filterBitmapStore(valueStore) {
+    if (valueStore?._filterBitmaps === true) return valueStore;
+    return valueStore?._filterBitmaps || null;
+  }
+
+  function facetBitmapMatches(store, field, doc) {
+    const bitmaps = store?.facets?.get(field);
+    if (!bitmaps) return null;
+    return bitmaps.some(bitmap => filterBitmapHas(bitmap, doc));
+  }
+
+  function booleanBitmapMatches(store, field, doc) {
+    const bitmap = store?.booleans?.get(field);
+    return bitmap ? filterBitmapHas(bitmap, doc) : null;
   }
 
   async function valueStoreForDocs(fields, docs) {
@@ -789,6 +910,142 @@ export async function createSearch(options = {}) {
       && bundle.nextTieDoc > boundary[0];
   }
 
+  function queryBundleFilteredTopKProven(bundle, ranked, k) {
+    if (bundle.complete) return true;
+    if (ranked.length < k) return false;
+    const boundary = ranked[k - 1];
+    return !!boundary && (bundle.nextScoreBound || 0) < boundary[1];
+  }
+
+  function queryBundleFilterValueFields(bundle, filterPlan) {
+    if (!filterPlan?.active || !bundle?.filterValues) return new Set();
+    return new Set(filterPlanFields(filterPlan).filter(field => Object.prototype.hasOwnProperty.call(bundle.filterValues, field)));
+  }
+
+  function knownQueryBundleFilterValues(bundle, fields, doc) {
+    const known = {};
+    for (const field of fields) known[field] = bundle.filterValues[field]?.[doc];
+    return known;
+  }
+
+  async function filterQueryBundleRowsWithEmbeddedValues({ bundle, candidateRows, docFilterPlan, k, embeddedFields }) {
+    const batchSize = Math.max(8, Math.min(32, k));
+    const ranked = [];
+    let scanned = 0;
+    let usedDocValues = false;
+    const omittedFields = [...embeddedFields];
+    for (let start = 0; start < candidateRows.length; start += batchSize) {
+      const batch = candidateRows.slice(start, start + batchSize);
+      const codeData = filterPlanFields(docFilterPlan).some(field => !embeddedFields.has(field))
+        ? await valueStoreForFilterPlan(docFilterPlan, batch.map(row => row[0]), omittedFields)
+        : null;
+      if (codeData?._docValues) usedDocValues = true;
+      scanned += batch.length;
+      for (const row of batch) {
+        if (passesFilterPlanWithKnown(row[0], codeData, docFilterPlan, knownQueryBundleFilterValues(bundle, embeddedFields, row[0]))) ranked.push(row);
+      }
+      if (queryBundleFilteredTopKProven(bundle, ranked, k)) {
+        const valueSource = usedDocValues ? "queryBundleRows+docValues" : "queryBundleRows";
+        return {
+          ranked,
+          topKProven: true,
+          scanned,
+          accepted: ranked.length,
+          exhausted: scanned >= candidateRows.length,
+          progressive: true,
+          valueSource,
+          usedDocValues,
+          filterProof: valueSource
+        };
+      }
+    }
+    const valueSource = usedDocValues ? "queryBundleRows+docValues" : "queryBundleRows";
+    return {
+      ranked,
+      topKProven: queryBundleFilteredTopKProven(bundle, ranked, k),
+      scanned,
+      accepted: ranked.length,
+      exhausted: true,
+      progressive: false,
+      valueSource,
+      usedDocValues,
+      filterProof: ""
+    };
+  }
+
+  async function filterQueryBundleRows({ bundle, candidateRows, docFilterPlan, k, summaryProvesFilters }) {
+    if (summaryProvesFilters) {
+      return {
+        ranked: candidateRows,
+        topKProven: queryBundleFilteredTopKProven(bundle, candidateRows, k),
+        scanned: 0,
+        accepted: candidateRows.length,
+        exhausted: true,
+        progressive: false,
+        valueSource: "rowGroupSummary",
+        filterProof: "rowGroupSummary"
+      };
+    }
+    const embeddedFields = queryBundleFilterValueFields(bundle, docFilterPlan);
+    if (embeddedFields.size) {
+      return filterQueryBundleRowsWithEmbeddedValues({
+        bundle,
+        candidateRows,
+        docFilterPlan,
+        k,
+        embeddedFields
+      });
+    }
+    const batchSize = Math.max(8, Math.min(32, k));
+    const ranked = [];
+    let scanned = 0;
+    for (let start = 0; start < candidateRows.length; start += batchSize) {
+      const batch = candidateRows.slice(start, start + batchSize);
+      const codeData = await valueStoreForFilterPlan(docFilterPlan, batch.map(row => row[0]));
+      if (!codeData) {
+        return {
+          ranked,
+          topKProven: false,
+          scanned,
+          accepted: ranked.length,
+          exhausted: false,
+          progressive: true,
+          valueSource: "",
+          usedDocValues: false,
+          filterProof: ""
+        };
+      }
+      scanned += batch.length;
+      for (const row of batch) {
+        if (passesFilterPlan(row[0], codeData, docFilterPlan)) ranked.push(row);
+      }
+      if (queryBundleFilteredTopKProven(bundle, ranked, k)) {
+        return {
+          ranked,
+          topKProven: true,
+          scanned,
+          accepted: ranked.length,
+          exhausted: scanned >= candidateRows.length,
+          progressive: true,
+          valueSource: "docValues",
+          usedDocValues: true,
+          filterProof: "progressiveDocValues"
+        };
+      }
+    }
+    return {
+      ranked,
+      topKProven: queryBundleFilteredTopKProven(bundle, ranked, k),
+      scanned,
+      accepted: ranked.length,
+      exhausted: true,
+      progressive: false,
+      valueSource: "docValues",
+      usedDocValues: true,
+      filterProof: ""
+    };
+  }
+
   async function tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank }) {
     const offset = (page - 1) * size;
     const k = offset + size;
@@ -818,24 +1075,24 @@ export async function createSearch(options = {}) {
         && candidateGroups
         && candidateGroups.length > 0
         && candidateGroups.every(group => blockDefinitelyPassesDocFilter({ filters: group.filters }, docFilterPlan));
-      const codeData = hasFilters && !summaryProvesFilters
-        ? await valueStoreForDocs(filterFields, candidateRows.map(row => row[0]))
+      const filterResult = hasFilters
+        ? await filterQueryBundleRows({ bundle, candidateRows, docFilterPlan, k, summaryProvesFilters })
         : null;
-      if (hasFilters && !summaryProvesFilters && !codeData) continue;
-      const ranked = hasFilters
-        ? summaryProvesFilters
-          ? candidateRows
-          : candidateRows.filter(row => passesFilterPlan(row[0], codeData, docFilterPlan))
-        : bundle.rows;
-      const filteredTopKProven = hasFilters
-        && (bundle.complete || (ranked.length >= k && (bundle.nextScoreBound || 0) < ranked[k - 1][1]));
-      if (hasFilters ? !filteredTopKProven : !bundleProvesTopK(bundle, k)) continue;
+      const ranked = hasFilters ? filterResult.ranked : bundle.rows;
+      if (hasFilters ? !filterResult.topKProven : !bundleProvesTopK(bundle, k)) continue;
       const rows = ranked.slice(offset, offset + size);
       const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
       const results = await rowsToResults(rows, resultContext);
-      const totalExact = !hasFilters || bundle.complete;
+      const totalExact = !hasFilters || (bundle.complete && filterResult.exhausted);
+      const total = !hasFilters
+        ? bundle.total
+        : totalExact
+          ? ranked.length
+          : Math.max(candidateRows.length, k);
+      const filterValueSource = filterResult?.valueSource || "";
+      const filterUsesDocValues = filterResult?.usedDocValues || filterValueSource === "docValues";
       return {
-        total: totalExact ? (hasFilters ? ranked.length : bundle.total) : Math.max(ranked.length, k),
+        total,
         page,
         size,
         approximate: !totalExact,
@@ -862,9 +1119,14 @@ export async function createSearch(options = {}) {
           queryBundleTotal: hasFilters ? ranked.length : bundle.total,
           queryBundleBytes: loaded.bytes || 0,
           queryBundleComplete: bundle.complete,
-          queryBundleFilterProof: summaryProvesFilters ? "rowGroupSummary" : "",
-          docValueRowsScanned: hasFilters && !summaryProvesFilters ? candidateRows.length : 0,
-          docValueRowsAccepted: hasFilters ? ranked.length : 0,
+          queryBundleFilterProof: filterResult?.filterProof || "",
+          queryBundleFilterProgressive: Boolean(filterResult?.progressive),
+          queryBundleFilterExhausted: filterResult?.exhausted ?? true,
+          queryBundleFilterValueSource: filterValueSource,
+          queryBundleFilterRowsScanned: hasFilters ? filterResult.scanned : 0,
+          queryBundleFilterRowsAccepted: hasFilters ? filterResult.accepted : 0,
+          docValueRowsScanned: hasFilters && filterUsesDocValues ? filterResult.scanned : 0,
+          docValueRowsAccepted: hasFilters && filterUsesDocValues ? filterResult.accepted : 0,
           docPayloadLane: resultContext.docPayloadLane,
           docPayloadPages: resultContext.docPayloadPages,
           docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
@@ -1442,7 +1704,13 @@ export async function createSearch(options = {}) {
 
   function passesFilterPlan(doc, codeData, filterPlan) {
     if (!filterPlan?.active) return true;
+    const bitmapStore = filterBitmapStore(codeData);
     for (const [field, selected] of filterPlan.facets) {
+      const bitmapMatch = facetBitmapMatches(bitmapStore, field, doc);
+      if (bitmapMatch != null) {
+        if (!bitmapMatch) return false;
+        continue;
+      }
       if (!facetCodeMatches(valueForDoc(codeData, field, doc), selected)) return false;
     }
     for (const [field, range] of filterPlan.numbers) {
@@ -1452,6 +1720,11 @@ export async function createSearch(options = {}) {
       if (range.max != null && value > range.max) return false;
     }
     for (const [field, expected] of filterPlan.booleans) {
+      const bitmapMatch = booleanBitmapMatches(bitmapStore, field, doc);
+      if (bitmapMatch != null) {
+        if (!bitmapMatch) return false;
+        continue;
+      }
       const value = valueForDoc(codeData, field, doc);
       if (value == null || value !== expected) return false;
     }
@@ -1469,7 +1742,13 @@ export async function createSearch(options = {}) {
 
   function passesFilterPlanWithKnown(doc, codeData, filterPlan, known = {}) {
     if (!filterPlan?.active) return true;
+    const bitmapStore = filterBitmapStore(codeData);
     for (const [field, selected] of filterPlan.facets) {
+      const bitmapMatch = facetBitmapMatches(bitmapStore, field, doc);
+      if (bitmapMatch != null) {
+        if (!bitmapMatch) return false;
+        continue;
+      }
       if (!facetCodeMatches(valueForDocWithKnown(codeData, field, doc, known), selected)) return false;
     }
     for (const [field, range] of filterPlan.numbers) {
@@ -1479,6 +1758,11 @@ export async function createSearch(options = {}) {
       if (range.max != null && value > range.max) return false;
     }
     for (const [field, expected] of filterPlan.booleans) {
+      const bitmapMatch = booleanBitmapMatches(bitmapStore, field, doc);
+      if (bitmapMatch != null) {
+        if (!bitmapMatch) return false;
+        continue;
+      }
       const value = valueForDocWithKnown(codeData, field, doc, known);
       if (value == null || value !== expected) return false;
     }
@@ -1812,7 +2096,7 @@ export async function createSearch(options = {}) {
       if (definite) definitelyPassedPages++;
       const codeData = definite || !filterFields.length
         ? null
-        : await valueStoreForDocs(filterFields, rows.map(row => row.doc));
+        : await valueStoreForFilterPlan(docFilterPlan, rows.map(row => row.doc), [field]);
       for (const row of rows) {
         const known = { [field]: row.value };
         if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
@@ -1913,7 +2197,7 @@ export async function createSearch(options = {}) {
       if (definite) definitelyPassedPages++;
       const codeData = definite || !filterFields.length
         ? null
-        : await valueStoreForDocs(filterFields, rows.map(row => row.doc));
+        : await valueStoreForFilterPlan(docFilterPlan, rows.map(row => row.doc), [field]);
       const candidateDocs = new Set();
       const pageScores = new Map();
       const pageHits = new Map();
@@ -2526,7 +2810,7 @@ export async function createSearch(options = {}) {
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
         const codeData = hasFilters && !filterSummaryProvesBlock && docValues
-          ? await valueStoreForDocs(filterFields, postingDocs(rows))
+          ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
           : filterSummaryProvesBlock ? null : fallbackCodeData;
         blocksDecoded++;
         postingsDecoded += rows.length / 2;
@@ -2621,7 +2905,7 @@ export async function createSearch(options = {}) {
         const postings = await decodeEntryPostings(shard, entry);
         for (let i = 0; i < postings.length; i += 2) docs.add(postings[i]);
       }
-      codeData = await valueStoreForDocs(filterFields, [...docs]);
+      codeData = await valueStoreForFilterPlan(docFilterPlan, [...docs]);
     }
 
     for (const { term, shard, entry } of entries) {

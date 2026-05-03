@@ -36,6 +36,7 @@ import {
   encodeDocValueSortDirectory,
   encodeDocValueSortPage
 } from "./doc_value_tree.js";
+import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
 import { buildDocOrdinalTable, buildDocPointerTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
@@ -741,14 +742,15 @@ function writeFacetDictionaries(out, dicts, config) {
 
 function writeDocValuePacks(out, config, total, codes) {
   const chunkSize = Math.max(1, Number(config.docValueChunkSize || 2048));
+  const lookupChunkSize = Math.max(1, Number(config.docValueLookupChunkSize || Math.min(256, chunkSize)));
   const packWriter = createPackWriter(resolve(out, "doc-values", "packs"), config.docValuePackBytes);
   const fields = {};
-  for (const field of docValueFields(config, codes)) {
+  const writeChunks = (field, activeChunkSize, keyPrefix = "") => {
     const chunks = [];
-    for (let start = 0; start < total; start += chunkSize) {
-      const rows = codeRows(codes, field.name, start, Math.min(total, start + chunkSize));
+    for (let start = 0; start < total; start += activeChunkSize) {
+      const rows = codeRows(codes, field.name, start, Math.min(total, start + activeChunkSize));
       const encoded = buildDocValueChunk(field, start, rows);
-      const key = `${field.name}\u0000${chunks.length}`;
+      const key = `${field.name}\u0000${keyPrefix}${chunks.length}`;
       const entry = writePackedShard(packWriter, key, gzipSync(encoded.buffer, { level: 6 }), {
         kind: "doc-value",
         codec: "rfdocvalues-v1",
@@ -770,18 +772,24 @@ function writeDocValuePacks(out, config, total, codes) {
         words: encoded.summary?.words ?? null
       });
     }
+    return chunks;
+  };
+  for (const field of docValueFields(config, codes)) {
+    const chunks = writeChunks(field, chunkSize);
+    const lookupChunks = lookupChunkSize < chunkSize ? writeChunks(field, lookupChunkSize, "lookup\u0000") : null;
     fields[field.name] = {
       name: field.name,
       kind: field.kind,
       type: field.type,
       words: field.words || 0,
-      chunks
+      chunks,
+      ...(lookupChunks ? { lookup_chunks: lookupChunks } : {})
     };
   }
   finalizePackWriter(packWriter);
   const indexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  for (const field of Object.values(fields)) {
-    for (const chunk of field.chunks) {
+  const hydrateChunkEntries = (chunks) => {
+    for (const chunk of chunks || []) {
       const entry = packWriter.entries[chunk.key];
       Object.assign(chunk, {
         pack: entry.pack,
@@ -794,12 +802,17 @@ function writeDocValuePacks(out, config, total, codes) {
       });
       delete chunk.key;
     }
+  };
+  for (const field of Object.values(fields)) {
+    hydrateChunkEntries(field.chunks);
+    hydrateChunkEntries(field.lookup_chunks);
   }
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
     format: "rfdocvalues-v1",
     chunk_size: chunkSize,
+    lookup_chunk_size: lookupChunkSize < chunkSize ? lookupChunkSize : chunkSize,
     fields,
     packs: packWriter.packs
   };
@@ -829,6 +842,111 @@ function codeRows(codes, name, start, end) {
   const count = Math.max(0, end - start);
   if (codes && typeof codes.chunk === "function") return codes.chunk(name, start, count);
   return (codes?.[name] || []).slice(start, end);
+}
+
+function facetCodesForBitmap(value) {
+  return value?.codes?.map(Number).filter(Number.isFinite) || [];
+}
+
+function bitmapBooleanKey(value) {
+  if (value === true || value === 1 || value === "true" || value === "1") return "true";
+  if (value === false || value === 0 || value === "false" || value === "0") return "false";
+  return "";
+}
+
+function writeFilterBitmapIndex(out, config, total, codes, dicts) {
+  const packWriter = createPackWriter(resolve(out, "filter-bitmaps", "packs"), config.filterBitmapPackBytes || config.packBytes);
+  const fields = {};
+  const maxFacetValues = Math.max(0, Number(config.filterBitmapMaxFacetValues ?? 64));
+
+  const writeBitmap = (field, value, bytes, count) => {
+    if (!count) return null;
+    const source = encodeFilterBitmap(total, bytes);
+    const key = `${field}\u0000${value}`;
+    const entry = writePackedShard(packWriter, key, gzipSync(source, { level: 6 }), {
+      kind: "filter-bitmap",
+      codec: FILTER_BITMAP_FORMAT,
+      logicalLength: source.length
+    });
+    return {
+      key,
+      count,
+      pack: entry.pack,
+      offset: entry.offset,
+      length: entry.length,
+      physicalLength: entry.physicalLength,
+      logicalLength: entry.logicalLength,
+      checksum: entry.checksum
+    };
+  };
+
+  if (config.filterBitmaps !== false) {
+    for (const facet of config.facets || []) {
+      const valueCount = dicts?.[facet.name]?.values?.length || 0;
+      if (!valueCount || valueCount > maxFacetValues) continue;
+      const bitmaps = Array.from({ length: valueCount }, () => createFilterBitmap(total));
+      const counts = new Array(valueCount).fill(0);
+      for (let doc = 0; doc < total; doc++) {
+        for (const code of facetCodesForBitmap(codeValue(codes, facet.name, doc))) {
+          if (code < 0 || code >= valueCount) continue;
+          setFilterBitmapBit(bitmaps[code], doc);
+          counts[code]++;
+        }
+      }
+      const values = {};
+      for (let code = 0; code < valueCount; code++) {
+        const entry = writeBitmap(facet.name, String(code), bitmaps[code], counts[code]);
+        if (entry) values[String(code)] = entry;
+      }
+      if (Object.keys(values).length) fields[facet.name] = { name: facet.name, kind: "facet", values };
+    }
+
+    for (const field of config.booleans || []) {
+      const bitmaps = { true: createFilterBitmap(total), false: createFilterBitmap(total) };
+      const counts = { true: 0, false: 0 };
+      for (let doc = 0; doc < total; doc++) {
+        const key = bitmapBooleanKey(codeValue(codes, field.name, doc));
+        if (!key) continue;
+        setFilterBitmapBit(bitmaps[key], doc);
+        counts[key]++;
+      }
+      const values = {};
+      for (const key of ["false", "true"]) {
+        const entry = writeBitmap(field.name, key, bitmaps[key], counts[key]);
+        if (entry) values[key] = entry;
+      }
+      if (Object.keys(values).length) fields[field.name] = { name: field.name, kind: "boolean", values };
+    }
+  }
+
+  finalizePackWriter(packWriter);
+  const indexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  for (const field of Object.values(fields)) {
+    for (const entry of Object.values(field.values || {})) {
+      const packed = packWriter.entries[entry.key];
+      Object.assign(entry, {
+        pack: packed.pack,
+        offset: packed.offset,
+        length: packed.length,
+        physicalLength: packed.physicalLength,
+        logicalLength: packed.logicalLength,
+        checksum: packed.checksum,
+        packIndex: indexes.get(packed.pack)
+      });
+      delete entry.key;
+    }
+  }
+
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    format: FILTER_BITMAP_FORMAT,
+    max_facet_values: maxFacetValues,
+    fields,
+    packs: packWriter.packs,
+    pack_table: packTable(packWriter.packs),
+    pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0)
+  };
 }
 
 function summarizeDocValuePage(summaryFields, codes, docs) {
@@ -1445,6 +1563,7 @@ function buildTelemetryDiskByteGroups(out) {
       resolve(out, "docs", "page-packs"),
       resolve(out, "doc-values", "packs"),
       resolve(out, "doc-values", "sorted-packs"),
+      resolve(out, "filter-bitmaps", "packs"),
       resolve(out, "facets", "packs"),
       resolve(out, "bundles", "packs"),
       resolve(out, "authority", "packs")
@@ -1456,6 +1575,7 @@ function buildTelemetryDiskByteGroups(out) {
       resolve(out, "docs", "ordinals"),
       resolve(out, "docs", "pages"),
       resolve(out, "doc-values", "sorted"),
+      resolve(out, "filter-bitmaps", "manifest.json.gz"),
       resolve(out, "facets", "directory"),
       resolve(out, "bundles", "directory"),
       resolve(out, "authority", "directory"),
@@ -1498,6 +1618,7 @@ function minimalManifest(manifest) {
       optimizer: INDEX_OPTIMIZER_PATH,
       doc_values: "doc-values/manifest.json.gz",
       doc_value_sorted: "doc-values/sorted/manifest.json.gz",
+      filter_bitmaps: "filter-bitmaps/manifest.json.gz",
       facet_dictionaries: "facets/manifest.json.gz"
     },
     total: manifest.total,
@@ -1619,6 +1740,7 @@ export async function build({ configPath }) {
     const typoManifest = await timeBuildPhase(telemetry, "typo", () => reduceTypoRuns(typoBuffer, dirs.out));
     const docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, runData.codes));
     const docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, runData.codes));
+    const filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, runData.codes, measured.dicts));
     const facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
     const buildTelemetry = finishBuildTelemetry(telemetry);
 
@@ -1636,6 +1758,7 @@ export async function build({ configPath }) {
       rangeDirectoryV2: true,
       docValues: true,
       docValueSorted: true,
+      filterBitmaps: Object.keys(filterBitmaps.fields).length > 0,
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
       queryBundles: !!queryBundles,
@@ -1659,6 +1782,7 @@ export async function build({ configPath }) {
         docPages: packTable(docs.pages.packs),
         docValues: packTable(docValues.packs),
         docValueSorted: packTable(docValueSorted.packs),
+        filterBitmaps: packTable(filterBitmaps.packs),
         facets: packTable(facetDictionaries.pack_objects),
         queryBundles: packTable(queryBundles?.packs),
         authority: packTable(authority?.packs),
@@ -1672,6 +1796,7 @@ export async function build({ configPath }) {
         docs.pages.packs,
         docValues.packs,
         docValueSorted.packs,
+        filterBitmaps.packs,
         facetDictionaries.pack_objects,
         queryBundles?.packs || [],
         authority?.packs || [],
@@ -1699,6 +1824,7 @@ export async function build({ configPath }) {
       compression: docValues.compression,
       format: docValues.format,
       chunk_size: docValues.chunk_size,
+      lookup_chunk_size: docValues.lookup_chunk_size,
       fields: docValues.fields,
       packs: docValues.packs.length
     },
@@ -1711,6 +1837,15 @@ export async function build({ configPath }) {
       fields: docValueSorted.fields,
       packs: docValueSorted.packs.length,
       pack_table: docValueSorted.pack_table
+    },
+    filter_bitmaps: {
+      storage: filterBitmaps.storage,
+      compression: filterBitmaps.compression,
+      format: filterBitmaps.format,
+      max_facet_values: filterBitmaps.max_facet_values,
+      fields: filterBitmaps.fields,
+      packs: filterBitmaps.packs.length,
+      pack_table: filterBitmaps.pack_table
     },
     initial_results: runData.initialResults,
     fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
@@ -1842,6 +1977,7 @@ export async function build({ configPath }) {
       doc_value_storage: docValues.storage,
       doc_value_format: docValues.format,
       doc_value_chunk_size: docValues.chunk_size,
+      doc_value_lookup_chunk_size: docValues.lookup_chunk_size,
       doc_value_fields: Object.keys(docValues.fields).length,
       doc_value_pack_files: docValues.packs.length,
       doc_value_pack_bytes: docValues.packs.reduce((sum, pack) => sum + pack.bytes, 0),
@@ -1854,6 +1990,11 @@ export async function build({ configPath }) {
       doc_value_sorted_directory_logical_bytes: docValueSorted.directory_logical_bytes,
       doc_value_sorted_pack_files: docValueSorted.packs.length,
       doc_value_sorted_pack_bytes: docValueSorted.pack_bytes,
+      filter_bitmap_storage: filterBitmaps.storage,
+      filter_bitmap_format: filterBitmaps.format,
+      filter_bitmap_fields: Object.keys(filterBitmaps.fields).length,
+      filter_bitmap_pack_files: filterBitmaps.packs.length,
+      filter_bitmap_pack_bytes: filterBitmaps.pack_bytes,
       facet_dictionary_storage: facetDictionaries.storage,
       facet_dictionary_format: facetDictionaries.format,
       facet_dictionary_page_files: facetDictionaries.directory.page_files,
@@ -1906,11 +2047,13 @@ export async function build({ configPath }) {
   mkdirSync(resolve(dirs.out, "debug"), { recursive: true });
   mkdirSync(resolve(dirs.out, "doc-values"), { recursive: true });
   mkdirSync(resolve(dirs.out, "doc-values", "sorted"), { recursive: true });
+  mkdirSync(resolve(dirs.out, "filter-bitmaps"), { recursive: true });
   mkdirSync(resolve(dirs.out, "facets"), { recursive: true });
   writeFileSync(resolve(dirs.out, "debug", "build-telemetry.json"), JSON.stringify(buildTelemetry, null, 2));
   writeFileSync(resolve(dirs.out, INDEX_OPTIMIZER_PATH), JSON.stringify(optimizerReport, null, 2));
   writeFileSync(resolve(dirs.out, "doc-values", "manifest.json.gz"), gzipSync(JSON.stringify(docValues), { level: 6 }));
   writeFileSync(resolve(dirs.out, "doc-values", "sorted", "manifest.json.gz"), gzipSync(JSON.stringify(manifest.doc_value_sorted), { level: 6 }));
+  writeFileSync(resolve(dirs.out, "filter-bitmaps", "manifest.json.gz"), gzipSync(JSON.stringify(filterBitmaps), { level: 6 }));
   writeFileSync(resolve(dirs.out, "facets", "manifest.json.gz"), gzipSync(JSON.stringify(facetDictionaries), { level: 6 }));
   writeFileSync(resolve(dirs.out, "manifest.full.json"), JSON.stringify(manifest));
   writeFileSync(resolve(dirs.out, "manifest.min.json"), JSON.stringify(minimalManifest(manifest)));

@@ -513,6 +513,7 @@ function networkBucket(url) {
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/facets/packs/")) return "facetDictionaries";
+  if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
   if (path.includes("/docs/ordinals/")) return "docOrdinals";
@@ -832,6 +833,11 @@ function compactRuntimeStats(stats = {}) {
     queryBundleBytes: stats.queryBundleBytes || 0,
     queryBundleComplete: Boolean(stats.queryBundleComplete),
     queryBundleFilterProof: stats.queryBundleFilterProof || "",
+    queryBundleFilterProgressive: Boolean(stats.queryBundleFilterProgressive),
+    queryBundleFilterExhausted: stats.queryBundleFilterExhausted !== false,
+    queryBundleFilterValueSource: stats.queryBundleFilterValueSource || "",
+    queryBundleFilterRowsScanned: stats.queryBundleFilterRowsScanned || 0,
+    queryBundleFilterRowsAccepted: stats.queryBundleFilterRowsAccepted || 0,
     authorityAttempted: Boolean(stats.authorityAttempted),
     authorityApplied: Boolean(stats.authorityApplied),
     authorityComplete: Boolean(stats.authorityComplete),

@@ -13,6 +13,8 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.input, join(dir, "docs.jsonl"));
   assert.equal(config.output, join(dir, "public/search"));
   assert.equal(config.docValueChunkSize, 2048);
+  assert.equal(config.docValueLookupChunkSize, 2048);
+  assert.equal(config.filterBitmapMaxFacetValues, 64);
   assert.equal(config.codecs.mode, "auto");
 });
 

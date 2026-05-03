@@ -266,6 +266,51 @@ test("query bundle codec round-trips proof metadata and rows", () => {
   assert.deepEqual(bundle.rowGroups, [{ rowStart: 0, rowCount: 2, scoreMax: 50, scoreMin: 44, docMin: 2062, docMax: 9405, filters: {} }]);
 });
 
+test("query bundle codec round-trips row filter values", () => {
+  const filters = buildBlockFilters({
+    facets: [{ name: "category" }],
+    numbers: [{ name: "year" }],
+    booleans: [{ name: "featured" }]
+  }, {
+    category: { values: [{ value: "docs", label: "Docs", n: 1 }] }
+  });
+  const bundle = parseQueryBundle(buildQueryBundle({
+    key: "exact-expanded-v1|chang climat",
+    baseTerms: ["chang", "climat"],
+    expandedTerms: ["chang", "climat", "chang_climat"],
+    total: 68,
+    complete: false,
+    nextScoreBound: 41,
+    nextTieDoc: 812,
+    rows: [{ doc: 2062, score: 50 }, { doc: 9405, score: 44 }],
+    rowGroups: [{
+      rowStart: 0,
+      rowCount: 2,
+      scoreMax: 50,
+      scoreMin: 44,
+      docMin: 2062,
+      docMax: 9405,
+      filters: {
+        category: { words: [1] },
+        year: { min: 2025, max: 2026 },
+        featured: { min: 1, max: 2 }
+      }
+    }],
+    filterValues: {
+      category: [{ codes: [0] }, { codes: [] }],
+      year: [2026, 2025],
+      featured: [true, false]
+    }
+  }, { block_filters: filters }), { block_filters: filters });
+
+  assert.deepEqual(bundle.filterValues.category[2062], { codes: [0] });
+  assert.deepEqual(bundle.filterValues.category[9405], { codes: [] });
+  assert.equal(bundle.filterValues.year[2062], 2026);
+  assert.equal(bundle.filterValues.year[9405], 2025);
+  assert.equal(bundle.filterValues.featured[2062], true);
+  assert.equal(bundle.filterValues.featured[9405], false);
+});
+
 test("authority shard codec round-trips exact and token rows", () => {
   const shard = parseAuthorityShard(buildAuthorityShard([
     ["t|paris", [[3, 800000], [1, 400000]]],

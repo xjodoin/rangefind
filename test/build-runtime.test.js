@@ -68,6 +68,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
     input: "docs.jsonl",
     output: "public/rangefind",
     docValueChunkSize: 2,
+    docValueLookupChunkSize: 1,
     docValueSortedPageSize: 2,
     buildTelemetrySampleMs: 5,
     buildTelemetryPath: "build-telemetry.json",
@@ -103,10 +104,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(minimalManifest.lazy_manifests.optimizer, "debug/index-optimizer.json");
   assert.equal(minimalManifest.lazy_manifests.doc_values, "doc-values/manifest.json.gz");
   assert.equal(minimalManifest.lazy_manifests.doc_value_sorted, "doc-values/sorted/manifest.json.gz");
+  assert.equal(minimalManifest.lazy_manifests.filter_bitmaps, "filter-bitmaps/manifest.json.gz");
   assert.equal(minimalManifest.lazy_manifests.facet_dictionaries, "facets/manifest.json.gz");
   assert.ok(await readFile(join(output, "manifest.full.json"), "utf8"));
   assert.ok(await readFile(join(output, "doc-values", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "doc-values", "sorted", "manifest.json.gz")));
+  assert.ok(await readFile(join(output, "filter-bitmaps", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "facets", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "debug", "build-telemetry.json"), "utf8"));
   const optimizerReport = JSON.parse(await readFile(join(output, "debug", "index-optimizer.json"), "utf8"));
@@ -130,6 +133,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.features.docLocalityLayout, true);
   assert.equal(manifest.features.docPages, true);
   assert.equal(manifest.features.docValueSorted, true);
+  assert.equal(manifest.features.filterBitmaps, true);
   assert.equal(manifest.features.queryBundles, true);
   assert.equal(manifest.features.authority, true);
   assert.equal(manifest.optimizer.format, "rfoptimizer-v1");
@@ -226,11 +230,17 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, manifest.authority.directory.root)));
   assert.ok(await readFile(join(output, "authority", "packs", manifest.object_store.pack_table.authority[0])));
   assert.equal(manifest.doc_values.storage, "range-pack-v1");
+  assert.equal(manifest.doc_values.lookup_chunk_size, 1);
   assert.ok(manifest.doc_values.fields.tags);
   assert.ok(manifest.doc_values.fields.published);
   assert.ok(manifest.doc_values.fields.tags.chunks[0].checksum.value);
+  assert.ok(manifest.doc_values.fields.tags.lookup_chunks[0].checksum.value);
   assert.match(manifest.doc_values.fields.tags.chunks[0].pack, /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.ok(await readFile(join(output, "doc-values", "packs", manifest.doc_values.fields.tags.chunks[0].pack)));
+  assert.equal(manifest.filter_bitmaps.storage, "range-pack-v1");
+  const tagBitmap = Object.values(manifest.filter_bitmaps.fields.tags.values)[0];
+  assert.ok(tagBitmap);
+  assert.ok(await readFile(join(output, "filter-bitmaps", "packs", tagBitmap.pack)));
   assert.equal(manifest.doc_value_sorted.storage, "range-pack-v1");
   assert.equal(manifest.doc_value_sorted.directory_format, "rfdocvaluesortdir-v1");
   assert.equal(manifest.doc_value_sorted.page_format, "rfdocvaluesortpage-v1");
@@ -327,10 +337,13 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(filteredBundled.stats.queryBundleRowGroups > 0);
   assert.ok(filteredBundled.stats.queryBundleRowGroupsScanned <= filteredBundled.stats.queryBundleRowGroups);
   assert.ok(filteredBundled.stats.docValueRowsScanned <= filteredBundled.stats.queryBundleRows);
+  assert.equal(filteredBundled.stats.queryBundleFilterValueSource, "queryBundleRows");
+  assert.equal(filteredBundled.stats.docValueRowsScanned, 0);
   assert.equal(filteredBundled.stats.blocksDecoded, 0);
 
+  server.requests.length = 0;
   const fullRequestsBeforeLazyFilter = server.requests.filter(request => request.pathname.endsWith("/manifest.full.json")).length;
-  const lazyFilterSearch = await createSearch({ baseUrl: server.baseUrl });
+  const lazyFilterSearch = await createSearch({ baseUrl: server.baseUrl, queryBundles: false });
   const lazyFilteredBundled = await lazyFilterSearch.search({
     q: "static range",
     size: 2,
@@ -340,7 +353,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.deepEqual(lazyFilteredBundled.results.map(result => result.id), ["a"]);
   assert.equal(server.requests.filter(request => request.pathname.endsWith("/manifest.full.json")).length, fullRequestsBeforeLazyFilter);
   assert.ok(server.requests.some(request => request.pathname.endsWith("/facets/manifest.json.gz")));
-  assert.ok(server.requests.some(request => request.pathname.endsWith("/doc-values/manifest.json.gz")));
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/filter-bitmaps/manifest.json.gz")));
+  assert.equal(server.requests.some(request => request.pathname.includes("/doc-values/packs/")), false);
 
   const bundledExact = await search.search({ q: "static range", size: 2, exact: true, rerank: false });
   assert.deepEqual(
@@ -446,6 +460,64 @@ test("builder output is searchable through the range-based runtime", async (t) =
     () => corruptSearch.search({ q: "static range search", size: 1 }),
     /checksum mismatch/
   );
+});
+
+test("query bundles progressively verify numeric filters before doc-value exhaustion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-query-bundle-filter-"));
+  const docsPath = join(root, "docs.jsonl");
+  const configPath = join(root, "rangefind.config.json");
+  const docs = Array.from({ length: 80 }, (_, index) => JSON.stringify({
+    id: String(index),
+    title: index < 10 ? `Needle anchor priority ${index}` : `Body match ${index}`,
+    body: index < 10 ? "priority body" : "Needle filler anchor background body",
+    rank: index < 10 ? 1 : 0,
+    url: `/${index}`
+  }));
+  await writeFile(docsPath, docs.join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    docValueChunkSize: 4,
+    baseShardDepth: 1,
+    maxShardDepth: 1,
+    targetShardPostings: 1000,
+    queryBundleMaxRows: 64,
+    queryBundleRowGroupSize: 16,
+    queryBundleMinSeedDocs: 2,
+    fields: [
+      { name: "title", path: "title", weight: 4.5, phrase: true },
+      { name: "body", path: "body", weight: 1.0 }
+    ],
+    numbers: [{ name: "rank", path: "rank" }],
+    display: ["title", "url", "rank"]
+  }));
+
+  await build({ configPath });
+  const server = await serveStatic(join(root, "public"));
+  t.after(() => server.close());
+  const search = await createSearch({ baseUrl: server.baseUrl });
+
+  const result = await search.search({
+    q: "needle anchor",
+    size: 10,
+    rerank: false,
+    filters: { numbers: { rank: { min: 1 } } }
+  });
+
+  assert.deepEqual(result.results.map(item => item.id), Array.from({ length: 10 }, (_, index) => String(index)));
+  assert.equal(result.stats.plannerLane, "queryBundleExact");
+  assert.equal(result.stats.queryBundleFiltered, true);
+  assert.equal(result.stats.queryBundleFilterProgressive, true);
+  assert.equal(result.stats.queryBundleFilterProof, "queryBundleRows");
+  assert.equal(result.stats.queryBundleFilterValueSource, "queryBundleRows");
+  assert.equal(result.stats.queryBundleFilterExhausted, false);
+  assert.equal(result.stats.queryBundleFilterRowsScanned, 10);
+  assert.equal(result.stats.queryBundleFilterRowsAccepted, 10);
+  assert.equal(result.stats.docValueRowsScanned, 0);
+  assert.equal(result.stats.docValueRowsAccepted, 0);
+  assert.ok(result.stats.queryBundleFilterRowsScanned < result.stats.queryBundleRows);
+  assert.equal(result.stats.blocksDecoded, 0);
+  assert.equal(result.approximate, true);
 });
 
 test("failed builds write diagnostics and clean partial scratch state", async () => {

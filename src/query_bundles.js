@@ -105,6 +105,26 @@ function bundleRowGroups(rows, rowGroupSize, filters, codes) {
   return groups;
 }
 
+function facetCodes(value) {
+  const values = Array.isArray(value) ? value : value?.codes || [];
+  return [...new Set(values.map(Number).filter(Number.isFinite))].sort((a, b) => a - b);
+}
+
+function normalizedFilterValue(filter, value) {
+  if (filter.kind === "facet") return { codes: facetCodes(value) };
+  if (filter.kind === "boolean") return value == null ? null : value === true;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function bundleFilterValues(rows, filters, codes) {
+  const out = {};
+  for (const filter of (filters || []).filter(item => item.kind !== "facet")) {
+    out[filter.name] = rows.map(row => normalizedFilterValue(filter, codes?.get(filter.name, row.doc)));
+  }
+  return out;
+}
+
 function docRuns(docs) {
   const runs = [];
   for (const doc of docs) {
@@ -182,7 +202,8 @@ export function writeQueryBundleObjects(options) {
   for (const bundle of bundles || []) {
     const buffer = buildQueryBundle({
       ...bundle,
-      rowGroups: bundleRowGroups(bundle.rows, config.queryBundleRowGroupSize, filters, filterCodes)
+      rowGroups: bundleRowGroups(bundle.rows, config.queryBundleRowGroupSize, filters, filterCodes),
+      filterValues: bundleFilterValues(bundle.rows, filters, filterCodes)
     }, { block_filters: filters });
     const entry = writePackedShard(packWriter, bundle.key, gzipSync(buffer, { level: 6 }), {
       kind: "query-bundle",
