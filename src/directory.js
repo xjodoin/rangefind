@@ -35,11 +35,11 @@ function commonPrefixLength(a, b) {
   return i;
 }
 
-function compareKeys(left, right) {
+export function compareDirectoryKeys(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function pageEntryLength(entry, previous) {
+export function directoryPageEntryLength(entry, previous) {
   const prefix = commonPrefixLength(previous, entry.shard);
   return varintLength(prefix)
     + utf8Length(entry.shard.slice(prefix))
@@ -57,7 +57,7 @@ function normalizePackIndex(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function normalizeEntry(entry) {
+export function normalizeDirectoryEntry(entry) {
   if (!entry.checksum?.value) throw new Error(`Rangefind directory entry ${entry.shard || ""} is missing a checksum.`);
   return {
     shard: String(entry.shard || ""),
@@ -89,17 +89,26 @@ function hasBit(bytes, bit) {
   return (bytes[bit >> 3] & (1 << (bit & 7))) !== 0;
 }
 
-function buildBloom(keys, bitsPerKey = DEFAULT_BLOOM_BITS_PER_KEY) {
-  if (!keys.length) return { bits: 0, hashes: 0, bytes: Uint8Array.of() };
-  const bits = Math.max(64, keys.length * bitsPerKey);
+export function createDirectoryBloom(entryCount, bitsPerKey = DEFAULT_BLOOM_BITS_PER_KEY) {
+  if (!entryCount) return { bits: 0, hashes: 0, bytes: Uint8Array.of() };
+  const bits = Math.max(64, entryCount * bitsPerKey);
   const hashes = Math.max(1, Math.round(bitsPerKey * Math.LN2));
-  const bytes = new Uint8Array(Math.ceil(bits / 8));
+  return { bits, hashes, bytes: new Uint8Array(Math.ceil(bits / 8)) };
+}
+
+export function addDirectoryBloomKey(bloom, key) {
+  if (!bloom?.bits || !bloom.hashes) return;
+  const h1 = hashString(key, 0);
+  const h2 = hashString(key, 0x9e3779b9) | 1;
+  for (let i = 0; i < bloom.hashes; i++) setBit(bloom.bytes, ((h1 + Math.imul(i, h2)) >>> 0) % bloom.bits);
+}
+
+function buildBloom(keys, bitsPerKey = DEFAULT_BLOOM_BITS_PER_KEY) {
+  const bloom = createDirectoryBloom(keys.length, bitsPerKey);
   for (const key of keys) {
-    const h1 = hashString(key, 0);
-    const h2 = hashString(key, 0x9e3779b9) | 1;
-    for (let i = 0; i < hashes; i++) setBit(bytes, ((h1 + Math.imul(i, h2)) >>> 0) % bits);
+    addDirectoryBloomKey(bloom, key);
   }
-  return { bits, hashes, bytes };
+  return bloom;
 }
 
 function bloomMightContain(bloom, key) {
@@ -112,7 +121,7 @@ function bloomMightContain(bloom, key) {
   return true;
 }
 
-function buildDirectoryPage(entries) {
+export function buildDirectoryPage(entries) {
   const out = [...DIRECTORY_PAGE_MAGIC];
   pushVarint(out, DIRECTORY_VERSION);
   pushVarint(out, entries.length);
@@ -158,9 +167,9 @@ function pageFile(index) {
 export function buildPagedDirectory(entries, options = {}) {
   const pageBytes = Math.max(1024, options.pageBytes || DEFAULT_DIRECTORY_PAGE_BYTES);
   const normalized = entries
-    .map(normalizeEntry)
+    .map(normalizeDirectoryEntry)
     .filter(entry => entry.shard)
-    .sort((a, b) => compareKeys(a.shard, b.shard));
+    .sort((a, b) => compareDirectoryKeys(a.shard, b.shard));
   const pages = [];
   let current = [];
   let rawBytes = DIRECTORY_PAGE_MAGIC.length + varintLength(DIRECTORY_VERSION);
@@ -185,7 +194,7 @@ export function buildPagedDirectory(entries, options = {}) {
   }
 
   for (const entry of normalized) {
-    const entryBytes = pageEntryLength(entry, previous);
+    const entryBytes = directoryPageEntryLength(entry, previous);
     if (current.length && rawBytes + entryBytes > pageBytes) flushPage();
     current.push(entry);
     rawBytes += entryBytes;

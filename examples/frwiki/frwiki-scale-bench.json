@@ -1,28 +1,28 @@
 {
   "fixture": "frwiki-scale",
+  "mode": "full",
   "limits": [
-    50000,
-    100000
+    500000
   ],
   "runs": 2,
   "bodyChars": 6000,
   "exactChecks": true,
-  "generatedAt": "2026-05-01T15:16:38.939Z",
+  "generatedAt": "2026-05-03T16:25:11.433Z",
   "points": [
     {
-      "limit": 50000,
-      "docs": 50000,
-      "indexFiles": 85,
-      "indexBytes": 153034218,
-      "bytesPerDoc": 3060.68436,
+      "limit": 500000,
+      "docs": 500000,
+      "indexFiles": 944,
+      "indexBytes": 1512268372,
+      "bytesPerDoc": 3024.536744,
       "init": {
-        "ms": 11.614875000028405,
+        "ms": 28.562166000250727,
         "requests": 1,
-        "kb": 104.7451171875,
+        "kb": 83.576171875,
         "by": {
-          "manifest": {
+          "manifestMin": {
             "requests": 1,
-            "kb": 104.7451171875
+            "kb": 83.576171875
           }
         }
       },
@@ -31,352 +31,254 @@
         "encoding": "rfdocpagecols-v1",
         "pageSize": 32,
         "fields": 13,
-        "pointerBytes": 64096,
-        "packFiles": 5,
-        "packBytes": 17141551
+        "pointerBytes": 640638,
+        "packFiles": 41,
+        "packBytes": 169058574
       },
-      "docValueSorted": {
-        "directoryFormat": "rfdocvaluesortdir-v1",
-        "pageFormat": "rfdocvaluesortpage-v1",
-        "pageSize": 512,
-        "fields": 6,
-        "directoryBytes": 29150,
-        "packFiles": 1,
-        "packBytes": 682688
+      "docValueSorted": null,
+      "termPackBytes": 0,
+      "postingBlockPackBytes": 0,
+      "docPackBytes": 308183138,
+      "docPagePackBytes": 169058574,
+      "docValuePackBytes": 7157675,
+      "docValueSortedDirectoryBytes": 247219,
+      "docValueSortedPackBytes": 6908727,
+      "authorityDirectoryBytes": 367967,
+      "authorityPackBytes": 15745164,
+      "builder": {
+        "totalMs": 2277425.670583,
+        "peakRss": 3959652352,
+        "peakHeapUsed": 1604208632,
+        "memorySampleCount": 1677,
+        "phaseSampleCount": 1651,
+        "tempPeakBytes": 2616038030,
+        "tempWrittenBytes": 2653943073,
+        "outputWrittenBytes": 1506088233,
+        "writeAmplification": 0.9959133318434567,
+        "phases": [
+          {
+            "name": "measure",
+            "ms": 48815.923333,
+            "peakRss": 209338368,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 0
+          },
+          {
+            "name": "scan-and-spool",
+            "ms": 277943.76041600003,
+            "peakRss": 3416571904,
+            "tempDeltaBytes": 2402743801,
+            "outputDeltaBytes": 0
+          },
+          {
+            "name": "reduce-postings",
+            "ms": 1707789.154208,
+            "peakRss": 3959652352,
+            "tempDeltaBytes": 179563198,
+            "outputDeltaBytes": 354300042
+          },
+          {
+            "name": "segment-manifest",
+            "ms": 1382.2216250000056,
+            "peakRss": 1136885760,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 531742340
+          },
+          {
+            "name": "query-bundles",
+            "ms": 71186.82891699974,
+            "peakRss": 1869709312,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 25641368
+          },
+          {
+            "name": "authority",
+            "ms": 9984.688209000044,
+            "peakRss": 1719009280,
+            "tempDeltaBytes": -37905043,
+            "outputDeltaBytes": 15745164
+          },
+          {
+            "name": "doc-packs",
+            "ms": 26638.806958000176,
+            "peakRss": 1638842368,
+            "tempDeltaBytes": 71636074,
+            "outputDeltaBytes": 330683161
+          },
+          {
+            "name": "doc-pages",
+            "ms": 18658.46966599999,
+            "peakRss": 1442152448,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 169699212
+          },
+          {
+            "name": "typo",
+            "ms": 108443.11675000004,
+            "peakRss": 1236729856,
+            "tempDeltaBytes": -410101712,
+            "outputDeltaBytes": 61983075
+          },
+          {
+            "name": "doc-values",
+            "ms": 2058.2783749997616,
+            "peakRss": 1107886080,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 7157675
+          },
+          {
+            "name": "doc-value-sorted",
+            "ms": 3107.013917000033,
+            "peakRss": 1151008768,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 7155946
+          },
+          {
+            "name": "filter-bitmaps",
+            "ms": 181.2760830000043,
+            "peakRss": 1151008768,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 366518
+          },
+          {
+            "name": "facet-dictionaries",
+            "ms": 231.30758300004527,
+            "peakRss": 1201799168,
+            "tempDeltaBytes": 0,
+            "outputDeltaBytes": 1613732
+          }
+        ]
       },
-      "termPackBytes": 29944659,
-      "postingBlockPackBytes": 18186333,
-      "docPackBytes": 31014390,
-      "docPagePackBytes": 17141551,
-      "docValuePackBytes": 688049,
-      "docValueSortedDirectoryBytes": 29150,
-      "docValueSortedPackBytes": 682688,
-      "avgTextColdRequests": 21.5,
-      "avgTextColdKb": 146.112890625,
-      "maxTextColdRequests": 31,
-      "avgBrowseColdRequests": 5.666666666666667,
-      "avgBrowseColdKb": 17.306640625,
-      "textExactMatches": 10,
-      "textRows": 10,
-      "browseRows": 3,
+      "avgTextColdRequests": 32.8421052631579,
+      "avgTextColdKb": 290.0849095394737,
+      "maxTextColdRequests": 68,
+      "avgBrowseColdRequests": 7,
+      "avgBrowseColdKb": 158.083984375,
+      "textExactMatches": 16,
+      "textRows": 19,
+      "browseRows": 5,
       "selectedRows": {
         "paris": {
           "total": 10,
-          "top": "Paris (homonymie)",
+          "top": "Paris",
           "valid": true,
-          "coldMs": 54.985625000001164,
-          "coldRequests": 14,
-          "coldKb": 90.5380859375,
+          "coldMs": 76.1700420002453,
+          "coldRequests": 26,
+          "coldKb": 208.9814453125,
           "coldBy": {
             "directory": {
-              "requests": 2,
-              "kb": 58.0234375
+              "requests": 4,
+              "kb": 110.603515625
             },
             "terms": {
               "requests": 1,
-              "kb": 11.1064453125
+              "kb": 52.8515625
             },
             "postingBlocks": {
               "requests": 1,
-              "kb": 6.87109375
+              "kb": 4.37109375
             },
             "docOrdinals": {
+              "requests": 11,
+              "kb": 0.04296875
+            },
+            "docPointers": {
+              "requests": 4,
+              "kb": 0.4404296875
+            },
+            "docs": {
+              "requests": 4,
+              "kb": 6.6884765625
+            },
+            "authority": {
+              "requests": 1,
+              "kb": 33.9833984375
+            }
+          },
+          "lane": "packedDocs",
+          "postingBlockFrontierBatches": 1,
+          "postingBlockFrontierBlocks": 1,
+          "postingBlockFrontierFetchGroups": 1,
+          "postingBlockFrontierWantedBlocks": 16,
+          "plannerLane": "tailProof",
+          "topKProven": true,
+          "totalExact": false,
+          "queryBundleHit": false,
+          "queryBundleBytes": 0,
+          "queryBundleRowGroups": 0,
+          "queryBundleRowGroupsScanned": 0,
+          "authorityAttempted": true,
+          "authorityApplied": true,
+          "authorityRows": 1,
+          "authorityInjected": 1,
+          "docValuePruning": false,
+          "docValuePruneField": "",
+          "docValuePagesVisited": 0,
+          "docValuePagesPruned": 0,
+          "docValueRowsScanned": 0,
+          "docValueRowsAccepted": 0,
+          "docValueChunkPruning": false,
+          "docValueChunksVisited": 0,
+          "docValueChunksPruned": 0,
+          "surfaceFallbackApplied": false,
+          "typoAttempted": false,
+          "typoApplied": false,
+          "exactTopKMatch": true,
+          "exactTotal": 61820
+        },
+        "revolution": {
+          "total": 10,
+          "top": "Révolution française",
+          "valid": true,
+          "coldMs": 107.57829099986702,
+          "coldRequests": 40,
+          "coldKb": 687.0703125,
+          "coldBy": {
+            "directory": {
               "requests": 6,
-              "kb": 8.18359375
-            },
-            "docPointers": {
-              "requests": 2,
-              "kb": 0.400390625
-            },
-            "docs": {
-              "requests": 2,
-              "kb": 5.953125
-            }
-          },
-          "lane": "packedDocs",
-          "postingBlockFrontierBatches": 1,
-          "postingBlockFrontierBlocks": 1,
-          "postingBlockFrontierFetchGroups": 1,
-          "postingBlockFrontierWantedBlocks": 16,
-          "docValuePruning": false,
-          "docValuePruneField": "",
-          "docValuePagesVisited": 0,
-          "docValuePagesPruned": 0,
-          "docValueRowsScanned": 0,
-          "docValueRowsAccepted": 0,
-          "docValueChunkPruning": false,
-          "docValueChunksVisited": 0,
-          "docValueChunksPruned": 0,
-          "exactTopKMatch": true,
-          "exactTotal": 6210
-        },
-        "revolution": {
-          "total": 10,
-          "top": "Révolution française",
-          "valid": true,
-          "coldMs": 59.63704199998756,
-          "coldRequests": 28,
-          "coldKb": 244.4560546875,
-          "coldBy": {
-            "directory": {
-              "requests": 3,
-              "kb": 96.2587890625
+              "kb": 175.501953125
             },
             "terms": {
               "requests": 2,
-              "kb": 109.8671875
+              "kb": 458.0732421875
             },
             "postingBlocks": {
-              "requests": 3,
-              "kb": 17.62890625
+              "requests": 4,
+              "kb": 18.9658203125
             },
             "docOrdinals": {
-              "requests": 5,
-              "kb": 1.740234375
+              "requests": 9,
+              "kb": 0.05078125
             },
             "docPointers": {
-              "requests": 7,
-              "kb": 12.65234375
+              "requests": 8,
+              "kb": 2.7626953125
             },
             "docs": {
-              "requests": 8,
-              "kb": 6.30859375
-            }
-          },
-          "lane": "packedDocs",
-          "postingBlockFrontierBatches": 19,
-          "postingBlockFrontierBlocks": 31,
-          "postingBlockFrontierFetchGroups": 3,
-          "postingBlockFrontierWantedBlocks": 71,
-          "docValuePruning": false,
-          "docValuePruneField": "",
-          "docValuePagesVisited": 0,
-          "docValuePagesPruned": 0,
-          "docValueRowsScanned": 0,
-          "docValueRowsAccepted": 0,
-          "docValueChunkPruning": false,
-          "docValueChunksVisited": 0,
-          "docValueChunksPruned": 0,
-          "exactTopKMatch": true,
-          "exactTotal": 583
-        },
-        "typedDates": {
-          "total": 10,
-          "top": "Algèbre linéaire",
-          "valid": true,
-          "coldMs": 11.200042000011308,
-          "coldRequests": 4,
-          "coldKb": 18.7578125,
-          "coldBy": {
-            "docValueSorted": {
-              "requests": 2,
-              "kb": 8.8876953125
+              "requests": 10,
+              "kb": 6.2685546875
             },
-            "docPagePointers": {
+            "authority": {
               "requests": 1,
-              "kb": 0.0400390625
-            },
-            "docPages": {
-              "requests": 1,
-              "kb": 9.830078125
-            }
-          },
-          "lane": "docPages",
-          "postingBlockFrontierBatches": 0,
-          "postingBlockFrontierBlocks": 0,
-          "postingBlockFrontierFetchGroups": 0,
-          "postingBlockFrontierWantedBlocks": 0,
-          "docValuePruning": true,
-          "docValuePruneField": "bodyLength",
-          "docValuePagesVisited": 1,
-          "docValuePagesPruned": 0,
-          "docValueRowsScanned": 2048,
-          "docValueRowsAccepted": 10,
-          "docValueChunkPruning": false,
-          "docValueChunksVisited": 0,
-          "docValueChunksPruned": 0,
-          "exactTopKMatch": null,
-          "exactTotal": null
-        },
-        "denseBrowse": {
-          "total": 10,
-          "top": "Antoine Meillet",
-          "valid": true,
-          "coldMs": 2.501542000012705,
-          "coldRequests": 3,
-          "coldKb": 11.58984375,
-          "coldBy": {
-            "docValues": {
-              "requests": 1,
-              "kb": 1.7197265625
-            },
-            "docPagePointers": {
-              "requests": 1,
-              "kb": 0.0400390625
-            },
-            "docPages": {
-              "requests": 1,
-              "kb": 9.830078125
-            }
-          },
-          "lane": "docPages",
-          "postingBlockFrontierBatches": 0,
-          "postingBlockFrontierBlocks": 0,
-          "postingBlockFrontierFetchGroups": 0,
-          "postingBlockFrontierWantedBlocks": 0,
-          "docValuePruning": false,
-          "docValuePruneField": "",
-          "docValuePagesVisited": 0,
-          "docValuePagesPruned": 0,
-          "docValueRowsScanned": 10,
-          "docValueRowsAccepted": 10,
-          "docValueChunkPruning": true,
-          "docValueChunksVisited": 1,
-          "docValueChunksPruned": 0,
-          "exactTopKMatch": null,
-          "exactTotal": null
-        }
-      }
-    },
-    {
-      "limit": 100000,
-      "docs": 100000,
-      "indexFiles": 122,
-      "indexBytes": 280011295,
-      "bytesPerDoc": 2800.11295,
-      "init": {
-        "ms": 7.808541000005789,
-        "requests": 1,
-        "kb": 169.287109375,
-        "by": {
-          "manifest": {
-            "requests": 1,
-            "kb": 169.287109375
-          }
-        }
-      },
-      "docPages": {
-        "format": "rfdocpage-v1",
-        "encoding": "rfdocpagecols-v1",
-        "pageSize": 32,
-        "fields": 13,
-        "pointerBytes": 128138,
-        "packFiles": 9,
-        "packBytes": 34275172
-      },
-      "docValueSorted": {
-        "directoryFormat": "rfdocvaluesortdir-v1",
-        "pageFormat": "rfdocvaluesortpage-v1",
-        "pageSize": 512,
-        "fields": 6,
-        "directoryBytes": 54188,
-        "packFiles": 1,
-        "packBytes": 1389526
-      },
-      "termPackBytes": 51039980,
-      "postingBlockPackBytes": 39361810,
-      "docPackBytes": 62061999,
-      "docPagePackBytes": 34275172,
-      "docValuePackBytes": 1616515,
-      "docValueSortedDirectoryBytes": 54188,
-      "docValueSortedPackBytes": 1389526,
-      "avgTextColdRequests": 22.1,
-      "avgTextColdKb": 172.003125,
-      "maxTextColdRequests": 35,
-      "avgBrowseColdRequests": 5.666666666666667,
-      "avgBrowseColdKb": 21.661458333333332,
-      "textExactMatches": 10,
-      "textRows": 10,
-      "browseRows": 3,
-      "selectedRows": {
-        "paris": {
-          "total": 10,
-          "top": "Paris (homonymie)",
-          "valid": true,
-          "coldMs": 40.37387500004843,
-          "coldRequests": 16,
-          "coldKb": 101.3037109375,
-          "coldBy": {
-            "directory": {
-              "requests": 2,
-              "kb": 64.833984375
-            },
-            "terms": {
-              "requests": 1,
-              "kb": 20.6103515625
-            },
-            "postingBlocks": {
-              "requests": 1,
-              "kb": 6.654296875
-            },
-            "docOrdinals": {
-              "requests": 8,
-              "kb": 2.78515625
-            },
-            "docPointers": {
-              "requests": 2,
-              "kb": 0.400390625
-            },
-            "docs": {
-              "requests": 2,
-              "kb": 6.01953125
-            }
-          },
-          "lane": "packedDocs",
-          "postingBlockFrontierBatches": 1,
-          "postingBlockFrontierBlocks": 1,
-          "postingBlockFrontierFetchGroups": 1,
-          "postingBlockFrontierWantedBlocks": 16,
-          "docValuePruning": false,
-          "docValuePruneField": "",
-          "docValuePagesVisited": 0,
-          "docValuePagesPruned": 0,
-          "docValueRowsScanned": 0,
-          "docValueRowsAccepted": 0,
-          "docValueChunkPruning": false,
-          "docValueChunksVisited": 0,
-          "docValueChunksPruned": 0,
-          "exactTopKMatch": true,
-          "exactTotal": 12853
-        },
-        "revolution": {
-          "total": 10,
-          "top": "Révolution française",
-          "valid": true,
-          "coldMs": 81.31158300000243,
-          "coldRequests": 28,
-          "coldKb": 277.9619140625,
-          "coldBy": {
-            "directory": {
-              "requests": 3,
-              "kb": 102.826171875
-            },
-            "terms": {
-              "requests": 2,
-              "kb": 120.9638671875
-            },
-            "postingBlocks": {
-              "requests": 3,
-              "kb": 20.9453125
-            },
-            "docOrdinals": {
-              "requests": 5,
-              "kb": 3.48046875
-            },
-            "docPointers": {
-              "requests": 7,
-              "kb": 22.1015625
-            },
-            "docs": {
-              "requests": 8,
-              "kb": 7.64453125
+              "kb": 25.447265625
             }
           },
           "lane": "packedDocs",
           "postingBlockFrontierBatches": 17,
           "postingBlockFrontierBlocks": 35,
-          "postingBlockFrontierFetchGroups": 3,
-          "postingBlockFrontierWantedBlocks": 82,
+          "postingBlockFrontierFetchGroups": 4,
+          "postingBlockFrontierWantedBlocks": 94,
+          "plannerLane": "tailProof",
+          "topKProven": true,
+          "totalExact": false,
+          "queryBundleHit": false,
+          "queryBundleBytes": 0,
+          "queryBundleRowGroups": 0,
+          "queryBundleRowGroupsScanned": 0,
+          "authorityAttempted": true,
+          "authorityApplied": true,
+          "authorityRows": 1,
+          "authorityInjected": 0,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -386,20 +288,27 @@
           "docValueChunkPruning": false,
           "docValueChunksVisited": 0,
           "docValueChunksPruned": 0,
+          "surfaceFallbackApplied": false,
+          "typoAttempted": false,
+          "typoApplied": false,
           "exactTopKMatch": true,
-          "exactTotal": 1047
+          "exactTotal": 4885
         },
         "typedDates": {
           "total": 10,
           "top": "Algèbre linéaire",
           "valid": true,
-          "coldMs": 10.459166999906301,
-          "coldRequests": 4,
-          "coldKb": 24.5712890625,
+          "coldMs": 19.519083000253886,
+          "coldRequests": 6,
+          "coldKb": 192.1787109375,
           "coldBy": {
             "docValueSorted": {
-              "requests": 2,
-              "kb": 14.701171875
+              "requests": 3,
+              "kb": 65.4267578125
+            },
+            "docValues": {
+              "requests": 1,
+              "kb": 116.8583984375
             },
             "docPagePointers": {
               "requests": 1,
@@ -407,7 +316,7 @@
             },
             "docPages": {
               "requests": 1,
-              "kb": 9.830078125
+              "kb": 9.853515625
             }
           },
           "lane": "docPages",
@@ -415,6 +324,17 @@
           "postingBlockFrontierBlocks": 0,
           "postingBlockFrontierFetchGroups": 0,
           "postingBlockFrontierWantedBlocks": 0,
+          "plannerLane": "",
+          "topKProven": false,
+          "totalExact": false,
+          "queryBundleHit": false,
+          "queryBundleBytes": 0,
+          "queryBundleRowGroups": 0,
+          "queryBundleRowGroupsScanned": 0,
+          "authorityAttempted": false,
+          "authorityApplied": false,
+          "authorityRows": 0,
+          "authorityInjected": 0,
           "docValuePruning": true,
           "docValuePruneField": "bodyLength",
           "docValuePagesVisited": 1,
@@ -424,6 +344,9 @@
           "docValueChunkPruning": false,
           "docValueChunksVisited": 0,
           "docValueChunksPruned": 0,
+          "surfaceFallbackApplied": false,
+          "typoAttempted": false,
+          "typoApplied": false,
           "exactTopKMatch": null,
           "exactTotal": null
         },
@@ -431,13 +354,13 @@
           "total": 10,
           "top": "Antoine Meillet",
           "valid": true,
-          "coldMs": 2.023083999985829,
-          "coldRequests": 3,
-          "coldKb": 11.58984375,
+          "coldMs": 5.219167000148445,
+          "coldRequests": 4,
+          "coldKb": 128.4765625,
           "coldBy": {
             "docValues": {
-              "requests": 1,
-              "kb": 1.7197265625
+              "requests": 2,
+              "kb": 118.5830078125
             },
             "docPagePointers": {
               "requests": 1,
@@ -445,7 +368,7 @@
             },
             "docPages": {
               "requests": 1,
-              "kb": 9.830078125
+              "kb": 9.853515625
             }
           },
           "lane": "docPages",
@@ -453,6 +376,17 @@
           "postingBlockFrontierBlocks": 0,
           "postingBlockFrontierFetchGroups": 0,
           "postingBlockFrontierWantedBlocks": 0,
+          "plannerLane": "",
+          "topKProven": false,
+          "totalExact": false,
+          "queryBundleHit": false,
+          "queryBundleBytes": 0,
+          "queryBundleRowGroups": 0,
+          "queryBundleRowGroupsScanned": 0,
+          "authorityAttempted": false,
+          "authorityApplied": false,
+          "authorityRows": 0,
+          "authorityInjected": 0,
           "docValuePruning": false,
           "docValuePruneField": "",
           "docValuePagesVisited": 0,
@@ -462,6 +396,9 @@
           "docValueChunkPruning": true,
           "docValueChunksVisited": 1,
           "docValueChunksPruned": 0,
+          "surfaceFallbackApplied": false,
+          "typoAttempted": false,
+          "typoApplied": false,
           "exactTopKMatch": null,
           "exactTotal": null
         }

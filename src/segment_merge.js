@@ -1,7 +1,8 @@
 import { closeSync, createReadStream, mkdirSync, openSync, rmSync, statSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { readSegmentDirectory, readSegmentRowsFromFd, writeSegmentFromTermRows } from "./segment_builder.js";
+import { createPostingRowBuffer, appendPostingRow, postingRowCount, postingRowDoc, postingRowScore, resetPostingRows } from "./posting_rows.js";
+import { readSegmentDirectory, readSegmentRowsFromFdInto, writeSegmentFromTermRows } from "./segment_builder.js";
 import { shardKey } from "./shards.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
 
@@ -55,17 +56,20 @@ class MinHeap {
 
 function encodeReducedTerm(term, rows, df) {
   const termBytes = textEncoder.encode(String(term || ""));
-  let bytes = varintLength(termBytes.length) + termBytes.length + varintLength(df) + varintLength(rows.length);
-  for (const [doc, score] of rows) bytes += varintLength(doc) + varintLength(score);
+  const rowCount = postingRowCount(rows);
+  let bytes = varintLength(termBytes.length) + termBytes.length + varintLength(df) + varintLength(rowCount);
+  for (let i = 0; i < rowCount; i++) {
+    bytes += varintLength(postingRowDoc(rows, i)) + varintLength(postingRowScore(rows, i));
+  }
   const out = Buffer.allocUnsafe(bytes);
   let pos = writeVarint(out, 0, termBytes.length);
   out.set(termBytes, pos);
   pos += termBytes.length;
   pos = writeVarint(out, pos, df);
-  pos = writeVarint(out, pos, rows.length);
-  for (const [doc, score] of rows) {
-    pos = writeVarint(out, pos, doc);
-    pos = writeVarint(out, pos, score);
+  pos = writeVarint(out, pos, rowCount);
+  for (let i = 0; i < rowCount; i++) {
+    pos = writeVarint(out, pos, postingRowDoc(rows, i));
+    pos = writeVarint(out, pos, postingRowScore(rows, i));
   }
   return out;
 }
@@ -89,7 +93,7 @@ function reducedTermFromBytes(bytes, state) {
     state.pos = start;
     return null;
   }
-  const rows = new Array(rowCount);
+  const rows = createPostingRowBuffer(rowCount);
   for (let i = 0; i < rowCount; i++) {
     const doc = tryReadVarint(bytes, state);
     const score = tryReadVarint(bytes, state);
@@ -97,7 +101,7 @@ function reducedTermFromBytes(bytes, state) {
       state.pos = start;
       return null;
     }
-    rows[i] = [doc, score];
+    appendPostingRow(rows, doc, score);
   }
   return { term, df, rows };
 }
@@ -124,6 +128,8 @@ function segmentReaders(segments) {
       index,
       data,
       fd: openSync(data.postingsPath, "r"),
+      readBuffer: Buffer.alloc(0),
+      rows: createPostingRowBuffer(0),
       position: 0,
       get current() {
         return data.terms[this.position] || null;
@@ -135,6 +141,7 @@ function segmentReaders(segments) {
 async function* mergedSegmentTermRows(segments, onTerm) {
   const readers = segmentReaders(segments);
   const heap = new MinHeap((left, right) => left.term.localeCompare(right.term) || left.reader - right.reader);
+  const mergedRows = createPostingRowBuffer(0);
   for (const reader of readers) {
     if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
   }
@@ -145,31 +152,54 @@ async function* mergedSegmentTermRows(segments, onTerm) {
       const term = first.term;
       const matches = [first.reader];
       while (heap.size && heap.items[0].term === term) matches.push(heap.pop().reader);
-      const rows = [];
+      resetPostingRows(mergedRows);
       for (const readerIndex of matches) {
         const reader = readers[readerIndex];
-        rows.push(...readSegmentRowsFromFd(reader.fd, reader.current));
+        resetPostingRows(reader.rows);
+        reader.readBuffer = readSegmentRowsFromFdInto(reader.fd, reader.current, reader.rows, reader.readBuffer);
+      }
+      mergeSortedReaderRows(readers, matches, mergedRows);
+      for (const readerIndex of matches) {
+        const reader = readers[readerIndex];
         reader.position++;
         if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
       }
-      const merged = mergeRows(rows);
-      onTerm?.(term, merged.length);
-      yield { term, rows: merged };
+      onTerm?.(term, mergedRows.length);
+      yield { term, rows: mergedRows };
     }
   } finally {
     for (const reader of readers) closeSync(reader.fd);
   }
 }
 
-function mergeRows(rows) {
-  rows.sort((a, b) => a[0] - b[0]);
-  const out = [];
-  for (const [doc, score] of rows) {
-    const last = out[out.length - 1];
-    if (last && last[0] === doc) last[1] += score;
-    else out.push([doc, score]);
+function mergeSortedReaderRows(readers, matches, out) {
+  const rowHeap = new MinHeap((left, right) => left.doc - right.doc || left.reader - right.reader);
+  for (const readerIndex of matches) {
+    const rows = readers[readerIndex].rows;
+    if (rows.length) rowHeap.push({ reader: readerIndex, index: 0, doc: rows.docs[0], score: rows.scores[0] });
+  }
+  while (rowHeap.size) {
+    const first = rowHeap.pop();
+    const doc = first.doc;
+    let score = first.score;
+    advanceReaderRow(readers, rowHeap, first);
+    while (rowHeap.size && rowHeap.items[0].doc === doc) {
+      const next = rowHeap.pop();
+      score += next.score;
+      advanceReaderRow(readers, rowHeap, next);
+    }
+    appendPostingRow(out, doc, score);
   }
   return out;
+}
+
+function advanceReaderRow(readers, rowHeap, item) {
+  const rows = readers[item.reader].rows;
+  item.index++;
+  if (item.index >= rows.length) return;
+  item.doc = rows.docs[item.index];
+  item.score = rows.scores[item.index];
+  rowHeap.push(item);
 }
 
 function addPrefixCounts(prefixCounts, term, df, config) {
@@ -213,46 +243,163 @@ async function mergeSegmentsToReducedSpool(segments, reducedPath, config, onTerm
 async function mergeSegmentBatchToSegment(segments, outDir, id, tier) {
   return writeSegmentFromTermRows(outDir, id, mergedSegmentTermRows(segments), {
     mergeTier: tier,
-    sourceSegments: segments.map(segment => segment.id).filter(Boolean)
+    mergePolicy: "tiered-log",
+    mergeReason: "similarly-sized-tier",
+    sourceSegments: segments.map(segment => segment.id).filter(Boolean),
+    sourceBytes: segments.reduce((sum, segment) => sum + segmentBytes(segment), 0),
+    sourceDocCount: segments.reduce((sum, segment) => sum + (segment.docCount || 0), 0)
   });
 }
 
+function segmentBytes(segment) {
+  return (segment.termsBytes || 0) + (segment.postingBytes || 0);
+}
+
+function mergeFanIn(config) {
+  return Math.max(2, Math.floor(Number(config.segmentMergeFanIn || config.segmentMergeTierSize || 8)));
+}
+
+function mergeTargetSegments(config, fanIn) {
+  const target = Math.floor(Number(config.finalSegmentTargetCount || config.segmentMergeTargetCount || 0));
+  return target > 0 ? Math.max(1, target) : fanIn;
+}
+
+function maxTempBytes(config) {
+  return Math.max(0, Math.floor(Number(config.segmentMergeMaxTempBytes || 0)));
+}
+
+function mergePolicyName(config) {
+  const policy = String(config.segmentMergePolicy || "tiered-log");
+  if (policy === "none") return "none";
+  return "tiered-log";
+}
+
+function orderedMergeCandidates(segments) {
+  return segments
+    .map((segment, index) => ({ segment, index, bytes: segmentBytes(segment) }))
+    .sort((left, right) => left.bytes - right.bytes || String(left.segment.id || "").localeCompare(String(right.segment.id || "")) || left.index - right.index)
+    .map(item => item.segment);
+}
+
+function mergeBatches(segments, config) {
+  const fanIn = mergeFanIn(config);
+  const cap = maxTempBytes(config);
+  const ordered = orderedMergeCandidates(segments);
+  const batches = [];
+  for (let start = 0; start < ordered.length;) {
+    const batch = [ordered[start++]];
+    let bytes = segmentBytes(batch[0]);
+    while (start < ordered.length && batch.length < fanIn) {
+      const next = ordered[start];
+      const nextBytes = segmentBytes(next);
+      if (cap && bytes + nextBytes > cap) break;
+      batch.push(next);
+      bytes += nextBytes;
+      start++;
+    }
+    batches.push(batch);
+  }
+  return batches;
+}
+
+function mergePolicySummary({ config, inputSegments, outputSegments, tiers }) {
+  const inputBytes = inputSegments.reduce((sum, segment) => sum + segmentBytes(segment), 0);
+  const intermediateBytes = tiers.reduce((sum, tier) => sum + (tier.output_bytes || 0), 0);
+  const outputBytes = outputSegments.reduce((sum, segment) => sum + segmentBytes(segment), 0);
+  const fanIn = mergeFanIn(config);
+  const targetSegments = mergeTargetSegments(config, fanIn);
+  return {
+    policy: mergePolicyName(config),
+    fanIn,
+    targetSegments,
+    forceMerge: targetSegments === 1,
+    maxTempBytes: maxTempBytes(config),
+    inputSegments: inputSegments.length,
+    outputSegments: outputSegments.length,
+    inputBytes,
+    outputBytes,
+    intermediateBytes,
+    skippedSegments: tiers.reduce((sum, tier) => sum + (tier.skipped_segments || 0), 0),
+    blockedByTempBudget: tiers.some(tier => tier.blocked_by_temp_budget),
+    writeAmplification: inputBytes > 0 ? intermediateBytes / inputBytes : 0
+  };
+}
+
 async function tierMergeSegments(segments, scratchDir, config) {
-  const fanIn = Math.max(2, Math.floor(Number(config.segmentMergeFanIn || config.segmentMergeTierSize || 8)));
+  const policyName = mergePolicyName(config);
+  const fanIn = mergeFanIn(config);
+  const targetSegments = mergeTargetSegments(config, fanIn);
+  if (policyName === "none" || segments.length <= targetSegments) {
+    const tiers = [];
+    return {
+      segments: segments.slice(),
+      tiers,
+      policy: mergePolicySummary({ config, inputSegments: segments, outputSegments: segments, tiers })
+    };
+  }
   let current = segments.slice();
   const tiers = [];
-  for (let tier = 1; current.length > fanIn; tier++) {
+  for (let tier = 1; current.length > targetSegments; tier++) {
     const tierDir = resolve(scratchDir, `tier-${String(tier).padStart(2, "0")}`);
     mkdirSync(tierDir, { recursive: true });
     const next = [];
     const batches = [];
-    for (let start = 0; start < current.length; start += fanIn) {
-      const batch = current.slice(start, start + fanIn);
+    let skippedSegments = 0;
+    let inputBytes = 0;
+    let outputBytes = 0;
+    let mergedBatches = 0;
+    for (const batch of mergeBatches(current, config)) {
+      inputBytes += batch.reduce((sum, segment) => sum + segmentBytes(segment), 0);
       if (batch.length === 1) {
         next.push(batch[0]);
+        skippedSegments++;
         continue;
       }
       const segment = await mergeSegmentBatchToSegment(batch, tierDir, `merged-${String(tier).padStart(2, "0")}-${String(batches.length).padStart(6, "0")}`, tier);
       next.push(segment);
+      mergedBatches++;
+      const batchInputBytes = batch.reduce((sum, item) => sum + segmentBytes(item), 0);
+      const batchOutputBytes = segmentBytes(segment);
+      outputBytes += batchOutputBytes;
       batches.push({
+        policy: policyName,
+        reason: "similarly-sized-tier",
         input_segments: batch.length,
+        source_segments: batch.map(item => item.id).filter(Boolean),
         input_terms: batch.reduce((sum, item) => sum + (item.termCount || 0), 0),
         input_postings: batch.reduce((sum, item) => sum + (item.postingCount || 0), 0),
+        input_bytes: batchInputBytes,
         output_terms: segment.termCount,
         output_postings: segment.postingCount,
-        output_bytes: (segment.termsBytes || 0) + (segment.postingBytes || 0)
+        output_bytes: batchOutputBytes,
+        write_amplification: batchInputBytes > 0 ? batchOutputBytes / batchInputBytes : 0
       });
     }
     tiers.push({
       tier,
+      policy: policyName,
       fan_in: fanIn,
+      target_segments: targetSegments,
       input_segments: current.length,
       output_segments: next.length,
+      skipped_segments: skippedSegments,
+      input_bytes: inputBytes,
+      output_bytes: outputBytes,
+      estimated_write_amplification: inputBytes > 0 ? outputBytes / inputBytes : 0,
+      blocked_by_temp_budget: mergedBatches === 0 && next.length > targetSegments,
       batches
     });
+    if (mergedBatches === 0) {
+      current = next;
+      break;
+    }
     current = next;
   }
-  return { segments: current, tiers };
+  return {
+    segments: current,
+    tiers,
+    policy: mergePolicySummary({ config, inputSegments: segments, outputSegments: current, tiers })
+  };
 }
 
 export async function mergeSegmentsToPartitions(options) {
@@ -261,11 +408,13 @@ export async function mergeSegmentsToPartitions(options) {
     scratchDir,
     config,
     onTerm,
-    onPartition
+    onPartition,
+    partitionConcurrency = 1
   } = options;
   mkdirSync(scratchDir, { recursive: true });
   const reducedPath = resolve(scratchDir, "reduced-terms.run");
   let sequence = 0;
+  const maxConcurrency = Math.max(1, Math.floor(Number(partitionConcurrency || 1)));
   try {
     const tierStart = performance.now();
     const tiered = await tierMergeSegments(segments, scratchDir, config);
@@ -276,23 +425,39 @@ export async function mergeSegmentsToPartitions(options) {
     const reducedSpoolBytes = statSync(reducedPath).size;
     const partitionStart = performance.now();
     const partitions = [];
+    const pendingPartitions = [];
+    const activePartitions = new Set();
+    async function queuePartition(partition) {
+      const partitionSequence = sequence++;
+      const promise = Promise.resolve(onPartition(partition, partitionSequence))
+        .then(result => {
+          partitions.push({ sequence: partitionSequence, result });
+          return result;
+        });
+      activePartitions.add(promise);
+      pendingPartitions.push(promise);
+      promise.finally(() => activePartitions.delete(promise));
+      while (activePartitions.size >= maxConcurrency) await Promise.race(activePartitions);
+    }
     let currentName = null;
     let entries = [];
     for await (const { term, rows } of readReducedTerms(reducedPath)) {
       const name = partitionNameForTerm(term, reduced.prefixCounts, config);
       if (currentName && name !== currentName) {
-        partitions.push(await onPartition({ name: currentName, entries }, sequence++));
+        await queuePartition({ name: currentName, entries });
         entries = [];
       }
       currentName = name;
       entries.push([term, rows]);
     }
-    if (currentName) partitions.push(await onPartition({ name: currentName, entries }, sequence++));
+    if (currentName) await queuePartition({ name: currentName, entries });
+    await Promise.all(pendingPartitions);
     return {
       terms: reduced.terms,
       postings: reduced.postings,
-      partitions,
+      partitions: partitions.sort((left, right) => left.sequence - right.sequence).map(item => item.result),
       mergeTiers: tiered.tiers,
+      mergePolicy: tiered.policy,
       timings: {
         tierMergeMs,
         reducedSpoolMs,
@@ -306,11 +471,19 @@ export async function mergeSegmentsToPartitions(options) {
 }
 
 export function segmentMergeSummary(segments) {
+  const flushReasons = {};
+  for (const segment of segments) {
+    const reason = segment.flushReason || "unknown";
+    flushReasons[reason] = (flushReasons[reason] || 0) + 1;
+  }
   return {
     format: "rfsegment-merge-v1",
     segments: segments.length,
     terms: segments.reduce((sum, segment) => sum + (segment.termCount || 0), 0),
     postings: segments.reduce((sum, segment) => sum + (segment.postingCount || 0), 0),
-    bytes: segments.reduce((sum, segment) => sum + (segment.termsBytes || 0) + (segment.postingBytes || 0), 0)
+    bytes: segments.reduce((sum, segment) => sum + (segment.termsBytes || 0) + (segment.postingBytes || 0), 0),
+    approxMemoryBytes: segments.reduce((sum, segment) => Math.max(sum, segment.approxMemoryBytes || 0), 0),
+    maxDocs: segments.reduce((sum, segment) => Math.max(sum, segment.sourceDocCount || segment.docCount || 0), 0),
+    flushReasons
   };
 }

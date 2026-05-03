@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
+import { appendPostingRow, isPostingRowBuffer, postingRowCount, postingRowDoc, postingRowScore } from "./posting_rows.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
 
 const TERMS_MAGIC = Uint8Array.from([0x52, 0x46, 0x53, 0x47, 0x54, 0x45, 0x52, 0x31]);
@@ -42,7 +44,26 @@ function normalizedScore(score) {
   return Math.max(1, Math.round(Number(score) || 0));
 }
 
+function positiveInteger(value, fallback = 0) {
+  const numeric = Math.floor(Number(value) || 0);
+  return numeric > 0 ? numeric : fallback;
+}
+
+function resolvedMaxBytes(config) {
+  const flushBytes = positiveInteger(config.segmentFlushBytes, 0);
+  if (flushBytes) return Math.max(1024, flushBytes);
+  const budget = positiveInteger(config.builderMemoryBudgetBytes, 0);
+  if (budget) {
+    const workers = Math.max(1, positiveInteger(config.scanWorkers, 1));
+    return Math.max(1024 * 1024, Math.floor(budget / workers / 2));
+  }
+  const explicit = positiveInteger(config.segmentMaxBytes, 0);
+  if (explicit) return Math.max(1024, explicit);
+  return 64 * 1024 * 1024;
+}
+
 function finishRows(rows) {
+  if (isPostingRowBuffer(rows)) return rows;
   rows.sort((a, b) => a[0] - b[0]);
   const out = [];
   for (const [doc, score] of rows) {
@@ -57,7 +78,10 @@ function encodeRows(rows) {
   const rowBytes = [];
   let docMin = null;
   let docMax = null;
-  for (const [doc, score] of rows) {
+  const count = postingRowCount(rows);
+  for (let i = 0; i < count; i++) {
+    const doc = postingRowDoc(rows, i);
+    const score = postingRowScore(rows, i);
     pushVarint(rowBytes, doc);
     pushVarint(rowBytes, score);
     docMin = docMin == null ? doc : Math.min(docMin, doc);
@@ -76,8 +100,19 @@ function writeSegmentTermsFile(termsPath, terms) {
     pushVarint(termBytes, item.df);
     pushVarint(termBytes, item.count);
   }
-  writeFileSync(termsPath, Buffer.from(Uint8Array.from(termBytes)));
-  return termBytes.length;
+  const buffer = Buffer.from(Uint8Array.from(termBytes));
+  writeFileSync(termsPath, buffer);
+  return {
+    bytes: buffer.length,
+    checksum: checksum(buffer)
+  };
+}
+
+function checksum(bytes) {
+  return {
+    algorithm: "sha256",
+    value: createHash("sha256").update(bytes).digest("hex")
+  };
 }
 
 function segmentMeta(id, terms, postingCount, termsBytes, postingBytes, docMin, docMax, extra = {}) {
@@ -92,6 +127,18 @@ function segmentMeta(id, terms, postingCount, termsBytes, postingBytes, docMin, 
     postingBytes,
     terms: "terms.bin",
     postings: "postings.bin",
+    files: {
+      terms: {
+        path: "terms.bin",
+        bytes: termsBytes,
+        checksum: extra.termsChecksum || null
+      },
+      postings: {
+        path: "postings.bin",
+        bytes: postingBytes,
+        checksum: extra.postingsChecksum || null
+      }
+    },
     heads: null,
     summaries: null,
     ...extra
@@ -109,14 +156,24 @@ export function createSegmentBuilder(outDir, config = {}) {
     approxBytes: 0,
     docMin: null,
     docMax: null,
+    docCount: 0,
+    lastDoc: null,
+    flushCounts: {},
     segments: [],
     maxPostings: Math.max(1, Math.floor(Number(config.segmentMaxPostings || 250000))),
-    maxBytes: Math.max(1024, Math.floor(Number(config.segmentMaxBytes || 64 * 1024 * 1024)))
+    maxDocs: positiveInteger(config.segmentFlushDocs, 0) || positiveInteger(config.segmentMaxDocs, 0),
+    maxBytes: resolvedMaxBytes(config),
+    memoryBudgetBytes: positiveInteger(config.builderMemoryBudgetBytes, 0),
+    pendingFlushReason: ""
   };
 }
 
 export function addSegmentPosting(builder, term, doc, score) {
   if (!term) return;
+  if (builder.lastDoc !== doc) {
+    builder.lastDoc = doc;
+    builder.docCount++;
+  }
   const key = String(term);
   let rows = builder.postings.get(key);
   if (!rows) {
@@ -131,12 +188,27 @@ export function addSegmentPosting(builder, term, doc, score) {
   builder.docMax = builder.docMax == null ? doc : Math.max(builder.docMax, doc);
 }
 
-export function shouldFlushSegment(builder) {
-  return builder.postingCount >= builder.maxPostings || builder.approxBytes >= builder.maxBytes;
+export function segmentFlushReason(builder) {
+  if (builder.postingCount >= builder.maxPostings) return "postings";
+  if (builder.maxDocs && builder.docCount >= builder.maxDocs) return "docs";
+  if (builder.approxBytes >= builder.maxBytes) {
+    if (builder.docCount <= 1) return "single-doc-bytes";
+    return "bytes";
+  }
+  return "";
 }
 
-export function flushSegment(builder) {
+export function shouldFlushSegment(builder) {
+  const reason = segmentFlushReason(builder);
+  builder.pendingFlushReason = reason;
+  return !!reason;
+}
+
+export function flushSegment(builder, reason = builder.pendingFlushReason || "finish") {
   if (!builder.postingCount) return null;
+  if (reason === "single-doc-bytes") {
+    throw new Error(`Rangefind segment flush limit exceeded by one document: approx ${builder.approxBytes} bytes > ${builder.maxBytes} bytes.`);
+  }
   const id = `segment-${String(builder.nextId++).padStart(6, "0")}`;
   const dir = resolve(builder.outDir, id);
   mkdirSync(dir, { recursive: true });
@@ -144,6 +216,7 @@ export function flushSegment(builder) {
   const termsPath = resolve(dir, "terms.bin");
   const postingsFd = openSync(postingsPath, "w");
   const terms = [];
+  const postingsHash = createHash("sha256");
   let postingOffset = 0;
   let postingCount = 0;
   let docMin = null;
@@ -153,6 +226,7 @@ export function flushSegment(builder) {
       const rows = finishRows(sourceRows);
       const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
       writeSync(postingsFd, buffer, 0, buffer.length, postingOffset);
+      postingsHash.update(buffer);
       terms.push({ term, offset: postingOffset, bytes: buffer.length, df: rows.length, count: rows.length });
       postingOffset += buffer.length;
       postingCount += rows.length;
@@ -163,8 +237,22 @@ export function flushSegment(builder) {
     closeSync(postingsFd);
   }
 
-  const termsBytes = writeSegmentTermsFile(termsPath, terms);
-  const meta = segmentMeta(id, terms, postingCount, termsBytes, postingOffset, docMin, docMax);
+  const termsFile = writeSegmentTermsFile(termsPath, terms);
+  const meta = segmentMeta(id, terms, postingCount, termsFile.bytes, postingOffset, docMin, docMax, {
+    flushReason: reason,
+    approxBytes: builder.approxBytes,
+    approxMemoryBytes: builder.approxBytes,
+    sourceDocCount: builder.docCount,
+    memoryBudgetBytes: builder.memoryBudgetBytes,
+    maxPostings: builder.maxPostings,
+    maxDocs: builder.maxDocs,
+    maxBytes: builder.maxBytes,
+    termsChecksum: termsFile.checksum,
+    postingsChecksum: {
+      algorithm: "sha256",
+      value: postingsHash.digest("hex")
+    }
+  });
   const metaPath = resolve(dir, "segment.json");
   writeFileSync(metaPath, JSON.stringify(meta));
   const segment = { ...meta, dir, metaPath, termsPath, postingsPath };
@@ -174,6 +262,10 @@ export function flushSegment(builder) {
   builder.approxBytes = 0;
   builder.docMin = null;
   builder.docMax = null;
+  builder.docCount = 0;
+  builder.lastDoc = null;
+  builder.pendingFlushReason = "";
+  builder.flushCounts[reason] = (builder.flushCounts[reason] || 0) + 1;
   return segment;
 }
 
@@ -184,6 +276,7 @@ export async function writeSegmentFromTermRows(outDir, id, termRows, extraMeta =
   const termsPath = resolve(dir, "terms.bin");
   const postingsFd = openSync(postingsPath, "w");
   const terms = [];
+  const postingsHash = createHash("sha256");
   let postingOffset = 0;
   let postingCount = 0;
   let docMin = null;
@@ -196,6 +289,7 @@ export async function writeSegmentFromTermRows(outDir, id, termRows, extraMeta =
       const rows = finishRows(sourceRows);
       const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
       writeSync(postingsFd, buffer, 0, buffer.length, postingOffset);
+      postingsHash.update(buffer);
       terms.push({ term, offset: postingOffset, bytes: buffer.length, df: rows.length, count: rows.length });
       postingOffset += buffer.length;
       postingCount += rows.length;
@@ -206,8 +300,18 @@ export async function writeSegmentFromTermRows(outDir, id, termRows, extraMeta =
     closeSync(postingsFd);
   }
 
-  const termsBytes = writeSegmentTermsFile(termsPath, terms);
-  const meta = segmentMeta(id, terms, postingCount, termsBytes, postingOffset, docMin, docMax, extraMeta);
+  const termsFile = writeSegmentTermsFile(termsPath, terms);
+  const meta = segmentMeta(id, terms, postingCount, termsFile.bytes, postingOffset, docMin, docMax, {
+    flushReason: extraMeta.flushReason || "merge",
+    approxBytes: (extraMeta.approxBytes || 0) || termsFile.bytes + postingOffset,
+    approxMemoryBytes: (extraMeta.approxMemoryBytes || 0) || termsFile.bytes + postingOffset,
+    ...extraMeta,
+    termsChecksum: termsFile.checksum,
+    postingsChecksum: {
+      algorithm: "sha256",
+      value: postingsHash.digest("hex")
+    }
+  });
   const metaPath = resolve(dir, "segment.json");
   writeFileSync(metaPath, JSON.stringify(meta));
   return { ...meta, dir, metaPath, termsPath, postingsPath };
@@ -258,9 +362,31 @@ export function readSegmentRows(segmentData, entry) {
   return rows;
 }
 
+export function readSegmentRowsFromBytesInto(postingsBytes, entry, target) {
+  const state = { pos: entry.offset };
+  const end = entry.offset + entry.bytes;
+  for (let i = 0; i < entry.count; i++) {
+    if (state.pos >= end) throw new Error(`Rangefind segment term ${entry.term} ended early.`);
+    appendPostingRow(target, readVarint(postingsBytes, state), readVarint(postingsBytes, state));
+  }
+  if (state.pos !== end) throw new Error(`Rangefind segment term ${entry.term} has trailing bytes.`);
+  return target;
+}
+
 export function readSegmentRowsFromFd(fd, entry) {
   const bytes = Buffer.alloc(entry.bytes);
   const bytesRead = readSync(fd, bytes, 0, bytes.length, entry.offset);
   if (bytesRead !== bytes.length) throw new Error(`Rangefind segment term ${entry.term} ended early.`);
   return readSegmentRows({ postingsBytes: bytes }, { ...entry, offset: 0 });
+}
+
+export function readSegmentRowsFromFdInto(fd, entry, target, reusableBuffer = null) {
+  const buffer = reusableBuffer && reusableBuffer.length >= entry.bytes
+    ? reusableBuffer
+    : Buffer.allocUnsafe(entry.bytes);
+  const bytes = buffer.subarray(0, entry.bytes);
+  const bytesRead = readSync(fd, bytes, 0, entry.bytes, entry.offset);
+  if (bytesRead !== entry.bytes) throw new Error(`Rangefind segment term ${entry.term} ended early.`);
+  readSegmentRowsFromBytesInto(bytes, { ...entry, offset: 0 }, target);
+  return buffer;
 }

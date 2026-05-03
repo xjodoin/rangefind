@@ -5,16 +5,19 @@ import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH } from "./object_sto
 
 export function createPackWriter(outDir, targetBytes, options = {}) {
   mkdirSync(outDir, { recursive: true });
+  const indexCounter = normalizeIndexCounter(options.indexCounter);
   return {
     index: -1,
     file: "",
     path: "",
     offset: 0,
     bytes: 0,
+    entryCount: 0,
     entries: {},
     packs: [],
     outDir,
     targetBytes,
+    indexCounter,
     dedupe: options.dedupe !== false,
     keepEntries: options.keepEntries !== false,
     objects: new Map(),
@@ -24,16 +27,41 @@ export function createPackWriter(outDir, targetBytes, options = {}) {
   };
 }
 
+export function createAppendOnlyPackWriter(outDir, targetBytes, options = {}) {
+  return createPackWriter(outDir, targetBytes, {
+    ...options,
+    keepEntries: false,
+    dedupe: options.dedupe === true
+  });
+}
+
 function sha256Hex(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function normalizeIndexCounter(counter) {
+  if (!counter) return null;
+  if (counter instanceof Int32Array) return counter;
+  if (counter instanceof SharedArrayBuffer) return new Int32Array(counter);
+  throw new Error("Rangefind pack writer indexCounter must be an Int32Array or SharedArrayBuffer.");
+}
+
+function nextPackIndex(writer) {
+  if (!writer.indexCounter) {
+    writer.index++;
+    return writer.index;
+  }
+  const index = Atomics.add(writer.indexCounter, 0, 1);
+  writer.index = index;
+  return index;
+}
+
 function openPack(writer) {
-  writer.index++;
-  writer.file = `${String(writer.index).padStart(4, "0")}.bin`;
+  const index = nextPackIndex(writer);
+  writer.file = `${String(index).padStart(4, "0")}.bin`;
   writer.path = resolve(writer.outDir, writer.file);
   writer.offset = 0;
-  const pack = { index: writer.index, file: writer.file, bytes: 0, shards: 0, objects: 0, references: 0, dedupedObjects: 0, dedupedBytes: 0 };
+  const pack = { index, file: writer.file, bytes: 0, shards: 0, objects: 0, references: 0, dedupedObjects: 0, dedupedBytes: 0 };
   Object.defineProperty(pack, "path", { value: writer.path, writable: true, enumerable: false, configurable: true });
   writer.packs.push(pack);
   writeFileSync(writer.path, "");
@@ -67,6 +95,7 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
       compression: metadata.compression || existing.compression || "gzip-member",
       checksum
     };
+    writer.entryCount++;
     if (writer.keepEntries) writer.entries[shard] = entry;
     return entry;
   }
@@ -83,6 +112,7 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
     compression: metadata.compression || "gzip-member",
     checksum
   };
+  writer.entryCount++;
   if (writer.keepEntries) writer.entries[shard] = entry;
   if (writer.dedupe) writer.objects.set(checksum.value, entry);
   writer.offset += compressed.length;
@@ -122,4 +152,10 @@ export function finalizePackWriter(writer) {
   writer.path = writer.packs.at(-1)?.path || "";
   writer.finalized = true;
   return writer;
+}
+
+export function resolvePackEntry(writer, entry) {
+  if (!entry) return entry;
+  const mapped = writer.packNameMap?.get(entry.pack);
+  return mapped && mapped !== entry.pack ? { ...entry, pack: mapped } : entry;
 }

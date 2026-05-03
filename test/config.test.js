@@ -15,7 +15,17 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.docValueChunkSize, 2048);
   assert.equal(config.docValueLookupChunkSize, 2048);
   assert.equal(config.filterBitmapMaxFacetValues, 64);
+  assert.equal(config.directorySortChunkEntries, 16384);
+  assert.equal(config.builderWorkerCount, 1);
+  assert.equal(config.partitionReducerWorkers, 0);
+  assert.equal(config.builderMemoryBudgetBytes, 0);
+  assert.equal(config.segmentFlushDocs, 0);
+  assert.equal(config.segmentFlushBytes, 0);
+  assert.equal(config.segmentMergePolicy, "tiered-log");
+  assert.equal(config.segmentMergeMaxTempBytes, 0);
+  assert.equal(config.finalSegmentTargetCount, 0);
   assert.equal(config.codecs.mode, "auto");
+  assert.equal(config.buildProgressLogMs, 0);
 });
 
 test("getPath reads nested values, arrays, nulls, and fallbacks", () => {

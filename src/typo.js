@@ -204,9 +204,10 @@ function isTypoIndexTerm(term, df, total, options) {
 }
 
 export function addTypoIndexTerm(buffer, term, df, total) {
-  if (!buffer || !isTypoIndexTerm(term, df, total, buffer.options)) return;
+  if (!buffer || !isTypoIndexTerm(term, df, total, buffer.options)) return false;
   buffer.terms++;
   bufferTypoCorrectionCandidate(buffer, term, term, df);
+  return true;
 }
 
 function parseCandidateText(text) {

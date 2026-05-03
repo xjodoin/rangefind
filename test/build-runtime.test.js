@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { gunzipSync } from "node:zlib";
 import test from "node:test";
 import { build } from "../src/builder.js";
 import { parseDocPagePointerPage } from "../src/doc_pages.js";
@@ -106,11 +107,29 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(minimalManifest.lazy_manifests.doc_value_sorted, "doc-values/sorted/manifest.json.gz");
   assert.equal(minimalManifest.lazy_manifests.filter_bitmaps, "filter-bitmaps/manifest.json.gz");
   assert.equal(minimalManifest.lazy_manifests.facet_dictionaries, "facets/manifest.json.gz");
+  assert.equal(minimalManifest.segments.manifest, "segments/manifest.json.gz");
   assert.ok(await readFile(join(output, "manifest.full.json"), "utf8"));
   assert.ok(await readFile(join(output, "doc-values", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "doc-values", "sorted", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "filter-bitmaps", "manifest.json.gz")));
   assert.ok(await readFile(join(output, "facets", "manifest.json.gz")));
+  const segmentManifest = JSON.parse(gunzipSync(await readFile(join(output, "segments", "manifest.json.gz"))).toString("utf8"));
+  assert.equal(segmentManifest.format, "rfsegmentmanifest-v1");
+  assert.equal(segmentManifest.published, true);
+  assert.equal(segmentManifest.storage, "static-segment-files-v1");
+  assert.equal(segmentManifest.totalDocs, 9);
+  assert.equal(segmentManifest.segmentCount, manifest.stats.segment_files);
+  assert.deepEqual(segmentManifest.fields.text, ["title", "body"]);
+  assert.deepEqual(segmentManifest.fields.facets, ["category", "tags"]);
+  assert.deepEqual(segmentManifest.fields.numbers.map(field => field.name), ["year", "temperature", "published"]);
+  assert.deepEqual(segmentManifest.fields.booleans, ["featured"]);
+  assert.ok(segmentManifest.segments.every(segment => segment.docCount > 0));
+  assert.ok(segmentManifest.segments.every(segment => segment.approxMemoryBytes > 0));
+  assert.ok(segmentManifest.segments.every(segment => segment.flushReason));
+  assert.ok(segmentManifest.segments.every(segment => segment.files.terms.checksum.value.length === 64));
+  assert.ok(segmentManifest.segments.every(segment => segment.files.postings.checksum.value.length === 64));
+  assert.ok(await readFile(join(output, segmentManifest.segments[0].files.terms.path)));
+  assert.ok(await readFile(join(output, segmentManifest.segments[0].files.postings.path)));
   assert.ok(await readFile(join(output, "debug", "build-telemetry.json"), "utf8"));
   const optimizerReport = JSON.parse(await readFile(join(output, "debug", "index-optimizer.json"), "utf8"));
   assert.equal(optimizerReport.format, "rfoptimizer-v1");
@@ -132,8 +151,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.features.denseDocPointers, true);
   assert.equal(manifest.features.docLocalityLayout, true);
   assert.equal(manifest.features.docPages, true);
+  assert.equal(manifest.features.fieldRowPipeline, true);
   assert.equal(manifest.features.docValueSorted, true);
   assert.equal(manifest.features.filterBitmaps, true);
+  assert.equal(manifest.features.segmentManifest, true);
   assert.equal(manifest.features.queryBundles, true);
   assert.equal(manifest.features.authority, true);
   assert.equal(manifest.optimizer.format, "rfoptimizer-v1");
@@ -166,12 +187,19 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.build.total_ms >= 0);
   assert.ok(manifest.build.peak_rss > 0);
   assert.ok(manifest.build.peak_memory.rss >= manifest.build.peak_rss);
+  assert.ok(manifest.build.memory_samples.length >= manifest.build.phases.length);
+  assert.ok(manifest.build.memory_samples.every(sample => sample.phase && sample.rss > 0));
   assert.ok(manifest.build.counters.selected_term_spool_bytes > 0);
   assert.ok(manifest.build.counters.selected_term_spool_terms > 0);
   assert.ok(manifest.build.counters.doc_raw_spool_bytes > 0);
   assert.ok(manifest.build.counters.doc_gzip_spool_bytes > 0);
   assert.ok(manifest.build.counters.segment_files > 0);
   assert.ok(manifest.build.counters.segment_postings > 0);
+  assert.equal(manifest.build.counters.field_row_fields, 6);
+  assert.equal(manifest.build.counters.field_row_facet_fields, 2);
+  assert.equal(manifest.build.counters.field_row_numeric_fields, 3);
+  assert.equal(manifest.build.counters.field_row_boolean_fields, 1);
+  assert.equal(manifest.build.counters.field_row_date_fields, 1);
   assert.ok(manifest.build.phases.some(phase => phase.name === "scan-and-spool" && phase.ms >= 0 && phase.cpu.user_us >= 0 && phase.peakMemory.rss > 0 && phase.disk.delta.build >= 0));
   assert.ok(manifest.build.phases.some(phase => phase.name === "reduce-postings" && phase.ms >= 0 && phase.disk.delta.final_packs >= 0 && phase.disk.delta.sidecars >= 0));
   assert.ok(manifest.build.phases.some(phase => phase.name === "query-bundles" && phase.ms >= 0));
@@ -198,16 +226,44 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.stats.term_storage, undefined);
   assert.equal(manifest.stats.posting_block_storage, undefined);
   assert.equal(manifest.stats.segment_format, "rfsegment-v1");
+  assert.equal(manifest.stats.segment_manifest_format, "rfsegmentmanifest-v1");
+  assert.equal(manifest.stats.segment_manifest_path, "segments/manifest.json.gz");
+  assert.equal(manifest.stats.segment_manifest_published, true);
+  assert.equal(manifest.stats.segment_manifest_storage, "static-segment-files-v1");
+  assert.ok(manifest.stats.segment_manifest_bytes > 0);
   assert.equal(manifest.stats.scan_workers, 2);
+  assert.equal(manifest.stats.partition_reducer_workers, 1);
+  assert.equal(manifest.stats.partition_reducer_worker_mode, "main-thread");
+  assert.ok(manifest.stats.segment_peak_memory_bytes > 0);
+  assert.ok(manifest.stats.segment_max_docs > 0);
+  assert.ok(Object.keys(manifest.stats.segment_flush_reasons).length > 0);
+  assert.ok(manifest.stats.segment_effective_flush_bytes > 0);
   assert.equal(manifest.stats.scan_batch_docs, 2);
   assert.equal(manifest.stats.segment_merge_fan_in, 512);
+  assert.equal(manifest.stats.segment_merge_policy, "tiered-log");
+  assert.equal(manifest.stats.segment_merge_target_segments, 512);
+  assert.equal(manifest.stats.segment_merge_blocked_by_temp_budget, false);
+  assert.ok(manifest.stats.segment_merge_intermediate_bytes >= 0);
+  assert.ok(manifest.stats.segment_merge_write_amplification >= 0);
   assert.equal(manifest.stats.segment_merge_tiers, 0);
   assert.ok(manifest.stats.segment_reduced_spool_bytes > 0);
+  assert.ok(manifest.stats.segment_directory_spool_bytes > 0);
+  assert.equal(manifest.stats.segment_directory_spool_entries, manifest.directory.entries);
   assert.ok(manifest.stats.segment_reduced_spool_ms >= 0);
   assert.ok(manifest.stats.segment_partition_assembly_ms >= 0);
   assert.ok(manifest.stats.segment_files > 0);
   assert.ok(manifest.stats.segment_terms > 0);
   assert.ok(manifest.stats.segment_postings > 0);
+  assert.equal(manifest.field_rows.format, "rffieldrows-v1");
+  assert.equal(manifest.field_rows.source, "rf-build-code-store-v1");
+  assert.equal(manifest.field_rows.fields.length, 6);
+  assert.equal(manifest.stats.field_row_format, "rffieldrows-v1");
+  assert.equal(manifest.stats.field_row_fields, 6);
+  assert.equal(manifest.stats.field_row_facet_fields, 2);
+  assert.equal(manifest.stats.field_row_numeric_fields, 3);
+  assert.equal(manifest.stats.field_row_boolean_fields, 1);
+  assert.equal(manifest.stats.field_row_date_fields, 1);
+  assert.ok(manifest.stats.typo_index_terms > 0);
   assert.ok(await readFile(join(output, manifest.docs.pointers.file)));
   assert.ok(await readFile(join(output, manifest.docs.pointers.ordinals.file)));
   assert.ok(await readFile(join(output, manifest.docs.pages.pointers.file)));
@@ -275,6 +331,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(lazyOptimizer.format, "rfoptimizer-v1");
   assert.ok(server.requests.some(request => request.pathname.endsWith("/debug/index-optimizer.json")));
   assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
+  const lazySegments = await search.loadSegmentManifest();
+  assert.equal(lazySegments.format, "rfsegmentmanifest-v1");
+  assert.equal(lazySegments.totalDocs, 9);
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/segments/manifest.json.gz")));
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
 
   const sortOnlySearch = await createSearch({ baseUrl: server.baseUrl });
   const sortOnlyInitial = await sortOnlySearch.search({ q: "", sort: "-year", size: 2 });
@@ -298,7 +359,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
     exactResults.results.map(result => result.title)
   );
   assert.equal(exactResults.stats.plannerFallbackReason, "exact_requested");
-  assert.ok(results.stats.blocksDecoded <= exactResults.stats.blocksDecoded);
+  assert.equal(exactResults.stats.plannerLane, "segmentFanoutExact");
+  assert.ok(exactResults.stats.segmentEntries > 0);
 
   const singleTerm = await search.search({ q: "search", size: 2, rerank: false });
   const singleTermExact = await search.search({ q: "search", size: 2, exact: true, rerank: false });
@@ -306,11 +368,36 @@ test("builder output is searchable through the range-based runtime", async (t) =
     singleTerm.results.map(result => result.title),
     singleTermExact.results.map(result => result.title)
   );
-  assert.ok(singleTerm.stats.blocksDecoded < singleTermExact.stats.blocksDecoded);
+  assert.equal(singleTermExact.stats.plannerLane, "segmentFanoutExact");
+  assert.ok(singleTermExact.stats.segmentEntries > 0);
   assert.ok(singleTerm.stats.topKProofAttempts > 0);
   assert.ok(singleTerm.stats.topKProofSuccesses > 0);
   assert.equal(singleTerm.stats.topKProofFailureReason, "");
   assert.equal(singleTerm.stats.topKProofSortAware, false);
+
+  const segmentFilteredSorted = await search.search({
+    q: "search",
+    size: 3,
+    exact: true,
+    rerank: false,
+    sort: "-year",
+    filters: { facets: { tags: ["static"] }, numbers: { year: { min: 2026 } } }
+  });
+  const forceMergedSearch = await createSearch({ baseUrl: server.baseUrl, segmentFanout: false });
+  const forceMergedFilteredSorted = await forceMergedSearch.search({
+    q: "search",
+    size: 3,
+    exact: true,
+    rerank: false,
+    sort: "-year",
+    filters: { facets: { tags: ["static"] }, numbers: { year: { min: 2026 } } }
+  });
+  assert.equal(segmentFilteredSorted.stats.plannerLane, "segmentFanoutExact");
+  assert.equal(forceMergedFilteredSorted.stats.plannerLane, "fullFallback");
+  assert.deepEqual(
+    segmentFilteredSorted.results.map(result => result.id),
+    forceMergedFilteredSorted.results.map(result => result.id)
+  );
 
   const missingBaseTerm = await search.search({ q: "static zzzzzrangefindaucunresultatzzzzextra", size: 2, rerank: false });
   assert.equal(missingBaseTerm.total, 0);
@@ -460,6 +547,55 @@ test("builder output is searchable through the range-based runtime", async (t) =
     () => corruptSearch.search({ q: "static range search", size: 1 }),
     /checksum mismatch/
   );
+});
+
+test("builder can reduce posting partitions in worker-owned packs", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-worker-reduce-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "a", title: "alpha beta", url: "/a" }),
+    JSON.stringify({ id: "b", title: "alpha gamma", url: "/b" }),
+    JSON.stringify({ id: "c", title: "delta epsilon", url: "/c" }),
+    JSON.stringify({ id: "d", title: "zeta eta", url: "/d" })
+  ].join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    externalPostingBlocks: true,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0,
+    postingBlockSize: 1,
+    partitionReducerWorkers: 2,
+    queryBundles: false,
+    typo: false,
+    baseShardDepth: 1,
+    maxShardDepth: 2,
+    targetShardPostings: 1,
+    fields: [{ name: "title", path: "title", weight: 1 }]
+  }));
+
+  await build({ configPath });
+  const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  const reduceWorkers = manifest.build.workers.find(group => group.phase === "reduce-postings");
+  assert.equal(reduceWorkers.count, 2);
+  assert.ok(reduceWorkers.workers.every(worker => worker.mode === "worker-thread"));
+  assert.ok(manifest.object_store.pack_table.terms.length <= 2);
+  assert.ok(manifest.object_store.pack_table.terms.every(file => /^\d{4}\.[0-9a-f]{24}\.bin$/u.test(file)));
+  assert.ok(manifest.object_store.pack_table.postingBlocks.length > 0);
+  assert.ok(manifest.object_store.pack_table.postingBlocks.length <= 2);
+  assert.ok(manifest.object_store.pack_table.postingBlocks.every(file => /^\d{4}\.[0-9a-f]{24}\.bin$/u.test(file)));
+  assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
+  assert.ok(manifest.stats.external_posting_segment_blocks > 0);
+  assert.equal(manifest.stats.partition_reducer_workers, 2);
+  assert.equal(manifest.stats.partition_reducer_worker_mode, "worker-thread-owned-packs");
+
+  const server = await serveStatic(join(root, "public"));
+  t.after(() => server.close());
+  const search = await createSearch({ baseUrl: server.baseUrl });
+  const results = await search.search({ q: "alpha", size: 2, exact: true, rerank: false });
+  assert.deepEqual(results.results.map(result => result.id), ["a", "b"]);
 });
 
 test("query bundles progressively verify numeric filters before doc-value exhaustion", async (t) => {

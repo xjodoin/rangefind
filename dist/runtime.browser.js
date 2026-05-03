@@ -1266,6 +1266,68 @@ function parseQueryBundle(buffer, manifest = {}) {
   return { key, baseTerms, expandedTerms, total, complete, nextScoreBound, nextTieDoc, rows, rowGroups, filterValues };
 }
 
+// src/segment_codec.js
+var SEGMENT_TERMS_MAGIC = Uint8Array.from([82, 70, 83, 71, 84, 69, 82, 49]);
+var textDecoder3 = new TextDecoder();
+function assertMagic2(bytes, magic, label) {
+  for (let i = 0; i < magic.length; i++) {
+    if (bytes[i] !== magic[i]) throw new Error(label);
+  }
+}
+function readVarint2(bytes, state) {
+  let value = 0;
+  let multiplier = 1;
+  while (state.pos < bytes.length) {
+    const byte = bytes[state.pos++];
+    value += (byte & 127) * multiplier;
+    if ((byte & 128) === 0) return value;
+    multiplier *= 128;
+  }
+  throw new Error("Truncated Rangefind segment varint.");
+}
+function readUtf82(bytes, state) {
+  const length = readVarint2(bytes, state);
+  if (state.pos + length > bytes.length) throw new Error("Truncated Rangefind segment string.");
+  const value = textDecoder3.decode(bytes.subarray(state.pos, state.pos + length));
+  state.pos += length;
+  return value;
+}
+function segmentImpact(score, df, total) {
+  const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
+  return Math.max(1, Math.round(score * idf / 10));
+}
+function parseSegmentTerms(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic2(bytes, SEGMENT_TERMS_MAGIC, "Unsupported Rangefind segment terms file.");
+  const state = { pos: SEGMENT_TERMS_MAGIC.length };
+  const count = readVarint2(bytes, state);
+  const terms = /* @__PURE__ */ new Map();
+  for (let i = 0; i < count; i++) {
+    const entry = {
+      term: readUtf82(bytes, state),
+      offset: readVarint2(bytes, state),
+      bytes: readVarint2(bytes, state),
+      df: readVarint2(bytes, state),
+      count: readVarint2(bytes, state)
+    };
+    terms.set(entry.term, entry);
+  }
+  return { format: "rfsegmentterms-v1", terms };
+}
+function decodeSegmentRows(buffer, entry, options = {}) {
+  const bytes = new Uint8Array(buffer);
+  const total = Math.max(1, Number(options.total || 1));
+  const df = Math.max(1, Number(options.df || entry.df || entry.count || 1));
+  const state = { pos: 0 };
+  const rows = new Int32Array((entry.count || 0) * 2);
+  for (let row = 0; row < rows.length; row += 2) {
+    rows[row] = readVarint2(bytes, state);
+    rows[row + 1] = segmentImpact(readVarint2(bytes, state), df, total);
+  }
+  if (state.pos !== bytes.length) throw new Error(`Rangefind segment term ${entry.term || ""} has trailing bytes.`);
+  return rows;
+}
+
 // src/shards.js
 var RANGE_MERGE_GAP_BYTES = 8 * 1024;
 function shardKey(term, depth) {
@@ -1448,7 +1510,7 @@ var TYPO_CORRECTION_CANDIDATES_PER_TOKEN = 2;
 var TYPO_CORRECTION_PLAN_LIMIT = 6;
 var TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
 var TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
-var textDecoder3 = new TextDecoder();
+var textDecoder4 = new TextDecoder();
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
     throw new Error("Rangefind requires DecompressionStream for compressed static index files.");
@@ -1506,7 +1568,7 @@ async function createSearch(options = {}) {
     const url = new URL(path, baseUrl);
     const response = await fetch(url);
     if (!response.ok) return null;
-    return JSON.parse(textDecoder3.decode(await inflateGzip(response)));
+    return JSON.parse(textDecoder4.decode(await inflateGzip(response)));
   }
   const manifest = await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
@@ -1524,6 +1586,8 @@ async function createSearch(options = {}) {
   const authorityShardCache = /* @__PURE__ */ new Map();
   const typoShardCache = /* @__PURE__ */ new Map();
   const typoLexiconShardCache = /* @__PURE__ */ new Map();
+  const segmentTermsCache = /* @__PURE__ */ new Map();
+  const segmentRowsCache = /* @__PURE__ */ new Map();
   const docOrdinalCache = /* @__PURE__ */ new Map();
   const docPointerCache = /* @__PURE__ */ new Map();
   const packedDocCache = /* @__PURE__ */ new Map();
@@ -1545,6 +1609,8 @@ async function createSearch(options = {}) {
   let buildTelemetryPromise = null;
   let indexOptimizer = null;
   let indexOptimizerPromise = null;
+  let segmentManifest = null;
+  let segmentManifestPromise = null;
   let docValues = manifest.doc_values || null;
   let docValuesPromise = null;
   let docValueSorted = manifest.doc_value_sorted || null;
@@ -1657,6 +1723,14 @@ async function createSearch(options = {}) {
     if (!indexOptimizerPromise) indexOptimizerPromise = fetchJsonIfOk(path);
     indexOptimizer = await indexOptimizerPromise;
     return indexOptimizer;
+  }
+  async function loadSegmentManifest() {
+    if (segmentManifest) return segmentManifest;
+    const path = manifest.segments?.manifest;
+    if (!path) return null;
+    if (!segmentManifestPromise) segmentManifestPromise = fetchManifestJsonIfOk(path);
+    segmentManifest = await segmentManifestPromise;
+    return segmentManifest;
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
   function rangeGroups(items, kind = "default") {
@@ -2196,6 +2270,43 @@ async function createSearch(options = {}) {
     }
     return out;
   }
+  async function loadSegmentTerms(segment) {
+    const key = segment.id || String(segment.ordinal);
+    if (!segmentTermsCache.has(key)) {
+      const path = segment.files?.terms?.path;
+      segmentTermsCache.set(key, path ? fetch(new URL(path, baseUrl)).then((response) => {
+        if (!response.ok) throw new Error(`Unable to fetch ${path}`);
+        return response.arrayBuffer();
+      }).then(parseSegmentTerms) : Promise.resolve(null));
+    }
+    return segmentTermsCache.get(key);
+  }
+  async function segmentTermEntries(terms) {
+    const meta = await loadSegmentManifest();
+    if (!meta?.published || !meta.segments?.length || options.segmentFanout === false) return null;
+    const dictionaries = await Promise.all(meta.segments.map((segment) => loadSegmentTerms(segment)));
+    const entries = [];
+    const dfs = /* @__PURE__ */ new Map();
+    for (const term of terms) {
+      for (let ordinal = 0; ordinal < meta.segments.length; ordinal++) {
+        const segment = meta.segments[ordinal];
+        const entry = dictionaries[ordinal]?.terms?.get(term);
+        if (!entry) continue;
+        entries.push({ term, segment, segmentOrdinal: ordinal, entry });
+        dfs.set(term, (dfs.get(term) || 0) + (entry.df || entry.count || 0));
+      }
+    }
+    return { manifest: meta, entries, dfs };
+  }
+  async function decodeSegmentEntryPostings(item, df) {
+    const path = item.segment.files?.postings?.path;
+    if (!path) return new Int32Array(0);
+    const key = `${item.segment.id || item.segmentOrdinal}\0${item.term}`;
+    if (!segmentRowsCache.has(key)) {
+      segmentRowsCache.set(key, fetchRange(new URL(path, baseUrl), item.entry.offset, item.entry.bytes).then((buffer) => decodeSegmentRows(buffer, item.entry, { df, total: manifest.total })));
+    }
+    return segmentRowsCache.get(key);
+  }
   async function authorityEntries(keys) {
     if (!authorityDirectory || options.authority === false || !keys.length) return [];
     const byShard = /* @__PURE__ */ new Map();
@@ -2631,7 +2742,7 @@ async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc ${item.index}`);
-          item.resolve(JSON.parse(textDecoder3.decode(new Uint8Array(inflated))));
+          item.resolve(JSON.parse(textDecoder4.decode(new Uint8Array(inflated))));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -4038,7 +4149,97 @@ async function createSearch(options = {}) {
       }
     };
   }
+  async function runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "exact_requested" }) {
+    const offset = (page - 1) * size;
+    const sortPlan = makeSortPlan(sort);
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters || sortPlan) await ensureDocValuesManifest();
+    await ensureFacetDictionaries(filters);
+    const segmentSearch = await segmentTermEntries(terms);
+    if (!segmentSearch) return null;
+    const entries = segmentSearch.entries;
+    const baseSet = new Set(baseTerms);
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const presentBaseTerms = new Set(entries.filter((item) => baseSet.has(item.term)).map((item) => item.term));
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextSearchResponse({
+        page,
+        size,
+        terms,
+        entries,
+        missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
+      });
+    }
+    const decoded = [];
+    const candidateDocs = /* @__PURE__ */ new Set();
+    let postingsDecoded = 0;
+    for (const item of entries) {
+      const rows2 = await decodeSegmentEntryPostings(item, segmentSearch.dfs.get(item.term));
+      decoded.push({ ...item, rows: rows2 });
+      postingsDecoded += rows2.length / 2;
+      for (let i = 0; i < rows2.length; i += 2) candidateDocs.add(rows2[i]);
+    }
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    let codeData = fallbackCodeData;
+    if (hasFilters && docValues) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
+    const scores = /* @__PURE__ */ new Map();
+    const hits = /* @__PURE__ */ new Map();
+    let postingsAccepted = 0;
+    for (const { term, rows: rows2 } of decoded) {
+      const isBase = baseSet.has(term);
+      for (let i = 0; i < rows2.length; i += 2) {
+        const doc = rows2[i];
+        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+        scores.set(doc, (scores.get(doc) || 0) + rows2[i + 1]);
+        if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
+        postingsAccepted++;
+      }
+    }
+    let ranked = collectEligibleScores(scores, hits, minShouldMatch);
+    const reranked = rerank === false || sortPlan ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
+    if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
+    ranked = sortRanked(reranked.ranked, codeData, sortPlan);
+    const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: sortPlan ? true : "auto" };
+    const results = await rowsToResults(rows, resultContext);
+    return {
+      total: ranked.length,
+      page,
+      size,
+      results,
+      approximate: false,
+      stats: {
+        exact: true,
+        plannerLane: "segmentFanoutExact",
+        topKProven: true,
+        totalExact: true,
+        tailExhausted: true,
+        terms: terms.length,
+        shards: new Set(entries.map((item) => item.segment.id || item.segmentOrdinal)).size,
+        segments: segmentSearch.manifest.segmentCount || segmentSearch.manifest.segments.length,
+        segmentEntries: entries.length,
+        segmentPublished: true,
+        postings: postingsDecoded,
+        blocksDecoded: entries.length,
+        postingsDecoded,
+        postingsAccepted,
+        skippedBlocks: 0,
+        plannerFallbackReason,
+        ...topKProofStatsObject(null, plannerFallbackReason),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        ...reranked.stats
+      }
+    };
+  }
   async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "full_scan" }) {
+    if (plannerFallbackReason === "exact_requested" || options.segmentFanout === true) {
+      const segmentResponse = await runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason });
+      if (segmentResponse) return segmentResponse;
+    }
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
@@ -4562,6 +4763,7 @@ async function createSearch(options = {}) {
     search,
     loadBuildTelemetry,
     loadIndexOptimizer,
+    loadSegmentManifest,
     loadFacetValues: loadFacetDictionary
   };
 }

@@ -9,6 +9,7 @@ import {
   readVarint,
   writeFixedInt
 } from "./binary.js";
+import { postingRowCount, postingRowDoc, postingRowScore } from "./posting_rows.js";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -252,16 +253,27 @@ export function summarizeBlockFilters(filters, codes, docs) {
 }
 
 function encodePostings(rows, total, codes, filters, config) {
-  const df = rows.length;
+  const df = postingRowCount(rows);
   const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
-  const encoded = rows
-    .map(([doc, score]) => [doc, Math.max(1, Math.round(score * idf / 10))])
-    .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  const docs = new Int32Array(df);
+  const impacts = new Int32Array(df);
+  const order = new Array(df);
+  for (let i = 0; i < df; i++) {
+    docs[i] = postingRowDoc(rows, i);
+    impacts[i] = Math.max(1, Math.round(postingRowScore(rows, i) * idf / 10));
+    order[i] = i;
+  }
+  order.sort((a, b) => impacts[b] - impacts[a] || docs[a] - docs[b]);
   const chunks = [];
   const blocks = [];
   let offset = 0;
-  for (let start = 0; start < encoded.length; start += config.postingBlockSize) {
-    const blockRows = encoded.slice(start, Math.min(encoded.length, start + config.postingBlockSize));
+  for (let start = 0; start < order.length; start += config.postingBlockSize) {
+    const end = Math.min(order.length, start + config.postingBlockSize);
+    const blockRows = new Array(end - start);
+    for (let i = start; i < end; i++) {
+      const row = order[i];
+      blockRows[i - start] = [docs[row], impacts[row]];
+    }
     if (!blockRows.length) continue;
     const [maxImpactDoc, maxImpact] = blockRows[0];
     const block = {
@@ -285,7 +297,7 @@ function encodePostings(rows, total, codes, filters, config) {
     chunks.push(encodedBlock.bytes);
     offset += encodedBlock.bytes.length;
   }
-  return { df, count: encoded.length, bytes: concatUint8(chunks, offset), blocks };
+  return { df, count: order.length, byteLength: offset, chunks, blocks };
 }
 
 function concatUint8(chunks, total) {
@@ -548,17 +560,14 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
 
   for (const [term, rows] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
     const postings = encodePostings(rows, total, codes, filters, config);
-    const external = !!writeBlock && postings.blocks.length >= minBlocks && postings.bytes.length >= minBytes;
+    const external = !!writeBlock && postings.blocks.length >= minBlocks && postings.byteLength >= minBytes;
     const blocks = [];
 
     if (external) {
       stats.externalTerms++;
       for (let i = 0; i < postings.blocks.length; i++) {
         const block = postings.blocks[i];
-        const next = postings.blocks[i + 1];
-        const start = block.offset;
-        const end = next ? next.offset : postings.bytes.length;
-        const bytes = postings.bytes.subarray(start, end);
+        const bytes = postings.chunks[i];
         const range = writeBlock({ term, blockIndex: i, bytes });
         blocks.push({
           ...block,
@@ -583,8 +592,9 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
       stats.superblockBlocks += blocks.length;
       directory.push({ term, postings, offset: 0, byteLength: 0, external: true, blocks, superblocks });
     } else {
-      chunks.push(postings.bytes);
-      stats.inlinePostingBytes += postings.bytes.length;
+      const bytes = concatUint8(postings.chunks, postings.byteLength);
+      chunks.push(bytes);
+      stats.inlinePostingBytes += bytes.length;
       for (let i = 0; i < postings.blocks.length; i++) {
         const block = postings.blocks[i];
         blocks.push({
@@ -597,8 +607,8 @@ export function buildPostingSegment(entries, total, codes, filters, config, writ
       stats.superblocks += superblocks.length;
       stats.superblockTerms += superblocks.length > 0 ? 1 : 0;
       stats.superblockBlocks += blocks.length;
-      directory.push({ term, postings, offset: postingOffset, byteLength: postings.bytes.length, external: false, blocks, superblocks });
-      postingOffset += postings.bytes.length;
+      directory.push({ term, postings, offset: postingOffset, byteLength: bytes.length, external: false, blocks, superblocks });
+      postingOffset += bytes.length;
     }
   }
 

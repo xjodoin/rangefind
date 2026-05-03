@@ -47,6 +47,8 @@ Useful options:
 - `--reuse-index`: skips JSONL extraction, site generation, and index building;
   use it when only runtime/benchmark code changed and `public/rangefind`
   already matches the requested limit.
+- `--build-progress-ms=N`: controls live builder progress logs. Default:
+  `15000`; use `0` to disable.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--scale-limits=50000,100000`: builds isolated scale points with the `scale`
   command.

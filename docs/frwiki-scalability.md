@@ -42,6 +42,14 @@ node scripts/frwiki_fixture.mjs runtime-bench --limit=5000 --runs=3
 node scripts/frwiki_fixture.mjs all --limit=5000 --runs=3 --reuse-index
 ```
 
+Run only the builder benchmark and skip runtime queries:
+
+```bash
+node scripts/frwiki_fixture.mjs builder-bench --limit=5000
+# or keep the all command shape and stop after the build report:
+node scripts/frwiki_fixture.mjs all --limit=5000 --builder-only
+```
+
 Run against the full dump:
 
 ```bash
@@ -65,6 +73,11 @@ Useful options:
 - `--reuse-index`: skips JSONL extraction, site generation, and index building.
   Use this for runtime-only changes when `public/rangefind` already matches the
   requested limit.
+- `--builder-only`: builds the index and writes the builder report while
+  skipping runtime query rows. Use this when the change affects only indexing.
+- `--build-progress-ms=N`: controls live builder progress logging. The frwiki
+  fixture defaults to `15000`, so long builds print phase heartbeats with
+  elapsed time, RSS, heap, temp bytes, pack bytes, and sidecar bytes.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--scale-limits=50000,100000`: controls the `scale` command document counts.
 - `--no-exact-checks`: skips the exact top-k comparison for text queries.
@@ -80,6 +93,13 @@ The `bench` command now exercises a broader set of cold-query lanes instead of
 only the default text queries. Each row records a `category`, the full request
 shape, cold request/KB breakdowns, compact runtime stats, validation status, and
 exact top-k agreement where an exact comparison is meaningful.
+
+Every build writes `frwiki-builder-bench.json` next to `frwiki-bench.json`. The
+builder report uses `rfbuilderbench-v1` and records phase wall time, peak RSS,
+heap samples, temp bytes, output bytes, worker summaries, and write
+amplification. Full runtime reports embed the latest builder report under the
+top-level `builder` key, and `scale --builder-only` records builder-only scale
+points without spending time on query execution.
 
 Covered scenarios include:
 
@@ -155,6 +175,13 @@ compressed document spool bytes. Use those manifest counters alongside
 `/usr/bin/time` when comparing builder changes, because they identify whether a
 run moved time between ingestion, posting reduction, query bundles, typo
 reduction, document packs, and doc pages.
+
+Latest 50k builder-only worker-reducer sanity run, reusing the cached JSONL:
+91.3 seconds total build time, 22.4 seconds in `reduce-postings`, 180 output
+files, 188.2 MB index bytes, and 2.10 GB peak RSS. Reducer workers kept
+external posting blocks enabled and emitted 11 term packs plus 4 block packs.
+The next validation point is the same path at 100k and 500k, with peak RSS
+tuning still open.
 
 ## Local 50k Run
 

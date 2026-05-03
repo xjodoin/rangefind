@@ -17,6 +17,8 @@ source modules remain the development and Node test surface.
 ```text
 rangefind/
   manifest.json
+  segments/
+    manifest.json.gz
   doc-values/
     packs/
       0000.<hash>.bin
@@ -113,12 +115,14 @@ include both short-token delete-key shards and compact long-token lexicon pages.
 Hosts can serve every hashed object with long-lived immutable cache headers;
 only the main `manifest.json` needs revalidation or versioned publication.
 
-The pack writer also performs a narrow ZFS-style deduplication pass at build
-time. It hashes each independently compressed object and reuses the same
-pack/offset pointer for exact byte-identical objects. This is intentionally exact
-deduplication only: near-duplicate text or cross-block semantic dedup would add
-runtime indirection and extra range fetches, which is usually a bad trade for a
-latency-sensitive browser index.
+The pack writer can perform a narrow ZFS-style deduplication pass at build time.
+When enabled, it hashes each independently compressed object and reuses the same
+pack/offset pointer for exact byte-identical objects. High-volume lanes that do
+not benefit from dedupe, such as document payload packs, use append-only writers
+that return object pointers without retaining a builder-wide entry map. Dedupe
+is intentionally exact only: near-duplicate text or cross-block semantic dedup
+would add runtime indirection and extra range fetches, which is usually a bad
+trade for a latency-sensitive browser index.
 
 `facets/packs/*.bin` store independently compressed binary facet dictionaries
 addressed through `facets/directory-root.<hash>.bin.gz` and
@@ -193,6 +197,49 @@ term streams with a heap, merges postings per term in doc-id order, and reuses
 that stream for prefix statistics, query-bundle df, typo index-term emission,
 and final partition emission.
 
+`segments/manifest.json.gz` stores `rfsegmentmanifest-v1`, a checksummed
+summary of the immutable segments that produced the published index. The
+builder publishes each segment's term directory and posting row file under
+`segments/s*/`, then records file checksums, doc-id ranges, term and posting
+counts, field lists, merge fan-in, and merge tier decisions. The runtime can
+lazy-load that manifest and use a segment-fanout exact lane that searches
+matching terms across published segments, applies the same global-id filters
+and sort lanes, and merges the final top-k candidates exactly. The force-merged
+posting layout remains the optimized default for block-max tail searches.
+
+Segment flushing is controlled by explicit builder limits. `segmentFlushDocs`
+and `segmentFlushBytes` set direct flush thresholds, while
+`builderMemoryBudgetBytes` can derive a per-worker byte budget when a direct
+byte threshold is not configured. Every segment manifest row records the flush
+reason and estimated peak segment memory. If one document alone exceeds the byte
+limit, the builder fails early instead of producing an unpredictable oversized
+segment.
+
+Segment merging uses an explicit `tiered-log` policy. Segments are ordered by
+size, similarly sized batches are merged up to `segmentMergeFanIn`, and
+`finalSegmentTargetCount` can request an optional force merge down to a target
+count such as `1`. `segmentMergeMaxTempBytes` can block oversized merge batches;
+blocked tiers are recorded instead of silently exceeding the temp budget. The
+build telemetry and segment manifest record the merge target, skipped segment
+count, intermediate bytes, write amplification, and whether a temp budget
+prevented the requested target from being reached.
+
+Term pack assembly uses the same append-only direction. As posting partitions
+are compressed into `terms/packs/*.bin`, the builder writes compact binary
+directory-entry records into `_build/terms-directory.run`. After immutable pack
+renaming, those spooled rows are sorted through bounded chunks and streamed into
+the paged term directory. This removes the old dependency on a retained
+`packWriter.entries` map for the term directory path and avoids holding all
+directory page payloads at once.
+
+When `partitionReducerWorkers` or `builderWorkerCount` enables reducer workers,
+posting partitions are encoded in worker threads. Workers write term packs and
+external posting-block packs into the shared numeric pack directories through
+atomic pack-index counters, so posting segment headers can keep stable numeric
+block-pack indexes. The main thread still owns final directory assembly, which
+keeps range lookup deterministic while moving partition encoding off the main
+event loop.
+
 The first ingestion pass also writes two extra file-backed spools. A
 selected-term spool stores each document's final selected scoring terms and
 scaled impacts, so query-bundle construction can stream precomputed scoring
@@ -201,12 +248,23 @@ payloads are stored in both compressed and raw spools: retrieval-local doc packs
 reuse the compressed payload spool, while dense doc-page construction reads the
 raw spool directly and avoids a build-time gzip/decompress loop.
 
+Field rows are captured in the same scan pass through the typed
+`rf-build-code-store-v1` spool. The build wraps that store as
+`rffieldrows-v1`, and query bundles, doc-value chunks, sorted doc-value pages,
+and filter bitmaps now consume the same typed row source. Numeric, date,
+boolean, single facet, and multi-facet rows are therefore extracted once during
+scan instead of re-reading the source corpus for every downstream artifact.
+
 The final pack writer still emits immutable range-pack objects in deterministic
 term order, and externalizes large posting blocks into `terms/block-packs/`.
 Every build manifest includes `build.format = "rfbuildtelemetry-v1"` with
 sampled per-phase memory peaks, CPU user/system time, disk byte deltas, segment
 counters, and reduce/merge worker timing so large-corpus regressions can be
-compared from the emitted index alone.
+compared from the emitted index alone. When `buildProgressLogMs` is non-zero,
+the same telemetry layer writes live phase start, heartbeat, and completion
+lines to stderr with elapsed time, RSS, heap, temp bytes, pack bytes, and
+sidecar bytes. This keeps long scan, reduce, typo, and segment-publish phases
+observable before the final telemetry file exists.
 
 Authority fields use the same file-backed run/reduce pattern as postings. Each
 configured title, entity-name, slug, or alias value emits surface-exact,

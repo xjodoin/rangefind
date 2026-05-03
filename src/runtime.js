@@ -8,6 +8,7 @@ import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.j
 import { filterBitmapHas, parseFilterBitmap } from "./filter_bitmaps.js";
 import { verifyBlockPointer } from "./object_store.js";
 import { parseQueryBundle } from "./query_bundle_codec.js";
+import { decodeSegmentRows, parseSegmentTerms } from "./segment_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
 import { parseTypoLexiconShard } from "./typo_lexicon.js";
 import {
@@ -115,6 +116,8 @@ export async function createSearch(options = {}) {
   const authorityShardCache = new Map();
   const typoShardCache = new Map();
   const typoLexiconShardCache = new Map();
+  const segmentTermsCache = new Map();
+  const segmentRowsCache = new Map();
   const docOrdinalCache = new Map();
   const docPointerCache = new Map();
   const packedDocCache = new Map();
@@ -136,6 +139,8 @@ export async function createSearch(options = {}) {
   let buildTelemetryPromise = null;
   let indexOptimizer = null;
   let indexOptimizerPromise = null;
+  let segmentManifest = null;
+  let segmentManifestPromise = null;
   let docValues = manifest.doc_values || null;
   let docValuesPromise = null;
   let docValueSorted = manifest.doc_value_sorted || null;
@@ -256,6 +261,15 @@ export async function createSearch(options = {}) {
     if (!indexOptimizerPromise) indexOptimizerPromise = fetchJsonIfOk(path);
     indexOptimizer = await indexOptimizerPromise;
     return indexOptimizer;
+  }
+
+  async function loadSegmentManifest() {
+    if (segmentManifest) return segmentManifest;
+    const path = manifest.segments?.manifest;
+    if (!path) return null;
+    if (!segmentManifestPromise) segmentManifestPromise = fetchManifestJsonIfOk(path);
+    segmentManifest = await segmentManifestPromise;
+    return segmentManifest;
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
 
@@ -848,6 +862,49 @@ export async function createSearch(options = {}) {
       }
     }
     return out;
+  }
+
+  async function loadSegmentTerms(segment) {
+    const key = segment.id || String(segment.ordinal);
+    if (!segmentTermsCache.has(key)) {
+      const path = segment.files?.terms?.path;
+      segmentTermsCache.set(key, path
+        ? fetch(new URL(path, baseUrl)).then(response => {
+            if (!response.ok) throw new Error(`Unable to fetch ${path}`);
+            return response.arrayBuffer();
+          }).then(parseSegmentTerms)
+        : Promise.resolve(null));
+    }
+    return segmentTermsCache.get(key);
+  }
+
+  async function segmentTermEntries(terms) {
+    const meta = await loadSegmentManifest();
+    if (!meta?.published || !meta.segments?.length || options.segmentFanout === false) return null;
+    const dictionaries = await Promise.all(meta.segments.map(segment => loadSegmentTerms(segment)));
+    const entries = [];
+    const dfs = new Map();
+    for (const term of terms) {
+      for (let ordinal = 0; ordinal < meta.segments.length; ordinal++) {
+        const segment = meta.segments[ordinal];
+        const entry = dictionaries[ordinal]?.terms?.get(term);
+        if (!entry) continue;
+        entries.push({ term, segment, segmentOrdinal: ordinal, entry });
+        dfs.set(term, (dfs.get(term) || 0) + (entry.df || entry.count || 0));
+      }
+    }
+    return { manifest: meta, entries, dfs };
+  }
+
+  async function decodeSegmentEntryPostings(item, df) {
+    const path = item.segment.files?.postings?.path;
+    if (!path) return new Int32Array(0);
+    const key = `${item.segment.id || item.segmentOrdinal}\u0000${item.term}`;
+    if (!segmentRowsCache.has(key)) {
+      segmentRowsCache.set(key, fetchRange(new URL(path, baseUrl), item.entry.offset, item.entry.bytes)
+        .then(buffer => decodeSegmentRows(buffer, item.entry, { df, total: manifest.total })));
+    }
+    return segmentRowsCache.get(key);
   }
 
   async function authorityEntries(keys) {
@@ -2873,7 +2930,104 @@ export async function createSearch(options = {}) {
     };
   }
 
+  async function runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "exact_requested" }) {
+    const offset = (page - 1) * size;
+    const sortPlan = makeSortPlan(sort);
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters || sortPlan) await ensureDocValuesManifest();
+    await ensureFacetDictionaries(filters);
+    const segmentSearch = await segmentTermEntries(terms);
+    if (!segmentSearch) return null;
+    const entries = segmentSearch.entries;
+    const baseSet = new Set(baseTerms);
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const presentBaseTerms = new Set(entries.filter(item => baseSet.has(item.term)).map(item => item.term));
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextSearchResponse({
+        page,
+        size,
+        terms,
+        entries,
+        missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
+      });
+    }
+
+    const decoded = [];
+    const candidateDocs = new Set();
+    let postingsDecoded = 0;
+    for (const item of entries) {
+      const rows = await decodeSegmentEntryPostings(item, segmentSearch.dfs.get(item.term));
+      decoded.push({ ...item, rows });
+      postingsDecoded += rows.length / 2;
+      for (let i = 0; i < rows.length; i += 2) candidateDocs.add(rows[i]);
+    }
+
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    let codeData = fallbackCodeData;
+    if (hasFilters && docValues) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
+
+    const scores = new Map();
+    const hits = new Map();
+    let postingsAccepted = 0;
+    for (const { term, rows } of decoded) {
+      const isBase = baseSet.has(term);
+      for (let i = 0; i < rows.length; i += 2) {
+        const doc = rows[i];
+        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+        scores.set(doc, (scores.get(doc) || 0) + rows[i + 1]);
+        if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
+        postingsAccepted++;
+      }
+    }
+
+    let ranked = collectEligibleScores(scores, hits, minShouldMatch);
+    const reranked = rerank === false || sortPlan
+      ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
+      : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
+    if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
+    ranked = sortRanked(reranked.ranked, codeData, sortPlan);
+    const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: sortPlan ? true : "auto" };
+    const results = await rowsToResults(rows, resultContext);
+    return {
+      total: ranked.length,
+      page,
+      size,
+      results,
+      approximate: false,
+      stats: {
+        exact: true,
+        plannerLane: "segmentFanoutExact",
+        topKProven: true,
+        totalExact: true,
+        tailExhausted: true,
+        terms: terms.length,
+        shards: new Set(entries.map(item => item.segment.id || item.segmentOrdinal)).size,
+        segments: segmentSearch.manifest.segmentCount || segmentSearch.manifest.segments.length,
+        segmentEntries: entries.length,
+        segmentPublished: true,
+        postings: postingsDecoded,
+        blocksDecoded: entries.length,
+        postingsDecoded,
+        postingsAccepted,
+        skippedBlocks: 0,
+        plannerFallbackReason,
+        ...topKProofStatsObject(null, plannerFallbackReason),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        ...reranked.stats
+      }
+    };
+  }
+
   async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "full_scan" }) {
+    if (plannerFallbackReason === "exact_requested" || options.segmentFanout === true) {
+      const segmentResponse = await runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason });
+      if (segmentResponse) return segmentResponse;
+    }
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
@@ -3440,6 +3594,7 @@ export async function createSearch(options = {}) {
     search,
     loadBuildTelemetry,
     loadIndexOptimizer,
+    loadSegmentManifest,
     loadFacetValues: loadFacetDictionary
   };
 }

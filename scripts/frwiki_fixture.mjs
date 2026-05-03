@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createSearch } from "../src/runtime.js";
 import { build } from "../src/builder.js";
+import { createBuildBenchmarkReport } from "../src/build_report.js";
 import {
   createFetchMeter,
   dirStats,
@@ -40,9 +41,11 @@ function parseArgs(argv) {
     runs: 3,
     size: 10,
     bodyChars: Number(process.env.FRWIKI_BODY_CHARS || 6000),
+    buildProgressLogMs: Number(process.env.FRWIKI_BUILD_PROGRESS_MS || 15000),
     force: false,
     limitExplicit: process.env.FRWIKI_LIMIT != null,
     reuseIndex: false,
+    builderOnly: false,
     exactChecks: process.env.FRWIKI_EXACT_CHECKS !== "0"
   };
   for (const arg of argv.slice(1)) {
@@ -57,10 +60,12 @@ function parseArgs(argv) {
     else if (arg.startsWith("--runs=")) args.runs = Number(arg.slice("--runs=".length)) || args.runs;
     else if (arg.startsWith("--size=")) args.size = Number(arg.slice("--size=".length)) || args.size;
     else if (arg.startsWith("--body-chars=")) args.bodyChars = Number(arg.slice("--body-chars=".length)) || 0;
+    else if (arg.startsWith("--build-progress-ms=")) args.buildProgressLogMs = Number(arg.slice("--build-progress-ms=".length)) || 0;
     else if (arg.startsWith("--scale-limits=")) args.scaleLimits = arg.slice("--scale-limits=".length).split(",").map(value => Number(value.trim())).filter(Boolean);
     else if (arg === "--exact-checks") args.exactChecks = true;
     else if (arg === "--no-exact-checks") args.exactChecks = false;
     else if (arg === "--reuse-index" || arg === "--bench-only" || arg === "--runtime-only") args.reuseIndex = true;
+    else if (arg === "--builder-only") args.builderOnly = true;
   }
   args.scaleLimits ||= [10000, 25000, 50000, 100000];
   return args;
@@ -418,8 +423,10 @@ function writeSite(args, docsPath) {
     targetShardPostings: 45000,
     segmentMergeFanIn: 512,
     buildTelemetryPath: "frwiki-build-telemetry.json",
+    buildProgressLogMs: args.buildProgressLogMs,
     scanWorkers: 4,
     scanBatchDocs: 128,
+    builderWorkerCount: 4,
     fields: [
       { name: "title", path: "title", weight: 5.5, b: 0.25, phrase: true, proximity: true, proximityWeight: 3, proximityWindow: 5 },
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
@@ -494,10 +501,49 @@ run();
   return configPath;
 }
 
-async function buildFixture(args) {
+function buildTelemetryPath(args) {
+  return resolve(args.root, "frwiki-build-telemetry.json");
+}
+
+function builderBenchPath(args) {
+  return resolve(args.root, "frwiki-builder-bench.json");
+}
+
+function readBuildTelemetry(args) {
+  return readJson(buildTelemetryPath(args))
+    || readJson(resolve(args.root, "public", "rangefind", "debug", "build-telemetry.json"));
+}
+
+function writeBuilderBenchReport(args, options = {}) {
+  const root = resolve(args.root, "public");
+  const manifest = readJson(resolve(root, "rangefind", "manifest.min.json"))
+    || readJson(resolve(root, "rangefind", "manifest.json"));
+  const meta = readJson(resolve(args.root, "data", "frwiki.meta.json"));
+  const telemetry = readBuildTelemetry(args);
+  if (!telemetry) {
+    throw new Error(`No build telemetry found for builder report at ${buildTelemetryPath(args)}`);
+  }
+  const report = createBuildBenchmarkReport({
+    telemetry,
+    index: dirStats(resolve(root, "rangefind")),
+    docs: meta?.docs || manifest?.total || args.limit,
+    meta,
+    mode: options.mode || "build"
+  });
+  writeFileSync(builderBenchPath(args), JSON.stringify(report, null, 2));
+  if (options.quiet === false) console.log(JSON.stringify(report, null, 2));
+  return report;
+}
+
+function readBuilderBenchReport(args) {
+  return readJson(builderBenchPath(args));
+}
+
+async function buildFixture(args, options = {}) {
   const docsPath = resolve(args.root, "data", "frwiki.jsonl");
   const configPath = writeSite(args, docsPath);
   await build({ configPath });
+  return writeBuilderBenchReport(args, options);
 }
 
 function networkBucket(url) {
@@ -998,6 +1044,7 @@ async function benchFixture(args, options = {}) {
         packBytes: engine.manifest.stats?.doc_value_sorted_pack_bytes || 0
       } : null,
       meta: existsSync(resolve(args.root, "data", "frwiki.meta.json")) ? JSON.parse(readFileSync(resolve(args.root, "data", "frwiki.meta.json"), "utf8")) : null,
+      builder: readBuilderBenchReport(args),
       benchmark: {
         coldEnginePerCase: true,
         queryColdExcludesInit: true
@@ -1023,6 +1070,8 @@ function clean(args) {
   rmSync(resolve(args.root, "public"), { recursive: true, force: true });
   rmSync(resolve(args.root, "rangefind.config.json"), { force: true });
   rmSync(resolve(args.root, "frwiki-bench.json"), { force: true });
+  rmSync(resolve(args.root, "frwiki-builder-bench.json"), { force: true });
+  rmSync(resolve(args.root, "frwiki-build-telemetry.json"), { force: true });
   rmSync(resolve(args.root, "scale"), { recursive: true, force: true });
 }
 
@@ -1106,6 +1155,7 @@ function scalePoint(limit, report) {
     docValueSortedPackBytes: report.rangefindStats?.doc_value_sorted_pack_bytes || 0,
     authorityDirectoryBytes: report.rangefindStats?.authority_directory_bytes || 0,
     authorityPackBytes: report.rangefindStats?.authority_pack_bytes || 0,
+    builder: summarizeBuilderReport(report.builder),
     avgTextColdRequests: mean(textRows.map(row => row.coldRequests)),
     avgTextColdKb: kb(mean(textRows.map(row => row.coldKb * 1024))),
     maxTextColdRequests: Math.max(0, ...textRows.map(row => row.coldRequests)),
@@ -1120,6 +1170,39 @@ function scalePoint(limit, report) {
       typedDates: summarizeScaleRow(rowByLabel(report, "typed dates sorted")),
       denseBrowse: summarizeScaleRow(rowByLabel(report, "dense filter browse"))
     }
+  };
+}
+
+function summarizeBuilderReport(report) {
+  if (!report) return null;
+  return {
+    totalMs: report.builder?.totalMs || 0,
+    peakRss: report.builder?.peakRss || 0,
+    peakHeapUsed: report.builder?.peakHeapUsed || 0,
+    memorySampleCount: report.builder?.memorySampleCount || 0,
+    phaseSampleCount: report.builder?.phaseSampleCount || 0,
+    tempPeakBytes: report.builder?.tempPeakBytes || 0,
+    tempWrittenBytes: report.builder?.tempWrittenBytes || 0,
+    outputWrittenBytes: report.builder?.outputWrittenBytes || 0,
+    writeAmplification: report.builder?.writeAmplification || 0,
+    phases: (report.phases || []).map(phase => ({
+      name: phase.name,
+      ms: phase.ms,
+      peakRss: phase.peakRss,
+      tempDeltaBytes: phase.tempDeltaBytes,
+      outputDeltaBytes: phase.outputDeltaBytes
+    }))
+  };
+}
+
+function builderScalePoint(limit, report) {
+  return {
+    limit,
+    docs: report.docs || limit,
+    indexFiles: report.index?.files || 0,
+    indexBytes: report.index?.bytes || 0,
+    bytesPerDoc: report.index?.bytesPerDoc || 0,
+    builder: summarizeBuilderReport(report)
   };
 }
 
@@ -1138,13 +1221,19 @@ async function scaleFixture(args) {
     };
     const docs = await writeJsonl(pointArgs);
     writeSite(pointArgs, docs);
-    await buildFixture(pointArgs);
-    const report = await benchFixture(pointArgs, { quiet: true });
-    points.push(scalePoint(limit, report));
-    console.error(`frwiki scale: ${limit.toLocaleString()} docs, ${(report.index.bytes / 1024 / 1024).toFixed(1)} MiB, init ${report.init.requests} req ${report.init.kb.toFixed(1)} KB`);
+    const builderReport = await buildFixture(pointArgs, { quiet: true, mode: args.builderOnly ? "scale-builder-only" : "scale" });
+    if (args.builderOnly) {
+      points.push(builderScalePoint(limit, builderReport));
+      console.error(`frwiki scale builder: ${limit.toLocaleString()} docs, ${(builderReport.index.bytes / 1024 / 1024).toFixed(1)} MiB, build ${(builderReport.builder.totalMs / 1000).toFixed(1)} s`);
+    } else {
+      const report = await benchFixture(pointArgs, { quiet: true });
+      points.push(scalePoint(limit, report));
+      console.error(`frwiki scale: ${limit.toLocaleString()} docs, ${(report.index.bytes / 1024 / 1024).toFixed(1)} MiB, init ${report.init.requests} req ${report.init.kb.toFixed(1)} KB`);
+    }
   }
   const scaleReport = {
     fixture: "frwiki-scale",
+    mode: args.builderOnly ? "builder-only" : "full",
     limits: args.scaleLimits,
     runs: args.runs,
     bodyChars: args.bodyChars,
@@ -1167,6 +1256,10 @@ if (args.command === "clean") {
   await writeJsonl(args);
 } else if (args.command === "build") {
   await buildFixture(args);
+} else if (args.command === "builder-bench") {
+  const docs = await writeJsonl(args);
+  writeSite(args, docs);
+  await buildFixture(args, { quiet: false, mode: "builder-only" });
 } else if (args.command === "bench" || args.command === "runtime-bench") {
   assertReusableIndex(args);
   await benchFixture(args);
@@ -1176,11 +1269,15 @@ if (args.command === "clean") {
   if (!args.reuseIndex) {
     const docs = await writeJsonl(args);
     writeSite(args, docs);
-    await buildFixture(args);
+    await buildFixture(args, { mode: args.builderOnly ? "builder-only" : "all" });
   } else {
     assertReusableIndex(args);
   }
-  await benchFixture(args);
+  if (args.builderOnly) {
+    writeBuilderBenchReport(args, { quiet: false, mode: args.reuseIndex ? "reused-builder-report" : "builder-only" });
+  } else {
+    await benchFixture(args);
+  }
 } else {
   console.error(`Unknown command: ${args.command}`);
   process.exit(1);

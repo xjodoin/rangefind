@@ -75,6 +75,45 @@ function diskDelta(start, end) {
   return Object.fromEntries([...keys].sort().map(key => [key, (end?.[key] || 0) - (start?.[key] || 0)]));
 }
 
+function formatBytes(bytes) {
+  const value = Math.abs(Number(bytes) || 0);
+  const sign = Number(bytes) < 0 ? "-" : "";
+  if (value >= 1024 * 1024 * 1024) return `${sign}${(value / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+  if (value >= 1024 * 1024) return `${sign}${(value / 1024 / 1024).toFixed(1)} MiB`;
+  if (value >= 1024) return `${sign}${(value / 1024).toFixed(1)} KiB`;
+  return `${sign}${value} B`;
+}
+
+function formatDuration(ms) {
+  const seconds = Math.max(0, Number(ms) || 0) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.floor(seconds % 60);
+  return `${minutes}m${String(rest).padStart(2, "0")}s`;
+}
+
+function phaseProgressLine(name, kind, elapsedMs, memory, disk = null, startDisk = null, extra = "") {
+  const parts = [
+    `Rangefind build: ${name} ${kind}`,
+    `elapsed ${formatDuration(elapsedMs)}`,
+    `rss ${formatBytes(memory.rss)}`,
+    `heap ${formatBytes(memory.heapUsed)}`
+  ];
+  if (disk && startDisk) {
+    const delta = diskDelta(startDisk, disk);
+    parts.push(`temp ${formatBytes(delta.build || 0)}`);
+    parts.push(`packs ${formatBytes(delta.final_packs || 0)}`);
+    parts.push(`sidecars ${formatBytes(delta.sidecars || 0)}`);
+  }
+  if (extra) parts.push(extra);
+  return parts.join(", ");
+}
+
+function logBuildProgress(telemetry, line) {
+  if (!telemetry?.progressLogger || telemetry.progressLogMs <= 0 || !line) return;
+  telemetry.progressLogger(line);
+}
+
 export function createBuildTelemetry(options = {}) {
   const startedAt = performance.now();
   const startMemory = memorySnapshot();
@@ -84,7 +123,11 @@ export function createBuildTelemetry(options = {}) {
     workers: [],
     counters: {},
     diskByteGroups: normalizeDiskByteGroups(options.diskByteGroups || options.diskRoots),
+    memorySamples: [],
+    maxMemorySamples: Math.max(0, Math.floor(Number(options.maxMemorySamples ?? 4096))),
     sampleIntervalMs: Math.max(0, Math.floor(Number(options.sampleIntervalMs ?? 1000))),
+    progressLogMs: Math.max(0, Math.floor(Number(options.progressLogMs || 0))),
+    progressLogger: typeof options.progressLogger === "function" ? options.progressLogger : null,
     startMemory,
     peakMemory: startMemory,
     peakRss: startMemory.rss,
@@ -118,30 +161,53 @@ export function recordBuildWorkers(telemetry, phase, workers, details = {}) {
   });
 }
 
+function recordMemorySample(telemetry, phase, memory) {
+  if (!telemetry || telemetry.memorySamples.length >= telemetry.maxMemorySamples) return;
+  telemetry.memorySamples.push({
+    phase,
+    ms: performance.now() - telemetry.startedAt,
+    ...memory
+  });
+}
+
 export async function timeBuildPhase(telemetry, name, fn) {
   if (!telemetry) return fn();
   const start = performance.now();
   const startMemory = memorySnapshot();
   const startCpu = process.cpuUsage();
   const startDisk = diskSnapshot(telemetry.diskByteGroups);
+  logBuildProgress(telemetry, phaseProgressLine(name, "started", 0, startMemory));
   let peakMemory = startMemory;
   let samples = 0;
+  recordMemorySample(telemetry, name, startMemory);
   const sample = () => {
     const current = memorySnapshot();
     peakMemory = maxMemory(peakMemory, current);
     telemetry.peakMemory = maxMemory(telemetry.peakMemory, current);
     telemetry.peakRss = Math.max(telemetry.peakRss || 0, current.rss);
+    recordMemorySample(telemetry, name, current);
     samples++;
   };
   const timer = telemetry.sampleIntervalMs > 0 ? setInterval(sample, telemetry.sampleIntervalMs) : null;
   timer?.unref?.();
+  const progressTimer = telemetry.progressLogMs > 0 ? setInterval(() => {
+    const current = memorySnapshot();
+    peakMemory = maxMemory(peakMemory, current);
+    telemetry.peakMemory = maxMemory(telemetry.peakMemory, current);
+    telemetry.peakRss = Math.max(telemetry.peakRss || 0, current.rss);
+    const disk = diskSnapshot(telemetry.diskByteGroups);
+    logBuildProgress(telemetry, phaseProgressLine(name, "running", performance.now() - start, current, disk, startDisk));
+  }, telemetry.progressLogMs) : null;
+  progressTimer?.unref?.();
   try {
     return await fn();
   } finally {
     if (timer) clearInterval(timer);
+    if (progressTimer) clearInterval(progressTimer);
     const endMemory = memorySnapshot();
     const endCpu = process.cpuUsage();
     const endDisk = diskSnapshot(telemetry.diskByteGroups);
+    recordMemorySample(telemetry, name, endMemory);
     peakMemory = maxMemory(peakMemory, endMemory);
     telemetry.peakMemory = maxMemory(telemetry.peakMemory, endMemory);
     telemetry.peakRss = Math.max(telemetry.peakRss || 0, endMemory.rss);
@@ -159,6 +225,10 @@ export async function timeBuildPhase(telemetry, name, fn) {
         delta: diskDelta(startDisk, endDisk)
       }
     });
+    logBuildProgress(
+      telemetry,
+      phaseProgressLine(name, "done", performance.now() - start, peakMemory, endDisk, startDisk, `peak ${formatBytes(peakMemory.rss)}`)
+    );
   }
 }
 
@@ -176,6 +246,7 @@ export function finishBuildTelemetry(telemetry) {
     end_memory: endMemory,
     counters: telemetry.counters,
     workers: telemetry.workers,
+    memory_samples: telemetry.memorySamples,
     phases: telemetry.phases
   };
 }

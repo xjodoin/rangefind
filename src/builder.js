@@ -29,7 +29,8 @@ import {
 import { getPath, readConfig } from "./config.js";
 import { DOC_LAYOUT_FORMAT, docLayoutRecord } from "./doc_layout.js";
 import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, encodeDocPageColumns } from "./doc_pages.js";
-import { writeDirectoryFiles } from "./directory_writer.js";
+import { writeDirectoryFiles, writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
+import { appendDirectoryEntry, createDirectoryEntrySpool, sortedDirectoryEntrySpool } from "./directory_spool.js";
 import {
   DOC_VALUE_SORT_DIRECTORY_FORMAT,
   DOC_VALUE_SORT_PAGE_FORMAT,
@@ -39,15 +40,19 @@ import {
 import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
 import { buildDocOrdinalTable, buildDocPointerTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
+import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
 import { buildIndexOptimizerReport, INDEX_OPTIMIZER_PATH } from "./optimizer.js";
-import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
+import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard } from "./packs.js";
+import { postingRowCount } from "./posting_rows.js";
 import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
 import { addFieldExpansionScores, addFieldScores, bm25fScores, fieldText, selectDocTerms } from "./scoring.js";
 import { addSegmentPosting, createSegmentBuilder, finishSegmentBuilder, flushSegment, shouldFlushSegment } from "./segment_builder.js";
 import { mergeSegmentsToPartitions, segmentMergeSummary } from "./segment_merge.js";
+import { writeSegmentManifest } from "./segment_manifest.js";
 import {
+  addTypoIndexTerm,
   addTypoSurfacePairsToBuffer,
   createTypoSurfacePairBuffer,
   flushTypoSurfacePairBuffer,
@@ -580,7 +585,7 @@ function readPackedDocEntry(fd, doc, packFiles) {
 
 async function finishDocPacks(out, spool, total, config) {
   const layout = await sortedLayoutOrder(spool, total, config);
-  const packWriter = createPackWriter(resolve(out, "docs", "packs"), config.docPackBytes, { keepEntries: false, dedupe: false });
+  const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
   const entryPath = resolve(out, "_build", "docs", "doc-pack-entries.bin");
   const entryOutFd = openSync(entryPath, "w");
   const fd = openSync(spool.path, "r");
@@ -650,7 +655,7 @@ async function finishDocPacks(out, spool, total, config) {
 function finishDocPages(out, spool, total, config) {
   const pageSize = Math.max(1, Math.floor(Number(config.docPageSize || 32)));
   const fields = docPayloadFieldNames(config);
-  const packWriter = createPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
+  const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
   const entries = [];
   const fd = openSync(spool.rawPath, "r");
   const spoolEntryFd = openSync(spool.rawEntryPath, "r");
@@ -676,7 +681,7 @@ function finishDocPages(out, spool, total, config) {
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  const pointerTable = buildDocPagePointerTable(entries, packIndexes);
+  const pointerTable = buildDocPagePointerTable(entries.map(entry => resolvePackEntry(packWriter, entry)), packIndexes);
   const hash = sha256Hex(pointerTable.buffer);
   const file = `docs/pages/${hashedFile("0000", hash, ".bin")}`;
   mkdirSync(resolve(out, "docs", "pages"), { recursive: true });
@@ -774,7 +779,7 @@ function writeDocValuePacks(out, config, total, codes) {
     }
     return chunks;
   };
-  for (const field of docValueFields(config, codes)) {
+  for (const field of codes.fields || docValueFields(config, codes)) {
     const chunks = writeChunks(field, chunkSize);
     const lookupChunks = lookupChunkSize < chunkSize ? writeChunks(field, lookupChunkSize, "lookup\u0000") : null;
     fields[field.name] = {
@@ -976,7 +981,7 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
   const pageSize = Math.max(1, Math.floor(Number(config.docValueSortedPageSize || 512)));
   const packWriter = createPackWriter(resolve(out, "doc-values", "sorted-packs"), config.docValueSortedPackBytes || config.docValuePackBytes);
   const fields = {};
-  const sourceFields = docValueFields(config, codes).filter(field => field.kind !== "facet");
+  const sourceFields = (codes.fields || docValueFields(config, codes)).filter(field => field.kind !== "facet");
   const summaryFields = sourceFields.map(field => ({ name: field.name, kind: field.kind, type: field.type }));
   const pagesByField = new Map();
 
@@ -1073,6 +1078,17 @@ function packTable(packs) {
   return (packs || []).map(pack => pack.file);
 }
 
+function packFileIndex(file) {
+  const match = /^(\d+)/u.exec(String(file || ""));
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+function comparePackFiles(left, right) {
+  const leftIndex = packFileIndex(left.file);
+  const rightIndex = packFileIndex(right.file);
+  return leftIndex - rightIndex || String(left.file).localeCompare(String(right.file));
+}
+
 function summarizeDedup(...packSets) {
   const packs = packSets.flat().filter(Boolean);
   return {
@@ -1113,7 +1129,7 @@ function addPostingSegmentStats(target, source) {
 function buildFinalPostingSegment(entries, total, codes, filters, config, blockPackWriter) {
   const writeBlock = !blockPackWriter || config.externalPostingBlocks === false ? null : ({ term, blockIndex, bytes }) => {
     const key = `${term}\u0000${blockIndex}\u0000${blockPackWriter.bytes}`;
-    return writePackedShard(blockPackWriter, key, gzipSync(Buffer.from(bytes), { level: 6 }), {
+    return writePackedShard(blockPackWriter, key, gzipSync(bytes, { level: 6 }), {
       kind: "posting-segment-block",
       codec: "rfsegpost-block-v1",
       logicalLength: bytes.length
@@ -1124,6 +1140,12 @@ function buildFinalPostingSegment(entries, total, codes, filters, config, blockP
 
 function scanWorkerCount(config) {
   return Math.max(1, Math.floor(Number(config.scanWorkers || 1)));
+}
+
+function partitionReducerWorkerCount(config) {
+  const explicit = Math.max(0, Math.floor(Number(config.partitionReducerWorkers || 0)));
+  const fallback = Math.max(1, Math.floor(Number(config.builderWorkerCount || 1)));
+  return Math.max(1, explicit || fallback);
 }
 
 function scanBatchDocs(config) {
@@ -1373,6 +1395,108 @@ async function scanWithWorkers(state) {
   }));
 }
 
+function postReducePartition(worker, message) {
+  return new Promise((resolvePartition, rejectPartition) => {
+    function cleanup() {
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+    }
+    function onMessage(response) {
+      if (response.id !== message.id) return;
+      cleanup();
+      if (response.error) rejectPartition(new Error(response.error));
+      else resolvePartition(response);
+    }
+    function onError(error) {
+      cleanup();
+      rejectPartition(error);
+    }
+    function onExit(code) {
+      cleanup();
+      if (code !== 0) rejectPartition(new Error(`Rangefind reduce partition worker exited with code ${code}.`));
+    }
+    worker.on("message", onMessage);
+    worker.once("error", onError);
+    worker.once("exit", onExit);
+    worker.postMessage(message);
+  });
+}
+
+function createPartitionReducerPool(config) {
+  const count = partitionReducerWorkerCount(config);
+  const termPackCounterBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const blockPackCounterBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const workers = Array.from({ length: count }, (_, index) => ({
+    index,
+    worker: new Worker(new URL("./reduce_partition_worker.js", import.meta.url), { type: "module" }),
+    tasks: 0,
+    inputBytes: 0,
+    reduceMs: 0,
+    finishMs: 0,
+    mode: "worker-thread"
+  }));
+  const available = workers.slice();
+  const active = new Set();
+  let nextId = 0;
+
+  async function waitForWorker() {
+    while (!available.length) await Promise.race(active);
+    return available.pop();
+  }
+
+  return {
+    count,
+    termPackCounterBuffer,
+    blockPackCounterBuffer,
+    async reduce(partition, message) {
+      const entry = await waitForWorker();
+      const id = nextId++;
+      const inputBytes = partition.entries.reduce((sum, [term, rows]) => sum + String(term).length + postingRowCount(rows) * 8, 0);
+      const promise = postReducePartition(entry.worker, { ...message, id, partition })
+        .then((result) => {
+          entry.tasks++;
+          entry.inputBytes += inputBytes;
+          entry.reduceMs += result.ms || 0;
+          return { ...result, worker: entry.index };
+        })
+        .finally(() => {
+          active.delete(promise);
+          available.push(entry);
+        });
+      active.add(promise);
+      return promise;
+    },
+    stats() {
+      return workers.map(entry => ({
+        worker: entry.index,
+        tasks: entry.tasks,
+        inputBytes: entry.inputBytes,
+        reduceMs: entry.reduceMs,
+        finishMs: entry.finishMs,
+        mode: entry.mode
+      }));
+    },
+    async finish() {
+      while (active.size) await Promise.race(active);
+      const results = await Promise.all(workers.map(async (entry) => {
+        const result = await postReducePartition(entry.worker, { id: nextId++, kind: "finish" });
+        entry.finishMs += result.ms || 0;
+        return result;
+      }));
+      return {
+        packs: results.flatMap(result => result.packs || []),
+        packBytes: results.reduce((sum, result) => sum + (result.packBytes || 0), 0),
+        blockPacks: results.flatMap(result => result.blockPacks || []),
+        blockPackBytes: results.reduce((sum, result) => sum + (result.blockPackBytes || 0), 0)
+      };
+    },
+    async close() {
+      await Promise.allSettled(workers.map(entry => entry.worker.terminate()));
+    }
+  };
+}
+
 async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const codes = createCodeStore(resolve(dirs.out, "_build", "codes"), config, measured.total, measured.dicts);
 
@@ -1425,73 +1549,117 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
 async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
   const filters = buildBlockFilters(config, measured.dicts);
   const started = performance.now();
-  const packWriter = createPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
-  const blockPackWriter = config.externalPostingBlocks === false
+  const usePartitionWorkers = partitionReducerWorkerCount(config) > 1;
+  const partitionPool = usePartitionWorkers ? createPartitionReducerPool(config) : null;
+  const packWriter = usePartitionWorkers ? null : createAppendOnlyPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
+  const directorySpool = createDirectoryEntrySpool(resolve(dirs.out, "_build", "terms-directory.run"));
+  const blockPackWriter = usePartitionWorkers || config.externalPostingBlocks === false
     ? null
     : createPackWriter(resolve(dirs.out, "terms", "block-packs"), config.postingBlockPackBytes);
   const finalShards = new Set();
   const blockStats = emptyPostingSegmentStats();
   const bundleDfs = new Map();
   const bundleTermSet = new Set(runData.queryBundleTerms || []);
-  const stats = await mergeSegmentsToPartitions({
-    segments: runData.segments,
-    scratchDir: resolve(dirs.out, "_build", "segment-merge"),
-    config,
-    onTerm: (term, df) => {
-      if (bundleTermSet.has(term)) bundleDfs.set(term, df);
-    },
-    onPartition: (partition) => {
-      const encoded = buildFinalPostingSegment(partition.entries, measured.total, runData.codes, filters, config, blockPackWriter);
-      addPostingSegmentStats(blockStats, encoded.stats);
-      writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }), {
-        kind: "posting-segment",
-        codec: encoded.format || POSTING_SEGMENT_FORMAT,
-        logicalLength: encoded.buffer.length
-      });
-      finalShards.add(partition.name);
-      return partition.name;
-    }
-  });
+  let partitionOutput = { packs: [], packBytes: 0, blockPacks: [], blockPackBytes: 0 };
+  let typoIndexTerms = 0;
+  let stats;
+  try {
+    stats = await mergeSegmentsToPartitions({
+      segments: runData.segments,
+      scratchDir: resolve(dirs.out, "_build", "segment-merge"),
+      config,
+      partitionConcurrency: usePartitionWorkers ? partitionPool.count : 1,
+      onTerm: (term, df) => {
+        if (bundleTermSet.has(term)) bundleDfs.set(term, df);
+        if (addTypoIndexTerm(typoBuffer, term, df, measured.total)) typoIndexTerms++;
+      },
+      onPartition: async (partition, sequence) => {
+        if (usePartitionWorkers) {
+          const result = await partitionPool.reduce(partition, {
+            config,
+            codesDescriptor: runData.codes.descriptor(),
+            filters,
+            termsOutDir: resolve(dirs.out, "terms", "packs"),
+            blockOutDir: resolve(dirs.out, "terms", "block-packs"),
+            termPackCounter: partitionPool.termPackCounterBuffer,
+            blockPackCounter: partitionPool.blockPackCounterBuffer,
+            targetBytes: config.packBytes,
+            blockTargetBytes: config.postingBlockPackBytes,
+            total: measured.total
+          });
+          addPostingSegmentStats(blockStats, result.stats);
+          appendDirectoryEntry(directorySpool, partition.name, result.entry);
+          finalShards.add(partition.name);
+          return partition.name;
+        }
+        const encoded = buildFinalPostingSegment(partition.entries, measured.total, runData.codes, filters, config, blockPackWriter);
+        addPostingSegmentStats(blockStats, encoded.stats);
+        const entry = writePackedShard(packWriter, partition.name, gzipSync(encoded.buffer, { level: 6 }), {
+          kind: "posting-segment",
+          codec: encoded.format || POSTING_SEGMENT_FORMAT,
+          logicalLength: encoded.buffer.length
+        });
+        appendDirectoryEntry(directorySpool, partition.name, entry);
+        finalShards.add(partition.name);
+        return partition.name;
+      }
+    });
+    if (usePartitionWorkers) partitionOutput = await partitionPool.finish();
+  } finally {
+    await partitionPool?.close();
+  }
   if (blockPackWriter) finalizePackWriter(blockPackWriter);
-  finalizePackWriter(packWriter);
+  if (packWriter) finalizePackWriter(packWriter);
+  const termPacks = usePartitionWorkers ? partitionOutput.packs.sort(comparePackFiles) : packWriter.packs;
+  const blockPacks = usePartitionWorkers ? partitionOutput.blockPacks.sort(comparePackFiles) : (blockPackWriter?.packs || []);
+  const termPackBytes = usePartitionWorkers ? partitionOutput.packBytes : packWriter.bytes;
+  const blockPackBytes = usePartitionWorkers ? partitionOutput.blockPackBytes : (blockPackWriter?.bytes || 0);
   const reduced = {
     finalShards,
-    packWriter,
-    blockPackWriter,
+    packs: termPacks,
+    packBytes: termPackBytes,
+    directorySpool,
+    blockPacks,
+    blockPackBytes,
     blockStats,
     termCount: stats.terms,
     postingCount: stats.postings,
     bundleDfs,
-    workerStats: [{
+    workerStats: usePartitionWorkers ? partitionPool.stats() : [{
       worker: 0,
       tasks: runData.segments.length,
       inputBytes: runData.segments.reduce((sum, segment) => sum + (segment.termsBytes || 0) + (segment.postingBytes || 0), 0),
       reduceMs: performance.now() - started,
-      finishMs: 0
+      finishMs: 0,
+      mode: "main-thread"
     }],
     reduceTimings: { finalPackAssemblyMs: 0 }
   };
-  const shards = [...reduced.finalShards].sort();
-  const packIndexes = new Map(reduced.packWriter.packs.map((pack, index) => [pack.file, index]));
-  const entries = shards.map((shard) => {
-    const entry = reduced.packWriter.entries[shard];
-    return { shard, packIndex: packIndexes.get(entry.pack), ...entry };
+  const packIndexes = new Map(reduced.packs.map((pack, index) => [pack.file, index]));
+  const entries = sortedDirectoryEntrySpool(reduced.directorySpool, {
+    packNameMap: reduced.packWriter?.packNameMap,
+    packIndexes,
+    chunkEntries: config.directorySortChunkEntries
   });
-  const directory = writeDirectoryFiles(resolve(dirs.out, "terms"), entries, config.directoryPageBytes, "terms", { packTable: reduced.packWriter.packs });
+  const directory = await writeDirectoryFilesFromSortedEntries(resolve(dirs.out, "terms"), entries, reduced.directorySpool.entries, config.directoryPageBytes, "terms", { packTable: reduced.packs });
+  const shards = [...reduced.finalShards].sort();
   return {
     filters,
     shards,
     directory,
-    packs: reduced.packWriter.packs,
-    blockPacks: reduced.blockPackWriter?.packs || [],
+    packs: reduced.packs,
+    blockPacks: reduced.blockPacks || [],
     blockStats: reduced.blockStats || emptyPostingSegmentStats(),
     termCount: reduced.termCount,
     postingCount: reduced.postingCount,
     bundleDfs: reduced.bundleDfs || new Map(),
-    packBytes: reduced.packWriter.bytes,
-    blockPackBytes: reduced.blockPackWriter?.bytes || 0,
+    packBytes: reduced.packBytes,
+    blockPackBytes: reduced.blockPackBytes || 0,
+    directorySpoolBytes: reduced.directorySpool.bytes,
+    directorySpoolEntries: reduced.directorySpool.entries,
     segmentSummary: runData.segmentSummary,
     mergeTiers: stats.mergeTiers || [],
+    mergePolicy: stats.mergePolicy || null,
     workerStats: reduced.workerStats || [],
     reduceTimings: {
       ...(reduced.reduceTimings || {}),
@@ -1499,7 +1667,8 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       segmentReducedSpoolMs: stats.timings?.reducedSpoolMs || 0,
       segmentPartitionAssemblyMs: stats.timings?.partitionAssemblyMs || 0
     },
-    reducedSpoolBytes: stats.reducedSpoolBytes || 0
+    reducedSpoolBytes: stats.reducedSpoolBytes || 0,
+    typoIndexTerms
   };
 }
 
@@ -1579,6 +1748,7 @@ function buildTelemetryDiskByteGroups(out) {
       resolve(out, "facets", "directory"),
       resolve(out, "bundles", "directory"),
       resolve(out, "authority", "directory"),
+      resolve(out, "segments"),
       resolve(out, "typo")
     ]
   };
@@ -1612,6 +1782,7 @@ function minimalManifest(manifest) {
       pointers: manifest.object_store.pointers
     },
     built_at: manifest.built_at,
+    segments: manifest.segments,
     lazy_manifests: {
       full: "manifest.full.json",
       build: "debug/build-telemetry.json",
@@ -1697,6 +1868,8 @@ export async function build({ configPath }) {
   };
   const telemetry = createBuildTelemetry({
     sampleIntervalMs: config.buildTelemetrySampleMs,
+    progressLogMs: config.buildProgressLogMs,
+    progressLogger: line => console.error(line),
     diskByteGroups: buildTelemetryDiskByteGroups(dirs.out)
   });
   rmSync(dirs.out, { recursive: true, force: true });
@@ -1729,18 +1902,44 @@ export async function build({ configPath }) {
       segment_reduced_spool_ms: reduced.reduceTimings.segmentReducedSpoolMs || 0,
       segment_partition_assembly_ms: reduced.reduceTimings.segmentPartitionAssemblyMs || 0,
       segment_reduced_spool_bytes: reduced.reducedSpoolBytes || 0,
+      segment_directory_spool_bytes: reduced.directorySpoolBytes || 0,
+      segment_directory_spool_entries: reduced.directorySpoolEntries || 0,
+      segment_merge_policy: reduced.mergePolicy?.policy || "",
+      segment_merge_target_segments: reduced.mergePolicy?.targetSegments || 0,
+      segment_merge_write_amplification: reduced.mergePolicy?.writeAmplification || 0,
+      segment_merge_intermediate_bytes: reduced.mergePolicy?.intermediateBytes || 0,
+      segment_merge_skipped_segments: reduced.mergePolicy?.skippedSegments || 0,
+      segment_merge_blocked_by_temp_budget: Boolean(reduced.mergePolicy?.blockedByTempBudget),
       segment_merge_fan_in: config.segmentMergeFanIn,
       segment_merge_tiers: reduced.mergeTiers.length,
-      segment_merge_tier_outputs: reduced.mergeTiers.map(tier => tier.output_segments)
+      segment_merge_tier_outputs: reduced.mergeTiers.map(tier => tier.output_segments),
+      partition_reducer_workers: reduced.workerStats.length,
+      partition_reducer_worker_mode: reduced.workerStats.some(worker => worker.mode === "worker-thread") ? "worker-thread-owned-packs" : "main-thread",
+      typo_index_terms: reduced.typoIndexTerms || 0
     });
-    const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, runData.codes));
+    const segmentManifest = await timeBuildPhase(telemetry, "segment-manifest", () => writeSegmentManifest(dirs.out, {
+      config,
+      total: measured.total,
+      segments: runData.segments,
+      summary: runData.segmentSummary,
+      mergeTiers: reduced.mergeTiers,
+      mergePolicy: reduced.mergePolicy,
+      publishSegments: true
+    }));
+    const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
+    addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
+    addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
+    addBuildCounter(telemetry, "field_row_numeric_fields", fieldRows.numericFields);
+    addBuildCounter(telemetry, "field_row_boolean_fields", fieldRows.booleanFields);
+    addBuildCounter(telemetry, "field_row_date_fields", fieldRows.dateFields);
+    const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
     const authority = await timeBuildPhase(telemetry, "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
     const docs = await timeBuildPhase(telemetry, "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
     docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
     const typoManifest = await timeBuildPhase(telemetry, "typo", () => reduceTypoRuns(typoBuffer, dirs.out));
-    const docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, runData.codes));
-    const docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, runData.codes));
-    const filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, runData.codes, measured.dicts));
+    const docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
+    const docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
+    const filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
     const facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
     const buildTelemetry = finishBuildTelemetry(telemetry);
 
@@ -1756,11 +1955,13 @@ export async function build({ configPath }) {
       docLocalityLayout: true,
       docPages: true,
       rangeDirectoryV2: true,
+      fieldRowPipeline: true,
       docValues: true,
       docValueSorted: true,
       filterBitmaps: Object.keys(filterBitmaps.fields).length > 0,
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
+      segmentManifest: true,
       queryBundles: !!queryBundles,
       authority: !!authority,
       typoSidecar: !!typoManifest
@@ -1817,6 +2018,18 @@ export async function build({ configPath }) {
     },
     built_at: new Date().toISOString(),
     build: buildTelemetry,
+    field_rows: fieldRows.descriptor(),
+    segments: {
+      format: segmentManifest.format,
+      source_format: segmentManifest.sourceFormat,
+      storage: segmentManifest.storage,
+      published: segmentManifest.published,
+      manifest: segmentManifest.path,
+      count: segmentManifest.segmentCount,
+      bytes: segmentManifest.compressedBytes,
+      term_count: segmentManifest.termCount,
+      posting_count: segmentManifest.postingCount
+    },
     total: measured.total,
     docs,
     doc_values: {
@@ -1981,6 +2194,13 @@ export async function build({ configPath }) {
       doc_value_fields: Object.keys(docValues.fields).length,
       doc_value_pack_files: docValues.packs.length,
       doc_value_pack_bytes: docValues.packs.reduce((sum, pack) => sum + pack.bytes, 0),
+      field_row_format: fieldRows.format,
+      field_row_source: fieldRows.source,
+      field_row_fields: fieldRows.fieldCount,
+      field_row_facet_fields: fieldRows.facetFields,
+      field_row_numeric_fields: fieldRows.numericFields,
+      field_row_boolean_fields: fieldRows.booleanFields,
+      field_row_date_fields: fieldRows.dateFields,
       doc_value_sorted_storage: docValueSorted.storage,
       doc_value_sorted_directory_format: docValueSorted.directory_format,
       doc_value_sorted_page_format: docValueSorted.page_format,
@@ -2010,6 +2230,7 @@ export async function build({ configPath }) {
       query_bundle_directory_bytes: queryBundles?.directory_bytes || 0,
       query_bundle_pack_files: queryBundles?.packs.length || 0,
       query_bundle_pack_bytes: queryBundles?.pack_bytes || 0,
+      typo_index_terms: reduced.typoIndexTerms || 0,
       authority_format: authority?.format || "",
       authority_fields: authority?.fields.length || 0,
       authority_keys: authority?.keys || 0,
@@ -2022,16 +2243,38 @@ export async function build({ configPath }) {
       scan_workers: scanWorkerCount(config),
       scan_batch_docs: scanBatchDocs(config),
       segment_merge_workers: 1,
+      partition_reducer_workers: reduced.workerStats.length,
+      partition_reducer_worker_mode: reduced.workerStats.some(worker => worker.mode === "worker-thread") ? "worker-thread-owned-packs" : "main-thread",
       segment_merge_fan_in: config.segmentMergeFanIn,
       segment_merge_tiers: reduced.mergeTiers.length,
       segment_reduced_spool_bytes: reduced.reducedSpoolBytes || 0,
+      segment_directory_spool_bytes: reduced.directorySpoolBytes || 0,
+      segment_directory_spool_entries: reduced.directorySpoolEntries || 0,
+      segment_merge_policy: reduced.mergePolicy?.policy || "",
+      segment_merge_target_segments: reduced.mergePolicy?.targetSegments || 0,
+      segment_merge_write_amplification: reduced.mergePolicy?.writeAmplification || 0,
+      segment_merge_intermediate_bytes: reduced.mergePolicy?.intermediateBytes || 0,
+      segment_merge_skipped_segments: reduced.mergePolicy?.skippedSegments || 0,
+      segment_merge_blocked_by_temp_budget: Boolean(reduced.mergePolicy?.blockedByTempBudget),
       segment_tier_merge_ms: Math.round(reduced.reduceTimings.segmentTierMergeMs || 0),
       segment_reduced_spool_ms: Math.round(reduced.reduceTimings.segmentReducedSpoolMs || 0),
       segment_partition_assembly_ms: Math.round(reduced.reduceTimings.segmentPartitionAssemblyMs || 0),
       segment_format: "rfsegment-v1",
+      segment_manifest_format: segmentManifest.format,
+      segment_manifest_path: segmentManifest.path,
+      segment_manifest_published: Boolean(segmentManifest.published),
+      segment_manifest_storage: segmentManifest.storage,
+      segment_manifest_bytes: segmentManifest.compressedBytes,
       segment_files: reduced.segmentSummary.segments,
       segment_terms: reduced.segmentSummary.terms,
       segment_postings: reduced.segmentSummary.postings,
+      segment_peak_memory_bytes: reduced.segmentSummary.approxMemoryBytes || 0,
+      segment_max_docs: reduced.segmentSummary.maxDocs || 0,
+      segment_flush_reasons: reduced.segmentSummary.flushReasons || {},
+      segment_flush_docs: config.segmentFlushDocs || config.segmentMaxDocs || 0,
+      segment_flush_bytes: config.segmentFlushBytes || config.segmentMaxBytes || 0,
+      segment_effective_flush_bytes: runData.segments[0]?.maxBytes || config.segmentFlushBytes || config.segmentMaxBytes || 0,
+      builder_memory_budget_bytes: config.builderMemoryBudgetBytes || 0,
       posting_segment_block_size: config.postingBlockSize,
       posting_segment_block_size_source: config._layoutDecisions?.posting_block_size?.source || "configured",
       base_shard_depth: config.baseShardDepth,
