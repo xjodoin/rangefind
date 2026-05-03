@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -41,12 +41,17 @@ function parseArgs(argv) {
     size: 10,
     bodyChars: Number(process.env.FRWIKI_BODY_CHARS || 6000),
     force: false,
+    limitExplicit: process.env.FRWIKI_LIMIT != null,
+    reuseIndex: false,
     exactChecks: process.env.FRWIKI_EXACT_CHECKS !== "0"
   };
   for (const arg of argv.slice(1)) {
     if (arg === "--force") args.force = true;
     else if (arg.startsWith("--dump-url=")) args.dumpUrl = arg.slice("--dump-url=".length);
-    else if (arg.startsWith("--limit=")) args.limit = Number(arg.slice("--limit=".length)) || 0;
+    else if (arg.startsWith("--limit=")) {
+      args.limit = Number(arg.slice("--limit=".length)) || 0;
+      args.limitExplicit = true;
+    }
     else if (arg.startsWith("--root=")) args.root = arg.slice("--root=".length);
     else if (arg.startsWith("--queries=")) args.queries = arg.slice("--queries=".length).split("|").filter(Boolean);
     else if (arg.startsWith("--runs=")) args.runs = Number(arg.slice("--runs=".length)) || args.runs;
@@ -55,6 +60,7 @@ function parseArgs(argv) {
     else if (arg.startsWith("--scale-limits=")) args.scaleLimits = arg.slice("--scale-limits=".length).split(",").map(value => Number(value.trim())).filter(Boolean);
     else if (arg === "--exact-checks") args.exactChecks = true;
     else if (arg === "--no-exact-checks") args.exactChecks = false;
+    else if (arg === "--reuse-index" || arg === "--bench-only" || arg === "--runtime-only") args.reuseIndex = true;
   }
   args.scaleLimits ||= [10000, 25000, 50000, 100000];
   return args;
@@ -181,6 +187,25 @@ function expectedMeta(args) {
   };
 }
 
+function expectedSourceMeta(args) {
+  return {
+    schemaVersion: FRWIKI_SCHEMA_VERSION,
+    dumpUrl: args.dumpUrl,
+    bodyChars: args.bodyChars || null
+  };
+}
+
+function tempPath(path) {
+  return `${path}.tmp-${process.pid}-${Date.now()}`;
+}
+
+function sourceMetaMatches(args, meta) {
+  const expected = expectedSourceMeta(args);
+  return meta?.schemaVersion === expected.schemaVersion
+    && meta.dumpUrl === expected.dumpUrl
+    && (meta.bodyChars ?? null) === expected.bodyChars;
+}
+
 function jsonlMatchesRun(args, out, metaPath) {
   if (!existsSync(out) || !existsSync(metaPath)) return false;
   try {
@@ -195,13 +220,30 @@ function jsonlMatchesRun(args, out, metaPath) {
   }
 }
 
-async function writeJsonl(args) {
-  const dataDir = resolve(args.root, "data");
-  const out = resolve(dataDir, "frwiki.jsonl");
-  const metaPath = resolve(dataDir, "frwiki.meta.json");
-  if (!args.force && jsonlMatchesRun(args, out, metaPath)) return out;
-  mkdirSync(dataDir, { recursive: true });
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
 
+function cacheSatisfiesRun(args, cachePath, cacheMetaPath) {
+  if (!existsSync(cachePath) || !existsSync(cacheMetaPath)) return false;
+  const meta = readJson(cacheMetaPath);
+  if (!sourceMetaMatches(args, meta)) return false;
+  if (!args.limit) return meta.complete === true;
+  return (meta.docs || 0) >= args.limit;
+}
+
+function finishStream(stream) {
+  return new Promise((resolveFinish, rejectFinish) => {
+    stream.on("error", rejectFinish);
+    stream.end(resolveFinish);
+  });
+}
+
+async function extractJsonl(args, out) {
   const sourceSpec = sourceCommand(args.dumpUrl);
   const source = spawn(sourceSpec.cmd, sourceSpec.args, { stdio: ["ignore", "pipe", "inherit"] });
   const sourceDone = waitForChild(source, sourceSpec.cmd, true);
@@ -226,15 +268,14 @@ async function writeJsonl(args) {
   const started = performance.now();
 
   async function finish() {
-    await new Promise(resolveFinish => output.end(resolveFinish));
+    await finishStream(output);
     await Promise.allSettled([sourceDone, streamDone]);
-    writeFileSync(metaPath, JSON.stringify({
-      ...expectedMeta(args),
+    return {
       docs,
       pagesRead: pages,
+      complete: !args.limit,
       builtAt: new Date().toISOString()
-    }, null, 2));
-    return out;
+    };
   }
 
   for await (const chunk of input) {
@@ -267,6 +308,98 @@ async function writeJsonl(args) {
   }
 
   return finish();
+}
+
+async function writeJsonlPrefix(sourcePath, out, limit) {
+  if (!limit) {
+    copyFileSync(sourcePath, out);
+    return null;
+  }
+
+  const tmp = tempPath(out);
+  const input = createReadStream(sourcePath, { encoding: "utf8" });
+  const output = createWriteStream(tmp);
+  let buffer = "";
+  let docs = 0;
+
+  try {
+    for await (const chunk of input) {
+      buffer += chunk;
+      while (true) {
+        const index = buffer.indexOf("\n");
+        if (index < 0) break;
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        if (!line) continue;
+        output.write(`${line}\n`);
+        docs++;
+        if (docs >= limit) {
+          input.destroy();
+          await finishStream(output);
+          renameSync(tmp, out);
+          return docs;
+        }
+      }
+    }
+    if (buffer.trim() && docs < limit) {
+      output.write(`${buffer.trimEnd()}\n`);
+      docs++;
+    }
+    await finishStream(output);
+    renameSync(tmp, out);
+    return docs;
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+async function materializeJsonlFromCache(args, cachePath, cacheMetaPath, out, metaPath) {
+  const cacheMeta = readJson(cacheMetaPath);
+  const docs = cacheMeta.docs === args.limit
+    ? (copyFileSync(cachePath, out), cacheMeta.docs)
+    : await writeJsonlPrefix(cachePath, out, args.limit || 0);
+  writeFileSync(metaPath, JSON.stringify({
+    ...expectedMeta(args),
+    docs: docs ?? cacheMeta.docs,
+    pagesRead: cacheMeta.pagesRead,
+    builtAt: new Date().toISOString(),
+    source: "cache",
+    cacheDocs: cacheMeta.docs
+  }, null, 2));
+  return out;
+}
+
+async function writeJsonl(args) {
+  const dataDir = resolve(args.root, "data");
+  const out = resolve(dataDir, "frwiki.jsonl");
+  const metaPath = resolve(dataDir, "frwiki.meta.json");
+  const cachePath = resolve(dataDir, "frwiki.cache.jsonl");
+  const cacheMetaPath = resolve(dataDir, "frwiki.cache.meta.json");
+  if (!args.force && jsonlMatchesRun(args, out, metaPath)) return out;
+  mkdirSync(dataDir, { recursive: true });
+
+  if (!args.force && cacheSatisfiesRun(args, cachePath, cacheMetaPath)) {
+    return materializeJsonlFromCache(args, cachePath, cacheMetaPath, out, metaPath);
+  }
+
+  const tmp = tempPath(cachePath);
+  try {
+    const extracted = await extractJsonl(args, tmp);
+    renameSync(tmp, cachePath);
+    writeFileSync(cacheMetaPath, JSON.stringify({
+      ...expectedSourceMeta(args),
+      limit: args.limit || null,
+      docs: extracted.docs,
+      pagesRead: extracted.pagesRead,
+      complete: extracted.complete,
+      builtAt: extracted.builtAt
+    }, null, 2));
+    return materializeJsonlFromCache(args, cachePath, cacheMetaPath, out, metaPath);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
 }
 
 function writeSite(args, docsPath) {
@@ -386,6 +519,7 @@ function networkBucket(url) {
   if (path.includes("/docs/pointers/")) return "docPointers";
   if (path.includes("/docs/pages/")) return "docPagePointers";
   if (path.includes("/docs/page-packs/")) return "docPages";
+  if (path.includes("/typo/lexicon-packs/") || path.includes("/typo/lexicon/")) return "typoLexicon";
   if (path.includes("/typo/")) return "typo";
   if (path.includes("/docs/")) return "docs";
   if (path.endsWith("/codes.bin.gz")) return "codes";
@@ -658,6 +792,7 @@ function compactRuntimeStats(stats = {}) {
     skippedBlocks: stats.skippedBlocks || 0,
     terms: stats.terms || 0,
     shards: stats.shards || 0,
+    missingBaseTerms: stats.missingBaseTerms || 0,
     postingBlockFrontier: stats.postingBlockFrontier || 0,
     postingBlockFrontierBatches: stats.postingBlockFrontierBatches || 0,
     postingBlockFrontierBlocks: stats.postingBlockFrontierBlocks || 0,
@@ -709,7 +844,14 @@ function compactRuntimeStats(stats = {}) {
     surfaceFallbackTerms: stats.surfaceFallbackTerms || [],
     typoAttempted: Boolean(stats.typoAttempted),
     typoApplied: Boolean(stats.typoApplied),
-    typoSkippedReason: stats.typoSkippedReason || ""
+    typoSkippedReason: stats.typoSkippedReason || "",
+    typoOriginalTotal: stats.typoOriginalTotal || 0,
+    typoCorrectedQuery: stats.typoCorrectedQuery || "",
+    typoCandidateTerms: stats.typoCandidateTerms || 0,
+    typoCorrectionPlans: stats.typoCorrectionPlans || 0,
+    typoShardLookups: stats.typoShardLookups || 0,
+    typoLexiconShardLookups: stats.typoLexiconShardLookups || 0,
+    typoLexiconCandidatesScanned: stats.typoLexiconCandidatesScanned || 0
   };
 }
 
@@ -878,6 +1020,18 @@ function clean(args) {
   rmSync(resolve(args.root, "scale"), { recursive: true, force: true });
 }
 
+function assertReusableIndex(args) {
+  const manifestPath = resolve(args.root, "public", "rangefind", "manifest.min.json");
+  const manifest = readJson(manifestPath);
+  if (!manifest) {
+    throw new Error(`No reusable Rangefind index found at ${manifestPath}; run the build or all command first.`);
+  }
+  if (args.limitExplicit && args.limit && manifest.total !== args.limit) {
+    throw new Error(`Reusable index has ${manifest.total} docs, but --limit=${args.limit}; rerun without --reuse-index or use the matching limit.`);
+  }
+  return manifest;
+}
+
 function rowByLabel(report, label) {
   return report.rows.find(row => row.q === label) || null;
 }
@@ -1007,14 +1161,19 @@ if (args.command === "clean") {
   await writeJsonl(args);
 } else if (args.command === "build") {
   await buildFixture(args);
-} else if (args.command === "bench") {
+} else if (args.command === "bench" || args.command === "runtime-bench") {
+  assertReusableIndex(args);
   await benchFixture(args);
 } else if (args.command === "scale") {
   await scaleFixture(args);
 } else if (args.command === "all") {
-  const docs = await writeJsonl(args);
-  writeSite(args, docs);
-  await buildFixture(args);
+  if (!args.reuseIndex) {
+    const docs = await writeJsonl(args);
+    writeSite(args, docs);
+    await buildFixture(args);
+  } else {
+    assertReusableIndex(args);
+  }
   await benchFixture(args);
 } else {
   console.error(`Unknown command: ${args.command}`);

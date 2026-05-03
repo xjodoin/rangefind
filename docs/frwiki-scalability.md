@@ -34,6 +34,14 @@ npm run build:browser
 node scripts/frwiki_fixture.mjs all --limit=5000
 ```
 
+Rerun only the runtime benchmark against the existing generated index:
+
+```bash
+node scripts/frwiki_fixture.mjs runtime-bench --limit=5000 --runs=3
+# or keep the all command shape and skip extraction/build:
+node scripts/frwiki_fixture.mjs all --limit=5000 --runs=3 --reuse-index
+```
+
 Run against the full dump:
 
 ```bash
@@ -52,10 +60,19 @@ Useful options:
   Default: `6000`. Use `0` for uncapped article text.
 - `--dump-url=URL_OR_FILE`: reads another dump URL or local dump file.
 - `--force`: regenerates JSONL even when the existing metadata matches the
-  requested dump URL, limit, and body cap.
+  requested dump URL, limit, and body cap, and refreshes the reusable extracted
+  JSONL cache.
+- `--reuse-index`: skips JSONL extraction, site generation, and index building.
+  Use this for runtime-only changes when `public/rangefind` already matches the
+  requested limit.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--scale-limits=50000,100000`: controls the `scale` command document counts.
 - `--no-exact-checks`: skips the exact top-k comparison for text queries.
+
+The fixture keeps a source-data cache at `data/frwiki.cache.jsonl` with matching
+metadata. Once a larger limit has been extracted, later smaller or equal limits
+with the same dump URL and `--body-chars` are materialized by slicing that cache
+instead of streaming and decompressing the Wikimedia dump again.
 
 ## Benchmark Coverage
 

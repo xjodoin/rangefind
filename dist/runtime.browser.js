@@ -1149,6 +1149,10 @@ var DEPENDENCY_SCORE_SCALE = 0.12;
 var SKIP_MAX_TERMS = 30;
 var EXTERNAL_POSTING_BLOCK_PREFETCH = 16;
 var POSTING_BLOCK_FRONTIER = 4;
+var TYPO_CORRECTION_CANDIDATES_PER_TOKEN = 2;
+var TYPO_CORRECTION_PLAN_LIMIT = 6;
+var TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
+var TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 var textDecoder3 = new TextDecoder();
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
@@ -2421,6 +2425,29 @@ async function createSearch(options = {}) {
   function collectEligibleScores(scores, hits, minShouldMatch) {
     return [...scores.entries()].filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch)).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
   }
+  function emptyTextSearchResponse({ page, size, terms, entries = [], missingBaseTerms = 0 }) {
+    return {
+      total: 0,
+      page,
+      size,
+      results: [],
+      approximate: false,
+      stats: {
+        exact: true,
+        plannerLane: "empty",
+        topKProven: true,
+        totalExact: true,
+        tailExhausted: true,
+        blocksDecoded: 0,
+        postingsDecoded: 0,
+        postingsAccepted: 0,
+        skippedBlocks: 0,
+        terms: terms.length,
+        shards: new Set(entries.map((item) => item.shardName)).size,
+        missingBaseTerms
+      }
+    };
+  }
   function makeSortPlan(sort) {
     if (!sort) return null;
     const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
@@ -2768,6 +2795,17 @@ async function createSearch(options = {}) {
     const fallbackCodeData = hasFilters && !docValues ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const presentBaseTerms = new Set(entries.filter((item) => baseSet.has(item.term)).map((item) => item.term));
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextSearchResponse({
+        page,
+        size,
+        terms,
+        entries,
+        missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
+      });
+    }
     const cursors = entries.map((item, termIndex) => ({
       ...item,
       termIndex,
@@ -2776,12 +2814,11 @@ async function createSearch(options = {}) {
       skippedBlocks: 0
     }));
     if (!cursors.length) {
-      return { total: 0, page, size, results: [], approximate: false, stats: { exact: true, plannerLane: "empty", topKProven: true, totalExact: true, tailExhausted: true, blocksDecoded: 0, postingsDecoded: 0, postingsAccepted: 0, skippedBlocks: 0, terms: terms.length, shards: 0 } };
+      return emptyTextSearchResponse({ page, size, terms });
     }
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     const masks = /* @__PURE__ */ new Map();
-    const minShouldMatch = minShouldMatchFor(baseTerms);
     let blocksDecoded = 0;
     let postingsDecoded = 0;
     let postingsAccepted = 0;
@@ -2867,9 +2904,20 @@ async function createSearch(options = {}) {
     if (hasFilters || sortPlan) await ensureFullManifest();
     await ensureFacetDictionaries(filters);
     const entries = await termEntries(terms);
+    const baseSet = new Set(baseTerms);
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const presentBaseTerms = new Set(entries.filter((item) => baseSet.has(item.term)).map((item) => item.term));
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextSearchResponse({
+        page,
+        size,
+        terms,
+        entries,
+        missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
+      });
+    }
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
-    const baseSet = new Set(baseTerms);
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
     const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
@@ -3014,6 +3062,7 @@ async function createSearch(options = {}) {
       const data = loaded.get(resolved.shard);
       const entries = data?.entries || [];
       const maxScan = Math.max(1, Number(meta.lexicon.max_scan_candidates || 2048));
+      const minScan = Math.min(maxScan, TYPO_LEXICON_MIN_SCAN_CANDIDATES);
       const out = [];
       let scanned = 0;
       let left = lexiconLowerBound(entries, token) - 1;
@@ -3031,6 +3080,7 @@ async function createSearch(options = {}) {
           distance,
           score: typoCandidateScore(token, entry.surface, entry.df, distance)
         });
+        if (scanned >= minScan && out.some((candidate) => candidate.score >= 0.5)) break;
       }
       debug.lexiconScanned += scanned;
       return out.sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, 64);
@@ -3056,17 +3106,20 @@ async function createSearch(options = {}) {
     if (!baseTerms.length || baseTerms.length > 8) return null;
     const presentTerms = new Map((await termEntries(baseTerms)).map((item) => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some((term) => !presentTerms.has(term));
-    const plans = [];
+    const plans = /* @__PURE__ */ new Map();
     const debug = { shards: /* @__PURE__ */ new Set(), lexiconShards: /* @__PURE__ */ new Set(), candidates: 0, lexiconScanned: 0 };
     for (let index = 0; index < analyzedTerms.length; index++) {
       const item = analyzedTerms[index];
       if (presentTerms.has(item.term) && hasMissingTerms) continue;
       const candidates = await typoCandidatesForToken(item.raw, debug);
-      for (const candidate of candidates.filter((item2) => item2.score >= 0.5).slice(0, 4)) {
+      const strongCandidates = candidates.filter((item2) => item2.score >= 0.5);
+      const bestScore = strongCandidates[0]?.score || 0;
+      const minScore = bestScore >= 1 ? bestScore * TYPO_CORRECTION_RELATIVE_SCORE : 0.5;
+      for (const candidate of strongCandidates.filter((item2) => item2.score >= minScore).slice(0, TYPO_CORRECTION_CANDIDATES_PER_TOKEN)) {
         const corrected = baseTerms.slice();
         corrected[index] = candidate.term;
         if (corrected[index] === item.term) continue;
-        plans.push({
+        const plan = {
           q: corrected.join(" "),
           baseTerms: corrected,
           corrections: [{
@@ -3078,15 +3131,19 @@ async function createSearch(options = {}) {
             score: Number(candidate.score.toFixed(3))
           }],
           score: candidate.score
-        });
+        };
+        const previous = plans.get(plan.q);
+        if (!previous || plan.score > previous.score) plans.set(plan.q, plan);
       }
     }
-    if (!plans.length) return null;
-    plans.sort((a, b) => b.score - a.score || a.q.localeCompare(b.q));
+    const sortedPlans = [...plans.values()].sort((a, b) => b.score - a.score || a.q.localeCompare(b.q));
+    if (!sortedPlans.length) return null;
+    const selectedPlans = sortedPlans.slice(0, TYPO_CORRECTION_PLAN_LIMIT);
     return {
-      plans: plans.slice(0, 12),
+      plans: selectedPlans,
       stats: {
         typoCandidateTerms: debug.candidates,
+        typoCorrectionPlans: selectedPlans.length,
         typoShardLookups: debug.shards.size,
         typoLexiconShardLookups: debug.lexiconShards.size,
         typoLexiconCandidatesScanned: debug.lexiconScanned

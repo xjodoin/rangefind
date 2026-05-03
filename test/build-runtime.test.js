@@ -260,6 +260,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
   );
   assert.ok(singleTerm.stats.blocksDecoded < singleTermExact.stats.blocksDecoded);
 
+  const missingBaseTerm = await search.search({ q: "static zzzzzrangefindaucunresultatzzzzextra", size: 2, rerank: false });
+  assert.equal(missingBaseTerm.total, 0);
+  assert.equal(missingBaseTerm.stats.plannerLane, "empty");
+  assert.equal(missingBaseTerm.stats.blocksDecoded, 0);
+  assert.ok(missingBaseTerm.stats.missingBaseTerms > 0);
+
   const bundled = await search.search({ q: "static range", size: 2, rerank: false });
   assert.equal(bundled.stats.plannerLane, "queryBundleExact");
   assert.equal(bundled.stats.topKProven, true);

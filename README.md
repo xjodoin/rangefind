@@ -85,11 +85,20 @@ npm run build:browser
 node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3
 ```
 
+For runtime-only changes, reuse the existing generated index and rerun just the
+request/transfer benchmark:
+
+```bash
+node scripts/frwiki_fixture.mjs runtime-bench --limit=50000 --runs=3
+```
+
 Use `--limit=0` to run against the full dump. The generated site lives at
 `examples/frwiki/public/`. The fixture validates text query top-k against the
 exact retrieval path by default and records cold request counts, transfer bytes,
 runtime posting-block stats, typed filter/sort validation, and scale reports
 across multiple Wikipedia sample sizes.
+Extracted JSONL is cached under `examples/frwiki/data/`, so later runs with the
+same dump/body cap and an equal or smaller limit do not stream the dump again.
 Each generated index includes `manifest.min.json`, `manifest.full.json`, and
 `debug/build-telemetry.json`. The full diagnostic `manifest.json` is still
 written for local inspection and records phase timings, sampled memory peaks,

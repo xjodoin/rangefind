@@ -17,6 +17,14 @@ node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3
 node scripts/serve.mjs examples/frwiki/public 5180
 ```
 
+Runtime-only rerun against an existing index:
+
+```bash
+node scripts/frwiki_fixture.mjs runtime-bench --limit=50000 --runs=3
+# equivalent when using the all entrypoint:
+node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reuse-index
+```
+
 Full dump run:
 
 ```bash
@@ -34,11 +42,18 @@ Useful options:
 - `--body-chars=N`: indexes the first `N` cleaned characters per article.
   The default is `6000`; use `0` for uncapped article text.
 - `--force`: rebuilds the JSONL even when the existing generated metadata
-  matches the requested dump URL, limit, and body cap.
+  matches the requested dump URL, limit, and body cap. It also refreshes the
+  reusable extracted-data cache.
+- `--reuse-index`: skips JSONL extraction, site generation, and index building;
+  use it when only runtime/benchmark code changed and `public/rangefind`
+  already matches the requested limit.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--scale-limits=50000,100000`: builds isolated scale points with the `scale`
   command.
 - `--no-exact-checks`: skips exact top-k validation for text queries.
 
-Generated data, public assets, config, and benchmark JSON are intentionally
-ignored by git.
+Generated data is cached in `examples/frwiki/data/frwiki.cache.jsonl` after the
+first extraction. Later runs with the same dump URL and body cap reuse that cache
+for equal or smaller `--limit` values by slicing the first `N` rows instead of
+streaming the dump again. Generated data, public assets, config, and benchmark
+JSON are intentionally ignored by git.
