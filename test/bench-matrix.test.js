@@ -102,3 +102,15 @@ test("deferred review watches sort overlays only after core promotion", () => {
   assert.equal(review.decisions.find(item => item.kind === "champion-window").status, "not-recommended");
   assert.equal(review.decisions.find(item => item.kind === "learned-sparse-import").status, "deferred");
 });
+
+test("deferred review accepts sorted candidate lookup when materialized postings are low", () => {
+  const current = report(8, 18);
+  current.fixtures[1].rows[2].coldStats.blocksDecoded = 100;
+  current.fixtures[1].rows[2].coldStats.postingsDecoded = 128;
+  current.fixtures[1].rows[2].coldStats.sortedTextCandidateLookup = true;
+  current.fixtures[1].rows[2].coldStats.sortPagePostingRowsScanned = 12000;
+  const promoted = createPromotionGates(current, report(10, 20));
+  const review = createDeferredReview(current, promoted);
+  assert.equal(review.promotedCore, true);
+  assert.equal(review.decisions.find(item => item.kind === "term-sort-materialization").status, "not-recommended");
+});

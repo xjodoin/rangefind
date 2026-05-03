@@ -10,6 +10,7 @@ import {
   docValueFields,
   decodePostingBytes,
   decodePostings,
+  lookupPostingBlock,
   parseCodes,
   parseDocValueChunk,
   parseFacetDictionary,
@@ -190,6 +191,56 @@ test("posting segment codec selects partitioned deltas for sparse regular doc id
   assert.equal(segment.stats.partitionedDeltaBlocks, 1);
   assert.ok(segment.stats.blockCodecSelectedBytes < segment.stats.blockCodecBaselineBytes);
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0), docs);
+});
+
+test("posting block lookup returns candidate docs without materializing the full block", () => {
+  const cases = [
+    {
+      mode: "off",
+      rows: [[1, 1000], [8, 900], [13, 800], [21, 700]],
+      total: 32
+    },
+    {
+      mode: "impact-runs",
+      rows: [[1, 1000], [8, 1000], [13, 1000], [21, 1000]],
+      total: 32
+    },
+    {
+      mode: "impact-bitset",
+      rows: Array.from({ length: 32 }, (_, doc) => [doc, 1000]),
+      total: 32
+    },
+    {
+      mode: "partitioned-deltas",
+      rows: Array.from({ length: 32 }, (_, index) => [index * 10, 1000]),
+      total: 311
+    }
+  ];
+
+  for (const item of cases) {
+    const config = {
+      facets: [],
+      numbers: [],
+      booleans: [],
+      postingBlockSize: 64,
+      postingSuperblockSize: 2,
+      codecs: { mode: item.mode }
+    };
+    const filters = buildBlockFilters(config, {});
+    const segment = buildPostingSegment([["common", item.rows]], item.total, {}, filters, config);
+    const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+    const entry = shard.terms.get("common");
+    const targets = new Set([item.rows[1][0], item.rows[item.rows.length - 1][0], 999999]);
+    const decoded = [...decodePostings(shard, entry)];
+    const expected = [];
+    for (let i = 0; i < decoded.length; i += 2) {
+      if (targets.has(decoded[i])) expected.push(decoded[i], decoded[i + 1]);
+    }
+    const lookup = lookupPostingBlock(shard, entry, 0, targets);
+    assert.deepEqual([...lookup.rows], expected, item.mode);
+    assert.ok(lookup.scanned > 0, item.mode);
+    assert.ok(lookup.rows.length < decoded.length, item.mode);
+  }
 });
 
 test("query bundle codec round-trips proof metadata and rows", () => {

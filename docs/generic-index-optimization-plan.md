@@ -1,7 +1,7 @@
 # Generic Index Optimization Plan
 
 Date: 2026-05-03
-Status: research-reviewed, core-first refactor
+Status: complete through current core-first plan
 
 This plan covers the next generic optimization work for Rangefind after the
 segment-based builder and posting-segment runtime refactor. It is intentionally
@@ -232,9 +232,18 @@ new query-shape materializations.
   71 and decoded postings dropped from 12,869 to 9,088 while the promotion gate
   stayed `promote` with 13 matched rows, zero regressions, and cross-family
   wins.
-- [ ] Next: evaluate an intra-block candidate lookup codec for page-driven
-  q+sort so candidate sorted-page docs can be scored without materializing every
-  row in each candidate impact block.
+- [x] 2026-05-03: Added intra-block candidate lookup for page-driven q+sort.
+  The runtime now scores sorted-page candidate docs directly from posting block
+  bytes instead of materializing every row in each candidate block. The lookup
+  works across pair-varint, impact-run, impact-bitset, and partitioned-delta
+  block codecs, and external posting blocks can cache raw logical block bytes
+  for this lane. On the 100k `frwiki` `Paris` sorted-by-`revisionDate` row,
+  materialized postings dropped from 9,088 to 135 while the exact page still
+  scans 9,088 encoded rows for proof. The promotion gate stayed `promote` with
+  13 matched rows, zero regressions, and seven improvements; deferred review now
+  marks champion windows, phrase materialization, and term-sort materialization
+  `not-recommended`, with learned-sparse import still deferred until explicit
+  sparse inputs and quality benchmarks exist.
 
 ## Milestone 0: Core Optimizer Report
 

@@ -807,12 +807,138 @@ function decodePartitionedDeltaBytes(bytes) {
   return Int32Array.from(rows);
 }
 
+function postingTargetSet(docs) {
+  return docs instanceof Set ? docs : new Set(docs || []);
+}
+
+function sortedPostingTargets(targets) {
+  return [...targets].filter(Number.isFinite).sort((a, b) => a - b);
+}
+
+function pushMatchedPosting(out, targets, doc, impact) {
+  if (targets.has(doc)) out.push(doc, impact);
+}
+
+function lookupPairVarintBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  while (state.pos < source.length) {
+    const doc = readVarint(source, state);
+    const impact = readVarint(source, state);
+    scanned++;
+    pushMatchedPosting(rows, targets, doc, impact);
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+
+function lookupImpactRunBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let previous = -1;
+    for (let i = 0; i < count; i++) {
+      const doc = previous + readVarint(source, state);
+      scanned++;
+      pushMatchedPosting(rows, targets, doc, impact);
+      previous = doc;
+    }
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+
+function lookupImpactBitsetBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const targetDocs = sortedPostingTargets(targets);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const minDoc = readVarint(source, state);
+    const span = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    const start = state.pos;
+    state.pos += byteLength;
+    const maxDoc = minDoc + span - 1;
+    for (const doc of targetDocs) {
+      if (doc < minDoc) continue;
+      if (doc > maxDoc) break;
+      scanned++;
+      const bit = doc - minDoc;
+      if (source[start + Math.floor(bit / 8)] & (1 << (bit % 8))) rows.push(doc, impact);
+    }
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+
+function lookupPartitionedDeltaBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let doc = readVarint(source, state);
+    const width = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    scanned++;
+    pushMatchedPosting(rows, targets, doc, impact);
+    for (const delta of readPackedUnsigned(source, state, Math.max(0, count - 1), width, byteLength)) {
+      doc += delta;
+      scanned++;
+      pushMatchedPosting(rows, targets, doc, impact);
+    }
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+
 export function decodePostingBytes(bytes, block = null) {
   const codec = block?.codec || POSTING_BLOCK_CODEC_PAIR_VARINT;
   if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return decodePartitionedDeltaBytes(bytes);
   if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return decodeImpactBitsetBytes(bytes);
   if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return decodeImpactRunBytes(bytes);
   return decodePairVarintBytes(bytes);
+}
+
+export function lookupPostingBytes(bytes, docs, block = null) {
+  const targets = postingTargetSet(docs);
+  if (!targets.size) return { rows: new Int32Array(0), scanned: 0 };
+  const codec = block?.codec || POSTING_BLOCK_CODEC_PAIR_VARINT;
+  if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return lookupPartitionedDeltaBytes(bytes, targets);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return lookupImpactBitsetBytes(bytes, targets);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return lookupImpactRunBytes(bytes, targets);
+  return lookupPairVarintBytes(bytes, targets);
+}
+
+export function lookupDecodedPostingRows(rows, docs) {
+  const targets = postingTargetSet(docs);
+  const out = [];
+  let scanned = 0;
+  for (let i = 0; i < (rows?.length || 0); i += 2) {
+    scanned++;
+    pushMatchedPosting(out, targets, rows[i], rows[i + 1]);
+  }
+  return { rows: Int32Array.from(out), scanned };
+}
+
+export function lookupPostingBlock(shard, entry, blockIndex, docs) {
+  const block = entry.blocks?.[blockIndex];
+  if (!block) return { rows: new Int32Array(0), scanned: 0 };
+  if (entry.external) throw new Error("External posting blocks require async runtime loading.");
+  const next = entry.blocks[blockIndex + 1];
+  const end = shard.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
+  const start = shard.dataStart + entry.offset + block.offset;
+  return lookupPostingBytes(shard.bytes.subarray(start, end), docs, block);
 }
 
 export function decodePostingBlock(shard, entry, blockIndex) {

@@ -460,12 +460,128 @@ function decodePartitionedDeltaBytes(bytes) {
   }
   return Int32Array.from(rows);
 }
+function postingTargetSet(docs) {
+  return docs instanceof Set ? docs : new Set(docs || []);
+}
+function sortedPostingTargets(targets) {
+  return [...targets].filter(Number.isFinite).sort((a, b) => a - b);
+}
+function pushMatchedPosting(out, targets, doc, impact) {
+  if (targets.has(doc)) out.push(doc, impact);
+}
+function lookupPairVarintBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  while (state.pos < source.length) {
+    const doc = readVarint(source, state);
+    const impact = readVarint(source, state);
+    scanned++;
+    pushMatchedPosting(rows, targets, doc, impact);
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+function lookupImpactRunBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let previous = -1;
+    for (let i = 0; i < count; i++) {
+      const doc = previous + readVarint(source, state);
+      scanned++;
+      pushMatchedPosting(rows, targets, doc, impact);
+      previous = doc;
+    }
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+function lookupImpactBitsetBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const targetDocs = sortedPostingTargets(targets);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const minDoc = readVarint(source, state);
+    const span = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    const start = state.pos;
+    state.pos += byteLength;
+    const maxDoc = minDoc + span - 1;
+    for (const doc of targetDocs) {
+      if (doc < minDoc) continue;
+      if (doc > maxDoc) break;
+      scanned++;
+      const bit = doc - minDoc;
+      if (source[start + Math.floor(bit / 8)] & 1 << bit % 8) rows.push(doc, impact);
+    }
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
+function lookupPartitionedDeltaBytes(bytes, targets) {
+  const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const state = { pos: 0 };
+  const rows = [];
+  let scanned = 0;
+  const groupCount = readVarint(source, state);
+  for (let group = 0; group < groupCount; group++) {
+    const impact = readVarint(source, state);
+    const count = readVarint(source, state);
+    let doc = readVarint(source, state);
+    const width = readVarint(source, state);
+    const byteLength = readVarint(source, state);
+    scanned++;
+    pushMatchedPosting(rows, targets, doc, impact);
+    for (const delta of readPackedUnsigned(source, state, Math.max(0, count - 1), width, byteLength)) {
+      doc += delta;
+      scanned++;
+      pushMatchedPosting(rows, targets, doc, impact);
+    }
+  }
+  return { rows: Int32Array.from(rows), scanned };
+}
 function decodePostingBytes(bytes, block = null) {
   const codec = block?.codec || POSTING_BLOCK_CODEC_PAIR_VARINT;
   if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return decodePartitionedDeltaBytes(bytes);
   if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return decodeImpactBitsetBytes(bytes);
   if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return decodeImpactRunBytes(bytes);
   return decodePairVarintBytes(bytes);
+}
+function lookupPostingBytes(bytes, docs, block = null) {
+  const targets = postingTargetSet(docs);
+  if (!targets.size) return { rows: new Int32Array(0), scanned: 0 };
+  const codec = block?.codec || POSTING_BLOCK_CODEC_PAIR_VARINT;
+  if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return lookupPartitionedDeltaBytes(bytes, targets);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return lookupImpactBitsetBytes(bytes, targets);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return lookupImpactRunBytes(bytes, targets);
+  return lookupPairVarintBytes(bytes, targets);
+}
+function lookupDecodedPostingRows(rows, docs) {
+  const targets = postingTargetSet(docs);
+  const out = [];
+  let scanned = 0;
+  for (let i = 0; i < (rows?.length || 0); i += 2) {
+    scanned++;
+    pushMatchedPosting(out, targets, rows[i], rows[i + 1]);
+  }
+  return { rows: Int32Array.from(out), scanned };
+}
+function lookupPostingBlock(shard, entry, blockIndex, docs) {
+  const block = entry.blocks?.[blockIndex];
+  if (!block) return { rows: new Int32Array(0), scanned: 0 };
+  if (entry.external) throw new Error("External posting blocks require async runtime loading.");
+  const next = entry.blocks[blockIndex + 1];
+  const end = shard.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
+  const start = shard.dataStart + entry.offset + block.offset;
+  return lookupPostingBytes(shard.bytes.subarray(start, end), docs, block);
 }
 function decodePostingBlock(shard, entry, blockIndex) {
   const block = entry.blocks?.[blockIndex];
@@ -2417,6 +2533,48 @@ async function createSearch(options = {}) {
     }));
     return { wanted, fetched: pending.length, groups: groups.length };
   }
+  async function loadPostingBlockByteBatch(requests, rangePlan = "postingBlocks") {
+    const pending = [];
+    let wanted = 0;
+    for (const request of requests) {
+      const owner = request.entry;
+      const blockIndex = request.blockIndex;
+      if (!owner.blockBytes) owner.blockBytes = /* @__PURE__ */ new Map();
+      wanted++;
+      if (owner.blockBytes.has(blockIndex)) continue;
+      const block = owner.blocks?.[blockIndex];
+      if (!block?.range) {
+        owner.blockBytes.set(blockIndex, Promise.resolve(new Uint8Array(0)));
+        continue;
+      }
+      let resolveBlock;
+      let rejectBlock;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveBlock = resolvePromise;
+        rejectBlock = rejectPromise;
+      });
+      promise.catch(() => {
+      });
+      owner.blockBytes.set(blockIndex, promise);
+      pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
+    }
+    const groups = rangeGroups(pending, rangePlan);
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          item.resolve(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          item.owner.blockBytes.delete(item.blockIndex);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+    return { wanted, fetched: pending.length, groups: groups.length };
+  }
   async function loadExternalPostingBlocks(entry, blockIndexes) {
     await loadPostingBlockBatch(blockIndexes.map((blockIndex) => ({ entry, blockIndex })));
     return Promise.all(blockIndexes.map((blockIndex) => entry.blockPostings.get(blockIndex)));
@@ -2468,19 +2626,28 @@ async function createSearch(options = {}) {
     entry.postings = out;
     return out;
   }
-  async function decodeEntryBlocks(shard, entry, blockIndexes) {
+  async function lookupEntryBlocks(shard, entry, blockIndexes, candidateDocs) {
     const indexes = [...new Set(blockIndexes || [])].filter((index) => index >= 0 && index < (entry.blocks?.length || 0));
-    if (!indexes.length) return [];
-    if (entry.external) {
-      await loadPostingBlockBatch(indexes.map((blockIndex) => ({ entry, blockIndex })));
-      return Promise.all(indexes.map(async (blockIndex) => ({
+    if (!indexes.length || !candidateDocs?.size) return [];
+    if (!entry.external) {
+      return indexes.map((blockIndex) => ({
         blockIndex,
-        rows: await entry.blockPostings.get(blockIndex) || new Int32Array(0)
-      })));
+        ...lookupPostingBlock(shard, entry, blockIndex, candidateDocs)
+      }));
     }
-    return indexes.map((blockIndex) => ({
-      blockIndex,
-      rows: decodePostingBlock(shard, entry, blockIndex)
+    const uncached = indexes.filter((blockIndex) => !entry.blockPostings?.has(blockIndex) && !entry.blockBytes?.has(blockIndex));
+    await loadPostingBlockByteBatch(uncached.map((blockIndex) => ({ entry, blockIndex })));
+    return Promise.all(indexes.map(async (blockIndex) => {
+      if (entry.blockPostings?.has(blockIndex)) {
+        return {
+          blockIndex,
+          ...lookupDecodedPostingRows(await entry.blockPostings.get(blockIndex), candidateDocs)
+        };
+      }
+      return {
+        blockIndex,
+        ...lookupPostingBytes(await entry.blockBytes.get(blockIndex), candidateDocs, entry.blocks?.[blockIndex])
+      };
     }));
   }
   function makeDocFilterPlan(filters) {
@@ -2916,6 +3083,8 @@ async function createSearch(options = {}) {
     let rowsAccepted = 0;
     let blocksDecoded = 0;
     let postingsDecoded = 0;
+    let postingRowsScanned = 0;
+    let postingLookupHits = 0;
     let candidatePostingBlocks = 0;
     let skippedPostingBlocks = 0;
     let consideredPostingBlocks = 0;
@@ -2950,13 +3119,15 @@ async function createSearch(options = {}) {
           skippedPostingBlocks += candidates.skippedBlocks;
           consideredPostingSuperblocks += candidates.consideredSuperblocks;
           skippedPostingSuperblocks += candidates.skippedSuperblocks;
-          for (const { blockIndex, rows: postings } of await decodeEntryBlocks(shard, entry, candidates.indexes)) {
+          for (const { blockIndex, rows: postings, scanned } of await lookupEntryBlocks(shard, entry, candidates.indexes, candidateDocs)) {
             const blockKey = `${shardName}\0${term}\0${blockIndex}`;
             if (!decodedBlocks.has(blockKey)) {
               decodedBlocks.add(blockKey);
               blocksDecoded++;
-              postingsDecoded += postings.length / 2;
             }
+            postingRowsScanned += scanned || 0;
+            postingLookupHits += postings.length / 2;
+            postingsDecoded += postings.length / 2;
             for (let i = 0; i < postings.length; i += 2) {
               const doc = postings[i];
               if (!candidateDocs.has(doc)) continue;
@@ -3006,11 +3177,14 @@ async function createSearch(options = {}) {
         postingsAccepted: rowsAccepted,
         skippedBlocks: skippedPostingBlocks,
         sortedTextBlockScheduler: true,
+        sortedTextCandidateLookup: true,
         sortPagePostingBlocksConsidered: consideredPostingBlocks,
         sortPagePostingBlocksCandidate: candidatePostingBlocks,
         sortPagePostingBlocksSkipped: skippedPostingBlocks,
         sortPagePostingSuperblocksConsidered: consideredPostingSuperblocks,
         sortPagePostingSuperblocksSkipped: skippedPostingSuperblocks,
+        sortPagePostingRowsScanned: postingRowsScanned,
+        sortPagePostingLookupHits: postingLookupHits,
         docValueSortText: true,
         docValuePruning: true,
         docValuePruneField: field,

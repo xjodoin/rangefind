@@ -131,11 +131,14 @@ function compactStats(stats = {}) {
     skippedBlocks: stats.skippedBlocks || 0,
     postingSuperblocksSkipped: stats.postingSuperblocksSkipped || 0,
     sortedTextBlockScheduler: Boolean(stats.sortedTextBlockScheduler),
+    sortedTextCandidateLookup: Boolean(stats.sortedTextCandidateLookup),
     sortPagePostingBlocksConsidered: stats.sortPagePostingBlocksConsidered || 0,
     sortPagePostingBlocksCandidate: stats.sortPagePostingBlocksCandidate || 0,
     sortPagePostingBlocksSkipped: stats.sortPagePostingBlocksSkipped || 0,
     sortPagePostingSuperblocksConsidered: stats.sortPagePostingSuperblocksConsidered || 0,
     sortPagePostingSuperblocksSkipped: stats.sortPagePostingSuperblocksSkipped || 0,
+    sortPagePostingRowsScanned: stats.sortPagePostingRowsScanned || 0,
+    sortPagePostingLookupHits: stats.sortPagePostingLookupHits || 0,
     filterSummaryProofBlocks: stats.filterSummaryProofBlocks || 0,
     docValuePagesVisited: stats.docValuePagesVisited || 0,
     docValueRowsScanned: stats.docValueRowsScanned || 0,
@@ -410,6 +413,9 @@ function evidenceRow(fixture, row) {
     avgRequests: round(row.avgRequests || 0),
     blocksDecoded: row.coldStats?.blocksDecoded || 0,
     postingsDecoded: row.coldStats?.postingsDecoded || 0,
+    sortPagePostingRowsScanned: row.coldStats?.sortPagePostingRowsScanned || 0,
+    sortPagePostingLookupHits: row.coldStats?.sortPagePostingLookupHits || 0,
+    sortedTextCandidateLookup: Boolean(row.coldStats?.sortedTextCandidateLookup),
     fallbackReason: row.coldStats?.plannerFallbackReason || ""
   };
 }
@@ -430,6 +436,14 @@ function hasMaterialTextCost(row, limits) {
     finite(stats.postingsDecoded) >= limits.highDecodedPostings;
 }
 
+function hasMaterialSortedTextCost(row, limits) {
+  const stats = row.coldStats || {};
+  return finite(row.p95Ms) >= limits.highTextP95Ms ||
+    finite(row.avgKb) >= limits.highTextKb ||
+    finite(stats.postingsDecoded) >= limits.highDecodedPostings ||
+    (!stats.sortedTextCandidateLookup && finite(stats.blocksDecoded) >= limits.highDecodedBlocks);
+}
+
 export function createDeferredReview(report, promotion, options = {}) {
   const limits = { ...DEFAULT_DEFERRED_REVIEW_LIMITS, ...(options || {}) };
   const promotedCore = promotion?.status === "promote";
@@ -437,10 +451,7 @@ export function createDeferredReview(report, promotion, options = {}) {
   const textRows = rowsWithFixtures(report, row => row.request?.q && ["text", "filter"].includes(row.category));
   const highCostTextRows = rowsWithFixtures(report, row => row.request?.q && ["text", "filter"].includes(row.category) && hasMaterialTextCost(row, limits));
   const phraseFallbackRows = rowsWithFixtures(report, row => row.request?.q && row.category === "text" && row.coldStats?.plannerLane === "fullFallback" && hasMaterialTextCost(row, limits));
-  const sortedDecodeRows = rowsWithFixtures(report, row => row.request?.q && row.category === "text-sort" && (
-    finite(row.coldStats?.blocksDecoded) >= limits.highDecodedBlocks ||
-    finite(row.coldStats?.postingsDecoded) >= limits.highDecodedPostings
-  ));
+  const sortedDecodeRows = rowsWithFixtures(report, row => row.request?.q && row.category === "text-sort" && hasMaterialSortedTextCost(row, limits));
 
   const decisions = [
     {

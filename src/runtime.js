@@ -1,6 +1,6 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms, queryTerms, tokenize } from "./analyzer.js";
 import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
-import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
+import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
@@ -1278,6 +1278,50 @@ export async function createSearch(options = {}) {
     return { wanted, fetched: pending.length, groups: groups.length };
   }
 
+  async function loadPostingBlockByteBatch(requests, rangePlan = "postingBlocks") {
+    const pending = [];
+    let wanted = 0;
+    for (const request of requests) {
+      const owner = request.entry;
+      const blockIndex = request.blockIndex;
+      if (!owner.blockBytes) owner.blockBytes = new Map();
+      wanted++;
+      if (owner.blockBytes.has(blockIndex)) continue;
+      const block = owner.blocks?.[blockIndex];
+      if (!block?.range) {
+        owner.blockBytes.set(blockIndex, Promise.resolve(new Uint8Array(0)));
+        continue;
+      }
+      let resolveBlock;
+      let rejectBlock;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveBlock = resolvePromise;
+        rejectBlock = rejectPromise;
+      });
+      promise.catch(() => {});
+      owner.blockBytes.set(blockIndex, promise);
+      pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
+    }
+
+    const groups = rangeGroups(pending, rangePlan);
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          item.resolve(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          item.owner.blockBytes.delete(item.blockIndex);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    return { wanted, fetched: pending.length, groups: groups.length };
+  }
+
   async function loadExternalPostingBlocks(entry, blockIndexes) {
     await loadPostingBlockBatch(blockIndexes.map(blockIndex => ({ entry, blockIndex })));
     return Promise.all(blockIndexes.map(blockIndex => entry.blockPostings.get(blockIndex)));
@@ -1336,19 +1380,28 @@ export async function createSearch(options = {}) {
     return out;
   }
 
-  async function decodeEntryBlocks(shard, entry, blockIndexes) {
+  async function lookupEntryBlocks(shard, entry, blockIndexes, candidateDocs) {
     const indexes = [...new Set(blockIndexes || [])].filter(index => index >= 0 && index < (entry.blocks?.length || 0));
-    if (!indexes.length) return [];
-    if (entry.external) {
-      await loadPostingBlockBatch(indexes.map(blockIndex => ({ entry, blockIndex })));
-      return Promise.all(indexes.map(async blockIndex => ({
+    if (!indexes.length || !candidateDocs?.size) return [];
+    if (!entry.external) {
+      return indexes.map(blockIndex => ({
         blockIndex,
-        rows: await entry.blockPostings.get(blockIndex) || new Int32Array(0)
-      })));
+        ...lookupPostingBlock(shard, entry, blockIndex, candidateDocs)
+      }));
     }
-    return indexes.map(blockIndex => ({
-      blockIndex,
-      rows: decodePostingBlock(shard, entry, blockIndex)
+    const uncached = indexes.filter(blockIndex => !entry.blockPostings?.has(blockIndex) && !entry.blockBytes?.has(blockIndex));
+    await loadPostingBlockByteBatch(uncached.map(blockIndex => ({ entry, blockIndex })));
+    return Promise.all(indexes.map(async blockIndex => {
+      if (entry.blockPostings?.has(blockIndex)) {
+        return {
+          blockIndex,
+          ...lookupDecodedPostingRows(await entry.blockPostings.get(blockIndex), candidateDocs)
+        };
+      }
+      return {
+        blockIndex,
+        ...lookupPostingBytes(await entry.blockBytes.get(blockIndex), candidateDocs, entry.blocks?.[blockIndex])
+      };
     }));
   }
 
@@ -1840,6 +1893,8 @@ export async function createSearch(options = {}) {
     let rowsAccepted = 0;
     let blocksDecoded = 0;
     let postingsDecoded = 0;
+    let postingRowsScanned = 0;
+    let postingLookupHits = 0;
     let candidatePostingBlocks = 0;
     let skippedPostingBlocks = 0;
     let consideredPostingBlocks = 0;
@@ -1879,13 +1934,15 @@ export async function createSearch(options = {}) {
           skippedPostingBlocks += candidates.skippedBlocks;
           consideredPostingSuperblocks += candidates.consideredSuperblocks;
           skippedPostingSuperblocks += candidates.skippedSuperblocks;
-          for (const { blockIndex, rows: postings } of await decodeEntryBlocks(shard, entry, candidates.indexes)) {
+          for (const { blockIndex, rows: postings, scanned } of await lookupEntryBlocks(shard, entry, candidates.indexes, candidateDocs)) {
             const blockKey = `${shardName}\u0000${term}\u0000${blockIndex}`;
             if (!decodedBlocks.has(blockKey)) {
               decodedBlocks.add(blockKey);
               blocksDecoded++;
-              postingsDecoded += postings.length / 2;
             }
+            postingRowsScanned += scanned || 0;
+            postingLookupHits += postings.length / 2;
+            postingsDecoded += postings.length / 2;
             for (let i = 0; i < postings.length; i += 2) {
               const doc = postings[i];
               if (!candidateDocs.has(doc)) continue;
@@ -1938,11 +1995,14 @@ export async function createSearch(options = {}) {
         postingsAccepted: rowsAccepted,
         skippedBlocks: skippedPostingBlocks,
         sortedTextBlockScheduler: true,
+        sortedTextCandidateLookup: true,
         sortPagePostingBlocksConsidered: consideredPostingBlocks,
         sortPagePostingBlocksCandidate: candidatePostingBlocks,
         sortPagePostingBlocksSkipped: skippedPostingBlocks,
         sortPagePostingSuperblocksConsidered: consideredPostingSuperblocks,
         sortPagePostingSuperblocksSkipped: skippedPostingSuperblocks,
+        sortPagePostingRowsScanned: postingRowsScanned,
+        sortPagePostingLookupHits: postingLookupHits,
         docValueSortText: true,
         docValuePruning: true,
         docValuePruneField: field,
