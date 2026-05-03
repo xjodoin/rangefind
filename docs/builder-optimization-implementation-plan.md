@@ -295,15 +295,18 @@ This keeps future generic fields from adding more full-corpus passes.
 - 50k builder-only run after bounding reducer worker code-store caches completed
   on 2026-05-03: 89.1s build time, 22.1s reducer time, 1.91 GB peak RSS,
   188.2 MB index, 180 files, 11 term packs, and 4 posting-block packs.
+- 100k builder-only run after bounding reducer worker code-store caches
+  completed on 2026-05-03: 190.9s build time, 60.9s reducer time, 2.17 GB peak
+  RSS, 351.2 MB index, 278 files, and 16 pack files.
 
 ### Acceptance Follow-Up
 
 - The implementation checklist is complete, but the 500k wall-time target is
   not met yet. The latest 500k full build is 2,277.4s versus the previous
   roughly 2,400s baseline, not the target 30 percent reduction.
-- The latest generic reducer fix is worker-safe external block packs. The next
-  acceptance step is rerunning reusable 100k and 500k frwiki builder/full
-  benches to quantify throughput and memory beyond the 50k validation point.
+- Worker-safe external block packs and bounded worker code-store caches now
+  validate at 50k and 100k. The next acceptance step is reducing the reducer
+  completion peak before rerunning the reusable 500k builder/full bench.
 
 ## Acceptance Targets
 

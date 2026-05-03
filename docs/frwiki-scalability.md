@@ -183,6 +183,11 @@ external posting blocks enabled and emitted 11 term packs plus 4 block packs.
 The run used bounded reducer worker code-store caches; the next validation
 point is the same path at 100k and 500k.
 
+Latest 100k builder-only validation on the same path: 190.9 seconds total build
+time, 60.9 seconds in `reduce-postings`, 278 output files, 351.2 MB index
+bytes, and 2.17 GB peak RSS. The remaining build-memory target is reducer
+completion/worker aggregation before the next 500k run.
+
 ## Local 50k Run
 
 Build command, reusing the cached 50k JSONL fixture:
