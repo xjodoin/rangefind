@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createPromotionGates } from "../scripts/bench_matrix.mjs";
+import { createDeferredReview, createPromotionGates } from "../scripts/bench_matrix.mjs";
 
 function fixture(label, family, p95Base) {
   return {
@@ -75,7 +75,30 @@ test("promotion gates promote cross-family wins without regressions", () => {
 test("promotion gates block runtime regressions", () => {
   const current = report(12, 35);
   const baseline = report(10, 20);
-  const gates = createPromotionGates(current, baseline);
+  const gates = createPromotionGates(current, baseline, { p95RegressionMinDeltaMs: 0 });
   assert.equal(gates.status, "blocked");
   assert.ok(gates.comparison.regressions.some(item => item.metric === "p95Ms"));
+});
+
+test("promotion gates ignore tiny timing noise when bytes and requests hold", () => {
+  const current = report(11, 21);
+  for (const fixture of current.fixtures) {
+    for (const row of fixture.rows) row.avgKb *= 0.9;
+  }
+  const baseline = report(10, 20);
+  const gates = createPromotionGates(current, baseline);
+  assert.equal(gates.status, "promote");
+  assert.equal(gates.comparison.regressions.length, 0);
+});
+
+test("deferred review watches sort overlays only after core promotion", () => {
+  const current = report(8, 18);
+  current.fixtures[1].rows[2].coldStats.blocksDecoded = 100;
+  current.fixtures[1].rows[2].coldStats.postingsDecoded = 12000;
+  const promoted = createPromotionGates(current, report(10, 20));
+  const review = createDeferredReview(current, promoted);
+  assert.equal(review.promotedCore, true);
+  assert.equal(review.decisions.find(item => item.kind === "term-sort-materialization").status, "watch-core-first");
+  assert.equal(review.decisions.find(item => item.kind === "champion-window").status, "not-recommended");
+  assert.equal(review.decisions.find(item => item.kind === "learned-sparse-import").status, "deferred");
 });

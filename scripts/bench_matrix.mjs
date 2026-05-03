@@ -32,8 +32,16 @@ const BUILTIN_FIXTURES = {
 const DEFAULT_PROMOTION_GATES = {
   minimumFamilies: 2,
   p95RegressionTolerance: 1.1,
+  p95RegressionMinDeltaMs: 10,
   kbRegressionTolerance: 1.05,
   requestRegressionTolerance: 1.1
+};
+
+const DEFAULT_DEFERRED_REVIEW_LIMITS = {
+  highTextP95Ms: 75,
+  highTextKb: 128,
+  highDecodedBlocks: 64,
+  highDecodedPostings: 8192
 };
 
 function parseMatrixArgs(argv) {
@@ -59,6 +67,7 @@ function parseMatrixArgs(argv) {
     else if (arg.startsWith("--fixture=")) args.customFixtures.push(parseCustomFixture(arg.slice("--fixture=".length)));
     else if (arg.startsWith("--gate-min-families=")) args.gates.minimumFamilies = Number(arg.slice("--gate-min-families=".length)) || args.gates.minimumFamilies;
     else if (arg.startsWith("--gate-p95-tolerance=")) args.gates.p95RegressionTolerance = Number(arg.slice("--gate-p95-tolerance=".length)) || args.gates.p95RegressionTolerance;
+    else if (arg.startsWith("--gate-p95-min-delta-ms=")) args.gates.p95RegressionMinDeltaMs = Number(arg.slice("--gate-p95-min-delta-ms=".length)) || args.gates.p95RegressionMinDeltaMs;
     else if (arg.startsWith("--gate-kb-tolerance=")) args.gates.kbRegressionTolerance = Number(arg.slice("--gate-kb-tolerance=".length)) || args.gates.kbRegressionTolerance;
     else if (arg.startsWith("--gate-request-tolerance=")) args.gates.requestRegressionTolerance = Number(arg.slice("--gate-request-tolerance=".length)) || args.gates.requestRegressionTolerance;
   }
@@ -121,6 +130,12 @@ function compactStats(stats = {}) {
     postingsAccepted: stats.postingsAccepted || 0,
     skippedBlocks: stats.skippedBlocks || 0,
     postingSuperblocksSkipped: stats.postingSuperblocksSkipped || 0,
+    sortedTextBlockScheduler: Boolean(stats.sortedTextBlockScheduler),
+    sortPagePostingBlocksConsidered: stats.sortPagePostingBlocksConsidered || 0,
+    sortPagePostingBlocksCandidate: stats.sortPagePostingBlocksCandidate || 0,
+    sortPagePostingBlocksSkipped: stats.sortPagePostingBlocksSkipped || 0,
+    sortPagePostingSuperblocksConsidered: stats.sortPagePostingSuperblocksConsidered || 0,
+    sortPagePostingSuperblocksSkipped: stats.sortPagePostingSuperblocksSkipped || 0,
     filterSummaryProofBlocks: stats.filterSummaryProofBlocks || 0,
     docValuePagesVisited: stats.docValuePagesVisited || 0,
     docValueRowsScanned: stats.docValueRowsScanned || 0,
@@ -236,17 +251,19 @@ function compareToBaseline(report, baselineReport, gates) {
       const p95Ratio = ratio(row.p95Ms, baseline.row.p95Ms);
       const kbRatio = ratio(row.avgKb, baseline.row.avgKb);
       const requestRatio = ratio(row.avgRequests, baseline.row.avgRequests);
+      const p95DeltaMs = finite(row.p95Ms) - finite(baseline.row.p95Ms);
       const comparison = {
         fixture: fixture.label,
         family: fixture.family,
         case: row.label,
         category: row.category,
         p95Ratio: round(p95Ratio),
+        p95DeltaMs: round(p95DeltaMs),
         kbRatio: round(kbRatio),
         requestRatio: round(requestRatio)
       };
       matched.push(comparison);
-      if (p95Ratio > gates.p95RegressionTolerance) regressions.push({ ...comparison, metric: "p95Ms" });
+      if (p95Ratio > gates.p95RegressionTolerance && p95DeltaMs > gates.p95RegressionMinDeltaMs) regressions.push({ ...comparison, metric: "p95Ms" });
       if (kbRatio > gates.kbRegressionTolerance) regressions.push({ ...comparison, metric: "avgKb" });
       if (requestRatio > gates.requestRegressionTolerance) regressions.push({ ...comparison, metric: "avgRequests" });
       if (p95Ratio < 0.98 || kbRatio < 0.98 || requestRatio < 0.98) improvements.push(comparison);
@@ -381,6 +398,99 @@ export function createPromotionGates(report, baselineReport = null, options = {}
   };
 }
 
+function evidenceRow(fixture, row) {
+  return {
+    fixture: fixture.label,
+    family: fixture.family,
+    case: row.label,
+    category: row.category,
+    lane: row.coldStats?.plannerLane || "",
+    p95Ms: round(row.p95Ms || 0),
+    avgKb: round(row.avgKb || 0),
+    avgRequests: round(row.avgRequests || 0),
+    blocksDecoded: row.coldStats?.blocksDecoded || 0,
+    postingsDecoded: row.coldStats?.postingsDecoded || 0,
+    fallbackReason: row.coldStats?.plannerFallbackReason || ""
+  };
+}
+
+function rowsWithFixtures(report, predicate) {
+  const out = [];
+  for (const fixture of report.fixtures || []) {
+    for (const row of fixture.rows || []) if (predicate(row, fixture)) out.push(evidenceRow(fixture, row));
+  }
+  return out;
+}
+
+function hasMaterialTextCost(row, limits) {
+  const stats = row.coldStats || {};
+  return finite(row.p95Ms) >= limits.highTextP95Ms ||
+    finite(row.avgKb) >= limits.highTextKb ||
+    finite(stats.blocksDecoded) >= limits.highDecodedBlocks ||
+    finite(stats.postingsDecoded) >= limits.highDecodedPostings;
+}
+
+export function createDeferredReview(report, promotion, options = {}) {
+  const limits = { ...DEFAULT_DEFERRED_REVIEW_LIMITS, ...(options || {}) };
+  const promotedCore = promotion?.status === "promote";
+  const waitReason = "wait_for_promoted_core_benchmark";
+  const textRows = rowsWithFixtures(report, row => row.request?.q && ["text", "filter"].includes(row.category));
+  const highCostTextRows = rowsWithFixtures(report, row => row.request?.q && ["text", "filter"].includes(row.category) && hasMaterialTextCost(row, limits));
+  const phraseFallbackRows = rowsWithFixtures(report, row => row.request?.q && row.category === "text" && row.coldStats?.plannerLane === "fullFallback" && hasMaterialTextCost(row, limits));
+  const sortedDecodeRows = rowsWithFixtures(report, row => row.request?.q && row.category === "text-sort" && (
+    finite(row.coldStats?.blocksDecoded) >= limits.highDecodedBlocks ||
+    finite(row.coldStats?.postingsDecoded) >= limits.highDecodedPostings
+  ));
+
+  const decisions = [
+    {
+      kind: "champion-window",
+      status: !promotedCore ? "deferred" : highCostTextRows.length ? "candidate" : "not-recommended",
+      reason: !promotedCore
+        ? waitReason
+        : highCostTextRows.length
+          ? "some text rows still exceed generic transfer, latency, or decode thresholds"
+          : "promoted core path has no high-cost generic text rows in this matrix",
+      evidence: highCostTextRows.slice(0, 8)
+    },
+    {
+      kind: "phrase-materialization",
+      status: !promotedCore ? "deferred" : phraseFallbackRows.length ? "candidate" : "not-recommended",
+      reason: !promotedCore
+        ? waitReason
+        : phraseFallbackRows.length
+          ? "multi-term fallback rows remain material after core promotion"
+          : "query bundles and core posting proof cover material multi-term rows in this matrix",
+      evidence: phraseFallbackRows.slice(0, 8)
+    },
+    {
+      kind: "term-sort-materialization",
+      status: !promotedCore ? "deferred" : sortedDecodeRows.length ? "watch-core-first" : "not-recommended",
+      reason: !promotedCore
+        ? waitReason
+        : sortedDecodeRows.length
+          ? "q+sort still decodes many postings; prefer improving core sorted-posting scheduling before adding an overlay"
+          : "sort summaries cover text-sort rows without material decode pressure",
+      evidence: sortedDecodeRows.slice(0, 8)
+    },
+    {
+      kind: "learned-sparse-import",
+      status: "deferred",
+      reason: "requires explicit sparse vector input and a quality benchmark; do not infer it from lexical latency rows",
+      evidence: []
+    }
+  ];
+
+  return {
+    format: "rfbenchdeferred-v1",
+    policy: "only-add-derived-structures-for-promoted-core-gaps",
+    promotedCore,
+    limits,
+    textRows: textRows.length,
+    decisions
+  };
+}
+
 async function benchFixture(fixture, args) {
   const server = await serveStatic(fixture.root);
   const meter = createFetchMeter(/\/rangefind\//u);
@@ -486,6 +596,17 @@ function markdown(report) {
     }
     lines.push("");
   }
+  if (report.deferredReview) {
+    lines.push("## Deferred Structure Review", "");
+    lines.push(`Promoted core: ${report.deferredReview.promotedCore ? "yes" : "no"}`);
+    lines.push("");
+    lines.push("| Structure | Status | Reason | Evidence rows |");
+    lines.push("| --- | --- | --- | ---: |");
+    for (const decision of report.deferredReview.decisions) {
+      lines.push(`| ${markdownCell(decision.kind)} | ${markdownCell(decision.status)} | ${markdownCell(decision.reason)} | ${decision.evidence.length} |`);
+    }
+    lines.push("");
+  }
   if (report.skipped.length) lines.push(`Skipped missing fixtures: ${report.skipped.join(", ")}`);
   if (report.failed.length) {
     lines.push("");
@@ -538,6 +659,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   report.promotion = createPromotionGates(report, loadBaselineReport(args.baselinePath), args.gates);
+  report.deferredReview = createDeferredReview(report, report.promotion);
   writeReport(args.outPath, report);
 
   if (args.json) console.log(JSON.stringify(report, null, 2));

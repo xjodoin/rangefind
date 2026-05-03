@@ -418,8 +418,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
   );
   assert.equal(sortedText.stats.plannerLane, "sortPageText");
   assert.equal(sortedText.stats.docValueSortText, true);
+  assert.equal(sortedText.stats.sortedTextBlockScheduler, true);
   assert.equal(sortedText.stats.topKProofSortAware, true);
   assert.ok(sortedText.stats.docValuePagesVisited < sortedText.stats.docValueDirectoryPages);
+  assert.ok(sortedText.stats.blocksDecoded <= sortedTextExact.stats.blocksDecoded);
+  assert.ok(sortedText.stats.sortPagePostingBlocksCandidate <= sortedText.stats.sortPagePostingBlocksConsidered);
 
   const pageTable = parseDocPagePointerPage(await readFile(join(output, manifest.docs.pages.pointers.file)), {
     packTable: manifest.docs.pages.pointers.pack_table

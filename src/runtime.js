@@ -1336,6 +1336,22 @@ export async function createSearch(options = {}) {
     return out;
   }
 
+  async function decodeEntryBlocks(shard, entry, blockIndexes) {
+    const indexes = [...new Set(blockIndexes || [])].filter(index => index >= 0 && index < (entry.blocks?.length || 0));
+    if (!indexes.length) return [];
+    if (entry.external) {
+      await loadPostingBlockBatch(indexes.map(blockIndex => ({ entry, blockIndex })));
+      return Promise.all(indexes.map(async blockIndex => ({
+        blockIndex,
+        rows: await entry.blockPostings.get(blockIndex) || new Int32Array(0)
+      })));
+    }
+    return indexes.map(blockIndex => ({
+      blockIndex,
+      rows: decodePostingBlock(shard, entry, blockIndex)
+    }));
+  }
+
   function makeDocFilterPlan(filters) {
     const facets = Object.entries(filters.facets || {})
       .map(([field, values]) => [field, selectedFacetCodes(manifest, field, new Set(values))])
@@ -1645,6 +1661,58 @@ export async function createSearch(options = {}) {
     ));
   }
 
+  function mergeSortPageFilter(filters, field, page) {
+    const numbers = { ...(filters.numbers || {}) };
+    const current = numbers[field] || {};
+    const fieldMeta = numberFields.get(field);
+    const currentMin = normalizeRangeValue(current.min, fieldMeta);
+    const currentMax = normalizeRangeValue(current.max, fieldMeta);
+    const pageMin = Number.isFinite(page?.min) ? page.min : null;
+    const pageMax = Number.isFinite(page?.max) ? page.max : null;
+    const min = currentMin == null ? pageMin : pageMin == null ? currentMin : Math.max(currentMin, pageMin);
+    const max = currentMax == null ? pageMax : pageMax == null ? currentMax : Math.min(currentMax, pageMax);
+    numbers[field] = { min, max };
+    return {
+      facets: filters.facets || {},
+      numbers,
+      booleans: filters.booleans || {}
+    };
+  }
+
+  function sortedTextCandidateBlockIndexes(entry, filterPlan) {
+    const indexes = [];
+    let consideredBlocks = 0;
+    let skippedBlocks = 0;
+    let consideredSuperblocks = 0;
+    let skippedSuperblocks = 0;
+    const blocks = entry.blocks || [];
+    const superblocks = entry.superblocks || [];
+    if (superblocks.length) {
+      for (const superblock of superblocks) {
+        consideredSuperblocks++;
+        const first = Math.max(0, superblock.firstBlock || 0);
+        const end = Math.min(blocks.length, first + (superblock.blockCount || 0));
+        if (!blockMayPass(superblock, filterPlan)) {
+          skippedSuperblocks++;
+          skippedBlocks += Math.max(0, end - first);
+          continue;
+        }
+        for (let blockIndex = first; blockIndex < end; blockIndex++) {
+          consideredBlocks++;
+          if (blockMayPass(blocks[blockIndex], filterPlan)) indexes.push(blockIndex);
+          else skippedBlocks++;
+        }
+      }
+      return { indexes, consideredBlocks, skippedBlocks, consideredSuperblocks, skippedSuperblocks };
+    }
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+      consideredBlocks++;
+      if (blockMayPass(blocks[blockIndex], filterPlan)) indexes.push(blockIndex);
+      else skippedBlocks++;
+    }
+    return { indexes, consideredBlocks, skippedBlocks, consideredSuperblocks, skippedSuperblocks };
+  }
+
   function compareKnownSortRows(a, b, sortPlan, sortValues) {
     const left = sortValues.get(a[0]);
     const right = sortValues.get(b[0]);
@@ -1758,22 +1826,6 @@ export async function createSearch(options = {}) {
       });
     }
 
-    const scores = new Map();
-    const hits = new Map();
-    let postingsDecoded = 0;
-    let blocksDecoded = 0;
-    for (const { term, shard, entry } of entries) {
-      const postings = await decodeEntryPostings(shard, entry);
-      const isBase = baseSet.has(term);
-      blocksDecoded += entry.blocks?.length || 0;
-      postingsDecoded += postings.length / 2;
-      for (let i = 0; i < postings.length; i += 2) {
-        const doc = postings[i];
-        scores.set(doc, (scores.get(doc) || 0) + postings[i + 1]);
-        if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
-      }
-    }
-
     const offset = (page - 1) * size;
     const k = offset + size;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
@@ -1782,9 +1834,17 @@ export async function createSearch(options = {}) {
     const candidatePages = sortedDirectoryPages(directory, desc, docFilterPlan);
     const collected = [];
     const sortValues = new Map();
+    const decodedBlocks = new Set();
     let pagesVisited = 0;
     let rowsScanned = 0;
     let rowsAccepted = 0;
+    let blocksDecoded = 0;
+    let postingsDecoded = 0;
+    let candidatePostingBlocks = 0;
+    let skippedPostingBlocks = 0;
+    let consideredPostingBlocks = 0;
+    let consideredPostingSuperblocks = 0;
+    let skippedPostingSuperblocks = 0;
     let definitelyPassedPages = 0;
     let stoppedBySortBound = false;
 
@@ -1799,12 +1859,46 @@ export async function createSearch(options = {}) {
       const codeData = definite || !filterFields.length
         ? null
         : await valueStoreForDocs(filterFields, rows.map(row => row.doc));
+      const candidateDocs = new Set();
+      const pageScores = new Map();
+      const pageHits = new Map();
 
       for (const row of rows) {
-        const score = scores.get(row.doc);
-        if (score == null || (hits.get(row.doc) || 0) < Math.max(1, minShouldMatch)) continue;
         const known = { [field]: row.value };
         if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+        candidateDocs.add(row.doc);
+      }
+
+      if (candidateDocs.size) {
+        const pageBlockFilterPlan = makeBlockFilterPlan(mergeSortPageFilter(filters, field, candidatePage));
+        for (const { term, shard, shardName, entry } of entries) {
+          const isBase = baseSet.has(term);
+          const candidates = sortedTextCandidateBlockIndexes(entry, pageBlockFilterPlan);
+          candidatePostingBlocks += candidates.indexes.length;
+          consideredPostingBlocks += candidates.consideredBlocks;
+          skippedPostingBlocks += candidates.skippedBlocks;
+          consideredPostingSuperblocks += candidates.consideredSuperblocks;
+          skippedPostingSuperblocks += candidates.skippedSuperblocks;
+          for (const { blockIndex, rows: postings } of await decodeEntryBlocks(shard, entry, candidates.indexes)) {
+            const blockKey = `${shardName}\u0000${term}\u0000${blockIndex}`;
+            if (!decodedBlocks.has(blockKey)) {
+              decodedBlocks.add(blockKey);
+              blocksDecoded++;
+              postingsDecoded += postings.length / 2;
+            }
+            for (let i = 0; i < postings.length; i += 2) {
+              const doc = postings[i];
+              if (!candidateDocs.has(doc)) continue;
+              pageScores.set(doc, (pageScores.get(doc) || 0) + postings[i + 1]);
+              if (isBase) pageHits.set(doc, (pageHits.get(doc) || 0) + 1);
+            }
+          }
+        }
+      }
+
+      for (const row of rows) {
+        const score = pageScores.get(row.doc);
+        if (score == null || (pageHits.get(row.doc) || 0) < Math.max(1, minShouldMatch)) continue;
         sortValues.set(row.doc, row.sortValue);
         collected.push([row.doc, score]);
         rowsAccepted++;
@@ -1842,7 +1936,13 @@ export async function createSearch(options = {}) {
         blocksDecoded,
         postingsDecoded,
         postingsAccepted: rowsAccepted,
-        skippedBlocks: 0,
+        skippedBlocks: skippedPostingBlocks,
+        sortedTextBlockScheduler: true,
+        sortPagePostingBlocksConsidered: consideredPostingBlocks,
+        sortPagePostingBlocksCandidate: candidatePostingBlocks,
+        sortPagePostingBlocksSkipped: skippedPostingBlocks,
+        sortPagePostingSuperblocksConsidered: consideredPostingSuperblocks,
+        sortPagePostingSuperblocksSkipped: skippedPostingSuperblocks,
         docValueSortText: true,
         docValuePruning: true,
         docValuePruneField: field,

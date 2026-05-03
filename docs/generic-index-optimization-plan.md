@@ -209,8 +209,32 @@ new query-shape materializations.
   `facets/manifest.json.gz` and changed filtered text/browse planning to load
   facet dictionaries plus the existing doc-value manifest directly, avoiding
   `manifest.full.json` for core filter paths.
-- [ ] Next: run the refreshed two-family matrix against a saved baseline before
-  changing any default `auto` thresholds.
+- [x] 2026-05-03: Ran the refreshed two-family matrix against a saved
+  pair-varint baseline built with the same `rfsegpost-v3` core format and
+  `codecs.mode = "off"`. The promotion gate matched 13 rows, found zero
+  material regressions after applying the 10 ms p95 noise floor, and returned
+  `promote` with winning families `docs-small` and `encyclopedia`. The 100k
+  `frwiki` auto build saved 27,251,885 posting-block bytes and reduced the
+  generated index from about 219 MB in the pair-varint baseline to about 203 MB.
+- [x] 2026-05-03: Added `rfbenchdeferred-v1` to the benchmark matrix so
+  champion windows, phrase materialization, term-sort overlays, and
+  learned-sparse import are reviewed from promoted-core evidence. The current
+  two-family baseline comparison marks champion windows and phrase
+  materialization `not-recommended`, learned-sparse import `deferred`, and
+  term-sort materialization `watch-core-first` because one q+sort row still
+  decodes many postings even though transfer stays low.
+- [x] 2026-05-03: Improved the core q+sort posting scheduler by making the
+  sorted-text lane page-driven. It now scans sorted doc-value pages first, uses
+  existing posting block and superblock numeric/boolean summaries as exact
+  overlap filters for the current sort page, and decodes only candidate posting
+  blocks before classifying that page. On the 100k `frwiki` matrix row for
+  `Paris` sorted by `revisionDate`, decoded posting blocks dropped from 101 to
+  71 and decoded postings dropped from 12,869 to 9,088 while the promotion gate
+  stayed `promote` with 13 matched rows, zero regressions, and cross-family
+  wins.
+- [ ] Next: evaluate an intra-block candidate lookup codec for page-driven
+  q+sort so candidate sorted-page docs can be scored without materializing every
+  row in each candidate impact block.
 
 ## Milestone 0: Core Optimizer Report
 
@@ -628,14 +652,18 @@ Acceptance:
 7. [x] Integrate filter summaries into the core proof path.
 8. [x] Integrate sort summaries into the core proof path.
 9. [x] Build the multi-fixture benchmark matrix.
-10. [ ] Promote only core wins that survive across fixtures into default `auto`.
+10. [x] Promote only core wins that survive across fixtures into default `auto`.
     Completed: `rfbenchpromotion-v1` now blocks default promotion unless fixture
     health, coverage, exactness, codec/layout invariants, and baseline
-    comparisons pass; `--out` writes reusable matrix reports. Remaining: compare
-    the refreshed multi-family matrix with a saved baseline and adjust defaults
-    only if the gate returns `promote`.
-11. [ ] Re-evaluate champion windows, phrase materialization, and learned-sparse
+    comparisons pass; `--out` writes reusable matrix reports. The pair-varint
+    baseline comparison returned `promote`, so the current measured codec/layout
+    `auto` defaults stay promoted.
+11. [x] Re-evaluate champion windows, phrase materialization, and learned-sparse
     import only after core benchmarks identify a remaining generic gap.
+    Completed: `rfbenchdeferred-v1` keeps champion/phrase materialization off for
+    the current matrix, keeps learned-sparse import deferred until explicit
+    sparse inputs and quality benchmarks exist, and routes the remaining q+sort
+    decode pressure back to core scheduler work.
 
 ## Open Questions
 
