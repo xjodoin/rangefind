@@ -254,6 +254,9 @@ Field rows are captured in the same scan pass through the typed
 and filter bitmaps now consume the same typed row source. Numeric, date,
 boolean, single facet, and multi-facet rows are therefore extracted once during
 scan instead of re-reading the source corpus for every downstream artifact.
+Reducer workers use `codeStoreWorkerCacheChunks` to cap their file-backed
+field-row caches independently from the main build process, which keeps worker
+parallelism from multiplying the full main-thread code-store cache.
 
 The final pack writer still emits immutable range-pack objects in deterministic
 term order, and externalizes large posting blocks into `terms/block-packs/`.

@@ -289,8 +289,12 @@ This keeps future generic fields from adding more full-corpus passes.
   packs and posting-block packs while preserving search correctness.
 - 50k builder-only run after worker-safe external block packs completed on
   2026-05-03: 91.3s build time, 22.4s reducer time, 2.10 GB peak RSS, 188.2 MB
-  index, 180 files, 11 pack files. This improves reducer wall time materially
-  versus the previous 45.1s reducer note, while peak RSS needs follow-up tuning.
+  index, 180 files, 11 pack files. This improved reducer wall time materially
+  versus the previous 45.1s reducer note, but showed that worker cache memory
+  needed a tighter bound.
+- 50k builder-only run after bounding reducer worker code-store caches completed
+  on 2026-05-03: 89.1s build time, 22.1s reducer time, 1.91 GB peak RSS,
+  188.2 MB index, 180 files, 11 term packs, and 4 posting-block packs.
 
 ### Acceptance Follow-Up
 

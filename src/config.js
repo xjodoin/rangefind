@@ -44,6 +44,7 @@ export const DEFAULTS = {
   blockFilterMaxFacetWords: 64,
   codeStoreCacheDocs: 16384,
   codeStoreCacheChunks: 64,
+  codeStoreWorkerCacheChunks: 8,
   docLayoutSortChunkDocs: 100000,
   scanWorkers: 1,
   scanBatchDocs: 128,

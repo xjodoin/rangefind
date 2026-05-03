@@ -19,6 +19,7 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.builderWorkerCount, 1);
   assert.equal(config.partitionReducerWorkers, 0);
   assert.equal(config.builderMemoryBudgetBytes, 0);
+  assert.equal(config.codeStoreWorkerCacheChunks, 8);
   assert.equal(config.segmentFlushDocs, 0);
   assert.equal(config.segmentFlushBytes, 0);
   assert.equal(config.segmentMergePolicy, "tiered-log");

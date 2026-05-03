@@ -4,7 +4,7 @@ import { performance } from "node:perf_hooks";
 import { gzipSync } from "node:zlib";
 import { openCodeStore } from "./build_store.js";
 import { buildPostingSegment, POSTING_SEGMENT_FORMAT } from "./codec.js";
-import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard } from "./packs.js";
+import { createAppendOnlyPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard } from "./packs.js";
 import { postingRowCount } from "./posting_rows.js";
 
 let activeCodes = null;
@@ -44,7 +44,7 @@ function termWriterFor(outDir, targetBytes, indexCounter) {
 function blockWriterFor(config, outDir, targetBytes, indexCounter) {
   if (config.externalPostingBlocks === false) return null;
   mkdirSync(outDir, { recursive: true });
-  if (!activeBlockWriter) activeBlockWriter = createPackWriter(outDir, targetBytes, { indexCounter });
+  if (!activeBlockWriter) activeBlockWriter = createAppendOnlyPackWriter(outDir, targetBytes, { indexCounter });
   return activeBlockWriter;
 }
 

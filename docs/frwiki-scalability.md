@@ -177,11 +177,11 @@ run moved time between ingestion, posting reduction, query bundles, typo
 reduction, document packs, and doc pages.
 
 Latest 50k builder-only worker-reducer sanity run, reusing the cached JSONL:
-91.3 seconds total build time, 22.4 seconds in `reduce-postings`, 180 output
-files, 188.2 MB index bytes, and 2.10 GB peak RSS. Reducer workers kept
+89.1 seconds total build time, 22.1 seconds in `reduce-postings`, 180 output
+files, 188.2 MB index bytes, and 1.91 GB peak RSS. Reducer workers kept
 external posting blocks enabled and emitted 11 term packs plus 4 block packs.
-The next validation point is the same path at 100k and 500k, with peak RSS
-tuning still open.
+The run used bounded reducer worker code-store caches; the next validation
+point is the same path at 100k and 500k.
 
 ## Local 50k Run
 

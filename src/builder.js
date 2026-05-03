@@ -1148,6 +1148,15 @@ function partitionReducerWorkerCount(config) {
   return Math.max(1, explicit || fallback);
 }
 
+function codeStoreDescriptorForPartitionWorkers(codes, config) {
+  const descriptor = codes.descriptor();
+  const cacheChunks = Math.max(1, Math.floor(Number(config.codeStoreWorkerCacheChunks || descriptor.cacheChunks || 1)));
+  return {
+    ...descriptor,
+    cacheChunks
+  };
+}
+
 function scanBatchDocs(config) {
   return Math.max(1, Math.floor(Number(config.scanBatchDocs || 128)));
 }
@@ -1555,12 +1564,13 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
   const directorySpool = createDirectoryEntrySpool(resolve(dirs.out, "_build", "terms-directory.run"));
   const blockPackWriter = usePartitionWorkers || config.externalPostingBlocks === false
     ? null
-    : createPackWriter(resolve(dirs.out, "terms", "block-packs"), config.postingBlockPackBytes);
+    : createAppendOnlyPackWriter(resolve(dirs.out, "terms", "block-packs"), config.postingBlockPackBytes);
   const finalShards = new Set();
   const blockStats = emptyPostingSegmentStats();
   const bundleDfs = new Map();
   const bundleTermSet = new Set(runData.queryBundleTerms || []);
   let partitionOutput = { packs: [], packBytes: 0, blockPacks: [], blockPackBytes: 0 };
+  const workerCodesDescriptor = usePartitionWorkers ? codeStoreDescriptorForPartitionWorkers(runData.codes, config) : null;
   let typoIndexTerms = 0;
   let stats;
   try {
@@ -1577,7 +1587,7 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
         if (usePartitionWorkers) {
           const result = await partitionPool.reduce(partition, {
             config,
-            codesDescriptor: runData.codes.descriptor(),
+            codesDescriptor: workerCodesDescriptor,
             filters,
             termsOutDir: resolve(dirs.out, "terms", "packs"),
             blockOutDir: resolve(dirs.out, "terms", "block-packs"),
