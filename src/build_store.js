@@ -50,13 +50,14 @@ function createReader(descriptor, openMode) {
     ...field,
     fd: openSync(field.path, openMode),
     indexFd: field.kind === "facet" ? openSync(field.indexPath, openMode) : null,
-    cache: null,
+    cache: new Map(),
     bytesPerDoc: field.bytesPerDoc || bytesPerDoc(field),
     offset: 0
   }));
   const byName = new Map(fields.map(field => [field.name, field]));
   const total = descriptor.total;
   const cacheDocs = Math.max(1, Math.floor(Number(descriptor.cacheDocs || 16384)));
+  const cacheChunks = Math.max(1, Math.floor(Number(descriptor.cacheChunks || 1)));
 
   function fieldFor(name) {
     const field = byName.get(name);
@@ -88,6 +89,30 @@ function createReader(descriptor, openMode) {
     return { codes };
   }
 
+  function readFacetChunk(field, start, count) {
+    const out = new Array(count);
+    for (let row = 0; row < count; row++) out[row] = readFacetValue(field, start + row);
+    return out;
+  }
+
+  function cacheGet(field, chunkIndex, createValue) {
+    if (field.cache.has(chunkIndex)) {
+      const value = field.cache.get(chunkIndex);
+      field.cache.delete(chunkIndex);
+      field.cache.set(chunkIndex, value);
+      return value;
+    }
+    const start = chunkIndex * cacheDocs;
+    const count = Math.min(cacheDocs, total - start);
+    const value = createValue(start, count);
+    field.cache.set(chunkIndex, value);
+    while (field.cache.size > cacheChunks) {
+      const oldest = field.cache.keys().next().value;
+      field.cache.delete(oldest);
+    }
+    return value;
+  }
+
   return {
     format: CODE_STORE_FORMAT,
     _fieldRecords: fields,
@@ -97,23 +122,20 @@ function createReader(descriptor, openMode) {
     get(name, doc) {
       if (doc < 0 || doc >= total) return null;
       const field = fieldFor(name);
-      if (field.kind === "facet") return readFacetValue(field, doc);
-      const cache = field.cache;
-      if (!cache || doc < cache.start || doc >= cache.start + cache.count) {
-        const start = Math.floor(doc / cacheDocs) * cacheDocs;
-        const count = Math.min(cacheDocs, total - start);
-        field.cache = { start, count, buffer: readRange(field, start, count) };
-      }
-      return readValue(field.cache.buffer, field, doc - field.cache.start);
+      const chunkIndex = Math.floor(doc / cacheDocs);
+      const chunk = cacheGet(field, chunkIndex, (start, count) => field.kind === "facet"
+        ? { start, count, values: readFacetChunk(field, start, count) }
+        : { start, count, buffer: readRange(field, start, count) });
+      return field.kind === "facet"
+        ? chunk.values[doc - chunk.start]
+        : readValue(chunk.buffer, field, doc - chunk.start);
     },
     chunk(name, start, count) {
       const field = fieldFor(name);
       const safeStart = Math.max(0, Math.min(total, start));
       const safeCount = Math.max(0, Math.min(count, total - safeStart));
       if (field.kind === "facet") {
-        const out = new Array(safeCount);
-        for (let row = 0; row < safeCount; row++) out[row] = readFacetValue(field, safeStart + row);
-        return out;
+        return readFacetChunk(field, safeStart, safeCount);
       }
       const buffer = readRange(field, safeStart, safeCount);
       const out = new Array(safeCount);
@@ -124,7 +146,8 @@ function createReader(descriptor, openMode) {
       return {
         ...descriptor,
         dicts: undefined,
-        fields: fields.map(({ fd, indexFd, cache, offset, ...field }) => ({ ...field }))
+        fields: fields.map(({ fd, indexFd, cache, offset, ...field }) => ({ ...field })),
+        cacheChunks
       };
     },
     close() {
@@ -164,6 +187,7 @@ export function createCodeStore(outDir, config, total, dicts, options = {}) {
     format: CODE_STORE_FORMAT,
     total,
     cacheDocs: Math.max(1, Math.floor(Number(options.cacheDocs || config.codeStoreCacheDocs || 16384))),
+    cacheChunks: Math.max(1, Math.floor(Number(options.cacheChunks || config.codeStoreCacheChunks || 8))),
     fields,
     dicts
   };

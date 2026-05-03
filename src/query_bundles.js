@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
+import { summarizeBlockFilters } from "./codec.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { buildQueryBundle, QUERY_BUNDLE_FORMAT } from "./query_bundle_codec.js";
@@ -76,6 +77,67 @@ function bundleFromHeap(seed, heap, total, maxRows) {
   };
 }
 
+function bundleRowGroups(rows, rowGroupSize, filters, codes) {
+  const size = Math.max(1, Math.floor(Number(rowGroupSize || 16)));
+  const groups = [];
+  for (let rowStart = 0; rowStart < rows.length; rowStart += size) {
+    const slice = rows.slice(rowStart, rowStart + size);
+    let docMin = Infinity;
+    let docMax = -Infinity;
+    let scoreMin = Infinity;
+    let scoreMax = -Infinity;
+    for (const row of slice) {
+      docMin = Math.min(docMin, row.doc);
+      docMax = Math.max(docMax, row.doc);
+      scoreMin = Math.min(scoreMin, row.score);
+      scoreMax = Math.max(scoreMax, row.score);
+    }
+    groups.push({
+      rowStart,
+      rowCount: slice.length,
+      scoreMax: Number.isFinite(scoreMax) ? scoreMax : 0,
+      scoreMin: Number.isFinite(scoreMin) ? scoreMin : 0,
+      docMin: Number.isFinite(docMin) ? docMin : 0,
+      docMax: Number.isFinite(docMax) ? docMax : 0,
+      filters: summarizeBlockFilters(filters || [], codes, slice.map(row => row.doc))
+    });
+  }
+  return groups;
+}
+
+function docRuns(docs) {
+  const runs = [];
+  for (const doc of docs) {
+    const last = runs[runs.length - 1];
+    if (last && doc === last.start + last.count) last.count++;
+    else runs.push({ start: doc, count: 1 });
+  }
+  return runs;
+}
+
+function createFilterCodeCache(filters, codes, bundles) {
+  if (!filters?.length || !codes) return codes;
+  const docs = [...new Set((bundles || []).flatMap(bundle => bundle.rows.map(row => row.doc)))].sort((a, b) => a - b);
+  if (!docs.length) return codes;
+  const runs = docRuns(docs);
+  const byField = new Map();
+  for (const filter of filters) {
+    const values = new Map();
+    for (const run of runs) {
+      const rows = typeof codes.chunk === "function"
+        ? codes.chunk(filter.name, run.start, run.count)
+        : Array.from({ length: run.count }, (_, index) => codes.get(filter.name, run.start + index));
+      rows.forEach((value, index) => values.set(run.start + index, value));
+    }
+    byField.set(filter.name, values);
+  }
+  return {
+    get(name, doc) {
+      return byField.get(name)?.get(doc) ?? null;
+    }
+  };
+}
+
 export function createQueryBundleCollector(seeds, maxRows) {
   return {
     seedMap: new Map(seeds.map(seed => [seed.key, seed])),
@@ -110,12 +172,18 @@ export function writeQueryBundleObjects(options) {
     outDir,
     config,
     bundles,
-    coverage = "all-base-docs"
+    coverage = "all-base-docs",
+    filters = [],
+    codes = null
   } = options;
   const packWriter = createPackWriter(resolve(outDir, "bundles", "packs"), config.queryBundlePackBytes || config.packBytes);
+  const filterCodes = createFilterCodeCache(filters, codes, bundles);
   const entries = [];
   for (const bundle of bundles || []) {
-    const buffer = buildQueryBundle(bundle);
+    const buffer = buildQueryBundle({
+      ...bundle,
+      rowGroups: bundleRowGroups(bundle.rows, config.queryBundleRowGroupSize, filters, filterCodes)
+    }, { block_filters: filters });
     const entry = writePackedShard(packWriter, bundle.key, gzipSync(buffer, { level: 6 }), {
       kind: "query-bundle",
       codec: QUERY_BUNDLE_FORMAT,
@@ -136,6 +204,8 @@ export function writeQueryBundleObjects(options) {
     format: QUERY_BUNDLE_FORMAT,
     coverage,
     max_rows: Math.max(1, Math.floor(Number(config.queryBundleMaxRows || 64))),
+    row_group_size: Math.max(1, Math.floor(Number(config.queryBundleRowGroupSize || 16))),
+    row_group_filter_fields: filters.length,
     keys: entries.length,
     directory,
     packs: packWriter.packs,

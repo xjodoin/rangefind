@@ -9,6 +9,7 @@ test("file-backed build code store reads random values and chunks without heap a
   const root = mkdtempSync(join(tmpdir(), "rangefind-codes-"));
   const config = {
     codeStoreCacheDocs: 2,
+    codeStoreCacheChunks: 2,
     facets: [{ name: "tags" }],
     numbers: [{ name: "year" }, { name: "rating", type: "double" }],
     booleans: [{ name: "featured" }]
@@ -39,6 +40,7 @@ test("file-backed build code store reads random values and chunks without heap a
     assert.equal(store.get("year", 1), null);
     assert.equal(store.get("rating", 2), 2.25);
     assert.equal(store.get("featured", 1), false);
+    assert.equal(store.descriptor().cacheChunks, 2);
 
     const reopened = openCodeStore(store.descriptor());
     try {

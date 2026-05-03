@@ -1,4 +1,4 @@
-export const TERM_SHARD_MAGIC = [0x52, 0x46, 0x53, 0x42]; // RFSB
+export const POSTING_SEGMENT_MAGIC = [0x52, 0x46, 0x50, 0x53]; // RFPS
 export const DIRECTORY_ROOT_MAGIC = [0x52, 0x46, 0x44, 0x52]; // RFDR
 export const DIRECTORY_PAGE_MAGIC = [0x52, 0x46, 0x44, 0x50]; // RFDP
 export const CODE_MAGIC = [0x52, 0x46, 0x43, 0x42]; // RFCB
@@ -13,6 +13,7 @@ export const DOC_VALUE_SORT_DIRECTORY_MAGIC = [0x52, 0x46, 0x44, 0x54]; // RFDT
 export const DOC_VALUE_SORT_PAGE_MAGIC = [0x52, 0x46, 0x44, 0x56]; // RFDV
 export const QUERY_BUNDLE_MAGIC = [0x52, 0x46, 0x51, 0x42]; // RFQB
 export const AUTHORITY_SHARD_MAGIC = [0x52, 0x46, 0x41, 0x55]; // RFAU
+export const TYPO_LEXICON_MAGIC = [0x52, 0x46, 0x54, 0x4c]; // RFTL
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));

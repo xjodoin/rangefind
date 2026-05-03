@@ -6,15 +6,14 @@ import {
   buildCodesFile,
   buildDocValueChunk,
   buildFacetDictionary,
-  buildTermShard,
+  buildPostingSegment,
   docValueFields,
   decodePostingBytes,
   decodePostings,
   parseCodes,
   parseDocValueChunk,
   parseFacetDictionary,
-  parseShard,
-  rewriteTermShardForExternalBlocks
+  parsePostingSegment
 } from "../src/codec.js";
 import {
   buildPagedDirectory,
@@ -27,7 +26,7 @@ import { buildQueryBundle, parseQueryBundle } from "../src/query_bundle_codec.js
 
 const checksum = { algorithm: "sha256", value: "a".repeat(64) };
 
-test("term shard codec round-trips postings and block filters", () => {
+test("posting segment codec round-trips postings and block filters", () => {
   const config = {
     facets: [{ name: "category" }],
     numbers: [{ name: "year" }],
@@ -43,17 +42,22 @@ test("term shard codec round-trips postings and block filters", () => {
     featured: [false, true, null]
   };
   const filters = buildBlockFilters(config, dicts);
-  const buffer = buildTermShard([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
-  const shard = parseShard(buffer, { block_filters: filters });
+  const segment = buildPostingSegment([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
   const entry = shard.terms.get("search");
+  assert.equal(segment.format, "rfsegpost-v1");
+  assert.equal(shard.format, "rfsegpost-v1");
+  assert.equal(entry.format, "rfsegpost-v1");
   assert.equal(entry.count, 3);
+  assert.equal(entry.blocks[0].rowCount, 2);
+  assert.equal(entry.blocks[1].rowCount, 1);
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0).sort(), [0, 1, 2]);
   assert.deepEqual(entry.blocks[0].filters.category.words, [2]);
   assert.deepEqual(entry.blocks[0].filters.year, { min: -5, max: 0 });
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 2 });
 });
 
-test("term shard codec can externalize posting blocks", () => {
+test("posting segment codec writes external posting blocks directly", () => {
   const config = {
     facets: [],
     numbers: [{ name: "year" }],
@@ -67,36 +71,39 @@ test("term shard codec can externalize posting blocks", () => {
     year: [-1, 0, 1],
     featured: [false, false, true]
   };
-  const buffer = buildTermShard([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
   const stored = [];
-  const rewritten = rewriteTermShardForExternalBlocks(buffer, { block_filters: filters }, config, ({ bytes }) => {
+  const segment = buildPostingSegment([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config, ({ bytes }) => {
     stored.push(bytes);
     return {
       pack: "0000.bin",
       offset: stored.length * 10,
       length: bytes.length,
       logicalLength: bytes.length,
-      checksum: { algorithm: "sha256", value: "0".repeat(64) }
+      checksum
     };
   });
-  const shard = parseShard(rewritten.buffer, {
+  const shard = parsePostingSegment(segment.buffer, {
     block_filters: filters,
-    stats: { posting_block_storage: "range-pack-v1" },
     object_store: {
       pointer_format: "rfbp-v1",
       pack_table: { postingBlocks: ["0000.immutable.bin"] }
     }
   });
   const entry = shard.terms.get("search");
+  assert.equal(segment.format, "rfsegpost-v1");
   assert.equal(entry.external, true);
   assert.equal(entry.blocks.length, 2);
+  assert.equal(entry.blocks[0].rowCount, 2);
+  assert.equal(entry.blocks[1].rowCount, 1);
   assert.equal(entry.blocks[0].range.pack, "0000.immutable.bin");
   assert.equal(entry.blocks[0].range.logicalLength, 4);
-  assert.equal(entry.blocks[0].range.checksum.value, "0".repeat(64));
+  assert.equal(entry.blocks[0].range.checksum.value, checksum.value);
   assert.deepEqual(entry.blocks[0].filters.year, { min: -1, max: 0 });
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 1 });
   assert.deepEqual([...decodePostingBytes(stored[0])], [0, 13, 1, 11]);
-  assert.equal(rewritten.stats.externalBlocks, 2);
+  assert.equal(segment.stats.externalBlocks, 2);
+  assert.equal(segment.stats.externalTerms, 1);
+  assert.equal(segment.stats.inlinePostingBytes, 0);
 });
 
 test("query bundle codec round-trips proof metadata and rows", () => {
@@ -108,7 +115,8 @@ test("query bundle codec round-trips proof metadata and rows", () => {
     complete: false,
     nextScoreBound: 41,
     nextTieDoc: 812,
-    rows: [{ doc: 2062, score: 50 }, { doc: 9405, score: 44 }]
+    rows: [{ doc: 2062, score: 50 }, { doc: 9405, score: 44 }],
+    rowGroups: [{ rowStart: 0, rowCount: 2, scoreMax: 50, scoreMin: 44, docMin: 2062, docMax: 9405 }]
   }));
   assert.equal(bundle.key, "exact-expanded-v1|chang climat");
   assert.deepEqual(bundle.baseTerms, ["chang", "climat"]);
@@ -118,6 +126,7 @@ test("query bundle codec round-trips proof metadata and rows", () => {
   assert.equal(bundle.nextScoreBound, 41);
   assert.equal(bundle.nextTieDoc, 812);
   assert.deepEqual(bundle.rows, [[2062, 50], [9405, 44]]);
+  assert.deepEqual(bundle.rowGroups, [{ rowStart: 0, rowCount: 2, scoreMax: 50, scoreMin: 44, docMin: 2062, docMax: 9405, filters: {} }]);
 });
 
 test("authority shard codec round-trips exact and token rows", () => {

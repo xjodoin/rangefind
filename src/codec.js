@@ -2,7 +2,7 @@ import {
   CODE_MAGIC,
   DOC_VALUE_MAGIC,
   FACET_DICT_MAGIC,
-  TERM_SHARD_MAGIC,
+  POSTING_SEGMENT_MAGIC,
   fixedWidth,
   pushVarint,
   readFixedInt,
@@ -21,6 +21,8 @@ const DOC_VALUE_FORMAT_VERSION = 2;
 const DOC_VALUE_ENCODING_DENSE = 0;
 const DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 const FACET_DICT_FORMAT_VERSION = 1;
+export const POSTING_SEGMENT_FORMAT = "rfsegpost-v1";
+const POSTING_SEGMENT_FORMAT_VERSION = 1;
 const MAX_SUMMARY_FACET_WORDS = 64;
 
 export function assertMagic(bytes, magic, message) {
@@ -136,7 +138,7 @@ function objectPackFileFromIndex(index, manifest, kind) {
   return table[index] || packFileFromIndex(index);
 }
 
-function writeBlockFilterSummary(out, filters, summary) {
+export function writeBlockFilterSummary(out, filters, summary) {
   for (let i = 0; i < filters.length; i++) {
     const filter = filters[i];
     const item = Array.isArray(summary) ? summary[i] : summary?.[filter.name];
@@ -156,7 +158,7 @@ function writeBlockFilterSummary(out, filters, summary) {
   }
 }
 
-function readBlockFilterSummary(bytes, state, manifest) {
+export function readBlockFilterSummary(bytes, state, manifest) {
   const filters = {};
   for (const filter of manifest.block_filters || []) {
     if (filter.kind === "facet") {
@@ -176,6 +178,12 @@ function readBlockFilterSummary(bytes, state, manifest) {
     }
   }
   return filters;
+}
+
+export function summarizeBlockFilters(filters, codes, docs) {
+  const summary = emptySummary(filters || []);
+  for (const doc of docs || []) updateSummary(summary, filters || [], codes, doc);
+  return Object.fromEntries((filters || []).map((filter, index) => [filter.name, summary[index]]));
 }
 
 function encodePostings(rows, total, codes, filters, config) {
@@ -198,52 +206,118 @@ function encodePostings(rows, total, codes, filters, config) {
   return { df, count: encoded.length, bytes: Uint8Array.from(bytes), blocks };
 }
 
-export function buildTermShard(entries, total, codes, filters, config) {
-  const header = [...TERM_SHARD_MAGIC];
-  const postingChunks = [];
+export function buildPostingSegment(entries, total, codes, filters, config, writeBlock) {
+  const minBlocks = Math.max(1, Number(config.externalPostingBlockMinBlocks || 0));
+  const minBytes = Math.max(0, Number(config.externalPostingBlockMinBytes || 0));
+  const header = [...POSTING_SEGMENT_MAGIC];
+  const chunks = [];
   const directory = [];
   let postingOffset = 0;
+  const stats = {
+    externalBlocks: 0,
+    externalTerms: 0,
+    externalPostings: 0,
+    externalPostingBytes: 0,
+    inlinePostingBytes: 0
+  };
 
   for (const [term, rows] of entries.sort((a, b) => a[0].localeCompare(b[0]))) {
     const postings = encodePostings(rows, total, codes, filters, config);
-    directory.push({ term, postings, offset: postingOffset });
-    postingChunks.push(postings.bytes);
-    postingOffset += postings.bytes.length;
-  }
+    const external = !!writeBlock && postings.blocks.length >= minBlocks && postings.bytes.length >= minBytes;
+    const blocks = [];
 
-  pushVarint(header, directory.length);
-  for (const entry of directory) {
-    pushUtf8(header, entry.term);
-    pushVarint(header, entry.postings.df);
-    pushVarint(header, entry.postings.count);
-    pushVarint(header, entry.offset);
-    pushVarint(header, entry.postings.bytes.length);
-    pushVarint(header, config.postingBlockSize);
-    pushVarint(header, entry.postings.blocks.length);
-    for (const block of entry.postings.blocks) {
-      pushVarint(header, block.offset);
-      pushVarint(header, block.maxImpact);
-      writeBlockFilterSummary(header, filters, block.filters);
+    if (external) {
+      stats.externalTerms++;
+      for (let i = 0; i < postings.blocks.length; i++) {
+        const block = postings.blocks[i];
+        const next = postings.blocks[i + 1];
+        const start = block.offset;
+        const end = next ? next.offset : postings.bytes.length;
+        const bytes = postings.bytes.subarray(start, end);
+        const range = writeBlock({ term, blockIndex: i, bytes });
+        blocks.push({
+          ...block,
+          rowCount: Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize),
+          range: {
+            packIndex: packIndexFromFile(range.pack),
+            offset: range.offset,
+            length: range.length,
+            physicalLength: range.physicalLength || range.length,
+            logicalLength: range.logicalLength || null,
+            checksum: range.checksum || null
+          }
+        });
+        stats.externalBlocks++;
+        stats.externalPostings += Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize);
+        stats.externalPostingBytes += bytes.length;
+      }
+      directory.push({ term, postings, offset: 0, byteLength: 0, external: true, blocks });
+    } else {
+      chunks.push(postings.bytes);
+      stats.inlinePostingBytes += postings.bytes.length;
+      for (let i = 0; i < postings.blocks.length; i++) {
+        const block = postings.blocks[i];
+        blocks.push({
+          ...block,
+          rowCount: Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize)
+        });
+      }
+      directory.push({ term, postings, offset: postingOffset, byteLength: postings.bytes.length, external: false, blocks });
+      postingOffset += postings.bytes.length;
     }
   }
 
-  return Buffer.concat([
-    Buffer.from(Uint8Array.from(header)),
-    ...postingChunks.map(chunk => Buffer.from(chunk))
-  ]);
+  pushVarint(header, POSTING_SEGMENT_FORMAT_VERSION);
+  pushVarint(header, directory.length);
+  for (const item of directory) {
+    pushUtf8(header, item.term);
+    pushVarint(header, item.postings.df);
+    pushVarint(header, item.postings.count);
+    pushVarint(header, item.offset);
+    pushVarint(header, item.byteLength);
+    pushVarint(header, config.postingBlockSize);
+    pushVarint(header, item.blocks.length);
+    pushVarint(header, item.external ? 1 : 0);
+    for (const block of item.blocks) {
+      pushVarint(header, block.offset);
+      pushVarint(header, block.rowCount);
+      pushVarint(header, block.maxImpact);
+      writeBlockFilterSummary(header, filters, block.filters);
+      if (item.external) {
+        pushVarint(header, block.range.packIndex);
+        pushVarint(header, block.range.offset);
+        pushVarint(header, block.range.length);
+        if (block.range.checksum?.value) {
+          pushVarint(header, block.range.logicalLength || 0);
+          pushUtf8(header, block.range.checksum.algorithm || "sha256");
+          pushUtf8(header, block.range.checksum.value);
+        }
+      }
+    }
+  }
+
+  return {
+    format: POSTING_SEGMENT_FORMAT,
+    buffer: Buffer.concat([
+      Buffer.from(Uint8Array.from(header)),
+      ...chunks.map(chunk => Buffer.from(chunk))
+    ]),
+    stats
+  };
 }
 
-export function parseShard(buffer, manifest) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, TERM_SHARD_MAGIC, "Unsupported Rangefind term shard");
-  const externalBlockFormat = manifest.stats?.posting_block_storage === "range-pack-v1";
+function parsePostingSegmentBytes(bytes, manifest = {}) {
+  assertMagic(bytes, POSTING_SEGMENT_MAGIC, "Unsupported Rangefind posting segment");
   const objectPointers = manifest.object_store?.pointer_format === "rfbp-v1" || manifest.features?.checksummedObjects;
-  const state = { pos: TERM_SHARD_MAGIC.length };
+  const state = { pos: POSTING_SEGMENT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== POSTING_SEGMENT_FORMAT_VERSION) throw new Error("Unsupported Rangefind posting segment version");
   const termCount = readVarint(bytes, state);
   const terms = new Map();
   for (let i = 0; i < termCount; i++) {
     const term = readUtf8(bytes, state);
     const entry = {
+      format: POSTING_SEGMENT_FORMAT,
       df: readVarint(bytes, state),
       count: readVarint(bytes, state),
       offset: readVarint(bytes, state),
@@ -253,11 +327,12 @@ export function parseShard(buffer, manifest) {
       postings: null
     };
     const blockCount = readVarint(bytes, state);
-    entry.external = externalBlockFormat && readVarint(bytes, state) === 1;
+    entry.external = readVarint(bytes, state) === 1;
     entry.blocks = new Array(blockCount);
     for (let j = 0; j < blockCount; j++) {
       const block = {
         offset: readVarint(bytes, state),
+        rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
         filters: {}
       };
@@ -283,7 +358,11 @@ export function parseShard(buffer, manifest) {
     }
     terms.set(term, entry);
   }
-  return { bytes, dataStart: state.pos, terms };
+  return { format: POSTING_SEGMENT_FORMAT, bytes, dataStart: state.pos, terms };
+}
+
+export function parsePostingSegment(buffer, manifest = {}) {
+  return parsePostingSegmentBytes(new Uint8Array(buffer), manifest);
 }
 
 export function decodePostings(shard, entry) {
@@ -325,95 +404,6 @@ export function decodePostingBlock(shard, entry, blockIndex) {
   const out = Int32Array.from(rows);
   entry.blockPostings.set(blockIndex, out);
   return out;
-}
-
-export function rewriteTermShardForExternalBlocks(buffer, manifest, config, writeBlock) {
-  const source = parseShard(buffer, { block_filters: manifest.block_filters || [] });
-  const minBlocks = Math.max(1, Number(config.externalPostingBlockMinBlocks || 0));
-  const minBytes = Math.max(0, Number(config.externalPostingBlockMinBytes || 0));
-  const header = [...TERM_SHARD_MAGIC];
-  const chunks = [];
-  const directory = [];
-  let postingOffset = 0;
-  const stats = {
-    externalBlocks: 0,
-    externalTerms: 0,
-    externalPostings: 0,
-    externalPostingBytes: 0,
-    inlinePostingBytes: 0
-  };
-
-  for (const [term, entry] of source.terms) {
-    const external = !!writeBlock && entry.blocks.length >= minBlocks && entry.byteLength >= minBytes;
-    const blocks = [];
-    if (external) {
-      stats.externalTerms++;
-      for (let i = 0; i < entry.blocks.length; i++) {
-        const block = entry.blocks[i];
-        const next = entry.blocks[i + 1];
-        const start = source.dataStart + entry.offset + block.offset;
-        const end = source.dataStart + entry.offset + (next ? next.offset : entry.byteLength);
-        const bytes = source.bytes.subarray(start, end);
-        const range = writeBlock({ term, blockIndex: i, bytes });
-        blocks.push({
-          ...block,
-          range: {
-            packIndex: packIndexFromFile(range.pack),
-            offset: range.offset,
-            length: range.length,
-            physicalLength: range.physicalLength || range.length,
-            logicalLength: range.logicalLength || null,
-            checksum: range.checksum || null
-          }
-        });
-        stats.externalBlocks++;
-        stats.externalPostings += Math.min(entry.blockSize, entry.count - i * entry.blockSize);
-        stats.externalPostingBytes += bytes.length;
-      }
-      directory.push({ term, entry, offset: 0, byteLength: 0, external: true, blocks });
-    } else {
-      const bytes = source.bytes.subarray(source.dataStart + entry.offset, source.dataStart + entry.offset + entry.byteLength);
-      chunks.push(bytes);
-      stats.inlinePostingBytes += bytes.length;
-      directory.push({ term, entry, offset: postingOffset, byteLength: bytes.length, external: false, blocks: entry.blocks });
-      postingOffset += bytes.length;
-    }
-  }
-
-  pushVarint(header, directory.length);
-  for (const item of directory) {
-    pushUtf8(header, item.term);
-    pushVarint(header, item.entry.df);
-    pushVarint(header, item.entry.count);
-    pushVarint(header, item.offset);
-    pushVarint(header, item.byteLength);
-    pushVarint(header, item.entry.blockSize);
-    pushVarint(header, item.blocks.length);
-    pushVarint(header, item.external ? 1 : 0);
-    for (const block of item.blocks) {
-      pushVarint(header, block.offset);
-      pushVarint(header, block.maxImpact);
-      writeBlockFilterSummary(header, manifest.block_filters || [], block.filters);
-      if (item.external) {
-        pushVarint(header, block.range.packIndex);
-        pushVarint(header, block.range.offset);
-        pushVarint(header, block.range.length);
-        if (block.range.checksum?.value) {
-          pushVarint(header, block.range.logicalLength || 0);
-          pushUtf8(header, block.range.checksum.algorithm || "sha256");
-          pushUtf8(header, block.range.checksum.value);
-        }
-      }
-    }
-  }
-
-  return {
-    buffer: Buffer.concat([
-      Buffer.from(Uint8Array.from(header)),
-      ...chunks.map(chunk => Buffer.from(chunk))
-    ]),
-    stats
-  };
 }
 
 function facetWords(value, words) {

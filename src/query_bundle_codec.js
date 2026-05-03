@@ -1,10 +1,10 @@
 import { QUERY_BUNDLE_MAGIC, pushVarint, readVarint } from "./binary.js";
-import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
+import { assertMagic, pushUtf8, readBlockFilterSummary, readUtf8, writeBlockFilterSummary } from "./codec.js";
 
 export const QUERY_BUNDLE_FORMAT = "rfqbundle-v1";
 const QUERY_BUNDLE_VERSION = 1;
 
-export function buildQueryBundle(bundle) {
+export function buildQueryBundle(bundle, manifest = {}) {
   const out = [...QUERY_BUNDLE_MAGIC];
   pushVarint(out, QUERY_BUNDLE_VERSION);
   pushUtf8(out, bundle.key);
@@ -26,10 +26,21 @@ export function buildQueryBundle(bundle) {
     pushVarint(out, row.doc);
     pushVarint(out, row.score);
   }
+  const rowGroups = bundle.rowGroups || [];
+  pushVarint(out, rowGroups.length);
+  for (const group of rowGroups) {
+    pushVarint(out, group.rowStart || 0);
+    pushVarint(out, group.rowCount || 0);
+    pushVarint(out, group.scoreMax || 0);
+    pushVarint(out, group.scoreMin || 0);
+    pushVarint(out, group.docMin || 0);
+    pushVarint(out, group.docMax || 0);
+    writeBlockFilterSummary(out, manifest.block_filters || [], group.filters);
+  }
   return Uint8Array.from(out);
 }
 
-export function parseQueryBundle(buffer) {
+export function parseQueryBundle(buffer, manifest = {}) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, QUERY_BUNDLE_MAGIC, "Unsupported Rangefind query bundle");
   const state = { pos: QUERY_BUNDLE_MAGIC.length };
@@ -50,5 +61,18 @@ export function parseQueryBundle(buffer) {
   for (let i = 0; i < rowCount; i++) {
     rows[i] = [readVarint(bytes, state), readVarint(bytes, state)];
   }
-  return { key, baseTerms, expandedTerms, total, complete, nextScoreBound, nextTieDoc, rows };
+  const rowGroupCount = state.pos < bytes.length ? readVarint(bytes, state) : 0;
+  const rowGroups = new Array(rowGroupCount);
+  for (let i = 0; i < rowGroupCount; i++) {
+    rowGroups[i] = {
+      rowStart: readVarint(bytes, state),
+      rowCount: readVarint(bytes, state),
+      scoreMax: readVarint(bytes, state),
+      scoreMin: readVarint(bytes, state),
+      docMin: readVarint(bytes, state),
+      docMax: readVarint(bytes, state),
+      filters: readBlockFilterSummary(bytes, state, manifest)
+    };
+  }
+  return { key, baseTerms, expandedTerms, total, complete, nextScoreBound, nextTieDoc, rows, rowGroups };
 }

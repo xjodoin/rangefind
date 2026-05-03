@@ -1,4 +1,3 @@
-import { availableParallelism } from "node:os";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
@@ -26,6 +25,7 @@ export const DEFAULTS = {
   queryBundleSeedCandidateFactor: 2,
   queryBundleMinSeedDocs: 2,
   queryBundleMaxRows: 64,
+  queryBundleRowGroupSize: 16,
   queryBundleMaxTerms: 3,
   queryBundleSeedMaxFieldTokens: 160,
   queryBundlePackBytes: 4 * 1024 * 1024,
@@ -37,19 +37,21 @@ export const DEFAULTS = {
   authorityDirectoryPageBytes: 16 * 1024,
   facetDictionaryPackBytes: 4 * 1024 * 1024,
   blockFilterMaxFacetWords: 64,
-  reduceWorkers: 1,
   codeStoreCacheDocs: 16384,
+  codeStoreCacheChunks: 64,
   docLayoutSortChunkDocs: 100000,
-  reduceSortChunkRecords: 25000,
-  reduceSortChunkBytes: 4 * 1024 * 1024,
-  reduceLargeRunBytes: 1024 * 1024,
-  reduceWorkerHeapMb: 512,
-  postingFlushLines: 100000,
+  scanWorkers: 1,
+  scanBatchDocs: 128,
+  segmentMaxPostings: 250000,
+  segmentMaxBytes: 64 * 1024 * 1024,
+  segmentMergeFanIn: 512,
   maxTermsPerDoc: 160,
   maxExpansionTermsPerDoc: 12,
   initialResultLimit: 20,
   postingBlockSize: 128,
-  bm25fK1: 1.2
+  bm25fK1: 1.2,
+  buildTelemetrySampleMs: 1000,
+  buildTelemetryPath: ""
 };
 
 function configDir(configPath) {
@@ -64,16 +66,23 @@ export async function readConfig(configPath) {
   const full = resolve(configPath);
   const base = configDir(full);
   const raw = JSON.parse(await readFile(full, "utf8"));
-  const autoReduceWorkers = Math.max(1, Math.min(4, availableParallelism() - 1));
-  const reduceWorkers = raw.reduceWorkers === "auto" || raw.reduceWorkers === 0
-    ? autoReduceWorkers
-    : Math.max(1, Number(raw.reduceWorkers ?? DEFAULTS.reduceWorkers) || DEFAULTS.reduceWorkers);
+  const activeRaw = { ...raw };
+  for (const key of [
+    "reduceWorkers",
+    "reduceSortChunkRecords",
+    "reduceSortChunkBytes",
+    "reduceLargeRunBytes",
+    "reduceWorkerHeapMb",
+    "postingFlushLines"
+  ]) {
+    delete activeRaw[key];
+  }
   return {
     ...DEFAULTS,
-    ...raw,
-    reduceWorkers,
+    ...activeRaw,
     input: resolveFrom(base, raw.input),
     output: resolveFrom(base, raw.output || "public/rangefind"),
+    buildTelemetryPath: raw.buildTelemetryPath ? resolveFrom(base, raw.buildTelemetryPath) : "",
     fields: raw.fields || [
       { name: "title", path: "title", weight: 4.5, b: 0.55, phrase: true },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }

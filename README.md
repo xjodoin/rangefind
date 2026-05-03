@@ -17,8 +17,8 @@ a large thesis corpus.
 - Schema-driven weighted fields.
 - BM25F-style field scoring.
 - Phrase signals for title/heading fields.
-- Adaptive logical term shards.
-- Independently compressed logical shards packed into `terms/packs/*.bin`.
+- Adaptive posting segments.
+- Independently compressed posting segments packed into `terms/packs/*.bin`.
 - Single ESM browser runtime bundle at `dist/runtime.browser.js`.
 - Lazy paged binary range directories at `terms/directory-root.<hash>.bin.gz`
   and `terms/directory-pages/*.bin.gz`.
@@ -34,12 +34,14 @@ a large thesis corpus.
 - Optional authority sidecar for exact title/entity/alias rescue without
   changing the main inverted index.
 - Range-packed binary facet dictionaries for high-cardinality metadata.
-- File-backed build pipeline with binary run spools, selected-term spools,
-  raw/compressed document spools, heap-based reduction, and build telemetry.
-- Parallel build-time shard reduction with deterministic final pack assembly.
+- File-backed build pipeline with immutable posting segments, selected-term
+  spools, raw/compressed document spools, heap-based segment merge, and sampled
+  build telemetry.
+- Minimal runtime manifest with lazy full-manifest and telemetry sidecars.
 - Browser runtime with adaptive HTTP `Range` coalescing and bounded overfetch.
-- Optional typo-tolerance sidecar using delete-key shards and HTTP `Range`
-  fetches only when an exact first-page query returns no results.
+- Optional typo-tolerance sidecar using delete-key shards for short tokens and
+  compact lexicon pages for longer tokens, fetched only when an exact first-page
+  query returns no results.
 - Multi-value keyword facets with lazy dictionary loading.
 - Range-addressed typed numeric, date, and boolean doc-values for filters and
   sorting.
@@ -80,7 +82,7 @@ latency, request count, and transfer size:
 
 ```bash
 npm run build:browser
-node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
+node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3
 ```
 
 Use `--limit=0` to run against the full dump. The generated site lives at
@@ -88,8 +90,10 @@ Use `--limit=0` to run against the full dump. The generated site lives at
 exact retrieval path by default and records cold request counts, transfer bytes,
 runtime posting-block stats, typed filter/sort validation, and scale reports
 across multiple Wikipedia sample sizes.
-Each generated `manifest.json` also records `build` telemetry with phase
-timings, peak RSS, and key spool byte counters for comparing indexing changes.
+Each generated index includes `manifest.min.json`, `manifest.full.json`, and
+`debug/build-telemetry.json`. The full diagnostic `manifest.json` is still
+written for local inspection and records phase timings, sampled memory peaks,
+CPU time, disk byte deltas, and segment counters.
 
 ## Build A Custom Index
 

@@ -9,6 +9,7 @@ import { writeDirectoryFiles } from "./directory_writer.js";
 import { OBJECT_NAME_HASH_LENGTH } from "./object_store.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
+import { buildTypoLexiconShard, typoLexiconShardKey, TYPO_LEXICON_FORMAT } from "./typo_lexicon.js";
 
 const SEPARATOR = "\u0001";
 
@@ -25,6 +26,13 @@ export const TYPO_DEFAULTS = {
   minDf: 1,
   maxDfRatio: 0.08,
   maxEdits: 2,
+  deleteMaxSurfaceLength: 8,
+  lexiconEnabled: true,
+  lexiconMinSurfaceLength: 8,
+  lexiconShardDepth: 2,
+  lexiconPackBytes: 4 * 1024 * 1024,
+  lexiconDirectoryPageBytes: 64 * 1024,
+  lexiconMaxScanCandidates: 2048,
   baseShardDepth: 2,
   maxShardDepth: 3,
   targetShardCandidates: 12000,
@@ -70,7 +78,19 @@ function typoShardKey(deleteKey, options, depth = options.baseShardDepth) {
 
 export function createTypoRunBuffer(runsOut, options) {
   mkdirSync(runsOut, { recursive: true });
-  return { byShard: new Map(), lines: 0, runsOut, options, terms: 0, deletePairs: 0, shards: new Set() };
+  return {
+    byShard: new Map(),
+    lexiconByShard: new Map(),
+    lines: 0,
+    lexiconLines: 0,
+    runsOut,
+    options,
+    terms: 0,
+    deletePairs: 0,
+    lexiconPairs: 0,
+    shards: new Set(),
+    lexiconShards: new Set()
+  };
 }
 
 export function flushTypoBuffer(buffer) {
@@ -80,7 +100,13 @@ export function flushTypoBuffer(buffer) {
     appendFileSync(resolve(buffer.runsOut, `${shard}.run`), Buffer.concat(records));
   }
   buffer.byShard.clear();
+  for (const [shard, records] of buffer.lexiconByShard) {
+    if (!records.length) continue;
+    appendFileSync(resolve(buffer.runsOut, `${shard}.lex.run`), Buffer.concat(records));
+  }
+  buffer.lexiconByShard.clear();
   buffer.lines = 0;
+  buffer.lexiconLines = 0;
 }
 
 function bufferTypoCandidate(buffer, deleteKey, text, df) {
@@ -91,6 +117,33 @@ function bufferTypoCandidate(buffer, deleteKey, text, df) {
   buffer.lines++;
   buffer.deletePairs++;
   if (buffer.lines >= buffer.options.flushLines) flushTypoBuffer(buffer);
+}
+
+function shouldWriteTypoLexicon(surface, options) {
+  return options.lexiconEnabled !== false && surface.length >= Math.max(1, Number(options.lexiconMinSurfaceLength || 1));
+}
+
+function shouldWriteTypoDeletes(surface, options) {
+  return surface.length <= Math.max(1, Number(options.deleteMaxSurfaceLength || 1));
+}
+
+function bufferTypoLexiconCandidate(buffer, surface, term, df) {
+  if (!shouldWriteTypoLexicon(surface, buffer.options)) return;
+  const shard = typoLexiconShardKey(surface, buffer.options.lexiconShardDepth);
+  if (!buffer.lexiconByShard.has(shard)) buffer.lexiconByShard.set(shard, []);
+  buffer.lexiconByShard.get(shard).push(encodeRunRecord(["string", "string", "number"], [surface, term, df]));
+  buffer.lexiconShards.add(shard);
+  buffer.lexiconLines++;
+  buffer.lexiconPairs++;
+  if (buffer.lexiconLines >= buffer.options.flushLines) flushTypoBuffer(buffer);
+}
+
+function bufferTypoCorrectionCandidate(buffer, surface, term, df) {
+  bufferTypoLexiconCandidate(buffer, surface, term, df);
+  if (!shouldWriteTypoDeletes(surface, buffer.options) && shouldWriteTypoLexicon(surface, buffer.options)) return;
+  for (const deleteKey of typoDeleteKeys(surface, buffer.options, typoMaxEditsFor(surface, buffer.options))) {
+    bufferTypoCandidate(buffer, deleteKey, surface === term ? term : `${surface}${SEPARATOR}${term}`, df);
+  }
 }
 
 function isTypoCandidate(surface, term, options) {
@@ -110,10 +163,25 @@ export function addTypoSurfacePairs(buffer, pairs) {
     if (seen.has(key) || !isTypoCandidate(surface, term, buffer.options)) continue;
     seen.add(key);
     buffer.terms++;
-    for (const deleteKey of typoDeleteKeys(surface, buffer.options, typoMaxEditsFor(surface, buffer.options))) {
-      bufferTypoCandidate(buffer, deleteKey, key, 1);
-    }
+    bufferTypoCorrectionCandidate(buffer, surface, term, 1);
   }
+}
+
+export function createTypoSurfacePairBuffer() {
+  return new Map();
+}
+
+export function addTypoSurfacePairsToBuffer(pairBuffer, pairs) {
+  if (!pairBuffer) return;
+  for (const [surface, term] of pairs) {
+    pairBuffer.set(`${surface}${SEPARATOR}${term}`, [surface, term]);
+  }
+}
+
+export function flushTypoSurfacePairBuffer(buffer, pairBuffer) {
+  if (!pairBuffer?.size) return;
+  addTypoSurfacePairs(buffer, pairBuffer.values());
+  pairBuffer.clear();
 }
 
 export function surfacePairsForFields(doc, fields, fieldText) {
@@ -138,9 +206,7 @@ function isTypoIndexTerm(term, df, total, options) {
 export function addTypoIndexTerm(buffer, term, df, total) {
   if (!buffer || !isTypoIndexTerm(term, df, total, buffer.options)) return;
   buffer.terms++;
-  for (const deleteKey of typoDeleteKeys(term, buffer.options)) {
-    bufferTypoCandidate(buffer, deleteKey, term, df);
-  }
+  bufferTypoCorrectionCandidate(buffer, term, term, df);
 }
 
 function parseCandidateText(text) {
@@ -412,6 +478,97 @@ async function reduceTypoShard(baseShard, buffer, packWriter, scratchRoot) {
   return { shards: finalShards, deleteKeys, pairs, candidates };
 }
 
+async function* reducedLexiconEntries(chunks) {
+  let currentSurface = null;
+  let currentTerm = null;
+  let currentDf = 0;
+
+  function finish() {
+    if (!currentSurface || !currentTerm) return null;
+    return { surface: currentSurface, term: currentTerm, df: currentDf };
+  }
+
+  for await (const [surface, term, df] of mergeSortedTypoChunks(chunks)) {
+    if (surface !== currentSurface || term !== currentTerm) {
+      const item = finish();
+      if (item) yield item;
+      currentSurface = surface;
+      currentTerm = term;
+      currentDf = df;
+      continue;
+    }
+    currentDf += df;
+  }
+  const item = finish();
+  if (item) yield item;
+}
+
+async function reduceTypoLexiconShard(shard, buffer, packWriter, scratchRoot) {
+  const path = resolve(buffer.runsOut, `${shard}.lex.run`);
+  const scratchDir = resolve(scratchRoot, encodeURIComponent(shard));
+  const chunks = await writeSortedTypoChunks(path, scratchDir, buffer.options);
+  const entries = [];
+  try {
+    for await (const entry of reducedLexiconEntries(chunks)) entries.push(entry);
+    const encoded = buildTypoLexiconShard(entries, buffer.options);
+    if (!encoded.stats.entries) return { entries: 0 };
+    writePackedShard(packWriter, shard, gzipSync(encoded.buffer, { level: 6 }), {
+      kind: "typo-lexicon",
+      codec: TYPO_LEXICON_FORMAT,
+      logicalLength: encoded.buffer.length
+    });
+    return { entries: encoded.stats.entries };
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
+    unlinkSync(path);
+  }
+}
+
+async function reduceTypoLexiconRuns(buffer, outDir) {
+  if (!buffer.lexiconShards.size) return null;
+  const packWriter = createPackWriter(resolve(outDir, "typo", "lexicon-packs"), buffer.options.lexiconPackBytes || buffer.options.packBytes);
+  const scratchRoot = resolve(outDir, "_build", "typo-lexicon-reduce-sort");
+  let entries = 0;
+  const shards = [];
+  for (const shard of [...buffer.lexiconShards].sort()) {
+    const stats = await reduceTypoLexiconShard(shard, buffer, packWriter, scratchRoot);
+    if (stats.entries > 0) {
+      entries += stats.entries;
+      shards.push(shard);
+    }
+  }
+  finalizePackWriter(packWriter);
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const directoryEntries = shards.map((shard) => {
+    const entry = packWriter.entries[shard];
+    return { shard, packIndex: packIndexes.get(entry.pack), ...entry };
+  });
+  const directory = writeDirectoryFiles(
+    resolve(outDir, "typo", "lexicon"),
+    directoryEntries,
+    buffer.options.lexiconDirectoryPageBytes || buffer.options.directoryPageBytes,
+    "typo/lexicon",
+    { packTable: packWriter.packs }
+  );
+  return {
+    format: TYPO_LEXICON_FORMAT,
+    storage: "range-pack-v1",
+    shard_depth: Math.max(1, Math.floor(Number(buffer.options.lexiconShardDepth || 1))),
+    min_surface_length: Math.max(1, Math.floor(Number(buffer.options.lexiconMinSurfaceLength || 1))),
+    max_scan_candidates: Math.max(1, Math.floor(Number(buffer.options.lexiconMaxScanCandidates || 2048))),
+    directory,
+    packs: packWriter.packs,
+    stats: {
+      raw_pairs: buffer.lexiconPairs,
+      entries,
+      pack_bytes: packWriter.bytes,
+      pack_files: packWriter.packs.length,
+      directory_page_files: directory.page_files,
+      directory_bytes: directory.total_bytes
+    }
+  };
+}
+
 export async function reduceTypoRuns(buffer, outDir) {
   if (!buffer || !buffer.options.enabled) return null;
   flushTypoBuffer(buffer);
@@ -429,6 +586,7 @@ export async function reduceTypoRuns(buffer, outDir) {
     for (const finalShard of stats.shards) finalShards.add(finalShard);
   }
   finalizePackWriter(packWriter);
+  const lexicon = await reduceTypoLexiconRuns(buffer, outDir);
   const shards = [...finalShards].sort();
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const directoryEntries = shards.map((shard) => {
@@ -446,15 +604,19 @@ export async function reduceTypoRuns(buffer, outDir) {
     max_surface_length: buffer.options.maxSurfaceLength,
     max_term_length: buffer.options.maxTermLength,
     max_edits: buffer.options.maxEdits,
+    delete_max_surface_length: buffer.options.deleteMaxSurfaceLength,
     base_shard_depth: buffer.options.baseShardDepth,
     max_shard_depth: buffer.options.maxShardDepth,
     max_candidates_per_delete: buffer.options.maxCandidatesPerDelete,
     storage: "range-pack-v1",
     directory,
     packs: packWriter.packs,
+    lexicon,
     stats: {
       terms: buffer.terms,
       delete_pairs: buffer.deletePairs,
+      lexicon_pairs: buffer.lexiconPairs,
+      lexicon_entries: lexicon?.stats?.entries || 0,
       delete_keys: deleteKeys,
       pairs,
       candidates,

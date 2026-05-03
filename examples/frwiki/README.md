@@ -13,7 +13,7 @@ Quick bounded run:
 
 ```bash
 npm run build:browser
-node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3 --reduce-workers=auto
+node scripts/frwiki_fixture.mjs all --limit=50000 --runs=3
 node scripts/serve.mjs examples/frwiki/public 5180
 ```
 
@@ -35,7 +35,6 @@ Useful options:
   The default is `6000`; use `0` for uncapped article text.
 - `--force`: rebuilds the JSONL even when the existing generated metadata
   matches the requested dump URL, limit, and body cap.
-- `--reduce-workers=auto`: enables Rangefind's worker reducer path.
 - `--queries=a|b|c`: overrides benchmark queries.
 - `--scale-limits=50000,100000`: builds isolated scale points with the `scale`
   command.

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,8 +9,11 @@ import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "../sr
 import {
   addTypoIndexTerm,
   addTypoSurfacePairs,
+  addTypoSurfacePairsToBuffer,
   boundedDamerauLevenshtein,
+  createTypoSurfacePairBuffer,
   createTypoRunBuffer,
+  flushTypoSurfacePairBuffer,
   parseTypoShard,
   reduceTypoRuns,
   surfacePairsForFields,
@@ -18,6 +22,7 @@ import {
   typoDeleteKeys,
   typoOptions
 } from "../src/typo.js";
+import { parseTypoLexiconShard, typoLexiconShardKey } from "../src/typo_lexicon.js";
 
 test("delete keys support single-edit surface correction", () => {
   assert.ok(typoDeleteKeys("static", typoOptions({})).has("stati"));
@@ -33,6 +38,7 @@ test("typo sidecar builds and parses packed delete-key shards", async () => {
   const fields = [{ path: "title" }];
   addTypoSurfacePairs(buffer, surfacePairsForFields(doc, fields, (item, field) => item[field.path]));
   addTypoIndexTerm(buffer, "static", 10, 100);
+  addTypoIndexTerm(buffer, "changement", 4, 100);
   const manifest = await reduceTypoRuns(buffer, root);
   assert.equal(manifest.packs.length, 1);
   assert.match(manifest.manifest, /^typo\/manifest\.[0-9a-f]{24}\.json$/u);
@@ -56,4 +62,36 @@ test("typo sidecar builds and parses packed delete-key shards", async () => {
   const shard = parseTypoShard(gunzipSync(compressed));
   const candidates = typoCandidatesForDeleteKey(shard, "stati");
   assert.ok(candidates.some(candidate => candidate.surface === "static" && candidate.term === "static"));
+  assert.equal(manifest.lexicon.format, "rftermlex-v1");
+  assert.ok(manifest.stats.lexicon_entries > 0);
+  const lexiconRootBytes = gunzipSync(await readFile(join(root, manifest.lexicon.directory.root)));
+  const lexiconRoot = parseDirectoryRoot(lexiconRootBytes);
+  const lexiconShard = typoLexiconShardKey("changement", manifest.lexicon.shard_depth);
+  const lexiconPageMeta = findDirectoryPage(lexiconRoot, lexiconShard);
+  assert.ok(lexiconPageMeta);
+  const lexiconPageBytes = gunzipSync(await readFile(join(root, "typo", "lexicon", "directory-pages", lexiconPageMeta.file)));
+  const lexiconPage = parseDirectoryPage(lexiconPageBytes, { packTable: manifest.lexicon.directory.pack_table });
+  const lexiconRange = lexiconPage.get(lexiconShard);
+  assert.ok(lexiconRange);
+  const lexiconBytes = await readFile(join(root, "typo", "lexicon-packs", lexiconRange.pack));
+  const lexiconShardData = parseTypoLexiconShard(gunzipSync(lexiconBytes.subarray(lexiconRange.offset, lexiconRange.offset + lexiconRange.length)));
+  assert.ok(lexiconShardData.entries.some(entry => entry.surface === "changement" && entry.term === "changement"));
+});
+
+test("typo surface pairs can be deduplicated across a segment flush", () => {
+  const options = { ...typoOptions({}), flushLines: 1000 };
+  const root = mkdtempSync(join(tmpdir(), "rangefind-typo-dedupe-"));
+  const buffer = createTypoRunBuffer(join(root, "_runs"), options);
+  const pairBuffer = createTypoSurfacePairBuffer();
+  const doc = { title: "Static range search" };
+  const fields = [{ path: "title" }];
+  const pairs = surfacePairsForFields(doc, fields, (item, field) => item[field.path]);
+
+  addTypoSurfacePairsToBuffer(pairBuffer, pairs);
+  addTypoSurfacePairsToBuffer(pairBuffer, surfacePairsForFields(doc, fields, (item, field) => item[field.path]));
+  flushTypoSurfacePairBuffer(buffer, pairBuffer);
+
+  assert.equal(buffer.terms, 3);
+  assert.equal(pairBuffer.size, 0);
+  assert.ok(buffer.deletePairs > buffer.terms);
 });

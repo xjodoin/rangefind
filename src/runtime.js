@@ -1,6 +1,6 @@
 import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms, queryTerms, tokenize } from "./analyzer.js";
 import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
-import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parseShard } from "./codec.js";
+import { decodePostingBlock, decodePostingBytes, decodePostings, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
@@ -8,6 +8,7 @@ import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.j
 import { verifyBlockPointer } from "./object_store.js";
 import { parseQueryBundle } from "./query_bundle_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
+import { parseTypoLexiconShard } from "./typo_lexicon.js";
 import {
   boundedDamerauLevenshtein,
   parseTypoShard,
@@ -78,18 +79,34 @@ function facetCodeMatches(words, selected) {
 
 export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
-  const manifest = await fetch(new URL("manifest.json", baseUrl)).then(r => r.json());
+  async function fetchJsonIfOk(path) {
+    const response = await fetch(new URL(path, baseUrl));
+    return response.ok ? response.json() : null;
+  }
+
+  async function fetchManifestJsonIfOk(path) {
+    if (!path) return null;
+    if (!String(path).endsWith(".gz")) return fetchJsonIfOk(path);
+    const url = new URL(path, baseUrl);
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    return JSON.parse(textDecoder.decode(await inflateGzip(response)));
+  }
+
+  const manifest = await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
+  if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
   const termDirectory = createDirectoryState(manifest.directory);
   const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
   const authorityDirectory = manifest.authority?.directory ? createDirectoryState(manifest.authority.directory) : null;
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
-  const facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
+  let facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
   const shardCache = new Map();
   const queryBundleCache = new Map();
   const authorityShardCache = new Map();
   const typoShardCache = new Map();
+  const typoLexiconShardCache = new Map();
   const docOrdinalCache = new Map();
   const docPointerCache = new Map();
   const packedDocCache = new Map();
@@ -102,10 +119,16 @@ export async function createSearch(options = {}) {
   let typoManifest = null;
   let typoManifestPromise = null;
   let typoDirectory = null;
+  let typoLexiconDirectory = null;
   let codes = null;
   let codesPromise = null;
-  const docValues = manifest.doc_values || null;
-  const docValueSorted = manifest.doc_value_sorted || null;
+  let fullManifestPromise = null;
+  let fullManifestLoaded = !manifest.lazy_manifests?.full;
+  let buildTelemetry = manifest.build || null;
+  let buildTelemetryPromise = null;
+  let docValues = manifest.doc_values || null;
+  let docValuesPromise = null;
+  let docValueSorted = manifest.doc_value_sorted || null;
   const docValueStore = { _docValues: true };
   const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
@@ -122,6 +145,46 @@ export async function createSearch(options = {}) {
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     ...(options.rangePlans || {})
   };
+
+  async function ensureFullManifest() {
+    if (fullManifestLoaded) return manifest;
+    if (!fullManifestPromise) {
+      fullManifestPromise = fetchJsonIfOk(manifest.lazy_manifests.full)
+        .then(full => {
+          if (!full) return manifest;
+          Object.assign(manifest, full);
+          docValues = manifest.doc_values || null;
+          docValueSorted = manifest.doc_value_sorted || null;
+          facetDirectory = manifest.facet_dictionaries?.directory ? createDirectoryState(manifest.facet_dictionaries.directory) : null;
+          fullManifestLoaded = true;
+          return manifest;
+        });
+    }
+    return fullManifestPromise;
+  }
+
+  async function ensureDocValuesManifest() {
+    if (docValues) return docValues;
+    const path = manifest.lazy_manifests?.doc_values;
+    if (!path) return null;
+    if (!docValuesPromise) {
+      docValuesPromise = fetchManifestJsonIfOk(path).then(meta => {
+        docValues = meta || null;
+        if (docValues) manifest.doc_values = docValues;
+        return docValues;
+      });
+    }
+    return docValuesPromise;
+  }
+
+  async function loadBuildTelemetry() {
+    if (buildTelemetry) return buildTelemetry;
+    const path = manifest.lazy_manifests?.build;
+    if (!path) return null;
+    if (!buildTelemetryPromise) buildTelemetryPromise = fetchJsonIfOk(path);
+    buildTelemetry = await buildTelemetryPromise;
+    return buildTelemetry;
+  }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
 
   function rangeGroups(items, kind = "default") {
@@ -212,6 +275,7 @@ export async function createSearch(options = {}) {
 
   async function loadFacetDictionary(field) {
     if (Array.isArray(manifest.facets?.[field])) return manifest.facets[field];
+    if (!facetDirectory && manifest.lazy_manifests?.full) await ensureFullManifest();
     if (!facetDirectory || !manifest.facet_dictionaries?.fields?.[field]) return [];
     if (!facetDictionaryCache.has(field)) {
       const promise = (async () => {
@@ -339,6 +403,7 @@ export async function createSearch(options = {}) {
   }
 
   async function ensureDocValuesForDocs(fields, docs) {
+    if (!docValues) await ensureDocValuesManifest();
     if (!docValues || !fields.length || !docs.length) return null;
     const requests = [];
     const seen = new Set();
@@ -359,6 +424,7 @@ export async function createSearch(options = {}) {
   }
 
   async function ensureDocValueChunkIndexes(fields, indexes) {
+    if (!docValues) await ensureDocValuesManifest();
     if (!docValues || !fields.length || !indexes.length) return null;
     const requests = [];
     for (const field of fields) {
@@ -384,6 +450,7 @@ export async function createSearch(options = {}) {
 
   async function valueStoreForDocs(fields, docs) {
     if (!fields.length) return null;
+    if (!docValues) await ensureDocValuesManifest();
     if (docValues) return ensureDocValuesForDocs(fields, docs);
     return loadCodes();
   }
@@ -401,6 +468,7 @@ export async function createSearch(options = {}) {
     }
     typoManifest = await typoManifestPromise;
     if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory);
+    if (typoManifest?.lexicon?.directory) typoLexiconDirectory = createDirectoryState(typoManifest.lexicon.directory);
     return typoManifest;
   }
 
@@ -428,7 +496,7 @@ export async function createSearch(options = {}) {
       try {
         const compressed = await fetchRange(new URL(`terms/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          item.resolve(parseShard(await inflateGroupItem(compressed, group.start, item, `term shard ${item.shard}`), manifest));
+          item.resolve(parsePostingSegment(await inflateGroupItem(compressed, group.start, item, `posting segment ${item.shard}`), manifest));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -536,6 +604,52 @@ export async function createSearch(options = {}) {
     return out;
   }
 
+  async function loadTypoLexiconShards(shards) {
+    const meta = await loadTypoManifest();
+    if (!meta?.lexicon) return new Map();
+
+    const wanted = [];
+    const pending = [];
+    const unique = new Map();
+    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
+    for (const { shard, entry } of unique.values()) {
+      wanted.push(shard);
+      if (typoLexiconShardCache.has(shard)) continue;
+      if (!entry) continue;
+      let resolve;
+      let reject;
+      const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      promise.catch(() => {});
+      typoLexiconShardCache.set(shard, promise);
+      pending.push({ shard, entry, resolve, reject });
+    }
+
+    await Promise.all(rangeGroups(pending).map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`typo/lexicon-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          item.resolve(parseTypoLexiconShard(await inflateGroupItem(compressed, group.start, item, `typo lexicon ${item.shard}`)));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          typoLexiconShardCache.delete(item.shard);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    const out = new Map();
+    await Promise.all(wanted.map(async (shard) => {
+      const data = await typoLexiconShardCache.get(shard);
+      if (data) out.set(shard, data);
+    }));
+    return out;
+  }
+
   async function termEntries(terms) {
     const byShard = new Map();
     for (const term of terms) {
@@ -598,7 +712,7 @@ export async function createSearch(options = {}) {
         if (!resolved) return null;
         const buffer = await fetchRange(new URL(`bundles/packs/${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
         return {
-          bundle: parseQueryBundle(await inflateObject(buffer, resolved.entry, `query bundle ${key}`)),
+          bundle: parseQueryBundle(await inflateObject(buffer, resolved.entry, `query bundle ${key}`), manifest),
           bytes: resolved.entry.length
         };
       })();
@@ -626,30 +740,58 @@ export async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters || sortPlan || !baseTerms.length || k > (manifest.query_bundles?.max_rows || 0)) return null;
+    if (sortPlan || !baseTerms.length || k > (manifest.query_bundles?.max_rows || 0)) return null;
     if (manifest.query_bundles?.coverage !== "all-base-docs") return null;
     if (rerank !== false && dependencyTerms(baseTerms).length) return null;
+    const hasFacetFilters = Object.keys(filters.facets || {}).length > 0;
+    if (hasFacetFilters) await ensureFacetDictionaries(filters);
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
+    const filterFields = hasFilters ? filterPlanFields(docFilterPlan) : [];
 
     let lookups = 0;
     for (const plan of queryBundleKeysFromBaseTerms(baseTerms)) {
       lookups++;
       const loaded = await loadQueryBundle(plan.key);
       const bundle = loaded?.bundle;
-      if (!bundle || !bundleProvesTopK(bundle, k)) continue;
-      const rows = bundle.rows.slice(offset, offset + size);
+      if (!bundle) continue;
+      const candidateGroups = hasFilters && bundle.rowGroups?.length
+        ? bundle.rowGroups.filter(group => blockMayPass({ filters: group.filters }, blockFilterPlan))
+        : null;
+      const candidateRows = candidateGroups
+        ? candidateGroups.flatMap(group => bundle.rows.slice(group.rowStart, group.rowStart + group.rowCount))
+        : bundle.rows;
+      const summaryProvesFilters = hasFilters
+        && candidateGroups
+        && candidateGroups.length > 0
+        && candidateGroups.every(group => blockDefinitelyPassesDocFilter({ filters: group.filters }, docFilterPlan));
+      const codeData = hasFilters && !summaryProvesFilters
+        ? await valueStoreForDocs(filterFields, candidateRows.map(row => row[0]))
+        : null;
+      if (hasFilters && !summaryProvesFilters && !codeData) continue;
+      const ranked = hasFilters
+        ? summaryProvesFilters
+          ? candidateRows
+          : candidateRows.filter(row => passesFilterPlan(row[0], codeData, docFilterPlan))
+        : bundle.rows;
+      const filteredTopKProven = hasFilters
+        && (bundle.complete || (ranked.length >= k && (bundle.nextScoreBound || 0) < ranked[k - 1][1]));
+      if (hasFilters ? !filteredTopKProven : !bundleProvesTopK(bundle, k)) continue;
+      const rows = ranked.slice(offset, offset + size);
       const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
       const results = await rowsToResults(rows, resultContext);
+      const totalExact = !hasFilters || bundle.complete;
       return {
-        total: bundle.total,
+        total: totalExact ? (hasFilters ? ranked.length : bundle.total) : Math.max(ranked.length, k),
         page,
         size,
-        approximate: false,
+        approximate: !totalExact,
         results,
         stats: {
           exact: true,
           plannerLane: "queryBundleExact",
           topKProven: true,
-          totalExact: true,
+          totalExact,
           tailExhausted: false,
           blocksDecoded: 0,
           postingsDecoded: 0,
@@ -659,10 +801,17 @@ export async function createSearch(options = {}) {
           shards: 0,
           queryBundleLookups: lookups,
           queryBundleHit: true,
+          queryBundleFiltered: Boolean(hasFilters),
           queryBundleRows: bundle.rows.length,
-          queryBundleTotal: bundle.total,
+          queryBundleRowGroups: bundle.rowGroups?.length || 0,
+          queryBundleRowGroupsScanned: candidateGroups?.length ?? (bundle.rowGroups?.length || 0),
+          queryBundleRowsAccepted: ranked.length,
+          queryBundleTotal: hasFilters ? ranked.length : bundle.total,
           queryBundleBytes: loaded.bytes || 0,
           queryBundleComplete: bundle.complete,
+          queryBundleFilterProof: summaryProvesFilters ? "rowGroupSummary" : "",
+          docValueRowsScanned: hasFilters && !summaryProvesFilters ? candidateRows.length : 0,
+          docValueRowsAccepted: hasFilters ? ranked.length : 0,
           docPayloadLane: resultContext.docPayloadLane,
           docPayloadPages: resultContext.docPayloadPages,
           docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
@@ -1256,6 +1405,23 @@ export async function createSearch(options = {}) {
     return true;
   }
 
+  function blockDefinitelyPassesDocFilter(block, filterPlan) {
+    if (!filterPlan?.active) return true;
+    if (filterPlan.facets.length) return false;
+    for (const [field, range] of filterPlan.numbers) {
+      const summary = block.filters?.[field];
+      if (!summary || summary.min == null || summary.max == null) return false;
+      if (range.min != null && summary.min < range.min) return false;
+      if (range.max != null && summary.max > range.max) return false;
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const summary = block.filters?.[field];
+      const code = expected ? 2 : 1;
+      if (!summary || summary.min !== code || summary.max !== code) return false;
+    }
+    return true;
+  }
+
   function minShouldMatchFor(baseTerms) {
     return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
   }
@@ -1654,6 +1820,7 @@ export async function createSearch(options = {}) {
     const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank });
     if (bundleResponse) return bundleResponse;
 
+    if (hasFilters) await ensureFullManifest();
     await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
@@ -1768,8 +1935,9 @@ export async function createSearch(options = {}) {
   async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
-    await ensureFacetDictionaries(filters);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters || sortPlan) await ensureFullManifest();
+    await ensureFacetDictionaries(filters);
     const entries = await termEntries(terms);
     const scores = new Map();
     const hits = new Map();
@@ -1845,48 +2013,129 @@ export async function createSearch(options = {}) {
     if (!/^[a-z][a-z0-9]*$/u.test(token) || /^\d+$/u.test(token)) return [];
 
     const maxEdits = typoMaxEditsFor(token, { maxEdits: meta.max_edits || 2 });
-    const deleteKeys = [...typoDeleteKeys(token, {
+    const deleteEnabled = token.length <= Math.max(1, Number(meta.delete_max_surface_length || 8));
+    const deleteKeys = deleteEnabled ? [...typoDeleteKeys(token, {
       minTermLength: meta.min_term_length || 4,
       maxEdits: meta.max_edits || 2
-    }, maxEdits)];
-    const byShard = new Map();
-    for (const key of deleteKeys) {
-      const resolved = await resolveDirectoryShard(
-        key,
-        typoDirectory,
-        meta.base_shard_depth || 2,
-        meta.max_shard_depth || meta.base_shard_depth || 3
-      );
-      if (!resolved) continue;
-      if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, keys: [] });
-      byShard.get(resolved.shard).keys.push(key);
-    }
+    }, maxEdits)] : [];
 
-    const candidates = new Map();
-    const loaded = await loadTypoShards([...byShard.values()]);
-    for (const [shard, bucket] of byShard) {
-      debug.shards.add(shard);
-      const data = loaded.get(shard);
-      if (!data) continue;
-      for (const key of bucket.keys) {
-        for (const candidate of typoCandidatesForDeleteKey(data, key)) {
-          if (candidate.surface === token) continue;
-          const candidateKey = `${candidate.surface}\u0001${candidate.term}`;
-          const previous = candidates.get(candidateKey);
-          if (!previous || candidate.df > previous.df) candidates.set(candidateKey, candidate);
+    async function candidatesForKeys(keys) {
+      const byShard = new Map();
+      for (const key of keys) {
+        const resolved = await resolveDirectoryShard(
+          key,
+          typoDirectory,
+          meta.base_shard_depth || 2,
+          meta.max_shard_depth || meta.base_shard_depth || 3
+        );
+        if (!resolved) continue;
+        if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, keys: [] });
+        byShard.get(resolved.shard).keys.push(key);
+      }
+
+      const candidates = new Map();
+      const loaded = await loadTypoShards([...byShard.values()]);
+      for (const [shard, bucket] of byShard) {
+        debug.shards.add(shard);
+        const data = loaded.get(shard);
+        if (!data) continue;
+        for (const key of bucket.keys) {
+          for (const candidate of typoCandidatesForDeleteKey(data, key)) {
+            if (candidate.surface === token) continue;
+            const candidateKey = `${candidate.surface}\u0001${candidate.term}`;
+            const previous = candidates.get(candidateKey);
+            if (!previous || candidate.df > previous.df) candidates.set(candidateKey, candidate);
+          }
         }
       }
+      return candidates;
     }
 
-    const verified = [];
-    for (const candidate of candidates.values()) {
-      const distance = boundedDamerauLevenshtein(token, candidate.surface, maxEdits);
-      if (distance <= 0 || distance > maxEdits) continue;
-      verified.push({
-        ...candidate,
-        distance,
-        score: typoCandidateScore(token, candidate.surface, candidate.df, distance)
-      });
+    function verifiedCandidates(candidates) {
+      const verified = [];
+      for (const candidate of candidates.values()) {
+        const distance = boundedDamerauLevenshtein(token, candidate.surface, maxEdits);
+        if (distance <= 0 || distance > maxEdits) continue;
+        verified.push({
+          ...candidate,
+          distance,
+          score: typoCandidateScore(token, candidate.surface, candidate.df, distance)
+        });
+      }
+      return verified;
+    }
+
+    function mergeVerified(left, right) {
+      const merged = new Map();
+      for (const candidate of [...left, ...right]) {
+        const key = `${candidate.surface}\u0001${candidate.term}`;
+        const previous = merged.get(key);
+        if (!previous || candidate.score > previous.score || (candidate.score === previous.score && candidate.df > previous.df)) {
+          merged.set(key, candidate);
+        }
+      }
+      return [...merged.values()];
+    }
+
+    function lexiconLowerBound(entries, value) {
+      let low = 0;
+      let high = entries.length;
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+        if (entries[mid].surface.localeCompare(value) < 0) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    }
+
+    async function verifiedLexiconCandidates() {
+      if (!meta.lexicon || !typoLexiconDirectory) return [];
+      if (token.length < (meta.lexicon.min_surface_length || meta.min_surface_length || 4)) return [];
+      const depth = meta.lexicon.shard_depth || 2;
+      const resolved = await resolveDirectoryShard(token, typoLexiconDirectory, depth, depth);
+      if (!resolved) return [];
+      const loaded = await loadTypoLexiconShards([{ shard: resolved.shard, entry: resolved.entry }]);
+      debug.lexiconShards.add(resolved.shard);
+      const data = loaded.get(resolved.shard);
+      const entries = data?.entries || [];
+      const maxScan = Math.max(1, Number(meta.lexicon.max_scan_candidates || 2048));
+      const out = [];
+      let scanned = 0;
+      let left = lexiconLowerBound(entries, token) - 1;
+      let right = left + 1;
+      let scanRight = true;
+      while (scanned < maxScan && (left >= 0 || right < entries.length)) {
+        const entry = (scanRight && right < entries.length) || left < 0 ? entries[right++] : entries[left--];
+        scanRight = !scanRight;
+        scanned++;
+        if (!entry || entry.surface === token || Math.abs(entry.surface.length - token.length) > maxEdits) continue;
+        const distance = boundedDamerauLevenshtein(token, entry.surface, maxEdits);
+        if (distance <= 0 || distance > maxEdits) continue;
+        out.push({
+          ...entry,
+          distance,
+          score: typoCandidateScore(token, entry.surface, entry.df, distance)
+        });
+      }
+      debug.lexiconScanned += scanned;
+      return out
+        .sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term))
+        .slice(0, 64);
+    }
+
+    const candidates = deleteEnabled ? await candidatesForKeys([token]) : new Map();
+    let verified = verifiedCandidates(candidates);
+    if (deleteEnabled && !verified.some(candidate => candidate.score >= 0.5)) {
+      const remainingKeys = deleteKeys.filter(key => key !== token);
+      const fallback = await candidatesForKeys(remainingKeys);
+      for (const [key, candidate] of fallback) {
+        const previous = candidates.get(key);
+        if (!previous || candidate.df > previous.df) candidates.set(key, candidate);
+      }
+      verified = verifiedCandidates(candidates);
+    }
+    if (!verified.some(candidate => candidate.score >= 0.5)) {
+      verified = mergeVerified(verified, await verifiedLexiconCandidates());
     }
     debug.candidates += verified.length;
     return verified
@@ -1899,7 +2148,7 @@ export async function createSearch(options = {}) {
     const presentTerms = new Map((await termEntries(baseTerms)).map(item => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some(term => !presentTerms.has(term));
     const plans = [];
-    const debug = { shards: new Set(), candidates: 0 };
+    const debug = { shards: new Set(), lexiconShards: new Set(), candidates: 0, lexiconScanned: 0 };
 
     for (let index = 0; index < analyzedTerms.length; index++) {
       const item = analyzedTerms[index];
@@ -1929,7 +2178,12 @@ export async function createSearch(options = {}) {
     plans.sort((a, b) => b.score - a.score || a.q.localeCompare(b.q));
     return {
       plans: plans.slice(0, 12),
-      stats: { typoCandidateTerms: debug.candidates, typoShardLookups: debug.shards.size }
+      stats: {
+        typoCandidateTerms: debug.candidates,
+        typoShardLookups: debug.shards.size,
+        typoLexiconShardLookups: debug.lexiconShards.size,
+        typoLexiconCandidatesScanned: debug.lexiconScanned
+      }
     };
   }
 
@@ -2143,6 +2397,7 @@ export async function createSearch(options = {}) {
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
 
     if (!q) {
+      if (hasFilters || sortPlan) await ensureFullManifest();
       if (!sortPlan && !hasFilters) {
         const docs = manifest.initial_results.slice(offset, offset + size);
         return { total: manifest.total, results: docs, page, size };
@@ -2198,6 +2453,7 @@ export async function createSearch(options = {}) {
 
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map(item => item.term);
+    if (sortPlan || params.exact) await ensureFullManifest();
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;
     const response = await searchFn({ q, page, size, filters, sort, baseTerms, terms: queryTerms(q), rerank: params.rerank });
     const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
@@ -2207,6 +2463,7 @@ export async function createSearch(options = {}) {
   return {
     manifest,
     search,
+    loadBuildTelemetry,
     loadFacetValues: loadFacetDictionary
   };
 }

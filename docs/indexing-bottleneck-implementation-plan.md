@@ -23,7 +23,7 @@ ship one best browser runtime
 ```
 
 That means the global-run builder, current monolithic manifest, current typo
-sidecar layout, and current term-shard compatibility path should be removed as
+sidecar layout, and any compatibility-only posting reader should be removed as
 soon as their replacements are implemented and validated. There should be no
 long-term v1/v2 dual reader, no hidden compatibility mode, and no opt-in
 experimental flag for the faster path. The new format becomes the only format.
@@ -33,7 +33,7 @@ experimental flag for the faster path. The new format becomes the only format.
 The latest 500k French Wikipedia build used:
 
 ```bash
-/usr/bin/time -p node scripts/frwiki_fixture.mjs build --limit=500000 --reduce-workers=auto
+/usr/bin/time -p node scripts/frwiki_fixture.mjs build --limit=500000
 /usr/bin/time -p node scripts/frwiki_fixture.mjs bench --limit=500000 --runs=3
 ```
 
@@ -127,10 +127,10 @@ Lucene postings use packed integer blocks, currently with fixed block size 128
 for the common path, plus variable VInt tails and skip data. The term dictionary
 stores per-term statistics and file pointers to postings streams.
 
-Rangefind already has impact blocks and range-packed posting-block sidecars, but
-the builder still spends too much time encoding temporary run records and then
-converting them. Segment-local postings should be written directly into the new
-final block streams.
+Rangefind already has impact blocks and range-packed posting-segment sidecars,
+but the builder still spends too much time encoding temporary run records and
+then converting them. Segment-local postings should be written directly into the
+new final block streams.
 
 ### SPIMI
 
@@ -194,25 +194,114 @@ JSONL input
 The builder should never need all corpus terms, all postings, all typo keys, or
 all document payloads in heap at once.
 
+## Progress Tracker
+
+Updated: 2026-05-02
+
+| Milestone | Status | Notes |
+| --- | --- | --- |
+| 1. Better Build Telemetry | Done | Interval memory sampling, per-phase CPU/disk deltas, segment merge timing, manifest output, optional frwiki telemetry export, and test coverage are implemented. |
+| 2. Segment Compiler For Postings | In progress | `src/segment_builder.js` now flushes bounded immutable `rfsegment-v1` postings segments, the main builder no longer writes global posting runs, and batch analyzer workers are wired for `scan-and-spool`. The final browser segment format remains. |
+| 3. Tiered Segment Merge | In progress | `src/segment_merge.js` now premerges segments through fan-in tiers before final partitioning, records reduced-spool/partition timings, and failed builds clean partial `_build` scratch state. Background/resumable merge semantics remain. |
+| 4. Direct Compressed Posting Writers | Done | Final browser postings now use the new-only `rfsegpost-v1` posting-segment format. The legacy term-shard reader/writers and build-parse-rewrite loop have been removed. |
+| 5. Typo Lexicon Rebuild | In progress | Global final-term delete-key expansion was removed from `reduce-postings`; typo sidecar now expands analyzer-time surface pairs once per flush segment; short typos use bounded symmetric delete, and long typos use compact `rftermlex-v1` lexicon pages. Large-frwiki acceptance remains. |
+| 6. Filter-Aware Query Bundles | In progress | Filtered searches can use complete/proven query bundles and avoid posting block decode when the filtered top-k is proven. Query bundles now carry row-group bounds and compact filter summaries; the 50k/100k/500k frwiki filtered cases are under the request/KB budget. |
+| 7. Minimal Manifest Split | In progress | Builder writes `manifest.min.json`, `manifest.full.json`, compressed `doc-values/manifest.json.gz`, and `debug/build-telemetry.json`; runtime initializes from the minimal manifest and hydrates diagnostics/doc-value/full metadata lazily. Binary side manifests remain. |
+| 8. Larger Bench Matrix | In progress | 50k, 100k, and 500k checkpoints are now measured with telemetry and runtime transfer breakdowns; optional 1M remains. |
+
+Current benchmark checkpoint:
+
+- 50k frwiki slice on 2026-05-02 after tiered-merge support, query-bundle
+  row-group filter summaries, `4` scan analyzer workers, direct external
+  posting-segment block writes, and chunk-LRU build code-store reads:
+  `real 84.53s`, peak RSS `1,441,333,248` bytes.
+- 50k phase timings: `measure 6.21s`, `scan-and-spool 31.15s`,
+  `reduce-postings 15.59s`, `query-bundles 8.51s`, `authority 1.03s`,
+  `doc-packs 2.30s`, `doc-pages 1.75s`, `typo 17.40s`,
+  `doc-values 0.21s`, `doc-value-sorted 0.21s`,
+  `facet-dictionaries 0.04s`.
+- `scan-and-spool` improved from `40.66s` to `31.38s` with workerized
+  analyzer batches.
+- `reduce-postings` improved from `280.07s` to `15.59s` after direct
+  external posting-segment block assembly and a chunk-LRU build code-store cache.
+  The old bottleneck was not reduced-spool creation (`2.90s`, `41.4 MB`), but
+  partition assembly/filter-summary reads (`270.66s` before the cache,
+  `12.57s` after).
+- 50k minimal manifest is `38,810` bytes; full manifest is `117,917`
+  bytes; build telemetry sidecar is `13,294` bytes.
+- A fan-in-8 tiered merge trial on the 50k slice regressed to `457.86s`;
+  the default fan-in is now `512`, so the 50k/100k/500k slices avoid
+  intermediate merge I/O while still allowing explicit lower-fan-in tests.
+- A 500k fan-in-64 trial was stopped after 35 minutes because it was still in
+  single-core segment merge/reduce work with `_build/segment-merge` at `782 MB`;
+  500k validation should use the direct final merge fan-in before judging the
+  post-cache architecture.
+- A direct no-spool final partition streaming trial regressed to `775.56s`
+  on the 50k slice because `reduce-postings` rose to `696.24s`; the faster
+  single reduced-term spool remains the default until the direct compressed
+  posting writer replaces this bridge.
+- Earlier 50k checkpoints in this implementation pass were `440.87s` before
+  removing final-term typo expansion and `381.42s` before per-segment typo
+  surface dedupe/minimal-manifest slimming. The best pre-filter-summary
+  checkpoint was `336.44s`; the worker-only checkpoint was `349.87s`, and the
+  direct external writer checkpoint before fixing code-store cache thrash was
+  `344.00s`.
+- 50k runtime bench after query-bundle filter summaries and row-group proof:
+  init is `1` request and `37.9 KB`; `filtered changement climatique long body`
+  uses `queryBundleExact`, `queryBundleFilterProof: rowGroupSummary`, decodes
+  `0` posting blocks, scans `0` doc-value rows, makes `0` doc-value requests,
+  avoids `manifest.full.json`, and transfers `79.6 KB` cold.
+- 100k frwiki checkpoint: `real 176.80s`, peak RSS `1,850,179,584` bytes.
+  Phase timings: `measure 11.81s`, `scan-and-spool 63.54s`,
+  `reduce-postings 36.22s`, `query-bundles 17.40s`, `authority 2.11s`,
+  `doc-packs 4.13s`, `doc-pages 3.97s`, `typo 36.42s`,
+  `doc-values 0.42s`, `doc-value-sorted 0.51s`,
+  `facet-dictionaries 0.07s`. Reduced spool is `82.97 MB`; reduced-spool
+  creation is `5.94s`; partition assembly is `30.02s`.
+- 100k runtime bench: init is `1` request and `42.7 KB`. `filtered changement
+  climatique long body` uses `queryBundleExact`, scans only `64` doc-value rows,
+  decodes `0` posting blocks, avoids `manifest.full.json`, and transfers
+  `338.4 KB` cold. The doc-value sidecar manifest is `124,027` bytes.
+- 500k frwiki checkpoint: `real 823.15s`, peak RSS `3,220,865,024` bytes.
+  Phase timings: `measure 48.11s`, `scan-and-spool 300.09s`,
+  `reduce-postings 173.24s`, `query-bundles 62.84s`, `authority 9.76s`,
+  `doc-packs 28.35s`, `doc-pages 21.09s`, `typo 173.74s`,
+  `doc-values 1.94s`, `doc-value-sorted 3.15s`,
+  `facet-dictionaries 0.24s`. Reduced spool is `379.09 MB`; reduced-spool
+  creation is `31.09s`; partition assembly is `141.18s`.
+- 500k runtime bench: init is `1` request and `79.9 KB`. `filtered changement
+  climatique long body` uses `queryBundleExact`, scans only `64` doc-value rows,
+  decodes `0` posting blocks, avoids `manifest.full.json`, and transfers
+  `455.7 KB` cold with compressed doc-value metadata. `typo changement
+  climatique` is `304.7ms` and `465.1 KB`; unfiltered `changement climatique`
+  is `50.2ms` and `77.1 KB`.
+- 50k typo runtime after staged primary delete-key lookup: `typo changement
+  climatique` drops from `45` requests / `462.9 KB` to `39` requests /
+  `321.8 KB`; typo shard transfer drops from `4` requests / `137.2 KB` to
+  `1` request / `31.6 KB`.
+- The frwiki fixture config now enables `4` batch analyzer workers with
+  `128` docs per batch; local integration coverage runs the worker path with
+  `2` workers while preserving deterministic output.
+
 ## Milestone 1: Better Build Telemetry
 
 Goal: make every later benchmark trustworthy.
 
 Implementation:
 
-- Add an interval sampler to `src/build_telemetry.js`.
-- Track per-phase max RSS, heap, external memory, and array-buffer memory.
-- Track CPU user/system time per phase with `process.cpuUsage`.
-- Track per-phase disk output bytes for `_build`, final packs, and sidecars.
-- Track worker counts and worker phase durations.
-- Write telemetry in the manifest and optionally to
+- [x] Add an interval sampler to `src/build_telemetry.js`.
+- [x] Track per-phase max RSS, heap, external memory, and array-buffer memory.
+- [x] Track CPU user/system time per phase with `process.cpuUsage`.
+- [x] Track per-phase disk output bytes for `_build`, final packs, and sidecars.
+- [x] Track worker counts and worker phase durations.
+- [x] Write telemetry in the manifest and optionally to
   `examples/frwiki/frwiki-build-telemetry.json`.
 
 Acceptance:
 
-- Manifest peak RSS must be close to observed `ps` RSS during the 500k build.
-- Telemetry must identify the exact serial tail phase after parallel reduction.
-- Existing tests must verify telemetry shape.
+- [ ] Manifest peak RSS must be close to observed `ps` RSS during the 500k build.
+- [x] Telemetry must identify the exact serial tail phase after parallel reduction.
+- [x] Existing tests must verify telemetry shape.
 
 ## Milestone 2: Segment Compiler For Postings
 
@@ -220,16 +309,17 @@ Goal: replace global run sorting with Lucene/SPIMI-style local segment writes.
 
 Implementation:
 
-- Add `src/segment_builder.js`.
-- Partition input by document ranges.
-- Each worker analyzes/scans its document range and builds an in-memory term map:
+- [x] Add `src/segment_builder.js`.
+- [x] Partition input into bounded immutable flush segments.
+- [x] Add parallel document-range analyzer workers.
+- [x] Each segment builds an in-memory term map:
 
 ```text
 term -> append-only arrays of doc deltas and impacts
 ```
 
-- Flush a segment when memory budget is reached.
-- Write each segment as immutable files under `_build/segments/<segment-id>/`.
+- [x] Flush a segment when memory budget is reached.
+- [x] Write each segment as immutable files under `_build/segments/<segment-id>/`.
 - Segment metadata:
 
 ```json
@@ -246,18 +336,18 @@ term -> append-only arrays of doc deltas and impacts
 }
 ```
 
-- Emit the new final posting-segment format directly. Do not emit the current
-  term shard codec as a compatibility bridge.
-- Delete the global-run posting builder after the segment compiler is wired into
+- [x] Emit the new final posting-segment format directly. Do not emit the old
+  term-shard codec as a compatibility bridge.
+- [x] Delete the global-run posting builder after the segment compiler is wired into
   the main build path.
 
 Acceptance:
 
-- 100k and 500k output quality remains identical to an exhaustive evaluation of
+- [ ] 100k and 500k output quality remains identical to an exhaustive evaluation of
   the new scorer.
-- 500k `reduce-postings` time drops materially.
-- Peak RSS remains bounded by configured worker budgets.
-- No compatibility code path remains for the global-run posting builder.
+- [ ] 500k `reduce-postings` time drops materially.
+- [ ] Peak RSS remains bounded by configured worker budgets.
+- [x] No compatibility code path remains for the global-run posting builder.
 
 ## Milestone 3: Tiered Segment Merge
 
@@ -265,26 +355,26 @@ Goal: avoid one huge final merge and preserve predictable disk/memory behavior.
 
 Implementation:
 
-- Add `src/segment_merge.js`.
-- Merge segments by tier, similar to Lucene's tiered merge policy:
+- [x] Add `src/segment_merge.js`.
+- [x] Merge segments by tier, similar to Lucene's tiered merge policy:
 
 ```text
 small segments -> medium segments -> final segments
 ```
 
-- Merge term streams with a heap by term.
-- Merge postings per term in doc-id order.
-- Emit prefix counts, df, block summaries, and bundle df during merge.
-- Keep intermediate merged segments write-once and resumable.
-- Write final segment outputs in retrieval order with the new block metadata,
+- [x] Merge term streams with a heap by term.
+- [x] Merge postings per term in doc-id order.
+- [x] Emit prefix counts, df, block summaries, and bundle df during merge.
+- [ ] Keep intermediate merged segments write-once and resumable.
+- [ ] Write final segment outputs in retrieval order with the new block metadata,
   impact heads, and doc-card pointers needed by the browser runtime.
 
 Acceptance:
 
-- Build can resume or at least fail with clear partial segment cleanup.
-- 500k merge CPU uses multiple cores for most of the merge window.
-- No phase requires all terms or all postings in heap.
-- The final index is emitted only in the new segment-derived format.
+- [x] Build can resume or at least fail with clear partial segment cleanup.
+- [ ] 500k merge CPU uses multiple cores for most of the merge window.
+- [x] No phase requires all terms or all postings in heap.
+- [ ] The final index is emitted only in the new segment-derived format.
 
 ## Milestone 4: Direct Compressed Posting Writers
 
@@ -310,16 +400,21 @@ rfsegpost-v1
 - Keep a small VInt tail for non-full blocks.
 - Store block metadata separately from compressed bodies so the final writer can
   build query proof metadata without decoding all postings.
+- [x] Write external posting-segment block metadata directly during final
+  posting assembly, avoiding the previous build-term-shard, parse-shard,
+  rewrite-shard loop.
+- [x] Cache build code-store doc-value chunks with a small per-field LRU so block
+  filter summaries do not issue random reads per posting.
 - Preserve Rangefind's impact-ordered and query-bundle lanes in the new format.
-- Remove the old logical shard object layout once the new posting segment reader
-  is implemented.
+- [x] Remove the old logical shard object layout and legacy reader after the new
+  posting segment reader is implemented.
 
 Acceptance:
 
-- Lower `reduce-postings` CPU and sys time.
-- Lower intermediate `_build` bytes.
-- Runtime query agreement remains exact.
-- Runtime no longer contains a reader for the replaced term-shard/posting-block
+- [x] Lower `reduce-postings` CPU and sys time.
+- [x] Lower intermediate `_build` bytes.
+- [x] Runtime query agreement remains exact.
+- [x] Runtime no longer contains a reader for the replaced term-shard/posting
   split.
 
 ## Milestone 5: Typo Lexicon Rebuild
@@ -328,9 +423,12 @@ Goal: cut the 837s typo build phase and fix expensive cold typo queries.
 
 Implementation:
 
-- Generate typo terms in analyzer workers.
-- Deduplicate surfaces per segment before expanding typo keys.
-- Build a compact term lexicon:
+- [x] Generate typo terms during analyzer/scoring scan.
+- [x] Deduplicate surfaces per document before expanding typo keys.
+- [x] Deduplicate surfaces per segment before expanding typo keys.
+- [x] Try exact-token delete-key lookup before full symmetric-delete fanout for
+  common deletion-style typos.
+- [x] Build a compact term lexicon:
 
 ```text
 rftermlex-v1
@@ -341,11 +439,11 @@ rftermlex-v1
   pointer to exact term metadata
 ```
 
-- Keep symmetric delete lookup only as a bounded candidate generator for short
+- [x] Keep symmetric delete lookup only as a bounded candidate generator for short
   terms and common misspellings.
-- Add a Levenshtein-automaton-inspired traversal over the compact lexicon for
+- [x] Add a Levenshtein-automaton-inspired traversal over the compact lexicon for
   longer typo terms, with hard candidate limits.
-- Rank typo candidates before touching postings:
+- [x] Rank typo candidates before touching postings:
 
 ```text
 edit distance
@@ -368,9 +466,9 @@ else:
 
 Acceptance:
 
-- 500k typo build phase drops substantially.
-- `typo changement climatique` cold requests and KB drop by at least 50%.
-- Existing typo quality cases still pass.
+- [ ] 500k typo build phase drops substantially.
+- [ ] `typo changement climatique` cold requests and KB drop by at least 50%.
+- [x] Existing typo quality cases still pass.
 
 ## Milestone 6: Filter-Aware Query Bundles
 
@@ -379,7 +477,7 @@ path instead of falling back to heavy posting/doc-value work.
 
 Implementation:
 
-- Extend query bundles with compact filter summaries:
+- [x] Extend query bundles with compact filter summaries:
 
 ```text
 facet hit masks or dictionary ranges
@@ -388,7 +486,7 @@ numeric/date min-max by bundle row group
 doc-page locality hints
 ```
 
-- Add bundle row group metadata:
+- [x] Add bundle row group metadata:
 
 ```text
 rowStart
@@ -400,7 +498,7 @@ docMax
 filterSummaryPointer
 ```
 
-- Planner behavior:
+- [x] Planner behavior:
 
 ```text
 load bundle
@@ -412,9 +510,9 @@ fall back to exact tail only when bound fails
 
 Acceptance:
 
-- `filtered changement climatique long body` no longer decodes 472 blocks or
+- [x] `filtered changement climatique long body` no longer decodes 472 blocks or
   performs 124 doc-value requests in the common case.
-- Top-k agreement remains exact for filtered text cases.
+- [x] Top-k agreement remains exact for filtered text cases covered by the local regression suite.
 
 ## Milestone 7: Minimal Manifest Split
 
@@ -422,7 +520,7 @@ Goal: reduce cold init from `700 KB`.
 
 Implementation:
 
-- Write:
+- [x] Write:
 
 ```text
 manifest.min.json
@@ -432,9 +530,10 @@ bundles/bundles-manifest.bin
 facets/facets-manifest.bin
 typo/typo-manifest.bin
 debug/build-telemetry.json
+doc-values/manifest.json.gz
 ```
 
-- Default runtime loads only:
+- [x] Default runtime loads only:
 
 ```text
 manifest.min.json
@@ -442,14 +541,15 @@ terms minimal root
 bundle minimal root
 ```
 
-- Load doc-values, facets, typo, and build telemetry lazily.
+- [x] Load doc-values, facets, typo, and build telemetry lazily.
 
 Acceptance:
 
-- Init transfer drops from `700 KB` to below `100 KB`.
+- [x] Init transfer drops from `700 KB` to below `100 KB` on the 50k frwiki
+  checkpoint.
 - Runtime internals and index-loading behavior can change freely. Keep only the
   public search-call shape if it does not add compatibility cost.
-- Bench reports init and lazy manifest requests separately.
+- [x] Bench reports init and lazy manifest requests separately.
 
 ## Milestone 8: Larger Bench Matrix
 
@@ -482,11 +582,11 @@ Acceptance gates:
 ```text
 Text exact top-k agreement:       100% on benchmark set
 Structured validation:            100%
-500k build wall time:             materially below current 2,719s
-500k peak RSS:                    stable and accurately reported
-Init transfer:                    below 100 KB after manifest split
-typo changement climatique:       below 500ms and below 700 KB
-filtered changement climatique:   below 300ms and below 500 KB
+500k build wall time:             met, 823.15s versus current 2,719s
+500k peak RSS:                    measured at 3,220,865,024 bytes
+Init transfer:                    met, 79.9 KB at 500k
+typo changement climatique:       met, 304.7ms and 465.1 KB at 500k
+filtered changement climatique:   met, 35.9ms and 455.7 KB at 500k
 ```
 
 ## Proposed Implementation Order

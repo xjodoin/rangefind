@@ -63,6 +63,12 @@ rangefind/
       0000.<hash>.bin.gz
     packs/
       0000.<hash>.bin
+    lexicon/
+      directory-root.<hash>.bin.gz
+      directory-pages/
+        0000.<hash>.bin.gz
+    lexicon-packs/
+      0000.<hash>.bin
 ```
 
 `manifest.json` is small enough for page initialization. It lists schema,
@@ -102,9 +108,10 @@ names. The numeric prefix keeps deterministic pack ordering, while the SHA-256
 hash suffix changes whenever the bytes change. Directory pages keep compact
 numeric pack indexes and resolve them through a `pack_table`, so filenames are
 CDN-safe without bloating every logical entry. The optional typo sidecar
-manifest is also content-addressed and referenced from the main manifest. Hosts
-can serve every hashed object with long-lived immutable cache headers; only the
-main `manifest.json` needs revalidation or versioned publication.
+manifest is also content-addressed and referenced from the main manifest; it can
+include both short-token delete-key shards and compact long-token lexicon pages.
+Hosts can serve every hashed object with long-lived immutable cache headers;
+only the main `manifest.json` needs revalidation or versioned publication.
 
 The pack writer also performs a narrow ZFS-style deduplication pass at build
 time. It hashes each independently compressed object and reuses the same
@@ -159,10 +166,10 @@ query. It contains page bounds and a compact Bloom filter for adaptive shard
 resolution. Only touched `terms/directory-pages/*.bin.gz` files are fetched, and
 each page maps logical shard names to checksummed object pointers.
 
-`terms/packs/*.bin` contain many independently compressed logical shards. The
-browser requests exactly the byte span it needs and decompresses that one shard.
-High-df posting lists can move their posting blocks into
-`terms/block-packs/*.bin`; the term shard then carries only term metadata,
+`terms/packs/*.bin` contain many independently compressed posting segments. The
+browser requests exactly the byte span it needs and decompresses that one
+segment. High-df posting lists can move their posting blocks into
+`terms/block-packs/*.bin`; the posting segment then carries term metadata,
 block-max scores, filter summaries, and byte ranges for external blocks.
 The text top-k runtime schedules a small frontier of the highest-impact active
 cursors, then batches external posting-block misses across those cursors before
@@ -173,14 +180,13 @@ block. The same adaptive overfetch planner is used for external posting blocks
 and result documents: nearby byte ranges are merged when the extra transfer is
 bounded and materially reduces request count.
 
-The builder writes temporary posting and typo runs with a compact binary record
-format instead of TSV. Runs are still partitioned by base shard, so reduction can
-stream bounded shard groups without holding the whole corpus index in memory.
-The posting reducer first sorts bounded chunks, then performs a heap-based
-k-way merge into a reduced-term spool. That single spool is reused for prefix
-statistics and final partition emission, avoiding the older double merge over
-the same sorted chunks. Each reduced term is encoded as a compact binary record:
-term, df, and `(docId, impact)` rows.
+The builder writes postings into bounded immutable `rfsegment-v1` segment
+directories under `_build/segments/`. Each segment contains a compact term
+directory and append-only posting rows, so the main indexing pass no longer
+builds one global posting run and sorts it at the end. The segment merger reads
+term streams with a heap, merges postings per term in doc-id order, and reuses
+that stream for prefix statistics, query-bundle df, typo index-term emission,
+and final partition emission.
 
 The first ingestion pass also writes two extra file-backed spools. A
 selected-term spool stores each document's final selected scoring terms and
@@ -190,15 +196,12 @@ payloads are stored in both compressed and raw spools: retrieval-local doc packs
 reuse the compressed payload spool, while dense doc-page construction reads the
 raw spool directly and avoids a build-time gzip/decompress loop.
 
-Base-shard reduction can run in worker threads. Workers write raw logical shard
-bytes and typo index-term run files into `_build/`; the parent then externalizes
-posting blocks, compresses each final object once, and assembles final range
-packs in sorted task order so pack offsets stay deterministic. Set
-`reduceWorkers` in the config to control the worker count; `1` is the default,
-while `0` or `"auto"` uses up to four workers. Every build manifest includes
-`build.format = "rfbuildtelemetry-v1"` with phase timings, memory snapshots, peak
-RSS, and spool byte counters so large-corpus regressions can be compared from
-the emitted index alone.
+The final pack writer still emits immutable range-pack objects in deterministic
+term order, and externalizes large posting blocks into `terms/block-packs/`.
+Every build manifest includes `build.format = "rfbuildtelemetry-v1"` with
+sampled per-phase memory peaks, CPU user/system time, disk byte deltas, segment
+counters, and reduce/merge worker timing so large-corpus regressions can be
+compared from the emitted index alone.
 
 Authority fields use the same file-backed run/reduce pattern as postings. Each
 configured title, entity-name, slug, or alias value emits surface-exact,
@@ -208,8 +211,8 @@ paged range directory. Authority has its own shard budget
 (`authorityTargetShardRows`) and deeper max shard depth
 (`authorityMaxShardDepth`) and smaller directory pages
 (`authorityDirectoryPageBytes`) because label lookups are point reads; they
-should not inherit the larger posting-list shard and directory budgets used by
-normal term shards.
+should not inherit the larger posting-list segment and directory budgets used by
+normal posting segments.
 The browser probes the surface-exact key first, which keeps accent-sensitive
 matches such as `Paris` and `Pâris` distinct. It only falls back to folded or
 token keys when the stronger key cannot rescue the first page. Authority scores

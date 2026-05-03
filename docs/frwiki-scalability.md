@@ -54,7 +54,6 @@ Useful options:
 - `--force`: regenerates JSONL even when the existing metadata matches the
   requested dump URL, limit, and body cap.
 - `--queries=a|b|c`: overrides benchmark queries.
-- `--reduce-workers=auto`: enables worker-based term reduction.
 - `--scale-limits=50000,100000`: controls the `scale` command document counts.
 - `--no-exact-checks`: skips the exact top-k comparison for text queries.
 
@@ -127,8 +126,9 @@ changement climatique:  unchanged,    28 requests,  76.8 KB, authority skipped
 fromage:                unchanged,    19 requests, 239.5 KB, authority miss 9.6 KB
 ```
 
-The full 500k build took 3,642 seconds wall time with `--reduce-workers=auto`
-and peaked at about 2.39 GB RSS. The main remaining build bottleneck was the
+An older full 500k build took 3,642 seconds wall time with the removed
+base-shard worker reducer and peaked at about 2.39 GB RSS. The main remaining
+build bottleneck was the
 pre-existing typo-sidecar merge/reduction path; rebuilding only the authority
 sidecar from the same 500k JSONL took about 14 seconds.
 
@@ -144,7 +144,7 @@ reduction, document packs, and doc pages.
 Build command, reusing the cached 50k JSONL fixture:
 
 ```bash
-/usr/bin/time -p node scripts/frwiki_fixture.mjs all --limit=50000 --runs=2 --reduce-workers=auto
+/usr/bin/time -p node scripts/frwiki_fixture.mjs all --limit=50000 --runs=2
 ```
 
 Latest cold-transfer bench command against that index:
@@ -247,7 +247,7 @@ The scale command builds isolated fixtures for each requested limit and writes a
 combined report to `examples/frwiki/frwiki-scale-bench.json`:
 
 ```bash
-node scripts/frwiki_fixture.mjs scale --scale-limits=50000,100000 --runs=2 --reduce-workers=auto
+node scripts/frwiki_fixture.mjs scale --scale-limits=50000,100000 --runs=2
 ```
 
 Latest scale result:

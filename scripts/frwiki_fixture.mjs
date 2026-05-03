@@ -41,8 +41,7 @@ function parseArgs(argv) {
     size: 10,
     bodyChars: Number(process.env.FRWIKI_BODY_CHARS || 6000),
     force: false,
-    exactChecks: process.env.FRWIKI_EXACT_CHECKS !== "0",
-    reduceWorkers: process.env.RANGEFIND_REDUCE_WORKERS || ""
+    exactChecks: process.env.FRWIKI_EXACT_CHECKS !== "0"
   };
   for (const arg of argv.slice(1)) {
     if (arg === "--force") args.force = true;
@@ -53,7 +52,6 @@ function parseArgs(argv) {
     else if (arg.startsWith("--runs=")) args.runs = Number(arg.slice("--runs=".length)) || args.runs;
     else if (arg.startsWith("--size=")) args.size = Number(arg.slice("--size=".length)) || args.size;
     else if (arg.startsWith("--body-chars=")) args.bodyChars = Number(arg.slice("--body-chars=".length)) || 0;
-    else if (arg.startsWith("--reduce-workers=")) args.reduceWorkers = arg.slice("--reduce-workers=".length);
     else if (arg.startsWith("--scale-limits=")) args.scaleLimits = arg.slice("--scale-limits=".length).split(",").map(value => Number(value.trim())).filter(Boolean);
     else if (arg === "--exact-checks") args.exactChecks = true;
     else if (arg === "--no-exact-checks") args.exactChecks = false;
@@ -285,7 +283,10 @@ function writeSite(args, docsPath) {
     maxTermsPerDoc: 180,
     maxExpansionTermsPerDoc: 8,
     targetShardPostings: 45000,
-    reduceWorkers: args.reduceWorkers ? (args.reduceWorkers === "auto" ? "auto" : Number(args.reduceWorkers)) : 1,
+    segmentMergeFanIn: 512,
+    buildTelemetryPath: "frwiki-build-telemetry.json",
+    scanWorkers: 4,
+    scanBatchDocs: 128,
     fields: [
       { name: "title", path: "title", weight: 5.5, b: 0.25, phrase: true, proximity: true, proximityWeight: 3, proximityWindow: 5 },
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
@@ -368,6 +369,9 @@ async function buildFixture(args) {
 
 function networkBucket(url) {
   const path = new URL(url).pathname;
+  if (path.endsWith("/manifest.min.json")) return "manifestMin";
+  if (path.endsWith("/manifest.full.json")) return "manifestFull";
+  if (path.endsWith("/debug/build-telemetry.json")) return "buildTelemetry";
   if (path.endsWith("/runtime.browser.js")) return "runtime";
   if (/\/manifest(?:\.[0-9a-f]+)?\.json$/u.test(path)) return "manifest";
   if (path.includes("/directory-")) return "directory";
@@ -684,10 +688,15 @@ function compactRuntimeStats(stats = {}) {
     docValueChunksPruned: stats.docValueChunksPruned || 0,
     queryBundleLookups: stats.queryBundleLookups || 0,
     queryBundleHit: Boolean(stats.queryBundleHit),
+    queryBundleFiltered: Boolean(stats.queryBundleFiltered),
     queryBundleRows: stats.queryBundleRows || 0,
+    queryBundleRowGroups: stats.queryBundleRowGroups || 0,
+    queryBundleRowGroupsScanned: stats.queryBundleRowGroupsScanned || 0,
+    queryBundleRowsAccepted: stats.queryBundleRowsAccepted || 0,
     queryBundleTotal: stats.queryBundleTotal || 0,
     queryBundleBytes: stats.queryBundleBytes || 0,
     queryBundleComplete: Boolean(stats.queryBundleComplete),
+    queryBundleFilterProof: stats.queryBundleFilterProof || "",
     authorityAttempted: Boolean(stats.authorityAttempted),
     authorityApplied: Boolean(stats.authorityApplied),
     authorityComplete: Boolean(stats.authorityComplete),
@@ -893,6 +902,8 @@ function summarizeScaleRow(row) {
     totalExact: row.coldStats?.totalExact || false,
     queryBundleHit: row.coldStats?.queryBundleHit || false,
     queryBundleBytes: row.coldStats?.queryBundleBytes || 0,
+    queryBundleRowGroups: row.coldStats?.queryBundleRowGroups || 0,
+    queryBundleRowGroupsScanned: row.coldStats?.queryBundleRowGroupsScanned || 0,
     authorityAttempted: row.coldStats?.authorityAttempted || false,
     authorityApplied: row.coldStats?.authorityApplied || false,
     authorityRows: row.coldStats?.authorityRows || 0,

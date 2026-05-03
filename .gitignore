@@ -7,7 +7,9 @@ examples/frwiki/data/
 examples/frwiki/public/
 examples/frwiki/rangefind.config.json
 examples/frwiki/frwiki-bench.json
+examples/frwiki/frwiki-build-telemetry.json
 .DS_Store
 *.log
 *.tgz
 target/
+.claude/

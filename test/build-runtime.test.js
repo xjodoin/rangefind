@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -56,7 +56,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   await writeFile(docsPath, [
     JSON.stringify({ id: "a", title: "Static range search", body: "Rangefind builds a static index with range requests.", category: "indexing", tags: ["static", "range"], year: 2026, temperature: -1, published: "2026-01-10", featured: true, url: "/a" }),
     JSON.stringify({ id: "b", title: "SQLite retrieval baseline", body: "A server-side SQLite benchmark compares retrieval quality.", aliases: ["authoritative alias"], category: "baseline", tags: ["sqlite", "quality"], year: 2025, temperature: -5, published: "2025-06-01", featured: false, url: "/b" }),
-    JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed term shards lazily.", category: "runtime", tags: ["static", "runtime"], year: 2026, temperature: 0, published: "2026-03-15", featured: false, url: "/c" }),
+    JSON.stringify({ id: "c", title: "Client search runtime", body: "The runtime fetches packed posting segments lazily.", category: "runtime", tags: ["static", "runtime"], year: 2026, temperature: 0, published: "2026-03-15", featured: false, url: "/c" }),
     JSON.stringify({ id: "d", title: "Electrified winding insulation", body: "A corrected stem must not be stemmed a second time.", category: "runtime", tags: ["typo"], year: 2026, temperature: 7, published: "2026-05-01", featured: true, url: "/d" }),
     JSON.stringify({ id: "e", title: "Archived catalog entry", body: "A low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-01", featured: false, url: "/e" }),
     JSON.stringify({ id: "f", title: "Collection note", body: "Another low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-02", featured: false, url: "/f" }),
@@ -68,6 +68,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
     input: "docs.jsonl",
     output: "public/rangefind",
     docValueChunkSize: 2,
+    buildTelemetrySampleMs: 5,
+    buildTelemetryPath: "build-telemetry.json",
+    scanWorkers: 2,
+    scanBatchDocs: 2,
     baseShardDepth: 2,
     maxShardDepth: 3,
     targetShardPostings: 2,
@@ -92,6 +96,18 @@ test("builder output is searchable through the range-based runtime", async (t) =
   await build({ configPath });
   assert.ok(await readFile(join(output, "manifest.json"), "utf8"));
   const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  const minimalManifest = JSON.parse(await readFile(join(output, "manifest.min.json"), "utf8"));
+  assert.equal(minimalManifest.lazy_manifests.full, "manifest.full.json");
+  assert.equal(minimalManifest.lazy_manifests.build, "debug/build-telemetry.json");
+  assert.equal(minimalManifest.lazy_manifests.doc_values, "doc-values/manifest.json.gz");
+  assert.ok(await readFile(join(output, "manifest.full.json"), "utf8"));
+  assert.ok(await readFile(join(output, "doc-values", "manifest.json.gz")));
+  assert.ok(await readFile(join(output, "debug", "build-telemetry.json"), "utf8"));
+  assert.equal(minimalManifest.build, undefined);
+  assert.equal(minimalManifest.doc_values, undefined);
+  assert.ok(minimalManifest.block_filters);
+  assert.equal(minimalManifest.typo.directory, undefined);
+  assert.equal(minimalManifest.facets.category.count, 5);
   assert.equal(manifest.features.checksummedObjects, true);
   assert.equal(manifest.features.contentAddressedObjects, true);
   assert.equal(manifest.features.deduplicatedObjects, true);
@@ -128,19 +144,43 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.build.format, "rfbuildtelemetry-v1");
   assert.ok(manifest.build.total_ms >= 0);
   assert.ok(manifest.build.peak_rss > 0);
+  assert.ok(manifest.build.peak_memory.rss >= manifest.build.peak_rss);
   assert.ok(manifest.build.counters.selected_term_spool_bytes > 0);
   assert.ok(manifest.build.counters.selected_term_spool_terms > 0);
   assert.ok(manifest.build.counters.doc_raw_spool_bytes > 0);
   assert.ok(manifest.build.counters.doc_gzip_spool_bytes > 0);
-  assert.ok(manifest.build.phases.some(phase => phase.name === "scan-and-spool" && phase.ms >= 0));
-  assert.ok(manifest.build.phases.some(phase => phase.name === "reduce-postings" && phase.ms >= 0));
+  assert.ok(manifest.build.counters.segment_files > 0);
+  assert.ok(manifest.build.counters.segment_postings > 0);
+  assert.ok(manifest.build.phases.some(phase => phase.name === "scan-and-spool" && phase.ms >= 0 && phase.cpu.user_us >= 0 && phase.peakMemory.rss > 0 && phase.disk.delta.build >= 0));
+  assert.ok(manifest.build.phases.some(phase => phase.name === "reduce-postings" && phase.ms >= 0 && phase.disk.delta.final_packs >= 0 && phase.disk.delta.sidecars >= 0));
   assert.ok(manifest.build.phases.some(phase => phase.name === "query-bundles" && phase.ms >= 0));
+  assert.ok(manifest.build.workers.some(group => group.phase === "scan-and-spool" && group.count === 2 && group.workers.every(worker => worker.mode === "worker-thread")));
+  assert.ok(manifest.build.workers.some(group => group.phase === "reduce-postings" && group.count >= 1 && group.workers[0].tasks >= 1));
+  const telemetryFile = JSON.parse(await readFile(join(root, "build-telemetry.json"), "utf8"));
+  assert.equal(telemetryFile.format, "rfbuildtelemetry-v1");
+  assert.equal(telemetryFile.phases.length, manifest.build.phases.length);
   assert.ok(manifest.stats.build_total_ms >= 0);
   assert.ok(manifest.stats.build_peak_rss > 0);
   assert.ok(manifest.stats.selected_term_spool_bytes > 0);
   assert.ok(manifest.stats.selected_term_spool_terms > 0);
   assert.ok(manifest.stats.doc_raw_spool_bytes > 0);
   assert.ok(manifest.stats.doc_gzip_spool_bytes > 0);
+  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v1");
+  assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
+  assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
+  assert.equal(manifest.stats.term_storage, undefined);
+  assert.equal(manifest.stats.posting_block_storage, undefined);
+  assert.equal(manifest.stats.segment_format, "rfsegment-v1");
+  assert.equal(manifest.stats.scan_workers, 2);
+  assert.equal(manifest.stats.scan_batch_docs, 2);
+  assert.equal(manifest.stats.segment_merge_fan_in, 512);
+  assert.equal(manifest.stats.segment_merge_tiers, 0);
+  assert.ok(manifest.stats.segment_reduced_spool_bytes > 0);
+  assert.ok(manifest.stats.segment_reduced_spool_ms >= 0);
+  assert.ok(manifest.stats.segment_partition_assembly_ms >= 0);
+  assert.ok(manifest.stats.segment_files > 0);
+  assert.ok(manifest.stats.segment_terms > 0);
+  assert.ok(manifest.stats.segment_postings > 0);
   assert.ok(await readFile(join(output, manifest.docs.pointers.file)));
   assert.ok(await readFile(join(output, manifest.docs.pointers.ordinals.file)));
   assert.ok(await readFile(join(output, manifest.docs.pages.pointers.file)));
@@ -151,6 +191,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.query_bundles);
   assert.equal(manifest.query_bundles.format, "rfqbundle-v1");
   assert.equal(manifest.query_bundles.coverage, "all-base-docs");
+  assert.equal(manifest.query_bundles.row_group_size, 16);
+  assert.ok(manifest.query_bundles.row_group_filter_fields > 0);
   assert.ok(manifest.query_bundles.keys > 0);
   assert.ok(await readFile(join(output, manifest.query_bundles.directory.root)));
   assert.ok(await readFile(join(output, "bundles", "packs", manifest.object_store.pack_table.queryBundles[0])));
@@ -188,6 +230,13 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());
   const search = await createSearch({ baseUrl: server.baseUrl });
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/manifest.min.json")));
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/debug/build-telemetry.json")), false);
+  const lazyTelemetry = await search.loadBuildTelemetry();
+  assert.equal(lazyTelemetry.format, "rfbuildtelemetry-v1");
+  assert.ok(server.requests.some(request => request.pathname.endsWith("/debug/build-telemetry.json")));
+  assert.equal(server.requests.some(request => request.pathname.endsWith("/manifest.full.json")), false);
 
   const results = await search.search({ q: "static range search", size: 3 });
   assert.equal(results.results[0].title, "Static range search");
@@ -212,16 +261,31 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(singleTerm.stats.blocksDecoded < singleTermExact.stats.blocksDecoded);
 
   const bundled = await search.search({ q: "static range", size: 2, rerank: false });
-  const bundledExact = await search.search({ q: "static range", size: 2, exact: true, rerank: false });
-  assert.deepEqual(
-    bundled.results.map(result => result.title),
-    bundledExact.results.map(result => result.title)
-  );
   assert.equal(bundled.stats.plannerLane, "queryBundleExact");
   assert.equal(bundled.stats.topKProven, true);
   assert.equal(bundled.stats.totalExact, true);
   assert.equal(bundled.stats.blocksDecoded, 0);
   assert.equal(bundled.stats.postingsDecoded, 0);
+
+  const filteredBundled = await search.search({
+    q: "static range",
+    size: 2,
+    rerank: false,
+    filters: { facets: { tags: ["static"] }, booleans: { featured: true } }
+  });
+  assert.deepEqual(filteredBundled.results.map(result => result.id), ["a"]);
+  assert.equal(filteredBundled.stats.plannerLane, "queryBundleExact");
+  assert.equal(filteredBundled.stats.queryBundleFiltered, true);
+  assert.ok(filteredBundled.stats.queryBundleRowGroups > 0);
+  assert.ok(filteredBundled.stats.queryBundleRowGroupsScanned <= filteredBundled.stats.queryBundleRowGroups);
+  assert.ok(filteredBundled.stats.docValueRowsScanned <= filteredBundled.stats.queryBundleRows);
+  assert.equal(filteredBundled.stats.blocksDecoded, 0);
+
+  const bundledExact = await search.search({ q: "static range", size: 2, exact: true, rerank: false });
+  assert.deepEqual(
+    bundled.results.map(result => result.title),
+    bundledExact.results.map(result => result.title)
+  );
 
   const authority = await search.search({ q: "authoritative alias", size: 3 });
   assert.equal(authority.results[0].title, "SQLite retrieval baseline");
@@ -234,9 +298,16 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.deepEqual(typo.corrections.map(item => item.to), ["static"]);
   assert.equal(typo.stats.typoApplied, true);
 
+  const deletionTypo = await search.search({ q: "statc range search", size: 3 });
+  assert.equal(deletionTypo.results[0].title, "Static range search");
+  assert.equal(deletionTypo.correctedQuery, "static range search");
+  assert.equal(deletionTypo.stats.typoApplied, true);
+  assert.equal(deletionTypo.stats.typoShardLookups, 1);
+
   const stemmedTypo = await search.search({ q: "elecrtified winding insulation", size: 3 });
   assert.equal(stemmedTypo.results[0].title, "Electrified winding insulation");
   assert.equal(stemmedTypo.stats.typoApplied, true);
+  assert.ok(stemmedTypo.stats.typoLexiconShardLookups > 0);
 
   const surfaceFallback = await search.search({ q: "paris", size: 3 });
   assert.equal(surfaceFallback.results[0].title, "Pariser cannon");
@@ -297,6 +368,32 @@ test("builder output is searchable through the range-based runtime", async (t) =
     () => corruptSearch.search({ q: "static range search", size: 1 }),
     /checksum mismatch/
   );
+});
+
+test("failed builds write diagnostics and clean partial scratch state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-build-failure-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "a", title: "Valid document", body: "This row is fine.", url: "/a" }),
+    "{ bad json"
+  ].join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    fields: [{ name: "title", path: "title" }],
+    display: ["title", "url"]
+  }));
+
+  await assert.rejects(() => build({ configPath }), /JSON|Unexpected/u);
+  await assert.rejects(() => stat(join(output, "_build")), /ENOENT/u);
+  const failure = JSON.parse(await readFile(join(output, "debug", "build-failure.json"), "utf8"));
+  assert.equal(failure.status, "failed");
+  assert.equal(failure.cleanup.removed, "_build");
+  const failedTelemetry = JSON.parse(await readFile(join(output, "debug", "build-telemetry.failed.json"), "utf8"));
+  assert.equal(failedTelemetry.status, "failed");
+  assert.ok(failedTelemetry.error.message);
 });
 
 test("runtime refills high-df posting block windows in batches", async (t) => {
