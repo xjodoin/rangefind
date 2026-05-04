@@ -563,6 +563,13 @@ function currentGitCommit() {
   }
 }
 
+let benchmarkGitCommitSnapshot;
+
+function benchmarkGitCommit() {
+  if (benchmarkGitCommitSnapshot === undefined) benchmarkGitCommitSnapshot = currentGitCommit();
+  return benchmarkGitCommitSnapshot;
+}
+
 function generatedAtForReport(report) {
   return report.generatedAt || new Date().toISOString();
 }
@@ -694,7 +701,7 @@ function writeBenchmarkIndex(args, record) {
 
 function writeBenchmarkArtifact(args, kind, report, options = {}) {
   const generatedAt = generatedAtForReport(report);
-  const commit = currentGitCommit();
+  const commit = benchmarkGitCommit();
   const limit = options.limit ?? args.limit;
   const limitName = limitSlug(limit);
   const historyDir = benchmarkHistoryDir(args, kind, limit);
