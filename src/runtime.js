@@ -2847,8 +2847,18 @@ export async function createSearch(options = {}) {
     return entryDocRangeMaxByIndex(entry)?.get(rangeIndex) || 0;
   }
 
+  function blockDocRangeMaxByIndex(block) {
+    if (!block?.docRanges?.ranges?.length) return null;
+    if (!block.docRangeMaxByIndex) {
+      block.docRangeMaxByIndex = new Map(block.docRanges.ranges.map(range => [range.index, range.maxImpact || 0]));
+    }
+    return block.docRangeMaxByIndex;
+  }
+
   function blockUpperBoundInDocRange(entry, block, rangeIndex) {
     const blockImpact = block?.maxImpact || 0;
+    const blockRangeMax = blockDocRangeMaxByIndex(block);
+    if (blockRangeMax) return blockRangeMax.get(rangeIndex) || 0;
     const rangeImpact = docRangeMaxForIndex(entry, rangeIndex);
     return rangeImpact ? Math.min(blockImpact, rangeImpact) : blockImpact;
   }
@@ -3153,6 +3163,8 @@ export async function createSearch(options = {}) {
     const blocks = entry.blocks || [];
     const superblocks = entry.superblocks || [];
     const maxDoc = Math.max(rangeStart, rangeEnd - 1);
+    const rangeIndex = entry.docRanges?.rangeSize ? Math.floor(rangeStart / entry.docRanges.rangeSize) : -1;
+    const blockMayContribute = block => rangeIndex < 0 || blockUpperBoundInDocRange(entry, block, rangeIndex) > 0;
     if (superblocks.length) {
       for (const superblock of superblocks) {
         consideredSuperblocks++;
@@ -3166,7 +3178,7 @@ export async function createSearch(options = {}) {
         for (let blockIndex = first; blockIndex < end; blockIndex++) {
           consideredBlocks++;
           const block = blocks[blockIndex];
-          if (blockMayPass(block, filterPlan) && blockOverlapsDocSpan(block, rangeStart, maxDoc)) indexes.push(blockIndex);
+          if (blockMayPass(block, filterPlan) && blockOverlapsDocSpan(block, rangeStart, maxDoc) && blockMayContribute(block)) indexes.push(blockIndex);
           else skippedBlocks++;
         }
       }
@@ -3175,7 +3187,7 @@ export async function createSearch(options = {}) {
     for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
       consideredBlocks++;
       const block = blocks[blockIndex];
-      if (blockMayPass(block, filterPlan) && blockOverlapsDocSpan(block, rangeStart, maxDoc)) indexes.push(blockIndex);
+      if (blockMayPass(block, filterPlan) && blockOverlapsDocSpan(block, rangeStart, maxDoc) && blockMayContribute(block)) indexes.push(blockIndex);
       else skippedBlocks++;
     }
     return { indexes, consideredBlocks, skippedBlocks, consideredSuperblocks, skippedSuperblocks };

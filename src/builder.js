@@ -1122,7 +1122,9 @@ function emptyPostingSegmentStats() {
     impactBucketOrderTerms: 0,
     impactBucketOrderPostings: 0,
     docRangeTerms: 0,
-    docRangeEntries: 0
+    docRangeEntries: 0,
+    docRangeBlocks: 0,
+    docRangeBlockEntries: 0
   };
 }
 
@@ -2257,6 +2259,8 @@ export async function build({ configPath }) {
       posting_segment_doc_range_quantization_bits: config.postingDocRangeQuantizationBits,
       posting_segment_doc_range_terms: reduced.blockStats.docRangeTerms,
       posting_segment_doc_range_entries: reduced.blockStats.docRangeEntries,
+      posting_segment_doc_range_blocks: reduced.blockStats.docRangeBlocks,
+      posting_segment_doc_range_block_entries: reduced.blockStats.docRangeBlockEntries,
       doc_storage: docs.storage,
       doc_layout_format: docs.layout.format,
       doc_layout_primary_terms: docs.layout.primary_terms,

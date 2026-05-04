@@ -22,8 +22,8 @@ const DOC_VALUE_FORMAT_VERSION = 2;
 const DOC_VALUE_ENCODING_DENSE = 0;
 const DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 const FACET_DICT_FORMAT_VERSION = 1;
-export const POSTING_SEGMENT_FORMAT = "rfsegpost-v4";
-const POSTING_SEGMENT_FORMAT_VERSION = 4;
+export const POSTING_SEGMENT_FORMAT = "rfsegpost-v5";
+const POSTING_SEGMENT_FORMAT_VERSION = 5;
 const MAX_SUMMARY_FACET_WORDS = 64;
 export const POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
 export const POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
@@ -308,7 +308,8 @@ function encodePostings(rows, total, codes, filters, config) {
       docMin,
       docMax,
       rowCount: blockRows.length,
-      filters: emptySummary(filters)
+      filters: emptySummary(filters),
+      docRanges: buildPostingBlockDocRanges(blockRows, docRanges)
     };
     for (const [doc] of blockRows) updateSummary(block.filters, filters, codes, doc);
     const encodedBlock = encodePostingBlockRows(blockRows, config);
@@ -353,6 +354,26 @@ function buildPostingDocRanges(docs, impacts, total, config) {
       maxImpact: Math.max(1, Math.min(quantizedMax, Math.ceil(impact / scale)))
     }));
   return { rangeSize, scale, rangeCount, quantizationBits, ranges };
+}
+
+function buildPostingBlockDocRanges(blockRows, docRanges) {
+  if (!docRanges?.rangeSize || !docRanges.scale || !blockRows?.length) return null;
+  const maxes = new Map();
+  for (const [doc, impact] of blockRows) {
+    if (doc < 0 || impact <= 0) continue;
+    const range = Math.floor(doc / docRanges.rangeSize);
+    if (impact <= (maxes.get(range) || 0)) continue;
+    maxes.set(range, impact);
+  }
+  if (!maxes.size) return null;
+  const quantizedMax = 2 ** (docRanges.quantizationBits || 8) - 1;
+  const ranges = [...maxes.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, impact]) => ({
+      index,
+      maxImpact: Math.max(1, Math.min(quantizedMax, Math.ceil(impact / docRanges.scale)))
+    }));
+  return ranges.length ? { ranges } : null;
 }
 
 function postingImpactOrder(docs, impacts, maxImpact, docsSorted, config) {
@@ -639,7 +660,9 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     impactBucketOrderTerms: 0,
     impactBucketOrderPostings: 0,
     docRangeTerms: 0,
-    docRangeEntries: 0
+    docRangeEntries: 0,
+    docRangeBlocks: 0,
+    docRangeBlockEntries: 0
   };
 
   const orderedEntries = Array.isArray(entries)
@@ -677,6 +700,10 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
           }
         });
         addPostingBlockCodecStats(stats, block);
+        if (block.docRanges?.ranges?.length) {
+          stats.docRangeBlocks++;
+          stats.docRangeBlockEntries += block.docRanges.ranges.length;
+        }
         stats.externalBlocks++;
         stats.externalPostings += Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize);
         stats.externalPostingBytes += bytes.length;
@@ -698,6 +725,10 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
           rowCount: Math.min(config.postingBlockSize, postings.count - i * config.postingBlockSize)
         });
         addPostingBlockCodecStats(stats, block);
+        if (block.docRanges?.ranges?.length) {
+          stats.docRangeBlocks++;
+          stats.docRangeBlockEntries += block.docRanges.ranges.length;
+        }
       }
       const superblocks = buildPostingSuperblocks(blocks, filters, config);
       stats.superblocks += superblocks.length;
@@ -737,6 +768,14 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
           pushUtf8(header, block.range.checksum.algorithm || "sha256");
           pushUtf8(header, block.range.checksum.value);
         }
+      }
+      const blockDocRanges = block.docRanges?.ranges || [];
+      pushVarint(header, blockDocRanges.length);
+      let previousBlockRange = -1;
+      for (const range of blockDocRanges) {
+        pushVarint(header, range.index - previousBlockRange - 1);
+        pushVarint(header, range.maxImpact);
+        previousBlockRange = range.index;
       }
     }
     pushVarint(header, item.superblocks.length);
@@ -838,6 +877,20 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         }
         block.range = range;
       }
+      const blockDocRangeCount = readVarint(bytes, state);
+      if (blockDocRangeCount > 0) {
+        const ranges = new Array(blockDocRangeCount);
+        let previousBlockRange = -1;
+        for (let k = 0; k < blockDocRangeCount; k++) {
+          const index = previousBlockRange + 1 + readVarint(bytes, state);
+          const quantizedMaxImpact = readVarint(bytes, state);
+          ranges[k] = { index, quantizedMaxImpact };
+          previousBlockRange = index;
+        }
+        block.docRanges = { ranges };
+      } else {
+        block.docRanges = null;
+      }
       entry.blocks[j] = block;
     }
     const superblockCount = readVarint(bytes, state);
@@ -873,8 +926,13 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         previousRange = index;
       }
       entry.docRanges = { rangeSize, scale, rangeCount, quantizationBits, ranges };
+      for (const block of entry.blocks) {
+        if (!block.docRanges?.ranges?.length) continue;
+        for (const range of block.docRanges.ranges) range.maxImpact = range.quantizedMaxImpact * scale;
+      }
     } else {
       entry.docRanges = null;
+      for (const block of entry.blocks) block.docRanges = null;
     }
     terms.set(term, entry);
   }

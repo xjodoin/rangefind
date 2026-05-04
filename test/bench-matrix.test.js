@@ -7,7 +7,7 @@ function fixture(label, family, p95Base) {
     label,
     family,
     optimizer: {
-      postingFormat: "rfsegpost-v4",
+      postingFormat: "rfsegpost-v5",
       blockSize: 64,
       superblockSize: 16,
       codecBaselineBytes: 1000,

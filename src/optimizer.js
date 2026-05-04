@@ -125,6 +125,8 @@ function coreDecisions(config, manifest) {
       quantization_bits: positiveInteger(config.postingDocRangeQuantizationBits, stat(stats, "posting_segment_doc_range_quantization_bits")),
       covered_terms: stat(stats, "posting_segment_doc_range_terms"),
       range_entries: stat(stats, "posting_segment_doc_range_entries"),
+      covered_blocks: stat(stats, "posting_segment_doc_range_blocks"),
+      block_range_entries: stat(stats, "posting_segment_doc_range_block_entries"),
       reason: "safe docID-range upper bounds for block-max range planning"
     },
     {

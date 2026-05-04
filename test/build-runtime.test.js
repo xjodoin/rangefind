@@ -214,7 +214,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.selected_term_spool_terms > 0);
   assert.ok(manifest.stats.doc_raw_spool_bytes > 0);
   assert.ok(manifest.stats.doc_gzip_spool_bytes > 0);
-  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v4");
+  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v5");
   assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
   assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
   assert.ok(manifest.stats.posting_segment_superblocks > 0);
@@ -226,6 +226,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.stats.posting_segment_doc_range_quantization_bits, 8);
   assert.ok(manifest.stats.posting_segment_doc_range_terms > 0);
   assert.ok(manifest.stats.posting_segment_doc_range_entries > 0);
+  assert.ok(manifest.stats.posting_segment_doc_range_blocks > 0);
+  assert.ok(manifest.stats.posting_segment_doc_range_block_entries > 0);
   assert.ok(manifest.stats.posting_segment_block_codec_pair_varint_blocks > 0);
   assert.ok(manifest.stats.posting_segment_block_codec_baseline_bytes >= manifest.stats.posting_segment_block_codec_selected_bytes);
   assert.equal(manifest.stats.term_storage, undefined);

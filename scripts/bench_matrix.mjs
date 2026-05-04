@@ -347,7 +347,7 @@ export function createPromotionGates(report, baselineReport = null, options = {}
 
   const badCodecFixtures = (report.fixtures || []).filter(fixture => {
     const optimizer = fixture.optimizer || {};
-    return optimizer.postingFormat !== "rfsegpost-v4" ||
+    return optimizer.postingFormat !== "rfsegpost-v5" ||
       finite(optimizer.blockSize) <= 0 ||
       finite(optimizer.superblockSize) <= 0 ||
       finite(optimizer.codecSelectedBytes) > finite(optimizer.codecBaselineBytes);
@@ -358,7 +358,7 @@ export function createPromotionGates(report, baselineReport = null, options = {}
     badCodecFixtures.length ? "fail" : "pass",
     badCodecFixtures.length
       ? badCodecFixtures.map(fixture => fixture.label).join(", ")
-      : "rfsegpost-v4 layout is valid and measured codecs never exceed baseline bytes"
+      : "rfsegpost-v5 layout is valid and measured codecs never exceed baseline bytes"
   );
 
   let comparison = null;

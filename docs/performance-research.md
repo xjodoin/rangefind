@@ -43,12 +43,14 @@ compact.
 
 The next format step is now implemented for high-df terms: eligible posting
 blocks are stored in `terms/block-packs/*.bin` and referenced from
-`rfsegpost-v4` posting-segment metadata. Each posting block carries doc-id
-min/max bounds, each superblock carries an aggregate doc-id span, and each term
-can emit sparse quantized doc-id-range max-impact rows. The runtime can sum
-query-term range upper bounds, apply filter/sort bounds, visit the most
-promising doc-id ranges first, and stop exactly once the current kth score beats
-the next unevaluated range upper bound.
+`rfsegpost-v5` posting-segment metadata. Each posting block carries doc-id
+min/max bounds, sparse per-block doc-id-range max-impact rows, each superblock
+carries an aggregate doc-id span, and each term can emit sparse quantized
+doc-id-range max-impact rows. The runtime can sum query-term range upper
+bounds, apply filter/sort bounds, skip posting blocks whose local range upper
+bound is already noncompetitive, visit the most promising doc-id ranges first,
+and stop exactly once the current kth score beats the next unevaluated range
+upper bound.
 
 The doc-id range lane is deliberately guarded by a selectivity check. On the
 current frwiki impact-ordered block layout, forcing pure range evaluation can
