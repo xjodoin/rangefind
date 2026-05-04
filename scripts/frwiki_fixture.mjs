@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createSearch } from "../src/runtime.js";
@@ -18,6 +18,8 @@ import {
 
 const DEFAULT_DUMP_URL = "https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pages-articles.xml.bz2";
 const FRWIKI_SCHEMA_VERSION = 3;
+const BENCHMARK_ARTIFACT_FORMAT = "rffrwikibench-artifact-v1";
+const BENCHMARK_INDEX_FORMAT = "rffrwikibench-index-v1";
 const DEFAULT_QUERIES = [
   "Paris",
   "Révolution française",
@@ -505,8 +507,218 @@ function buildTelemetryPath(args) {
   return resolve(args.root, "frwiki-build-telemetry.json");
 }
 
-function builderBenchPath(args) {
-  return resolve(args.root, "frwiki-builder-bench.json");
+function benchmarkRoot(_args) {
+  return resolve("benchmarks", "frwiki");
+}
+
+function benchmarkLatestPath(args, kind, limit = args.limit) {
+  return resolve(benchmarkRoot(args), "latest", kind, `${limitSlug(limit)}.json`);
+}
+
+function benchmarkHistoryDir(args, kind, limit = args.limit) {
+  return resolve(benchmarkRoot(args), "history", kind, limitSlug(limit));
+}
+
+function benchmarkIndexPath(args) {
+  return resolve(benchmarkRoot(args), "index.json");
+}
+
+function legacyBenchmarkPath(args, kind) {
+  if (kind === "runtime") return resolve(args.root, "frwiki-bench.json");
+  if (kind === "builder") return resolve(args.root, "frwiki-builder-bench.json");
+  if (kind === "scale") return resolve(args.root, "frwiki-scale-bench.json");
+  return null;
+}
+
+function limitSlug(limit) {
+  return Number(limit) > 0 ? `limit-${Number(limit)}` : "full-dump";
+}
+
+function safeRunId(generatedAt, commit = null) {
+  const timestamp = String(generatedAt || new Date().toISOString())
+    .replace(/[.:]/gu, "-");
+  return commit ? `${timestamp}_${commit}` : timestamp;
+}
+
+function currentGitCommit() {
+  try {
+    return execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+      cwd: resolve("."),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function generatedAtForReport(report) {
+  return report.generatedAt || new Date().toISOString();
+}
+
+function runtimeSummary(report) {
+  const rows = report.rows || [];
+  const selected = Object.fromEntries([
+    "Paris",
+    "Révolution française",
+    "Révolution française size 25",
+    "typo changement climatique",
+    "Paris sorted by revision date"
+  ].map(label => {
+    const row = rowByLabel(report, label);
+    return [label, row ? {
+      coldMs: row.coldMs,
+      coldRequests: row.coldRequests,
+      coldKb: row.coldKb,
+      valid: row.valid,
+      lane: row.coldStats?.plannerLane || "",
+      docPayloadLane: row.coldStats?.docPayloadLane || "",
+      blocksDecoded: row.coldStats?.blocksDecoded || 0,
+      postingsDecoded: row.coldStats?.postingsDecoded || 0,
+      docValuePagesVisited: row.coldStats?.docValuePagesVisited || 0,
+      docValueSortPageFetchGroups: row.coldStats?.docValueSortPageFetchGroups || 0
+    } : null];
+  }));
+  return {
+    docs: report.meta?.docs || report.rangefindStats?.totalDocs || 0,
+    indexBytes: report.index?.bytes || 0,
+    indexFiles: report.index?.files || 0,
+    rows: rows.length,
+    validRows: rows.filter(row => row.valid).length,
+    avgColdMs: mean(rows.map(row => row.coldMs || 0)),
+    avgColdRequests: mean(rows.map(row => row.coldRequests || 0)),
+    avgColdKb: mean(rows.map(row => row.coldKb || 0)),
+    maxColdMs: Math.max(0, ...rows.map(row => row.coldMs || 0)),
+    selected
+  };
+}
+
+function builderSummary(report) {
+  return {
+    docs: report.docs || 0,
+    indexBytes: report.index?.bytes || 0,
+    indexFiles: report.index?.files || 0,
+    bytesPerDoc: report.index?.bytesPerDoc || 0,
+    totalMs: report.builder?.totalMs || 0,
+    peakRss: report.builder?.peakRss || 0,
+    tempPeakBytes: report.builder?.tempPeakBytes || 0,
+    outputWrittenBytes: report.builder?.outputWrittenBytes || 0,
+    writeAmplification: report.builder?.writeAmplification || 0
+  };
+}
+
+function scaleSummary(report) {
+  const points = report.points || [];
+  return {
+    mode: report.mode,
+    limits: report.limits || points.map(point => point.limit),
+    points: points.map(point => ({
+      limit: point.limit,
+      docs: point.docs,
+      indexBytes: point.indexBytes,
+      bytesPerDoc: point.bytesPerDoc,
+      avgTextColdRequests: point.avgTextColdRequests || 0,
+      avgTextColdKb: point.avgTextColdKb || 0,
+      builderMs: point.builder?.totalMs || 0,
+      peakRss: point.builder?.peakRss || 0
+    }))
+  };
+}
+
+function benchmarkSummary(kind, report) {
+  if (kind === "runtime") return runtimeSummary(report);
+  if (kind === "builder") return builderSummary(report);
+  if (kind === "scale") return scaleSummary(report);
+  return {};
+}
+
+function numericDeltas(current, previous, prefix = "") {
+  if (!previous) return {};
+  const out = {};
+  for (const [key, value] of Object.entries(current || {})) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (typeof value === "number" && Number.isFinite(value) && typeof previous[key] === "number" && Number.isFinite(previous[key])) {
+      const delta = value - previous[key];
+      out[path] = {
+        previous: previous[key],
+        current: value,
+        delta,
+        pct: previous[key] ? delta / previous[key] : null
+      };
+    } else if (value && typeof value === "object" && !Array.isArray(value) && previous[key] && typeof previous[key] === "object" && !Array.isArray(previous[key])) {
+      Object.assign(out, numericDeltas(value, previous[key], path));
+    }
+  }
+  return out;
+}
+
+function readBenchmarkIndex(args) {
+  return readJson(benchmarkIndexPath(args)) || {
+    format: BENCHMARK_INDEX_FORMAT,
+    updatedAt: null,
+    latest: {},
+    history: []
+  };
+}
+
+function benchmarkKey(record) {
+  return `${record.kind}:${record.limitSlug}`;
+}
+
+function writeBenchmarkIndex(args, record) {
+  const indexPath = benchmarkIndexPath(args);
+  const index = readBenchmarkIndex(args);
+  const key = benchmarkKey(record);
+  const previous = [...(index.history || [])].reverse()
+    .find(item => item.kind === record.kind && item.limitSlug === record.limitSlug && item.historyPath !== record.historyPath);
+  record.previousHistoryPath = previous?.historyPath || null;
+  record.deltas = numericDeltas(record.summary, previous?.summary);
+  index.updatedAt = new Date().toISOString();
+  index.latest[key] = record;
+  index.history = [...(index.history || []).filter(item => item.historyPath !== record.historyPath), record]
+    .sort((a, b) => String(a.generatedAt).localeCompare(String(b.generatedAt)));
+  mkdirSync(benchmarkRoot(args), { recursive: true });
+  writeFileSync(indexPath, `${JSON.stringify(index, null, 2)}\n`);
+}
+
+function writeBenchmarkArtifact(args, kind, report, options = {}) {
+  const generatedAt = generatedAtForReport(report);
+  const commit = currentGitCommit();
+  const limit = options.limit ?? args.limit;
+  const limitName = limitSlug(limit);
+  const historyDir = benchmarkHistoryDir(args, kind, limit);
+  const latestPath = benchmarkLatestPath(args, kind, limit);
+  const runId = safeRunId(generatedAt, commit);
+  const historyPath = resolve(historyDir, `${runId}.json`);
+  const artifact = {
+    format: BENCHMARK_ARTIFACT_FORMAT,
+    kind,
+    limit,
+    limitSlug: limitName,
+    generatedAt,
+    gitCommit: commit,
+    command: args.command,
+    runs: args.runs,
+    size: args.size,
+    historyPath,
+    latestPath
+  };
+  report.benchmarkArtifact = artifact;
+  mkdirSync(historyDir, { recursive: true });
+  mkdirSync(resolve(benchmarkRoot(args), "latest", kind), { recursive: true });
+  writeFileSync(historyPath, `${JSON.stringify(report, null, 2)}\n`);
+  writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`);
+  writeBenchmarkIndex(args, {
+    ...artifact,
+    historyPath,
+    latestPath,
+    summary: benchmarkSummary(kind, report)
+  });
+  return { historyPath, latestPath };
+}
+
+function readBenchmarkReport(args, kind) {
+  return readJson(benchmarkLatestPath(args, kind)) || readJson(legacyBenchmarkPath(args, kind));
 }
 
 function readBuildTelemetry(args) {
@@ -530,13 +742,13 @@ function writeBuilderBenchReport(args, options = {}) {
     meta,
     mode: options.mode || "build"
   });
-  writeFileSync(builderBenchPath(args), JSON.stringify(report, null, 2));
+  const artifact = writeBenchmarkArtifact(args, "builder", report);
   if (options.quiet === false) console.log(JSON.stringify(report, null, 2));
-  return report;
+  return { ...report, benchmarkArtifact: report.benchmarkArtifact || { latestPath: artifact.latestPath, historyPath: artifact.historyPath } };
 }
 
 function readBuilderBenchReport(args) {
-  return readJson(builderBenchPath(args));
+  return readBenchmarkReport(args, "builder");
 }
 
 async function buildFixture(args, options = {}) {
@@ -1066,6 +1278,7 @@ async function benchFixture(args, options = {}) {
     await addExactChecks(args, server.url, rows, cases);
     const report = {
       fixture: "frwiki",
+      generatedAt: new Date().toISOString(),
       root,
       index: dirStats(resolve(root, "rangefind")),
       rangefindStats: engine.manifest.stats,
@@ -1098,8 +1311,7 @@ async function benchFixture(args, options = {}) {
     };
     const invalid = rows.filter(row => !row.valid);
     if (invalid.length) report.validationErrors = invalid.map(row => ({ q: row.q, errors: row.validationErrors }));
-    const reportPath = resolve(args.root, "frwiki-bench.json");
-    writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    writeBenchmarkArtifact(args, "runtime", report);
     if (!options.quiet) console.log(JSON.stringify(report, null, 2));
     if (invalid.length) throw new Error(`frwiki typed bench validation failed for ${invalid.map(row => row.q).join(", ")}`);
     return report;
@@ -1116,6 +1328,8 @@ function clean(args) {
   rmSync(resolve(args.root, "frwiki-bench.json"), { force: true });
   rmSync(resolve(args.root, "frwiki-builder-bench.json"), { force: true });
   rmSync(resolve(args.root, "frwiki-build-telemetry.json"), { force: true });
+  rmSync(benchmarkRoot(args), { recursive: true, force: true });
+  rmSync(resolve(args.root, "benchmarks"), { recursive: true, force: true });
   rmSync(resolve(args.root, "scale"), { recursive: true, force: true });
 }
 
@@ -1295,8 +1509,7 @@ async function scaleFixture(args) {
     generatedAt: new Date().toISOString(),
     points
   };
-  const reportPath = resolve(args.root, "frwiki-scale-bench.json");
-  writeFileSync(reportPath, JSON.stringify(scaleReport, null, 2));
+  writeBenchmarkArtifact(args, "scale", scaleReport, { limit: 0 });
   console.log(JSON.stringify(scaleReport, null, 2));
   return scaleReport;
 }

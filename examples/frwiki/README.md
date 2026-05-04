@@ -59,3 +59,13 @@ first extraction. Later runs with the same dump URL and body cap reuse that cach
 for equal or smaller `--limit` values by slicing the first `N` rows instead of
 streaming the dump again. Generated data, public assets, config, and benchmark
 JSON are intentionally ignored by git.
+
+Benchmark results are written under repo-level `benchmarks/frwiki/`, outside the
+example fixture tree:
+
+- `latest/<kind>/<limit>.json` keeps the most recent report for each bench kind
+  and limit.
+- `history/<kind>/limit-<N>/<timestamp>_<commit>.json` keeps raw run history.
+- `index.json` records compact run summaries and numeric deltas against the
+  previous run with the same bench kind and limit, which makes progression and
+  regressions easy to scan.

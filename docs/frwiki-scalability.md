@@ -94,9 +94,30 @@ only the default text queries. Each row records a `category`, the full request
 shape, cold request/KB breakdowns, compact runtime stats, validation status, and
 exact top-k agreement where an exact comparison is meaningful.
 
-Every build writes `frwiki-builder-bench.json` next to `frwiki-bench.json`. The
-builder report uses `rfbuilderbench-v1` and records phase wall time, peak RSS,
-heap samples, temp bytes, output bytes, worker summaries, and write
+Every benchmark run writes into repo-level `benchmarks/frwiki/` instead of
+overwriting flat JSON files in the fixture root or mixing generated history into
+`examples/`. The layout keeps both latest results and historical raw reports:
+
+```text
+benchmarks/frwiki/
+  latest/
+    runtime/limit-50000.json
+    builder/limit-50000.json
+    scale/full-dump.json
+  history/
+    runtime/limit-50000/<timestamp>_<commit>.json
+    builder/limit-50000/<timestamp>_<commit>.json
+    scale/full-dump/<timestamp>_<commit>.json
+  index.json
+```
+
+`index.json` is a compact progression ledger. It stores one summary per run,
+the current latest report for each `kind:limit` pair, and numeric deltas against
+the previous run with the same kind and limit so regressions can be inspected
+without opening every raw report.
+
+The builder report uses `rfbuilderbench-v1` and records phase wall time, peak
+RSS, heap samples, temp bytes, output bytes, worker summaries, and write
 amplification. Full runtime reports embed the latest builder report under the
 top-level `builder` key, and `scale --builder-only` records builder-only scale
 points without spending time on query execution.
@@ -293,7 +314,8 @@ retrieval-local packed docs.
 ## Scale Run
 
 The scale command builds isolated fixtures for each requested limit and writes a
-combined report to `examples/frwiki/frwiki-scale-bench.json`:
+combined report to `benchmarks/frwiki/latest/scale/full-dump.json`, with
+timestamped history under `benchmarks/frwiki/history/scale/`:
 
 ```bash
 node scripts/frwiki_fixture.mjs scale --scale-limits=50000,100000 --runs=2
