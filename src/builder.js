@@ -1120,7 +1120,9 @@ function emptyPostingSegmentStats() {
     blockCodecImpactBitsetCandidateBytes: 0,
     blockCodecPartitionedDeltaCandidateBytes: 0,
     impactBucketOrderTerms: 0,
-    impactBucketOrderPostings: 0
+    impactBucketOrderPostings: 0,
+    docRangeTerms: 0,
+    docRangeEntries: 0
   };
 }
 
@@ -2250,6 +2252,11 @@ export async function build({ configPath }) {
       posting_segment_block_codec_bytes_saved: Math.max(0, reduced.blockStats.blockCodecBaselineBytes - reduced.blockStats.blockCodecSelectedBytes),
       posting_segment_impact_bucket_order_terms: reduced.blockStats.impactBucketOrderTerms,
       posting_segment_impact_bucket_order_postings: reduced.blockStats.impactBucketOrderPostings,
+      posting_segment_doc_range_block_max: config.postingDocRangeBlockMax !== false,
+      posting_segment_doc_range_size: config.postingDocRangeSize,
+      posting_segment_doc_range_quantization_bits: config.postingDocRangeQuantizationBits,
+      posting_segment_doc_range_terms: reduced.blockStats.docRangeTerms,
+      posting_segment_doc_range_entries: reduced.blockStats.docRangeEntries,
       doc_storage: docs.storage,
       doc_layout_format: docs.layout.format,
       doc_layout_primary_terms: docs.layout.primary_terms,

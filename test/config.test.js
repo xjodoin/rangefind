@@ -23,6 +23,9 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.postingSegmentStreamMinBytes, 64 * 1024);
   assert.equal(config.postingImpactBucketOrderMinRows, 2048);
   assert.equal(config.postingImpactBucketOrderMaxBuckets, 65536);
+  assert.equal(config.postingDocRangeBlockMax, true);
+  assert.equal(config.postingDocRangeSize, 1024);
+  assert.equal(config.postingDocRangeQuantizationBits, 8);
   assert.equal(config.codeStoreWorkerCacheChunks, 0);
   assert.equal(config.codeStoreWorkerMaxAutoCacheChunks, 64);
   assert.equal(config.segmentFlushDocs, 0);

@@ -62,8 +62,9 @@ test("typo sidecar builds and parses packed delete-key shards", async () => {
   const shard = parseTypoShard(gunzipSync(compressed));
   const candidates = typoCandidatesForDeleteKey(shard, "stati");
   assert.ok(candidates.some(candidate => candidate.surface === "static" && candidate.term === "static"));
-  assert.equal(manifest.lexicon.format, "rftermlex-v1");
+  assert.equal(manifest.lexicon.format, "rftermlex-v2");
   assert.ok(manifest.stats.lexicon_entries > 0);
+  assert.ok(manifest.lexicon.stats.trie_nodes > 0);
   const lexiconRootBytes = gunzipSync(await readFile(join(root, manifest.lexicon.directory.root)));
   const lexiconRoot = parseDirectoryRoot(lexiconRootBytes);
   const lexiconShard = typoLexiconShardKey("changement", manifest.lexicon.shard_depth);
@@ -76,6 +77,7 @@ test("typo sidecar builds and parses packed delete-key shards", async () => {
   const lexiconBytes = await readFile(join(root, "typo", "lexicon-packs", lexiconRange.pack));
   const lexiconShardData = parseTypoLexiconShard(gunzipSync(lexiconBytes.subarray(lexiconRange.offset, lexiconRange.offset + lexiconRange.length)));
   assert.ok(lexiconShardData.entries.some(entry => entry.surface === "changement" && entry.term === "changement"));
+  assert.ok(lexiconShardData.trie.children.size > 0);
 });
 
 test("typo surface pairs can be deduplicated across a segment flush", () => {

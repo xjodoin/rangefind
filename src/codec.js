@@ -22,8 +22,8 @@ const DOC_VALUE_FORMAT_VERSION = 2;
 const DOC_VALUE_ENCODING_DENSE = 0;
 const DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 const FACET_DICT_FORMAT_VERSION = 1;
-export const POSTING_SEGMENT_FORMAT = "rfsegpost-v3";
-const POSTING_SEGMENT_FORMAT_VERSION = 3;
+export const POSTING_SEGMENT_FORMAT = "rfsegpost-v4";
+const POSTING_SEGMENT_FORMAT_VERSION = 4;
 const MAX_SUMMARY_FACET_WORDS = 64;
 export const POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
 export const POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
@@ -165,6 +165,15 @@ function postingSuperblockSize(config) {
   return Math.max(1, Math.floor(Number(config.postingSuperblockSize || 16)));
 }
 
+function postingDocRangeSize(config) {
+  if (config.postingDocRangeBlockMax === false) return 0;
+  return Math.max(1, Math.floor(Number(config.postingDocRangeSize || 1024)));
+}
+
+function postingDocRangeQuantizationBits(config) {
+  return Math.max(1, Math.min(16, Math.floor(Number(config.postingDocRangeQuantizationBits || 8))));
+}
+
 function buildPostingSuperblocks(blocks, filters, config) {
   const size = postingSuperblockSize(config);
   const superblocks = [];
@@ -174,9 +183,13 @@ function buildPostingSuperblocks(blocks, filters, config) {
     let rowCount = 0;
     let maxImpact = 0;
     let maxImpactDoc = 0;
+    let docMin = null;
+    let docMax = null;
     for (let i = firstBlock; i < firstBlock + blockCount; i++) {
       const block = blocks[i];
       rowCount += block.rowCount || 0;
+      if (Number.isFinite(block.docMin)) docMin = docMin == null ? block.docMin : Math.min(docMin, block.docMin);
+      if (Number.isFinite(block.docMax)) docMax = docMax == null ? block.docMax : Math.max(docMax, block.docMax);
       if (block.maxImpact > maxImpact) {
         maxImpact = block.maxImpact;
         maxImpactDoc = block.maxImpactDoc || 0;
@@ -185,7 +198,7 @@ function buildPostingSuperblocks(blocks, filters, config) {
       }
       mergeBlockFilterSummary(summary, filters, block.filters);
     }
-    superblocks.push({ firstBlock, blockCount, rowCount, maxImpact, maxImpactDoc, filters: summary });
+    superblocks.push({ firstBlock, blockCount, rowCount, maxImpact, maxImpactDoc, docMin: docMin ?? 0, docMax: docMax ?? 0, filters: summary });
   }
   return superblocks;
 }
@@ -267,6 +280,7 @@ function encodePostings(rows, total, codes, filters, config) {
     if (docs[i] < previousDoc) docsSorted = false;
     previousDoc = docs[i];
   }
+  const docRanges = buildPostingDocRanges(docs, impacts, total, config);
   const orderPlan = postingImpactOrder(docs, impacts, maxImpact, docsSorted, config);
   const order = orderPlan.order;
   const chunks = [];
@@ -281,10 +295,18 @@ function encodePostings(rows, total, codes, filters, config) {
     }
     if (!blockRows.length) continue;
     const [maxImpactDoc, maxImpact] = blockRows[0];
+    let docMin = blockRows[0][0];
+    let docMax = blockRows[0][0];
+    for (const [doc] of blockRows) {
+      docMin = Math.min(docMin, doc);
+      docMax = Math.max(docMax, doc);
+    }
     const block = {
       offset,
       maxImpact,
       maxImpactDoc,
+      docMin,
+      docMax,
       rowCount: blockRows.length,
       filters: emptySummary(filters)
     };
@@ -302,7 +324,35 @@ function encodePostings(rows, total, codes, filters, config) {
     chunks.push(encodedBlock.bytes);
     offset += encodedBlock.bytes.length;
   }
-  return { df, count: order.length, byteLength: offset, chunks, blocks, orderCodec: orderPlan.codec };
+  return { df, count: order.length, byteLength: offset, chunks, blocks, docRanges, orderCodec: orderPlan.codec };
+}
+
+function buildPostingDocRanges(docs, impacts, total, config) {
+  const rangeSize = postingDocRangeSize(config);
+  if (!rangeSize || !docs.length) return null;
+  const rangeCount = Math.max(1, Math.ceil(Math.max(0, Number(total || 0)) / rangeSize));
+  const maxes = new Map();
+  let maxImpact = 0;
+  for (let i = 0; i < docs.length; i++) {
+    const doc = docs[i];
+    if (doc < 0) continue;
+    const range = Math.floor(doc / rangeSize);
+    const impact = impacts[i] || 0;
+    if (impact <= (maxes.get(range) || 0)) continue;
+    maxes.set(range, impact);
+    maxImpact = Math.max(maxImpact, impact);
+  }
+  if (!maxes.size || maxImpact <= 0) return null;
+  const quantizationBits = postingDocRangeQuantizationBits(config);
+  const quantizedMax = 2 ** quantizationBits - 1;
+  const scale = Math.max(1, Math.ceil(maxImpact / quantizedMax));
+  const ranges = [...maxes.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([index, impact]) => ({
+      index,
+      maxImpact: Math.max(1, Math.min(quantizedMax, Math.ceil(impact / scale)))
+    }));
+  return { rangeSize, scale, rangeCount, quantizationBits, ranges };
 }
 
 function postingImpactOrder(docs, impacts, maxImpact, docsSorted, config) {
@@ -587,7 +637,9 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     blockCodecImpactBitsetCandidateBytes: 0,
     blockCodecPartitionedDeltaCandidateBytes: 0,
     impactBucketOrderTerms: 0,
-    impactBucketOrderPostings: 0
+    impactBucketOrderPostings: 0,
+    docRangeTerms: 0,
+    docRangeEntries: 0
   };
 
   const orderedEntries = Array.isArray(entries)
@@ -598,6 +650,10 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     if (postings.orderCodec === "impact-bucket") {
       stats.impactBucketOrderTerms++;
       stats.impactBucketOrderPostings += postings.count;
+    }
+    if (postings.docRanges?.ranges?.length) {
+      stats.docRangeTerms++;
+      stats.docRangeEntries += postings.docRanges.ranges.length;
     }
     const external = !!writeBlock && postings.blocks.length >= minBlocks && postings.byteLength >= minBytes;
     const blocks = [];
@@ -668,6 +724,8 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
       pushVarint(header, block.rowCount);
       pushVarint(header, block.maxImpact);
       pushVarint(header, block.maxImpactDoc || 0);
+      pushVarint(header, block.docMin || 0);
+      pushVarint(header, block.docMax || 0);
       pushVarint(header, postingBlockCodecCode(block.codec));
       writeBlockFilterSummary(header, filters, block.filters);
       if (item.external) {
@@ -688,7 +746,24 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
       pushVarint(header, superblock.rowCount);
       pushVarint(header, superblock.maxImpact);
       pushVarint(header, superblock.maxImpactDoc || 0);
+      pushVarint(header, superblock.docMin || 0);
+      pushVarint(header, superblock.docMax || 0);
       writeBlockFilterSummary(header, filters, superblock.filters);
+    }
+    const docRanges = item.postings.docRanges;
+    pushVarint(header, docRanges?.ranges?.length ? 1 : 0);
+    if (docRanges?.ranges?.length) {
+      pushVarint(header, docRanges.rangeSize);
+      pushVarint(header, docRanges.scale);
+      pushVarint(header, docRanges.rangeCount);
+      pushVarint(header, docRanges.quantizationBits || 8);
+      pushVarint(header, docRanges.ranges.length);
+      let previousRange = -1;
+      for (const range of docRanges.ranges) {
+        pushVarint(header, range.index - previousRange - 1);
+        pushVarint(header, range.maxImpact);
+        previousRange = range.index;
+      }
     }
   }
 
@@ -740,6 +815,8 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
         maxImpactDoc: readVarint(bytes, state),
+        docMin: readVarint(bytes, state),
+        docMax: readVarint(bytes, state),
         codec: postingBlockCodecName(readVarint(bytes, state)),
         filters: {}
       };
@@ -772,8 +849,32 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
         maxImpactDoc: readVarint(bytes, state),
+        docMin: readVarint(bytes, state),
+        docMax: readVarint(bytes, state),
         filters: readBlockFilterSummary(bytes, state, manifest)
       };
+    }
+    if (readVarint(bytes, state) === 1) {
+      const rangeSize = readVarint(bytes, state);
+      const scale = readVarint(bytes, state);
+      const rangeCount = readVarint(bytes, state);
+      const quantizationBits = readVarint(bytes, state);
+      const count = readVarint(bytes, state);
+      const ranges = new Array(count);
+      let previousRange = -1;
+      for (let j = 0; j < count; j++) {
+        const index = previousRange + 1 + readVarint(bytes, state);
+        const quantizedMaxImpact = readVarint(bytes, state);
+        ranges[j] = {
+          index,
+          maxImpact: quantizedMaxImpact * scale,
+          quantizedMaxImpact
+        };
+        previousRange = index;
+      }
+      entry.docRanges = { rangeSize, scale, rangeCount, quantizationBits, ranges };
+    } else {
+      entry.docRanges = null;
     }
     terms.set(term, entry);
   }

@@ -518,7 +518,11 @@ async function reduceTypoLexiconShard(shard, buffer, packWriter, scratchRoot) {
       codec: TYPO_LEXICON_FORMAT,
       logicalLength: encoded.buffer.length
     });
-    return { entries: encoded.stats.entries };
+    return {
+      entries: encoded.stats.entries,
+      trieNodes: encoded.stats.trie_nodes || 0,
+      trieArcs: encoded.stats.trie_arcs || 0
+    };
   } finally {
     rmSync(scratchDir, { recursive: true, force: true });
     unlinkSync(path);
@@ -530,11 +534,15 @@ async function reduceTypoLexiconRuns(buffer, outDir) {
   const packWriter = createPackWriter(resolve(outDir, "typo", "lexicon-packs"), buffer.options.lexiconPackBytes || buffer.options.packBytes);
   const scratchRoot = resolve(outDir, "_build", "typo-lexicon-reduce-sort");
   let entries = 0;
+  let trieNodes = 0;
+  let trieArcs = 0;
   const shards = [];
   for (const shard of [...buffer.lexiconShards].sort()) {
     const stats = await reduceTypoLexiconShard(shard, buffer, packWriter, scratchRoot);
     if (stats.entries > 0) {
       entries += stats.entries;
+      trieNodes += stats.trieNodes || 0;
+      trieArcs += stats.trieArcs || 0;
       shards.push(shard);
     }
   }
@@ -562,6 +570,8 @@ async function reduceTypoLexiconRuns(buffer, outDir) {
     stats: {
       raw_pairs: buffer.lexiconPairs,
       entries,
+      trie_nodes: trieNodes,
+      trie_arcs: trieArcs,
       pack_bytes: packWriter.bytes,
       pack_files: packWriter.packs.length,
       directory_page_files: directory.page_files,

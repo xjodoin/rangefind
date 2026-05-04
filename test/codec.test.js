@@ -47,14 +47,16 @@ test("posting segment codec round-trips postings and block filters", () => {
   const segment = buildPostingSegment([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
   const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
   const entry = shard.terms.get("search");
-  assert.equal(segment.format, "rfsegpost-v3");
-  assert.equal(shard.format, "rfsegpost-v3");
-  assert.equal(entry.format, "rfsegpost-v3");
+  assert.equal(segment.format, "rfsegpost-v4");
+  assert.equal(shard.format, "rfsegpost-v4");
+  assert.equal(entry.format, "rfsegpost-v4");
   assert.equal(entry.count, 3);
   assert.equal(entry.blocks[0].rowCount, 2);
   assert.equal(entry.blocks[1].rowCount, 1);
   assert.equal(entry.blocks[0].maxImpactDoc, 0);
   assert.equal(entry.blocks[1].maxImpactDoc, 2);
+  assert.deepEqual(entry.blocks.map(block => [block.docMin, block.docMax]), [[0, 1], [2, 2]]);
+  assert.deepEqual(entry.docRanges.ranges.map(range => [range.index, range.maxImpact]), [[0, 13]]);
   assert.deepEqual(entry.superblocks.map(item => ({
     firstBlock: item.firstBlock,
     blockCount: item.blockCount,
@@ -133,7 +135,7 @@ test("posting segment codec writes external posting blocks directly", () => {
     }
   });
   const entry = shard.terms.get("search");
-  assert.equal(segment.format, "rfsegpost-v3");
+  assert.equal(segment.format, "rfsegpost-v4");
   assert.equal(entry.external, true);
   assert.equal(entry.blocks.length, 2);
   assert.equal(entry.blocks[0].rowCount, 2);

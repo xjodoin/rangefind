@@ -833,6 +833,9 @@ function compactRuntimeStats(stats = {}) {
     topKProven: Boolean(stats.topKProven),
     totalExact: Boolean(stats.totalExact),
     tailExhausted: Boolean(stats.tailExhausted),
+    topKProofDocRangeAware: Boolean(stats.topKProofDocRangeAware),
+    topKProofThreshold: stats.topKProofThreshold || 0,
+    topKProofMaxOutsidePotential: stats.topKProofMaxOutsidePotential || 0,
     blocksDecoded: stats.blocksDecoded || 0,
     postingsDecoded: stats.postingsDecoded || 0,
     postingsAccepted: stats.postingsAccepted || 0,
@@ -847,6 +850,18 @@ function compactRuntimeStats(stats = {}) {
     postingBlockFrontierFetchedBlocks: stats.postingBlockFrontierFetchedBlocks || 0,
     postingBlockFrontierFetchGroups: stats.postingBlockFrontierFetchGroups || 0,
     postingBlockFrontierWantedBlocks: stats.postingBlockFrontierWantedBlocks || 0,
+    docRangeBlockMax: Boolean(stats.docRangeBlockMax),
+    docRangeSize: stats.docRangeSize || 0,
+    docRangeCandidateRanges: stats.docRangeCandidateRanges || 0,
+    docRangeRangesVisited: stats.docRangeRangesVisited || 0,
+    docRangeRangesPruned: stats.docRangeRangesPruned || 0,
+    docRangeNextUpperBound: stats.docRangeNextUpperBound || 0,
+    docRangeCandidateBlockRatio: stats.docRangeCandidateBlockRatio || 0,
+    docRangeBlocksVisited: stats.docRangeBlocksVisited || 0,
+    docRangePostingRowsScanned: stats.docRangePostingRowsScanned || 0,
+    docRangePostingBlocksCandidate: stats.docRangePostingBlocksCandidate || 0,
+    docRangeFetchedBlocks: stats.docRangeFetchedBlocks || 0,
+    docRangeFetchGroups: stats.docRangeFetchGroups || 0,
     rerankCandidates: stats.rerankCandidates || 0,
     dependencyFeatures: stats.dependencyFeatures || 0,
     dependencyTermsMatched: stats.dependencyTermsMatched || 0,
@@ -901,9 +916,27 @@ function compactRuntimeStats(stats = {}) {
     typoCorrectedQuery: stats.typoCorrectedQuery || "",
     typoCandidateTerms: stats.typoCandidateTerms || 0,
     typoCorrectionPlans: stats.typoCorrectionPlans || 0,
+    typoCorrectionPlansEstimated: stats.typoCorrectionPlansEstimated || 0,
+    typoCorrectionPlansExecuted: stats.typoCorrectionPlansExecuted || 0,
+    typoCorrectionBestUpperBound: stats.typoCorrectionBestUpperBound || 0,
+    typoCorrectedUpperBound: stats.typoCorrectedUpperBound || 0,
     typoShardLookups: stats.typoShardLookups || 0,
     typoLexiconShardLookups: stats.typoLexiconShardLookups || 0,
-    typoLexiconCandidatesScanned: stats.typoLexiconCandidatesScanned || 0
+    typoLexiconCandidatesScanned: stats.typoLexiconCandidatesScanned || 0,
+    trace: compactRuntimeTrace(stats.trace)
+  };
+}
+
+function compactRuntimeTrace(trace) {
+  if (!trace?.spans?.length) return null;
+  return {
+    totalMs: trace.totalMs || 0,
+    spans: trace.spans.map(span => ({
+      name: span.name,
+      count: span.count || 0,
+      totalMs: span.totalMs || 0,
+      maxMs: span.maxMs || 0
+    }))
   };
 }
 
@@ -974,6 +1007,7 @@ async function benchFixture(args, options = {}) {
           filters: item.filters,
           sort: item.sort,
           size: item.size || args.size,
+          trace: i === 0,
           ...(item.options || {})
         });
         times.push(performance.now() - start);
@@ -1106,6 +1140,10 @@ function summarizeScaleRow(row) {
     postingBlockFrontierBlocks: row.coldStats?.postingBlockFrontierBlocks || 0,
     postingBlockFrontierFetchGroups: row.coldStats?.postingBlockFrontierFetchGroups || 0,
     postingBlockFrontierWantedBlocks: row.coldStats?.postingBlockFrontierWantedBlocks || 0,
+    docRangeBlockMax: row.coldStats?.docRangeBlockMax || false,
+    docRangeRangesVisited: row.coldStats?.docRangeRangesVisited || 0,
+    docRangeRangesPruned: row.coldStats?.docRangeRangesPruned || 0,
+    docRangeCandidateBlockRatio: row.coldStats?.docRangeCandidateBlockRatio || 0,
     plannerLane: row.coldStats?.plannerLane || "",
     topKProven: row.coldStats?.topKProven || false,
     totalExact: row.coldStats?.totalExact || false,
@@ -1129,6 +1167,7 @@ function summarizeScaleRow(row) {
     surfaceFallbackApplied: row.coldStats?.surfaceFallbackApplied || false,
     typoAttempted: row.coldStats?.typoAttempted || false,
     typoApplied: row.coldStats?.typoApplied || false,
+    typoCorrectionPlansExecuted: row.coldStats?.typoCorrectionPlansExecuted || 0,
     exactTopKMatch: row.exactTopKMatch ?? null,
     exactTotal: row.exactTotal ?? null
   };

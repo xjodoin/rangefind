@@ -118,6 +118,16 @@ function coreDecisions(config, manifest) {
       reason: "baseline scheduler for the superblock refactor"
     },
     {
+      kind: "doc-range-block-max",
+      status: stat(stats, "posting_segment_doc_range_entries") > 0 ? "current" : "planned",
+      scope: "rfsegpost",
+      range_size: positiveInteger(config.postingDocRangeSize, stat(stats, "posting_segment_doc_range_size")),
+      quantization_bits: positiveInteger(config.postingDocRangeQuantizationBits, stat(stats, "posting_segment_doc_range_quantization_bits")),
+      covered_terms: stat(stats, "posting_segment_doc_range_terms"),
+      range_entries: stat(stats, "posting_segment_doc_range_entries"),
+      reason: "safe docID-range upper bounds for block-max range planning"
+    },
+    {
       kind: "codec-layout",
       status: codecMode === "off" ? "off" : "current",
       scope: "posting-blocks",

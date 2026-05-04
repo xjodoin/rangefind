@@ -222,8 +222,8 @@ var DOC_VALUE_FORMAT_VERSION = 2;
 var DOC_VALUE_ENCODING_DENSE = 0;
 var DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 var FACET_DICT_FORMAT_VERSION = 1;
-var POSTING_SEGMENT_FORMAT = "rfsegpost-v3";
-var POSTING_SEGMENT_FORMAT_VERSION = 3;
+var POSTING_SEGMENT_FORMAT = "rfsegpost-v4";
+var POSTING_SEGMENT_FORMAT_VERSION = 4;
 var POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
 var POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
 var POSTING_BLOCK_CODEC_IMPACT_BITSET = "impact-bitset-v1";
@@ -342,6 +342,8 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
         maxImpactDoc: readVarint(bytes, state),
+        docMin: readVarint(bytes, state),
+        docMax: readVarint(bytes, state),
         codec: postingBlockCodecName(readVarint(bytes, state)),
         filters: {}
       };
@@ -374,8 +376,32 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
         rowCount: readVarint(bytes, state),
         maxImpact: readVarint(bytes, state),
         maxImpactDoc: readVarint(bytes, state),
+        docMin: readVarint(bytes, state),
+        docMax: readVarint(bytes, state),
         filters: readBlockFilterSummary(bytes, state, manifest)
       };
+    }
+    if (readVarint(bytes, state) === 1) {
+      const rangeSize = readVarint(bytes, state);
+      const scale = readVarint(bytes, state);
+      const rangeCount = readVarint(bytes, state);
+      const quantizationBits = readVarint(bytes, state);
+      const count = readVarint(bytes, state);
+      const ranges = new Array(count);
+      let previousRange = -1;
+      for (let j = 0; j < count; j++) {
+        const index = previousRange + 1 + readVarint(bytes, state);
+        const quantizedMaxImpact = readVarint(bytes, state);
+        ranges[j] = {
+          index,
+          maxImpact: quantizedMaxImpact * scale,
+          quantizedMaxImpact
+        };
+        previousRange = index;
+      }
+      entry.docRanges = { rangeSize, scale, rangeCount, quantizationBits, ranges };
+    } else {
+      entry.docRanges = null;
     }
     terms.set(term, entry);
   }
@@ -1375,8 +1401,8 @@ function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
 }
 
 // src/typo_lexicon.js
-var TYPO_LEXICON_FORMAT = "rftermlex-v1";
-var TYPO_LEXICON_VERSION = 1;
+var TYPO_LEXICON_FORMAT = "rftermlex-v2";
+var TYPO_LEXICON_VERSION = 2;
 function parseTypoLexiconShard(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, TYPO_LEXICON_MAGIC, "Unsupported Rangefind typo lexicon shard");
@@ -1392,7 +1418,26 @@ function parseTypoLexiconShard(buffer) {
       df: readVarint(bytes, state)
     };
   }
-  return { format: TYPO_LEXICON_FORMAT, entries };
+  const nodeCount = readVarint(bytes, state);
+  const rawNodes = new Array(nodeCount);
+  for (let i = 0; i < nodeCount; i++) {
+    const entryIds = new Array(readVarint(bytes, state));
+    for (let j = 0; j < entryIds.length; j++) entryIds[j] = readVarint(bytes, state);
+    const childCount = readVarint(bytes, state);
+    const children = new Array(childCount);
+    for (let j = 0; j < childCount; j++) children[j] = [readUtf8(bytes, state), readVarint(bytes, state)];
+    rawNodes[i] = { entryIds, children };
+  }
+  const nodes = rawNodes.map((node) => ({
+    children: /* @__PURE__ */ new Map(),
+    entries: node.entryIds.map((index) => entries[index]).filter(Boolean)
+  }));
+  for (let i = 0; i < rawNodes.length; i++) {
+    for (const [char, childIndex] of rawNodes[i].children) {
+      if (nodes[childIndex]) nodes[i].children.set(char, nodes[childIndex]);
+    }
+  }
+  return { format: TYPO_LEXICON_FORMAT, entries, trie: nodes[0] || { children: /* @__PURE__ */ new Map(), entries: [] }, trieNodes: nodes.length };
 }
 
 // src/typo_runtime.js
@@ -1508,9 +1553,116 @@ var POSTING_BLOCK_FRONTIER = 4;
 var FILTER_BITMAP_SPARSE_DOC_LIMIT = 256;
 var TYPO_CORRECTION_CANDIDATES_PER_TOKEN = 2;
 var TYPO_CORRECTION_PLAN_LIMIT = 6;
+var TYPO_CORRECTION_EXECUTION_PLAN_LIMIT = 1;
 var TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
 var TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
+var DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
+var DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.75;
 var textDecoder4 = new TextDecoder();
+var activeRuntimeTrace = null;
+function nowMs() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+function createRuntimeTrace() {
+  return {
+    started: nowMs(),
+    spans: /* @__PURE__ */ new Map()
+  };
+}
+function traceBucketFromPath(path) {
+  if (path.endsWith("/manifest.min.json")) return "manifest";
+  if (/\/manifest(?:\.[0-9a-f]+)?\.json(?:\.gz)?$/u.test(path)) return "manifest";
+  if (path.includes("/terms/block-packs/")) return "postingBlocks";
+  if (path.includes("/terms/packs/")) return "terms";
+  if (path.includes("/bundles/packs/")) return "queryBundles";
+  if (path.includes("/authority/packs/")) return "authority";
+  if (path.includes("/typo/lexicon-packs/") || path.includes("/typo/lexicon/")) return "typoLexicon";
+  if (path.includes("/typo/")) return "typo";
+  if (path.includes("/doc-values/sorted")) return "docValueSorted";
+  if (path.includes("/doc-values/")) return "docValues";
+  if (path.includes("/docs/ordinals/")) return "docOrdinals";
+  if (path.includes("/docs/pointers/")) return "docPointers";
+  if (path.includes("/docs/pages/")) return "docPagePointers";
+  if (path.includes("/docs/page-packs/")) return "docPages";
+  if (path.includes("/docs/")) return "docs";
+  if (path.includes("/facets/")) return "facetDictionaries";
+  if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
+  if (path.includes("/directory-")) return "directory";
+  if (path.endsWith("/codes.bin.gz")) return "codes";
+  return "other";
+}
+function traceBucketFromUrl(url) {
+  try {
+    return traceBucketFromPath(new URL(String(url)).pathname);
+  } catch {
+    return "other";
+  }
+}
+function traceLabelBucket(label) {
+  const value = String(label || "");
+  if (value.startsWith("posting block")) return "postingBlocks";
+  if (value.startsWith("posting segment")) return "terms";
+  if (value.startsWith("query bundle")) return "queryBundles";
+  if (value.startsWith("authority shard")) return "authority";
+  if (value.startsWith("typo lexicon")) return "typoLexicon";
+  if (value.startsWith("typo shard")) return "typo";
+  if (value.startsWith("doc-value sort page")) return "docValueSorted";
+  if (value.startsWith("doc-value")) return "docValues";
+  if (value.startsWith("doc page")) return "docPages";
+  if (value.startsWith("doc ")) return "docs";
+  if (value.startsWith("facet dictionary")) return "facetDictionaries";
+  if (value.startsWith("filter bitmap")) return "filterBitmaps";
+  return "object";
+}
+function recordTraceSpan(trace, name, ms) {
+  if (!trace || !Number.isFinite(ms)) return;
+  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0 };
+  current.count++;
+  current.totalMs += ms;
+  current.maxMs = Math.max(current.maxMs, ms);
+  trace.spans.set(name, current);
+}
+async function traceSpan(name, fn) {
+  const trace = activeRuntimeTrace;
+  if (!trace) return fn();
+  const started = nowMs();
+  try {
+    return await fn();
+  } finally {
+    recordTraceSpan(trace, name, nowMs() - started);
+  }
+}
+function traceSpanSync(name, fn) {
+  const trace = activeRuntimeTrace;
+  if (!trace) return fn();
+  const started = nowMs();
+  try {
+    return fn();
+  } finally {
+    recordTraceSpan(trace, name, nowMs() - started);
+  }
+}
+async function withRuntimeTrace(trace, fn) {
+  const previous = activeRuntimeTrace;
+  activeRuntimeTrace = trace || previous;
+  try {
+    return await fn();
+  } finally {
+    activeRuntimeTrace = previous;
+  }
+}
+function finalizeRuntimeTrace(trace) {
+  if (!trace) return null;
+  return {
+    totalMs: nowMs() - trace.started,
+    spans: [...trace.spans.values()].map((span) => ({
+      name: span.name,
+      count: span.count,
+      totalMs: span.totalMs,
+      maxMs: span.maxMs
+    })).sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name))
+  };
+}
 async function inflateGzip(responseOrBuffer) {
   if (!("DecompressionStream" in globalThis)) {
     throw new Error("Rangefind requires DecompressionStream for compressed static index files.");
@@ -1520,16 +1672,18 @@ async function inflateGzip(responseOrBuffer) {
   return new Response(stream.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 }
 async function fetchGzipArrayBuffer(url) {
-  const response = await fetch(url);
+  const bucket = traceBucketFromUrl(url);
+  const response = await traceSpan(`${bucket}.fetch`, () => fetch(url));
   if (!response.ok) throw new Error(`Unable to fetch ${url}`);
-  return inflateGzip(response);
+  return traceSpan(`${bucket}.inflate`, () => inflateGzip(response));
 }
 async function fetchRange(url, offset, length) {
-  const response = await fetch(url, {
+  const bucket = traceBucketFromUrl(url);
+  const response = await traceSpan(`${bucket}.fetch`, () => fetch(url, {
     headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-  });
+  }));
   if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
-  return response.arrayBuffer();
+  return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
 }
 function selectedFacetCodes(manifest, field, selected) {
   if (!selected?.size) return null;
@@ -1568,7 +1722,8 @@ async function createSearch(options = {}) {
     const url = new URL(path, baseUrl);
     const response = await fetch(url);
     if (!response.ok) return null;
-    return JSON.parse(textDecoder4.decode(await inflateGzip(response)));
+    const inflated = await traceSpan("manifest.inflate", () => inflateGzip(response));
+    return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder4.decode(inflated)));
   }
   const manifest = await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
@@ -1633,6 +1788,7 @@ async function createSearch(options = {}) {
     authority: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
+    postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     ...options.rangePlans || {}
   };
   async function ensureFullManifest() {
@@ -1733,6 +1889,11 @@ async function createSearch(options = {}) {
     return segmentManifest;
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
+  const docRangePlannerEnabled = options.docRangePlanner !== false;
+  const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
+    TYPO_CORRECTION_PLAN_LIMIT,
+    Math.floor(Number(options.typoCorrectionExecutionPlans || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
+  ));
   function rangeGroups(items, kind = "default") {
     return groupRanges(items, rangePlans[kind] || rangePlans.default);
   }
@@ -1755,14 +1916,14 @@ async function createSearch(options = {}) {
   async function loadDirectoryRoot(state) {
     if (state.root) return state.root;
     if (!state.rootPromise) {
-      state.rootPromise = fetchGzipArrayBuffer(new URL(state.meta.root, baseUrl)).then(parseDirectoryRoot);
+      state.rootPromise = fetchGzipArrayBuffer(new URL(state.meta.root, baseUrl)).then((buffer) => traceSpanSync("directory.parseRoot", () => parseDirectoryRoot(buffer)));
     }
     state.root = await state.rootPromise;
     return state.root;
   }
   async function loadDirectoryPage(state, page) {
     if (!state.pages.has(page.file)) {
-      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then((buffer) => parseDirectoryPage(buffer, { packTable: state.meta.packTable })));
+      state.pages.set(page.file, fetchGzipArrayBuffer(new URL(directoryPagePath(state, page), baseUrl)).then((buffer) => traceSpanSync("directory.parsePage", () => parseDirectoryPage(buffer, { packTable: state.meta.packTable }))));
     }
     return state.pages.get(page.file);
   }
@@ -1774,12 +1935,14 @@ async function createSearch(options = {}) {
     return entry ? { shard, entry } : null;
   }
   async function resolveDirectoryShard(value, state, baseDepth, maxDepth) {
-    const root = await loadDirectoryRoot(state);
-    for (let depth = maxDepth; depth >= baseDepth; depth--) {
-      const resolved = await directoryEntryFromRoot(state, root, shardKey(value, depth));
-      if (resolved) return resolved;
-    }
-    return null;
+    return traceSpan("directory.resolve", async () => {
+      const root = await loadDirectoryRoot(state);
+      for (let depth = maxDepth; depth >= baseDepth; depth--) {
+        const resolved = await directoryEntryFromRoot(state, root, shardKey(value, depth));
+        if (resolved) return resolved;
+      }
+      return null;
+    });
   }
   async function loadCodes() {
     if (codes) return codes;
@@ -1789,7 +1952,7 @@ async function createSearch(options = {}) {
   }
   async function inflateObject(compressed, pointer, label) {
     if (verifyChecksums) await verifyBlockPointer(compressed, pointer, label);
-    return inflateGzip(compressed);
+    return traceSpan(`${traceLabelBucket(label)}.inflate`, () => inflateGzip(compressed));
   }
   async function inflateGroupItem(compressed, groupStart, item, label) {
     const start = item.entry.offset - groupStart;
@@ -1818,7 +1981,8 @@ async function createSearch(options = {}) {
         if (!resolved) return [];
         const packs = facetDictionaries.packs || "facets/packs/";
         const buffer = await fetchRange(new URL(`${packs.replace(/\/?$/u, "/")}${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
-        const values = parseFacetDictionary(await inflateObject(buffer, resolved.entry, `facet dictionary ${field}`));
+        const inflated = await inflateObject(buffer, resolved.entry, `facet dictionary ${field}`);
+        const values = traceSpanSync("facetDictionaries.parse", () => parseFacetDictionary(inflated));
         if (!manifest.facets) manifest.facets = {};
         manifest.facets[field] = values;
         return values;
@@ -1854,41 +2018,44 @@ async function createSearch(options = {}) {
     return `${field}\0${lookup ? "lookup" : "chunk"}\0${index}`;
   }
   async function loadDocValueChunks(requests) {
-    if (!docValues || !requests.length) return;
-    const pending = [];
-    for (const request of requests) {
-      const fieldMeta = docValueField(request.field);
-      const chunk = docValueChunkForRequest(fieldMeta, request);
-      if (!chunk) continue;
-      const key = docValueCacheKey(request.field, request.index, request.lookup);
-      if (docValueCache.has(key)) continue;
-      let resolve;
-      let reject;
-      const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      promise.catch(() => {
-      });
-      docValueCache.set(key, promise);
-      pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
-    }
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          const parsed = parseDocValueChunk(await inflateGroupItem(compressed, group.start, item, `doc-value ${item.field}:${item.index}`));
-          docValueCache.set(docValueCacheKey(item.field, item.index, item.lookup), parsed);
-          item.resolve(parsed);
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
-          item.reject(error);
-        }
-        throw error;
+    return traceSpan("docValues.loadChunks", async () => {
+      if (!docValues || !requests.length) return;
+      const pending = [];
+      for (const request of requests) {
+        const fieldMeta = docValueField(request.field);
+        const chunk = docValueChunkForRequest(fieldMeta, request);
+        if (!chunk) continue;
+        const key = docValueCacheKey(request.field, request.index, request.lookup);
+        if (docValueCache.has(key)) continue;
+        let resolve;
+        let reject;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        promise.catch(() => {
+        });
+        docValueCache.set(key, promise);
+        pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
       }
-    }));
+      await Promise.all(rangeGroups(pending).map(async (group) => {
+        try {
+          const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+          await Promise.all(group.items.map(async (item) => {
+            const inflated = await inflateGroupItem(compressed, group.start, item, `doc-value ${item.field}:${item.index}`);
+            const parsed = traceSpanSync("docValues.parse", () => parseDocValueChunk(inflated));
+            docValueCache.set(docValueCacheKey(item.field, item.index, item.lookup), parsed);
+            item.resolve(parsed);
+          }));
+        } catch (error) {
+          for (const item of group.items) {
+            docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
+            item.reject(error);
+          }
+          throw error;
+        }
+      }));
+    });
   }
   async function loadDocValueSortDirectory(field) {
     const meta = docValueSortField(field);
@@ -1927,7 +2094,7 @@ async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`doc-values/sorted-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc-value sort page ${item.field}:${item.pageIndex}`);
-          item.resolve(decodeDocValueSortPage(inflated, { name: item.field }));
+          item.resolve(traceSpanSync("docValueSorted.decode", () => decodeDocValueSortPage(inflated, { name: item.field })));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -1982,7 +2149,7 @@ async function createSearch(options = {}) {
     if (!entry) return null;
     const key = filterBitmapCacheKey(field, value);
     if (!filterBitmapCache.has(key)) {
-      const promise = fetchRange(new URL(`filter-bitmaps/packs/${entry.pack}`, baseUrl), entry.offset, entry.length).then((buffer) => inflateObject(buffer, entry, `filter bitmap ${field}:${value}`)).then(parseFilterBitmap);
+      const promise = fetchRange(new URL(`filter-bitmaps/packs/${entry.pack}`, baseUrl), entry.offset, entry.length).then((buffer) => inflateObject(buffer, entry, `filter bitmap ${field}:${value}`)).then((buffer) => traceSpanSync("filterBitmaps.parse", () => parseFilterBitmap(buffer)));
       promise.catch(() => {
         filterBitmapCache.delete(key);
       });
@@ -2101,7 +2268,8 @@ async function createSearch(options = {}) {
       try {
         const compressed = await fetchRange(new URL(`terms/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          item.resolve(parsePostingSegment(await inflateGroupItem(compressed, group.start, item, `posting segment ${item.shard}`), manifest));
+          const inflated = await inflateGroupItem(compressed, group.start, item, `posting segment ${item.shard}`);
+          item.resolve(traceSpanSync("terms.parse", () => parsePostingSegment(inflated, manifest)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2142,7 +2310,8 @@ async function createSearch(options = {}) {
       try {
         const compressed = await fetchRange(new URL(`authority/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          item.resolve(parseAuthorityShard(await inflateGroupItem(compressed, group.start, item, `authority shard ${item.shard}`)));
+          const inflated = await inflateGroupItem(compressed, group.start, item, `authority shard ${item.shard}`);
+          item.resolve(traceSpanSync("authority.parse", () => parseAuthorityShard(inflated)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2185,7 +2354,8 @@ async function createSearch(options = {}) {
       try {
         const compressed = await fetchRange(new URL(`typo/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          item.resolve(parseTypoShard(await inflateGroupItem(compressed, group.start, item, `typo shard ${item.shard}`)));
+          const inflated = await inflateGroupItem(compressed, group.start, item, `typo shard ${item.shard}`);
+          item.resolve(traceSpanSync("typo.parse", () => parseTypoShard(inflated)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2228,7 +2398,8 @@ async function createSearch(options = {}) {
       try {
         const compressed = await fetchRange(new URL(`typo/lexicon-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
-          item.resolve(parseTypoLexiconShard(await inflateGroupItem(compressed, group.start, item, `typo lexicon ${item.shard}`)));
+          const inflated = await inflateGroupItem(compressed, group.start, item, `typo lexicon ${item.shard}`);
+          item.resolve(traceSpanSync("typoLexicon.parse", () => parseTypoLexiconShard(inflated)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2246,29 +2417,31 @@ async function createSearch(options = {}) {
     return out;
   }
   async function termEntries(terms) {
-    const byShard = /* @__PURE__ */ new Map();
-    for (const term of terms) {
-      const resolved = await resolveDirectoryShard(
-        term,
-        termDirectory,
-        manifest.stats?.base_shard_depth || 3,
-        manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
-      );
-      if (!resolved) continue;
-      if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, terms: [] });
-      byShard.get(resolved.shard).terms.push(term);
-    }
-    const loaded = await loadShards([...byShard.values()]);
-    const out = [];
-    for (const [shard, bucket] of byShard) {
-      const data = loaded.get(shard);
-      if (!data) continue;
-      for (const term of bucket.terms) {
-        const entry = data.terms.get(term);
-        if (entry) out.push({ term, shard: data, shardName: shard, entry });
+    return traceSpan("terms.entries", async () => {
+      const byShard = /* @__PURE__ */ new Map();
+      for (const term of terms) {
+        const resolved = await resolveDirectoryShard(
+          term,
+          termDirectory,
+          manifest.stats?.base_shard_depth || 3,
+          manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
+        );
+        if (!resolved) continue;
+        if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, terms: [] });
+        byShard.get(resolved.shard).terms.push(term);
       }
-    }
-    return out;
+      const loaded = await loadShards([...byShard.values()]);
+      const out = [];
+      for (const [shard, bucket] of byShard) {
+        const data = loaded.get(shard);
+        if (!data) continue;
+        for (const term of bucket.terms) {
+          const entry = data.terms.get(term);
+          if (entry) out.push({ term, shard: data, shardName: shard, entry });
+        }
+      }
+      return out;
+    });
   }
   async function loadSegmentTerms(segment) {
     const key = segment.id || String(segment.ordinal);
@@ -2277,7 +2450,7 @@ async function createSearch(options = {}) {
       segmentTermsCache.set(key, path ? fetch(new URL(path, baseUrl)).then((response) => {
         if (!response.ok) throw new Error(`Unable to fetch ${path}`);
         return response.arrayBuffer();
-      }).then(parseSegmentTerms) : Promise.resolve(null));
+      }).then((buffer) => traceSpanSync("segments.parseTerms", () => parseSegmentTerms(buffer))) : Promise.resolve(null));
     }
     return segmentTermsCache.get(key);
   }
@@ -2334,24 +2507,27 @@ async function createSearch(options = {}) {
     return out;
   }
   async function loadQueryBundle(key) {
-    if (!queryBundleDirectory || options.queryBundles === false) return null;
-    if (!queryBundleCache.has(key)) {
-      const promise = (async () => {
-        const root = await loadDirectoryRoot(queryBundleDirectory);
-        const resolved = await directoryEntryFromRoot(queryBundleDirectory, root, key);
-        if (!resolved) return null;
-        const buffer = await fetchRange(new URL(`bundles/packs/${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
-        return {
-          bundle: parseQueryBundle(await inflateObject(buffer, resolved.entry, `query bundle ${key}`), manifest),
-          bytes: resolved.entry.length
-        };
-      })();
-      promise.catch(() => {
-        queryBundleCache.delete(key);
-      });
-      queryBundleCache.set(key, promise);
-    }
-    return queryBundleCache.get(key);
+    return traceSpan("queryBundles.load", async () => {
+      if (!queryBundleDirectory || options.queryBundles === false) return null;
+      if (!queryBundleCache.has(key)) {
+        const promise = (async () => {
+          const root = await loadDirectoryRoot(queryBundleDirectory);
+          const resolved = await directoryEntryFromRoot(queryBundleDirectory, root, key);
+          if (!resolved) return null;
+          const buffer = await fetchRange(new URL(`bundles/packs/${resolved.entry.pack}`, baseUrl), resolved.entry.offset, resolved.entry.length);
+          const inflated = await inflateObject(buffer, resolved.entry, `query bundle ${key}`);
+          return {
+            bundle: traceSpanSync("queryBundles.parse", () => parseQueryBundle(inflated, manifest)),
+            bytes: resolved.entry.length
+          };
+        })();
+        promise.catch(() => {
+          queryBundleCache.delete(key);
+        });
+        queryBundleCache.set(key, promise);
+      }
+      return queryBundleCache.get(key);
+    });
   }
   function bundleProvesTopK(bundle, k) {
     if (!bundle) return false;
@@ -2492,6 +2668,9 @@ async function createSearch(options = {}) {
     };
   }
   async function tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank }) {
+    return traceSpan("queryBundles.search", () => tryQueryBundleSearchInner({ page, size, baseTerms, filters, sortPlan, rerank }));
+  }
+  async function tryQueryBundleSearchInner({ page, size, baseTerms, filters, sortPlan, rerank }) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
@@ -2742,7 +2921,7 @@ async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc ${item.index}`);
-          item.resolve(JSON.parse(textDecoder4.decode(new Uint8Array(inflated))));
+          item.resolve(traceSpanSync("docs.parse", () => JSON.parse(textDecoder4.decode(new Uint8Array(inflated)))));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2852,7 +3031,7 @@ async function createSearch(options = {}) {
         const compressed = await fetchRange(new URL(`docs/page-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc page ${item.pageIndex}`);
-          item.resolve(decodeDocPagePayload(inflated, item.pageIndex));
+          item.resolve(traceSpanSync("docPages.decode", () => decodeDocPagePayload(inflated, item.pageIndex)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2880,8 +3059,10 @@ async function createSearch(options = {}) {
     return plan ? loadDocPages(indexes, plan) : loadPackedDocs(indexes);
   }
   async function rowsToResults(rows, context = {}) {
-    const docs = await loadDocs(rows.map(([index]) => index), context);
-    return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
+    return traceSpan("docs.hydrate", async () => {
+      const docs = await loadDocs(rows.map(([index]) => index), context);
+      return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
+    });
   }
   function normalizeRangeValue(value, field) {
     if (value == null || value === "") return null;
@@ -2898,91 +3079,96 @@ async function createSearch(options = {}) {
     return null;
   }
   async function loadPostingBlockBatch(requests, rangePlan = "postingBlocks") {
-    const pending = [];
-    let wanted = 0;
-    for (const request of requests) {
-      const owner = request.entry;
-      const blockIndex = request.blockIndex;
-      if (!owner.blockPostings) owner.blockPostings = /* @__PURE__ */ new Map();
-      wanted++;
-      if (owner.blockPostings.has(blockIndex)) continue;
-      const block = owner.blocks?.[blockIndex];
-      if (!block?.range) {
-        owner.blockPostings.set(blockIndex, Promise.resolve(new Int32Array(0)));
-        continue;
-      }
-      let resolveBlock;
-      let rejectBlock;
-      const promise = new Promise((resolvePromise, rejectPromise) => {
-        resolveBlock = resolvePromise;
-        rejectBlock = rejectPromise;
-      });
-      promise.catch(() => {
-      });
-      owner.blockPostings.set(blockIndex, promise);
-      pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
-    }
-    const groups = rangeGroups(pending, rangePlan);
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          item.resolve(decodePostingBytes(
-            await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`),
-            item.owner.blocks?.[item.blockIndex]
-          ));
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          item.owner.blockPostings.delete(item.blockIndex);
-          item.reject(error);
+    return traceSpan("postingBlocks.load", async () => {
+      const pending = [];
+      let wanted = 0;
+      for (const request of requests) {
+        const owner = request.entry;
+        const blockIndex = request.blockIndex;
+        if (!owner.blockPostings) owner.blockPostings = /* @__PURE__ */ new Map();
+        wanted++;
+        if (owner.blockPostings.has(blockIndex)) continue;
+        const block = owner.blocks?.[blockIndex];
+        if (!block?.range) {
+          owner.blockPostings.set(blockIndex, Promise.resolve(new Int32Array(0)));
+          continue;
         }
-        throw error;
+        let resolveBlock;
+        let rejectBlock;
+        const promise = new Promise((resolvePromise, rejectPromise) => {
+          resolveBlock = resolvePromise;
+          rejectBlock = rejectPromise;
+        });
+        promise.catch(() => {
+        });
+        owner.blockPostings.set(blockIndex, promise);
+        pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
       }
-    }));
-    return { wanted, fetched: pending.length, groups: groups.length };
+      const groups = rangeGroups(pending, rangePlan);
+      await Promise.all(groups.map(async (group) => {
+        try {
+          const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+          await Promise.all(group.items.map(async (item) => {
+            const inflated = await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`);
+            item.resolve(traceSpanSync("postingBlocks.decode", () => decodePostingBytes(
+              inflated,
+              item.owner.blocks?.[item.blockIndex]
+            )));
+          }));
+        } catch (error) {
+          for (const item of group.items) {
+            item.owner.blockPostings.delete(item.blockIndex);
+            item.reject(error);
+          }
+          throw error;
+        }
+      }));
+      return { wanted, fetched: pending.length, groups: groups.length };
+    });
   }
   async function loadPostingBlockByteBatch(requests, rangePlan = "postingBlocks") {
-    const pending = [];
-    let wanted = 0;
-    for (const request of requests) {
-      const owner = request.entry;
-      const blockIndex = request.blockIndex;
-      if (!owner.blockBytes) owner.blockBytes = /* @__PURE__ */ new Map();
-      wanted++;
-      if (owner.blockBytes.has(blockIndex)) continue;
-      const block = owner.blocks?.[blockIndex];
-      if (!block?.range) {
-        owner.blockBytes.set(blockIndex, Promise.resolve(new Uint8Array(0)));
-        continue;
-      }
-      let resolveBlock;
-      let rejectBlock;
-      const promise = new Promise((resolvePromise, rejectPromise) => {
-        resolveBlock = resolvePromise;
-        rejectBlock = rejectPromise;
-      });
-      promise.catch(() => {
-      });
-      owner.blockBytes.set(blockIndex, promise);
-      pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
-    }
-    const groups = rangeGroups(pending, rangePlan);
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          item.resolve(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`));
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          item.owner.blockBytes.delete(item.blockIndex);
-          item.reject(error);
+    return traceSpan("postingBlocks.loadBytes", async () => {
+      const pending = [];
+      let wanted = 0;
+      for (const request of requests) {
+        const owner = request.entry;
+        const blockIndex = request.blockIndex;
+        if (!owner.blockBytes) owner.blockBytes = /* @__PURE__ */ new Map();
+        wanted++;
+        if (owner.blockBytes.has(blockIndex)) continue;
+        const block = owner.blocks?.[blockIndex];
+        if (!block?.range) {
+          owner.blockBytes.set(blockIndex, Promise.resolve(new Uint8Array(0)));
+          continue;
         }
-        throw error;
+        let resolveBlock;
+        let rejectBlock;
+        const promise = new Promise((resolvePromise, rejectPromise) => {
+          resolveBlock = resolvePromise;
+          rejectBlock = rejectPromise;
+        });
+        promise.catch(() => {
+        });
+        owner.blockBytes.set(blockIndex, promise);
+        pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
       }
-    }));
-    return { wanted, fetched: pending.length, groups: groups.length };
+      const groups = rangeGroups(pending, rangePlan);
+      await Promise.all(groups.map(async (group) => {
+        try {
+          const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+          await Promise.all(group.items.map(async (item) => {
+            item.resolve(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`));
+          }));
+        } catch (error) {
+          for (const item of group.items) {
+            item.owner.blockBytes.delete(item.blockIndex);
+            item.reject(error);
+          }
+          throw error;
+        }
+      }));
+      return { wanted, fetched: pending.length, groups: groups.length };
+    });
   }
   async function loadExternalPostingBlocks(entry, blockIndexes) {
     await loadPostingBlockBatch(blockIndexes.map((blockIndex) => ({ entry, blockIndex })));
@@ -3363,7 +3549,20 @@ async function createSearch(options = {}) {
       booleans: filters.booleans || {}
     };
   }
-  function sortedTextCandidateBlockIndexes(entry, filterPlan) {
+  function blockOverlapsDocSpan(block, minDoc, maxDoc) {
+    if (minDoc == null || maxDoc == null) return true;
+    if (!Number.isFinite(block?.docMin) || !Number.isFinite(block?.docMax)) return true;
+    return block.docMax >= minDoc && block.docMin <= maxDoc;
+  }
+  function candidateDocsOverlapBlock(candidateDocs, block) {
+    if (!candidateDocs?.size) return true;
+    if (!Number.isFinite(block?.docMin) || !Number.isFinite(block?.docMax)) return true;
+    for (const doc of candidateDocs) {
+      if (doc >= block.docMin && doc <= block.docMax) return true;
+    }
+    return false;
+  }
+  function sortedTextCandidateBlockIndexes(entry, filterPlan, candidateDocs = null) {
     const indexes = [];
     let consideredBlocks = 0;
     let skippedBlocks = 0;
@@ -3376,14 +3575,14 @@ async function createSearch(options = {}) {
         consideredSuperblocks++;
         const first = Math.max(0, superblock.firstBlock || 0);
         const end = Math.min(blocks.length, first + (superblock.blockCount || 0));
-        if (!blockMayPass(superblock, filterPlan)) {
+        if (!blockMayPass(superblock, filterPlan) || !candidateDocsOverlapBlock(candidateDocs, superblock)) {
           skippedSuperblocks++;
           skippedBlocks += Math.max(0, end - first);
           continue;
         }
         for (let blockIndex = first; blockIndex < end; blockIndex++) {
           consideredBlocks++;
-          if (blockMayPass(blocks[blockIndex], filterPlan)) indexes.push(blockIndex);
+          if (blockMayPass(blocks[blockIndex], filterPlan) && candidateDocsOverlapBlock(candidateDocs, blocks[blockIndex])) indexes.push(blockIndex);
           else skippedBlocks++;
         }
       }
@@ -3391,7 +3590,7 @@ async function createSearch(options = {}) {
     }
     for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
       consideredBlocks++;
-      if (blockMayPass(blocks[blockIndex], filterPlan)) indexes.push(blockIndex);
+      if (blockMayPass(blocks[blockIndex], filterPlan) && candidateDocsOverlapBlock(candidateDocs, blocks[blockIndex])) indexes.push(blockIndex);
       else skippedBlocks++;
     }
     return { indexes, consideredBlocks, skippedBlocks, consideredSuperblocks, skippedSuperblocks };
@@ -3413,6 +3612,9 @@ async function createSearch(options = {}) {
     return desc ? page.max >= boundarySortValue : page.min <= boundarySortValue;
   }
   async function runDocValueBrowse({ page, size, filters, sortPlan, hasFilters }) {
+    return traceSpan("docValues.sortedBrowse", () => runDocValueBrowseInner({ page, size, filters, sortPlan, hasFilters }));
+  }
+  async function runDocValueBrowseInner({ page, size, filters, sortPlan, hasFilters }) {
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const field = sortPlan?.field || null;
     if (field && !docValueSorted) await ensureDocValueSortedManifest();
@@ -3478,6 +3680,9 @@ async function createSearch(options = {}) {
     };
   }
   async function runSortedTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
+    return traceSpan("sortPageText.search", () => runSortedTextSearchInner({ page, size, filters, sortPlan, baseTerms, terms, rerank }));
+  }
+  async function runSortedTextSearchInner({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
     const field = sortPlan?.field || null;
     if (field && !docValueSorted) await ensureDocValueSortedManifest();
     if (!field || !docValueSortField(field) || !baseTerms.length || terms.length > SKIP_MAX_TERMS) return null;
@@ -3544,7 +3749,7 @@ async function createSearch(options = {}) {
         const pageBlockFilterPlan = makeBlockFilterPlan(mergeSortPageFilter(filters, field, candidatePage));
         for (const { term, shard, shardName, entry } of entries) {
           const isBase = baseSet.has(term);
-          const candidates = sortedTextCandidateBlockIndexes(entry, pageBlockFilterPlan);
+          const candidates = sortedTextCandidateBlockIndexes(entry, pageBlockFilterPlan, candidateDocs);
           candidatePostingBlocks += candidates.indexes.length;
           consideredPostingBlocks += candidates.consideredBlocks;
           skippedPostingBlocks += candidates.skippedBlocks;
@@ -3643,6 +3848,9 @@ async function createSearch(options = {}) {
     };
   }
   async function runDocValueChunkBrowse({ page, size, filters, hasFilters }) {
+    return traceSpan("docValues.chunkBrowse", () => runDocValueChunkBrowseInner({ page, size, filters, hasFilters }));
+  }
+  async function runDocValueChunkBrowseInner({ page, size, filters, hasFilters }) {
     if (!docValues || !hasFilters) return null;
     const docFilterPlan = makeDocFilterPlan(filters);
     if (!docFilterPlan?.active) return null;
@@ -3746,6 +3954,7 @@ async function createSearch(options = {}) {
       lastRemainingTermUpperBound: 0,
       filterAware: Boolean(hasFilters),
       sortAware: Boolean(sortPlan),
+      docRangeAware: false,
       filterUnknown: Boolean(blockFilterPlan?.unknownFields?.length),
       unknownFilterFields: blockFilterPlan?.unknownFields || []
     };
@@ -3783,6 +3992,7 @@ async function createSearch(options = {}) {
         topKProofRemainingTermUpperBound: 0,
         topKProofFilterAware: false,
         topKProofSortAware: false,
+        topKProofDocRangeAware: false,
         topKProofFilterUnknown: false,
         topKProofUnknownFilterFields: ""
       };
@@ -3800,6 +4010,7 @@ async function createSearch(options = {}) {
       topKProofRemainingTermUpperBound: stats.lastRemainingTermUpperBound,
       topKProofFilterAware: stats.filterAware,
       topKProofSortAware: stats.sortAware,
+      topKProofDocRangeAware: stats.docRangeAware,
       topKProofFilterUnknown: stats.filterUnknown,
       topKProofUnknownFilterFields: stats.unknownFilterFields.join(",")
     };
@@ -3853,7 +4064,26 @@ async function createSearch(options = {}) {
     }
     return false;
   }
-  function remainingPotentialInfo(cursors, mask = 0, filterPlan = null) {
+  function entryDocRangeMaxByIndex(entry) {
+    if (!entry?.docRanges?.ranges?.length) return null;
+    if (!entry.docRangeMaxByIndex) {
+      entry.docRangeMaxByIndex = new Map(entry.docRanges.ranges.map((range) => [range.index, range.maxImpact || 0]));
+    }
+    return entry.docRangeMaxByIndex;
+  }
+  function docRangeMaxForDoc(entry, doc) {
+    const docRanges = entry?.docRanges;
+    if (!docRanges?.rangeSize) return null;
+    const rangeIndex = Math.floor(doc / docRanges.rangeSize);
+    return entryDocRangeMaxByIndex(entry)?.get(rangeIndex) || 0;
+  }
+  function remainingImpactForCursor(cursor, block, doc = null) {
+    const blockImpact = block?.maxImpact || 0;
+    if (doc == null) return blockImpact;
+    const rangeImpact = docRangeMaxForDoc(cursor.entry, doc);
+    return rangeImpact == null ? blockImpact : Math.min(blockImpact, rangeImpact);
+  }
+  function remainingPotentialInfo(cursors, mask = 0, filterPlan = null, doc = null) {
     let potential = 0;
     let tieDocLowerBound = 0;
     let hasRemaining = false;
@@ -3863,7 +4093,7 @@ async function createSearch(options = {}) {
       if (!advanceCursor(cursor, filterPlan) || bitIsSet(mask, cursor.termIndex)) continue;
       const block = cursor.entry.blocks[cursor.blockIndex];
       if (!block) continue;
-      potential += block.maxImpact;
+      potential += remainingImpactForCursor(cursor, block, doc);
       tieDocLowerBound = Math.max(tieDocLowerBound, block.maxImpactDoc ?? 0);
       hasRemaining = true;
       terms++;
@@ -3872,6 +4102,46 @@ async function createSearch(options = {}) {
     return {
       potential,
       tieDocLowerBound: hasRemaining ? tieDocLowerBound : Infinity,
+      terms,
+      baseTerms
+    };
+  }
+  function remainingDocRangePotentialInfo(cursors, filterPlan = null) {
+    const rangeBounds = /* @__PURE__ */ new Map();
+    let fallbackPotential = 0;
+    let hasRangeBounds = false;
+    let terms = 0;
+    let baseTerms = 0;
+    for (const cursor of cursors) {
+      if (!advanceCursor(cursor, filterPlan)) continue;
+      const block = cursor.entry.blocks[cursor.blockIndex];
+      if (!block) continue;
+      terms++;
+      if (cursor.isBase) baseTerms++;
+      const ranges = cursor.entry.docRanges?.ranges;
+      if (!ranges?.length) {
+        fallbackPotential += block.maxImpact || 0;
+        continue;
+      }
+      hasRangeBounds = true;
+      for (const range of ranges) {
+        const impact = Math.min(block.maxImpact || 0, range.maxImpact || 0);
+        if (!impact) continue;
+        rangeBounds.set(range.index, (rangeBounds.get(range.index) || 0) + impact);
+      }
+    }
+    if (!hasRangeBounds) return remainingPotentialInfo(cursors, 0, filterPlan);
+    let potential = fallbackPotential;
+    let bestRange = -1;
+    for (const [range, bound] of rangeBounds) {
+      if (bound + fallbackPotential > potential) {
+        potential = bound + fallbackPotential;
+        bestRange = range;
+      }
+    }
+    return {
+      potential,
+      tieDocLowerBound: bestRange >= 0 ? 0 : Infinity,
       terms,
       baseTerms
     };
@@ -3887,14 +4157,37 @@ async function createSearch(options = {}) {
     const topDocs = new Set(top.map(([doc]) => doc));
     const threshold = top[top.length - 1][1];
     const boundaryDoc = top[top.length - 1][0];
-    const unseen = remainingPotentialInfo(cursors, 0, filterPlan);
+    const hasDocRangeBounds = cursors.some((cursor) => (cursor.entry.docRanges?.ranges?.length || 0) >= 2);
+    const baselineUnseen = remainingPotentialInfo(cursors, 0, filterPlan);
+    const rangeUnseen = hasDocRangeBounds ? remainingDocRangePotentialInfo(cursors, filterPlan) : null;
+    const docRangeAware = rangeUnseen && rangeUnseen.potential < baselineUnseen.potential;
+    if (proofStats && docRangeAware) proofStats.docRangeAware = true;
+    const unseen = docRangeAware ? rangeUnseen : baselineUnseen;
     let maxOutsidePotential = unseen.potential;
     let maxOutsideTieDoc = unseen.tieDocLowerBound;
     let maxRemainingTerms = unseen.terms;
     let maxRemainingTermUpperBound = unseen.potential;
+    if (maxOutsidePotential > threshold) {
+      recordTopKProofFailure(proofStats, "score_bound", {
+        threshold,
+        maxOutsidePotential,
+        remainingTerms: maxRemainingTerms,
+        remainingTermUpperBound: maxRemainingTermUpperBound
+      });
+      return null;
+    }
+    if (maxOutsidePotential === threshold && maxOutsideTieDoc <= boundaryDoc) {
+      recordTopKProofFailure(proofStats, "tie_bound", {
+        threshold,
+        maxOutsidePotential,
+        remainingTerms: maxRemainingTerms,
+        remainingTermUpperBound: maxRemainingTermUpperBound
+      });
+      return null;
+    }
     for (const [doc, score] of scores) {
       if (topDocs.has(doc)) continue;
-      const remaining = remainingPotentialInfo(cursors, masks.get(doc) || 0, filterPlan);
+      const remaining = remainingPotentialInfo(cursors, masks.get(doc) || 0, filterPlan, docRangeAware ? doc : null);
       const potential = score + remaining.potential;
       if (potential > maxOutsidePotential || potential === maxOutsidePotential && doc < maxOutsideTieDoc) {
         maxOutsidePotential = potential;
@@ -4004,7 +4297,311 @@ async function createSearch(options = {}) {
       wantedBlocks: batch.wanted
     };
   }
+  async function decodeEntryBlockBatch(shard, entry, blockIndexes, rangePlan = "postingBlocks") {
+    const indexes = [...new Set(blockIndexes || [])].filter((index) => index >= 0 && index < (entry.blocks?.length || 0));
+    if (!indexes.length) return { blocks: [], fetchedBlocks: 0, fetchGroups: 0, wantedBlocks: 0 };
+    if (!entry.external) {
+      return {
+        blocks: indexes.map((blockIndex) => ({ blockIndex, rows: decodePostingBlock(shard, entry, blockIndex) })),
+        fetchedBlocks: 0,
+        fetchGroups: 0,
+        wantedBlocks: indexes.length
+      };
+    }
+    const batch = await loadPostingBlockBatch(indexes.map((blockIndex) => ({ entry, blockIndex })), rangePlan);
+    const blocks = await Promise.all(indexes.map(async (blockIndex) => ({
+      blockIndex,
+      rows: await entry.blockPostings.get(blockIndex) || new Int32Array(0)
+    })));
+    return {
+      blocks,
+      fetchedBlocks: batch.fetched,
+      fetchGroups: batch.groups,
+      wantedBlocks: batch.wanted
+    };
+  }
+  function buildDocRangeUpperBoundPlan(entries, baseSet, minShouldMatch) {
+    let rangeSize = null;
+    let rangeCount = 0;
+    let termRangeEntries = 0;
+    const ranges = /* @__PURE__ */ new Map();
+    for (const item of entries) {
+      const docRanges = item.entry.docRanges;
+      if (!docRanges?.rangeSize || !docRanges.ranges?.length) return null;
+      if (rangeSize == null) rangeSize = docRanges.rangeSize;
+      if (docRanges.rangeSize !== rangeSize) return null;
+      rangeCount = Math.max(rangeCount, docRanges.rangeCount || 0);
+      const isBase = baseSet.has(item.term);
+      for (const range of docRanges.ranges) {
+        const current = ranges.get(range.index) || { index: range.index, upperBound: 0, baseHits: 0, termHits: 0 };
+        current.upperBound += range.maxImpact || 0;
+        current.termHits++;
+        if (isBase) current.baseHits++;
+        ranges.set(range.index, current);
+        termRangeEntries++;
+      }
+    }
+    const candidates = [...ranges.values()].filter((range) => range.upperBound > 0 && range.baseHits >= Math.max(1, minShouldMatch)).sort((a, b) => b.upperBound - a.upperBound || a.index - b.index);
+    return { rangeSize, rangeCount, termRangeEntries, candidates };
+  }
+  function docRangeCandidateBlockIndexes(entry, rangeStart, rangeEnd, filterPlan) {
+    const indexes = [];
+    let consideredBlocks = 0;
+    let skippedBlocks = 0;
+    let consideredSuperblocks = 0;
+    let skippedSuperblocks = 0;
+    const blocks = entry.blocks || [];
+    const superblocks = entry.superblocks || [];
+    const maxDoc = Math.max(rangeStart, rangeEnd - 1);
+    if (superblocks.length) {
+      for (const superblock of superblocks) {
+        consideredSuperblocks++;
+        const first = Math.max(0, superblock.firstBlock || 0);
+        const end = Math.min(blocks.length, first + (superblock.blockCount || 0));
+        if (!blockMayPass(superblock, filterPlan) || !blockOverlapsDocSpan(superblock, rangeStart, maxDoc)) {
+          skippedSuperblocks++;
+          skippedBlocks += Math.max(0, end - first);
+          continue;
+        }
+        for (let blockIndex = first; blockIndex < end; blockIndex++) {
+          consideredBlocks++;
+          const block = blocks[blockIndex];
+          if (blockMayPass(block, filterPlan) && blockOverlapsDocSpan(block, rangeStart, maxDoc)) indexes.push(blockIndex);
+          else skippedBlocks++;
+        }
+      }
+      return { indexes, consideredBlocks, skippedBlocks, consideredSuperblocks, skippedSuperblocks };
+    }
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+      consideredBlocks++;
+      const block = blocks[blockIndex];
+      if (blockMayPass(block, filterPlan) && blockOverlapsDocSpan(block, rangeStart, maxDoc)) indexes.push(blockIndex);
+      else skippedBlocks++;
+    }
+    return { indexes, consideredBlocks, skippedBlocks, consideredSuperblocks, skippedSuperblocks };
+  }
+  function docRangePlannerSelectivity(plan, entries, blockFilterPlan) {
+    const sampleSize = Math.min(plan.candidates.length, Math.max(1, postingBlockFrontier));
+    let candidateBlocks = 0;
+    let availableBlocks = 0;
+    for (const range of plan.candidates.slice(0, sampleSize)) {
+      const rangeStart = range.index * plan.rangeSize;
+      const rangeEnd = Math.min(manifest.total, rangeStart + plan.rangeSize);
+      for (const item of entries) {
+        availableBlocks += item.entry.blocks?.length || 0;
+        candidateBlocks += docRangeCandidateBlockIndexes(item.entry, rangeStart, rangeEnd, blockFilterPlan).indexes.length;
+      }
+    }
+    const ratio = availableBlocks ? candidateBlocks / availableBlocks : 1;
+    return { sampleSize, candidateBlocks, availableBlocks, ratio };
+  }
+  function postingDocsInRange(rows, rangeStart, rangeEnd) {
+    const docs = [];
+    for (let i = 0; i < rows.length; i += 2) {
+      const doc = rows[i];
+      if (doc >= rangeStart && doc < rangeEnd) docs.push(doc);
+    }
+    return docs;
+  }
+  function applyBlockRowsInDocRange(cursor, rows, rangeStart, rangeEnd, codeData, filterPlan, scores, hits, masks) {
+    let accepted = 0;
+    const bit = cursor.termIndex < SKIP_MAX_TERMS ? 2 ** cursor.termIndex : 0;
+    for (let i = 0; i < rows.length; i += 2) {
+      const doc = rows[i];
+      if (doc < rangeStart || doc >= rangeEnd) continue;
+      if (codeData && !passesFilterPlan(doc, codeData, filterPlan)) continue;
+      scores.set(doc, (scores.get(doc) || 0) + rows[i + 1]);
+      if (bit) masks.set(doc, (masks.get(doc) || 0) | bit);
+      if (cursor.isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
+      accepted++;
+    }
+    return accepted;
+  }
+  function stableDocRangeTopK(scores, hits, minShouldMatch, k, nextRangeUpperBound, proofStats = null) {
+    if (proofStats) proofStats.attempts++;
+    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
+    if (eligible.length < k) {
+      recordTopKProofFailure(proofStats, "candidate_count", { maxOutsidePotential: nextRangeUpperBound });
+      return null;
+    }
+    const top = eligible.slice(0, k);
+    const threshold = top[top.length - 1][1];
+    if (nextRangeUpperBound < threshold) {
+      recordTopKProofSuccess(proofStats, {
+        threshold,
+        maxOutsidePotential: nextRangeUpperBound,
+        remainingTerms: 0,
+        remainingTermUpperBound: nextRangeUpperBound
+      });
+      return top;
+    }
+    recordTopKProofFailure(proofStats, nextRangeUpperBound === threshold ? "tie_bound" : "score_bound", {
+      threshold,
+      maxOutsidePotential: nextRangeUpperBound,
+      remainingTerms: 0,
+      remainingTermUpperBound: nextRangeUpperBound
+    });
+    return null;
+  }
+  async function runDocRangeUpperBoundSearch({
+    page,
+    size,
+    baseTerms,
+    terms,
+    entries,
+    hasFilters,
+    blockFilterPlan,
+    docFilterPlan,
+    fallbackCodeData,
+    rerank,
+    candidateK,
+    minShouldMatch
+  }) {
+    if (!docRangePlannerEnabled || !entries.length) return null;
+    const baseSet = new Set(baseTerms);
+    const plan = buildDocRangeUpperBoundPlan(entries, baseSet, minShouldMatch);
+    if (!plan || plan.candidates.length < DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES) return null;
+    const selectivity = docRangePlannerSelectivity(plan, entries, blockFilterPlan);
+    const maxRatio = Number.isFinite(Number(options.docRangePlannerMaxCandidateBlockRatio)) ? Number(options.docRangePlannerMaxCandidateBlockRatio) : DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO;
+    if (selectivity.ratio > maxRatio) return null;
+    const offset = (page - 1) * size;
+    const cursors = entries.map((item, termIndex) => ({
+      ...item,
+      termIndex,
+      isBase: baseSet.has(item.term)
+    }));
+    const scores = /* @__PURE__ */ new Map();
+    const hits = /* @__PURE__ */ new Map();
+    const masks = /* @__PURE__ */ new Map();
+    const decodedBlocks = /* @__PURE__ */ new Set();
+    const proofStats = createTopKProofStats({ hasFilters, blockFilterPlan });
+    let stable = null;
+    let exhausted = false;
+    let rangesVisited = 0;
+    let candidatePostingBlocks = 0;
+    let consideredPostingBlocks = 0;
+    let skippedPostingBlocks = 0;
+    let consideredPostingSuperblocks = 0;
+    let skippedPostingSuperblocks = 0;
+    let blocksDecoded = 0;
+    let blocksVisited = 0;
+    let postingsDecoded = 0;
+    let postingRowsScanned = 0;
+    let postingsAccepted = 0;
+    let fetchedBlocks = 0;
+    let fetchGroups = 0;
+    let wantedBlocks = 0;
+    let filterSummaryProofBlocks = 0;
+    let stopUpperBound = 0;
+    for (let rangeIndex = 0; rangeIndex < plan.candidates.length; rangeIndex++) {
+      const range = plan.candidates[rangeIndex];
+      const rangeStart = range.index * plan.rangeSize;
+      const rangeEnd = Math.min(manifest.total, rangeStart + plan.rangeSize);
+      rangesVisited++;
+      for (const cursor of cursors) {
+        const candidates = docRangeCandidateBlockIndexes(cursor.entry, rangeStart, rangeEnd, blockFilterPlan);
+        candidatePostingBlocks += candidates.indexes.length;
+        consideredPostingBlocks += candidates.consideredBlocks;
+        skippedPostingBlocks += candidates.skippedBlocks;
+        consideredPostingSuperblocks += candidates.consideredSuperblocks;
+        skippedPostingSuperblocks += candidates.skippedSuperblocks;
+        if (!candidates.indexes.length) continue;
+        const decoded = await decodeEntryBlockBatch(cursor.shard, cursor.entry, candidates.indexes, "postingDocRanges");
+        fetchedBlocks += decoded.fetchedBlocks;
+        fetchGroups += decoded.fetchGroups;
+        wantedBlocks += decoded.wantedBlocks;
+        for (const { blockIndex, rows: rows2 } of decoded.blocks) {
+          const block = cursor.entry.blocks?.[blockIndex];
+          const blockKey = `${cursor.shardName}\0${cursor.term}\0${blockIndex}`;
+          if (!decodedBlocks.has(blockKey)) {
+            decodedBlocks.add(blockKey);
+            blocksDecoded++;
+          }
+          blocksVisited++;
+          postingRowsScanned += rows2.length / 2;
+          const docsInRange = hasFilters ? postingDocsInRange(rows2, rangeStart, rangeEnd) : null;
+          if (hasFilters && !docsInRange.length) continue;
+          const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
+          if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
+          const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : filterSummaryProvesBlock ? null : fallbackCodeData;
+          postingsDecoded += rows2.length / 2;
+          postingsAccepted += applyBlockRowsInDocRange(
+            cursor,
+            rows2,
+            rangeStart,
+            rangeEnd,
+            codeData,
+            filterSummaryProvesBlock ? null : docFilterPlan,
+            scores,
+            hits,
+            masks
+          );
+        }
+      }
+      stopUpperBound = plan.candidates[rangeIndex + 1]?.upperBound || 0;
+      stable = stableDocRangeTopK(scores, hits, minShouldMatch, candidateK, stopUpperBound, proofStats);
+      if (stable) break;
+    }
+    exhausted = !stable && rangesVisited >= plan.candidates.length;
+    let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, candidateK);
+    const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
+    ranked = reranked.ranked;
+    const rows = ranked.slice(offset, offset + size);
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+    const results = await rowsToResults(rows, resultContext);
+    return {
+      total: exhausted ? ranked.length : Math.max(ranked.length, offset + size),
+      page,
+      size,
+      approximate: !exhausted,
+      results,
+      stats: {
+        exact: exhausted,
+        plannerLane: exhausted ? "docRangeBlockMaxExhausted" : "docRangeBlockMax",
+        topKProven: Boolean(stable || exhausted),
+        totalExact: exhausted,
+        tailExhausted: exhausted,
+        blocksDecoded,
+        postingsDecoded,
+        postingsAccepted,
+        skippedBlocks: skippedPostingBlocks,
+        terms: terms.length,
+        shards: new Set(entries.map((item) => item.shardName)).size,
+        docRangeBlockMax: true,
+        docRangeSize: plan.rangeSize,
+        docRangeCandidateRanges: plan.candidates.length,
+        docRangeRangesVisited: rangesVisited,
+        docRangeRangesPruned: Math.max(0, plan.candidates.length - rangesVisited),
+        docRangeNextUpperBound: stopUpperBound,
+        docRangeTermRangeEntries: plan.termRangeEntries,
+        docRangeCandidateBlockRatio: selectivity.ratio,
+        docRangeSelectivitySampleBlocks: selectivity.candidateBlocks,
+        docRangeSelectivityAvailableBlocks: selectivity.availableBlocks,
+        docRangeBlocksVisited: blocksVisited,
+        docRangePostingRowsScanned: postingRowsScanned,
+        docRangePostingBlocksConsidered: consideredPostingBlocks,
+        docRangePostingBlocksCandidate: candidatePostingBlocks,
+        docRangePostingBlocksSkipped: skippedPostingBlocks,
+        docRangePostingSuperblocksConsidered: consideredPostingSuperblocks,
+        docRangePostingSuperblocksSkipped: skippedPostingSuperblocks,
+        docRangeFetchedBlocks: fetchedBlocks,
+        docRangeFetchGroups: fetchGroups,
+        docRangeWantedBlocks: wantedBlocks,
+        filterSummaryProofBlocks,
+        plannerFallbackReason: exhausted ? "range_exhausted" : "",
+        ...topKProofStatsObject(proofStats, exhausted ? "range_exhausted" : ""),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        ...reranked.stats
+      }
+    };
+  }
   async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
+    return traceSpan("text.search", () => runSkippedSearchInner({ q, page, size, filters, sort, baseTerms, terms, rerank }));
+  }
+  async function runSkippedSearchInner({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const candidateK = candidateLimitFor(baseTerms, k, rerank);
@@ -4040,6 +4637,21 @@ async function createSearch(options = {}) {
         missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
       });
     }
+    const docRangeResponse = await runDocRangeUpperBoundSearch({
+      page,
+      size,
+      baseTerms,
+      terms,
+      entries,
+      hasFilters,
+      blockFilterPlan,
+      docFilterPlan,
+      fallbackCodeData,
+      rerank,
+      candidateK,
+      minShouldMatch
+    });
+    if (docRangeResponse) return docRangeResponse;
     const cursors = entries.map((item, termIndex) => ({
       ...item,
       termIndex,
@@ -4395,6 +5007,63 @@ async function createSearch(options = {}) {
       }
       return low;
     }
+    function lexiconTrie(data) {
+      if (data.trie) return data.trie;
+      const root = { children: /* @__PURE__ */ new Map(), entries: [] };
+      for (const entry of data.entries || []) {
+        let node = root;
+        for (const char of entry.surface) {
+          let child = node.children.get(char);
+          if (!child) {
+            child = { children: /* @__PURE__ */ new Map(), entries: [] };
+            node.children.set(char, child);
+          }
+          node = child;
+        }
+        node.entries.push(entry);
+      }
+      data.trie = root;
+      return root;
+    }
+    function levenshteinAutomatonLexiconCandidates(data) {
+      const root = lexiconTrie(data);
+      const chars = [...token];
+      const initial = Array.from({ length: chars.length + 1 }, (_, index) => index);
+      const out = [];
+      let visited = 0;
+      const visit = (node, char, previousRow) => {
+        const current = [previousRow[0] + 1];
+        let rowMin = current[0];
+        for (let column = 1; column <= chars.length; column++) {
+          const insertCost = current[column - 1] + 1;
+          const deleteCost = previousRow[column] + 1;
+          const replaceCost = previousRow[column - 1] + (chars[column - 1] === char ? 0 : 1);
+          const value = Math.min(insertCost, deleteCost, replaceCost);
+          current[column] = value;
+          rowMin = Math.min(rowMin, value);
+        }
+        if (node.entries.length && current[chars.length] <= maxEdits) {
+          for (const entry of node.entries) {
+            visited++;
+            if (entry.surface === token || Math.abs(entry.surface.length - token.length) > maxEdits) continue;
+            const distance = boundedDamerauLevenshtein(token, entry.surface, maxEdits);
+            if (distance <= 0 || distance > maxEdits) continue;
+            out.push({
+              ...entry,
+              distance,
+              score: typoCandidateScore(token, entry.surface, entry.df, distance)
+            });
+          }
+        }
+        if (rowMin > maxEdits) return;
+        for (const [nextChar, child] of node.children) visit(child, nextChar, current);
+      };
+      for (const [char, child] of root.children) visit(child, char, initial);
+      return {
+        candidates: out.sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, 64),
+        visited
+      };
+    }
     async function verifiedLexiconCandidates() {
       if (!meta.lexicon || !typoLexiconDirectory) return [];
       if (token.length < (meta.lexicon.min_surface_length || meta.min_surface_length || 4)) return [];
@@ -4405,6 +5074,11 @@ async function createSearch(options = {}) {
       debug.lexiconShards.add(resolved.shard);
       const data = loaded.get(resolved.shard);
       const entries = data?.entries || [];
+      if (data) {
+        const automaton = levenshteinAutomatonLexiconCandidates(data);
+        debug.lexiconScanned += automaton.visited;
+        if (automaton.candidates.some((candidate) => candidate.score >= 0.5)) return automaton.candidates;
+      }
       const maxScan = Math.max(1, Number(meta.lexicon.max_scan_candidates || 2048));
       const minScan = Math.min(maxScan, TYPO_LEXICON_MIN_SCAN_CANDIDATES);
       const out = [];
@@ -4447,6 +5121,9 @@ async function createSearch(options = {}) {
     return verified.sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, 64);
   }
   async function correctedTypoQuery(baseTerms, analyzedTerms) {
+    return traceSpan("typo.resolve", () => correctedTypoQueryInner(baseTerms, analyzedTerms));
+  }
+  async function correctedTypoQueryInner(baseTerms, analyzedTerms) {
     if (!baseTerms.length || baseTerms.length > 8) return null;
     const presentTerms = new Map((await termEntries(baseTerms)).map((item) => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some((term) => !presentTerms.has(term));
@@ -4482,17 +5159,42 @@ async function createSearch(options = {}) {
     }
     const sortedPlans = [...plans.values()].sort((a, b) => b.score - a.score || a.q.localeCompare(b.q));
     if (!sortedPlans.length) return null;
-    const selectedPlans = sortedPlans.slice(0, TYPO_CORRECTION_PLAN_LIMIT);
+    const selectedPlans = await rankTypoCorrectionPlans(sortedPlans.slice(0, TYPO_CORRECTION_PLAN_LIMIT));
     return {
       plans: selectedPlans,
       stats: {
         typoCandidateTerms: debug.candidates,
         typoCorrectionPlans: selectedPlans.length,
+        typoCorrectionPlansEstimated: selectedPlans.filter((plan) => Number.isFinite(plan.estimatedUpperBound)).length,
+        typoCorrectionBestUpperBound: selectedPlans[0]?.estimatedUpperBound || 0,
         typoShardLookups: debug.shards.size,
         typoLexiconShardLookups: debug.lexiconShards.size,
         typoLexiconCandidatesScanned: debug.lexiconScanned
       }
     };
+  }
+  async function rankTypoCorrectionPlans(plans) {
+    const estimated = await Promise.all(plans.map(async (plan) => {
+      const terms = expandedTermsFromBaseTerms(plan.baseTerms);
+      const entries = await termEntries(terms);
+      const baseSet = new Set(plan.baseTerms);
+      const rangePlan = buildDocRangeUpperBoundPlan(entries, baseSet, minShouldMatchFor(plan.baseTerms));
+      const rangeUpperBound = rangePlan?.candidates?.[0]?.upperBound || 0;
+      const blockUpperBound = entries.reduce((sum, item) => {
+        const blocks = item.entry.blocks || [];
+        return sum + blocks.reduce((max, block) => Math.max(max, block.maxImpact || 0), 0);
+      }, 0);
+      const presentBaseTerms = entries.filter((item) => baseSet.has(item.term)).length;
+      return {
+        ...plan,
+        estimatedUpperBound: Math.max(rangeUpperBound, blockUpperBound),
+        estimatedRangeUpperBound: rangeUpperBound,
+        estimatedBlockUpperBound: blockUpperBound,
+        estimatedPresentBaseTerms: presentBaseTerms,
+        estimatedTerms: entries.length
+      };
+    }));
+    return estimated.sort((a, b) => b.estimatedUpperBound - a.estimatedUpperBound || b.estimatedPresentBaseTerms - a.estimatedPresentBaseTerms || b.score - a.score || a.q.localeCompare(b.q));
   }
   function rawSurfaceFallbackTerms(baseTerms, analyzedTerms, presentTerms) {
     let changed = false;
@@ -4535,6 +5237,9 @@ async function createSearch(options = {}) {
     };
   }
   async function maybeTypoFallback(params, response, baseTerms, analyzedTerms) {
+    return traceSpan("typo.fallback", () => maybeTypoFallbackInner(params, response, baseTerms, analyzedTerms));
+  }
+  async function maybeTypoFallbackInner(params, response, baseTerms, analyzedTerms) {
     if (params.page !== 1 || response.total > 0) return response;
     const surfaceFallback = await maybeSurfaceExactFallback(params, response, baseTerms, analyzedTerms);
     if (surfaceFallback) return surfaceFallback;
@@ -4543,7 +5248,8 @@ async function createSearch(options = {}) {
       return { ...response, stats: { ...response.stats || {}, typoAttempted: true, typoApplied: false } };
     }
     let best = null;
-    for (const plan of correction.plans) {
+    const executionPlans = correction.plans.slice(0, typoCorrectionExecutionPlanLimit);
+    for (const plan of executionPlans) {
       const corrected = await runSkippedSearch({
         ...params,
         q: plan.q,
@@ -4555,7 +5261,7 @@ async function createSearch(options = {}) {
       if (!best || value > best.value) best = { value, plan, response: corrected };
     }
     if (!best) {
-      return { ...response, stats: { ...response.stats || {}, typoAttempted: true, typoApplied: false, ...correction.stats } };
+      return { ...response, stats: { ...response.stats || {}, typoAttempted: true, typoApplied: false, ...correction.stats, typoCorrectionPlansExecuted: executionPlans.length } };
     }
     return {
       ...best.response,
@@ -4568,6 +5274,8 @@ async function createSearch(options = {}) {
         typoOriginalTotal: response.total,
         typoCorrectedQuery: best.plan.q,
         typoCorrections: best.plan.corrections,
+        typoCorrectionPlansExecuted: executionPlans.length,
+        typoCorrectedUpperBound: best.plan.estimatedUpperBound || 0,
         ...correction.stats
       }
     };
@@ -4578,6 +5286,9 @@ async function createSearch(options = {}) {
     return !!title && !!surface && title === surface;
   }
   async function maybeAuthorityRerank(params, response) {
+    return traceSpan("authority.rerank", () => maybeAuthorityRerankInner(params, response));
+  }
+  async function maybeAuthorityRerankInner(params, response) {
     const stats = response.stats || {};
     if (!authorityDirectory || options.authority === false || params.authority === false) return response;
     if (params.page !== 1 || params.sort) return response;
@@ -4677,7 +5388,7 @@ async function createSearch(options = {}) {
     for (const { entry } of entries || []) rows += entry.rows?.length || 0;
     return rows;
   }
-  async function search(params = {}) {
+  async function executeSearch(params = {}) {
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(100, Number(params.size || 10)));
@@ -4757,6 +5468,18 @@ async function createSearch(options = {}) {
     });
     const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
     return maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, authority: params.authority }, typoResponse);
+  }
+  async function search(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("search.total", () => executeSearch(params)));
+    if (!trace) return response;
+    return {
+      ...response,
+      stats: {
+        ...response.stats || {},
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
   }
   return {
     manifest,
