@@ -24,6 +24,13 @@ export const DEFAULTS = {
   docValuePackBytes: 4 * 1024 * 1024,
   docValueSortedPageSize: 512,
   docValueSortedPackBytes: 4 * 1024 * 1024,
+  sortReplicas: [],
+  sortReplicaRankChunkSize: 4096,
+  sortReplicaDocPageSize: 32,
+  sortReplicaPackBytes: 4 * 1024 * 1024,
+  sortReplicaDocPackBytes: 4 * 1024 * 1024,
+  sortReplicaDocPagePackBytes: 4 * 1024 * 1024,
+  sortReplicaPostingBlockPackBytes: 4 * 1024 * 1024,
   directoryPageBytes: 64 * 1024,
   directorySortChunkEntries: 16384,
   queryBundles: true,
@@ -120,6 +127,7 @@ export async function readConfig(configPath) {
     numbers: raw.numbers || [],
     booleans: raw.booleans || [],
     sorts: raw.sorts || [],
+    sortReplicas: raw.sortReplicas || [],
     display: raw.display || ["title", "url"],
     authority: raw.authority || DEFAULTS.authority
   };

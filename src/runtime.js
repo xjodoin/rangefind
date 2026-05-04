@@ -2,7 +2,7 @@ import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryBundleKey
 import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
-import { DOC_PAGE_ENCODING, decodeDocPageColumns } from "./doc_pages.js";
+import { DOC_PAGE_ENCODING, decodeDocPageColumns, decodeDocPagePointerRecord } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
 import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.js";
 import { filterBitmapHas, parseFilterBitmap } from "./filter_bitmaps.js";
@@ -53,12 +53,20 @@ function createRuntimeTrace() {
 function traceBucketFromPath(path) {
   if (path.endsWith("/manifest.min.json")) return "manifest";
   if (/\/manifest(?:\.[0-9a-f]+)?\.json(?:\.gz)?$/u.test(path)) return "manifest";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/pointers/")) return "sortReplicaDocPointers";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/packs/")) return "sortReplicaDocs";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/pages/")) return "sortReplicaDocPagePointers";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/page-packs/")) return "sortReplicaDocPages";
+  if (path.includes("/sort-replicas/") && path.includes("/rank-packs/")) return "sortReplicaRankMaps";
+  if (path.includes("/sort-replicas/") && path.includes("/terms/block-packs/")) return "sortReplicaPostingBlocks";
+  if (path.includes("/sort-replicas/") && path.includes("/terms/packs/")) return "sortReplicaTerms";
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/authority/packs/")) return "authority";
   if (path.includes("/typo/lexicon-packs/") || path.includes("/typo/lexicon/")) return "typoLexicon";
   if (path.includes("/typo/")) return "typo";
+  if (path.includes("/sort-replicas/")) return "sortReplicas";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
   if (path.includes("/docs/ordinals/")) return "docOrdinals";
@@ -89,6 +97,12 @@ function traceLabelBucket(label) {
   if (value.startsWith("authority shard")) return "authority";
   if (value.startsWith("typo lexicon")) return "typoLexicon";
   if (value.startsWith("typo shard")) return "typo";
+  if (value.startsWith("sort replica doc pointer")) return "sortReplicaDocPointers";
+  if (value.startsWith("sort replica doc page")) return "sortReplicaDocPages";
+  if (value.startsWith("sort replica doc ")) return "sortReplicaDocs";
+  if (value.startsWith("sort replica rank")) return "sortReplicaRankMaps";
+  if (value.startsWith("sort replica segment")) return "sortReplicaTerms";
+  if (value.startsWith("sort replica")) return "sortReplicas";
   if (value.startsWith("doc-value sort page")) return "docValueSorted";
   if (value.startsWith("doc-value")) return "docValues";
   if (value.startsWith("doc page")) return "docPages";
@@ -251,6 +265,13 @@ export async function createSearch(options = {}) {
   const docValueCache = new Map();
   const docValueSortDirectoryCache = new Map();
   const docValueSortPageCache = new Map();
+  const sortReplicaDirectoryCache = new Map();
+  const sortReplicaShardCache = new Map();
+  const sortReplicaRankCache = new Map();
+  const sortReplicaDocPointerCache = new Map();
+  const sortReplicaPackedDocCache = new Map();
+  const sortReplicaDocPagePointerCache = new Map();
+  const sortReplicaDocPageCache = new Map();
   const facetDictionaryCache = new Map();
   let typoManifest = null;
   let typoManifestPromise = null;
@@ -285,6 +306,11 @@ export async function createSearch(options = {}) {
     docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     docPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     docValueSortPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaRankMaps: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaDocPointers: { mergeGapBytes: 4 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaDocs: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 16 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaDocPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaDocPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 128 * 1024, maxOverfetchRatio: Infinity },
     authority: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
@@ -1577,7 +1603,8 @@ export async function createSearch(options = {}) {
   }
 
   function docPagePlan(indexes, context = {}) {
-    const forced = context.preferDocPages === true;
+    const hardForced = context.preferDocPages === "force";
+    const forced = hardForced || context.preferDocPages === true;
     const adaptive = options.textDocPageHydration !== false
       && (context.preferDocPages === "auto" || (context.preferDocPages == null && context.hasTextTerms));
     if (!docPages?.pointers?.file || (!forced && !adaptive)) return null;
@@ -1590,7 +1617,7 @@ export async function createSearch(options = {}) {
       ? configuredMaxOverfetchDocs
       : Math.max(1, Number(options.textDocPageMaxOverfetchDocs || configuredMaxOverfetchDocs));
     const maxPayloadDocs = Math.max(docPageSize(), unique.length * maxOverfetchDocs);
-    if (payloadDocs > maxPayloadDocs) return null;
+    if (!hardForced && payloadDocs > maxPayloadDocs) return null;
     if (!forced) {
       const pageFetchEstimate = pages.length * 2;
       const packedFetchEstimate = unique.length * 3;
@@ -1601,7 +1628,8 @@ export async function createSearch(options = {}) {
       pageSize: docPageSize(),
       payloadDocs,
       uniqueDocs: unique.length,
-      adaptive: !forced
+      adaptive: !forced,
+      forced: hardForced
     };
   }
 
@@ -1696,6 +1724,7 @@ export async function createSearch(options = {}) {
     context.docPayloadRows = indexes.length;
     context.docPayloadOverfetchDocs = plan?.payloadDocs || indexes.length;
     context.docPayloadAdaptive = Boolean(plan?.adaptive);
+    context.docPayloadForced = Boolean(plan?.forced);
     return plan ? loadDocPages(indexes, plan) : loadPackedDocs(indexes);
   }
 
@@ -1745,13 +1774,28 @@ export async function createSearch(options = {}) {
         });
         promise.catch(() => {});
         owner.blockPostings.set(blockIndex, promise);
-        pending.push({ owner, blockIndex, entry: block.range, resolve: resolveBlock, reject: rejectBlock });
+        pending.push({
+          owner,
+          blockIndex,
+          entry: block.range,
+          basePath: owner.blockPackBasePath || "terms/block-packs",
+          resolve: resolveBlock,
+          reject: rejectBlock
+        });
       }
 
-      const groups = rangeGroups(pending, rangePlan);
+      const groups = [];
+      const pendingByBasePath = new Map();
+      for (const item of pending) {
+        if (!pendingByBasePath.has(item.basePath)) pendingByBasePath.set(item.basePath, []);
+        pendingByBasePath.get(item.basePath).push(item);
+      }
+      for (const [basePath, items] of pendingByBasePath) {
+        for (const group of rangeGroups(items, rangePlan)) groups.push({ ...group, basePath });
+      }
       await Promise.all(groups.map(async (group) => {
         try {
-          const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+          const compressed = await fetchRange(new URL(`${group.basePath.replace(/\/?$/u, "/")}${group.pack}`, baseUrl), group.start, group.end - group.start);
           await Promise.all(group.items.map(async (item) => {
             const inflated = await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`);
             item.resolve(traceSpanSync("postingBlocks.decode", () => decodePostingBytes(
@@ -2317,6 +2361,524 @@ export async function createSearch(options = {}) {
     return desc ? page.max >= boundarySortValue : page.min <= boundarySortValue;
   }
 
+  function sortReplicaPlanKey(sortPlan) {
+    return sortPlan?.field ? `${sortPlan.field}:${sortPlan.desc ? "desc" : "asc"}` : "";
+  }
+
+  function sortReplicaForPlan(sortPlan) {
+    const replicas = manifest.sort_replicas?.replicas || {};
+    return replicas[sortReplicaPlanKey(sortPlan)] || null;
+  }
+
+  function sortReplicaDirectoryState(replica) {
+    const key = replica?.id || replica?.key;
+    if (!key || !replica?.terms?.directory) return null;
+    if (!sortReplicaDirectoryCache.has(key)) sortReplicaDirectoryCache.set(key, createDirectoryState(replica.terms.directory));
+    return sortReplicaDirectoryCache.get(key);
+  }
+
+  function sortReplicaTermsPath(replica) {
+    return (replica.terms?.packs_path || `sort-replicas/${replica.id}/terms/packs`).replace(/\/?$/u, "/");
+  }
+
+  function sortReplicaBlockPath(replica) {
+    return (replica.terms?.block_packs_path || `sort-replicas/${replica.id}/terms/block-packs`).replace(/\/?$/u, "/");
+  }
+
+  function sortReplicaRankPath(replica) {
+    return (replica.rank_map?.packs_path || `sort-replicas/${replica.id}/rank-packs`).replace(/\/?$/u, "/");
+  }
+
+  function sortReplicaPostingManifest(replica) {
+    return {
+      ...manifest,
+      block_filters: [],
+      object_store: {
+        ...(manifest.object_store || {}),
+        pack_table: {
+          ...(manifest.object_store?.pack_table || {}),
+          postingBlocks: replica.terms?.block_pack_table || []
+        }
+      }
+    };
+  }
+
+  async function loadSortReplicaShards(replica, shards) {
+    const wanted = [];
+    const pending = [];
+    const unique = new Map();
+    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
+    for (const { shard, entry } of unique.values()) {
+      wanted.push(shard);
+      const cacheKey = `${replica.id}\u0000${shard}`;
+      if (sortReplicaShardCache.has(cacheKey)) continue;
+      if (!entry) continue;
+      let resolveShard;
+      let rejectShard;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveShard = resolvePromise;
+        rejectShard = rejectPromise;
+      });
+      promise.catch(() => {});
+      sortReplicaShardCache.set(cacheKey, promise);
+      pending.push({ shard, cacheKey, entry, resolve: resolveShard, reject: rejectShard });
+    }
+
+    const parseManifest = sortReplicaPostingManifest(replica);
+    const blockBasePath = sortReplicaBlockPath(replica);
+    await Promise.all(rangeGroups(pending).map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`${sortReplicaTermsPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica segment ${replica.id}:${item.shard}`);
+          const parsed = traceSpanSync("sortReplicas.parseTerms", () => parsePostingSegment(inflated, parseManifest));
+          for (const entry of parsed.terms.values()) {
+            entry.blockPackBasePath = blockBasePath;
+            entry.sortReplicaId = replica.id;
+          }
+          item.resolve(parsed);
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          sortReplicaShardCache.delete(item.cacheKey);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    const out = new Map();
+    await Promise.all(wanted.map(async (shard) => {
+      const data = await sortReplicaShardCache.get(`${replica.id}\u0000${shard}`);
+      if (data) out.set(shard, data);
+    }));
+    return out;
+  }
+
+  async function sortReplicaTermEntries(terms, replica) {
+    return traceSpan("sortReplicas.entries", async () => {
+      const directory = sortReplicaDirectoryState(replica);
+      if (!directory) return [];
+      const byShard = new Map();
+      for (const term of terms) {
+        const resolved = await resolveDirectoryShard(
+          term,
+          directory,
+          replica.base_shard_depth || manifest.stats?.base_shard_depth || 3,
+          replica.max_shard_depth || manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
+        );
+        if (!resolved) continue;
+        if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, terms: [] });
+        byShard.get(resolved.shard).terms.push(term);
+      }
+      const loaded = await loadSortReplicaShards(replica, [...byShard.values()]);
+      const out = [];
+      for (const [shard, bucket] of byShard) {
+        const data = loaded.get(shard);
+        if (!data) continue;
+        for (const term of bucket.terms) {
+          const entry = data.terms.get(term);
+          if (entry) out.push({ term, shard: data, shardName: shard, entry });
+        }
+      }
+      return out;
+    });
+  }
+
+  function decodeSortReplicaRankChunk(buffer, meta) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = Math.max(0, Math.floor(Number(meta.count || 0)));
+    const docs = new Uint32Array(count);
+    const values = new Float64Array(count);
+    for (let index = 0, offset = 0; index < count; index++, offset += 12) {
+      docs[index] = view.getUint32(offset, true);
+      values[index] = view.getFloat64(offset + 4, true);
+    }
+    return { start: meta.start || 0, count, docs, values };
+  }
+
+  function sortReplicaRankCacheKey(replica, chunkIndex) {
+    return `${replica.id}\u0000${chunkIndex}`;
+  }
+
+  async function loadSortReplicaRankChunks(replica, chunkIndexes, stats = null) {
+    const wanted = [];
+    const pending = [];
+    for (const chunkIndex of [...new Set(chunkIndexes)]) {
+      const chunk = replica.rank_map?.chunks?.[chunkIndex];
+      if (!chunk) continue;
+      wanted.push(chunkIndex);
+      const key = sortReplicaRankCacheKey(replica, chunkIndex);
+      if (sortReplicaRankCache.has(key)) continue;
+      let resolveChunk;
+      let rejectChunk;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveChunk = resolvePromise;
+        rejectChunk = rejectPromise;
+      });
+      promise.catch(() => {});
+      sortReplicaRankCache.set(key, promise);
+      pending.push({ chunkIndex, key, entry: chunk, resolve: resolveChunk, reject: rejectChunk });
+    }
+    const groups = rangeGroups(pending, "sortReplicaRankMaps");
+    if (stats) {
+      stats.rankChunksWanted += wanted.length;
+      stats.rankChunksFetched += pending.length;
+      stats.rankChunkFetchGroups += groups.length;
+    }
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`${sortReplicaRankPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica rank ${replica.id}:${item.chunkIndex}`);
+          item.resolve(traceSpanSync("sortReplicas.decodeRankMap", () => decodeSortReplicaRankChunk(inflated, item.entry)));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          sortReplicaRankCache.delete(item.key);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+  }
+
+  async function sortReplicaRankRows(replica, ranks, stats = null) {
+    const total = Math.max(0, Number(replica.rank_map?.total ?? replica.total ?? 0));
+    const chunkSize = Math.max(1, Number(replica.rank_map?.chunk_size || total || 1));
+    const wantedRanks = [...new Set(ranks || [])].filter(rank => rank >= 0 && rank < total);
+    if (stats) stats.rankLookups += wantedRanks.length;
+    const chunkIndexes = wantedRanks.map(rank => Math.floor(rank / chunkSize));
+    await loadSortReplicaRankChunks(replica, chunkIndexes, stats);
+    const out = new Map();
+    await Promise.all([...new Set(chunkIndexes)].map(async (chunkIndex) => sortReplicaRankCache.get(sortReplicaRankCacheKey(replica, chunkIndex))));
+    for (const rank of wantedRanks) {
+      const chunkIndex = Math.floor(rank / chunkSize);
+      const chunk = await sortReplicaRankCache.get(sortReplicaRankCacheKey(replica, chunkIndex));
+      if (!chunk) continue;
+      const offset = rank - chunk.start;
+      if (offset < 0 || offset >= chunk.count) continue;
+      out.set(rank, { rank, doc: chunk.docs[offset], value: chunk.values[offset] });
+    }
+    return out;
+  }
+
+  function sortReplicaDocPacksMeta(replica) {
+    return replica?.doc_packs || null;
+  }
+
+  function sortReplicaDocPackPath(replica) {
+    const docs = sortReplicaDocPacksMeta(replica);
+    return (docs?.packs_path || `sort-replicas/${replica.id}/docs/packs`).replace(/\/?$/u, "/");
+  }
+
+  function sortReplicaDocCacheKey(replica, rank) {
+    return `${replica.id}\u0000${rank}`;
+  }
+
+  async function loadSortReplicaDocPointers(replica, ranks, stats = null) {
+    const docs = sortReplicaDocPacksMeta(replica);
+    const pointerMeta = docs?.pointers;
+    if (!pointerMeta?.file) throw new Error(`Rangefind sort replica ${replica.id} is missing doc pointers.`);
+    const pending = [];
+    const total = Math.max(0, Number(replica.total || pointerMeta.count || 0));
+    const wanted = [...new Set(ranks || [])].filter(rank => rank >= 0 && rank < total);
+    for (const rank of wanted) {
+      const key = sortReplicaDocCacheKey(replica, rank);
+      if (sortReplicaDocPointerCache.has(key)) continue;
+      let resolvePointer;
+      let rejectPointer;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePointer = resolvePromise;
+        rejectPointer = rejectPromise;
+      });
+      promise.catch(() => {});
+      sortReplicaDocPointerCache.set(key, promise);
+      const offset = pointerMeta.dataOffset + rank * pointerMeta.recordBytes;
+      pending.push({
+        rank,
+        key,
+        entry: { pack: pointerMeta.file, offset, length: pointerMeta.recordBytes },
+        resolve: resolvePointer,
+        reject: rejectPointer
+      });
+    }
+    const groups = rangeGroups(pending, "sortReplicaDocPointers");
+    if (stats) {
+      stats.docPackPointerLookups += wanted.length;
+      stats.docPackPointerFetches += pending.length;
+      stats.docPackPointerFetchGroups += groups.length;
+    }
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
+          item.resolve(pointer);
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          sortReplicaDocPointerCache.delete(item.key);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+    return wanted;
+  }
+
+  async function loadSortReplicaPackedDocs(replica, ranks, stats = null) {
+    if (!sortReplicaDocPacksMeta(replica)?.pointers?.file) return null;
+    const wanted = await loadSortReplicaDocPointers(replica, ranks, stats);
+    if (!wanted.length) return new Map();
+    const pending = [];
+    for (const rank of wanted) {
+      const key = sortReplicaDocCacheKey(replica, rank);
+      if (sortReplicaPackedDocCache.has(key)) continue;
+      let resolveDoc;
+      let rejectDoc;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolveDoc = resolvePromise;
+        rejectDoc = rejectPromise;
+      });
+      promise.catch(() => {});
+      sortReplicaPackedDocCache.set(key, promise);
+      const entry = await sortReplicaDocPointerCache.get(key);
+      pending.push({ rank, key, entry, resolve: resolveDoc, reject: rejectDoc });
+    }
+    const groups = rangeGroups(pending, "sortReplicaDocs");
+    const plannedBytes = groups.reduce((sum, group) => sum + Math.max(0, group.end - group.start), 0);
+    const maxGroups = Math.max(1, Number(options.sortReplicaDocMaxFetchGroups || 12));
+    const maxBytes = Math.max(1, Number(options.sortReplicaDocMaxFetchBytes || 256 * 1024));
+    if (groups.length > maxGroups || plannedBytes > maxBytes) {
+      if (stats) {
+        stats.docPackSkippedReason = groups.length > maxGroups ? "fetch_groups" : "fetch_bytes";
+        stats.docPackPlannedFetchGroups = groups.length;
+        stats.docPackPlannedFetchBytes = plannedBytes;
+      }
+      for (const item of pending) sortReplicaPackedDocCache.delete(item.key);
+      return null;
+    }
+    if (stats) {
+      stats.docPackPlannedFetchGroups = groups.length;
+      stats.docPackPlannedFetchBytes = plannedBytes;
+      stats.docPackFetches += pending.length;
+      stats.docPackFetchGroups += groups.length;
+    }
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`${sortReplicaDocPackPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica doc ${replica.id}:${item.rank}`);
+          item.resolve(traceSpanSync("sortReplicas.parseDoc", () => JSON.parse(textDecoder.decode(new Uint8Array(inflated)))));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          sortReplicaPackedDocCache.delete(item.key);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+    const out = new Map();
+    for (const rank of wanted) {
+      const doc = await sortReplicaPackedDocCache.get(sortReplicaDocCacheKey(replica, rank));
+      if (doc) out.set(rank, doc);
+    }
+    return out;
+  }
+
+  function sortReplicaDocPagesMeta(replica) {
+    return replica?.doc_pages || null;
+  }
+
+  function sortReplicaDocPageSize(replica) {
+    return Math.max(1, Number(sortReplicaDocPagesMeta(replica)?.page_size || 0));
+  }
+
+  function sortReplicaDocPageIndex(replica, rank) {
+    return Math.floor(rank / sortReplicaDocPageSize(replica));
+  }
+
+  function sortReplicaDocPagePackPath(replica) {
+    const pages = sortReplicaDocPagesMeta(replica);
+    return (pages?.packs_path || `sort-replicas/${replica.id}/docs/page-packs`).replace(/\/?$/u, "/");
+  }
+
+  function sortReplicaDocPagePointerCacheKey(replica, pageIndex) {
+    return `${replica.id}\u0000${pageIndex}`;
+  }
+
+  async function loadSortReplicaDocPagePointers(replica, pageIndexes, stats = null) {
+    const pages = sortReplicaDocPagesMeta(replica);
+    const pointerMeta = pages?.pointers;
+    if (!pointerMeta?.file) throw new Error(`Rangefind sort replica ${replica.id} is missing doc page pointers.`);
+    const pending = [];
+    const wanted = [...new Set(pageIndexes)];
+    for (const pageIndexValue of wanted) {
+      const key = sortReplicaDocPagePointerCacheKey(replica, pageIndexValue);
+      if (sortReplicaDocPagePointerCache.has(key)) continue;
+      if (pageIndexValue < 0 || pageIndexValue >= pointerMeta.count) throw new Error(`Rangefind sort replica doc page ${pageIndexValue} is outside ${replica.id}.`);
+      let resolvePointer;
+      let rejectPointer;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePointer = resolvePromise;
+        rejectPointer = rejectPromise;
+      });
+      promise.catch(() => {});
+      sortReplicaDocPagePointerCache.set(key, promise);
+      const offset = pointerMeta.dataOffset + pageIndexValue * pointerMeta.recordBytes;
+      pending.push({
+        pageIndex: pageIndexValue,
+        key,
+        entry: { pack: pointerMeta.file, offset, length: pointerMeta.recordBytes },
+        resolve: resolvePointer,
+        reject: rejectPointer
+      });
+    }
+    const groups = rangeGroups(pending, "sortReplicaDocPagePointers");
+    if (stats) {
+      stats.docPagePointerPagesWanted += wanted.length;
+      stats.docPagePointerPagesFetched += pending.length;
+      stats.docPagePointerFetchGroups += groups.length;
+    }
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+        for (const item of group.items) {
+          const pointer = decodeDocPagePointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
+          item.resolve(pointer);
+        }
+      } catch (error) {
+        for (const item of group.items) {
+          sortReplicaDocPagePointerCache.delete(item.key);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+  }
+
+  function sortReplicaDocPageCacheKey(replica, pageIndex) {
+    return `${replica.id}\u0000${pageIndex}`;
+  }
+
+  async function loadSortReplicaDocPages(replica, ranks, stats = null) {
+    const pages = sortReplicaDocPagesMeta(replica);
+    if (!pages?.pointers?.file) return null;
+    if (pages.encoding !== DOC_PAGE_ENCODING) throw new Error(`Unsupported Rangefind sort replica doc page encoding ${pages.encoding || "unknown"}.`);
+    const pageSize = sortReplicaDocPageSize(replica);
+    const wantedRanks = [...new Set(ranks || [])].filter(rank => rank >= 0 && rank < (pages.total ?? replica.total ?? 0));
+    if (!wantedRanks.length) return new Map();
+    const pageIndexes = [...new Set(wantedRanks.map(rank => sortReplicaDocPageIndex(replica, rank)))].sort((a, b) => a - b);
+    if (stats) {
+      stats.docPageLookups += wantedRanks.length;
+      stats.docPagesWanted += pageIndexes.length;
+    }
+    await loadSortReplicaDocPagePointers(replica, pageIndexes, stats);
+    const pending = [];
+    for (const pageIndexValue of pageIndexes) {
+      const key = sortReplicaDocPageCacheKey(replica, pageIndexValue);
+      if (sortReplicaDocPageCache.has(key)) continue;
+      let resolvePage;
+      let rejectPage;
+      const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolvePage = resolvePromise;
+        rejectPage = rejectPromise;
+      });
+      promise.catch(() => {});
+      sortReplicaDocPageCache.set(key, promise);
+      const entry = await sortReplicaDocPagePointerCache.get(sortReplicaDocPagePointerCacheKey(replica, pageIndexValue));
+      pending.push({ pageIndex: pageIndexValue, key, entry, resolve: resolvePage, reject: rejectPage });
+    }
+    const groups = rangeGroups(pending, "sortReplicaDocPages");
+    const plannedBytes = groups.reduce((sum, group) => sum + Math.max(0, group.end - group.start), 0);
+    const maxGroups = Math.max(1, Number(options.sortReplicaDocPageMaxFetchGroups || 4));
+    const maxBytes = Math.max(1, Number(options.sortReplicaDocPageMaxFetchBytes || 256 * 1024));
+    if (groups.length > maxGroups || plannedBytes > maxBytes) {
+      if (stats) {
+        stats.docPageSkippedReason = groups.length > maxGroups ? "fetch_groups" : "fetch_bytes";
+        stats.docPagePlannedFetchGroups = groups.length;
+        stats.docPagePlannedFetchBytes = plannedBytes;
+      }
+      for (const item of pending) sortReplicaDocPageCache.delete(item.key);
+      return null;
+    }
+    if (stats) {
+      stats.docPagePlannedFetchGroups = groups.length;
+      stats.docPagePlannedFetchBytes = plannedBytes;
+      stats.docPagesFetched += pending.length;
+      stats.docPageFetchGroups += groups.length;
+    }
+    await Promise.all(groups.map(async (group) => {
+      try {
+        const compressed = await fetchRange(new URL(`${sortReplicaDocPagePackPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+        await Promise.all(group.items.map(async (item) => {
+          const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica doc page ${replica.id}:${item.pageIndex}`);
+          item.resolve(traceSpanSync("sortReplicas.decodeDocPage", () => decodeDocPageColumns(inflated, pages.fields || [], item.pageIndex * pageSize)));
+        }));
+      } catch (error) {
+        for (const item of group.items) {
+          sortReplicaDocPageCache.delete(item.key);
+          item.reject(error);
+        }
+        throw error;
+      }
+    }));
+
+    const out = new Map();
+    for (const rank of wantedRanks) {
+      const pageIndexValue = sortReplicaDocPageIndex(replica, rank);
+      const page = await sortReplicaDocPageCache.get(sortReplicaDocPageCacheKey(replica, pageIndexValue));
+      const doc = page?.[rank - pageIndexValue * pageSize];
+      if (doc) out.set(rank, doc);
+    }
+    return out;
+  }
+
+  function applySortReplicaBlockRows(cursor, rows, scores, hits) {
+    let accepted = 0;
+    for (let i = 0; i < rows.length; i += 2) {
+      const rank = rows[i];
+      scores.set(rank, (scores.get(rank) || 0) + rows[i + 1]);
+      if (cursor.isBase) hits.set(rank, (hits.get(rank) || 0) + 1);
+      accepted++;
+    }
+    return accepted;
+  }
+
+  function sortReplicaNextRanks(cursors) {
+    const ranks = [];
+    for (const cursor of cursors) {
+      const block = cursor.entry.blocks?.[cursor.blockIndex];
+      if (block && Number.isFinite(block.docMin)) ranks.push(block.docMin);
+    }
+    return ranks;
+  }
+
+  async function sortReplicaRankedState(replica, scores, hits, minShouldMatch, sortPlan, stats) {
+    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
+    const rankInfo = await sortReplicaRankRows(replica, eligible.map(([rank]) => rank), stats);
+    const sortValues = new Map();
+    for (const [rank, info] of rankInfo) sortValues.set(rank, info.value);
+    eligible.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
+    return { eligible, rankInfo, sortValues };
+  }
+
+  async function sortReplicaStopState(replica, cursors, scores, hits, minShouldMatch, k, sortPlan, stats) {
+    const state = await sortReplicaRankedState(replica, scores, hits, minShouldMatch, sortPlan, stats);
+    if (state.eligible.length < k) return { ...state, stop: false, exhausted: false, boundarySortValue: null };
+    const boundarySortValue = state.sortValues.get(state.eligible[k - 1][0]);
+    const nextRanks = sortReplicaNextRanks(cursors);
+    if (!nextRanks.length) return { ...state, stop: true, exhausted: true, boundarySortValue };
+    const nextRows = await sortReplicaRankRows(replica, nextRanks, stats);
+    const canTieOrBeat = [...nextRows.values()].some(row => (
+      sortPlan.desc ? row.value >= boundarySortValue : row.value <= boundarySortValue
+    ));
+    return { ...state, stop: !canTieOrBeat, exhausted: false, boundarySortValue };
+  }
+
   async function runDocValueBrowse({ page, size, filters, sortPlan, hasFilters }) {
     return traceSpan("docValues.sortedBrowse", () => runDocValueBrowseInner({ page, size, filters, sortPlan, hasFilters }));
   }
@@ -2405,12 +2967,243 @@ export async function createSearch(options = {}) {
     };
   }
 
+  async function runSortReplicaTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
+    return traceSpan("sortReplicaText.search", () => runSortReplicaTextSearchInner({ page, size, filters, sortPlan, baseTerms, terms, rerank }));
+  }
+
+  async function runSortReplicaTextSearchInner({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
+    const replica = sortReplicaForPlan(sortPlan);
+    if (!replica || !baseTerms.length || terms.length > SKIP_MAX_TERMS) return null;
+    if (rerank !== false && dependencyTerms(baseTerms).length) return null;
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters) return null;
+
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const entries = await sortReplicaTermEntries(terms, replica);
+    const baseSet = new Set(baseTerms);
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const presentBaseTerms = new Set(entries.filter(item => baseSet.has(item.term)).map(item => item.term));
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextSearchResponse({
+        page,
+        size,
+        terms,
+        entries,
+        missingBaseTerms: Math.max(0, baseTerms.length - presentBaseTerms.size)
+      });
+    }
+
+    const cursors = entries.map((item, termIndex) => ({
+      ...item,
+      termIndex,
+      isBase: baseSet.has(item.term),
+      blockIndex: 0
+    }));
+    if (!cursors.length) return emptyTextSearchResponse({ page, size, terms });
+
+    const scores = new Map();
+    const hits = new Map();
+    const rankStats = { rankLookups: 0, rankChunksWanted: 0, rankChunksFetched: 0, rankChunkFetchGroups: 0 };
+    const docPackStats = {
+      docPackPointerLookups: 0,
+      docPackPointerFetches: 0,
+      docPackPointerFetchGroups: 0,
+      docPackFetches: 0,
+      docPackFetchGroups: 0,
+      docPackPlannedFetchGroups: 0,
+      docPackPlannedFetchBytes: 0,
+      docPackSkippedReason: ""
+    };
+    const docPageStats = {
+      docPageLookups: 0,
+      docPagesWanted: 0,
+      docPagesFetched: 0,
+      docPageFetchGroups: 0,
+      docPagePlannedFetchGroups: 0,
+      docPagePlannedFetchBytes: 0,
+      docPageSkippedReason: "",
+      docPagePointerPagesWanted: 0,
+      docPagePointerPagesFetched: 0,
+      docPagePointerFetchGroups: 0
+    };
+    const proofStats = createTopKProofStats({ sortPlan });
+    let blocksDecoded = 0;
+    let postingsDecoded = 0;
+    let postingsAccepted = 0;
+    let frontierBatches = 0;
+    let frontierBlocks = 0;
+    let frontierMax = 0;
+    let fetchedBlocks = 0;
+    let fetchGroups = 0;
+    let wantedBlocks = 0;
+    let stopChecks = 0;
+    let stoppedBySortBound = false;
+    let exhausted = false;
+    let finalState = null;
+
+    while (true) {
+      const active = cursors.filter(cursor => cursor.blockIndex < (cursor.entry.blocks?.length || 0));
+      stopChecks++;
+      proofStats.attempts++;
+      finalState = await sortReplicaStopState(replica, active, scores, hits, minShouldMatch, k, sortPlan, rankStats);
+      if (finalState.stop) {
+        exhausted = finalState.exhausted;
+        stoppedBySortBound = !finalState.exhausted;
+        recordTopKProofSuccess(proofStats, { threshold: finalState.boundarySortValue || 0, maxOutsidePotential: 0 });
+        break;
+      }
+      if (!active.length) {
+        exhausted = true;
+        finalState = await sortReplicaRankedState(replica, scores, hits, minShouldMatch, sortPlan, rankStats);
+        recordTopKProofSuccess(proofStats, { threshold: 0, maxOutsidePotential: 0 });
+        break;
+      }
+
+      active.sort((a, b) => {
+        const left = a.entry.blocks[a.blockIndex];
+        const right = b.entry.blocks[b.blockIndex];
+        return (left.docMin || 0) - (right.docMin || 0) || (right.maxImpact || 0) - (left.maxImpact || 0);
+      });
+      const frontier = active.slice(0, postingBlockFrontier);
+      frontierBatches++;
+      frontierBlocks += frontier.length;
+      frontierMax = Math.max(frontierMax, frontier.length);
+      await Promise.all(frontier.map(async (cursor) => {
+        const blockIndex = cursor.blockIndex;
+        const decoded = await decodeEntryBlockBatch(cursor.shard, cursor.entry, [blockIndex], "postingBlocks");
+        fetchedBlocks += decoded.fetchedBlocks;
+        fetchGroups += decoded.fetchGroups;
+        wantedBlocks += decoded.wantedBlocks;
+        cursor.blockIndex++;
+        const block = decoded.blocks[0];
+        const rows = block?.rows || new Int32Array(0);
+        blocksDecoded++;
+        postingsDecoded += rows.length / 2;
+        postingsAccepted += applySortReplicaBlockRows(cursor, rows, scores, hits);
+      }));
+    }
+
+    if (!finalState) finalState = await sortReplicaRankedState(replica, scores, hits, minShouldMatch, sortPlan, rankStats);
+    const ranked = finalState.eligible || [];
+    const rows = ranked.slice(offset, offset + size);
+    const rowRanks = rows.map(([rank]) => rank);
+    let rankDocs = await loadSortReplicaPackedDocs(replica, rowRanks, docPackStats);
+    let rankDocLane = rankDocs ? "sortReplicaDocPacks" : "";
+    if (!rankDocs) {
+      rankDocs = await loadSortReplicaDocPages(replica, rowRanks, docPageStats);
+      rankDocLane = rankDocs ? "sortReplicaDocPages" : "";
+    }
+    let results;
+    const resultContext = {};
+    if (rankDocs) {
+      results = rows
+        .map(([rank, score]) => {
+          const doc = rankDocs.get(rank);
+          return doc ? { ...doc, score } : null;
+        })
+        .filter(Boolean);
+      resultContext.docPayloadLane = rankDocLane;
+      resultContext.docPayloadPages = rankDocLane === "sortReplicaDocPages" ? docPageStats.docPagesWanted : 0;
+      resultContext.docPayloadRows = rows.length;
+      resultContext.docPayloadOverfetchDocs = rankDocLane === "sortReplicaDocPages"
+        ? docPageStats.docPagesWanted * sortReplicaDocPageSize(replica)
+        : rows.length;
+      resultContext.docPayloadAdaptive = false;
+      resultContext.docPayloadForced = false;
+    } else {
+      const rankInfo = await sortReplicaRankRows(replica, rows.map(([rank]) => rank), rankStats);
+      const mappedRows = rows
+        .map(([rank, score]) => {
+          const info = rankInfo.get(rank) || finalState.rankInfo?.get(rank);
+          return info ? [info.doc, score] : null;
+        })
+        .filter(Boolean);
+      Object.assign(resultContext, { hasTextTerms: true, preferDocPages: true });
+      results = await rowsToResults(mappedRows, resultContext);
+    }
+    const totalExact = exhausted;
+    return {
+      total: totalExact ? ranked.length : Math.max(ranked.length, k),
+      page,
+      size,
+      results,
+      approximate: !totalExact,
+      stats: {
+        exact: true,
+        plannerLane: "sortReplicaText",
+        topKProven: true,
+        totalExact,
+        tailExhausted: totalExact,
+        terms: terms.length,
+        shards: new Set(entries.map(item => item.shardName)).size,
+        blocksDecoded,
+        postingsDecoded,
+        postingsAccepted,
+        skippedBlocks: 0,
+        sortReplicaText: true,
+        sortReplicaId: replica.id,
+        sortReplicaField: replica.field,
+        sortReplicaDirection: sortPlan.desc ? "desc" : "asc",
+        sortReplicaStopReason: stoppedBySortBound ? "sort_bound" : "exhausted",
+        sortReplicaStopChecks: stopChecks,
+        sortReplicaFrontier: postingBlockFrontier,
+        sortReplicaFrontierBatches: frontierBatches,
+        sortReplicaFrontierBlocks: frontierBlocks,
+        sortReplicaFrontierMax: frontierMax,
+        sortReplicaFetchedBlocks: fetchedBlocks,
+        sortReplicaFetchGroups: fetchGroups,
+        sortReplicaWantedBlocks: wantedBlocks,
+        sortReplicaRankLookups: rankStats.rankLookups,
+        sortReplicaRankChunksWanted: rankStats.rankChunksWanted,
+        sortReplicaRankChunksFetched: rankStats.rankChunksFetched,
+        sortReplicaRankChunkFetchGroups: rankStats.rankChunkFetchGroups,
+        sortReplicaDocPackPointerLookups: docPackStats.docPackPointerLookups,
+        sortReplicaDocPackPointerFetches: docPackStats.docPackPointerFetches,
+        sortReplicaDocPackPointerFetchGroups: docPackStats.docPackPointerFetchGroups,
+        sortReplicaDocPackFetches: docPackStats.docPackFetches,
+        sortReplicaDocPackFetchGroups: docPackStats.docPackFetchGroups,
+        sortReplicaDocPackPlannedFetchGroups: docPackStats.docPackPlannedFetchGroups,
+        sortReplicaDocPackPlannedFetchBytes: docPackStats.docPackPlannedFetchBytes,
+        sortReplicaDocPackSkippedReason: docPackStats.docPackSkippedReason,
+        sortReplicaDocPageLookups: docPageStats.docPageLookups,
+        sortReplicaDocPagesWanted: docPageStats.docPagesWanted,
+        sortReplicaDocPagesFetched: docPageStats.docPagesFetched,
+        sortReplicaDocPageFetchGroups: docPageStats.docPageFetchGroups,
+        sortReplicaDocPagePlannedFetchGroups: docPageStats.docPagePlannedFetchGroups,
+        sortReplicaDocPagePlannedFetchBytes: docPageStats.docPagePlannedFetchBytes,
+        sortReplicaDocPageSkippedReason: docPageStats.docPageSkippedReason,
+        sortReplicaDocPagePointerPagesWanted: docPageStats.docPagePointerPagesWanted,
+        sortReplicaDocPagePointerPagesFetched: docPageStats.docPagePointerPagesFetched,
+        sortReplicaDocPagePointerFetchGroups: docPageStats.docPagePointerFetchGroups,
+        docValueSortText: false,
+        docValuePruning: false,
+        sortedTextBlockScheduler: false,
+        sortedTextCandidateLookup: false,
+        plannerFallbackReason: "",
+        ...topKProofStatsObject(proofStats, ""),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
+        rerankCandidates: 0,
+        dependencyFeatures: 0,
+        dependencyTermsMatched: 0,
+        dependencyPostingsScanned: 0,
+        dependencyCandidateMatches: 0
+      }
+    };
+  }
+
   async function runSortedTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
     return traceSpan("sortPageText.search", () => runSortedTextSearchInner({ page, size, filters, sortPlan, baseTerms, terms, rerank }));
   }
 
   async function runSortedTextSearchInner({ page, size, filters, sortPlan, baseTerms, terms, rerank = true }) {
     const field = sortPlan?.field || null;
+    const replicaResponse = await runSortReplicaTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank });
+    if (replicaResponse) return replicaResponse;
     if (field && !docValueSorted) await ensureDocValueSortedManifest();
     if (!field || !docValueSortField(field) || !baseTerms.length || terms.length > SKIP_MAX_TERMS) return null;
     if (rerank !== false && dependencyTerms(baseTerms).length) return null;

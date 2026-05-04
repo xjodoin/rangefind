@@ -294,12 +294,17 @@ function encodePostings(rows, total, codes, filters, config) {
       blockRows[i - start] = [docs[row], impacts[row]];
     }
     if (!blockRows.length) continue;
-    const [maxImpactDoc, maxImpact] = blockRows[0];
+    let maxImpactDoc = blockRows[0][0];
+    let maxImpact = blockRows[0][1];
     let docMin = blockRows[0][0];
     let docMax = blockRows[0][0];
-    for (const [doc] of blockRows) {
+    for (const [doc, impact] of blockRows) {
       docMin = Math.min(docMin, doc);
       docMax = Math.max(docMax, doc);
+      if (impact > maxImpact || (impact === maxImpact && doc < maxImpactDoc)) {
+        maxImpact = impact;
+        maxImpactDoc = doc;
+      }
     }
     const block = {
       offset,
@@ -378,6 +383,12 @@ function buildPostingBlockDocRanges(blockRows, docRanges) {
 
 function postingImpactOrder(docs, impacts, maxImpact, docsSorted, config) {
   const count = docs.length;
+  const requestedOrder = String(config.postingOrder || "").toLowerCase();
+  if (requestedOrder === "doc" || requestedOrder === "doc-id" || requestedOrder === "docid" || requestedOrder === "sort-rank") {
+    const order = new Int32Array(count);
+    for (let i = 0; i < count; i++) order[i] = i;
+    return { order, codec: "doc-id" };
+  }
   const minRows = Math.max(0, Math.floor(Number(config.postingImpactBucketOrderMinRows ?? 2048)));
   const maxBuckets = Math.max(1, Math.floor(Number(config.postingImpactBucketOrderMaxBuckets ?? 65536)));
   if (docsSorted && count >= minRows && maxImpact > 0 && maxImpact <= maxBuckets) {

@@ -413,7 +413,7 @@ function writeSite(args, docsPath) {
   const root = resolve(args.root);
   const publicDir = resolve(root, "public");
   mkdirSync(publicDir, { recursive: true });
-  copyFileSync(resolve("dist/runtime.browser.js"), resolve(publicDir, "runtime.browser.js"));
+  syncRuntimeBundle(args);
   const configPath = resolve(root, "rangefind.config.json");
   const config = {
     input: docsPath,
@@ -450,6 +450,9 @@ function writeSite(args, docsPath) {
     ],
     booleans: [
       { name: "hasCategories", path: "hasCategories" }
+    ],
+    sortReplicas: [
+      { field: "revisionDate", order: "desc" }
     ],
     display: [
       "id",
@@ -501,6 +504,12 @@ run();
 </script>
 `);
   return configPath;
+}
+
+function syncRuntimeBundle(args) {
+  const publicDir = resolve(args.root, "public");
+  mkdirSync(publicDir, { recursive: true });
+  copyFileSync(resolve("dist/runtime.browser.js"), resolve(publicDir, "runtime.browser.js"));
 }
 
 function buildTelemetryPath(args) {
@@ -591,8 +600,16 @@ function runtimeSummary(report) {
       valid: row.valid,
       lane: row.coldStats?.plannerLane || "",
       docPayloadLane: row.coldStats?.docPayloadLane || "",
+      docPayloadForced: Boolean(row.coldStats?.docPayloadForced),
       blocksDecoded: row.coldStats?.blocksDecoded || 0,
       postingsDecoded: row.coldStats?.postingsDecoded || 0,
+      sortReplicaText: Boolean(row.coldStats?.sortReplicaText),
+      sortReplicaFetchedBlocks: row.coldStats?.sortReplicaFetchedBlocks || 0,
+      sortReplicaRankChunksFetched: row.coldStats?.sortReplicaRankChunksFetched || 0,
+      sortReplicaDocPackFetches: row.coldStats?.sortReplicaDocPackFetches || 0,
+      sortReplicaDocPackSkippedReason: row.coldStats?.sortReplicaDocPackSkippedReason || "",
+      sortReplicaDocPagesFetched: row.coldStats?.sortReplicaDocPagesFetched || 0,
+      sortReplicaDocPageSkippedReason: row.coldStats?.sortReplicaDocPageSkippedReason || "",
       docValuePagesVisited: row.coldStats?.docValuePagesVisited || 0,
       docValueSortPageFetchGroups: row.coldStats?.docValueSortPageFetchGroups || 0
     } : null];
@@ -781,6 +798,13 @@ function networkBucket(url) {
   if (path.endsWith("/debug/build-telemetry.json")) return "buildTelemetry";
   if (path.endsWith("/runtime.browser.js")) return "runtime";
   if (/\/manifest(?:\.[0-9a-f]+)?\.json$/u.test(path)) return "manifest";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/pointers/")) return "sortReplicaDocPointers";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/packs/")) return "sortReplicaDocs";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/pages/")) return "sortReplicaDocPagePointers";
+  if (path.includes("/sort-replicas/") && path.includes("/docs/page-packs/")) return "sortReplicaDocPages";
+  if (path.includes("/sort-replicas/") && path.includes("/rank-packs/")) return "sortReplicaRankMaps";
+  if (path.includes("/sort-replicas/") && path.includes("/terms/block-packs/")) return "sortReplicaPostingBlocks";
+  if (path.includes("/sort-replicas/") && path.includes("/terms/packs/")) return "sortReplicaTerms";
   if (path.includes("/directory-")) return "directory";
   if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/authority/packs/")) return "authority";
@@ -1078,6 +1102,41 @@ function compactRuntimeStats(stats = {}) {
     postingBlockFrontierFetchedBlocks: stats.postingBlockFrontierFetchedBlocks || 0,
     postingBlockFrontierFetchGroups: stats.postingBlockFrontierFetchGroups || 0,
     postingBlockFrontierWantedBlocks: stats.postingBlockFrontierWantedBlocks || 0,
+    sortReplicaText: Boolean(stats.sortReplicaText),
+    sortReplicaId: stats.sortReplicaId || "",
+    sortReplicaField: stats.sortReplicaField || "",
+    sortReplicaDirection: stats.sortReplicaDirection || "",
+    sortReplicaStopReason: stats.sortReplicaStopReason || "",
+    sortReplicaStopChecks: stats.sortReplicaStopChecks || 0,
+    sortReplicaFrontier: stats.sortReplicaFrontier || 0,
+    sortReplicaFrontierBatches: stats.sortReplicaFrontierBatches || 0,
+    sortReplicaFrontierBlocks: stats.sortReplicaFrontierBlocks || 0,
+    sortReplicaFrontierMax: stats.sortReplicaFrontierMax || 0,
+    sortReplicaFetchedBlocks: stats.sortReplicaFetchedBlocks || 0,
+    sortReplicaFetchGroups: stats.sortReplicaFetchGroups || 0,
+    sortReplicaWantedBlocks: stats.sortReplicaWantedBlocks || 0,
+    sortReplicaRankLookups: stats.sortReplicaRankLookups || 0,
+    sortReplicaRankChunksWanted: stats.sortReplicaRankChunksWanted || 0,
+    sortReplicaRankChunksFetched: stats.sortReplicaRankChunksFetched || 0,
+    sortReplicaRankChunkFetchGroups: stats.sortReplicaRankChunkFetchGroups || 0,
+    sortReplicaDocPackPointerLookups: stats.sortReplicaDocPackPointerLookups || 0,
+    sortReplicaDocPackPointerFetches: stats.sortReplicaDocPackPointerFetches || 0,
+    sortReplicaDocPackPointerFetchGroups: stats.sortReplicaDocPackPointerFetchGroups || 0,
+    sortReplicaDocPackFetches: stats.sortReplicaDocPackFetches || 0,
+    sortReplicaDocPackFetchGroups: stats.sortReplicaDocPackFetchGroups || 0,
+    sortReplicaDocPackPlannedFetchGroups: stats.sortReplicaDocPackPlannedFetchGroups || 0,
+    sortReplicaDocPackPlannedFetchBytes: stats.sortReplicaDocPackPlannedFetchBytes || 0,
+    sortReplicaDocPackSkippedReason: stats.sortReplicaDocPackSkippedReason || "",
+    sortReplicaDocPageLookups: stats.sortReplicaDocPageLookups || 0,
+    sortReplicaDocPagesWanted: stats.sortReplicaDocPagesWanted || 0,
+    sortReplicaDocPagesFetched: stats.sortReplicaDocPagesFetched || 0,
+    sortReplicaDocPageFetchGroups: stats.sortReplicaDocPageFetchGroups || 0,
+    sortReplicaDocPagePlannedFetchGroups: stats.sortReplicaDocPagePlannedFetchGroups || 0,
+    sortReplicaDocPagePlannedFetchBytes: stats.sortReplicaDocPagePlannedFetchBytes || 0,
+    sortReplicaDocPageSkippedReason: stats.sortReplicaDocPageSkippedReason || "",
+    sortReplicaDocPagePointerPagesWanted: stats.sortReplicaDocPagePointerPagesWanted || 0,
+    sortReplicaDocPagePointerPagesFetched: stats.sortReplicaDocPagePointerPagesFetched || 0,
+    sortReplicaDocPagePointerFetchGroups: stats.sortReplicaDocPagePointerFetchGroups || 0,
     docRangeBlockMax: Boolean(stats.docRangeBlockMax),
     docRangeSize: stats.docRangeSize || 0,
     docRangeCandidateRanges: stats.docRangeCandidateRanges || 0,
@@ -1102,6 +1161,7 @@ function compactRuntimeStats(stats = {}) {
     docPayloadPages: stats.docPayloadPages || 0,
     docPayloadOverfetchDocs: stats.docPayloadOverfetchDocs || 0,
     docPayloadAdaptive: Boolean(stats.docPayloadAdaptive),
+    docPayloadForced: Boolean(stats.docPayloadForced),
     docValuePruning: Boolean(stats.docValuePruning),
     docValuePruneField: stats.docValuePruneField || "",
     docValueDirectoryPages: stats.docValueDirectoryPages || 0,
@@ -1379,6 +1439,7 @@ function summarizeScaleRow(row) {
     coldKb: row.coldKb,
     coldBy: row.coldBy,
     lane: row.coldStats?.docPayloadLane || "",
+    docPayloadForced: Boolean(row.coldStats?.docPayloadForced),
     postingBlockFrontierBatches: row.coldStats?.postingBlockFrontierBatches || 0,
     postingBlockFrontierBlocks: row.coldStats?.postingBlockFrontierBlocks || 0,
     postingBlockFrontierFetchGroups: row.coldStats?.postingBlockFrontierFetchGroups || 0,
@@ -1389,6 +1450,15 @@ function summarizeScaleRow(row) {
     docRangeInnerBlocksPruned: row.coldStats?.docRangeInnerBlocksPruned || 0,
     docRangeCandidateBlockRatio: row.coldStats?.docRangeCandidateBlockRatio || 0,
     plannerLane: row.coldStats?.plannerLane || "",
+    sortReplicaText: row.coldStats?.sortReplicaText || false,
+    sortReplicaField: row.coldStats?.sortReplicaField || "",
+    sortReplicaStopReason: row.coldStats?.sortReplicaStopReason || "",
+    sortReplicaFetchedBlocks: row.coldStats?.sortReplicaFetchedBlocks || 0,
+    sortReplicaRankChunksFetched: row.coldStats?.sortReplicaRankChunksFetched || 0,
+    sortReplicaDocPackFetches: row.coldStats?.sortReplicaDocPackFetches || 0,
+    sortReplicaDocPackSkippedReason: row.coldStats?.sortReplicaDocPackSkippedReason || "",
+    sortReplicaDocPagesFetched: row.coldStats?.sortReplicaDocPagesFetched || 0,
+    sortReplicaDocPageSkippedReason: row.coldStats?.sortReplicaDocPageSkippedReason || "",
     topKProven: row.coldStats?.topKProven || false,
     totalExact: row.coldStats?.totalExact || false,
     queryBundleHit: row.coldStats?.queryBundleHit || false,
@@ -1549,6 +1619,7 @@ if (args.command === "clean") {
   await buildFixture(args, { quiet: false, mode: "builder-only" });
 } else if (args.command === "bench" || args.command === "runtime-bench") {
   assertReusableIndex(args);
+  syncRuntimeBundle(args);
   await benchFixture(args);
 } else if (args.command === "scale") {
   await scaleFixture(args);
@@ -1559,6 +1630,7 @@ if (args.command === "clean") {
     await buildFixture(args, { mode: args.builderOnly ? "builder-only" : "all" });
   } else {
     assertReusableIndex(args);
+    syncRuntimeBundle(args);
   }
   if (args.builderOnly) {
     writeBuilderBenchReport(args, { quiet: false, mode: args.reuseIndex ? "reused-builder-report" : "builder-only" });

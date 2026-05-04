@@ -64,6 +64,9 @@ import {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const SORT_REPLICA_FORMAT = "rfsortreplicas-v1";
+const SORT_REPLICA_RANK_MAP_FORMAT = "rfsortrankmap-v1";
+const SORT_REPLICA_RANK_RECORD_BYTES = 12;
 
 function addDict(dict, value, label = value) {
   const key = String(value || "");
@@ -1078,6 +1081,469 @@ function packTable(packs) {
   return (packs || []).map(pack => pack.file);
 }
 
+function sortReplicaKey(field, order) {
+  return `${field}:${order === "desc" ? "desc" : "asc"}`;
+}
+
+function sortReplicaId(field, order) {
+  return safeObjectName(`${field}_${order === "desc" ? "desc" : "asc"}`);
+}
+
+function sortReplicaFieldMap(config) {
+  const fields = new Map();
+  for (const field of config.numbers || []) {
+    fields.set(field.name, { ...field, kind: "number", type: normalizedNumberType(field) });
+  }
+  for (const field of config.booleans || []) {
+    fields.set(field.name, { ...field, kind: "boolean", type: "boolean" });
+  }
+  return fields;
+}
+
+function sortReplicaDefinitions(config) {
+  const fields = sortReplicaFieldMap(config);
+  const definitions = [];
+  const seen = new Set();
+  for (const item of config.sortReplicas || []) {
+    const rawField = typeof item === "string" ? item.replace(/^-/, "") : item.field || item.name;
+    const fieldName = String(rawField || "");
+    if (!fieldName) continue;
+    const source = fields.get(fieldName);
+    if (!source) {
+      throw new Error(`Rangefind sort replica field "${fieldName}" must be configured as a number or boolean field.`);
+    }
+    const requestedOrder = typeof item === "string" && item.startsWith("-")
+      ? "desc"
+      : String(item.order || item.direction || "asc").toLowerCase();
+    const order = requestedOrder === "desc" ? "desc" : "asc";
+    const key = sortReplicaKey(fieldName, order);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    definitions.push({
+      key,
+      id: sortReplicaId(fieldName, order),
+      field: { name: source.name, kind: source.kind, type: source.type },
+      order
+    });
+  }
+  return definitions;
+}
+
+function sortReplicaRankChunkSize(config) {
+  return Math.max(1, Math.floor(Number(config.sortReplicaRankChunkSize || 4096)));
+}
+
+function sortRowsForReplica(config, total, codes, field, order) {
+  const rows = [];
+  const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
+  for (let start = 0; start < total; start += readChunkSize) {
+    const values = codeRows(codes, field.name, start, Math.min(total, start + readChunkSize));
+    for (let row = 0; row < values.length; row++) {
+      const value = sortableDocValue(field, values[row]);
+      if (Number.isFinite(value)) rows.push({ doc: start + row, value });
+    }
+  }
+  rows.sort((a, b) => (
+    order === "desc"
+      ? b.value - a.value || a.doc - b.doc
+      : a.value - b.value || a.doc - b.doc
+  ));
+  return rows;
+}
+
+function encodeSortReplicaRankChunk(rows, start, end) {
+  const buffer = Buffer.allocUnsafe((end - start) * SORT_REPLICA_RANK_RECORD_BYTES);
+  let offset = 0;
+  for (let index = start; index < end; index++) {
+    buffer.writeUInt32LE(rows[index].doc, offset);
+    offset += 4;
+    buffer.writeDoubleLE(rows[index].value, offset);
+    offset += 8;
+  }
+  return buffer;
+}
+
+function writeSortReplicaRankMap(out, config, replica, rows) {
+  const chunkSize = sortReplicaRankChunkSize(config);
+  const basePath = `sort-replicas/${replica.id}/rank-packs`;
+  const packWriter = createPackWriter(resolve(out, basePath), config.sortReplicaPackBytes || config.packBytes);
+  const chunks = [];
+  for (let start = 0; start < rows.length; start += chunkSize) {
+    const end = Math.min(rows.length, start + chunkSize);
+    const encoded = encodeSortReplicaRankChunk(rows, start, end);
+    const entry = writePackedShard(packWriter, `${replica.id}\u0000${start}`, gzipSync(encoded, { level: 6 }), {
+      kind: "sort-replica-rank-map",
+      codec: SORT_REPLICA_RANK_MAP_FORMAT,
+      logicalLength: encoded.length
+    });
+    chunks.push({
+      start,
+      count: end - start,
+      ...entry
+    });
+  }
+  finalizePackWriter(packWriter);
+  const packFiles = packTable(packWriter.packs);
+  const packIndexes = new Map(packFiles.map((file, index) => [file, index]));
+  for (const chunk of chunks) {
+    chunk.pack = packWriter.packNameMap?.get(chunk.pack) || chunk.pack;
+    chunk.packIndex = packIndexes.get(chunk.pack);
+  }
+  return {
+    format: SORT_REPLICA_RANK_MAP_FORMAT,
+    compression: "gzip-member",
+    record_bytes: SORT_REPLICA_RANK_RECORD_BYTES,
+    chunk_size: chunkSize,
+    total: rows.length,
+    chunks,
+    packs_path: basePath,
+    packs: packWriter.packs.length,
+    pack_table: packFiles,
+    pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0)
+  };
+}
+
+function sortReplicaDocPageSize(config) {
+  return Math.max(1, Math.floor(Number(config.sortReplicaDocPageSize || config.docPageSize || 32)));
+}
+
+function writeSortReplicaDocPages(out, config, replica, rows, spool) {
+  const pageSize = sortReplicaDocPageSize(config);
+  const fields = [...new Set([...docPayloadFieldNames(config), "index"])];
+  const packBase = `sort-replicas/${replica.id}/docs/page-packs`;
+  const pointerBase = `sort-replicas/${replica.id}/docs/pages`;
+  const packWriter = createAppendOnlyPackWriter(resolve(out, packBase), config.sortReplicaDocPagePackBytes || config.docPagePackBytes || config.docPackBytes);
+  const entries = [];
+  const fd = openSync(spool.rawPath, "r");
+  const spoolEntryFd = openSync(spool.rawEntryPath, "r");
+  try {
+    for (let pageStart = 0, pageIndex = 0; pageStart < rows.length; pageStart += pageSize, pageIndex++) {
+      const pageEnd = Math.min(rows.length, pageStart + pageSize);
+      const docs = [];
+      for (let rank = pageStart; rank < pageEnd; rank++) {
+        const doc = rows[rank].doc;
+        const entry = readDocSpoolEntry(spoolEntryFd, doc);
+        docs.push(JSON.parse(readSpooledDoc(fd, entry).toString("utf8")));
+      }
+      const source = encodeDocPageColumns(docs, fields);
+      const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
+        kind: "sort-replica-doc-page",
+        codec: DOC_PAGE_FORMAT,
+        logicalLength: source.length
+      });
+      entries[pageIndex] = packed;
+    }
+  } finally {
+    closeSync(fd);
+    closeSync(spoolEntryFd);
+  }
+  finalizePackWriter(packWriter);
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const pointerTable = buildDocPagePointerTable(entries.map(entry => resolvePackEntry(packWriter, entry)), packIndexes);
+  const hash = sha256Hex(pointerTable.buffer);
+  const file = `${pointerBase}/${hashedFile("0000", hash, ".bin")}`;
+  mkdirSync(resolve(out, pointerBase), { recursive: true });
+  writeFileSync(resolve(out, file), pointerTable.buffer);
+  return {
+    storage: "range-pack-v1",
+    format: DOC_PAGE_FORMAT,
+    encoding: DOC_PAGE_ENCODING,
+    compression: "gzip-member",
+    order: "sort-rank-page",
+    fields,
+    page_size: pageSize,
+    total: rows.length,
+    pointers: {
+      ...pointerTable.meta,
+      file,
+      order: "sort-rank-page",
+      content_hash: hash,
+      immutable: true,
+      bytes: pointerTable.buffer.length,
+      pack_table: packTable(packWriter.packs)
+    },
+    packs_path: packBase,
+    packs: packWriter.packs.length,
+    pack_table: packTable(packWriter.packs),
+    pack_bytes: packWriter.bytes
+  };
+}
+
+function writeSortReplicaDocPacks(out, config, replica, rows, spool) {
+  const packBase = `sort-replicas/${replica.id}/docs/packs`;
+  const pointerBase = `sort-replicas/${replica.id}/docs/pointers`;
+  const packWriter = createAppendOnlyPackWriter(resolve(out, packBase), config.sortReplicaDocPackBytes || config.docPackBytes);
+  const entries = [];
+  const fd = openSync(spool.path, "r");
+  const spoolEntryFd = openSync(spool.entryPath, "r");
+  try {
+    for (let rank = 0; rank < rows.length; rank++) {
+      const doc = rows[rank].doc;
+      const entry = readDocSpoolEntry(spoolEntryFd, doc);
+      const packed = writePackedShard(packWriter, docIndexKey(rank), readSpooledDoc(fd, entry), {
+        kind: "sort-replica-doc",
+        codec: "json-v1",
+        logicalLength: entry.logicalLength
+      });
+      entries[rank] = packed;
+    }
+  } finally {
+    closeSync(fd);
+    closeSync(spoolEntryFd);
+  }
+  finalizePackWriter(packWriter);
+  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
+  const pointerTable = buildDocPointerTable(entries.map(entry => resolvePackEntry(packWriter, entry)), packIndexes);
+  const hash = sha256Hex(pointerTable.buffer);
+  const file = `${pointerBase}/${hashedFile("0000", hash, ".bin")}`;
+  mkdirSync(resolve(out, pointerBase), { recursive: true });
+  writeFileSync(resolve(out, file), pointerTable.buffer);
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    order: "sort-rank",
+    pointers: {
+      ...pointerTable.meta,
+      file,
+      order: "sort-rank",
+      content_hash: hash,
+      immutable: true,
+      bytes: pointerTable.buffer.length,
+      pack_table: packTable(packWriter.packs)
+    },
+    packs_path: packBase,
+    packs: packWriter.packs.length,
+    pack_table: packTable(packWriter.packs),
+    pack_bytes: packWriter.bytes
+  };
+}
+
+function sortReplicaBuildConfig(config) {
+  return {
+    ...config,
+    postingOrder: "doc-id",
+    postingImpactBucketOrderMinRows: Number.MAX_SAFE_INTEGER
+  };
+}
+
+async function buildSortReplicaSegments(config, dirs, selectedTermSpool, replica, docToRank) {
+  const replicaConfig = sortReplicaBuildConfig(config);
+  const builder = createSegmentBuilder(resolve(dirs.out, "_build", "sort-replicas", replica.id, "segments"), replicaConfig);
+  let docs = 0;
+  let skippedDocs = 0;
+  let postings = 0;
+  for await (const { doc, selectedTerms } of readSelectedTermSpool(selectedTermSpool.path)) {
+    const rank = docToRank[doc];
+    if (rank < 0) {
+      skippedDocs++;
+      continue;
+    }
+    docs++;
+    for (const [term, score] of selectedTerms) {
+      addSegmentPosting(builder, term, rank, score);
+      postings++;
+    }
+    if (shouldFlushSegment(builder)) flushSegment(builder);
+  }
+  const segments = finishSegmentBuilder(builder);
+  return {
+    segments,
+    summary: segmentMergeSummary(segments),
+    docs,
+    skippedDocs,
+    postings
+  };
+}
+
+async function reduceSortReplicaSegments(config, measured, dirs, replica, segmentData, totalRanks) {
+  const replicaConfig = sortReplicaBuildConfig(config);
+  const termsBase = resolve(dirs.out, "sort-replicas", replica.id, "terms");
+  const scratchDir = resolve(dirs.out, "_build", "sort-replicas", replica.id, "segment-merge");
+  const packWriter = createAppendOnlyPackWriter(resolve(termsBase, "packs"), config.sortReplicaPackBytes || config.packBytes);
+  const blockPackWriter = config.externalPostingBlocks === false
+    ? null
+    : createAppendOnlyPackWriter(resolve(termsBase, "block-packs"), config.sortReplicaPostingBlockPackBytes || config.postingBlockPackBytes);
+  const directorySpool = createDirectoryEntrySpool(resolve(dirs.out, "_build", "sort-replicas", replica.id, "terms-directory.run"));
+  const finalShards = new Set();
+  const blockStats = emptyPostingSegmentStats();
+  let stats = { terms: 0, postings: 0, mergeTiers: [], mergePolicy: null, timings: {}, reducedSpoolBytes: 0, partitionSpoolBytes: 0, partitionSpoolEntries: 0 };
+
+  if (segmentData.segments.length) {
+    stats = await mergeSegmentsToPartitions({
+      segments: segmentData.segments,
+      scratchDir,
+      config: replicaConfig,
+      partitionConcurrency: 1,
+      onPartition: async (partition) => {
+        const encoded = buildFinalPostingSegmentChunks(partitionTermEntries(partition), totalRanks, null, [], replicaConfig, blockPackWriter);
+        addPostingSegmentStats(blockStats, encoded.stats);
+        const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
+          kind: "posting-segment",
+          codec: encoded.format || POSTING_SEGMENT_FORMAT,
+          logicalLength: encoded.logicalLength,
+          streamMinBytes: replicaConfig.postingSegmentStreamMinBytes
+        });
+        appendDirectoryEntry(directorySpool, partition.name, entry);
+        finalShards.add(partition.name);
+        return partition.name;
+      }
+    });
+  }
+
+  if (blockPackWriter) finalizePackWriter(blockPackWriter);
+  finalizePackWriter(packWriter);
+  const termPacks = packWriter.packs;
+  const blockPacks = blockPackWriter?.packs || [];
+  const packIndexes = new Map(termPacks.map((pack, index) => [pack.file, index]));
+  const directoryEntries = directorySpool.entries
+    ? sortedDirectoryEntrySpool(directorySpool, {
+        packNameMap: packWriter.packNameMap,
+        packIndexes,
+        chunkEntries: config.directorySortChunkEntries
+      })
+    : (async function* emptyDirectoryEntries() {})();
+  const directory = await writeDirectoryFilesFromSortedEntries(
+    termsBase,
+    directoryEntries,
+    directorySpool.entries,
+    config.directoryPageBytes,
+    `sort-replicas/${replica.id}/terms`,
+    { packTable: termPacks }
+  );
+
+  return {
+    directory,
+    shards: [...finalShards].sort(),
+    packs: termPacks,
+    blockPacks,
+    blockStats,
+    termCount: stats.terms || 0,
+    postingCount: stats.postings || 0,
+    packBytes: packWriter.bytes,
+    blockPackBytes: blockPackWriter?.bytes || 0,
+    directoryBytes: directory.total_bytes,
+    directorySpoolBytes: directorySpool.bytes,
+    directorySpoolEntries: directorySpool.entries,
+    segmentSummary: segmentData.summary,
+    mergeTiers: stats.mergeTiers || [],
+    mergePolicy: stats.mergePolicy || null,
+    reduceTimings: {
+      segmentTierMergeMs: stats.timings?.tierMergeMs || 0,
+      segmentReducedSpoolMs: stats.timings?.reducedSpoolMs || 0,
+      segmentPartitionAssemblyMs: stats.timings?.partitionAssemblyMs || 0
+    },
+    reducedSpoolBytes: stats.reducedSpoolBytes || 0,
+    partitionSpoolBytes: stats.partitionSpoolBytes || 0,
+    partitionSpoolEntries: stats.partitionSpoolEntries || 0
+  };
+}
+
+async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docSpool, codes) {
+  const definitions = sortReplicaDefinitions(config);
+  const replicas = {};
+  const aggregate = {
+    docs: 0,
+    terms: 0,
+    postings: 0,
+    segmentFiles: 0,
+    termPackFiles: 0,
+    termPackBytes: 0,
+    blockPackFiles: 0,
+    blockPackBytes: 0,
+    rankPackFiles: 0,
+    rankPackBytes: 0,
+    docPackFiles: 0,
+    docPackBytes: 0,
+    docPointerBytes: 0,
+    docPagePackFiles: 0,
+    docPagePackBytes: 0,
+    docPagePointerBytes: 0,
+    directoryBytes: 0
+  };
+
+  for (const definition of definitions) {
+    const rows = sortRowsForReplica(config, measured.total, codes, definition.field, definition.order);
+    const docToRank = new Int32Array(measured.total);
+    docToRank.fill(-1);
+    for (let rank = 0; rank < rows.length; rank++) docToRank[rows[rank].doc] = rank;
+    const rankMap = writeSortReplicaRankMap(dirs.out, config, definition, rows);
+    const docPacks = writeSortReplicaDocPacks(dirs.out, config, definition, rows, docSpool);
+    const segmentData = await buildSortReplicaSegments(config, dirs, selectedTermSpool, definition, docToRank);
+    const reduced = await reduceSortReplicaSegments(config, measured, dirs, definition, segmentData, rows.length);
+
+    aggregate.docs += rows.length;
+    aggregate.terms += reduced.termCount;
+    aggregate.postings += reduced.postingCount;
+    aggregate.segmentFiles += segmentData.segments.length;
+    aggregate.termPackFiles += reduced.packs.length;
+    aggregate.termPackBytes += reduced.packBytes;
+    aggregate.blockPackFiles += reduced.blockPacks.length;
+    aggregate.blockPackBytes += reduced.blockPackBytes;
+    aggregate.rankPackFiles += rankMap.packs;
+    aggregate.rankPackBytes += rankMap.pack_bytes;
+    aggregate.docPackFiles += docPacks.packs;
+    aggregate.docPackBytes += docPacks.pack_bytes;
+    aggregate.docPointerBytes += docPacks.pointers.bytes;
+    aggregate.directoryBytes += reduced.directoryBytes;
+
+    replicas[definition.key] = {
+      format: "rfsortreplica-v1",
+      key: definition.key,
+      id: definition.id,
+      field: definition.field.name,
+      field_kind: definition.field.kind,
+      field_type: definition.field.type,
+      order: definition.order,
+      total: rows.length,
+      posting_order: "sort-rank",
+      base_shard_depth: config.baseShardDepth,
+      max_shard_depth: config.maxShardDepth,
+      terms: {
+        directory: reduced.directory,
+        packs_path: `sort-replicas/${definition.id}/terms/packs`,
+        block_packs_path: `sort-replicas/${definition.id}/terms/block-packs`,
+        packs: reduced.packs.length,
+        pack_table: packTable(reduced.packs),
+        block_packs: reduced.blockPacks.length,
+        block_pack_table: packTable(reduced.blockPacks)
+      },
+      rank_map: rankMap,
+      doc_packs: docPacks,
+      stats: {
+        docs: rows.length,
+        skipped_docs: segmentData.skippedDocs,
+        terms: reduced.termCount,
+        postings: reduced.postingCount,
+        segment_files: segmentData.segments.length,
+        term_pack_files: reduced.packs.length,
+        term_pack_bytes: reduced.packBytes,
+        block_pack_files: reduced.blockPacks.length,
+        block_pack_bytes: reduced.blockPackBytes,
+        rank_pack_files: rankMap.packs,
+        rank_pack_bytes: rankMap.pack_bytes,
+        doc_pack_files: docPacks.packs,
+        doc_pack_bytes: docPacks.pack_bytes,
+        doc_pointer_bytes: docPacks.pointers.bytes,
+        directory_bytes: reduced.directoryBytes,
+        external_blocks: reduced.blockStats.externalBlocks,
+        external_terms: reduced.blockStats.externalTerms,
+        external_postings: reduced.blockStats.externalPostings,
+        reduced_spool_bytes: reduced.reducedSpoolBytes,
+        partition_spool_bytes: reduced.partitionSpoolBytes,
+        partition_spool_entries: reduced.partitionSpoolEntries
+      }
+    };
+  }
+
+  return {
+    format: SORT_REPLICA_FORMAT,
+    compression: "gzip-member",
+    count: Object.keys(replicas).length,
+    replicas,
+    stats: aggregate
+  };
+}
+
 function packFileIndex(file) {
   const match = /^(\d+)/u.exec(String(file || ""));
   return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
@@ -1804,27 +2270,28 @@ function buildTelemetryDiskByteGroups(out) {
       resolve(out, "docs", "page-packs"),
       resolve(out, "doc-values", "packs"),
       resolve(out, "doc-values", "sorted-packs"),
-      resolve(out, "filter-bitmaps", "packs"),
-      resolve(out, "facets", "packs"),
-      resolve(out, "bundles", "packs"),
-      resolve(out, "authority", "packs")
-    ],
-    sidecars: [
-      resolve(out, "terms", "block-packs"),
-      resolve(out, "terms", "directory"),
+	      resolve(out, "filter-bitmaps", "packs"),
+	      resolve(out, "facets", "packs"),
+	      resolve(out, "bundles", "packs"),
+	      resolve(out, "authority", "packs"),
+	      resolve(out, "sort-replicas")
+	    ],
+	    sidecars: [
+	      resolve(out, "terms", "block-packs"),
+	      resolve(out, "terms", "directory"),
       resolve(out, "docs", "pointers"),
       resolve(out, "docs", "ordinals"),
       resolve(out, "docs", "pages"),
       resolve(out, "doc-values", "sorted"),
       resolve(out, "filter-bitmaps", "manifest.json.gz"),
       resolve(out, "facets", "directory"),
-      resolve(out, "bundles", "directory"),
-      resolve(out, "authority", "directory"),
-      resolve(out, "segments"),
-      resolve(out, "typo")
-    ]
-  };
-}
+	      resolve(out, "bundles", "directory"),
+	      resolve(out, "authority", "directory"),
+	      resolve(out, "segments"),
+	      resolve(out, "typo")
+	    ]
+	  };
+	}
 
 function minimalManifest(manifest) {
   return {
@@ -1872,9 +2339,10 @@ function minimalManifest(manifest) {
     numbers: manifest.numbers,
     booleans: manifest.booleans,
     sorts: manifest.sorts,
-    block_filters: manifest.block_filters,
-    directory: manifest.directory,
-    query_bundles: manifest.query_bundles,
+	    block_filters: manifest.block_filters,
+	    directory: manifest.directory,
+	    sort_replicas: manifest.sort_replicas,
+	    query_bundles: manifest.query_bundles,
     authority: manifest.authority,
     optimizer: manifest.optimizer,
     typo: manifest.typo ? {
@@ -2005,13 +2473,18 @@ export async function build({ configPath }) {
       mergePolicy: reduced.mergePolicy,
       publishSegments: true
     }));
-    const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
-    addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
-    addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
-    addBuildCounter(telemetry, "field_row_numeric_fields", fieldRows.numericFields);
-    addBuildCounter(telemetry, "field_row_boolean_fields", fieldRows.booleanFields);
-    addBuildCounter(telemetry, "field_row_date_fields", fieldRows.dateFields);
-    const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
+	    const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
+	    addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
+	    addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
+	    addBuildCounter(telemetry, "field_row_numeric_fields", fieldRows.numericFields);
+	    addBuildCounter(telemetry, "field_row_boolean_fields", fieldRows.booleanFields);
+	    addBuildCounter(telemetry, "field_row_date_fields", fieldRows.dateFields);
+	    const sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
+	    addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
+	    addBuildCounter(telemetry, "sort_replica_docs", sortReplicas.stats.docs);
+	    addBuildCounter(telemetry, "sort_replica_postings", sortReplicas.stats.postings);
+	    addBuildCounter(telemetry, "sort_replica_doc_pack_bytes", sortReplicas.stats.docPackBytes);
+	    const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
     const authority = await timeBuildPhase(telemetry, "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
     const docs = await timeBuildPhase(telemetry, "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
     docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
@@ -2041,10 +2514,11 @@ export async function build({ configPath }) {
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
       segmentManifest: true,
-      queryBundles: !!queryBundles,
-      authority: !!authority,
-      typoSidecar: !!typoManifest
-    },
+	      queryBundles: !!queryBundles,
+	      authority: !!authority,
+	      sortReplicas: sortReplicas.count > 0,
+	      typoSidecar: !!typoManifest
+	    },
     object_store: {
       format: OBJECT_STORE_FORMAT,
       pointer_format: OBJECT_POINTER_FORMAT,
@@ -2120,7 +2594,7 @@ export async function build({ configPath }) {
       fields: docValues.fields,
       packs: docValues.packs.length
     },
-    doc_value_sorted: {
+	    doc_value_sorted: {
       storage: docValueSorted.storage,
       compression: docValueSorted.compression,
       directory_format: docValueSorted.directory_format,
@@ -2128,9 +2602,10 @@ export async function build({ configPath }) {
       page_size: docValueSorted.page_size,
       fields: docValueSorted.fields,
       packs: docValueSorted.packs.length,
-      pack_table: docValueSorted.pack_table
-    },
-    filter_bitmaps: {
+	      pack_table: docValueSorted.pack_table
+	    },
+	    sort_replicas: sortReplicas,
+	    filter_bitmaps: {
       storage: filterBitmaps.storage,
       compression: filterBitmaps.compression,
       format: filterBitmaps.format,
@@ -2297,9 +2772,28 @@ export async function build({ configPath }) {
       doc_value_sorted_fields: Object.keys(docValueSorted.fields).length,
       doc_value_sorted_directory_bytes: docValueSorted.directory_bytes,
       doc_value_sorted_directory_logical_bytes: docValueSorted.directory_logical_bytes,
-      doc_value_sorted_pack_files: docValueSorted.packs.length,
-      doc_value_sorted_pack_bytes: docValueSorted.pack_bytes,
-      filter_bitmap_storage: filterBitmaps.storage,
+	      doc_value_sorted_pack_files: docValueSorted.packs.length,
+	      doc_value_sorted_pack_bytes: docValueSorted.pack_bytes,
+	      sort_replica_format: sortReplicas.format,
+	      sort_replica_count: sortReplicas.count,
+	      sort_replica_docs: sortReplicas.stats.docs,
+	      sort_replica_terms: sortReplicas.stats.terms,
+	      sort_replica_postings: sortReplicas.stats.postings,
+	      sort_replica_segment_files: sortReplicas.stats.segmentFiles,
+	      sort_replica_term_pack_files: sortReplicas.stats.termPackFiles,
+	      sort_replica_term_pack_bytes: sortReplicas.stats.termPackBytes,
+	      sort_replica_block_pack_files: sortReplicas.stats.blockPackFiles,
+	      sort_replica_block_pack_bytes: sortReplicas.stats.blockPackBytes,
+	      sort_replica_rank_pack_files: sortReplicas.stats.rankPackFiles,
+	      sort_replica_rank_pack_bytes: sortReplicas.stats.rankPackBytes,
+	      sort_replica_doc_pack_files: sortReplicas.stats.docPackFiles,
+	      sort_replica_doc_pack_bytes: sortReplicas.stats.docPackBytes,
+	      sort_replica_doc_pointer_bytes: sortReplicas.stats.docPointerBytes,
+	      sort_replica_doc_page_pack_files: sortReplicas.stats.docPagePackFiles,
+	      sort_replica_doc_page_pack_bytes: sortReplicas.stats.docPagePackBytes,
+	      sort_replica_doc_page_pointer_bytes: sortReplicas.stats.docPagePointerBytes,
+	      sort_replica_directory_bytes: sortReplicas.stats.directoryBytes,
+	      filter_bitmap_storage: filterBitmaps.storage,
       filter_bitmap_format: filterBitmaps.format,
       filter_bitmap_fields: Object.keys(filterBitmaps.fields).length,
       filter_bitmap_pack_files: filterBitmaps.packs.length,
