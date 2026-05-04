@@ -1,6 +1,6 @@
 {
   "format": "rffrwikibench-index-v1",
-  "updatedAt": "2026-05-04T12:14:40.092Z",
+  "updatedAt": "2026-05-04T12:33:25.774Z",
   "latest": {
     "runtime:limit-1000000": {
       "format": "rffrwikibench-artifact-v1",
@@ -354,6 +354,120 @@
           "pct": 0
         }
       }
+    },
+    "builder:limit-50000": {
+      "format": "rffrwikibench-artifact-v1",
+      "kind": "builder",
+      "limit": 50000,
+      "limitSlug": "limit-50000",
+      "generatedAt": "2026-05-04T12:33:24.694Z",
+      "gitCommit": "a4f3a9f",
+      "command": "all",
+      "runs": 1,
+      "size": 10,
+      "historyPath": "benchmarks/frwiki/history/builder/limit-50000/2026-05-04T12-33-24-694Z_a4f3a9f.json",
+      "latestPath": "benchmarks/frwiki/latest/builder/limit-50000.json",
+      "summary": {
+        "docs": 50000,
+        "indexBytes": 198938115,
+        "indexFiles": 181,
+        "bytesPerDoc": 3978.7623,
+        "totalMs": 93725.082084,
+        "peakRss": 1825079296,
+        "tempPeakBytes": 293115406,
+        "outputWrittenBytes": 196924402,
+        "writeAmplification": 0.9898776913614568
+      },
+      "previousHistoryPath": null,
+      "deltas": {}
+    },
+    "runtime:limit-50000": {
+      "format": "rffrwikibench-artifact-v1",
+      "kind": "runtime",
+      "limit": 50000,
+      "limitSlug": "limit-50000",
+      "generatedAt": "2026-05-04T12:33:25.769Z",
+      "gitCommit": "a4f3a9f",
+      "command": "all",
+      "runs": 1,
+      "size": 10,
+      "historyPath": "benchmarks/frwiki/history/runtime/limit-50000/2026-05-04T12-33-25-769Z_a4f3a9f.json",
+      "latestPath": "benchmarks/frwiki/latest/runtime/limit-50000.json",
+      "summary": {
+        "docs": 50000,
+        "indexBytes": 198938115,
+        "indexFiles": 181,
+        "rows": 25,
+        "validRows": 25,
+        "avgColdMs": 14.860028439998278,
+        "avgColdRequests": 22.68,
+        "avgColdKb": 155.7826953125,
+        "maxColdMs": 44.94566699999268,
+        "selected": {
+          "Paris": {
+            "coldMs": 36.335625000006985,
+            "coldRequests": 22,
+            "coldKb": 179.6376953125,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 1,
+            "postingsDecoded": 128,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Révolution française": {
+            "coldMs": 36.01579099999799,
+            "coldRequests": 28,
+            "coldKb": 317.939453125,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 36,
+            "postingsDecoded": 4390,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Révolution française size 25": {
+            "coldMs": 44.94566699999268,
+            "coldRequests": 56,
+            "coldKb": 428.6181640625,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 53,
+            "postingsDecoded": 6566,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "typo changement climatique": {
+            "coldMs": 22.047959000003175,
+            "coldRequests": 38,
+            "coldKb": 312.7607421875,
+            "valid": true,
+            "lane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 0,
+            "postingsDecoded": 0,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Paris sorted by revision date": {
+            "coldMs": 16.250625000000582,
+            "coldRequests": 32,
+            "coldKb": 183.630859375,
+            "valid": true,
+            "lane": "sortPageText",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 35,
+            "postingsDecoded": 67,
+            "docValuePagesVisited": 1,
+            "docValueSortPageFetchGroups": 1
+          }
+        }
+      },
+      "previousHistoryPath": null,
+      "deltas": {}
     }
   },
   "history": [
@@ -1150,6 +1264,120 @@
           "pct": 0
         }
       }
+    },
+    {
+      "format": "rffrwikibench-artifact-v1",
+      "kind": "builder",
+      "limit": 50000,
+      "limitSlug": "limit-50000",
+      "generatedAt": "2026-05-04T12:33:24.694Z",
+      "gitCommit": "a4f3a9f",
+      "command": "all",
+      "runs": 1,
+      "size": 10,
+      "historyPath": "benchmarks/frwiki/history/builder/limit-50000/2026-05-04T12-33-24-694Z_a4f3a9f.json",
+      "latestPath": "benchmarks/frwiki/latest/builder/limit-50000.json",
+      "summary": {
+        "docs": 50000,
+        "indexBytes": 198938115,
+        "indexFiles": 181,
+        "bytesPerDoc": 3978.7623,
+        "totalMs": 93725.082084,
+        "peakRss": 1825079296,
+        "tempPeakBytes": 293115406,
+        "outputWrittenBytes": 196924402,
+        "writeAmplification": 0.9898776913614568
+      },
+      "previousHistoryPath": null,
+      "deltas": {}
+    },
+    {
+      "format": "rffrwikibench-artifact-v1",
+      "kind": "runtime",
+      "limit": 50000,
+      "limitSlug": "limit-50000",
+      "generatedAt": "2026-05-04T12:33:25.769Z",
+      "gitCommit": "a4f3a9f",
+      "command": "all",
+      "runs": 1,
+      "size": 10,
+      "historyPath": "benchmarks/frwiki/history/runtime/limit-50000/2026-05-04T12-33-25-769Z_a4f3a9f.json",
+      "latestPath": "benchmarks/frwiki/latest/runtime/limit-50000.json",
+      "summary": {
+        "docs": 50000,
+        "indexBytes": 198938115,
+        "indexFiles": 181,
+        "rows": 25,
+        "validRows": 25,
+        "avgColdMs": 14.860028439998278,
+        "avgColdRequests": 22.68,
+        "avgColdKb": 155.7826953125,
+        "maxColdMs": 44.94566699999268,
+        "selected": {
+          "Paris": {
+            "coldMs": 36.335625000006985,
+            "coldRequests": 22,
+            "coldKb": 179.6376953125,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 1,
+            "postingsDecoded": 128,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Révolution française": {
+            "coldMs": 36.01579099999799,
+            "coldRequests": 28,
+            "coldKb": 317.939453125,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 36,
+            "postingsDecoded": 4390,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Révolution française size 25": {
+            "coldMs": 44.94566699999268,
+            "coldRequests": 56,
+            "coldKb": 428.6181640625,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 53,
+            "postingsDecoded": 6566,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "typo changement climatique": {
+            "coldMs": 22.047959000003175,
+            "coldRequests": 38,
+            "coldKb": 312.7607421875,
+            "valid": true,
+            "lane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 0,
+            "postingsDecoded": 0,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Paris sorted by revision date": {
+            "coldMs": 16.250625000000582,
+            "coldRequests": 32,
+            "coldKb": 183.630859375,
+            "valid": true,
+            "lane": "sortPageText",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 35,
+            "postingsDecoded": 67,
+            "docValuePagesVisited": 1,
+            "docValueSortPageFetchGroups": 1
+          }
+        }
+      },
+      "previousHistoryPath": null,
+      "deltas": {}
     }
   ]
 }
