@@ -33,6 +33,7 @@ const TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
 const TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 const DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
 const DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.75;
+const DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 512;
 const DOC_VALUE_SORT_PAGE_BATCH_SIZE = 16;
 const textDecoder = new TextDecoder();
 let activeRuntimeTrace = null;
@@ -401,6 +402,10 @@ export async function createSearch(options = {}) {
     Math.floor(Number(options.docValueSortPageBatchSize || DOC_VALUE_SORT_PAGE_BATCH_SIZE))
   ));
   const docRangePlannerEnabled = options.docRangePlanner !== false;
+  const docRangeBlockPruneBatchSize = Math.max(1, Math.min(
+    2048,
+    Math.floor(Number(options.docRangeBlockPruneBatchSize || DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE))
+  ));
   const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
     TYPO_CORRECTION_PLAN_LIMIT,
     Math.floor(Number(options.typoCorrectionExecutionPlans || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
@@ -2838,6 +2843,16 @@ export async function createSearch(options = {}) {
     return entryDocRangeMaxByIndex(entry)?.get(rangeIndex) || 0;
   }
 
+  function docRangeMaxForIndex(entry, rangeIndex) {
+    return entryDocRangeMaxByIndex(entry)?.get(rangeIndex) || 0;
+  }
+
+  function blockUpperBoundInDocRange(entry, block, rangeIndex) {
+    const blockImpact = block?.maxImpact || 0;
+    const rangeImpact = docRangeMaxForIndex(entry, rangeIndex);
+    return rangeImpact ? Math.min(blockImpact, rangeImpact) : blockImpact;
+  }
+
   function remainingImpactForCursor(cursor, block, doc = null) {
     const blockImpact = block?.maxImpact || 0;
     if (doc == null) return blockImpact;
@@ -3233,6 +3248,76 @@ export async function createSearch(options = {}) {
     return null;
   }
 
+  function remainingBlockPotential(remainingTermBounds, mask = 0) {
+    let potential = 0;
+    let terms = 0;
+    for (let termIndex = 0; termIndex < remainingTermBounds.length; termIndex++) {
+      const bound = remainingTermBounds[termIndex] || 0;
+      if (!bound) continue;
+      if (termIndex < SKIP_MAX_TERMS && bitIsSet(mask, termIndex)) continue;
+      potential += bound;
+      terms++;
+    }
+    return { potential, terms };
+  }
+
+  function stableDocRangeBlockTopK(scores, hits, masks, minShouldMatch, k, nextRangeUpperBound, remainingTermBounds, proofStats = null) {
+    if (proofStats) proofStats.attempts++;
+    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
+    const unseenBlocks = remainingBlockPotential(remainingTermBounds);
+    const unseenPotential = Math.max(nextRangeUpperBound, unseenBlocks.potential);
+    if (eligible.length < k) {
+      recordTopKProofFailure(proofStats, "candidate_count", { maxOutsidePotential: unseenPotential });
+      return null;
+    }
+
+    const top = eligible.slice(0, k);
+    const threshold = top[top.length - 1][1];
+    const boundaryDoc = top[top.length - 1][0];
+    let maxOutsidePotential = unseenPotential;
+    let maxRemainingTerms = unseenBlocks.potential >= nextRangeUpperBound ? unseenBlocks.terms : 0;
+    let maxRemainingTermUpperBound = unseenPotential;
+
+    if (maxOutsidePotential >= threshold) {
+      recordTopKProofFailure(proofStats, maxOutsidePotential === threshold ? "tie_bound" : "score_bound", {
+        threshold,
+        maxOutsidePotential,
+        remainingTerms: maxRemainingTerms,
+        remainingTermUpperBound: maxRemainingTermUpperBound
+      });
+      return null;
+    }
+
+    const topDocs = new Set(top.map(([doc]) => doc));
+    for (const [doc, score] of scores) {
+      if (topDocs.has(doc)) continue;
+      const remaining = remainingBlockPotential(remainingTermBounds, masks.get(doc) || 0);
+      const potential = score + remaining.potential;
+      if (potential > maxOutsidePotential) {
+        maxOutsidePotential = potential;
+        maxRemainingTerms = remaining.terms;
+        maxRemainingTermUpperBound = remaining.potential;
+      }
+      if (potential > threshold || (potential === threshold && doc < boundaryDoc)) {
+        recordTopKProofFailure(proofStats, potential === threshold ? "tie_bound" : "score_bound", {
+          threshold,
+          maxOutsidePotential: potential,
+          remainingTerms: remaining.terms,
+          remainingTermUpperBound: remaining.potential
+        });
+        return null;
+      }
+    }
+
+    recordTopKProofSuccess(proofStats, {
+      threshold,
+      maxOutsidePotential,
+      remainingTerms: maxRemainingTerms,
+      remainingTermUpperBound: maxRemainingTermUpperBound
+    });
+    return top;
+  }
+
   async function runDocRangeUpperBoundSearch({
     page,
     size,
@@ -3285,12 +3370,21 @@ export async function createSearch(options = {}) {
     let fetchGroups = 0;
     let wantedBlocks = 0;
     let filterSummaryProofBlocks = 0;
+    let docRangeBlockBatches = 0;
+    let docRangeInnerBlocksPruned = 0;
     let stopUpperBound = 0;
 
     for (let rangeIndex = 0; rangeIndex < plan.candidates.length; rangeIndex++) {
       const range = plan.candidates[rangeIndex];
       const rangeStart = range.index * plan.rangeSize;
       const rangeEnd = Math.min(manifest.total, rangeStart + plan.rangeSize);
+      const nextRangeUpperBound = plan.candidates[rangeIndex + 1]?.upperBound || 0;
+      const queues = [];
+      const remainingTermBounds = new Array(cursors.length).fill(0);
+      const remainingQueueBlocks = () => queues.reduce((sum, queue) => sum + Math.max(0, queue.tasks.length - queue.offset), 0);
+      const refreshQueueBound = (queue) => {
+        remainingTermBounds[queue.termIndex] = queue.offset < queue.tasks.length ? queue.tasks[queue.offset].upperBound : 0;
+      };
       rangesVisited++;
       for (const cursor of cursors) {
         const candidates = docRangeCandidateBlockIndexes(cursor.entry, rangeStart, rangeEnd, blockFilterPlan);
@@ -3300,42 +3394,94 @@ export async function createSearch(options = {}) {
         consideredPostingSuperblocks += candidates.consideredSuperblocks;
         skippedPostingSuperblocks += candidates.skippedSuperblocks;
         if (!candidates.indexes.length) continue;
-        const decoded = await decodeEntryBlockBatch(cursor.shard, cursor.entry, candidates.indexes, "postingDocRanges");
-        fetchedBlocks += decoded.fetchedBlocks;
-        fetchGroups += decoded.fetchGroups;
-        wantedBlocks += decoded.wantedBlocks;
-        for (const { blockIndex, rows } of decoded.blocks) {
-          const block = cursor.entry.blocks?.[blockIndex];
-          const blockKey = `${cursor.shardName}\u0000${cursor.term}\u0000${blockIndex}`;
-          if (!decodedBlocks.has(blockKey)) {
-            decodedBlocks.add(blockKey);
-            blocksDecoded++;
+        const tasks = candidates.indexes
+          .map(blockIndex => ({
+            blockIndex,
+            upperBound: blockUpperBoundInDocRange(cursor.entry, cursor.entry.blocks?.[blockIndex], range.index)
+          }))
+          .filter(task => task.upperBound > 0)
+          .sort((a, b) => b.upperBound - a.upperBound || a.blockIndex - b.blockIndex);
+        if (!tasks.length) continue;
+        const queue = { cursor, termIndex: cursor.termIndex, tasks, offset: 0 };
+        queues.push(queue);
+        refreshQueueBound(queue);
+      }
+      stopUpperBound = Math.max(nextRangeUpperBound, remainingBlockPotential(remainingTermBounds).potential);
+      stable = stableDocRangeBlockTopK(scores, hits, masks, minShouldMatch, candidateK, nextRangeUpperBound, remainingTermBounds, proofStats);
+      if (stable) {
+        docRangeInnerBlocksPruned += remainingQueueBlocks();
+        break;
+      }
+
+      while (remainingQueueBlocks() > 0) {
+        const batch = [];
+        while (batch.length < docRangeBlockPruneBatchSize) {
+          let bestQueue = null;
+          let bestTask = null;
+          for (const queue of queues) {
+            const task = queue.tasks[queue.offset];
+            if (!task) continue;
+            if (!bestTask || task.upperBound > bestTask.upperBound || (task.upperBound === bestTask.upperBound && task.blockIndex < bestTask.blockIndex)) {
+              bestQueue = queue;
+              bestTask = task;
+            }
           }
-          blocksVisited++;
-          postingRowsScanned += rows.length / 2;
-          const docsInRange = hasFilters ? postingDocsInRange(rows, rangeStart, rangeEnd) : null;
-          if (hasFilters && !docsInRange.length) continue;
-          const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
-          if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
-          const codeData = hasFilters && !filterSummaryProvesBlock && docValues
-            ? await valueStoreForFilterPlan(docFilterPlan, docsInRange)
-            : filterSummaryProvesBlock ? null : fallbackCodeData;
-          postingsDecoded += rows.length / 2;
-          postingsAccepted += applyBlockRowsInDocRange(
-            cursor,
-            rows,
-            rangeStart,
-            rangeEnd,
-            codeData,
-            filterSummaryProvesBlock ? null : docFilterPlan,
-            scores,
-            hits,
-            masks
-          );
+          if (!bestQueue || !bestTask) break;
+          bestQueue.offset++;
+          refreshQueueBound(bestQueue);
+          batch.push({ cursor: bestQueue.cursor, blockIndex: bestTask.blockIndex });
+        }
+        if (!batch.length) break;
+        docRangeBlockBatches++;
+        const byCursor = new Map();
+        for (const item of batch) {
+          const key = item.cursor.termIndex;
+          const current = byCursor.get(key) || { cursor: item.cursor, indexes: [] };
+          current.indexes.push(item.blockIndex);
+          byCursor.set(key, current);
+        }
+        for (const { cursor, indexes } of byCursor.values()) {
+          const decoded = await decodeEntryBlockBatch(cursor.shard, cursor.entry, indexes, "postingDocRanges");
+          fetchedBlocks += decoded.fetchedBlocks;
+          fetchGroups += decoded.fetchGroups;
+          wantedBlocks += decoded.wantedBlocks;
+          for (const { blockIndex, rows } of decoded.blocks) {
+            const block = cursor.entry.blocks?.[blockIndex];
+            const blockKey = `${cursor.shardName}\u0000${cursor.term}\u0000${blockIndex}`;
+            if (!decodedBlocks.has(blockKey)) {
+              decodedBlocks.add(blockKey);
+              blocksDecoded++;
+            }
+            blocksVisited++;
+            postingRowsScanned += rows.length / 2;
+            const docsInRange = hasFilters ? postingDocsInRange(rows, rangeStart, rangeEnd) : null;
+            if (hasFilters && !docsInRange.length) continue;
+            const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
+            if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
+            const codeData = hasFilters && !filterSummaryProvesBlock && docValues
+              ? await valueStoreForFilterPlan(docFilterPlan, docsInRange)
+              : filterSummaryProvesBlock ? null : fallbackCodeData;
+            postingsDecoded += rows.length / 2;
+            postingsAccepted += applyBlockRowsInDocRange(
+              cursor,
+              rows,
+              rangeStart,
+              rangeEnd,
+              codeData,
+              filterSummaryProvesBlock ? null : docFilterPlan,
+              scores,
+              hits,
+              masks
+            );
+          }
+        }
+        stopUpperBound = Math.max(nextRangeUpperBound, remainingBlockPotential(remainingTermBounds).potential);
+        stable = stableDocRangeBlockTopK(scores, hits, masks, minShouldMatch, candidateK, nextRangeUpperBound, remainingTermBounds, proofStats);
+        if (stable) {
+          docRangeInnerBlocksPruned += remainingQueueBlocks();
+          break;
         }
       }
-      stopUpperBound = plan.candidates[rangeIndex + 1]?.upperBound || 0;
-      stable = stableDocRangeTopK(scores, hits, minShouldMatch, candidateK, stopUpperBound, proofStats);
       if (stable) break;
     }
     exhausted = !stable && rangesVisited >= plan.candidates.length;
@@ -3382,7 +3528,10 @@ export async function createSearch(options = {}) {
         docRangePostingRowsScanned: postingRowsScanned,
         docRangePostingBlocksConsidered: consideredPostingBlocks,
         docRangePostingBlocksCandidate: candidatePostingBlocks,
+        docRangePostingBlocksProcessed: blocksVisited,
         docRangePostingBlocksSkipped: skippedPostingBlocks,
+        docRangeInnerBlockBatches: docRangeBlockBatches,
+        docRangeInnerBlocksPruned,
         docRangePostingSuperblocksConsidered: consideredPostingSuperblocks,
         docRangePostingSuperblocksSkipped: skippedPostingSuperblocks,
         docRangeFetchedBlocks: fetchedBlocks,

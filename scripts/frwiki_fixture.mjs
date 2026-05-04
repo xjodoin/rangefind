@@ -546,11 +546,18 @@ function safeRunId(generatedAt, commit = null) {
 
 function currentGitCommit() {
   try {
-    return execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+    const commit = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: resolve("."),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
-    }).trim() || null;
+    }).trim();
+    if (!commit) return null;
+    const dirty = execFileSync("git", ["status", "--short", "--untracked-files=no"], {
+      cwd: resolve("."),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    return dirty ? `${commit}-dirty` : commit;
   } catch {
     return null;
   }
@@ -1074,6 +1081,9 @@ function compactRuntimeStats(stats = {}) {
     docRangeBlocksVisited: stats.docRangeBlocksVisited || 0,
     docRangePostingRowsScanned: stats.docRangePostingRowsScanned || 0,
     docRangePostingBlocksCandidate: stats.docRangePostingBlocksCandidate || 0,
+    docRangePostingBlocksProcessed: stats.docRangePostingBlocksProcessed || 0,
+    docRangeInnerBlockBatches: stats.docRangeInnerBlockBatches || 0,
+    docRangeInnerBlocksPruned: stats.docRangeInnerBlocksPruned || 0,
     docRangeFetchedBlocks: stats.docRangeFetchedBlocks || 0,
     docRangeFetchGroups: stats.docRangeFetchGroups || 0,
     rerankCandidates: stats.rerankCandidates || 0,
@@ -1369,6 +1379,7 @@ function summarizeScaleRow(row) {
     docRangeBlockMax: row.coldStats?.docRangeBlockMax || false,
     docRangeRangesVisited: row.coldStats?.docRangeRangesVisited || 0,
     docRangeRangesPruned: row.coldStats?.docRangeRangesPruned || 0,
+    docRangeInnerBlocksPruned: row.coldStats?.docRangeInnerBlocksPruned || 0,
     docRangeCandidateBlockRatio: row.coldStats?.docRangeCandidateBlockRatio || 0,
     plannerLane: row.coldStats?.plannerLane || "",
     topKProven: row.coldStats?.topKProven || false,

@@ -859,3 +859,51 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
   assert.equal(largePageFallback.stats.topKProofFailureReason, "top_k_limit");
   assert.equal(largePageFallback.stats.topKProofAttempts, 0);
 });
+
+test("doc-range planner batches candidate blocks with inner proof stats", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-doc-range-inner-"));
+  const docsPath = join(root, "docs.jsonl");
+  const configPath = join(root, "rangefind.config.json");
+  const docs = Array.from({ length: 60 }, (_, index) => {
+    const head = index < 5;
+    return JSON.stringify({
+      id: String(index),
+      title: head ? "alpha beta alpha beta alpha beta" : `document ${index}`,
+      body: "alpha beta",
+      url: `/${index}`
+    });
+  });
+  await writeFile(docsPath, docs.join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    baseShardDepth: 1,
+    maxShardDepth: 1,
+    targetShardPostings: 1000,
+    postingBlockSize: 1,
+    postingDocRangeSize: 5,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0,
+    queryBundles: false,
+    fields: [
+      { name: "title", path: "title", weight: 4.0 },
+      { name: "body", path: "body", weight: 1.0 }
+    ],
+    display: ["title", "url"]
+  }));
+
+  await build({ configPath });
+  const server = await serveStatic(join(root, "public"));
+  t.after(() => server.close());
+  const search = await createSearch({
+    baseUrl: server.baseUrl,
+    docRangeBlockPruneBatchSize: 2
+  });
+
+  const result = await search.search({ q: "alpha beta", size: 5, rerank: false });
+  assert.equal(result.stats.plannerLane, "docRangeBlockMax");
+  assert.deepEqual(result.results.map(row => row.id), ["0", "1", "2", "3", "4"]);
+  assert.ok(result.stats.docRangeInnerBlockBatches > 0);
+  assert.ok(result.stats.docRangePostingBlocksProcessed <= result.stats.docRangePostingBlocksCandidate);
+  assert.ok(result.stats.docRangeNextUpperBound < result.stats.topKProofThreshold);
+});
