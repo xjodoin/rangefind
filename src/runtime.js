@@ -32,8 +32,9 @@ const TYPO_CORRECTION_EXECUTION_PLAN_LIMIT = 1;
 const TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
 const TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 const DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
-const DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.75;
+const DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.12;
 const DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 512;
+const DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE = 32;
 const DOC_VALUE_SORT_PAGE_BATCH_SIZE = 16;
 const textDecoder = new TextDecoder();
 let activeRuntimeTrace = null;
@@ -405,6 +406,10 @@ export async function createSearch(options = {}) {
   const docRangeBlockPruneBatchSize = Math.max(1, Math.min(
     2048,
     Math.floor(Number(options.docRangeBlockPruneBatchSize || DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE))
+  ));
+  const docRangeBlockPruneInitialBatchSize = Math.max(1, Math.min(
+    docRangeBlockPruneBatchSize,
+    Math.floor(Number(options.docRangeBlockPruneInitialBatchSize || DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE))
   ));
   const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
     TYPO_CORRECTION_PLAN_LIMIT,
@@ -3425,9 +3430,10 @@ export async function createSearch(options = {}) {
         break;
       }
 
+      let batchLimit = Math.min(docRangeBlockPruneBatchSize, docRangeBlockPruneInitialBatchSize);
       while (remainingQueueBlocks() > 0) {
         const batch = [];
-        while (batch.length < docRangeBlockPruneBatchSize) {
+        while (batch.length < batchLimit) {
           let bestQueue = null;
           let bestTask = null;
           for (const queue of queues) {
@@ -3493,6 +3499,7 @@ export async function createSearch(options = {}) {
           docRangeInnerBlocksPruned += remainingQueueBlocks();
           break;
         }
+        batchLimit = Math.min(docRangeBlockPruneBatchSize, batchLimit * 2);
       }
       if (stable) break;
     }
