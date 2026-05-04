@@ -1,18 +1,18 @@
 {
   "format": "rffrwikibench-index-v1",
-  "updatedAt": "2026-05-04T11:59:08.144Z",
+  "updatedAt": "2026-05-04T12:14:40.092Z",
   "latest": {
     "runtime:limit-1000000": {
       "format": "rffrwikibench-artifact-v1",
       "kind": "runtime",
       "limit": 1000000,
       "limitSlug": "limit-1000000",
-      "generatedAt": "2026-05-04T11:59:08.091Z",
-      "gitCommit": "6eace23",
+      "generatedAt": "2026-05-04T12:14:40.021Z",
+      "gitCommit": "d679210",
       "command": "runtime-bench",
       "runs": 1,
       "size": 10,
-      "historyPath": "benchmarks/frwiki/history/runtime/limit-1000000/2026-05-04T11-59-08-091Z_6eace23.json",
+      "historyPath": "benchmarks/frwiki/history/runtime/limit-1000000/2026-05-04T12-14-40-021Z_d679210.json",
       "latestPath": "benchmarks/frwiki/latest/runtime/limit-1000000.json",
       "summary": {
         "docs": 1000000,
@@ -20,13 +20,13 @@
         "indexFiles": 1705,
         "rows": 25,
         "validRows": 25,
-        "avgColdMs": 52.57144659999998,
-        "avgColdRequests": 29.6,
-        "avgColdKb": 568.88171875,
-        "maxColdMs": 221.988,
+        "avgColdMs": 49.04583844000002,
+        "avgColdRequests": 30.08,
+        "avgColdKb": 565.3615625,
+        "maxColdMs": 222.45012499999996,
         "selected": {
           "Paris": {
-            "coldMs": 87.293542,
+            "coldMs": 80.12145900000002,
             "coldRequests": 39,
             "coldKb": 183.1103515625,
             "valid": true,
@@ -38,31 +38,31 @@
             "docValueSortPageFetchGroups": 0
           },
           "Révolution française": {
-            "coldMs": 221.988,
-            "coldRequests": 54,
-            "coldKb": 3383.5732421875,
+            "coldMs": 214.97108400000002,
+            "coldRequests": 60,
+            "coldKb": 3339.5712890625,
             "valid": true,
             "lane": "docRangeBlockMax",
             "docPayloadLane": "packedDocs",
             "blocksDecoded": 1039,
-            "postingsDecoded": 1309651,
+            "postingsDecoded": 1298020,
             "docValuePagesVisited": 0,
             "docValueSortPageFetchGroups": 0
           },
           "Révolution française size 25": {
-            "coldMs": 220.37537499999996,
-            "coldRequests": 88,
-            "coldKb": 3588.6337890625,
+            "coldMs": 222.45012499999996,
+            "coldRequests": 94,
+            "coldKb": 3544.6318359375,
             "valid": true,
             "lane": "docRangeBlockMax",
             "docPayloadLane": "packedDocs",
             "blocksDecoded": 1051,
-            "postingsDecoded": 2593907,
+            "postingsDecoded": 2583940,
             "docValuePagesVisited": 0,
             "docValueSortPageFetchGroups": 0
           },
           "typo changement climatique": {
-            "coldMs": 55.28491700000018,
+            "coldMs": 51.20024999999998,
             "coldRequests": 41,
             "coldKb": 592.6064453125,
             "valid": true,
@@ -74,7 +74,7 @@
             "docValueSortPageFetchGroups": 0
           },
           "Paris sorted by revision date": {
-            "coldMs": 69.42766699999993,
+            "coldMs": 60.772207999999864,
             "coldRequests": 39,
             "coldKb": 541.5126953125,
             "valid": true,
@@ -87,7 +87,7 @@
           }
         }
       },
-      "previousHistoryPath": "benchmarks/frwiki/history/runtime/limit-1000000/2026-05-04T11-55-48-778Z_4363a96.json",
+      "previousHistoryPath": "benchmarks/frwiki/history/runtime/limit-1000000/2026-05-04T11-59-08-091Z_6eace23.json",
       "deltas": {
         "docs": {
           "previous": 1000000,
@@ -120,34 +120,34 @@
           "pct": 0
         },
         "avgColdMs": {
-          "previous": 50.58472660000003,
-          "current": 52.57144659999998,
-          "delta": 1.9867199999999485,
-          "pct": 0.039275096131486206
+          "previous": 52.57144659999998,
+          "current": 49.04583844000002,
+          "delta": -3.525608159999962,
+          "pct": -0.0670631756973559
         },
         "avgColdRequests": {
           "previous": 29.6,
-          "current": 29.6,
-          "delta": 0,
-          "pct": 0
+          "current": 30.08,
+          "delta": 0.4799999999999969,
+          "pct": 0.01621621621621611
         },
         "avgColdKb": {
           "previous": 568.88171875,
-          "current": 568.88171875,
-          "delta": 0,
-          "pct": 0
+          "current": 565.3615625,
+          "delta": -3.5201562500000136,
+          "pct": -0.006187852648411395
         },
         "maxColdMs": {
-          "previous": 214.892334,
-          "current": 221.988,
-          "delta": 7.095665999999994,
-          "pct": 0.03301963298513941
+          "previous": 221.988,
+          "current": 222.45012499999996,
+          "delta": 0.4621249999999577,
+          "pct": 0.002081756671531604
         },
         "selected.Paris.coldMs": {
-          "previous": 85.970416,
-          "current": 87.293542,
-          "delta": 1.323126000000002,
-          "pct": 0.015390480371759536
+          "previous": 87.293542,
+          "current": 80.12145900000002,
+          "delta": -7.172082999999986,
+          "pct": -0.08216052225260817
         },
         "selected.Paris.coldRequests": {
           "previous": 39,
@@ -186,22 +186,22 @@
           "pct": null
         },
         "selected.Révolution française.coldMs": {
-          "previous": 213.029875,
-          "current": 221.988,
-          "delta": 8.958124999999995,
-          "pct": 0.04205102688061942
+          "previous": 221.988,
+          "current": 214.97108400000002,
+          "delta": -7.016915999999981,
+          "pct": -0.03160943834801872
         },
         "selected.Révolution française.coldRequests": {
           "previous": 54,
-          "current": 54,
-          "delta": 0,
-          "pct": 0
+          "current": 60,
+          "delta": 6,
+          "pct": 0.1111111111111111
         },
         "selected.Révolution française.coldKb": {
           "previous": 3383.5732421875,
-          "current": 3383.5732421875,
-          "delta": 0,
-          "pct": 0
+          "current": 3339.5712890625,
+          "delta": -44.001953125,
+          "pct": -0.013004581244575772
         },
         "selected.Révolution française.blocksDecoded": {
           "previous": 1039,
@@ -211,9 +211,9 @@
         },
         "selected.Révolution française.postingsDecoded": {
           "previous": 1309651,
-          "current": 1309651,
-          "delta": 0,
-          "pct": 0
+          "current": 1298020,
+          "delta": -11631,
+          "pct": -0.008880991958926462
         },
         "selected.Révolution française.docValuePagesVisited": {
           "previous": 0,
@@ -228,22 +228,22 @@
           "pct": null
         },
         "selected.Révolution française size 25.coldMs": {
-          "previous": 214.892334,
-          "current": 220.37537499999996,
-          "delta": 5.483040999999957,
-          "pct": 0.025515293626062797
+          "previous": 220.37537499999996,
+          "current": 222.45012499999996,
+          "delta": 2.0747499999999945,
+          "pct": 0.0094146181260043
         },
         "selected.Révolution française size 25.coldRequests": {
           "previous": 88,
-          "current": 88,
-          "delta": 0,
-          "pct": 0
+          "current": 94,
+          "delta": 6,
+          "pct": 0.06818181818181818
         },
         "selected.Révolution française size 25.coldKb": {
           "previous": 3588.6337890625,
-          "current": 3588.6337890625,
-          "delta": 0,
-          "pct": 0
+          "current": 3544.6318359375,
+          "delta": -44.001953125,
+          "pct": -0.012261477685215447
         },
         "selected.Révolution française size 25.blocksDecoded": {
           "previous": 1051,
@@ -253,9 +253,9 @@
         },
         "selected.Révolution française size 25.postingsDecoded": {
           "previous": 2593907,
-          "current": 2593907,
-          "delta": 0,
-          "pct": 0
+          "current": 2583940,
+          "delta": -9967,
+          "pct": -0.0038424662102380693
         },
         "selected.Révolution française size 25.docValuePagesVisited": {
           "previous": 0,
@@ -270,10 +270,10 @@
           "pct": null
         },
         "selected.typo changement climatique.coldMs": {
-          "previous": 53.527375000000006,
-          "current": 55.28491700000018,
-          "delta": 1.7575420000001714,
-          "pct": 0.03283445153064523
+          "previous": 55.28491700000018,
+          "current": 51.20024999999998,
+          "delta": -4.084667000000195,
+          "pct": -0.07388393112718578
         },
         "selected.typo changement climatique.coldRequests": {
           "previous": 41,
@@ -312,10 +312,10 @@
           "pct": null
         },
         "selected.Paris sorted by revision date.coldMs": {
-          "previous": 69.68995900000004,
-          "current": 69.42766699999993,
-          "delta": -0.2622920000001159,
-          "pct": -0.0037636985838966517
+          "previous": 69.42766699999993,
+          "current": 60.772207999999864,
+          "delta": -8.655459000000064,
+          "pct": -0.12466872896650946
         },
         "selected.Paris sorted by revision date.coldRequests": {
           "previous": 39,
@@ -759,6 +759,359 @@
           "current": 69.42766699999993,
           "delta": -0.2622920000001159,
           "pct": -0.0037636985838966517
+        },
+        "selected.Paris sorted by revision date.coldRequests": {
+          "previous": 39,
+          "current": 39,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris sorted by revision date.coldKb": {
+          "previous": 541.5126953125,
+          "current": 541.5126953125,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris sorted by revision date.blocksDecoded": {
+          "previous": 1,
+          "current": 1,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris sorted by revision date.postingsDecoded": {
+          "previous": 10,
+          "current": 10,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris sorted by revision date.docValuePagesVisited": {
+          "previous": 61,
+          "current": 61,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris sorted by revision date.docValueSortPageFetchGroups": {
+          "previous": 5,
+          "current": 5,
+          "delta": 0,
+          "pct": 0
+        }
+      }
+    },
+    {
+      "format": "rffrwikibench-artifact-v1",
+      "kind": "runtime",
+      "limit": 1000000,
+      "limitSlug": "limit-1000000",
+      "generatedAt": "2026-05-04T12:14:40.021Z",
+      "gitCommit": "d679210",
+      "command": "runtime-bench",
+      "runs": 1,
+      "size": 10,
+      "historyPath": "benchmarks/frwiki/history/runtime/limit-1000000/2026-05-04T12-14-40-021Z_d679210.json",
+      "latestPath": "benchmarks/frwiki/latest/runtime/limit-1000000.json",
+      "summary": {
+        "docs": 1000000,
+        "indexBytes": 2921956668,
+        "indexFiles": 1705,
+        "rows": 25,
+        "validRows": 25,
+        "avgColdMs": 49.04583844000002,
+        "avgColdRequests": 30.08,
+        "avgColdKb": 565.3615625,
+        "maxColdMs": 222.45012499999996,
+        "selected": {
+          "Paris": {
+            "coldMs": 80.12145900000002,
+            "coldRequests": 39,
+            "coldKb": 183.1103515625,
+            "valid": true,
+            "lane": "tailProof",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 1,
+            "postingsDecoded": 48,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Révolution française": {
+            "coldMs": 214.97108400000002,
+            "coldRequests": 60,
+            "coldKb": 3339.5712890625,
+            "valid": true,
+            "lane": "docRangeBlockMax",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 1039,
+            "postingsDecoded": 1298020,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Révolution française size 25": {
+            "coldMs": 222.45012499999996,
+            "coldRequests": 94,
+            "coldKb": 3544.6318359375,
+            "valid": true,
+            "lane": "docRangeBlockMax",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 1051,
+            "postingsDecoded": 2583940,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "typo changement climatique": {
+            "coldMs": 51.20024999999998,
+            "coldRequests": 41,
+            "coldKb": 592.6064453125,
+            "valid": true,
+            "lane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 0,
+            "postingsDecoded": 0,
+            "docValuePagesVisited": 0,
+            "docValueSortPageFetchGroups": 0
+          },
+          "Paris sorted by revision date": {
+            "coldMs": 60.772207999999864,
+            "coldRequests": 39,
+            "coldKb": 541.5126953125,
+            "valid": true,
+            "lane": "sortPageText",
+            "docPayloadLane": "packedDocs",
+            "blocksDecoded": 1,
+            "postingsDecoded": 10,
+            "docValuePagesVisited": 61,
+            "docValueSortPageFetchGroups": 5
+          }
+        }
+      },
+      "previousHistoryPath": "benchmarks/frwiki/history/runtime/limit-1000000/2026-05-04T11-59-08-091Z_6eace23.json",
+      "deltas": {
+        "docs": {
+          "previous": 1000000,
+          "current": 1000000,
+          "delta": 0,
+          "pct": 0
+        },
+        "indexBytes": {
+          "previous": 2921956668,
+          "current": 2921956668,
+          "delta": 0,
+          "pct": 0
+        },
+        "indexFiles": {
+          "previous": 1705,
+          "current": 1705,
+          "delta": 0,
+          "pct": 0
+        },
+        "rows": {
+          "previous": 25,
+          "current": 25,
+          "delta": 0,
+          "pct": 0
+        },
+        "validRows": {
+          "previous": 25,
+          "current": 25,
+          "delta": 0,
+          "pct": 0
+        },
+        "avgColdMs": {
+          "previous": 52.57144659999998,
+          "current": 49.04583844000002,
+          "delta": -3.525608159999962,
+          "pct": -0.0670631756973559
+        },
+        "avgColdRequests": {
+          "previous": 29.6,
+          "current": 30.08,
+          "delta": 0.4799999999999969,
+          "pct": 0.01621621621621611
+        },
+        "avgColdKb": {
+          "previous": 568.88171875,
+          "current": 565.3615625,
+          "delta": -3.5201562500000136,
+          "pct": -0.006187852648411395
+        },
+        "maxColdMs": {
+          "previous": 221.988,
+          "current": 222.45012499999996,
+          "delta": 0.4621249999999577,
+          "pct": 0.002081756671531604
+        },
+        "selected.Paris.coldMs": {
+          "previous": 87.293542,
+          "current": 80.12145900000002,
+          "delta": -7.172082999999986,
+          "pct": -0.08216052225260817
+        },
+        "selected.Paris.coldRequests": {
+          "previous": 39,
+          "current": 39,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris.coldKb": {
+          "previous": 183.1103515625,
+          "current": 183.1103515625,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris.blocksDecoded": {
+          "previous": 1,
+          "current": 1,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris.postingsDecoded": {
+          "previous": 48,
+          "current": 48,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Paris.docValuePagesVisited": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.Paris.docValueSortPageFetchGroups": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.Révolution française.coldMs": {
+          "previous": 221.988,
+          "current": 214.97108400000002,
+          "delta": -7.016915999999981,
+          "pct": -0.03160943834801872
+        },
+        "selected.Révolution française.coldRequests": {
+          "previous": 54,
+          "current": 60,
+          "delta": 6,
+          "pct": 0.1111111111111111
+        },
+        "selected.Révolution française.coldKb": {
+          "previous": 3383.5732421875,
+          "current": 3339.5712890625,
+          "delta": -44.001953125,
+          "pct": -0.013004581244575772
+        },
+        "selected.Révolution française.blocksDecoded": {
+          "previous": 1039,
+          "current": 1039,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Révolution française.postingsDecoded": {
+          "previous": 1309651,
+          "current": 1298020,
+          "delta": -11631,
+          "pct": -0.008880991958926462
+        },
+        "selected.Révolution française.docValuePagesVisited": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.Révolution française.docValueSortPageFetchGroups": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.Révolution française size 25.coldMs": {
+          "previous": 220.37537499999996,
+          "current": 222.45012499999996,
+          "delta": 2.0747499999999945,
+          "pct": 0.0094146181260043
+        },
+        "selected.Révolution française size 25.coldRequests": {
+          "previous": 88,
+          "current": 94,
+          "delta": 6,
+          "pct": 0.06818181818181818
+        },
+        "selected.Révolution française size 25.coldKb": {
+          "previous": 3588.6337890625,
+          "current": 3544.6318359375,
+          "delta": -44.001953125,
+          "pct": -0.012261477685215447
+        },
+        "selected.Révolution française size 25.blocksDecoded": {
+          "previous": 1051,
+          "current": 1051,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.Révolution française size 25.postingsDecoded": {
+          "previous": 2593907,
+          "current": 2583940,
+          "delta": -9967,
+          "pct": -0.0038424662102380693
+        },
+        "selected.Révolution française size 25.docValuePagesVisited": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.Révolution française size 25.docValueSortPageFetchGroups": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.typo changement climatique.coldMs": {
+          "previous": 55.28491700000018,
+          "current": 51.20024999999998,
+          "delta": -4.084667000000195,
+          "pct": -0.07388393112718578
+        },
+        "selected.typo changement climatique.coldRequests": {
+          "previous": 41,
+          "current": 41,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.typo changement climatique.coldKb": {
+          "previous": 592.6064453125,
+          "current": 592.6064453125,
+          "delta": 0,
+          "pct": 0
+        },
+        "selected.typo changement climatique.blocksDecoded": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.typo changement climatique.postingsDecoded": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.typo changement climatique.docValuePagesVisited": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.typo changement climatique.docValueSortPageFetchGroups": {
+          "previous": 0,
+          "current": 0,
+          "delta": 0,
+          "pct": null
+        },
+        "selected.Paris sorted by revision date.coldMs": {
+          "previous": 69.42766699999993,
+          "current": 60.772207999999864,
+          "delta": -8.655459000000064,
+          "pct": -0.12466872896650946
         },
         "selected.Paris sorted by revision date.coldRequests": {
           "previous": 39,
