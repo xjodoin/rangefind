@@ -309,8 +309,8 @@ export async function createSearch(options = {}) {
     sortReplicaRankMaps: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     sortReplicaDocPointers: { mergeGapBytes: 4 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
     sortReplicaDocs: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 16 * 1024, maxOverfetchRatio: Infinity },
-    sortReplicaDocPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
-    sortReplicaDocPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 128 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaDocPagePointers: { mergeGapBytes: 4 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
+    sortReplicaDocPages: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 16 * 1024, maxOverfetchRatio: Infinity },
     authority: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     postingBlocks: { mergeGapBytes: 256 * 1024, maxMergedBytes: 1024 * 1024, maxOverfetchBytes: 512 * 1024, maxOverfetchRatio: Infinity },
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
@@ -2794,8 +2794,8 @@ export async function createSearch(options = {}) {
     }
     const groups = rangeGroups(pending, "sortReplicaDocPages");
     const plannedBytes = groups.reduce((sum, group) => sum + Math.max(0, group.end - group.start), 0);
-    const maxGroups = Math.max(1, Number(options.sortReplicaDocPageMaxFetchGroups || 4));
-    const maxBytes = Math.max(1, Number(options.sortReplicaDocPageMaxFetchBytes || 256 * 1024));
+    const maxGroups = Math.max(1, Number(options.sortReplicaDocPageMaxFetchGroups || 12));
+    const maxBytes = Math.max(1, Number(options.sortReplicaDocPageMaxFetchBytes || 192 * 1024));
     if (groups.length > maxGroups || plannedBytes > maxBytes) {
       if (stats) {
         stats.docPageSkippedReason = groups.length > maxGroups ? "fetch_groups" : "fetch_bytes";
@@ -3088,11 +3088,11 @@ export async function createSearch(options = {}) {
     const ranked = finalState.eligible || [];
     const rows = ranked.slice(offset, offset + size);
     const rowRanks = rows.map(([rank]) => rank);
-    let rankDocs = await loadSortReplicaPackedDocs(replica, rowRanks, docPackStats);
-    let rankDocLane = rankDocs ? "sortReplicaDocPacks" : "";
+    let rankDocs = await loadSortReplicaDocPages(replica, rowRanks, docPageStats);
+    let rankDocLane = rankDocs ? "sortReplicaDocPages" : "";
     if (!rankDocs) {
-      rankDocs = await loadSortReplicaDocPages(replica, rowRanks, docPageStats);
-      rankDocLane = rankDocs ? "sortReplicaDocPages" : "";
+      rankDocs = await loadSortReplicaPackedDocs(replica, rowRanks, docPackStats);
+      rankDocLane = rankDocs ? "sortReplicaDocPacks" : "";
     }
     let results;
     const resultContext = {};

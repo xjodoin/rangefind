@@ -38,7 +38,7 @@ import {
   encodeDocValueSortPage
 } from "./doc_value_tree.js";
 import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
-import { buildDocOrdinalTable, buildDocPointerTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
+import { buildDocOrdinalTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
 import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
@@ -1249,6 +1249,7 @@ function writeSortReplicaDocPages(out, config, replica, rows, spool) {
     format: DOC_PAGE_FORMAT,
     encoding: DOC_PAGE_ENCODING,
     compression: "gzip-member",
+    role: "display",
     order: "sort-rank-page",
     fields,
     page_size: pageSize,
@@ -1257,55 +1258,6 @@ function writeSortReplicaDocPages(out, config, replica, rows, spool) {
       ...pointerTable.meta,
       file,
       order: "sort-rank-page",
-      content_hash: hash,
-      immutable: true,
-      bytes: pointerTable.buffer.length,
-      pack_table: packTable(packWriter.packs)
-    },
-    packs_path: packBase,
-    packs: packWriter.packs.length,
-    pack_table: packTable(packWriter.packs),
-    pack_bytes: packWriter.bytes
-  };
-}
-
-function writeSortReplicaDocPacks(out, config, replica, rows, spool) {
-  const packBase = `sort-replicas/${replica.id}/docs/packs`;
-  const pointerBase = `sort-replicas/${replica.id}/docs/pointers`;
-  const packWriter = createAppendOnlyPackWriter(resolve(out, packBase), config.sortReplicaDocPackBytes || config.docPackBytes);
-  const entries = [];
-  const fd = openSync(spool.path, "r");
-  const spoolEntryFd = openSync(spool.entryPath, "r");
-  try {
-    for (let rank = 0; rank < rows.length; rank++) {
-      const doc = rows[rank].doc;
-      const entry = readDocSpoolEntry(spoolEntryFd, doc);
-      const packed = writePackedShard(packWriter, docIndexKey(rank), readSpooledDoc(fd, entry), {
-        kind: "sort-replica-doc",
-        codec: "json-v1",
-        logicalLength: entry.logicalLength
-      });
-      entries[rank] = packed;
-    }
-  } finally {
-    closeSync(fd);
-    closeSync(spoolEntryFd);
-  }
-  finalizePackWriter(packWriter);
-  const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
-  const pointerTable = buildDocPointerTable(entries.map(entry => resolvePackEntry(packWriter, entry)), packIndexes);
-  const hash = sha256Hex(pointerTable.buffer);
-  const file = `${pointerBase}/${hashedFile("0000", hash, ".bin")}`;
-  mkdirSync(resolve(out, pointerBase), { recursive: true });
-  writeFileSync(resolve(out, file), pointerTable.buffer);
-  return {
-    storage: "range-pack-v1",
-    compression: "gzip-member",
-    order: "sort-rank",
-    pointers: {
-      ...pointerTable.meta,
-      file,
-      order: "sort-rank",
       content_hash: hash,
       immutable: true,
       bytes: pointerTable.buffer.length,
@@ -1467,7 +1419,7 @@ async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docS
     docToRank.fill(-1);
     for (let rank = 0; rank < rows.length; rank++) docToRank[rows[rank].doc] = rank;
     const rankMap = writeSortReplicaRankMap(dirs.out, config, definition, rows);
-    const docPacks = writeSortReplicaDocPacks(dirs.out, config, definition, rows, docSpool);
+    const docPages = writeSortReplicaDocPages(dirs.out, config, definition, rows, docSpool);
     const segmentData = await buildSortReplicaSegments(config, dirs, selectedTermSpool, definition, docToRank);
     const reduced = await reduceSortReplicaSegments(config, measured, dirs, definition, segmentData, rows.length);
 
@@ -1481,9 +1433,9 @@ async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docS
     aggregate.blockPackBytes += reduced.blockPackBytes;
     aggregate.rankPackFiles += rankMap.packs;
     aggregate.rankPackBytes += rankMap.pack_bytes;
-    aggregate.docPackFiles += docPacks.packs;
-    aggregate.docPackBytes += docPacks.pack_bytes;
-    aggregate.docPointerBytes += docPacks.pointers.bytes;
+    aggregate.docPagePackFiles += docPages.packs;
+    aggregate.docPagePackBytes += docPages.pack_bytes;
+    aggregate.docPagePointerBytes += docPages.pointers.bytes;
     aggregate.directoryBytes += reduced.directoryBytes;
 
     replicas[definition.key] = {
@@ -1508,7 +1460,7 @@ async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docS
         block_pack_table: packTable(reduced.blockPacks)
       },
       rank_map: rankMap,
-      doc_packs: docPacks,
+      doc_pages: docPages,
       stats: {
         docs: rows.length,
         skipped_docs: segmentData.skippedDocs,
@@ -1521,9 +1473,12 @@ async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docS
         block_pack_bytes: reduced.blockPackBytes,
         rank_pack_files: rankMap.packs,
         rank_pack_bytes: rankMap.pack_bytes,
-        doc_pack_files: docPacks.packs,
-        doc_pack_bytes: docPacks.pack_bytes,
-        doc_pointer_bytes: docPacks.pointers.bytes,
+        doc_pack_files: 0,
+        doc_pack_bytes: 0,
+        doc_pointer_bytes: 0,
+        doc_page_pack_files: docPages.packs,
+        doc_page_pack_bytes: docPages.pack_bytes,
+        doc_page_pointer_bytes: docPages.pointers.bytes,
         directory_bytes: reduced.directoryBytes,
         external_blocks: reduced.blockStats.externalBlocks,
         external_terms: reduced.blockStats.externalTerms,
@@ -2473,18 +2428,18 @@ export async function build({ configPath }) {
       mergePolicy: reduced.mergePolicy,
       publishSegments: true
     }));
-	    const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
-	    addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
-	    addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
-	    addBuildCounter(telemetry, "field_row_numeric_fields", fieldRows.numericFields);
-	    addBuildCounter(telemetry, "field_row_boolean_fields", fieldRows.booleanFields);
-	    addBuildCounter(telemetry, "field_row_date_fields", fieldRows.dateFields);
-	    const sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
-	    addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
-	    addBuildCounter(telemetry, "sort_replica_docs", sortReplicas.stats.docs);
-	    addBuildCounter(telemetry, "sort_replica_postings", sortReplicas.stats.postings);
-	    addBuildCounter(telemetry, "sort_replica_doc_pack_bytes", sortReplicas.stats.docPackBytes);
-	    const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
+    const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
+    addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
+    addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
+    addBuildCounter(telemetry, "field_row_numeric_fields", fieldRows.numericFields);
+    addBuildCounter(telemetry, "field_row_boolean_fields", fieldRows.booleanFields);
+    addBuildCounter(telemetry, "field_row_date_fields", fieldRows.dateFields);
+    const sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
+    addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
+    addBuildCounter(telemetry, "sort_replica_docs", sortReplicas.stats.docs);
+    addBuildCounter(telemetry, "sort_replica_postings", sortReplicas.stats.postings);
+    addBuildCounter(telemetry, "sort_replica_doc_page_pack_bytes", sortReplicas.stats.docPagePackBytes);
+    const queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
     const authority = await timeBuildPhase(telemetry, "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
     const docs = await timeBuildPhase(telemetry, "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
     docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
@@ -2514,11 +2469,11 @@ export async function build({ configPath }) {
       facetDictionaries: true,
       externalPostingBlocks: config.externalPostingBlocks !== false,
       segmentManifest: true,
-	      queryBundles: !!queryBundles,
-	      authority: !!authority,
-	      sortReplicas: sortReplicas.count > 0,
-	      typoSidecar: !!typoManifest
-	    },
+      queryBundles: !!queryBundles,
+      authority: !!authority,
+      sortReplicas: sortReplicas.count > 0,
+      typoSidecar: !!typoManifest
+    },
     object_store: {
       format: OBJECT_STORE_FORMAT,
       pointer_format: OBJECT_POINTER_FORMAT,
@@ -2772,28 +2727,28 @@ export async function build({ configPath }) {
       doc_value_sorted_fields: Object.keys(docValueSorted.fields).length,
       doc_value_sorted_directory_bytes: docValueSorted.directory_bytes,
       doc_value_sorted_directory_logical_bytes: docValueSorted.directory_logical_bytes,
-	      doc_value_sorted_pack_files: docValueSorted.packs.length,
-	      doc_value_sorted_pack_bytes: docValueSorted.pack_bytes,
-	      sort_replica_format: sortReplicas.format,
-	      sort_replica_count: sortReplicas.count,
-	      sort_replica_docs: sortReplicas.stats.docs,
-	      sort_replica_terms: sortReplicas.stats.terms,
-	      sort_replica_postings: sortReplicas.stats.postings,
-	      sort_replica_segment_files: sortReplicas.stats.segmentFiles,
-	      sort_replica_term_pack_files: sortReplicas.stats.termPackFiles,
-	      sort_replica_term_pack_bytes: sortReplicas.stats.termPackBytes,
-	      sort_replica_block_pack_files: sortReplicas.stats.blockPackFiles,
-	      sort_replica_block_pack_bytes: sortReplicas.stats.blockPackBytes,
-	      sort_replica_rank_pack_files: sortReplicas.stats.rankPackFiles,
-	      sort_replica_rank_pack_bytes: sortReplicas.stats.rankPackBytes,
-	      sort_replica_doc_pack_files: sortReplicas.stats.docPackFiles,
-	      sort_replica_doc_pack_bytes: sortReplicas.stats.docPackBytes,
-	      sort_replica_doc_pointer_bytes: sortReplicas.stats.docPointerBytes,
-	      sort_replica_doc_page_pack_files: sortReplicas.stats.docPagePackFiles,
-	      sort_replica_doc_page_pack_bytes: sortReplicas.stats.docPagePackBytes,
-	      sort_replica_doc_page_pointer_bytes: sortReplicas.stats.docPagePointerBytes,
-	      sort_replica_directory_bytes: sortReplicas.stats.directoryBytes,
-	      filter_bitmap_storage: filterBitmaps.storage,
+      doc_value_sorted_pack_files: docValueSorted.packs.length,
+      doc_value_sorted_pack_bytes: docValueSorted.pack_bytes,
+      sort_replica_format: sortReplicas.format,
+      sort_replica_count: sortReplicas.count,
+      sort_replica_docs: sortReplicas.stats.docs,
+      sort_replica_terms: sortReplicas.stats.terms,
+      sort_replica_postings: sortReplicas.stats.postings,
+      sort_replica_segment_files: sortReplicas.stats.segmentFiles,
+      sort_replica_term_pack_files: sortReplicas.stats.termPackFiles,
+      sort_replica_term_pack_bytes: sortReplicas.stats.termPackBytes,
+      sort_replica_block_pack_files: sortReplicas.stats.blockPackFiles,
+      sort_replica_block_pack_bytes: sortReplicas.stats.blockPackBytes,
+      sort_replica_rank_pack_files: sortReplicas.stats.rankPackFiles,
+      sort_replica_rank_pack_bytes: sortReplicas.stats.rankPackBytes,
+      sort_replica_doc_pack_files: sortReplicas.stats.docPackFiles,
+      sort_replica_doc_pack_bytes: sortReplicas.stats.docPackBytes,
+      sort_replica_doc_pointer_bytes: sortReplicas.stats.docPointerBytes,
+      sort_replica_doc_page_pack_files: sortReplicas.stats.docPagePackFiles,
+      sort_replica_doc_page_pack_bytes: sortReplicas.stats.docPagePackBytes,
+      sort_replica_doc_page_pointer_bytes: sortReplicas.stats.docPagePointerBytes,
+      sort_replica_directory_bytes: sortReplicas.stats.directoryBytes,
+      filter_bitmap_storage: filterBitmaps.storage,
       filter_bitmap_format: filterBitmaps.format,
       filter_bitmap_fields: Object.keys(filterBitmaps.fields).length,
       filter_bitmap_pack_files: filterBitmaps.packs.length,

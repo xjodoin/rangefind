@@ -316,12 +316,13 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.sort_replicas.format, "rfsortreplicas-v1");
   assert.equal(manifest.sort_replicas.count, 1);
   assert.equal(manifest.sort_replicas.replicas["year:desc"].field, "year");
-  assert.equal(manifest.sort_replicas.replicas["year:desc"].doc_packs.order, "sort-rank");
-  assert.equal(manifest.sort_replicas.replicas["year:desc"].doc_packs.pointers.order, "sort-rank");
+  assert.equal(manifest.sort_replicas.replicas["year:desc"].doc_pages.order, "sort-rank-page");
+  assert.equal(manifest.sort_replicas.replicas["year:desc"].doc_pages.role, "display");
+  assert.equal(manifest.sort_replicas.replicas["year:desc"].doc_pages.pointers.order, "sort-rank-page");
   assert.ok(await readFile(join(output, manifest.sort_replicas.replicas["year:desc"].terms.directory.root)));
   assert.ok(await readFile(join(output, "sort-replicas", "year_desc", "rank-packs", manifest.sort_replicas.replicas["year:desc"].rank_map.pack_table[0])));
-  assert.ok(await readFile(join(output, manifest.sort_replicas.replicas["year:desc"].doc_packs.pointers.file)));
-  assert.ok(await readFile(join(output, "sort-replicas", "year_desc", "docs", "packs", manifest.sort_replicas.replicas["year:desc"].doc_packs.pack_table[0])));
+  assert.ok(await readFile(join(output, manifest.sort_replicas.replicas["year:desc"].doc_pages.pointers.file)));
+  assert.ok(await readFile(join(output, "sort-replicas", "year_desc", "docs", "page-packs", manifest.sort_replicas.replicas["year:desc"].doc_pages.pack_table[0])));
   assert.equal(manifest.facets.category.count, 5);
   assert.equal(manifest.facet_dictionaries.storage, "range-pack-v1");
   assert.equal(manifest.facet_dictionaries.directory.format, "rfdir-v2");
@@ -538,11 +539,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(sortedText.stats.sortReplicaText, true);
   assert.equal(sortedText.stats.sortReplicaField, "year");
   assert.equal(sortedText.stats.topKProofSortAware, true);
-  assert.equal(sortedText.stats.docPayloadLane, "sortReplicaDocPacks");
+  assert.equal(sortedText.stats.docPayloadLane, "sortReplicaDocPages");
   assert.equal(sortedText.stats.docPayloadForced, false);
   assert.ok(sortedText.stats.blocksDecoded <= sortedTextExact.stats.blocksDecoded);
   assert.ok(sortedText.stats.sortReplicaRankChunksWanted >= 1);
-  assert.ok(sortedText.stats.sortReplicaDocPackFetches >= 1);
+  assert.ok(sortedText.stats.sortReplicaDocPagesFetched >= 1);
   assert.ok(sortedText.stats.sortReplicaWantedBlocks >= sortedText.stats.blocksDecoded);
 
   const pageTable = parseDocPagePointerPage(await readFile(join(output, manifest.docs.pages.pointers.file)), {
