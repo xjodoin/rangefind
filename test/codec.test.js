@@ -47,9 +47,9 @@ test("posting segment codec round-trips postings and block filters", () => {
   const segment = buildPostingSegment([["search", [[0, 1000], [1, 800], [2, 100]]]], 3, codes, filters, config);
   const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
   const entry = shard.terms.get("search");
-  assert.equal(segment.format, "rfsegpost-v5");
-  assert.equal(shard.format, "rfsegpost-v5");
-  assert.equal(entry.format, "rfsegpost-v5");
+  assert.equal(segment.format, "rfsegpost-v6");
+  assert.equal(shard.format, "rfsegpost-v6");
+  assert.equal(entry.format, "rfsegpost-v6");
   assert.equal(entry.count, 3);
   assert.equal(entry.blocks[0].rowCount, 2);
   assert.equal(entry.blocks[1].rowCount, 1);
@@ -104,6 +104,40 @@ test("posting segment codec bucket-orders large sorted posting lists by impact",
   assert.deepEqual([...docs].sort((a, b) => a - b), rows.map(([doc]) => doc));
 });
 
+test("posting segment codec stores impact-tier block order", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 2,
+    postingSuperblockSize: 2,
+    postingOrder: "doc-id",
+    postingImpactTierMinBlocks: 1,
+    postingImpactTierMaxBlocks: 3
+  };
+  const rows = [
+    [0, 1000],
+    [1, 8000],
+    [2, 30000],
+    [3, 1000],
+    [4, 16000],
+    [5, 1000],
+    [6, 4000],
+    [7, 1000]
+  ];
+  const filters = buildBlockFilters(config, {});
+  const segment = buildPostingSegment([["common", rows]], 1000, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("common");
+
+  assert.equal(segment.stats.impactTierTerms, 1);
+  assert.equal(segment.stats.impactTierBlocks, 3);
+  assert.ok(segment.stats.impactTierTiers >= 2);
+  assert.deepEqual([...entry.impactTiers.blocks], [1, 2, 0]);
+  assert.equal(entry.impactTiers.tiers[0].first, 0);
+  assert.equal(entry.impactTiers.tiers[0].count, 1);
+});
+
 test("posting segment codec writes external posting blocks directly", () => {
   const config = {
     facets: [],
@@ -138,7 +172,7 @@ test("posting segment codec writes external posting blocks directly", () => {
     }
   });
   const entry = shard.terms.get("search");
-  assert.equal(segment.format, "rfsegpost-v5");
+  assert.equal(segment.format, "rfsegpost-v6");
   assert.equal(entry.external, true);
   assert.equal(entry.blocks.length, 2);
   assert.equal(entry.blocks[0].rowCount, 2);

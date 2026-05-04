@@ -76,6 +76,8 @@ export const DEFAULTS = {
   postingSuperblockSize: 16,
   postingImpactBucketOrderMinRows: 2048,
   postingImpactBucketOrderMaxBuckets: 65536,
+  postingImpactTierMinBlocks: 8,
+  postingImpactTierMaxBlocks: 256,
   postingDocRangeBlockMax: true,
   postingDocRangeSize: 1024,
   postingDocRangeQuantizationBits: 8,

@@ -22,8 +22,8 @@ const DOC_VALUE_FORMAT_VERSION = 2;
 const DOC_VALUE_ENCODING_DENSE = 0;
 const DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 const FACET_DICT_FORMAT_VERSION = 1;
-export const POSTING_SEGMENT_FORMAT = "rfsegpost-v5";
-const POSTING_SEGMENT_FORMAT_VERSION = 5;
+export const POSTING_SEGMENT_FORMAT = "rfsegpost-v6";
+const POSTING_SEGMENT_FORMAT_VERSION = 6;
 const MAX_SUMMARY_FACET_WORDS = 64;
 export const POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
 export const POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
@@ -172,6 +172,51 @@ function postingDocRangeSize(config) {
 
 function postingDocRangeQuantizationBits(config) {
   return Math.max(1, Math.min(16, Math.floor(Number(config.postingDocRangeQuantizationBits || 8))));
+}
+
+function postingImpactTierMinBlocks(config) {
+  if (config.postingImpactTiers === false) return Number.MAX_SAFE_INTEGER;
+  return Math.max(1, Math.floor(Number(config.postingImpactTierMinBlocks ?? 8)));
+}
+
+function postingImpactTierMaxBlocks(config) {
+  if (config.postingImpactTiers === false) return 0;
+  return Math.max(0, Math.floor(Number(config.postingImpactTierMaxBlocks ?? 256)));
+}
+
+function buildPostingImpactTiers(blocks, config) {
+  const maxBlocks = postingImpactTierMaxBlocks(config);
+  if (!maxBlocks || blocks.length < postingImpactTierMinBlocks(config)) return null;
+  const ordered = blocks
+    .map((block, blockIndex) => ({
+      blockIndex,
+      maxImpact: block.maxImpact || 0,
+      maxImpactDoc: block.maxImpactDoc ?? Number.MAX_SAFE_INTEGER,
+      rowCount: block.rowCount || 0
+    }))
+    .filter(item => item.maxImpact > 0)
+    .sort((a, b) => (
+      b.maxImpact - a.maxImpact
+      || a.rowCount - b.rowCount
+      || a.maxImpactDoc - b.maxImpactDoc
+      || a.blockIndex - b.blockIndex
+    ))
+    .slice(0, maxBlocks);
+  if (!ordered.length) return null;
+  const tiers = [];
+  let tierFirst = 0;
+  for (const item of ordered) {
+    const current = tiers[tiers.length - 1];
+    if (current?.maxImpact === item.maxImpact) current.count++;
+    else {
+      tiers.push({ maxImpact: item.maxImpact, first: tierFirst, count: 1 });
+    }
+    tierFirst++;
+  }
+  return {
+    blocks: Int32Array.from(ordered.map(item => item.blockIndex)),
+    tiers
+  };
 }
 
 function buildPostingSuperblocks(blocks, filters, config) {
@@ -670,6 +715,9 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     blockCodecPartitionedDeltaCandidateBytes: 0,
     impactBucketOrderTerms: 0,
     impactBucketOrderPostings: 0,
+    impactTierTerms: 0,
+    impactTierBlocks: 0,
+    impactTierTiers: 0,
     docRangeTerms: 0,
     docRangeEntries: 0,
     docRangeBlocks: 0,
@@ -723,7 +771,13 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
       stats.superblocks += superblocks.length;
       stats.superblockTerms += superblocks.length > 0 ? 1 : 0;
       stats.superblockBlocks += blocks.length;
-      directory.push({ term, postings, offset: 0, byteLength: 0, external: true, blocks, superblocks });
+      const impactTiers = buildPostingImpactTiers(blocks, config);
+      if (impactTiers?.blocks.length) {
+        stats.impactTierTerms++;
+        stats.impactTierBlocks += impactTiers.blocks.length;
+        stats.impactTierTiers += impactTiers.tiers.length;
+      }
+      directory.push({ term, postings, offset: 0, byteLength: 0, external: true, blocks, superblocks, impactTiers });
     } else {
       const bytes = concatUint8(postings.chunks, postings.byteLength);
       chunks.push(bytes);
@@ -745,7 +799,13 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
       stats.superblocks += superblocks.length;
       stats.superblockTerms += superblocks.length > 0 ? 1 : 0;
       stats.superblockBlocks += blocks.length;
-      directory.push({ term, postings, offset: postingOffset, byteLength: bytes.length, external: false, blocks, superblocks });
+      const impactTiers = buildPostingImpactTiers(blocks, config);
+      if (impactTiers?.blocks.length) {
+        stats.impactTierTerms++;
+        stats.impactTierBlocks += impactTiers.blocks.length;
+        stats.impactTierTiers += impactTiers.tiers.length;
+      }
+      directory.push({ term, postings, offset: postingOffset, byteLength: bytes.length, external: false, blocks, superblocks, impactTiers });
       postingOffset += bytes.length;
     }
   }
@@ -814,6 +874,17 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
         pushVarint(header, range.maxImpact);
         previousRange = range.index;
       }
+    }
+    const impactTiers = item.impactTiers;
+    pushVarint(header, impactTiers?.blocks?.length || 0);
+    if (impactTiers?.blocks?.length) {
+      pushVarint(header, impactTiers.tiers.length);
+      for (const tier of impactTiers.tiers) {
+        pushVarint(header, tier.maxImpact);
+        pushVarint(header, tier.first);
+        pushVarint(header, tier.count);
+      }
+      for (const blockIndex of impactTiers.blocks) pushVarint(header, blockIndex);
     }
   }
 
@@ -944,6 +1015,23 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
     } else {
       entry.docRanges = null;
       for (const block of entry.blocks) block.docRanges = null;
+    }
+    const impactTierBlockCount = readVarint(bytes, state);
+    if (impactTierBlockCount > 0) {
+      const tierCount = readVarint(bytes, state);
+      const tiers = new Array(tierCount);
+      for (let j = 0; j < tierCount; j++) {
+        tiers[j] = {
+          maxImpact: readVarint(bytes, state),
+          first: readVarint(bytes, state),
+          count: readVarint(bytes, state)
+        };
+      }
+      const blocks = new Int32Array(impactTierBlockCount);
+      for (let j = 0; j < impactTierBlockCount; j++) blocks[j] = readVarint(bytes, state);
+      entry.impactTiers = { blocks, tiers };
+    } else {
+      entry.impactTiers = null;
     }
     terms.set(term, entry);
   }

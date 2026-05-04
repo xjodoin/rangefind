@@ -222,8 +222,8 @@ var DOC_VALUE_FORMAT_VERSION = 2;
 var DOC_VALUE_ENCODING_DENSE = 0;
 var DOC_VALUE_ENCODING_SPARSE_FACET = 1;
 var FACET_DICT_FORMAT_VERSION = 1;
-var POSTING_SEGMENT_FORMAT = "rfsegpost-v5";
-var POSTING_SEGMENT_FORMAT_VERSION = 5;
+var POSTING_SEGMENT_FORMAT = "rfsegpost-v6";
+var POSTING_SEGMENT_FORMAT_VERSION = 6;
 var POSTING_BLOCK_CODEC_PAIR_VARINT = "pair-varint-v1";
 var POSTING_BLOCK_CODEC_IMPACT_RUNS = "impact-runs-v1";
 var POSTING_BLOCK_CODEC_IMPACT_BITSET = "impact-bitset-v1";
@@ -421,6 +421,23 @@ function parsePostingSegmentBytes(bytes, manifest = {}) {
     } else {
       entry.docRanges = null;
       for (const block of entry.blocks) block.docRanges = null;
+    }
+    const impactTierBlockCount = readVarint(bytes, state);
+    if (impactTierBlockCount > 0) {
+      const tierCount = readVarint(bytes, state);
+      const tiers = new Array(tierCount);
+      for (let j = 0; j < tierCount; j++) {
+        tiers[j] = {
+          maxImpact: readVarint(bytes, state),
+          first: readVarint(bytes, state),
+          count: readVarint(bytes, state)
+        };
+      }
+      const blocks = new Int32Array(impactTierBlockCount);
+      for (let j = 0; j < impactTierBlockCount; j++) blocks[j] = readVarint(bytes, state);
+      entry.impactTiers = { blocks, tiers };
+    } else {
+      entry.impactTiers = null;
     }
     terms.set(term, entry);
   }
@@ -1580,7 +1597,7 @@ var TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
 var TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 var DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
 var DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.12;
-var DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 512;
+var DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 1024;
 var DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE = 32;
 var DOC_VALUE_SORT_PAGE_BATCH_SIZE = 16;
 var textDecoder4 = new TextDecoder();
@@ -1953,6 +1970,7 @@ async function createSearch(options = {}) {
     docRangeBlockPruneBatchSize,
     Math.floor(Number(options.docRangeBlockPruneInitialBatchSize || DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE))
   ));
+  const docRangeImpactPlannerEnabled = options.docRangeImpactPlanner !== false;
   const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
     TYPO_CORRECTION_PLAN_LIMIT,
     Math.floor(Number(options.typoCorrectionExecutionPlans || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
@@ -5157,6 +5175,68 @@ async function createSearch(options = {}) {
       wantedBlocks: batch.wanted
     };
   }
+  async function decodeCursorBlockBatch(items, rangePlan = "postingBlocks") {
+    const unique = /* @__PURE__ */ new Map();
+    for (const item of items || []) {
+      const blockIndex = item.blockIndex;
+      if (!item?.cursor || blockIndex < 0 || blockIndex >= (item.cursor.entry.blocks?.length || 0)) continue;
+      unique.set(postingBlockKey(item.cursor, blockIndex), { cursor: item.cursor, blockIndex });
+    }
+    const requests = [];
+    for (const { cursor, blockIndex } of unique.values()) {
+      if (cursor.entry.external) requests.push({ entry: cursor.entry, blockIndex });
+    }
+    const batch = await loadPostingBlockBatch(requests, rangePlan);
+    const blocks = await Promise.all([...unique.values()].map(async ({ cursor, blockIndex }) => ({
+      cursor,
+      blockIndex,
+      rows: cursor.entry.external ? await cursor.entry.blockPostings.get(blockIndex) || new Int32Array(0) : decodePostingBlock(cursor.shard, cursor.entry, blockIndex)
+    })));
+    return {
+      blocks,
+      fetchedBlocks: batch.fetched,
+      fetchGroups: batch.groups,
+      wantedBlocks: unique.size
+    };
+  }
+  function postingBlockKey(cursor, blockIndex) {
+    return `${cursor.shardName}\0${cursor.term}\0${blockIndex}`;
+  }
+  function impactTierRankForEntry(entry) {
+    if (!docRangeImpactPlannerEnabled || !entry?.impactTiers?.blocks?.length) return null;
+    if (!entry.impactTierRank) {
+      entry.impactTierRank = /* @__PURE__ */ new Map();
+      for (let rank = 0; rank < entry.impactTiers.blocks.length; rank++) {
+        entry.impactTierRank.set(entry.impactTiers.blocks[rank], rank);
+      }
+    }
+    return entry.impactTierRank;
+  }
+  function docRangeTaskTieDocLowerBound(entry, block, rangeIndex, rangeStart, rangeEnd, upperBound) {
+    if (block?.maxImpact === upperBound && block.maxImpactDoc >= rangeStart && block.maxImpactDoc < rangeEnd) {
+      return block.maxImpactDoc;
+    }
+    const blockMin = Number.isFinite(block?.docMin) ? block.docMin : rangeStart;
+    return Math.max(rangeStart, Math.min(rangeEnd - 1, blockMin));
+  }
+  function compareDocRangeTasks(a, b) {
+    return b.upperBound - a.upperBound || a.impactRank - b.impactRank || a.tieDocLowerBound - b.tieDocLowerBound || a.blockIndex - b.blockIndex;
+  }
+  function docRangeCandidateBlockTasks(cursor, rangeStart, rangeEnd, rangeIndex, filterPlan) {
+    const candidates = docRangeCandidateBlockIndexes(cursor.entry, rangeStart, rangeEnd, filterPlan);
+    const rankByBlock = impactTierRankForEntry(cursor.entry);
+    const tasks = candidates.indexes.map((blockIndex) => {
+      const block = cursor.entry.blocks?.[blockIndex];
+      const upperBound = blockUpperBoundInDocRange(cursor.entry, block, rangeIndex);
+      return {
+        blockIndex,
+        upperBound,
+        tieDocLowerBound: docRangeTaskTieDocLowerBound(cursor.entry, block, rangeIndex, rangeStart, rangeEnd, upperBound),
+        impactRank: rankByBlock?.get(blockIndex) ?? Number.MAX_SAFE_INTEGER
+      };
+    }).filter((task) => task.upperBound > 0).sort(compareDocRangeTasks);
+    return { ...candidates, tasks };
+  }
   function buildDocRangeUpperBoundPlan(entries, baseSet, minShouldMatch) {
     let rangeSize = null;
     let rangeCount = 0;
@@ -5256,60 +5336,89 @@ async function createSearch(options = {}) {
     }
     return accepted;
   }
-  function stableDocRangeTopK(scores, hits, minShouldMatch, k, nextRangeUpperBound, proofStats = null) {
-    if (proofStats) proofStats.attempts++;
-    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
-    if (eligible.length < k) {
-      recordTopKProofFailure(proofStats, "candidate_count", { maxOutsidePotential: nextRangeUpperBound });
-      return null;
-    }
-    const top = eligible.slice(0, k);
-    const threshold = top[top.length - 1][1];
-    if (nextRangeUpperBound < threshold) {
-      recordTopKProofSuccess(proofStats, {
-        threshold,
-        maxOutsidePotential: nextRangeUpperBound,
-        remainingTerms: 0,
-        remainingTermUpperBound: nextRangeUpperBound
-      });
-      return top;
-    }
-    recordTopKProofFailure(proofStats, nextRangeUpperBound === threshold ? "tie_bound" : "score_bound", {
-      threshold,
-      maxOutsidePotential: nextRangeUpperBound,
-      remainingTerms: 0,
-      remainingTermUpperBound: nextRangeUpperBound
-    });
-    return null;
-  }
-  function remainingBlockPotential(remainingTermBounds, mask = 0) {
+  function remainingBlockPotential(remainingTermBounds, mask = 0, remainingTermTieDocs = null) {
     let potential = 0;
+    let tieDocLowerBound = 0;
+    let hasRemaining = false;
     let terms = 0;
     for (let termIndex = 0; termIndex < remainingTermBounds.length; termIndex++) {
       const bound = remainingTermBounds[termIndex] || 0;
       if (!bound) continue;
       if (termIndex < SKIP_MAX_TERMS && bitIsSet(mask, termIndex)) continue;
       potential += bound;
+      tieDocLowerBound = Math.max(tieDocLowerBound, remainingTermTieDocs?.[termIndex] ?? 0);
+      hasRemaining = true;
       terms++;
     }
-    return { potential, terms };
+    return { potential, tieDocLowerBound: hasRemaining ? tieDocLowerBound : Infinity, terms };
   }
-  function stableDocRangeBlockTopK(scores, hits, masks, minShouldMatch, k, nextRangeUpperBound, remainingTermBounds, proofStats = null) {
-    if (proofStats) proofStats.attempts++;
+  function rangeStatePotential(state) {
+    if (!state || state.exhausted) return { potential: 0, tieDocLowerBound: Infinity, terms: 0 };
+    if (!state.initialized) {
+      return {
+        potential: state.range.upperBound || 0,
+        tieDocLowerBound: state.range.index * state.rangeSize,
+        terms: state.range.termHits || 0
+      };
+    }
+    return remainingBlockPotential(state.remainingTermBounds, 0, state.remainingTermTieDocs);
+  }
+  function compareRangeStatePotential(a, b) {
+    if (a.potential !== b.potential) return b.potential - a.potential;
+    if (a.tieDocLowerBound !== b.tieDocLowerBound) return a.tieDocLowerBound - b.tieDocLowerBound;
+    return a.ordinal - b.ordinal;
+  }
+  function bestDocRangeState(states) {
+    let best = null;
+    let bestPotential = null;
+    for (const state of states) {
+      const potential = rangeStatePotential(state);
+      if (potential.potential <= 0) continue;
+      const candidate = { ...potential, ordinal: state.ordinal };
+      if (!best || compareRangeStatePotential(candidate, bestPotential) < 0) {
+        best = state;
+        bestPotential = candidate;
+      }
+    }
+    return best;
+  }
+  function maxDocRangeOutsidePotential(states) {
+    let potential = 0;
+    let tieDocLowerBound = Infinity;
+    let terms = 0;
+    for (const state of states) {
+      const current = rangeStatePotential(state);
+      if (current.potential > potential) {
+        potential = current.potential;
+        tieDocLowerBound = current.tieDocLowerBound;
+        terms = current.terms;
+      } else if (current.potential === potential && current.potential > 0) {
+        tieDocLowerBound = Math.min(tieDocLowerBound, current.tieDocLowerBound);
+        terms = Math.max(terms, current.terms);
+      }
+    }
+    return { potential, tieDocLowerBound, terms };
+  }
+  function stableDocRangeGlobalTopK(scores, hits, masks, minShouldMatch, k, rangeSize, stateByRangeIndex, states, proofStats = null) {
+    if (proofStats) {
+      proofStats.attempts++;
+      proofStats.docRangeAware = true;
+    }
     const eligible = collectEligibleScores(scores, hits, minShouldMatch);
-    const unseenBlocks = remainingBlockPotential(remainingTermBounds);
-    const unseenPotential = Math.max(nextRangeUpperBound, unseenBlocks.potential);
+    const outside = maxDocRangeOutsidePotential(states);
     if (eligible.length < k) {
-      recordTopKProofFailure(proofStats, "candidate_count", { maxOutsidePotential: unseenPotential });
+      recordTopKProofFailure(proofStats, "candidate_count", { maxOutsidePotential: outside.potential });
       return null;
     }
     const top = eligible.slice(0, k);
+    const topDocs = new Set(top.map(([doc]) => doc));
     const threshold = top[top.length - 1][1];
     const boundaryDoc = top[top.length - 1][0];
-    let maxOutsidePotential = unseenPotential;
-    let maxRemainingTerms = unseenBlocks.potential >= nextRangeUpperBound ? unseenBlocks.terms : 0;
-    let maxRemainingTermUpperBound = unseenPotential;
-    if (maxOutsidePotential >= threshold) {
+    let maxOutsidePotential = outside.potential;
+    let maxOutsideTieDoc = outside.tieDocLowerBound;
+    let maxRemainingTerms = outside.terms;
+    let maxRemainingTermUpperBound = outside.potential;
+    if (maxOutsidePotential > threshold || maxOutsidePotential === threshold && maxOutsideTieDoc <= boundaryDoc) {
       recordTopKProofFailure(proofStats, maxOutsidePotential === threshold ? "tie_bound" : "score_bound", {
         threshold,
         maxOutsidePotential,
@@ -5318,13 +5427,14 @@ async function createSearch(options = {}) {
       });
       return null;
     }
-    const topDocs = new Set(top.map(([doc]) => doc));
     for (const [doc, score] of scores) {
       if (topDocs.has(doc)) continue;
-      const remaining = remainingBlockPotential(remainingTermBounds, masks.get(doc) || 0);
+      const state = stateByRangeIndex.get(Math.floor(doc / rangeSize));
+      const remaining = state?.initialized && !state.exhausted ? remainingBlockPotential(state.remainingTermBounds, masks.get(doc) || 0, state.remainingTermTieDocs) : { potential: 0, tieDocLowerBound: Infinity, terms: 0 };
       const potential = score + remaining.potential;
-      if (potential > maxOutsidePotential) {
+      if (potential > maxOutsidePotential || potential === maxOutsidePotential && doc < maxOutsideTieDoc) {
         maxOutsidePotential = potential;
+        maxOutsideTieDoc = doc;
         maxRemainingTerms = remaining.terms;
         maxRemainingTermUpperBound = remaining.potential;
       }
@@ -5373,6 +5483,26 @@ async function createSearch(options = {}) {
       termIndex,
       isBase: baseSet.has(item.term)
     }));
+    const impactTierTerms = cursors.reduce((sum, cursor) => sum + (cursor.entry.impactTiers?.blocks?.length ? 1 : 0), 0);
+    const initialBatchLimit = Math.min(
+      docRangeBlockPruneBatchSize,
+      Math.max(
+        docRangeBlockPruneInitialBatchSize,
+        Math.ceil(candidateK / 16) * docRangeBlockPruneInitialBatchSize
+      )
+    );
+    const rangeStates = plan.candidates.map((range, ordinal) => ({
+      range,
+      ordinal,
+      rangeSize: plan.rangeSize,
+      initialized: false,
+      exhausted: false,
+      queues: [],
+      remainingTermBounds: new Array(cursors.length).fill(0),
+      remainingTermTieDocs: new Array(cursors.length).fill(Infinity),
+      batchLimit: initialBatchLimit
+    }));
+    const stateByRangeIndex = new Map(rangeStates.map((state) => [state.range.index, state]));
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     const masks = /* @__PURE__ */ new Map();
@@ -5381,11 +5511,13 @@ async function createSearch(options = {}) {
     let stable = null;
     let exhausted = false;
     let rangesVisited = 0;
+    let rangeRevisits = 0;
     let candidatePostingBlocks = 0;
     let consideredPostingBlocks = 0;
     let skippedPostingBlocks = 0;
     let consideredPostingSuperblocks = 0;
     let skippedPostingSuperblocks = 0;
+    let impactTierTasks = 0;
     let blocksDecoded = 0;
     let blocksVisited = 0;
     let postingsDecoded = 0;
@@ -5398,113 +5530,120 @@ async function createSearch(options = {}) {
     let docRangeBlockBatches = 0;
     let docRangeInnerBlocksPruned = 0;
     let stopUpperBound = 0;
-    for (let rangeIndex = 0; rangeIndex < plan.candidates.length; rangeIndex++) {
-      const range = plan.candidates[rangeIndex];
+    const refreshQueueBound = (state, queue) => {
+      const task = queue.tasks[queue.offset];
+      state.remainingTermBounds[queue.termIndex] = task?.upperBound || 0;
+      state.remainingTermTieDocs[queue.termIndex] = task?.tieDocLowerBound ?? Infinity;
+    };
+    const remainingQueueBlocks = (state) => state.queues.reduce((sum, queue) => sum + Math.max(0, queue.tasks.length - queue.offset), 0);
+    const initializeRangeState = (state) => {
+      if (state.initialized) {
+        rangeRevisits++;
+        return;
+      }
+      state.initialized = true;
+      rangesVisited++;
+      const range = state.range;
       const rangeStart = range.index * plan.rangeSize;
       const rangeEnd = Math.min(manifest.total, rangeStart + plan.rangeSize);
-      const nextRangeUpperBound = plan.candidates[rangeIndex + 1]?.upperBound || 0;
-      const queues = [];
-      const remainingTermBounds = new Array(cursors.length).fill(0);
-      const remainingQueueBlocks = () => queues.reduce((sum, queue) => sum + Math.max(0, queue.tasks.length - queue.offset), 0);
-      const refreshQueueBound = (queue) => {
-        remainingTermBounds[queue.termIndex] = queue.offset < queue.tasks.length ? queue.tasks[queue.offset].upperBound : 0;
-      };
-      rangesVisited++;
       for (const cursor of cursors) {
-        const candidates = docRangeCandidateBlockIndexes(cursor.entry, rangeStart, rangeEnd, blockFilterPlan);
-        candidatePostingBlocks += candidates.indexes.length;
+        const candidates = docRangeCandidateBlockTasks(cursor, rangeStart, rangeEnd, range.index, blockFilterPlan);
+        candidatePostingBlocks += candidates.tasks.length;
         consideredPostingBlocks += candidates.consideredBlocks;
         skippedPostingBlocks += candidates.skippedBlocks;
         consideredPostingSuperblocks += candidates.consideredSuperblocks;
         skippedPostingSuperblocks += candidates.skippedSuperblocks;
-        if (!candidates.indexes.length) continue;
-        const tasks = candidates.indexes.map((blockIndex) => ({
-          blockIndex,
-          upperBound: blockUpperBoundInDocRange(cursor.entry, cursor.entry.blocks?.[blockIndex], range.index)
-        })).filter((task) => task.upperBound > 0).sort((a, b) => b.upperBound - a.upperBound || a.blockIndex - b.blockIndex);
+        impactTierTasks += candidates.tasks.filter((task) => task.impactRank !== Number.MAX_SAFE_INTEGER).length;
+        const tasks = candidates.tasks;
         if (!tasks.length) continue;
         const queue = { cursor, termIndex: cursor.termIndex, tasks, offset: 0 };
-        queues.push(queue);
-        refreshQueueBound(queue);
+        state.queues.push(queue);
+        refreshQueueBound(state, queue);
       }
-      stopUpperBound = Math.max(nextRangeUpperBound, remainingBlockPotential(remainingTermBounds).potential);
-      stable = stableDocRangeBlockTopK(scores, hits, masks, minShouldMatch, candidateK, nextRangeUpperBound, remainingTermBounds, proofStats);
+      if (!remainingQueueBlocks(state)) state.exhausted = true;
+    };
+    while (true) {
+      stopUpperBound = maxDocRangeOutsidePotential(rangeStates).potential;
+      stable = stableDocRangeGlobalTopK(
+        scores,
+        hits,
+        masks,
+        minShouldMatch,
+        candidateK,
+        plan.rangeSize,
+        stateByRangeIndex,
+        rangeStates,
+        proofStats
+      );
       if (stable) {
-        docRangeInnerBlocksPruned += remainingQueueBlocks();
+        docRangeInnerBlocksPruned += rangeStates.reduce((sum, state2) => sum + (state2.initialized ? remainingQueueBlocks(state2) : 0), 0);
         break;
       }
-      let batchLimit = Math.min(docRangeBlockPruneBatchSize, docRangeBlockPruneInitialBatchSize);
-      while (remainingQueueBlocks() > 0) {
-        const batch = [];
-        while (batch.length < batchLimit) {
-          let bestQueue = null;
-          let bestTask = null;
-          for (const queue of queues) {
-            const task = queue.tasks[queue.offset];
-            if (!task) continue;
-            if (!bestTask || task.upperBound > bestTask.upperBound || task.upperBound === bestTask.upperBound && task.blockIndex < bestTask.blockIndex) {
-              bestQueue = queue;
-              bestTask = task;
-            }
-          }
-          if (!bestQueue || !bestTask) break;
-          bestQueue.offset++;
-          refreshQueueBound(bestQueue);
-          batch.push({ cursor: bestQueue.cursor, blockIndex: bestTask.blockIndex });
-        }
-        if (!batch.length) break;
-        docRangeBlockBatches++;
-        const byCursor = /* @__PURE__ */ new Map();
-        for (const item of batch) {
-          const key = item.cursor.termIndex;
-          const current = byCursor.get(key) || { cursor: item.cursor, indexes: [] };
-          current.indexes.push(item.blockIndex);
-          byCursor.set(key, current);
-        }
-        for (const { cursor, indexes } of byCursor.values()) {
-          const decoded = await decodeEntryBlockBatch(cursor.shard, cursor.entry, indexes, "postingDocRanges");
-          fetchedBlocks += decoded.fetchedBlocks;
-          fetchGroups += decoded.fetchGroups;
-          wantedBlocks += decoded.wantedBlocks;
-          for (const { blockIndex, rows: rows2 } of decoded.blocks) {
-            const block = cursor.entry.blocks?.[blockIndex];
-            const blockKey = `${cursor.shardName}\0${cursor.term}\0${blockIndex}`;
-            if (!decodedBlocks.has(blockKey)) {
-              decodedBlocks.add(blockKey);
-              blocksDecoded++;
-            }
-            blocksVisited++;
-            postingRowsScanned += rows2.length / 2;
-            const docsInRange = hasFilters ? postingDocsInRange(rows2, rangeStart, rangeEnd) : null;
-            if (hasFilters && !docsInRange.length) continue;
-            const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
-            if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
-            const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : filterSummaryProvesBlock ? null : fallbackCodeData;
-            postingsDecoded += rows2.length / 2;
-            postingsAccepted += applyBlockRowsInDocRange(
-              cursor,
-              rows2,
-              rangeStart,
-              rangeEnd,
-              codeData,
-              filterSummaryProvesBlock ? null : docFilterPlan,
-              scores,
-              hits,
-              masks
-            );
+      const state = bestDocRangeState(rangeStates);
+      if (!state) break;
+      initializeRangeState(state);
+      if (state.exhausted) continue;
+      const range = state.range;
+      const rangeStart = range.index * plan.rangeSize;
+      const rangeEnd = Math.min(manifest.total, rangeStart + plan.rangeSize);
+      const batch = [];
+      const batchLimit = Math.min(docRangeBlockPruneBatchSize, state.batchLimit);
+      while (batch.length < batchLimit) {
+        let bestQueue = null;
+        let bestTask = null;
+        for (const queue of state.queues) {
+          const task = queue.tasks[queue.offset];
+          if (!task) continue;
+          if (!bestTask || compareDocRangeTasks(task, bestTask) < 0) {
+            bestQueue = queue;
+            bestTask = task;
           }
         }
-        stopUpperBound = Math.max(nextRangeUpperBound, remainingBlockPotential(remainingTermBounds).potential);
-        stable = stableDocRangeBlockTopK(scores, hits, masks, minShouldMatch, candidateK, nextRangeUpperBound, remainingTermBounds, proofStats);
-        if (stable) {
-          docRangeInnerBlocksPruned += remainingQueueBlocks();
-          break;
-        }
-        batchLimit = Math.min(docRangeBlockPruneBatchSize, batchLimit * 2);
+        if (!bestQueue || !bestTask) break;
+        bestQueue.offset++;
+        refreshQueueBound(state, bestQueue);
+        batch.push({ cursor: bestQueue.cursor, blockIndex: bestTask.blockIndex });
       }
-      if (stable) break;
+      if (!batch.length) {
+        state.exhausted = true;
+        continue;
+      }
+      docRangeBlockBatches++;
+      const decoded = await decodeCursorBlockBatch(batch, "postingDocRanges");
+      fetchedBlocks += decoded.fetchedBlocks;
+      fetchGroups += decoded.fetchGroups;
+      wantedBlocks += decoded.wantedBlocks;
+      for (const { cursor, blockIndex, rows: rows2 } of decoded.blocks) {
+        const block = cursor.entry.blocks?.[blockIndex];
+        const blockKey = postingBlockKey(cursor, blockIndex);
+        if (!decodedBlocks.has(blockKey)) {
+          decodedBlocks.add(blockKey);
+          blocksDecoded++;
+        }
+        blocksVisited++;
+        postingRowsScanned += rows2.length / 2;
+        const docsInRange = hasFilters ? postingDocsInRange(rows2, rangeStart, rangeEnd) : null;
+        if (hasFilters && !docsInRange.length) continue;
+        const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
+        if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
+        const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : filterSummaryProvesBlock ? null : fallbackCodeData;
+        postingsDecoded += rows2.length / 2;
+        postingsAccepted += applyBlockRowsInDocRange(
+          cursor,
+          rows2,
+          rangeStart,
+          rangeEnd,
+          codeData,
+          filterSummaryProvesBlock ? null : docFilterPlan,
+          scores,
+          hits,
+          masks
+        );
+      }
+      state.exhausted = remainingQueueBlocks(state) === 0;
+      state.batchLimit = Math.min(docRangeBlockPruneBatchSize, Math.max(1, state.batchLimit * 2));
     }
-    exhausted = !stable && rangesVisited >= plan.candidates.length;
+    exhausted = !stable && maxDocRangeOutsidePotential(rangeStates).potential <= 0;
     let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, candidateK);
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
@@ -5534,6 +5673,7 @@ async function createSearch(options = {}) {
         docRangeCandidateRanges: plan.candidates.length,
         docRangeRangesVisited: rangesVisited,
         docRangeRangesPruned: Math.max(0, plan.candidates.length - rangesVisited),
+        docRangeRangeRevisits: rangeRevisits,
         docRangeNextUpperBound: stopUpperBound,
         docRangeTermRangeEntries: plan.termRangeEntries,
         docRangeCandidateBlockRatio: selectivity.ratio,
@@ -5547,6 +5687,19 @@ async function createSearch(options = {}) {
         docRangePostingBlocksSkipped: skippedPostingBlocks,
         docRangeInnerBlockBatches: docRangeBlockBatches,
         docRangeInnerBlocksPruned,
+        docRangeInitialBatchLimit: initialBatchLimit,
+        docRangeImpactPlanner: docRangeImpactPlannerEnabled && impactTierTerms > 0,
+        docRangeImpactTierTerms: impactTierTerms,
+        docRangeImpactTierTasks: impactTierTasks,
+        docRangeImpactSeed: false,
+        docRangeImpactSeedBlocks: 0,
+        docRangeImpactSeedRowsScanned: 0,
+        docRangeImpactSeedPostingsAccepted: 0,
+        docRangeImpactSeedFetchedBlocks: 0,
+        docRangeImpactSeedFetchGroups: 0,
+        docRangeImpactSeedWantedBlocks: 0,
+        docRangeImpactSeedIndexedTerms: impactTierTerms,
+        docRangeImpactSeedScannedTerms: 0,
         docRangePostingSuperblocksConsidered: consideredPostingSuperblocks,
         docRangePostingSuperblocksSkipped: skippedPostingSuperblocks,
         docRangeFetchedBlocks: fetchedBlocks,

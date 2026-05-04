@@ -79,6 +79,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
     maxShardDepth: 3,
     targetShardPostings: 2,
     postingBlockSize: 2,
+    postingImpactTierMinBlocks: 1,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0,
     queryBundleMinSeedDocs: 1,
@@ -215,13 +216,18 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.selected_term_spool_terms > 0);
   assert.ok(manifest.stats.doc_raw_spool_bytes > 0);
   assert.ok(manifest.stats.doc_gzip_spool_bytes > 0);
-  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v5");
+  assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v6");
   assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
   assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
   assert.ok(manifest.stats.posting_segment_superblocks > 0);
   assert.ok(manifest.stats.posting_segment_superblock_terms > 0);
   assert.ok(manifest.stats.posting_segment_superblock_blocks >= manifest.stats.posting_segment_superblocks);
   assert.equal(manifest.stats.posting_segment_superblock_size, 16);
+  assert.ok(manifest.stats.posting_segment_impact_tier_terms > 0);
+  assert.ok(manifest.stats.posting_segment_impact_tier_blocks > 0);
+  assert.ok(manifest.stats.posting_segment_impact_tier_tiers > 0);
+  assert.equal(manifest.stats.posting_segment_impact_tier_min_blocks, 1);
+  assert.equal(manifest.stats.posting_segment_impact_tier_max_blocks, 256);
   assert.equal(manifest.stats.posting_segment_doc_range_block_max, true);
   assert.equal(manifest.stats.posting_segment_doc_range_size, 1024);
   assert.equal(manifest.stats.posting_segment_doc_range_quantization_bits, 8);
@@ -907,12 +913,17 @@ test("doc-range planner batches candidate blocks with inner proof stats", async 
   t.after(() => server.close());
   const search = await createSearch({
     baseUrl: server.baseUrl,
-    docRangeBlockPruneBatchSize: 2
+    docRangeBlockPruneBatchSize: 2,
+    docRangeBlockPruneInitialBatchSize: 1
   });
 
   const result = await search.search({ q: "alpha beta", size: 5, rerank: false });
   assert.equal(result.stats.plannerLane, "docRangeBlockMax");
   assert.deepEqual(result.results.map(row => row.id), ["0", "1", "2", "3", "4"]);
+  assert.equal(result.stats.docRangeImpactPlanner, true);
+  assert.equal(result.stats.docRangeImpactSeed, false);
+  assert.ok(result.stats.docRangeImpactTierTerms > 0);
+  assert.ok(result.stats.docRangeImpactTierTasks > 0);
   assert.ok(result.stats.docRangeInnerBlockBatches > 0);
   assert.ok(result.stats.docRangePostingBlocksProcessed <= result.stats.docRangePostingBlocksCandidate);
   assert.ok(result.stats.docRangeNextUpperBound < result.stats.topKProofThreshold);

@@ -259,6 +259,17 @@ instead of a JavaScript comparator sort when the quantized impact range fits
 but turns the common high-df reducer path into linear counting/bucket placement
 rather than `O(n log n)` object-array sorting.
 
+Posting segment headers also emit impact-tier block references for high-df
+terms. When a term has at least `postingImpactTierMinBlocks` posting blocks, the
+builder stores up to `postingImpactTierMaxBlocks` block indexes ordered by
+per-block max impact, with tier boundaries for equal-impact groups. The runtime
+uses those references to schedule exact Block-Max/doc-range work without sorting
+all block metadata during query execution. The planner keeps one task queue per
+term and doc-id range, decodes the highest local upper-bound blocks first, scales
+the initial batch quantum with the requested top-k, coalesces all selected
+term/block pairs through one range-fetch grouping pass, and stops only when the
+global upper-bound proof proves top-k completeness.
+
 The first ingestion pass also writes two extra file-backed spools. A
 selected-term spool stores each document's final selected scoring terms and
 scaled impacts, so query-bundle construction can stream precomputed scoring
