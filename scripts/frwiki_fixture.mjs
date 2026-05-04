@@ -2,7 +2,7 @@
 
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createSearch } from "../src/runtime.js";
 import { build } from "../src/builder.js";
@@ -511,6 +511,10 @@ function benchmarkRoot(_args) {
   return resolve("benchmarks", "frwiki");
 }
 
+function repoRelativePath(filePath) {
+  return relative(resolve("."), filePath).replace(/\\/gu, "/");
+}
+
 function benchmarkLatestPath(args, kind, limit = args.limit) {
   return resolve(benchmarkRoot(args), "latest", kind, `${limitSlug(limit)}.json`);
 }
@@ -700,8 +704,8 @@ function writeBenchmarkArtifact(args, kind, report, options = {}) {
     command: args.command,
     runs: args.runs,
     size: args.size,
-    historyPath,
-    latestPath
+    historyPath: repoRelativePath(historyPath),
+    latestPath: repoRelativePath(latestPath)
   };
   report.benchmarkArtifact = artifact;
   mkdirSync(historyDir, { recursive: true });
@@ -710,8 +714,6 @@ function writeBenchmarkArtifact(args, kind, report, options = {}) {
   writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`);
   writeBenchmarkIndex(args, {
     ...artifact,
-    historyPath,
-    latestPath,
     summary: benchmarkSummary(kind, report)
   });
   return { historyPath, latestPath };
@@ -1279,7 +1281,7 @@ async function benchFixture(args, options = {}) {
     const report = {
       fixture: "frwiki",
       generatedAt: new Date().toISOString(),
-      root,
+      root: repoRelativePath(root),
       index: dirStats(resolve(root, "rangefind")),
       rangefindStats: engine.manifest.stats,
       docPages: engine.manifest.docs?.pages ? {

@@ -10,7 +10,6 @@ examples/frwiki/frwiki-bench.json
 examples/frwiki/frwiki-builder-bench.json
 examples/frwiki/frwiki-build-telemetry.json
 examples/frwiki/frwiki-scale-bench.json
-benchmarks/frwiki/
 examples/frwiki/scale/
 .DS_Store
 *.log

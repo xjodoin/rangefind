@@ -58,7 +58,7 @@ Generated data is cached in `examples/frwiki/data/frwiki.cache.jsonl` after the
 first extraction. Later runs with the same dump URL and body cap reuse that cache
 for equal or smaller `--limit` values by slicing the first `N` rows instead of
 streaming the dump again. Generated data, public assets, config, and benchmark
-JSON are intentionally ignored by git.
+JSON inside the fixture tree are intentionally ignored by git.
 
 Benchmark results are written under repo-level `benchmarks/frwiki/`, outside the
 example fixture tree:
@@ -69,3 +69,6 @@ example fixture tree:
 - `index.json` records compact run summaries and numeric deltas against the
   previous run with the same bench kind and limit, which makes progression and
   regressions easy to scan.
+
+This benchmark history is tracked by git so performance changes can be reviewed
+alongside code changes.

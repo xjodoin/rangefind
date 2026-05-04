@@ -114,7 +114,8 @@ benchmarks/frwiki/
 `index.json` is a compact progression ledger. It stores one summary per run,
 the current latest report for each `kind:limit` pair, and numeric deltas against
 the previous run with the same kind and limit so regressions can be inspected
-without opening every raw report.
+without opening every raw report. The `benchmarks/frwiki/` tree is tracked by
+git so benchmark progression and regressions are visible in normal code review.
 
 The builder report uses `rfbuilderbench-v1` and records phase wall time, peak
 RSS, heap samples, temp bytes, output bytes, worker summaries, and write
