@@ -33,6 +33,7 @@ const TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
 const TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 const DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
 const DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.75;
+const DOC_VALUE_SORT_PAGE_BATCH_SIZE = 16;
 const textDecoder = new TextDecoder();
 let activeRuntimeTrace = null;
 
@@ -395,6 +396,10 @@ export async function createSearch(options = {}) {
     return segmentManifest;
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
+  const docValueSortPageBatchSize = Math.max(1, Math.min(
+    64,
+    Math.floor(Number(options.docValueSortPageBatchSize || DOC_VALUE_SORT_PAGE_BATCH_SIZE))
+  ));
   const docRangePlannerEnabled = options.docRangePlanner !== false;
   const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
     TYPO_CORRECTION_PLAN_LIMIT,
@@ -598,7 +603,7 @@ export async function createSearch(options = {}) {
     return docValueSortDirectoryCache.get(field);
   }
 
-  async function loadDocValueSortPages(field, directory, pageIndexes) {
+  async function loadDocValueSortPages(field, directory, pageIndexes, stats = null) {
     const wanted = [];
     const pending = [];
     for (const pageIndexValue of [...new Set(pageIndexes)]) {
@@ -618,7 +623,13 @@ export async function createSearch(options = {}) {
       pending.push({ field, pageIndex: pageIndexValue, entry: page, resolve: resolvePage, reject: rejectPage });
     }
 
-    await Promise.all(rangeGroups(pending, "docValueSortPages").map(async (group) => {
+    const groups = rangeGroups(pending, "docValueSortPages");
+    if (stats) {
+      stats.wanted += wanted.length;
+      stats.fetched += pending.length;
+      stats.groups += groups.length;
+    }
+    await Promise.all(groups.map(async (group) => {
       try {
         const compressed = await fetchRange(new URL(`doc-values/sorted-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
@@ -2318,28 +2329,37 @@ export async function createSearch(options = {}) {
     let rowsAccepted = 0;
     let definitelyPassedPages = 0;
     let stoppedEarly = false;
+    const sortPageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
 
-    for (const candidatePage of pages) {
-      const [loadedPage] = await loadDocValueSortPages(field, directory, [candidatePage.index]);
-      pagesVisited++;
-      const rows = sortedPageRows(loadedPage, desc);
-      rowsScanned += rows.length;
-      const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
-      if (definite) definitelyPassedPages++;
-      const codeData = definite || !filterFields.length
-        ? null
-        : await valueStoreForFilterPlan(docFilterPlan, rows.map(row => row.doc), [field]);
-      for (const row of rows) {
-        const known = { [field]: row.value };
-        if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
-        collected.push([row.doc, 0]);
-        rowsAccepted++;
-        if (collected.length >= k) {
-          stoppedEarly = true;
-          break;
+    for (let pageIndex = 0; pageIndex < pages.length && !stoppedEarly;) {
+      const startPageIndex = pageIndex;
+      const batchPages = pages.slice(startPageIndex, startPageIndex + docValueSortPageBatchSize);
+      const loadedPages = await loadDocValueSortPages(field, directory, batchPages.map(item => item.index), sortPageFetchStats);
+      for (let batchOffset = 0; batchOffset < batchPages.length; batchOffset++) {
+        const candidatePage = batchPages[batchOffset];
+        const loadedPage = loadedPages[batchOffset];
+        pageIndex = startPageIndex + batchOffset;
+        pagesVisited++;
+        const rows = sortedPageRows(loadedPage, desc);
+        rowsScanned += rows.length;
+        const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
+        if (definite) definitelyPassedPages++;
+        const codeData = definite || !filterFields.length
+          ? null
+          : await valueStoreForFilterPlan(docFilterPlan, rows.map(row => row.doc), [field]);
+        for (const row of rows) {
+          const known = { [field]: row.value };
+          if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+          collected.push([row.doc, 0]);
+          rowsAccepted++;
+          if (collected.length >= k) {
+            stoppedEarly = true;
+            break;
+          }
         }
+        if (stoppedEarly) break;
       }
-      if (stoppedEarly) break;
+      pageIndex = startPageIndex + batchPages.length;
     }
 
     const resultContext = { hasTextTerms: false, preferDocPages: true };
@@ -2360,6 +2380,11 @@ export async function createSearch(options = {}) {
         docValueCandidatePages: pages.length,
         docValuePagesPruned: directory.pages.length - pages.length,
         docValuePagesVisited: pagesVisited,
+        docValueSortPageBatchSize,
+        docValueSortPagesPrefetched: sortPageFetchStats.wanted,
+        docValueSortPagesFetched: sortPageFetchStats.fetched,
+        docValueSortPageFetchGroups: sortPageFetchStats.groups,
+        docValueSortPageOverfetch: Math.max(0, sortPageFetchStats.wanted - pagesVisited),
         docValueRowsScanned: rowsScanned,
         docValueRowsAccepted: rowsAccepted,
         docValueDefinitePages: definitelyPassedPages,
@@ -2422,73 +2447,81 @@ export async function createSearch(options = {}) {
     let skippedPostingSuperblocks = 0;
     let definitelyPassedPages = 0;
     let stoppedBySortBound = false;
+    const sortPageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
 
-    for (let pageIndex = 0; pageIndex < candidatePages.length; pageIndex++) {
-      const candidatePage = candidatePages[pageIndex];
-      const [loadedPage] = await loadDocValueSortPages(field, directory, [candidatePage.index]);
-      pagesVisited++;
-      const rows = sortedPageRows(loadedPage, desc);
-      rowsScanned += rows.length;
-      const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
-      if (definite) definitelyPassedPages++;
-      const codeData = definite || !filterFields.length
-        ? null
-        : await valueStoreForFilterPlan(docFilterPlan, rows.map(row => row.doc), [field]);
-      const candidateDocs = new Set();
-      const pageScores = new Map();
-      const pageHits = new Map();
+    for (let pageIndex = 0; pageIndex < candidatePages.length && !stoppedBySortBound;) {
+      const startPageIndex = pageIndex;
+      const batchPages = candidatePages.slice(startPageIndex, startPageIndex + docValueSortPageBatchSize);
+      const loadedPages = await loadDocValueSortPages(field, directory, batchPages.map(item => item.index), sortPageFetchStats);
+      for (let batchOffset = 0; batchOffset < batchPages.length; batchOffset++) {
+        pageIndex = startPageIndex + batchOffset;
+        const candidatePage = batchPages[batchOffset];
+        const loadedPage = loadedPages[batchOffset];
+        pagesVisited++;
+        const rows = sortedPageRows(loadedPage, desc);
+        rowsScanned += rows.length;
+        const definite = pageDefinitelyPassesDocValueFilter(candidatePage, docFilterPlan, field);
+        if (definite) definitelyPassedPages++;
+        const codeData = definite || !filterFields.length
+          ? null
+          : await valueStoreForFilterPlan(docFilterPlan, rows.map(row => row.doc), [field]);
+        const candidateDocs = new Set();
+        const pageScores = new Map();
+        const pageHits = new Map();
 
-      for (const row of rows) {
-        const known = { [field]: row.value };
-        if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
-        candidateDocs.add(row.doc);
-      }
+        for (const row of rows) {
+          const known = { [field]: row.value };
+          if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+          candidateDocs.add(row.doc);
+        }
 
-      if (candidateDocs.size) {
-        const pageBlockFilterPlan = makeBlockFilterPlan(mergeSortPageFilter(filters, field, candidatePage));
-        for (const { term, shard, shardName, entry } of entries) {
-          const isBase = baseSet.has(term);
-          const candidates = sortedTextCandidateBlockIndexes(entry, pageBlockFilterPlan, candidateDocs);
-          candidatePostingBlocks += candidates.indexes.length;
-          consideredPostingBlocks += candidates.consideredBlocks;
-          skippedPostingBlocks += candidates.skippedBlocks;
-          consideredPostingSuperblocks += candidates.consideredSuperblocks;
-          skippedPostingSuperblocks += candidates.skippedSuperblocks;
-          for (const { blockIndex, rows: postings, scanned } of await lookupEntryBlocks(shard, entry, candidates.indexes, candidateDocs)) {
-            const blockKey = `${shardName}\u0000${term}\u0000${blockIndex}`;
-            if (!decodedBlocks.has(blockKey)) {
-              decodedBlocks.add(blockKey);
-              blocksDecoded++;
-            }
-            postingRowsScanned += scanned || 0;
-            postingLookupHits += postings.length / 2;
-            postingsDecoded += postings.length / 2;
-            for (let i = 0; i < postings.length; i += 2) {
-              const doc = postings[i];
-              if (!candidateDocs.has(doc)) continue;
-              pageScores.set(doc, (pageScores.get(doc) || 0) + postings[i + 1]);
-              if (isBase) pageHits.set(doc, (pageHits.get(doc) || 0) + 1);
+        if (candidateDocs.size) {
+          const pageBlockFilterPlan = makeBlockFilterPlan(mergeSortPageFilter(filters, field, candidatePage));
+          for (const { term, shard, shardName, entry } of entries) {
+            const isBase = baseSet.has(term);
+            const candidates = sortedTextCandidateBlockIndexes(entry, pageBlockFilterPlan, candidateDocs);
+            candidatePostingBlocks += candidates.indexes.length;
+            consideredPostingBlocks += candidates.consideredBlocks;
+            skippedPostingBlocks += candidates.skippedBlocks;
+            consideredPostingSuperblocks += candidates.consideredSuperblocks;
+            skippedPostingSuperblocks += candidates.skippedSuperblocks;
+            for (const { blockIndex, rows: postings, scanned } of await lookupEntryBlocks(shard, entry, candidates.indexes, candidateDocs)) {
+              const blockKey = `${shardName}\u0000${term}\u0000${blockIndex}`;
+              if (!decodedBlocks.has(blockKey)) {
+                decodedBlocks.add(blockKey);
+                blocksDecoded++;
+              }
+              postingRowsScanned += scanned || 0;
+              postingLookupHits += postings.length / 2;
+              postingsDecoded += postings.length / 2;
+              for (let i = 0; i < postings.length; i += 2) {
+                const doc = postings[i];
+                if (!candidateDocs.has(doc)) continue;
+                pageScores.set(doc, (pageScores.get(doc) || 0) + postings[i + 1]);
+                if (isBase) pageHits.set(doc, (pageHits.get(doc) || 0) + 1);
+              }
             }
           }
         }
-      }
 
-      for (const row of rows) {
-        const score = pageScores.get(row.doc);
-        if (score == null || (pageHits.get(row.doc) || 0) < Math.max(1, minShouldMatch)) continue;
-        sortValues.set(row.doc, row.sortValue);
-        collected.push([row.doc, score]);
-        rowsAccepted++;
-      }
+        for (const row of rows) {
+          const score = pageScores.get(row.doc);
+          if (score == null || (pageHits.get(row.doc) || 0) < Math.max(1, minShouldMatch)) continue;
+          sortValues.set(row.doc, row.sortValue);
+          collected.push([row.doc, score]);
+          rowsAccepted++;
+        }
 
-      collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
-      if (collected.length >= k) {
-        const boundarySortValue = sortValues.get(collected[k - 1][0]);
-        if (!nextSortPageCanTie(candidatePages[pageIndex + 1], boundarySortValue, desc)) {
-          stoppedBySortBound = true;
-          break;
+        collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
+        if (collected.length >= k) {
+          const boundarySortValue = sortValues.get(collected[k - 1][0]);
+          if (!nextSortPageCanTie(candidatePages[pageIndex + 1], boundarySortValue, desc)) {
+            stoppedBySortBound = true;
+            break;
+          }
         }
       }
+      pageIndex = startPageIndex + batchPages.length;
     }
 
     collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
@@ -2531,6 +2564,11 @@ export async function createSearch(options = {}) {
         docValueCandidatePages: candidatePages.length,
         docValuePagesPruned: directory.pages.length - candidatePages.length,
         docValuePagesVisited: pagesVisited,
+        docValueSortPageBatchSize,
+        docValueSortPagesPrefetched: sortPageFetchStats.wanted,
+        docValueSortPagesFetched: sortPageFetchStats.fetched,
+        docValueSortPageFetchGroups: sortPageFetchStats.groups,
+        docValueSortPageOverfetch: Math.max(0, sortPageFetchStats.wanted - pagesVisited),
         docValueRowsScanned: rowsScanned,
         docValueRowsAccepted: rowsAccepted,
         docValueDefinitePages: definitelyPassedPages,

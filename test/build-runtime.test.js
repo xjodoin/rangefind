@@ -528,6 +528,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(sortedText.stats.sortedTextCandidateLookup, true);
   assert.equal(sortedText.stats.topKProofSortAware, true);
   assert.ok(sortedText.stats.docValuePagesVisited < sortedText.stats.docValueDirectoryPages);
+  assert.equal(sortedText.stats.docValueSortPageBatchSize, 16);
+  assert.ok(sortedText.stats.docValueSortPagesPrefetched >= sortedText.stats.docValuePagesVisited);
+  assert.ok(sortedText.stats.docValueSortPageFetchGroups <= sortedText.stats.docValueSortPagesFetched);
   assert.ok(sortedText.stats.blocksDecoded <= sortedTextExact.stats.blocksDecoded);
   assert.ok(sortedText.stats.sortPagePostingBlocksCandidate <= sortedText.stats.sortPagePostingBlocksConsidered);
   assert.ok(sortedText.stats.postingsDecoded <= sortedText.stats.sortPagePostingRowsScanned);

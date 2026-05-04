@@ -877,6 +877,11 @@ function compactRuntimeStats(stats = {}) {
     docValueCandidatePages: stats.docValueCandidatePages || 0,
     docValuePagesPruned: stats.docValuePagesPruned || 0,
     docValuePagesVisited: stats.docValuePagesVisited || 0,
+    docValueSortPageBatchSize: stats.docValueSortPageBatchSize || 0,
+    docValueSortPagesPrefetched: stats.docValueSortPagesPrefetched || 0,
+    docValueSortPagesFetched: stats.docValueSortPagesFetched || 0,
+    docValueSortPageFetchGroups: stats.docValueSortPageFetchGroups || 0,
+    docValueSortPageOverfetch: stats.docValueSortPageOverfetch || 0,
     docValueRowsScanned: stats.docValueRowsScanned || 0,
     docValueRowsAccepted: stats.docValueRowsAccepted || 0,
     docValueDefinitePages: stats.docValueDefinitePages || 0,
@@ -952,6 +957,11 @@ async function addExactChecks(args, serverUrl, rows, cases) {
     if (item.exactCheck === false || !item.q || item.sort) continue;
     const row = rowsByLabel.get(item.label);
     if (!row) continue;
+    if (row.coldStats?.surfaceFallbackApplied) {
+      row.exactTopKMatch = null;
+      row.exactSkippedReason = "surface-fallback";
+      continue;
+    }
     const start = performance.now();
     const response = await exactEngine.search({
       q: item.q,
@@ -1159,6 +1169,11 @@ function summarizeScaleRow(row) {
     docValuePruneField: row.coldStats?.docValuePruneField || "",
     docValuePagesVisited: row.coldStats?.docValuePagesVisited || 0,
     docValuePagesPruned: row.coldStats?.docValuePagesPruned || 0,
+    docValueSortPageBatchSize: row.coldStats?.docValueSortPageBatchSize || 0,
+    docValueSortPagesPrefetched: row.coldStats?.docValueSortPagesPrefetched || 0,
+    docValueSortPagesFetched: row.coldStats?.docValueSortPagesFetched || 0,
+    docValueSortPageFetchGroups: row.coldStats?.docValueSortPageFetchGroups || 0,
+    docValueSortPageOverfetch: row.coldStats?.docValueSortPageOverfetch || 0,
     docValueRowsScanned: row.coldStats?.docValueRowsScanned || 0,
     docValueRowsAccepted: row.coldStats?.docValueRowsAccepted || 0,
     docValueChunkPruning: row.coldStats?.docValueChunkPruning || false,
