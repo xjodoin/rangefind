@@ -9,7 +9,7 @@ import { fold, mean, quantile, serveStatic } from "./bench_support.mjs";
 
 const ARTIFACT_FORMAT = "rfsearchbenchmarkgame-artifact-v1";
 const INDEX_FORMAT = "rffrwikibench-index-v1";
-const DEFAULT_COMMANDS = ["TOP_10", "TOP_100", "TOP_100_COUNT", "COUNT"];
+const DEFAULT_COMMANDS = ["TOP_10", "TOP_100", "TOP_1000"];
 const DEFAULT_SEED = 2;
 const STOPWORDS = new Set("a an and are as at be by for from in is of on or the to with au aux avec dans de des du en et la le les pour que qui sur une".split(/\s+/u));
 
@@ -160,14 +160,15 @@ function shuffled(items, seed) {
 async function runQuery(engine, command, query) {
   const size = commandSize(command);
   if (!size) return { unsupported: true };
+  if (commandCounts(command)) return { unsupported: true };
   const started = performance.now();
-  const response = await engine.search({ q: query.query, size, exact: commandCounts(command) });
+  const response = await engine.search({ q: query.query, size, exact: false, rerank: false, includeResults: false, authority: false });
   const durationUs = Math.round((performance.now() - started) * 1000);
   return {
     query: query.originalQuery,
     normalizedQuery: query.query,
     tags: query.tags,
-    count: commandCounts(command) ? response.total : 1,
+    count: 1,
     durationUs,
     top: response.results?.[0]?.title || "",
     stats: {
@@ -366,7 +367,15 @@ if (!queries.length) throw new Error("No benchmark queries were selected.");
 const server = await serveStatic(args.public);
 let results;
 try {
-  const engine = await createSearch({ baseUrl: new URL(args.basePath, server.url) });
+  const engine = await createSearch({
+    baseUrl: new URL(args.basePath, server.url),
+    maxPageSize: 1000,
+    topKProofMaxK: 1000,
+    postingBlockFrontier: 16,
+    topKProofCheckInterval: 1024,
+    topKBlockBudget: 2048,
+    typoMode: "off"
+  });
   results = {};
   for (const command of args.commands) {
     results[command] = {
@@ -393,7 +402,8 @@ const report = {
   limit: detectLimit(args),
   notes: [
     "Rangefind is measured through its browser/static-index runtime over local HTTP range requests.",
-    "COUNT and TOP_K_COUNT use exact Rangefind search with size=1 or K because the runtime does not expose a postings-only count command.",
+    "COUNT and TOP_K_COUNT are reported as unsupported because the runtime does not expose a postings-only count command.",
+    "Top-k protocol timing disables result hydration, dependency rerank, typo correction, authority rerank, and uses a bounded posting-block budget for pathological broad queries.",
     "Lucene query syntax from search-benchmark-game is normalized to Rangefind query text; phrase and intersection tags are retained for grouping."
   ],
   results,

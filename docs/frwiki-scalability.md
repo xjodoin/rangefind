@@ -182,8 +182,8 @@ npm run bench:frwiki:search-game
 ```
 
 The harness reads the existing frwiki fixture, generates phrase/union/intersection
-query rows, runs the Search Benchmark Game command shapes (`TOP_10`, `TOP_100`,
-`TOP_100_COUNT`, and `COUNT` by default), and writes reports under:
+query rows, runs the top-k Search Benchmark Game command shapes (`TOP_10`,
+`TOP_100`, and `TOP_1000` by default), and writes reports under:
 
 ```text
 benchmarks/frwiki/latest/search-benchmark-game/
@@ -201,30 +201,57 @@ npm run bench:frwiki:search-game -- \
 
 This is intentionally a protocol-compatible local trend benchmark, not an
 official Search Benchmark Game submission. Rangefind is measured through its
-browser/static-index runtime over local HTTP range requests; `COUNT` and
-`TOP_K_COUNT` use exact Rangefind search with `size: 1` or `size: K` because the
-runtime does not expose a postings-only count command, and Lucene query syntax
-such as `+term` and quoted phrases is normalized to Rangefind query text while
-retaining the original tags in the report.
+browser/static-index runtime over local HTTP range requests. `COUNT` and
+`TOP_K_COUNT` are reported as unsupported because the runtime does not expose a
+postings-only count command. Lucene query syntax such as `+term` and quoted
+phrases is normalized to Rangefind query text while retaining the original tags
+in the report.
+
+Use the replay profiler when optimizing the upstream query path. It keeps the
+run single-process so Node CPU profiles line up with the per-query trace rows:
+
+```bash
+node --cpu-prof \
+  --cpu-prof-dir=benchmarks/frwiki/latest/search-benchmark-game \
+  --cpu-prof-name=search-game-profile.cpuprofile \
+  scripts/search_benchmark_game_profile.mjs \
+  --queries=/tmp/search-benchmark-game/queries.txt \
+  --index=/tmp/search-benchmark-game/engines/rangefind/index/public/rangefind \
+  --commands=TOP_10,TOP_100,TOP_1000 \
+  --query-limit=50 \
+  --runs=1 \
+  --warmup-runs=1 \
+  --cpu-profile-path=benchmarks/frwiki/latest/search-benchmark-game/search-game-profile.cpuprofile
+```
 
 For an upstream Search Benchmark Game checkout, the repo also includes an engine
 adapter in `scripts/search_benchmark_game/rangefind/`. Symlink or copy that
 directory into the upstream checkout's `engines/rangefind` directory, set
 `RANGEFIND_REPO=/path/to/rangefind` when needed, and run the normal upstream
-flow with `ENGINES=rangefind`. The adapter implements the expected `clean`,
-`compile`, `index`, and `serve` targets. Its `index` target preserves the
-builder resume directory unless `RANGEFIND_SBG_FORCE=1` is set. The upstream
-adapter currently reports `UNSUPPORTED` for `COUNT` and `TOP_K_COUNT` commands;
-Rangefind's runtime does not yet expose a postings-only count path, and using
-the exact scorer for broad official queries can materialize too many postings.
+flow with `ENGINES=rangefind COMMANDS="TOP_10 TOP_100 TOP_1000"`. The adapter
+implements the expected `clean`, `compile`, `index`, and `serve` targets. Its
+`index` target preserves the builder resume directory unless
+`RANGEFIND_SBG_FORCE=1` is set. The upstream adapter opts into `size=1000`
+top-k proof planning, disables dependency rerank and document hydration for
+protocol timing, uses a 2048 posting-block budget for pathological broad
+queries, and reports `UNSUPPORTED` for `COUNT` and `TOP_K_COUNT` commands.
 
-Latest local 5k compatibility run:
+Latest 50-query replay profile against the full upstream 5,032,104-document
+index:
 
 ```text
-TOP_10:       best mean 0.03 ms, p50 0.02 ms, p90 0.08 ms
-TOP_100:      best mean 0.03 ms, p50 0.02 ms, p90 0.07 ms
-TOP_100_COUNT: best mean 0.02 ms, p50 0.01 ms, p90 0.04 ms
-COUNT:        best mean 0.01 ms, p50 0.01 ms, p90 0.03 ms
+TOP_10:   best mean 43.12 ms, p50 50.91 ms, p90 77.65 ms
+TOP_100:  best mean 42.78 ms, p50 46.38 ms, p90 77.08 ms
+TOP_1000: best mean 43.31 ms, p50 46.83 ms, p90 77.83 ms
+```
+
+Latest upstream top-k run with one warmup pass and one measured pass over all
+962 official queries:
+
+```text
+TOP_10:   mean 46.38 ms, p50 49.74 ms, p90 79.56 ms
+TOP_100:  mean 47.25 ms, p50 51.00 ms, p90 82.03 ms
+TOP_1000: mean 44.65 ms, p50 47.54 ms, p90 76.90 ms
 ```
 
 The known-title improvement still comes from a generic authority sidecar over

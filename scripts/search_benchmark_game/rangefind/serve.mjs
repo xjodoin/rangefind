@@ -11,15 +11,33 @@ const { createSearch } = await import(pathToFileURL(resolve(repoRoot, "src/runti
 const { analyzeTerms } = await import(pathToFileURL(resolve(repoRoot, "src/analyzer.js")).href);
 const { serveStatic } = await import(pathToFileURL(resolve(repoRoot, "scripts/bench_support.mjs")).href);
 
-function installFetchLimit(limit) {
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetries(nativeFetch, input, init, retries) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await nativeFetch(input, init);
+    } catch (error) {
+      if (attempt >= retries) throw error;
+      attempt++;
+      await delay(20 * attempt);
+    }
+  }
+}
+
+function installFetchLimit(limit, retries = 2) {
   const max = Math.max(1, Math.floor(Number(limit) || 64));
+  const attempts = Math.max(0, Math.floor(Number(retries) || 0));
   const nativeFetch = globalThis.fetch;
   let active = 0;
   const queue = [];
   globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
     const run = () => {
       active++;
-      nativeFetch(input, init)
+      fetchWithRetries(nativeFetch, input, init, attempts)
         .then(resolve, reject)
         .finally(() => {
           active--;
@@ -54,9 +72,17 @@ function commandCounts(command) {
 }
 
 const indexPath = resolve(process.argv[2] || "index/public/rangefind");
-installFetchLimit(process.env.RANGEFIND_SBG_FETCH_CONCURRENCY);
+installFetchLimit(process.env.RANGEFIND_SBG_FETCH_CONCURRENCY, process.env.RANGEFIND_SBG_FETCH_RETRIES);
 const server = await serveStatic(dirname(indexPath));
-const engine = await createSearch({ baseUrl: new URL(`${basename(indexPath)}/`, server.url) });
+const engine = await createSearch({
+  baseUrl: new URL(`${basename(indexPath)}/`, server.url),
+  maxPageSize: 1000,
+  topKProofMaxK: 1000,
+  postingBlockFrontier: 16,
+  topKProofCheckInterval: 1024,
+  topKBlockBudget: 2048,
+  typoMode: "off"
+});
 
 const rl = createInterface({ input: stdin, crlfDelay: Infinity });
 try {
@@ -81,7 +107,7 @@ try {
       stdout.write("1\n");
       continue;
     }
-    await engine.search({ q, size, exact: false });
+    await engine.search({ q, size, exact: false, rerank: false, includeResults: false, authority: false });
     stdout.write("1\n");
   }
 } finally {

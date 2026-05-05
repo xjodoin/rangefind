@@ -989,6 +989,26 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
   assert.equal(largePageFallback.stats.plannerFallbackReason, "top_k_limit");
   assert.equal(largePageFallback.stats.topKProofFailureReason, "top_k_limit");
   assert.equal(largePageFallback.stats.topKProofAttempts, 0);
+
+  const protocolSearch = await createSearch({
+    baseUrl: server.baseUrl,
+    maxPageSize: 1000,
+    topKProofMaxK: 1000,
+    topKProofCheckInterval: 16,
+    topKBlockBudget: 5
+  });
+  const protocol = await protocolSearch.search({ q: "common", size: 5, rerank: false, includeResults: false, authority: false });
+  assert.equal(protocol.results.length, 5);
+  assert.equal(protocol.results[0].id, undefined);
+  assert.equal(typeof protocol.results[0].index, "number");
+  assert.equal(protocol.stats.docPayloadLane, "skipped");
+  assert.equal(protocol.stats.plannerLane, "blockBudget");
+  assert.equal(protocol.stats.topKBlockBudgetExhausted, true);
+  assert.equal(protocol.stats.topKProven, false);
+
+  const wide = await protocolSearch.search({ q: "common", size: 120, rerank: false, includeResults: false, authority: false });
+  assert.equal(wide.size, 120);
+  assert.notEqual(wide.stats.plannerFallbackReason, "top_k_limit");
 });
 
 test("doc-id posting order uses remaining suffix block max for tail proof", async (t) => {

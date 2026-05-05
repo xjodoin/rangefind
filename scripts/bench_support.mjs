@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { extname, resolve } from "node:path";
 
@@ -53,7 +53,18 @@ export async function serveStatic(root) {
       if (req.headers.range) {
         const range = parseRange(req.headers.range, s.size);
         if (!range) return res.writeHead(416, { ...headers, "content-range": `bytes */${s.size}` }).end();
-        const body = (await readFile(file)).subarray(range.start, range.end + 1);
+        const body = Buffer.allocUnsafe(range.end - range.start + 1);
+        const handle = await open(file, "r");
+        try {
+          let offset = 0;
+          while (offset < body.length) {
+            const { bytesRead } = await handle.read(body, offset, body.length - offset, range.start + offset);
+            if (!bytesRead) break;
+            offset += bytesRead;
+          }
+        } finally {
+          await handle.close();
+        }
         return res.writeHead(206, {
           ...headers,
           "content-range": `bytes ${range.start}-${range.end}/${s.size}`,

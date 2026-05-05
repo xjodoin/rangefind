@@ -281,6 +281,8 @@ export async function createSearch(options = {}) {
   let filterBitmaps = manifest.filter_bitmaps || null;
   let filterBitmapsPromise = null;
   const docValueStore = { _docValues: true };
+  const maxPageSize = Math.max(1, Math.min(1000, Math.floor(Number(options.maxPageSize || 100))));
+  const topKProofMaxK = Math.max(1, Math.min(1000, Math.floor(Number(options.topKProofMaxK || 100))));
   const filterBitmapCache = new Map();
   const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
@@ -410,6 +412,8 @@ export async function createSearch(options = {}) {
     return segmentManifest;
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
+  const topKProofCheckInterval = Math.max(1, Math.min(4096, Math.floor(Number(options.topKProofCheckInterval || 1))));
+  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget || 0)));
   const docValueSortPageBatchSize = Math.max(1, Math.min(
     64,
     Math.floor(Number(options.docValueSortPageBatchSize || DOC_VALUE_SORT_PAGE_BATCH_SIZE))
@@ -1173,11 +1177,11 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank }) {
-    return traceSpan("queryBundles.search", () => tryQueryBundleSearchInner({ page, size, baseTerms, filters, sortPlan, rerank }));
+  async function tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank, includeResults }) {
+    return traceSpan("queryBundles.search", () => tryQueryBundleSearchInner({ page, size, baseTerms, filters, sortPlan, rerank, includeResults }));
   }
 
-  async function tryQueryBundleSearchInner({ page, size, baseTerms, filters, sortPlan, rerank }) {
+  async function tryQueryBundleSearchInner({ page, size, baseTerms, filters, sortPlan, rerank, includeResults }) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
@@ -1213,7 +1217,7 @@ export async function createSearch(options = {}) {
       if (hasFilters ? !filterResult.topKProven : !bundleProvesTopK(bundle, k)) continue;
       const rows = ranked.slice(offset, offset + size);
       const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
-      const results = await rowsToResults(rows, resultContext);
+      const results = await rowsToSearchResults(rows, resultContext, includeResults);
       const totalExact = !hasFilters || (bundle.complete && filterResult.exhausted);
       const total = !hasFilters
         ? bundle.total
@@ -1571,6 +1575,19 @@ export async function createSearch(options = {}) {
       const docs = await loadDocs(rows.map(([index]) => index), context);
       return docs.map((doc, i) => ({ ...doc, score: rows[i][1] }));
     });
+  }
+
+  async function rowsToSearchResults(rows, context = {}, includeResults = true) {
+    if (includeResults === false) {
+      context.docPayloadLane = "skipped";
+      context.docPayloadPages = 0;
+      context.docPayloadRows = rows.length;
+      context.docPayloadOverfetchDocs = 0;
+      context.docPayloadAdaptive = false;
+      context.docPayloadForced = false;
+      return rows.map(([index, score]) => ({ index, score }));
+    }
+    return rowsToResults(rows, context);
   }
 
   function normalizeRangeValue(value, field) {
@@ -4139,7 +4156,8 @@ export async function createSearch(options = {}) {
     fallbackCodeData,
     rerank,
     candidateK,
-    minShouldMatch
+    minShouldMatch,
+    includeResults
   }) {
     if (!docRangePlannerEnabled || !entries.length) return null;
     const baseSet = new Set(baseTerms);
@@ -4335,7 +4353,7 @@ export async function createSearch(options = {}) {
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
     const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
-    const results = await rowsToResults(rows, resultContext);
+    const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
       total: exhausted ? ranked.length : Math.max(ranked.length, offset + size),
       page,
@@ -4403,11 +4421,11 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
-    return traceSpan("text.search", () => runSkippedSearchInner({ q, page, size, filters, sort, baseTerms, terms, rerank }));
+  async function runSkippedSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true, includeResults = true }) {
+    return traceSpan("text.search", () => runSkippedSearchInner({ q, page, size, filters, sort, baseTerms, terms, rerank, includeResults }));
   }
 
-  async function runSkippedSearchInner({ q, page, size, filters, sort, baseTerms, terms, rerank = true }) {
+  async function runSkippedSearchInner({ q, page, size, filters, sort, baseTerms, terms, rerank = true, includeResults = true }) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const candidateK = candidateLimitFor(baseTerms, k, rerank);
@@ -4415,19 +4433,19 @@ export async function createSearch(options = {}) {
     if (sortPlan) {
       const sortedText = await runSortedTextSearch({ page, size, filters, sortPlan, baseTerms, terms, rerank });
       if (sortedText) return sortedText;
-      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason: "sort_requested" });
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, includeResults, plannerFallbackReason: "sort_requested" });
     }
-    if (!baseTerms.length || terms.length > SKIP_MAX_TERMS || k > 100) {
+    if (!baseTerms.length || terms.length > SKIP_MAX_TERMS || k > topKProofMaxK) {
       const plannerFallbackReason = !baseTerms.length
         ? "no_text_terms"
         : terms.length > SKIP_MAX_TERMS
           ? "too_many_terms"
           : "top_k_limit";
-      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason });
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, includeResults, plannerFallbackReason });
     }
 
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank });
+    const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank, includeResults });
     if (bundleResponse) return bundleResponse;
 
     if (hasFilters) await ensureDocValuesManifest();
@@ -4461,7 +4479,8 @@ export async function createSearch(options = {}) {
       fallbackCodeData,
       rerank,
       candidateK,
-      minShouldMatch
+      minShouldMatch,
+      includeResults
     });
     if (docRangeResponse) return docRangeResponse;
     const cursors = entries.map((item, termIndex) => ({
@@ -4494,6 +4513,8 @@ export async function createSearch(options = {}) {
     let frontierWantedBlocks = 0;
     let frontierMax = 0;
     let filterSummaryProofBlocks = 0;
+    let blocksSinceProofCheck = topKProofCheckInterval;
+    let budgetExhausted = false;
     const proofStats = createTopKProofStats({ hasFilters, blockFilterPlan });
 
     while (true) {
@@ -4503,8 +4524,11 @@ export async function createSearch(options = {}) {
         break;
       }
 
-      stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
-      if (stable) break;
+      if (blocksSinceProofCheck >= topKProofCheckInterval) {
+        stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
+        blocksSinceProofCheck = 0;
+        if (stable) break;
+      }
 
       active.sort((a, b) => cursorSuperblockImpact(b) - cursorSuperblockImpact(a) || cursorImpact(b) - cursorImpact(a));
       const frontier = active.slice(0, postingBlockFrontier);
@@ -4527,10 +4551,18 @@ export async function createSearch(options = {}) {
         blocksDecoded++;
         postingsDecoded += rows.length / 2;
         postingsAccepted += applyBlockRows(cursor, rows, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
-        stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
-        if (stable) break;
+        blocksSinceProofCheck++;
+        if (blocksSinceProofCheck >= topKProofCheckInterval) {
+          stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
+          blocksSinceProofCheck = 0;
+          if (stable) break;
+        }
+        if (topKBlockBudget > 0 && blocksDecoded >= topKBlockBudget) {
+          budgetExhausted = true;
+          break;
+        }
       }
-      if (stable) break;
+      if (stable || budgetExhausted) break;
     }
 
     let ranked = exhausted
@@ -4542,18 +4574,18 @@ export async function createSearch(options = {}) {
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
     const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
-    const results = await rowsToResults(rows, resultContext);
+    const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
       total: exhausted ? ranked.length : Math.max(ranked.length, k),
       page,
       size,
-      approximate: !exhausted,
+      approximate: budgetExhausted || !exhausted,
       results,
       stats: {
-        exact: exhausted,
-        plannerLane: exhausted ? "fullFallback" : "tailProof",
-        topKProven: Boolean(stable || exhausted),
-        totalExact: exhausted,
+        exact: exhausted && !budgetExhausted,
+        plannerLane: budgetExhausted ? "blockBudget" : exhausted ? "fullFallback" : "tailProof",
+        topKProven: !budgetExhausted && Boolean(stable || exhausted),
+        totalExact: exhausted && !budgetExhausted,
         tailExhausted: exhausted,
         blocksDecoded,
         postingsDecoded,
@@ -4568,14 +4600,17 @@ export async function createSearch(options = {}) {
         postingBlockFrontierFetchedBlocks: frontierFetchedBlocks,
         postingBlockFrontierFetchGroups: frontierFetchGroups,
         postingBlockFrontierWantedBlocks: frontierWantedBlocks,
+        topKProofCheckInterval,
+        topKBlockBudget,
+        topKBlockBudgetExhausted: budgetExhausted,
         postingSuperblockScheduler: cursors.some(cursor => cursor.entry.superblocks?.length),
         postingSuperblocks: entries.reduce((sum, item) => sum + (item.entry.superblocks?.length || 0), 0),
         postingSuperblocksConsidered: cursors.reduce((sum, cursor) => sum + cursor.superblocksConsidered, 0),
         postingSuperblocksSkipped: cursors.reduce((sum, cursor) => sum + cursor.skippedSuperblocks, 0),
         postingSuperblocksDecoded: cursors.reduce((sum, cursor) => sum + cursor.superblocksDecoded, 0),
         filterSummaryProofBlocks,
-        plannerFallbackReason: exhausted ? "tail_exhausted" : "",
-        ...topKProofStatsObject(proofStats, exhausted ? "tail_exhausted" : ""),
+        plannerFallbackReason: budgetExhausted ? "block_budget" : exhausted ? "tail_exhausted" : "",
+        ...topKProofStatsObject(proofStats, budgetExhausted ? "block_budget" : exhausted ? "tail_exhausted" : ""),
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
@@ -4585,7 +4620,7 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "exact_requested" }) {
+  async function runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank = true, includeResults = true, plannerFallbackReason = "exact_requested" }) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
@@ -4644,7 +4679,7 @@ export async function createSearch(options = {}) {
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
     const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: sortPlan ? true : "auto" };
-    const results = await rowsToResults(rows, resultContext);
+    const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
       total: ranked.length,
       page,
@@ -4678,9 +4713,9 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true, plannerFallbackReason = "full_scan" }) {
+  async function runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank = true, includeResults = true, plannerFallbackReason = "full_scan" }) {
     if (plannerFallbackReason === "exact_requested" || options.segmentFanout === true) {
-      const segmentResponse = await runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank, plannerFallbackReason });
+      const segmentResponse = await runSegmentFanoutSearch({ page, size, filters, sort, baseTerms, terms, rerank, includeResults, plannerFallbackReason });
       if (segmentResponse) return segmentResponse;
     }
     const offset = (page - 1) * size;
@@ -4736,7 +4771,7 @@ export async function createSearch(options = {}) {
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
     const rows = ranked.slice(offset, offset + size);
     const resultContext = { hasTextTerms: !!baseTerms.length, preferDocPages: sortPlan ? true : "auto" };
-    const results = await rowsToResults(rows, resultContext);
+    const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
       total: ranked.length,
       page,
@@ -5048,6 +5083,7 @@ export async function createSearch(options = {}) {
   async function maybeAuthorityRerankInner(params, response) {
     const stats = response.stats || {};
     if (!authorityDirectory || options.authority === false || params.authority === false) return response;
+    if (params.includeResults === false) return response;
     if (params.page !== 1 || params.sort) return response;
     const filters = params.filters || {};
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
@@ -5158,7 +5194,7 @@ export async function createSearch(options = {}) {
   async function executeSearch(params = {}) {
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
-    const size = Math.max(1, Math.min(100, Number(params.size || 10)));
+    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
     const offset = (page - 1) * size;
     const filters = params.filters || {};
     const sort = params.sort || null;
@@ -5235,10 +5271,12 @@ export async function createSearch(options = {}) {
       baseTerms,
       terms: queryTerms(q),
       rerank: params.rerank,
+      includeResults: params.includeResults !== false,
       plannerFallbackReason: params.exact ? "exact_requested" : "full_scan"
     });
-    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank }, response, baseTerms, analyzedTerms);
-    return maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, authority: params.authority }, typoResponse);
+    const includeResults = params.includeResults !== false;
+    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults }, response, baseTerms, analyzedTerms);
+    return maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, includeResults, authority: params.authority }, typoResponse);
   }
 
   async function search(params = {}) {
