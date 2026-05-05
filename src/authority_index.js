@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, mkdirSync, openSync, rmSync, unlinkSync, writeSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { authorityKeysForValue, AUTHORITY_FORMAT, buildAuthorityShard } from "./authority_codec.js";
@@ -112,7 +112,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
     const runPath = resolve(dirs.authorityRunsOut, `${baseShard}.run`);
     const stats = await reduceRunToPartitions({
       runPath,
-      scratchDir: resolve(dirs.out, "_build", "authority-reduce-sort", encodeURIComponent(baseShard)),
+      scratchDir: resolve(dirs.build || resolve(dirs.out, "_build"), "authority-reduce-sort", encodeURIComponent(baseShard)),
       config: shardConfig,
       onPartition: (partition) => {
         const buffer = buildAuthorityShard(partition.entries, { maxRows: config.authorityMaxRowsPerKey });
@@ -128,13 +128,11 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
     });
     keyCount += stats.terms;
     rowCount += stats.postings;
-    unlinkSync(runPath);
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const directoryEntries = entries.map(entry => ({ ...entry, packIndex: packIndexes.get(entry.pack) }));
   const directory = writeDirectoryFiles(resolve(dirs.out, "authority"), directoryEntries, config.authorityDirectoryPageBytes || config.directoryPageBytes, "authority", { packTable: packWriter.packs });
-  rmSync(dirs.authorityRunsOut, { recursive: true, force: true });
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",

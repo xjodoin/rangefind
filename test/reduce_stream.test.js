@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ function runBytes(records) {
 test("external run reducer sorts, merges duplicate postings, and streams prefix partitions", async () => {
   const root = mkdtempSync(join(tmpdir(), "rangefind-reduce-"));
   const runPath = join(root, "ab.run");
+  const scratchDir = join(root, "sort");
   writeFileSync(runPath, runBytes([
     ["abc", 3, 10],
     ["abd", 2, 20],
@@ -29,7 +30,7 @@ test("external run reducer sorts, merges duplicate postings, and streams prefix 
   try {
     const stats = await reduceRunToPartitions({
       runPath,
-      scratchDir: join(root, "sort"),
+      scratchDir,
       config: {
         baseShardDepth: 2,
         maxShardDepth: 3,
@@ -41,6 +42,7 @@ test("external run reducer sorts, merges duplicate postings, and streams prefix 
         terms.push([term, df]);
       },
       onPartition(partition, sequence) {
+        assert.equal(existsSync(join(scratchDir, "reduced-terms.run")), false);
         partitions.push({ sequence, name: partition.name, entries: partition.entries });
         return partition.name;
       }

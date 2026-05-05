@@ -330,6 +330,7 @@ function encodePostings(rows, total, codes, filters, config) {
   const order = orderPlan.order;
   const chunks = [];
   const blocks = [];
+  const pendingBlocks = [];
   let offset = 0;
   for (let start = 0; start < order.length; start += config.postingBlockSize) {
     const end = Math.min(order.length, start + config.postingBlockSize);
@@ -351,18 +352,26 @@ function encodePostings(rows, total, codes, filters, config) {
         maxImpactDoc = doc;
       }
     }
-    const block = {
-      offset,
-      maxImpact,
-      maxImpactDoc,
-      docMin,
-      docMax,
-      rowCount: blockRows.length,
-      filters: emptySummary(filters),
-      docRanges: buildPostingBlockDocRanges(blockRows, docRanges)
-    };
-    for (const [doc] of blockRows) updateSummary(block.filters, filters, codes, doc);
-    const encodedBlock = encodePostingBlockRows(blockRows, config);
+    pendingBlocks.push({
+      rows: blockRows,
+      block: {
+        offset: 0,
+        maxImpact,
+        maxImpactDoc,
+        docMin,
+        docMax,
+        rowCount: blockRows.length,
+        filters: emptySummary(filters),
+        docRanges: buildPostingBlockDocRanges(blockRows, docRanges)
+      }
+    });
+  }
+  const codecPlan = planPostingBlockCodec(pendingBlocks.map(item => item.rows), config);
+  for (const item of pendingBlocks) {
+    const block = item.block;
+    block.offset = offset;
+    for (const [doc] of item.rows) updateSummary(block.filters, filters, codes, doc);
+    const encodedBlock = encodePostingBlockRows(item.rows, config, codecPlan);
     block.codec = encodedBlock.codec;
     block.bytes = encodedBlock.bytes;
     block.baselineBytes = encodedBlock.baselineBytes;
@@ -375,7 +384,7 @@ function encodePostings(rows, total, codes, filters, config) {
     chunks.push(encodedBlock.bytes);
     offset += encodedBlock.bytes.length;
   }
-  return { df, count: order.length, byteLength: offset, chunks, blocks, docRanges, orderCodec: orderPlan.codec };
+  return { df, count: order.length, byteLength: offset, chunks, blocks, docRanges, orderCodec: orderPlan.codec, codecPlan };
 }
 
 function buildPostingDocRanges(docs, impacts, total, config) {
@@ -623,7 +632,110 @@ function encodePartitionedDeltaRows(rows) {
   return Uint8Array.from(bytes);
 }
 
-function encodePostingBlockRows(rows, config) {
+function docIdPostingOrder(config) {
+  const order = String(config.postingOrder || "").toLowerCase();
+  return order === "doc" || order === "doc-id" || order === "docid" || order === "sort-rank";
+}
+
+function blockCodecForMode(mode) {
+  if (mode === "impact-runs" || mode === "compact-impact") return POSTING_BLOCK_CODEC_IMPACT_RUNS;
+  if (mode === "impact-bitset" || mode === "dense-bitset") return POSTING_BLOCK_CODEC_IMPACT_BITSET;
+  if (mode === "partitioned-deltas" || mode === "partitioned-ef") return POSTING_BLOCK_CODEC_PARTITIONED_DELTAS;
+  return POSTING_BLOCK_CODEC_PAIR_VARINT;
+}
+
+function encodeRowsWithCodec(rows, codec) {
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_RUNS) return encodeImpactRunRows(rows);
+  if (codec === POSTING_BLOCK_CODEC_IMPACT_BITSET) return encodeImpactBitsetRows(rows);
+  if (codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS) return encodePartitionedDeltaRows(rows);
+  return encodePairVarintRows(rows);
+}
+
+function sampleBlockIndexes(count, limit) {
+  const max = Math.max(1, Math.min(count, Math.floor(Number(limit || 3))));
+  if (count <= max) return Array.from({ length: count }, (_, index) => index);
+  const indexes = new Set([0, count - 1]);
+  while (indexes.size < max) {
+    const fraction = indexes.size / Math.max(1, max - 1);
+    indexes.add(Math.min(count - 1, Math.floor(fraction * (count - 1))));
+  }
+  return [...indexes].sort((a, b) => a - b);
+}
+
+function blockCodecSummary(rows) {
+  let previousDoc = -1;
+  let maxDelta = 0;
+  let impactRuns = 0;
+  let previousImpact = null;
+  for (const [doc, impact] of rows) {
+    if (previousDoc >= 0) maxDelta = Math.max(maxDelta, doc - previousDoc);
+    previousDoc = doc;
+    if (impact !== previousImpact) {
+      impactRuns++;
+      previousImpact = impact;
+    }
+  }
+  const firstDoc = rows[0]?.[0] || 0;
+  const lastDoc = rows[rows.length - 1]?.[0] || firstDoc;
+  return {
+    rows: rows.length,
+    span: Math.max(1, lastDoc - firstDoc + 1),
+    maxDelta,
+    impactRuns
+  };
+}
+
+function planPostingBlockCodec(blockRows, config) {
+  const mode = String(config.codecs?.mode || "varint").toLowerCase();
+  const pairModes = new Set(["off", "pair", "pairs", "pair-varint", "varint"]);
+  const stats = {
+    mode,
+    sampledTerms: 0,
+    sampledBlocks: 0,
+    skipImpactCandidates: 0,
+    skipBitsetCandidates: 0,
+    skipPartitionedDeltaCandidates: 0
+  };
+  if (pairModes.has(mode) || !blockRows.length) return { codec: POSTING_BLOCK_CODEC_PAIR_VARINT, stats };
+  if (mode !== "auto") return { codec: blockCodecForMode(mode), stats };
+
+  const sampleIndexes = sampleBlockIndexes(blockRows.length, config.codecPlannerSampleBlocks || 3);
+  const samples = sampleIndexes.map(index => blockRows[index]).filter(rows => rows?.length);
+  const summaries = samples.map(blockCodecSummary);
+  stats.sampledTerms = samples.length ? 1 : 0;
+  stats.sampledBlocks = samples.length;
+  const spanFactor = Math.max(2, Number(config.codecPlannerBitsetMaxSpanFactor || 16));
+  const sparseForBitset = summaries.length && summaries.every(summary => summary.span > summary.rows * spanFactor);
+  const unclusteredImpacts = docIdPostingOrder(config)
+    && summaries.length
+    && summaries.every(summary => summary.impactRuns > Math.max(1, summary.rows / 2));
+  const wideDeltas = summaries.some(summary => summary.maxDelta > 2 ** 30);
+  const candidates = [POSTING_BLOCK_CODEC_PAIR_VARINT];
+  if (unclusteredImpacts) stats.skipImpactCandidates++;
+  else candidates.push(POSTING_BLOCK_CODEC_IMPACT_RUNS);
+  if (sparseForBitset || unclusteredImpacts) stats.skipBitsetCandidates++;
+  else candidates.push(POSTING_BLOCK_CODEC_IMPACT_BITSET);
+  if (wideDeltas || unclusteredImpacts) stats.skipPartitionedDeltaCandidates++;
+  else candidates.push(POSTING_BLOCK_CODEC_PARTITIONED_DELTAS);
+
+  let selected = { codec: POSTING_BLOCK_CODEC_PAIR_VARINT, bytes: Infinity };
+  for (const codec of candidates) {
+    let bytes = 0;
+    let valid = true;
+    for (const rows of samples) {
+      const encoded = encodeRowsWithCodec(rows, codec);
+      if (!encoded) {
+        valid = false;
+        break;
+      }
+      bytes += encoded.length;
+    }
+    if (valid && bytes < selected.bytes) selected = { codec, bytes };
+  }
+  return { codec: selected.codec, stats };
+}
+
+function encodePostingBlockRows(rows, config, plan = null) {
   const baseline = encodePairVarintRows(rows);
   const mode = String(config.codecs?.mode || "auto").toLowerCase();
   if (mode === "off" || mode === "pair" || mode === "pairs" || mode === "pair-varint" || mode === "varint") {
@@ -634,44 +746,19 @@ function encodePostingBlockRows(rows, config) {
       alternateBytes: baseline.length
     };
   }
-  const impactRuns = encodeImpactRunRows(rows);
-  const impactBitset = encodeImpactBitsetRows(rows);
-  const partitionedDeltas = encodePartitionedDeltaRows(rows);
-  const candidates = [
-    {
-      codec: POSTING_BLOCK_CODEC_PAIR_VARINT,
-      bytes: baseline
-    },
-    {
-      codec: POSTING_BLOCK_CODEC_IMPACT_RUNS,
-      bytes: impactRuns,
-    },
-    {
-      codec: POSTING_BLOCK_CODEC_IMPACT_BITSET,
-      bytes: impactBitset
-    }
-  ];
-  if (partitionedDeltas) {
-    candidates.push({
-      codec: POSTING_BLOCK_CODEC_PARTITIONED_DELTAS,
-      bytes: partitionedDeltas
-    });
-  }
-  let selected = candidates[0];
-  if (mode === "impact-runs" || mode === "compact-impact") selected = candidates[1];
-  else if (mode === "impact-bitset" || mode === "dense-bitset") selected = candidates[2];
-  else if ((mode === "partitioned-deltas" || mode === "partitioned-ef") && partitionedDeltas) selected = candidates[candidates.length - 1];
-  else if (mode === "auto") {
-    selected = candidates.reduce((best, candidate) => candidate.bytes.length < best.bytes.length ? candidate : best, candidates[0]);
-  }
+  const selectedCodec = plan?.codec || blockCodecForMode(mode);
+  const selectedBytes = selectedCodec === POSTING_BLOCK_CODEC_PAIR_VARINT ? baseline : encodeRowsWithCodec(rows, selectedCodec);
+  const selected = selectedBytes
+    ? { codec: selectedCodec, bytes: selectedBytes }
+    : { codec: POSTING_BLOCK_CODEC_PAIR_VARINT, bytes: baseline };
   return {
     codec: selected.codec,
     bytes: selected.bytes,
     baselineBytes: baseline.length,
-    alternateBytes: Math.min(impactRuns.length, impactBitset.length, partitionedDeltas?.length || Infinity),
-    impactRunBytes: impactRuns.length,
-    impactBitsetBytes: impactBitset.length,
-    partitionedDeltaBytes: partitionedDeltas?.length || 0
+    alternateBytes: selected.codec === POSTING_BLOCK_CODEC_PAIR_VARINT ? baseline.length : selected.bytes.length,
+    impactRunBytes: selected.codec === POSTING_BLOCK_CODEC_IMPACT_RUNS ? selected.bytes.length : 0,
+    impactBitsetBytes: selected.codec === POSTING_BLOCK_CODEC_IMPACT_BITSET ? selected.bytes.length : 0,
+    partitionedDeltaBytes: selected.codec === POSTING_BLOCK_CODEC_PARTITIONED_DELTAS ? selected.bytes.length : 0
   };
 }
 
@@ -713,6 +800,11 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     blockCodecImpactRunCandidateBytes: 0,
     blockCodecImpactBitsetCandidateBytes: 0,
     blockCodecPartitionedDeltaCandidateBytes: 0,
+    codecPlannerSampledTerms: 0,
+    codecPlannerSampledBlocks: 0,
+    codecPlannerSkipImpactCandidates: 0,
+    codecPlannerSkipBitsetCandidates: 0,
+    codecPlannerSkipPartitionedDeltaCandidates: 0,
     impactBucketOrderTerms: 0,
     impactBucketOrderPostings: 0,
     impactTierTerms: 0,
@@ -729,6 +821,12 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     : entries;
   for (const [term, rows] of orderedEntries) {
     const postings = encodePostings(rows, total, codes, filters, config);
+    const plannerStats = postings.codecPlan?.stats || {};
+    stats.codecPlannerSampledTerms += plannerStats.sampledTerms || 0;
+    stats.codecPlannerSampledBlocks += plannerStats.sampledBlocks || 0;
+    stats.codecPlannerSkipImpactCandidates += plannerStats.skipImpactCandidates || 0;
+    stats.codecPlannerSkipBitsetCandidates += plannerStats.skipBitsetCandidates || 0;
+    stats.codecPlannerSkipPartitionedDeltaCandidates += plannerStats.skipPartitionedDeltaCandidates || 0;
     if (postings.orderCodec === "impact-bucket") {
       stats.impactBucketOrderTerms++;
       stats.impactBucketOrderPostings += postings.count;

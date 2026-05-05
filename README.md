@@ -74,6 +74,23 @@ npm run serve:example
 
 Open `http://localhost:5178/`.
 
+## Full Wikipedia Search Site
+
+The `examples/wiki-search` project is a fuller static search application for
+Wikimedia article dumps. It defaults to the latest English Wikipedia articles
+dump and can run on a bounded sample or the full dump:
+
+```bash
+npm run build:wiki-site -- --limit=50000
+npm run serve:wiki-site
+```
+
+Use `npm run build:wiki-site:full` to build the full default dump with the
+bounded body cap, or `npm run build:wiki-site:fr:full` for the full French
+Wikipedia dump. The generated site lives at `examples/wiki-search/public/` and
+keeps the same static hosting requirement as every Rangefind index: the host
+must support HTTP `Range` requests for `.bin` files.
+
 ## French Wikipedia Scalability Fixture
 
 Rangefind includes a reproducible French Wikipedia fixture that streams the
@@ -121,6 +138,10 @@ Create `rangefind.config.json`:
   "output": "public/rangefind",
   "idPath": "id",
   "urlPath": "url",
+  "indexProfile": "static-large",
+  "targetPostingsPerDoc": 12,
+  "bodyIndexChars": 6000,
+  "alwaysIndexFields": ["title", "category"],
   "display": ["id", "url", "title", "body", "category", "tags", "year", "published", "featured"],
   "fields": [
     { "name": "title", "path": "title", "weight": 4.5, "b": 0.55, "phrase": true },
@@ -154,6 +175,11 @@ can stay long while returned fields are capped, for example:
 ```json
 { "name": "body", "path": "body", "maxChars": 640 }
 ```
+
+For large static corpora, `targetPostingsPerDoc` is the body-term budget.
+`bodyIndexChars` caps only the text considered by the indexer, while display
+payload size stays controlled by `display` entries. Terms from
+`alwaysIndexFields` are indexed before the body budget is applied.
 
 `authority` fields build a separate packed sidecar for canonical labels such as
 titles, entity names, product names, slugs, and aliases. The runtime first tries

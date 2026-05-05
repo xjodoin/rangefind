@@ -10,11 +10,12 @@ const PORT = Number(process.argv[3] || process.env.PORT || 5178);
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".gz": "application/gzip",
   ".bin": "application/octet-stream"
 };
-const GZIP_TYPES = new Set([".html", ".js", ".json"]);
+const GZIP_TYPES = new Set([".html", ".js", ".css", ".json"]);
 
 function parseRange(header, size) {
   const match = /^bytes=(\d*)-(\d*)$/u.exec(String(header || ""));

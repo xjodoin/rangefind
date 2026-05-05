@@ -47,6 +47,20 @@ test("segment builder writes bounded immutable term segments", async () => {
   assert.deepEqual(readSegmentRows(data, data.terms[0]), [[1, 7]]);
 });
 
+test("segment builder streams large term metadata files with readable checksums", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-segments-large-"));
+  const builder = createSegmentBuilder(root, { segmentMaxPostings: 10000 });
+  for (let i = 0; i < 5000; i++) addSegmentPosting(builder, `term-${String(i).padStart(5, "0")}`, i, 1);
+  const [segment] = finishSegmentBuilder(builder);
+
+  assert.equal(segment.termCount, 5000);
+  assert.match(segment.files.terms.checksum.value, /^[0-9a-f]{64}$/u);
+  const data = readSegmentTerms(segment);
+  assert.equal(data.terms.length, 5000);
+  assert.equal(data.terms[0].term, "term-00000");
+  assert.equal(data.terms.at(-1).term, "term-04999");
+});
+
 test("segment builder flushes by explicit doc and byte budgets", async () => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-segment-budget-"));
   const byDocs = createSegmentBuilder(join(root, "docs"), { segmentFlushDocs: 2, segmentMaxPostings: 100 });
@@ -128,18 +142,87 @@ test("segment merge combines terms and emits deterministic partitions", async ()
   assert.deepEqual(seenTerms, [["alpha", 2], ["beta", 1], ["gamma", 1]]);
   assert.equal(stats.terms, 3);
   assert.equal(stats.postings, 4);
-  assert.ok(stats.reducedSpoolBytes > 0);
+  assert.equal("reducedSpoolBytes" in stats, false);
   assert.ok(stats.partitionSpoolBytes > 0);
   assert.equal(stats.partitionSpoolEntries, 3);
-  assert.ok(stats.timings.reducedSpoolMs >= 0);
+  assert.ok(stats.timings.prefixCountMs >= 0);
   assert.ok(stats.timings.partitionAssemblyMs >= 0);
-  assert.ok(partitions.every(partition => partition.entries == null));
+  assert.ok(partitions.every(partition => Array.isArray(partition.entries)));
   assert.ok(partitions.every(partition => partition.length > 0 && partition.inputBytes === partition.length));
   assert.deepEqual(partitionPairs, [
     ["alpha", [[1, 2], [4, 7]]],
     ["beta", [[3, 5]]],
     ["gamma", [[5, 11]]]
   ]);
+});
+
+test("segment merge schedules partitions with byte-credit backpressure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-segment-credit-"));
+  const builder = createSegmentBuilder(join(root, "segments"), { segmentMaxPostings: 1 });
+  for (const [term, doc] of [["alpha", 1], ["bravo", 2], ["charlie", 3]]) {
+    addSegmentPosting(builder, term, doc, 1);
+    flushSegment(builder);
+  }
+  let active = 0;
+  let maxActive = 0;
+
+  const stats = await mergeSegmentsToPartitions({
+    segments: finishSegmentBuilder(builder),
+    scratchDir: join(root, "merge"),
+    config: {
+      baseShardDepth: 1,
+      maxShardDepth: 1,
+      targetShardPostings: 1,
+      partitionReducerInFlightBytes: 16
+    },
+    partitionConcurrency: 3,
+    async onPartition(partition) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+      return partition.name;
+    }
+  });
+
+  assert.equal(maxActive, 1);
+  assert.equal(stats.partitionScheduler.creditLimitBytes, 16);
+  assert.ok(stats.partitionScheduler.creditWaits > 0);
+  assert.ok(stats.partitionScheduler.maxActiveInputBytes <= 16);
+});
+
+test("segment merge runs one oversized partition alone and records telemetry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-segment-oversized-credit-"));
+  const builder = createSegmentBuilder(join(root, "segments"), { segmentMaxPostings: 1 });
+  for (const [term, doc] of [[`oversized-${"x".repeat(64)}`, 1], ["zulu", 2]]) {
+    addSegmentPosting(builder, term, doc, 1);
+    flushSegment(builder);
+  }
+  let active = 0;
+  let maxActive = 0;
+
+  const stats = await mergeSegmentsToPartitions({
+    segments: finishSegmentBuilder(builder),
+    scratchDir: join(root, "merge"),
+    config: {
+      baseShardDepth: 1,
+      maxShardDepth: 1,
+      targetShardPostings: 1,
+      partitionReducerInFlightBytes: 16
+    },
+    partitionConcurrency: 2,
+    async onPartition(partition) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+      return partition.name;
+    }
+  });
+
+  assert.equal(maxActive, 1);
+  assert.equal(stats.partitionScheduler.oversizedPartitions, 1);
+  assert.ok(stats.partitionScheduler.maxActiveInputBytes > 16);
 });
 
 test("segment merge writes intermediate tiers before final partitioning", async () => {

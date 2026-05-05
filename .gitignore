@@ -11,6 +11,12 @@ examples/frwiki/frwiki-builder-bench.json
 examples/frwiki/frwiki-build-telemetry.json
 examples/frwiki/frwiki-scale-bench.json
 examples/frwiki/scale/
+examples/wiki-search/data/
+examples/wiki-search/public/rangefind/
+examples/wiki-search/public/runtime.browser.js
+examples/wiki-search/public/site-meta.json
+examples/wiki-search/rangefind.config.json
+examples/wiki-search/wiki-search-build-telemetry.json
 .DS_Store
 *.log
 *.tgz

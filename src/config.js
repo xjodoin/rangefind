@@ -32,7 +32,7 @@ export const DEFAULTS = {
   sortReplicaPostingBlockPackBytes: 4 * 1024 * 1024,
   directoryPageBytes: 64 * 1024,
   directorySortChunkEntries: 16384,
-  queryBundles: true,
+  queryBundles: false,
   queryBundleMaxKeys: 20000,
   queryBundleSeedCandidateFactor: 2,
   queryBundleMinSeedDocs: 2,
@@ -58,30 +58,39 @@ export const DEFAULTS = {
   scanBatchDocs: 128,
   builderWorkerCount: 1,
   partitionReducerWorkers: 0,
-  partitionReducerInFlightBytes: 0,
+  partitionReducerInFlightBytes: 1024 * 1024 * 1024,
   builderMemoryBudgetBytes: 0,
+  indexProfile: "static-large",
+  targetPostingsPerDoc: 12,
+  bodyIndexChars: 6000,
+  alwaysIndexFields: ["title", "categories"],
+  resumeBuild: true,
+  resumeDir: "_build/resume",
+  typo: false,
   segmentFlushDocs: 0,
   segmentFlushBytes: 0,
   segmentMaxDocs: 0,
   segmentMaxPostings: 250000,
   segmentMaxBytes: 64 * 1024 * 1024,
   segmentMergePolicy: "tiered-log",
-  segmentMergeFanIn: 512,
-  segmentMergeMaxTempBytes: 0,
+  segmentMergeFanIn: 128,
+  segmentMergeMaxTempBytes: 512 * 1024 * 1024,
   finalSegmentTargetCount: 0,
-  maxTermsPerDoc: 160,
-  maxExpansionTermsPerDoc: 12,
+  maxTermsPerDoc: 12,
+  maxExpansionTermsPerDoc: 0,
   initialResultLimit: 20,
+  postingOrder: "doc-id",
   postingBlockSize: 128,
   postingSuperblockSize: 16,
-  postingImpactBucketOrderMinRows: 2048,
+  postingImpactBucketOrderMinRows: Number.MAX_SAFE_INTEGER,
   postingImpactBucketOrderMaxBuckets: 65536,
+  postingImpactTiers: false,
   postingImpactTierMinBlocks: 8,
   postingImpactTierMaxBlocks: 256,
-  postingDocRangeBlockMax: true,
+  postingDocRangeBlockMax: false,
   postingDocRangeSize: 1024,
   postingDocRangeQuantizationBits: 8,
-  codecs: { mode: "auto" },
+  codecs: { mode: "varint" },
   optimizationBudgetRatio: 0.08,
   optimizationBudgetMaxBytes: 50 * 1024 * 1024,
   bm25fK1: 1.2,
@@ -96,6 +105,19 @@ function configDir(configPath) {
 
 function resolveFrom(base, value) {
   return resolve(base, value || ".");
+}
+
+function applyIndexProfile(config, raw) {
+  config.indexProfile = String(config.indexProfile || DEFAULTS.indexProfile).toLowerCase();
+  config.targetPostingsPerDoc = Math.max(0, Math.floor(Number(config.targetPostingsPerDoc ?? DEFAULTS.targetPostingsPerDoc)));
+  config.maxTermsPerDoc = config.targetPostingsPerDoc;
+  config.bodyIndexChars = Math.max(0, Math.floor(Number(config.bodyIndexChars ?? DEFAULTS.bodyIndexChars)));
+  config.alwaysIndexFields = Array.isArray(config.alwaysIndexFields)
+    ? config.alwaysIndexFields.map(String).filter(Boolean)
+    : DEFAULTS.alwaysIndexFields.slice();
+  if (raw.resumeBuild == null) config.resumeBuild = config.indexProfile === "static-large";
+  config.resumeDir = String(config.resumeDir || DEFAULTS.resumeDir);
+  return config;
 }
 
 export async function readConfig(configPath) {
@@ -113,7 +135,7 @@ export async function readConfig(configPath) {
   ]) {
     delete activeRaw[key];
   }
-  return {
+  return applyIndexProfile({
     ...DEFAULTS,
     ...activeRaw,
     codecs: { ...DEFAULTS.codecs, ...(raw.codecs || {}) },
@@ -131,7 +153,7 @@ export async function readConfig(configPath) {
     sortReplicas: raw.sortReplicas || [],
     display: raw.display || ["title", "url"],
     authority: raw.authority || DEFAULTS.authority
-  };
+  }, raw);
 }
 
 export function getPath(object, path, fallback = "") {

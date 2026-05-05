@@ -260,6 +260,82 @@ test("posting segment codec selects partitioned deltas for sparse regular doc id
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0), docs);
 });
 
+test("static-large default posting codec keeps pair-varint blocks without sampling", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    indexProfile: "static-large",
+    postingOrder: "doc-id",
+    postingBlockSize: 8,
+    postingSuperblockSize: 2
+  };
+  const filters = buildBlockFilters(config, {});
+  const rows = Array.from({ length: 16 }, (_, index) => [index * 100, 1000]);
+  const segment = buildPostingSegment([["common", rows]], 1600, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("common");
+
+  assert.deepEqual(entry.blocks.map(block => block.codec), ["pair-varint-v1", "pair-varint-v1"]);
+  assert.equal(segment.stats.pairVarintBlocks, 2);
+  assert.equal(segment.stats.impactRunBlocks, 0);
+  assert.equal(segment.stats.impactBitsetBlocks, 0);
+  assert.equal(segment.stats.partitionedDeltaBlocks, 0);
+  assert.equal(segment.stats.codecPlannerSampledTerms, 0);
+  assert.equal(segment.stats.codecPlannerSampledBlocks, 0);
+});
+
+test("auto posting codec samples once per term and reuses the selected codec", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingOrder: "doc-id",
+    postingBlockSize: 4,
+    postingSuperblockSize: 2,
+    codecPlannerSampleBlocks: 3,
+    codecs: { mode: "auto" }
+  };
+  const filters = buildBlockFilters(config, {});
+  const rows = Array.from({ length: 12 }, (_, index) => [index * 100, 1000]);
+  const segment = buildPostingSegment([["common", rows]], 1200, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("common");
+
+  assert.deepEqual(entry.blocks.map(block => block.codec), ["impact-runs-v1", "impact-runs-v1", "impact-runs-v1"]);
+  assert.equal(segment.stats.codecPlannerSampledTerms, 1);
+  assert.equal(segment.stats.codecPlannerSampledBlocks, 3);
+  assert.equal(segment.stats.impactRunBlocks, 3);
+  assert.equal(segment.stats.pairVarintBlocks, 0);
+});
+
+test("auto posting codec skips bad candidates for sparse unclustered doc-id terms", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingOrder: "doc-id",
+    postingBlockSize: 8,
+    postingSuperblockSize: 2,
+    codecPlannerSampleBlocks: 2,
+    codecs: { mode: "auto" }
+  };
+  const filters = buildBlockFilters(config, {});
+  const rows = Array.from({ length: 16 }, (_, index) => [index * 100, index % 2 === 0 ? 1000 : 700]);
+  const segment = buildPostingSegment([["common", rows]], 1600, {}, filters, config);
+  const shard = parsePostingSegment(segment.buffer, { block_filters: filters });
+  const entry = shard.terms.get("common");
+
+  assert.deepEqual(entry.blocks.map(block => block.codec), ["pair-varint-v1", "pair-varint-v1"]);
+  assert.equal(segment.stats.codecPlannerSampledTerms, 1);
+  assert.equal(segment.stats.codecPlannerSkipImpactCandidates, 1);
+  assert.equal(segment.stats.codecPlannerSkipBitsetCandidates, 1);
+  assert.equal(segment.stats.codecPlannerSkipPartitionedDeltaCandidates, 1);
+  assert.equal(segment.stats.impactRunBlocks, 0);
+  assert.equal(segment.stats.impactBitsetBlocks, 0);
+  assert.equal(segment.stats.partitionedDeltaBlocks, 0);
+});
+
 test("posting block lookup returns candidate docs without materializing the full block", () => {
   const cases = [
     {

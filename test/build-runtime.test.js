@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -49,6 +49,13 @@ async function serveStatic(root) {
   };
 }
 
+async function resumeStageFile(output, stage) {
+  const resumeRoot = join(output, "_build", "resume");
+  const fingerprints = await readdir(resumeRoot);
+  assert.equal(fingerprints.length, 1);
+  return join(resumeRoot, fingerprints[0], "stages", `${stage}.json`);
+}
+
 test("builder output is searchable through the range-based runtime", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-build-"));
   const docsPath = join(root, "docs.jsonl");
@@ -78,7 +85,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
     baseShardDepth: 2,
     maxShardDepth: 3,
     targetShardPostings: 2,
+    queryBundles: true,
+    typo: { enabled: true },
+    segmentMergeFanIn: 512,
     postingBlockSize: 2,
+    postingDocRangeBlockMax: true,
+    postingImpactTiers: true,
     postingImpactTierMinBlocks: 1,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0,
@@ -260,10 +272,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.segment_merge_intermediate_bytes >= 0);
   assert.ok(manifest.stats.segment_merge_write_amplification >= 0);
   assert.equal(manifest.stats.segment_merge_tiers, 0);
-  assert.ok(manifest.stats.segment_reduced_spool_bytes > 0);
   assert.ok(manifest.stats.segment_directory_spool_bytes > 0);
   assert.equal(manifest.stats.segment_directory_spool_entries, manifest.directory.entries);
-  assert.ok(manifest.stats.segment_reduced_spool_ms >= 0);
+  assert.ok(manifest.stats.segment_prefix_count_ms >= 0);
   assert.ok(manifest.stats.segment_partition_assembly_ms >= 0);
   assert.ok(manifest.stats.segment_files > 0);
   assert.ok(manifest.stats.segment_terms > 0);
@@ -647,6 +658,7 @@ test("query bundles progressively verify numeric filters before doc-value exhaus
     baseShardDepth: 1,
     maxShardDepth: 1,
     targetShardPostings: 1000,
+    queryBundles: true,
     queryBundleMaxRows: 64,
     queryBundleRowGroupSize: 16,
     queryBundleMinSeedDocs: 2,
@@ -703,13 +715,111 @@ test("failed builds write diagnostics and clean partial scratch state", async ()
   }));
 
   await assert.rejects(() => build({ configPath }), /JSON|Unexpected/u);
-  await assert.rejects(() => stat(join(output, "_build")), /ENOENT/u);
+  await stat(join(output, "_build"));
   const failure = JSON.parse(await readFile(join(output, "debug", "build-failure.json"), "utf8"));
   assert.equal(failure.status, "failed");
-  assert.equal(failure.cleanup.removed, "_build");
+  assert.equal(failure.cleanup.preserved, "_build/resume");
   const failedTelemetry = JSON.parse(await readFile(join(output, "debug", "build-telemetry.failed.json"), "utf8"));
   assert.equal(failedTelemetry.status, "failed");
   assert.ok(failedTelemetry.error.message);
+});
+
+test("static-large budget keeps all docs, always indexes key fields, and caps body indexing", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-budget-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "a", title: "RareTitle", categories: "KeptCategory", body: "earlybody lateunindexed retained display text", url: "/a" }),
+    JSON.stringify({ id: "b", title: "Other article", categories: "OtherCategory", body: "lateunindexed only in body", url: "/b" })
+  ].join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    targetPostingsPerDoc: 0,
+    bodyIndexChars: 10,
+    alwaysIndexFields: ["title", "categories"],
+    queryBundles: false,
+    fields: [
+      { name: "title", path: "title", weight: 5 },
+      { name: "categories", path: "categories", weight: 3 },
+      { name: "body", path: "body", weight: 1 }
+    ],
+    display: ["title", "url", { name: "bodySnippet", path: "body", maxChars: 12 }]
+  }));
+
+  await build({ configPath });
+  const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.equal(manifest.total, 2);
+  assert.equal(manifest.stats.target_postings_per_doc, 0);
+  assert.equal(manifest.stats.body_index_chars, 10);
+  assert.deepEqual(manifest.stats.always_index_fields, ["title", "categories"]);
+
+  const server = await serveStatic(join(root, "public"));
+  t.after(() => server.close());
+  const search = await createSearch({ baseUrl: server.baseUrl });
+  const title = await search.search({ q: "raretitle", size: 2 });
+  const category = await search.search({ q: "keptcategory", size: 2 });
+  const body = await search.search({ q: "lateunindexed", size: 2 });
+  assert.equal(title.results[0].id, "a");
+  assert.equal(title.results[0].bodySnippet, "earlybody la");
+  assert.equal(category.results[0].id, "a");
+  assert.equal(body.total, 0);
+});
+
+test("resumable builds reuse scan and reduce stages and keep old manifest on failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-resume-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  const baseConfig = {
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    queryBundles: false,
+    fields: [{ name: "title", path: "title", weight: 1 }],
+    display: ["title", "url"]
+  };
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "a", title: "Alpha", url: "/a" }),
+    JSON.stringify({ id: "b", title: "Beta", url: "/b" })
+  ].join("\n"));
+
+  await writeFile(configPath, JSON.stringify({ ...baseConfig, debugFailAfterStage: "scan" }));
+  await assert.rejects(() => build({ configPath }), /debug failure after scan/u);
+  const scanStage = await resumeStageFile(output, "scan");
+  const scanBefore = await readFile(scanStage, "utf8");
+  await writeFile(configPath, JSON.stringify(baseConfig));
+  await build({ configPath });
+  assert.equal(await readFile(scanStage, "utf8"), scanBefore);
+  const firstManifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.equal(firstManifest.total, 2);
+
+  const reduceRoot = await mkdtemp(join(tmpdir(), "rangefind-resume-reduce-"));
+  const reduceDocsPath = join(reduceRoot, "docs.jsonl");
+  const reduceOutput = join(reduceRoot, "public", "rangefind");
+  const reduceConfigPath = join(reduceRoot, "rangefind.config.json");
+  const reduceConfig = { ...baseConfig, input: "docs.jsonl", output: "public/rangefind" };
+  await writeFile(reduceDocsPath, [
+    JSON.stringify({ id: "a", title: "Alpha", url: "/a" }),
+    JSON.stringify({ id: "b", title: "Beta", url: "/b" })
+  ].join("\n"));
+  await writeFile(reduceConfigPath, JSON.stringify({ ...reduceConfig, debugFailAfterStage: "reduce" }));
+  await assert.rejects(() => build({ configPath: reduceConfigPath }), /debug failure after reduce/u);
+  const reduceStage = await resumeStageFile(reduceOutput, "reduce");
+  const reduceBefore = await readFile(reduceStage, "utf8");
+  await writeFile(reduceConfigPath, JSON.stringify(reduceConfig));
+  await build({ configPath: reduceConfigPath });
+  assert.equal(await readFile(reduceStage, "utf8"), reduceBefore);
+
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "a", title: "Changed", url: "/a" }),
+    JSON.stringify({ id: "b", title: "Beta", url: "/b" }),
+    JSON.stringify({ id: "c", title: "Gamma", url: "/c" })
+  ].join("\n"));
+  await writeFile(configPath, JSON.stringify({ ...baseConfig, debugFailAfterStage: "scan" }));
+  await assert.rejects(() => build({ configPath }), /debug failure after scan/u);
+  const stillPublished = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.equal(stillPublished.total, 2);
 });
 
 test("builder resolves auto posting layout into manifest and optimizer report", async () => {
@@ -726,6 +836,7 @@ test("builder resolves auto posting layout into manifest and optimizer report", 
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
     output: "public/rangefind",
+    codecs: { mode: "auto" },
     postingBlockSize: "auto",
     postingSuperblockSize: "auto",
     queryBundles: false,
@@ -747,7 +858,10 @@ test("builder resolves auto posting layout into manifest and optimizer report", 
   assert.equal(codecLayout.mode, "auto");
   assert.equal(codecLayout.block_size_source, "auto");
   assert.equal(codecLayout.superblock_size_source, "auto");
-  assert.equal(codecLayout.selected_codec, "mixed-auto-block-codec");
+  assert.equal(codecLayout.selected_codec, "term-sampled-auto-block-codec");
+  assert.equal(manifest.stats.posting_segment_codec_planner_mode, "auto");
+  assert.ok(manifest.stats.posting_segment_codec_planner_sampled_terms > 0);
+  assert.ok(manifest.stats.posting_segment_codec_planner_sampled_blocks > 0);
 });
 
 test("runtime refills high-df posting block windows in batches", async (t) => {
@@ -897,6 +1011,8 @@ test("doc-range planner batches candidate blocks with inner proof stats", async 
     maxShardDepth: 1,
     targetShardPostings: 1000,
     postingBlockSize: 1,
+    postingDocRangeBlockMax: true,
+    postingImpactTiers: true,
     postingDocRangeSize: 5,
     externalPostingBlockMinBlocks: 1,
     externalPostingBlockMinBytes: 0,

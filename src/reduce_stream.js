@@ -1,11 +1,9 @@
-import { closeSync, createReadStream, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
-import { encodeRunRecord, readRunRecords, tryReadVarint, varintLength, writeVarint } from "./runs.js";
+import { encodeRunRecord, readRunRecords } from "./runs.js";
 import { shardKey } from "./shards.js";
 
 const RUN_SCHEMA = ["string", "number", "number"];
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 function compareTerms(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -140,80 +138,12 @@ async function* mergeSortedChunks(chunks) {
   }
 }
 
-function encodeReducedTerm(term, rows, df) {
-  const termBytes = textEncoder.encode(String(term || ""));
-  let bytes = varintLength(termBytes.length) + termBytes.length + varintLength(df) + varintLength(rows.length);
-  for (const [doc, score] of rows) bytes += varintLength(doc) + varintLength(score);
-  const out = Buffer.allocUnsafe(bytes);
-  let pos = writeVarint(out, 0, termBytes.length);
-  out.set(termBytes, pos);
-  pos += termBytes.length;
-  pos = writeVarint(out, pos, df);
-  pos = writeVarint(out, pos, rows.length);
-  for (const [doc, score] of rows) {
-    pos = writeVarint(out, pos, doc);
-    pos = writeVarint(out, pos, score);
-  }
-  return out;
-}
-
-function reducedTermFromBytes(bytes, state) {
-  const start = state.pos;
-  const termLength = tryReadVarint(bytes, state);
-  if (termLength == null || state.pos + termLength > bytes.length) {
-    state.pos = start;
-    return null;
-  }
-  const term = textDecoder.decode(bytes.subarray(state.pos, state.pos + termLength));
-  state.pos += termLength;
-  const df = tryReadVarint(bytes, state);
-  if (df == null) {
-    state.pos = start;
-    return null;
-  }
-  const rowCount = tryReadVarint(bytes, state);
-  if (rowCount == null) {
-    state.pos = start;
-    return null;
-  }
-  const rows = new Array(rowCount);
-  for (let i = 0; i < rowCount; i++) {
-    const doc = tryReadVarint(bytes, state);
-    const score = tryReadVarint(bytes, state);
-    if (doc == null || score == null) {
-      state.pos = start;
-      return null;
-    }
-    rows[i] = [doc, score];
-  }
-  return { term, df, rows };
-}
-
-async function* readReducedTerms(path) {
-  let pending = Buffer.alloc(0);
-  for await (const chunk of createReadStream(path)) {
-    const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    const state = { pos: 0 };
-    while (state.pos < bytes.length) {
-      const item = reducedTermFromBytes(bytes, state);
-      if (!item) break;
-      yield item;
-    }
-    pending = state.pos < bytes.length ? bytes.subarray(state.pos) : Buffer.alloc(0);
-  }
-  if (pending.length) throw new Error(`Truncated Rangefind reduced term file: ${path}`);
-}
-
-async function reduceChunksToTermSpool(chunks, reducedPath, options = {}) {
+async function* mergedReducedTerms(chunks) {
   let currentTerm = null;
   let currentDoc = null;
   let currentScore = 0;
   let rows = [];
   let df = 0;
-  let terms = 0;
-  let postings = 0;
-  const prefixCounts = new Map();
-  const fd = openSync(reducedPath, "w");
 
   function finishDoc() {
     if (currentDoc == null) return;
@@ -225,12 +155,6 @@ async function reduceChunksToTermSpool(chunks, reducedPath, options = {}) {
     if (currentTerm == null) return null;
     finishDoc();
     const item = { term: currentTerm, rows, df };
-    const encoded = encodeReducedTerm(item.term, item.rows, item.df);
-    writeSync(fd, encoded, 0, encoded.length);
-    terms++;
-    postings += item.df;
-    addPrefixCounts(prefixCounts, item.term, item.df, options.config);
-    options.onTerm?.(item.term, item.df);
     rows = [];
     df = 0;
     currentDoc = null;
@@ -238,26 +162,36 @@ async function reduceChunksToTermSpool(chunks, reducedPath, options = {}) {
     return item;
   }
 
-  try {
-    for await (const [term, doc, score] of mergeSortedChunks(chunks)) {
-      if (term !== currentTerm) {
-        finishTerm();
-        currentTerm = term;
-        currentDoc = doc;
-        currentScore = score;
-        continue;
-      }
-      if (doc !== currentDoc) {
-        finishDoc();
-        currentDoc = doc;
-        currentScore = score;
-        continue;
-      }
-      currentScore += score;
+  for await (const [term, doc, score] of mergeSortedChunks(chunks)) {
+    if (term !== currentTerm) {
+      const item = finishTerm();
+      if (item) yield item;
+      currentTerm = term;
+      currentDoc = doc;
+      currentScore = score;
+      continue;
     }
-    finishTerm();
-  } finally {
-    closeSync(fd);
+    if (doc !== currentDoc) {
+      finishDoc();
+      currentDoc = doc;
+      currentScore = score;
+      continue;
+    }
+    currentScore += score;
+  }
+  const item = finishTerm();
+  if (item) yield item;
+}
+
+async function measureReducedTerms(chunks, options = {}) {
+  let terms = 0;
+  let postings = 0;
+  const prefixCounts = new Map();
+  for await (const item of mergedReducedTerms(chunks)) {
+    terms++;
+    postings += item.df;
+    addPrefixCounts(prefixCounts, item.term, item.df, options.config);
+    options.onTerm?.(item.term, item.df);
   }
   return { terms, postings, prefixCounts };
 }
@@ -293,15 +227,13 @@ export async function reduceRunToPartitions(options) {
     onPartition
   } = options;
   const chunks = await writeSortedChunks(runPath, scratchDir, config);
-  const reducedPath = resolve(scratchDir, "reduced-terms.run");
   let sequence = 0;
   try {
-    const reduced = await reduceChunksToTermSpool(chunks, reducedPath, { config, onTerm });
-
+    const reduced = await measureReducedTerms(chunks, { config, onTerm });
     const partitions = [];
     let currentName = null;
     let entries = [];
-    for await (const { term, rows } of readReducedTerms(reducedPath)) {
+    for await (const { term, rows } of mergedReducedTerms(chunks)) {
       const name = partitionNameForTerm(term, reduced.prefixCounts, config);
       if (currentName && name !== currentName) {
         partitions.push(await onPartition({ name: currentName, entries }, sequence++));

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wikipedia Search</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Rangefind</p>
+      <h1>Wikipedia Search</h1>
+    </div>
+    <div class="index-meter" id="indexMeter">
+      <span class="meter-value" id="docCount">-</span>
+      <span class="meter-label">articles</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="search-band" aria-label="Search">
+      <form id="searchForm" class="search-form">
+        <label class="query-label" for="queryInput">Search Wikipedia</label>
+        <div class="query-row">
+          <input id="queryInput" name="q" type="search" value="artificial intelligence" autocomplete="off" autofocus>
+          <button type="submit">Search</button>
+        </div>
+        <div class="controls-grid">
+          <label>
+            Sort
+            <select id="sortSelect" name="sort">
+              <option value="relevance">Relevance</option>
+              <option value="newest">Newest revision</option>
+              <option value="oldest">Oldest revision</option>
+            </select>
+          </label>
+          <label>
+            Results
+            <select id="sizeSelect" name="size">
+              <option>10</option>
+              <option>25</option>
+              <option>50</option>
+            </select>
+          </label>
+          <label>
+            Category
+            <input id="categoryInput" name="category" placeholder="Physics">
+          </label>
+          <label>
+            Minimum body length
+            <input id="bodyLengthInput" name="bodyLength" type="number" min="0" step="1000" placeholder="0">
+          </label>
+        </div>
+        <div class="toggle-row" aria-label="Article filters">
+          <label><input id="hasCategoriesInput" type="checkbox"> Has categories</label>
+          <label><input id="longBodyInput" type="checkbox"> Long articles</label>
+          <label><input id="shortTitleInput" type="checkbox"> Short titles</label>
+        </div>
+      </form>
+    </section>
+
+    <section class="status-row" aria-live="polite">
+      <div>
+        <strong id="resultSummary">Loading index...</strong>
+        <span id="correctionSummary"></span>
+      </div>
+      <div class="stats" id="runtimeStats"></div>
+    </section>
+
+    <section id="results" class="results" aria-label="Results"></section>
+  </main>
+
+  <template id="resultTemplate">
+    <article class="result-card">
+      <h2><a class="result-title" target="_blank" rel="noopener"></a></h2>
+      <div class="result-meta"></div>
+      <p class="result-body"></p>
+      <div class="chip-row"></div>
+    </article>
+  </template>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

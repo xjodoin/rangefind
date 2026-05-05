@@ -14,10 +14,30 @@ function pushVarint(out, value) {
   out.push(...tmp);
 }
 
-function pushUtf8(out, value) {
+function varintBuffer(value) {
+  const tmp = Buffer.allocUnsafe(varintLength(value));
+  writeVarint(tmp, 0, value);
+  return tmp;
+}
+
+function writeHashed(fd, hash, state, chunk) {
+  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  let written = 0;
+  while (written < buffer.length) {
+    written += writeSync(fd, buffer, written, buffer.length - written);
+  }
+  hash.update(buffer);
+  state.bytes += buffer.length;
+}
+
+function writeVarintHashed(fd, hash, state, value) {
+  writeHashed(fd, hash, state, varintBuffer(value));
+}
+
+function writeUtf8Hashed(fd, hash, state, value) {
   const bytes = textEncoder.encode(String(value || ""));
-  pushVarint(out, bytes.length);
-  out.push(...bytes);
+  writeVarintHashed(fd, hash, state, bytes.length);
+  writeHashed(fd, hash, state, bytes);
 }
 
 function readVarint(bytes, state) {
@@ -91,20 +111,28 @@ function encodeRows(rows) {
 }
 
 function writeSegmentTermsFile(termsPath, terms) {
-  const termBytes = [...TERMS_MAGIC];
-  pushVarint(termBytes, terms.length);
-  for (const item of terms) {
-    pushUtf8(termBytes, item.term);
-    pushVarint(termBytes, item.offset);
-    pushVarint(termBytes, item.bytes);
-    pushVarint(termBytes, item.df);
-    pushVarint(termBytes, item.count);
+  const fd = openSync(termsPath, "w");
+  const hash = createHash("sha256");
+  const state = { bytes: 0 };
+  try {
+    writeHashed(fd, hash, state, TERMS_MAGIC);
+    writeVarintHashed(fd, hash, state, terms.length);
+    for (const item of terms) {
+      writeUtf8Hashed(fd, hash, state, item.term);
+      writeVarintHashed(fd, hash, state, item.offset);
+      writeVarintHashed(fd, hash, state, item.bytes);
+      writeVarintHashed(fd, hash, state, item.df);
+      writeVarintHashed(fd, hash, state, item.count);
+    }
+  } finally {
+    closeSync(fd);
   }
-  const buffer = Buffer.from(Uint8Array.from(termBytes));
-  writeFileSync(termsPath, buffer);
   return {
-    bytes: buffer.length,
-    checksum: checksum(buffer)
+    bytes: state.bytes,
+    checksum: {
+      algorithm: "sha256",
+      value: hash.digest("hex")
+    }
   };
 }
 

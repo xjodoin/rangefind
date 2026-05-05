@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, mkdirSync, openSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -475,7 +475,6 @@ async function reduceTypoShard(baseShard, buffer, packWriter, scratchRoot) {
   } finally {
     rmSync(scratchDir, { recursive: true, force: true });
   }
-  unlinkSync(path);
   return { shards: finalShards, deleteKeys, pairs, candidates };
 }
 
@@ -525,14 +524,13 @@ async function reduceTypoLexiconShard(shard, buffer, packWriter, scratchRoot) {
     };
   } finally {
     rmSync(scratchDir, { recursive: true, force: true });
-    unlinkSync(path);
   }
 }
 
 async function reduceTypoLexiconRuns(buffer, outDir) {
   if (!buffer.lexiconShards.size) return null;
   const packWriter = createPackWriter(resolve(outDir, "typo", "lexicon-packs"), buffer.options.lexiconPackBytes || buffer.options.packBytes);
-  const scratchRoot = resolve(outDir, "_build", "typo-lexicon-reduce-sort");
+  const scratchRoot = resolve(buffer.runsOut, "..", "typo-lexicon-reduce-sort");
   let entries = 0;
   let trieNodes = 0;
   let trieArcs = 0;
@@ -585,7 +583,7 @@ export async function reduceTypoRuns(buffer, outDir) {
   flushTypoBuffer(buffer);
   const packWriter = createPackWriter(resolve(outDir, "typo", "packs"), buffer.options.packBytes);
   const finalShards = new Set();
-  const scratchRoot = resolve(outDir, "_build", "typo-reduce-sort");
+  const scratchRoot = resolve(buffer.runsOut, "..", "typo-reduce-sort");
   let deleteKeys = 0;
   let pairs = 0;
   let candidates = 0;

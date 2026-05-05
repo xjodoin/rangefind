@@ -1,8 +1,7 @@
-import { closeSync, mkdirSync, openSync, rmSync, statSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { createPostingRowBuffer, appendPostingRow, resetPostingRows } from "./posting_rows.js";
-import { readReducedTermRanges, writeReducedTerm } from "./reduced_terms.js";
+import { createPostingRowBuffer, appendPostingRow, copyPostingRows, postingRowCount, resetPostingRows } from "./posting_rows.js";
 import { readSegmentDirectory, readSegmentRowsFromFdInto, writeSegmentFromTermRows } from "./segment_builder.js";
 import { shardKey } from "./shards.js";
 
@@ -150,21 +149,15 @@ function partitionNameForTerm(term, prefixCounts, config) {
   return shardKey(term, depth);
 }
 
-async function mergeSegmentsToReducedSpool(segments, reducedPath, config, onTerm) {
-  const fd = openSync(reducedPath, "w");
+async function measureMergedSegmentTerms(segments, config, onTerm) {
   const prefixCounts = new Map();
   let terms = 0;
   let postings = 0;
-  try {
-    for await (const { term, rows } of mergedSegmentTermRows(segments, onTerm)) {
-      const df = rows.length;
-      writeReducedTerm(fd, term, rows, df);
-      terms++;
-      postings += df;
-      addPrefixCounts(prefixCounts, term, df, config);
-    }
-  } finally {
-    closeSync(fd);
+  for await (const { term, rows } of mergedSegmentTermRows(segments, onTerm)) {
+    const df = postingRowCount(rows);
+    terms++;
+    postings += df;
+    addPrefixCounts(prefixCounts, term, df, config);
   }
   return { terms, postings, prefixCounts };
 }
@@ -341,41 +334,60 @@ export async function mergeSegmentsToPartitions(options) {
     partitionConcurrency = 1
   } = options;
   mkdirSync(scratchDir, { recursive: true });
-  const reducedPath = resolve(scratchDir, "reduced-terms.run");
   let sequence = 0;
   const maxConcurrency = Math.max(1, Math.floor(Number(partitionConcurrency || 1)));
+  const creditLimitBytes = Math.max(0, Math.floor(Number(config.partitionReducerInFlightBytes || 0)));
   let partitionSpoolBytes = 0;
   let partitionSpoolEntries = 0;
+  let activeInputBytes = 0;
+  let maxActiveInputBytes = 0;
+  let creditWaitMs = 0;
+  let creditWaits = 0;
+  let oversizedPartitions = 0;
   try {
     const tierStart = performance.now();
     const tiered = await tierMergeSegments(segments, scratchDir, config);
     const tierMergeMs = performance.now() - tierStart;
-    const spoolStart = performance.now();
-    const reduced = await mergeSegmentsToReducedSpool(tiered.segments, reducedPath, config, onTerm);
-    const reducedSpoolMs = performance.now() - spoolStart;
-    const reducedSpoolBytes = statSync(reducedPath).size;
     const partitionStart = performance.now();
     const partitions = [];
     const pendingPartitions = [];
     const activePartitions = new Set();
+    function hasCredit(inputBytes) {
+      return !creditLimitBytes || activeInputBytes === 0 || activeInputBytes + inputBytes <= creditLimitBytes;
+    }
     async function queuePartition(partition) {
+      const inputBytes = partition.inputBytes || partition.length || 0;
+      const started = performance.now();
+      let waited = false;
+      while (activePartitions.size >= maxConcurrency || !hasCredit(inputBytes)) {
+        waited = true;
+        await Promise.race(activePartitions);
+      }
+      if (waited) {
+        creditWaits++;
+        creditWaitMs += performance.now() - started;
+      }
+      if (creditLimitBytes && inputBytes > creditLimitBytes && activeInputBytes === 0) oversizedPartitions++;
+      activeInputBytes += inputBytes;
+      maxActiveInputBytes = Math.max(maxActiveInputBytes, activeInputBytes);
       const partitionSequence = sequence++;
       const promise = Promise.resolve(onPartition(partition, partitionSequence))
         .then(result => {
           partitions.push({ sequence: partitionSequence, result });
           return result;
+        })
+        .finally(() => {
+          activeInputBytes -= inputBytes;
         });
       activePartitions.add(promise);
       pendingPartitions.push(promise);
       promise.finally(() => activePartitions.delete(promise));
-      while (activePartitions.size >= maxConcurrency) await Promise.race(activePartitions);
     }
-    function newPartition(name, offset) {
+    function newStreamingPartition(name) {
       return {
         format: "rfreducerpartition-v1",
         name,
-        path: reducedPath,
-        offset,
+        entries: [],
         length: 0,
         terms: 0,
         rows: 0,
@@ -384,27 +396,37 @@ export async function mergeSegmentsToPartitions(options) {
         lastTerm: ""
       };
     }
-    function addPartitionTerm(partition, item) {
-      partition.length += item.length;
-      partition.inputBytes += item.length;
+    function addStreamingPartitionTerm(partition, term, rows) {
+      const copiedRows = copyPostingRows(rows);
+      const rowCount = postingRowCount(copiedRows);
+      const inputBytes = String(term || "").length + rowCount * 8;
+      partition.entries.push([term, copiedRows]);
+      partition.length += inputBytes;
+      partition.inputBytes += inputBytes;
       partition.terms++;
-      partition.rows += item.df;
+      partition.rows += rowCount;
       partitionSpoolEntries++;
-      if (!partition.firstTerm) partition.firstTerm = item.term;
-      partition.lastTerm = item.term;
+      if (!partition.firstTerm) partition.firstTerm = term;
+      partition.lastTerm = term;
     }
+    const prefixStart = performance.now();
+    const reduced = await measureMergedSegmentTerms(tiered.segments, config, onTerm);
+    const prefixCountMs = performance.now() - prefixStart;
     let current = null;
-    for await (const item of readReducedTermRanges(reducedPath, { includeRows: false })) {
-      const name = partitionNameForTerm(item.term, reduced.prefixCounts, config);
+    for await (const { term, rows } of mergedSegmentTermRows(tiered.segments)) {
+      const name = partitionNameForTerm(term, reduced.prefixCounts, config);
       if (current && name !== current.name) {
         await queuePartition(current);
+        partitionSpoolBytes += current.inputBytes;
         current = null;
       }
-      if (!current) current = newPartition(name, item.offset);
-      addPartitionTerm(current, item);
+      if (!current) current = newStreamingPartition(name);
+      addStreamingPartitionTerm(current, term, rows);
     }
-    if (current) await queuePartition(current);
-    partitionSpoolBytes = reducedSpoolBytes;
+    if (current) {
+      await queuePartition(current);
+      partitionSpoolBytes += current.inputBytes;
+    }
     await Promise.all(pendingPartitions);
     return {
       terms: reduced.terms,
@@ -414,10 +436,16 @@ export async function mergeSegmentsToPartitions(options) {
       mergePolicy: tiered.policy,
       timings: {
         tierMergeMs,
-        reducedSpoolMs,
+        prefixCountMs,
         partitionAssemblyMs: performance.now() - partitionStart
       },
-      reducedSpoolBytes,
+      partitionScheduler: {
+        creditLimitBytes,
+        maxActiveInputBytes,
+        creditWaitMs,
+        creditWaits,
+        oversizedPartitions
+      },
       partitionSpoolBytes,
       partitionSpoolEntries
     };

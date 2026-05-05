@@ -77,7 +77,7 @@ function coreDecisions(config, manifest) {
   const stats = manifest.stats || {};
   const superblocks = stat(stats, "posting_segment_superblocks");
   const layout = config._layoutDecisions || {};
-  const codecMode = String(config.codecs?.mode || layout.codecs?.mode || stat(stats, "posting_segment_codec_mode") || "auto");
+  const codecMode = String(config.codecs?.mode || layout.codecs?.mode || stat(stats, "posting_segment_codec_mode") || "varint");
   const fieldCounts = {
     facets: Object.keys(manifest.facet_dictionaries?.fields || manifest.facets || {}).length,
     numbers: manifest.numbers?.length || 0,
@@ -134,7 +134,7 @@ function coreDecisions(config, manifest) {
       status: codecMode === "off" ? "off" : "current",
       scope: "posting-blocks",
       mode: codecMode,
-      selected_codec: layout.codecs?.selected_posting_codec || stats.posting_segment_codec || "varint-impact-gzip-member",
+      selected_codec: layout.codecs?.selected_posting_codec || stats.posting_segment_codec || "pair-varint-v1",
       block_size: positiveInteger(config.postingBlockSize, stat(stats, "posting_segment_block_size")),
       block_size_source: layout.posting_block_size?.source || stats.posting_segment_block_size_source || "configured",
       superblock_size: positiveInteger(config.postingSuperblockSize, stat(stats, "posting_segment_superblock_size")),
@@ -147,7 +147,7 @@ function coreDecisions(config, manifest) {
       selected_bytes: stat(stats, "posting_segment_block_codec_selected_bytes"),
       bytes_saved: stat(stats, "posting_segment_block_codec_bytes_saved"),
       avg_postings_per_term: Math.round(finiteNumber(layout.corpus?.avg_postings_per_term, 0) * 100) / 100,
-      candidates: ["partitioned-elias-fano", "dense-bitset-container", "compact-impact-array"],
+      candidates: ["pair-varint-v1", "impact-runs-v1", "impact-bitset-v1", "partitioned-deltas-v1"],
       reason: "optimize transferred bytes and browser decode work from corpus statistics"
     },
     {

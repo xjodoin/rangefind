@@ -1,0 +1,13 @@
+{
+  "name": "rangefind-wikipedia-search",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:sample": "node scripts/build.mjs --limit=50000",
+    "build:full": "node scripts/build.mjs --limit=0",
+    "build:fr:full": "node scripts/build.mjs --dump-url=https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pages-articles.xml.bz2 --wiki=frwiki --limit=0",
+    "serve": "node ../../scripts/serve.mjs public 5182"
+  }
+}
