@@ -71,6 +71,10 @@ function commandCounts(command) {
   return command === "COUNT" || command === "UNOPTIMIZED_COUNT" || /^TOP_\d+_COUNT$/u.test(command);
 }
 
+function commandTopKCounts(command) {
+  return /^TOP_\d+_COUNT$/u.test(command);
+}
+
 const indexPath = resolve(process.argv[2] || "index/public/rangefind");
 installFetchLimit(process.env.RANGEFIND_SBG_FETCH_CONCURRENCY, process.env.RANGEFIND_SBG_FETCH_RETRIES);
 const server = await serveStatic(dirname(indexPath));
@@ -98,12 +102,21 @@ try {
       stdout.write("UNSUPPORTED\n");
       continue;
     }
+    const q = normalizeGameQuery(rawQuery);
+    const hasTerms = analyzeTerms(q).length > 0;
     if (commandCounts(command)) {
-      stdout.write("UNSUPPORTED\n");
+      if (!hasTerms) {
+        stdout.write("0\n");
+        continue;
+      }
+      if (commandTopKCounts(command)) {
+        await engine.search({ q, size, exact: false, rerank: false, includeResults: false, authority: false });
+      }
+      const response = await engine.count({ q });
+      stdout.write(`${response.total}\n`);
       continue;
     }
-    const q = normalizeGameQuery(rawQuery);
-    if (!analyzeTerms(q).length) {
+    if (!hasTerms) {
       stdout.write("1\n");
       continue;
     }

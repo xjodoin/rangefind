@@ -136,6 +136,10 @@ function commandCounts(command) {
   return command === "COUNT" || command === "UNOPTIMIZED_COUNT" || /^TOP_\d+_COUNT$/u.test(command);
 }
 
+function commandTopKCounts(command) {
+  return /^TOP_\d+_COUNT$/u.test(command);
+}
+
 function mulberry32(seed) {
   let value = seed >>> 0;
   return () => {
@@ -160,8 +164,36 @@ function shuffled(items, seed) {
 async function runQuery(engine, command, query) {
   const size = commandSize(command);
   if (!size) return { unsupported: true };
-  if (commandCounts(command)) return { unsupported: true };
   const started = performance.now();
+  if (commandCounts(command)) {
+    const hasTerms = Boolean(query.query);
+    let topKResponse = null;
+    if (hasTerms && commandTopKCounts(command)) {
+      topKResponse = await engine.search({ q: query.query, size, exact: false, rerank: false, includeResults: false, authority: false });
+    }
+    const countResponse = hasTerms
+      ? await engine.count({ q: query.query })
+      : { total: 0, stats: { plannerLane: "countTermless", countLane: "countTermless" } };
+    const durationUs = Math.round((performance.now() - started) * 1000);
+    return {
+      query: query.originalQuery,
+      normalizedQuery: query.query,
+      tags: query.tags,
+      count: countResponse.total,
+      durationUs,
+      top: "",
+      stats: {
+        total: countResponse.total,
+        plannerLane: countResponse.stats?.plannerLane || "",
+        countLane: countResponse.stats?.countLane || "",
+        baseTermCount: countResponse.stats?.baseTermCount || 0,
+        termEntriesVisited: countResponse.stats?.termEntriesVisited || 0,
+        postingsDecoded: countResponse.stats?.postingsDecoded || 0,
+        topKTotal: topKResponse?.total ?? null,
+        topKPlannerLane: topKResponse?.stats?.plannerLane || ""
+      }
+    };
+  }
   const response = await engine.search({ q: query.query, size, exact: false, rerank: false, includeResults: false, authority: false });
   const durationUs = Math.round((performance.now() - started) * 1000);
   return {
@@ -402,8 +434,9 @@ const report = {
   limit: detectLimit(args),
   notes: [
     "Rangefind is measured through its browser/static-index runtime over local HTTP range requests.",
-    "COUNT and TOP_K_COUNT are reported as unsupported because the runtime does not expose a postings-only count command.",
+    "COUNT and TOP_K_COUNT return exact counts for Rangefind-normalized query semantics through a postings-only count path.",
     "Top-k protocol timing disables result hydration, dependency rerank, typo correction, authority rerank, and uses a bounded posting-block budget for pathological broad queries.",
+    "COUNT timings do not use the top-k posting-block budget and do not hydrate result payloads.",
     "Lucene query syntax from search-benchmark-game is normalized to Rangefind query text; phrase and intersection tags are retained for grouping."
   ],
   results,

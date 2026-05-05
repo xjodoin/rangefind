@@ -202,10 +202,11 @@ npm run bench:frwiki:search-game -- \
 This is intentionally a protocol-compatible local trend benchmark, not an
 official Search Benchmark Game submission. Rangefind is measured through its
 browser/static-index runtime over local HTTP range requests. `COUNT` and
-`TOP_K_COUNT` are reported as unsupported because the runtime does not expose a
-postings-only count command. Lucene query syntax such as `+term` and quoted
-phrases is normalized to Rangefind query text while retaining the original tags
-in the report.
+`TOP_K_COUNT` return exact totals for Rangefind-normalized query semantics
+through a postings-only count path. Lucene query syntax such as `+term` and
+quoted phrases is normalized to Rangefind query text while retaining the
+original tags in the report, so count deltas against published engines are
+reported as semantic deltas unless they disagree with Rangefind exact search.
 
 Use the replay profiler when optimizing the upstream query path. It keeps the
 run single-process so Node CPU profiles line up with the per-query trace rows:
@@ -217,7 +218,7 @@ node --cpu-prof \
   scripts/search_benchmark_game_profile.mjs \
   --queries=/tmp/search-benchmark-game/queries.txt \
   --index=/tmp/search-benchmark-game/engines/rangefind/index/public/rangefind \
-  --commands=TOP_10,TOP_100,TOP_1000 \
+  --commands=COUNT,TOP_100_COUNT \
   --query-limit=50 \
   --runs=1 \
   --warmup-runs=1 \
@@ -234,16 +235,36 @@ implements the expected `clean`, `compile`, `index`, and `serve` targets. Its
 `RANGEFIND_SBG_FORCE=1` is set. The upstream adapter opts into `size=1000`
 top-k proof planning, disables dependency rerank and document hydration for
 protocol timing, uses a 2048 posting-block budget for pathological broad
-queries, and reports `UNSUPPORTED` for `COUNT` and `TOP_K_COUNT` commands.
+queries, and serves `COUNT`, `UNOPTIMIZED_COUNT`, and `TOP_K_COUNT` with the
+exact Rangefind-normalized postings-only count path.
 
-Latest 50-query replay profile against the full upstream 5,032,104-document
-index:
+Latest COUNT replay profile against the full upstream 5,032,104-document index
+at `/tmp/search-benchmark-game/engines/rangefind/index/public/rangefind`,
+using commit `a75cb8c-dirty` and saving
+`benchmarks/frwiki/latest/search-benchmark-game/search-game-count-profile.cpuprofile`:
 
 ```text
-TOP_10:   best mean 43.12 ms, p50 50.91 ms, p90 77.65 ms
-TOP_100:  best mean 42.78 ms, p50 46.38 ms, p90 77.08 ms
-TOP_1000: best mean 43.31 ms, p50 46.83 ms, p90 77.83 ms
+COUNT:         best mean  3.42 ms, p50  3.21 ms, p90  4.08 ms
+TOP_100_COUNT: best mean 42.30 ms, p50 45.55 ms, p90 75.73 ms
 ```
+
+Latest upstream COUNT run with `WARMUP_TIME=1`, `NUM_ITER=1`, and
+`COMMANDS="COUNT TOP_10_COUNT TOP_100_COUNT TOP_1000_COUNT"` over all 962
+official queries:
+
+```text
+COUNT:          mean  9.14 ms, p50  3.18 ms, p90  4.94 ms
+TOP_10_COUNT:   mean 45.47 ms, p50 48.22 ms, p90 74.98 ms
+TOP_100_COUNT:  mean 48.11 ms, p50 51.26 ms, p90 81.08 ms
+TOP_1000_COUNT: mean 46.40 ms, p50 48.51 ms, p90 77.78 ms
+```
+
+Rangefind count outputs are internally consistent across `COUNT` and
+`TOP_K_COUNT` for all 962 official queries. Against published
+Search Benchmark Game count outputs, only 54/962 rows match Tantivy/Lucene
+exactly because this pass counts Rangefind-normalized semantics: stopwords such
+as `the` count as `0`, quoted phrases are not phrase-counted, and bare multi-term
+queries use Rangefind's current base-term eligibility.
 
 Latest upstream top-k run with one warmup pass and one measured pass over all
 962 official queries:

@@ -1,0 +1,588 @@
+{
+  "format": "rfsearchbenchmarkgame-upstream-count-v1",
+  "generatedAt": "2026-05-05T22:50:10.832Z",
+  "gitCommit": "a75cb8c-dirty",
+  "protocolSource": "https://github.com/quickwit-oss/search-benchmark-game",
+  "indexPath": "/tmp/search-benchmark-game/engines/rangefind/index/public/rangefind",
+  "queriesPath": "/tmp/search-benchmark-game/queries.txt",
+  "resultsPath": "/tmp/search-benchmark-game/results.json",
+  "rawResultsArtifact": "benchmarks/frwiki/latest/search-benchmark-game/upstream-count-results-limit-5032104.json",
+  "publishedResultsPath": "/tmp/search-benchmark-game/published-results.json",
+  "commands": [
+    "COUNT",
+    "TOP_10_COUNT",
+    "TOP_100_COUNT",
+    "TOP_1000_COUNT"
+  ],
+  "upstreamRun": {
+    "cwd": "/tmp/search-benchmark-game",
+    "command": "RANGEFIND_REPO=/Users/xjodoin/git/rangefind WARMUP_TIME=1 NUM_ITER=1 COMMANDS=\"COUNT TOP_10_COUNT TOP_100_COUNT TOP_1000_COUNT\" ENGINES=rangefind make bench",
+    "warmupTimeSeconds": 1,
+    "iterations": 1,
+    "completed": true,
+    "rebuiltIndex": false
+  },
+  "notes": [
+    "COUNT and TOP_K_COUNT return exact counts for Rangefind-normalized query semantics, not Lucene/Search Benchmark Game query parser parity.",
+    "TOP_K_COUNT runs Rangefind top-k serving plus the exact postings-only count path, so timings include both pieces of work.",
+    "The existing 5,032,104-document index was reused; the upstream bench target did not rebuild it.",
+    "Published count mismatches are expected semantic deltas unless they also disagree with Rangefind exact search eligibility."
+  ],
+  "summary": {
+    "COUNT": {
+      "rangefind": {
+        "queries": 962,
+        "measured": 962,
+        "meanUs": 9143,
+        "p50Us": 3181,
+        "p90Us": 4941,
+        "maxUs": 187902,
+        "minCount": 0,
+        "maxCount": 501717
+      },
+      "published": {
+        "tantivy-0.25": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 875,
+          "p50Us": 197,
+          "p90Us": 1395,
+          "maxUs": 129339,
+          "minCount": 10,
+          "maxCount": 4539182
+        },
+        "lucene-10.3.0": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 747,
+          "p50Us": 234,
+          "p90Us": 1178,
+          "maxUs": 91218,
+          "minCount": 10,
+          "maxCount": 4539182
+        },
+        "lucene-10.3.0-bp": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 591,
+          "p50Us": 173,
+          "p90Us": 1061,
+          "maxUs": 82193,
+          "minCount": 10,
+          "maxCount": 4539182
+        },
+        "pisa-0.8.2": {
+          "queries": 962,
+          "measured": 661,
+          "meanUs": 1470,
+          "p50Us": 232,
+          "p90Us": 3092,
+          "maxUs": 106701,
+          "minCount": 1,
+          "maxCount": 4539182
+        },
+        "iresearch-26.03.1": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 450,
+          "p50Us": 169,
+          "p90Us": 796,
+          "maxUs": 40504,
+          "minCount": 10,
+          "maxCount": 4539182
+        }
+      }
+    },
+    "TOP_10_COUNT": {
+      "rangefind": {
+        "queries": 962,
+        "measured": 962,
+        "meanUs": 45466,
+        "p50Us": 48217,
+        "p90Us": 74984,
+        "maxUs": 965549,
+        "minCount": 0,
+        "maxCount": 501717
+      },
+      "published": {}
+    },
+    "TOP_100_COUNT": {
+      "rangefind": {
+        "queries": 962,
+        "measured": 962,
+        "meanUs": 48108,
+        "p50Us": 51261,
+        "p90Us": 81078,
+        "maxUs": 869667,
+        "minCount": 0,
+        "maxCount": 501717
+      },
+      "published": {
+        "tantivy-0.25": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 1729,
+          "p50Us": 498,
+          "p90Us": 3006,
+          "maxUs": 130909,
+          "minCount": 10,
+          "maxCount": 4539182
+        },
+        "lucene-10.3.0": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 2336,
+          "p50Us": 569,
+          "p90Us": 4275,
+          "maxUs": 92055,
+          "minCount": 10,
+          "maxCount": 4539182
+        },
+        "lucene-10.3.0-bp": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 2251,
+          "p50Us": 423,
+          "p90Us": 3826,
+          "maxUs": 80989,
+          "minCount": 10,
+          "maxCount": 4539182
+        },
+        "pisa-0.8.2": {
+          "queries": 962,
+          "measured": 661,
+          "meanUs": 1497,
+          "p50Us": 246,
+          "p90Us": 3314,
+          "maxUs": 94470,
+          "minCount": 1,
+          "maxCount": 4539182
+        },
+        "iresearch-26.03.1": {
+          "queries": 962,
+          "measured": 962,
+          "meanUs": 879,
+          "p50Us": 372,
+          "p90Us": 1697,
+          "maxUs": 40130,
+          "minCount": 10,
+          "maxCount": 4539182
+        }
+      }
+    },
+    "TOP_1000_COUNT": {
+      "rangefind": {
+        "queries": 962,
+        "measured": 962,
+        "meanUs": 46403,
+        "p50Us": 48507,
+        "p90Us": 77776,
+        "maxUs": 897474,
+        "minCount": 0,
+        "maxCount": 501717
+      },
+      "published": {}
+    }
+  },
+  "countComparison": {
+    "COUNT": {
+      "tantivy-0.25": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "lucene-10.3.0": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "lucene-10.3.0-bp": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "pisa-0.8.2": {
+        "overlap": 962,
+        "same": 55,
+        "mismatch": 907,
+        "meanAbsDelta": 253217,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 0,
+            "delta": 81
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "iresearch-26.03.1": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      }
+    },
+    "TOP_100_COUNT": {
+      "tantivy-0.25": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "lucene-10.3.0": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "lucene-10.3.0-bp": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "pisa-0.8.2": {
+        "overlap": 962,
+        "same": 55,
+        "mismatch": 907,
+        "meanAbsDelta": 253217,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 0,
+            "delta": 81
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      },
+      "iresearch-26.03.1": {
+        "overlap": 962,
+        "same": 54,
+        "mismatch": 908,
+        "meanAbsDelta": 249681,
+        "maxAbsDelta": 4539104,
+        "examples": [
+          {
+            "query": "the",
+            "rangefindCount": 0,
+            "publishedCount": 4168066,
+            "delta": -4168066
+          },
+          {
+            "query": "+griffith +observatory",
+            "rangefindCount": 81,
+            "publishedCount": 79,
+            "delta": 2
+          },
+          {
+            "query": "\"griffith observatory\"",
+            "rangefindCount": 81,
+            "publishedCount": 57,
+            "delta": 24
+          },
+          {
+            "query": "griffith observatory",
+            "rangefindCount": 81,
+            "publishedCount": 15456,
+            "delta": -15375
+          },
+          {
+            "query": "+bowel +obstruction",
+            "rangefindCount": 208,
+            "publishedCount": 195,
+            "delta": 13
+          }
+        ]
+      }
+    },
+    "rangefindConsistency": {
+      "overlap": 962,
+      "mismatches": 0,
+      "examples": []
+    }
+  }
+}

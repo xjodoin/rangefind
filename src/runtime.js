@@ -2019,6 +2019,116 @@ export async function createSearch(options = {}) {
     };
   }
 
+  function emptyTextCountResponse({ baseTerms = [], entries = [], missingBaseTerms = 0, lane = "countEmpty" }) {
+    return {
+      total: 0,
+      totalExact: true,
+      approximate: false,
+      stats: {
+        exact: true,
+        plannerLane: lane,
+        countLane: lane,
+        totalExact: true,
+        terms: baseTerms.length,
+        baseTermCount: baseTerms.length,
+        minShouldMatch: baseTerms.length ? minShouldMatchFor(baseTerms) : 0,
+        termEntriesVisited: entries.length,
+        shards: new Set(entries.map(item => item.shardName)).size,
+        missingBaseTerms,
+        blocksDecoded: 0,
+        postingsDecoded: 0,
+        postingsAccepted: 0
+      }
+    };
+  }
+
+  function counterArrayForBaseTerms(baseTerms) {
+    if (baseTerms.length <= 255) return Uint8Array;
+    if (baseTerms.length <= 65535) return Uint16Array;
+    return Uint32Array;
+  }
+
+  async function runCountSearch({ baseTerms }) {
+    return traceSpan("count.search", () => runCountSearchInner({ baseTerms }));
+  }
+
+  async function runCountSearchInner({ baseTerms }) {
+    if (!baseTerms.length) return emptyTextCountResponse({ baseTerms, lane: "countTermless" });
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const entries = await termEntries(baseTerms);
+    const presentBaseTerms = new Set(entries.map(item => item.term));
+    const missingBaseTerms = Math.max(0, baseTerms.length - presentBaseTerms.size);
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return emptyTextCountResponse({ baseTerms, entries, missingBaseTerms, lane: "countMissingTerms" });
+    }
+
+    const commonStats = {
+      exact: true,
+      totalExact: true,
+      terms: baseTerms.length,
+      baseTermCount: baseTerms.length,
+      minShouldMatch,
+      termEntriesVisited: entries.length,
+      shards: new Set(entries.map(item => item.shardName)).size,
+      missingBaseTerms
+    };
+
+    if (baseTerms.length === 1) {
+      const total = entries.reduce((sum, item) => sum + (item.entry.df || item.entry.count || 0), 0);
+      return {
+        total,
+        totalExact: true,
+        approximate: false,
+        stats: {
+          ...commonStats,
+          plannerLane: "countSingleTermDf",
+          countLane: "countSingleTermDf",
+          blocksDecoded: 0,
+          postingsDecoded: 0,
+          postingsAccepted: total
+        }
+      };
+    }
+
+    const CounterArray = counterArrayForBaseTerms(baseTerms);
+    const counters = new CounterArray(Math.max(0, manifest.total || 0));
+    let blocksDecoded = 0;
+    let postingsDecoded = 0;
+    await traceSpan("count.postings", async () => {
+      for (const { shard, entry } of entries) {
+        const postings = await decodeEntryPostings(shard, entry);
+        blocksDecoded += entry.blocks?.length || 0;
+        postingsDecoded += Math.floor(postings.length / 2);
+        for (let index = 0; index < postings.length; index += 2) {
+          const doc = postings[index];
+          if (doc >= 0 && doc < counters.length) counters[doc]++;
+        }
+      }
+    });
+
+    const total = traceSpanSync("count.scan", () => {
+      let matches = 0;
+      for (let doc = 0; doc < counters.length; doc++) {
+        if (counters[doc] >= minShouldMatch) matches++;
+      }
+      return matches;
+    });
+
+    return {
+      total,
+      totalExact: true,
+      approximate: false,
+      stats: {
+        ...commonStats,
+        plannerLane: "countPostingCounter",
+        countLane: "countPostingCounter",
+        blocksDecoded,
+        postingsDecoded,
+        postingsAccepted: total
+      }
+    };
+  }
+
   function makeSortPlan(sort) {
     if (!sort) return null;
     const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
@@ -5279,6 +5389,18 @@ export async function createSearch(options = {}) {
     return maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, includeResults, authority: params.authority }, typoResponse);
   }
 
+  async function executeCount(params = {}) {
+    const q = String(params.q || "").trim();
+    const filters = params.filters || {};
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (hasFilters || params.sort) {
+      throw new Error("Rangefind count currently supports text-only queries without filters or sort.");
+    }
+    const analyzedTerms = analyzeTerms(q);
+    const baseTerms = analyzedTerms.map(item => item.term);
+    return runCountSearch({ q, baseTerms });
+  }
+
   async function search(params = {}) {
     const trace = params.trace || options.trace ? createRuntimeTrace() : null;
     const response = await withRuntimeTrace(trace, () => traceSpan("search.total", () => executeSearch(params)));
@@ -5292,9 +5414,25 @@ export async function createSearch(options = {}) {
     };
   }
 
+  async function count(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("count.total", () => executeCount(params)));
+    if (!trace) return response;
+    const finalizedTrace = finalizeRuntimeTrace(trace);
+    return {
+      ...response,
+      trace: finalizedTrace,
+      stats: {
+        ...(response.stats || {}),
+        trace: finalizedTrace
+      }
+    };
+  }
+
   return {
     manifest,
     search,
+    count,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,

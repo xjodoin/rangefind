@@ -105,6 +105,10 @@ function commandCounts(command) {
   return command === "COUNT" || command === "UNOPTIMIZED_COUNT" || /^TOP_\d+_COUNT$/u.test(command);
 }
 
+function commandTopKCounts(command) {
+  return /^TOP_\d+_COUNT$/u.test(command);
+}
+
 async function readGameQueries(path, limit) {
   const rows = [];
   const input = createReadStream(path, { encoding: "utf8" });
@@ -180,6 +184,10 @@ function compactStats(response) {
     blocksDecoded: stats.blocksDecoded || 0,
     postingsDecoded: stats.postingsDecoded || 0,
     postingsAccepted: stats.postingsAccepted || 0,
+    baseTermCount: stats.baseTermCount || 0,
+    minShouldMatch: stats.minShouldMatch || 0,
+    termEntriesVisited: stats.termEntriesVisited || 0,
+    countLane: stats.countLane || "",
     skippedBlocks: stats.skippedBlocks || 0,
     postingBlockFrontier: stats.postingBlockFrontier || 0,
     postingBlockFrontierBatches: stats.postingBlockFrontierBatches || 0,
@@ -212,7 +220,7 @@ function memorySnapshot() {
 async function runQuery(engine, command, query, options = {}) {
   const size = commandSize(command);
   const started = performance.now();
-  if (!size || commandCounts(command)) {
+  if (!size) {
     return {
       unsupported: true,
       durationUs: Math.round((performance.now() - started) * 1000),
@@ -220,7 +228,44 @@ async function runQuery(engine, command, query, options = {}) {
     };
   }
 
-  if (!query.query || !analyzeTerms(query.query).length) {
+  const hasTerms = Boolean(query.query && analyzeTerms(query.query).length);
+  if (commandCounts(command)) {
+    let searchResponse = null;
+    if (hasTerms && commandTopKCounts(command)) {
+      searchResponse = await engine.search({
+        q: query.query,
+        size,
+        exact: false,
+        rerank: false,
+        includeResults: false,
+        authority: false,
+        trace: options.trace === true
+      });
+    }
+    const countResponse = hasTerms
+      ? await engine.count({ q: query.query, trace: options.trace === true })
+      : {
+          total: 0,
+          approximate: false,
+          totalExact: true,
+          stats: { plannerLane: "countTermless", countLane: "countTermless", exact: true, totalExact: true }
+        };
+    return {
+      unsupported: false,
+      termless: !hasTerms,
+      count: countResponse.total,
+      durationUs: Math.round((performance.now() - started) * 1000),
+      memory: memorySnapshot(),
+      total: countResponse.total,
+      topTotal: searchResponse?.total ?? null,
+      stats: compactStats(countResponse),
+      topKStats: searchResponse ? compactStats(searchResponse) : null,
+      trace: compactTrace(countResponse.trace || countResponse.stats?.trace),
+      topKTrace: searchResponse ? compactTrace(searchResponse.stats?.trace) : null
+    };
+  }
+
+  if (!hasTerms) {
     return {
       unsupported: false,
       termless: true,
@@ -402,8 +447,9 @@ const report = {
   cpuProfile: cpuProfileMetadata(args),
   notes: [
     "This profile is single-process and deterministic so Node --cpu-prof output maps directly to the measured query replay.",
-    "COUNT and TOP_K_COUNT are reported as unsupported; this profile targets top-k serving only.",
+    "COUNT and TOP_K_COUNT return exact counts for Rangefind-normalized query semantics through a postings-only count path.",
     "Top-k profile timing disables result hydration, dependency rerank, typo correction, authority rerank, and uses a bounded posting-block budget for pathological broad queries.",
+    "COUNT timings do not use the top-k posting-block budget and do not hydrate result payloads.",
     "Search Benchmark Game query syntax is normalized to Rangefind query text before execution."
   ],
   results,
