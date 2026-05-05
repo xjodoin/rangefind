@@ -1,6 +1,6 @@
 {
   "format": "rffrwikibench-index-v1",
-  "updatedAt": "2026-05-05T14:55:16.646Z",
+  "updatedAt": "2026-05-05T15:11:44.980Z",
   "latest": {
     "runtime:limit-1000000": {
       "format": "rffrwikibench-artifact-v1",
@@ -2060,6 +2060,84 @@
         "typoMrr10": 0.6396250000000001,
         "typoAppliedRate": 0.72,
         "guardFalseCorrectionRate": 0
+      }
+    },
+    "search-benchmark-game:limit-5000": {
+      "format": "rfsearchbenchmarkgame-artifact-v1",
+      "kind": "search-benchmark-game",
+      "limit": 5000,
+      "limitSlug": "limit-5000",
+      "generatedAt": "2026-05-05T15:11:44.952Z",
+      "gitCommit": "59922a9-dirty",
+      "historyPath": "benchmarks/frwiki/history/search-benchmark-game/limit-5000/2026-05-05T15-11-44-952Z_59922a9-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/search-benchmark-game/limit-5000.json",
+      "summary": {
+        "commands": {
+          "TOP_10": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 25,
+              "p50": 16,
+              "p90": 76,
+              "max": 80
+            },
+            "medianRunUs": {
+              "mean": 25,
+              "p50": 16,
+              "p90": 76,
+              "max": 80
+            }
+          },
+          "TOP_100": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 27,
+              "p50": 18,
+              "p90": 70,
+              "max": 88
+            },
+            "medianRunUs": {
+              "mean": 27,
+              "p50": 18,
+              "p90": 70,
+              "max": 88
+            }
+          },
+          "TOP_100_COUNT": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 18,
+              "p50": 15,
+              "p90": 37,
+              "max": 38
+            },
+            "medianRunUs": {
+              "mean": 18,
+              "p50": 15,
+              "p90": 37,
+              "max": 38
+            }
+          },
+          "COUNT": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 13,
+              "p50": 8,
+              "p90": 30,
+              "max": 33
+            },
+            "medianRunUs": {
+              "mean": 13,
+              "p50": 8,
+              "p90": 30,
+              "max": 33
+            }
+          }
+        }
       }
     }
   },
@@ -21599,6 +21677,84 @@
         "typoMrr10": 0.6909583333333331,
         "typoAppliedRate": 0.75,
         "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rfsearchbenchmarkgame-artifact-v1",
+      "kind": "search-benchmark-game",
+      "limit": 5000,
+      "limitSlug": "limit-5000",
+      "generatedAt": "2026-05-05T15:11:44.952Z",
+      "gitCommit": "59922a9-dirty",
+      "historyPath": "benchmarks/frwiki/history/search-benchmark-game/limit-5000/2026-05-05T15-11-44-952Z_59922a9-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/search-benchmark-game/limit-5000.json",
+      "summary": {
+        "commands": {
+          "TOP_10": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 25,
+              "p50": 16,
+              "p90": 76,
+              "max": 80
+            },
+            "medianRunUs": {
+              "mean": 25,
+              "p50": 16,
+              "p90": 76,
+              "max": 80
+            }
+          },
+          "TOP_100": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 27,
+              "p50": 18,
+              "p90": 70,
+              "max": 88
+            },
+            "medianRunUs": {
+              "mean": 27,
+              "p50": 18,
+              "p90": 70,
+              "max": 88
+            }
+          },
+          "TOP_100_COUNT": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 18,
+              "p50": 15,
+              "p90": 37,
+              "max": 38
+            },
+            "medianRunUs": {
+              "mean": 18,
+              "p50": 15,
+              "p90": 37,
+              "max": 38
+            }
+          },
+          "COUNT": {
+            "queries": 24,
+            "supported": 24,
+            "bestUs": {
+              "mean": 13,
+              "p50": 8,
+              "p90": 30,
+              "max": 33
+            },
+            "medianRunUs": {
+              "mean": 13,
+              "p50": 8,
+              "p90": 30,
+              "max": 33
+            }
+          }
+        }
       }
     }
   ]

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from "node:fs";
+import { mkdirSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendPostingRow, isPostingRowBuffer, postingRowCount, postingRowDoc, postingRowScore } from "./posting_rows.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
@@ -8,36 +8,19 @@ const TERMS_MAGIC = Uint8Array.from([0x52, 0x46, 0x53, 0x47, 0x54, 0x45, 0x52, 0
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-function pushVarint(out, value) {
-  const tmp = Buffer.allocUnsafe(varintLength(value));
-  writeVarint(tmp, 0, value);
-  out.push(...tmp);
-}
-
 function varintBuffer(value) {
   const tmp = Buffer.allocUnsafe(varintLength(value));
   writeVarint(tmp, 0, value);
   return tmp;
 }
 
-function writeHashed(fd, hash, state, chunk) {
-  const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-  let written = 0;
-  while (written < buffer.length) {
-    written += writeSync(fd, buffer, written, buffer.length - written);
+function pushVarint(out, value) {
+  let n = Math.max(0, Math.floor(Number(value) || 0));
+  while (n >= 0x80) {
+    out.push((n % 0x80) | 0x80);
+    n = Math.floor(n / 0x80);
   }
-  hash.update(buffer);
-  state.bytes += buffer.length;
-}
-
-function writeVarintHashed(fd, hash, state, value) {
-  writeHashed(fd, hash, state, varintBuffer(value));
-}
-
-function writeUtf8Hashed(fd, hash, state, value) {
-  const bytes = textEncoder.encode(String(value || ""));
-  writeVarintHashed(fd, hash, state, bytes.length);
-  writeHashed(fd, hash, state, bytes);
+  out.push(n);
 }
 
 function readVarint(bytes, state) {
@@ -111,24 +94,29 @@ function encodeRows(rows) {
 }
 
 function writeSegmentTermsFile(termsPath, terms) {
-  const fd = openSync(termsPath, "w");
   const hash = createHash("sha256");
-  const state = { bytes: 0 };
-  try {
-    writeHashed(fd, hash, state, TERMS_MAGIC);
-    writeVarintHashed(fd, hash, state, terms.length);
-    for (const item of terms) {
-      writeUtf8Hashed(fd, hash, state, item.term);
-      writeVarintHashed(fd, hash, state, item.offset);
-      writeVarintHashed(fd, hash, state, item.bytes);
-      writeVarintHashed(fd, hash, state, item.df);
-      writeVarintHashed(fd, hash, state, item.count);
+  const chunks = [Buffer.from(TERMS_MAGIC), varintBuffer(terms.length)];
+  let total = chunks[0].length + chunks[1].length;
+  for (const item of terms) {
+    const termBytes = textEncoder.encode(String(item.term || ""));
+    const itemChunks = [
+      varintBuffer(termBytes.length),
+      Buffer.from(termBytes),
+      varintBuffer(item.offset),
+      varintBuffer(item.bytes),
+      varintBuffer(item.df),
+      varintBuffer(item.count)
+    ];
+    for (const chunk of itemChunks) {
+      chunks.push(chunk);
+      total += chunk.length;
     }
-  } finally {
-    closeSync(fd);
   }
+  const bytes = Buffer.concat(chunks, total);
+  writeFileSync(termsPath, bytes);
+  hash.update(bytes);
   return {
-    bytes: state.bytes,
+    bytes: total,
     checksum: {
       algorithm: "sha256",
       value: hash.digest("hex")
@@ -242,28 +230,25 @@ export function flushSegment(builder, reason = builder.pendingFlushReason || "fi
   mkdirSync(dir, { recursive: true });
   const postingsPath = resolve(dir, "postings.bin");
   const termsPath = resolve(dir, "terms.bin");
-  const postingsFd = openSync(postingsPath, "w");
   const terms = [];
   const postingsHash = createHash("sha256");
+  const postingBuffers = [];
   let postingOffset = 0;
   let postingCount = 0;
   let docMin = null;
   let docMax = null;
-  try {
-    for (const [term, sourceRows] of [...builder.postings.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      const rows = finishRows(sourceRows);
-      const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
-      writeSync(postingsFd, buffer, 0, buffer.length, postingOffset);
-      postingsHash.update(buffer);
-      terms.push({ term, offset: postingOffset, bytes: buffer.length, df: rows.length, count: rows.length });
-      postingOffset += buffer.length;
-      postingCount += rows.length;
-      docMin = termDocMin == null ? docMin : docMin == null ? termDocMin : Math.min(docMin, termDocMin);
-      docMax = termDocMax == null ? docMax : docMax == null ? termDocMax : Math.max(docMax, termDocMax);
-    }
-  } finally {
-    closeSync(postingsFd);
+  for (const [term, sourceRows] of [...builder.postings.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const rows = finishRows(sourceRows);
+    const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
+    postingBuffers.push(buffer);
+    postingsHash.update(buffer);
+    terms.push({ term, offset: postingOffset, bytes: buffer.length, df: rows.length, count: rows.length });
+    postingOffset += buffer.length;
+    postingCount += rows.length;
+    docMin = termDocMin == null ? docMin : docMin == null ? termDocMin : Math.min(docMin, termDocMin);
+    docMax = termDocMax == null ? docMax : docMax == null ? termDocMax : Math.max(docMax, termDocMax);
   }
+  writeFileSync(postingsPath, Buffer.concat(postingBuffers, postingOffset));
 
   const termsFile = writeSegmentTermsFile(termsPath, terms);
   const meta = segmentMeta(id, terms, postingCount, termsFile.bytes, postingOffset, docMin, docMax, {
@@ -302,31 +287,28 @@ export async function writeSegmentFromTermRows(outDir, id, termRows, extraMeta =
   mkdirSync(dir, { recursive: true });
   const postingsPath = resolve(dir, "postings.bin");
   const termsPath = resolve(dir, "terms.bin");
-  const postingsFd = openSync(postingsPath, "w");
   const terms = [];
   const postingsHash = createHash("sha256");
+  const postingBuffers = [];
   let postingOffset = 0;
   let postingCount = 0;
   let docMin = null;
   let docMax = null;
-  try {
-    for await (const item of termRows) {
-      const term = Array.isArray(item) ? item[0] : item.term;
-      const sourceRows = Array.isArray(item) ? item[1] : item.rows;
-      if (!term || !sourceRows?.length) continue;
-      const rows = finishRows(sourceRows);
-      const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
-      writeSync(postingsFd, buffer, 0, buffer.length, postingOffset);
-      postingsHash.update(buffer);
-      terms.push({ term, offset: postingOffset, bytes: buffer.length, df: rows.length, count: rows.length });
-      postingOffset += buffer.length;
-      postingCount += rows.length;
-      docMin = termDocMin == null ? docMin : docMin == null ? termDocMin : Math.min(docMin, termDocMin);
-      docMax = termDocMax == null ? docMax : docMax == null ? termDocMax : Math.max(docMax, termDocMax);
-    }
-  } finally {
-    closeSync(postingsFd);
+  for await (const item of termRows) {
+    const term = Array.isArray(item) ? item[0] : item.term;
+    const sourceRows = Array.isArray(item) ? item[1] : item.rows;
+    if (!term || !sourceRows?.length) continue;
+    const rows = finishRows(sourceRows);
+    const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
+    postingBuffers.push(buffer);
+    postingsHash.update(buffer);
+    terms.push({ term, offset: postingOffset, bytes: buffer.length, df: rows.length, count: rows.length });
+    postingOffset += buffer.length;
+    postingCount += rows.length;
+    docMin = termDocMin == null ? docMin : docMin == null ? termDocMin : Math.min(docMin, termDocMin);
+    docMax = termDocMax == null ? docMax : docMax == null ? termDocMax : Math.max(docMax, termDocMax);
   }
+  writeFileSync(postingsPath, Buffer.concat(postingBuffers, postingOffset));
 
   const termsFile = writeSegmentTermsFile(termsPath, terms);
   const meta = segmentMeta(id, terms, postingCount, termsFile.bytes, postingOffset, docMin, docMax, {

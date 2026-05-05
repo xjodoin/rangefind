@@ -1,0 +1,2206 @@
+{
+  "fixture": "search-benchmark-game-compatible-frwiki",
+  "protocolSource": "https://github.com/quickwit-oss/search-benchmark-game",
+  "root": "/Users/xjodoin/git/rangefind/examples/frwiki",
+  "public": "/Users/xjodoin/git/rangefind/examples/frwiki/public",
+  "docs": "/Users/xjodoin/git/rangefind/examples/frwiki/data/frwiki.jsonl",
+  "queriesPath": null,
+  "querySource": "frwiki-generated",
+  "queryCount": 24,
+  "commands": [
+    "TOP_10",
+    "TOP_100",
+    "TOP_100_COUNT",
+    "COUNT"
+  ],
+  "runs": 2,
+  "warmupMs": 100,
+  "generatedAt": "2026-05-05T15:11:44.952Z",
+  "limit": 5000,
+  "notes": [
+    "Rangefind is measured through its browser/static-index runtime over local HTTP range requests.",
+    "COUNT and TOP_K_COUNT use exact Rangefind search with size=1 or K because the runtime does not expose a postings-only count command.",
+    "Lucene query syntax from search-benchmark-game is normalized to Rangefind query text; phrase and intersection tags are retained for grouping."
+  ],
+  "results": {
+    "TOP_10": {
+      "rangefind": [
+        {
+          "query": "antoine meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            16,
+            18
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+antoine +meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            15,
+            15
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"antoine meillet\"",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            16,
+            17
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            6,
+            7
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            7,
+            10
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre lineaire\"",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            7,
+            8
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            7,
+            9
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            7,
+            9
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre generale\"",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            7,
+            8
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "politique argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            80,
+            88
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+politique +argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            76,
+            81
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"politique argentine\"",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            77,
+            79
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "armee republicaine irlandaise",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            33,
+            48
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+armee +republicaine",
+          "normalizedQuery": "armee republicaine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            31,
+            33
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"armee republicaine irlandaise\"",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            32,
+            33
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arc triomphe etoile",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            37,
+            49
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arc +triomphe",
+          "normalizedQuery": "arc triomphe",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            16
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arc triomphe etoile\"",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            38,
+            42
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arsene lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            6,
+            6
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arsene +lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            6,
+            9
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arsene lupin\"",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            5,
+            6
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "queryBundleExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": true,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre boole logique",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            33,
+            34
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +boole",
+          "normalizedQuery": "algebre boole",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            24,
+            24
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre boole logique\"",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            29,
+            33
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        }
+      ]
+    },
+    "TOP_100": {
+      "rangefind": [
+        {
+          "query": "antoine meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            12,
+            15
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+antoine +meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            24
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"antoine meillet\"",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            15,
+            49
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            15
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            20
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre lineaire\"",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            17,
+            27
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            19,
+            22
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            14,
+            17
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre generale\"",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            18,
+            24
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "politique argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            71,
+            161
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+politique +argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            70,
+            81
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"politique argentine\"",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            88,
+            105
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "armee republicaine irlandaise",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            31,
+            44
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+armee +republicaine",
+          "normalizedQuery": "armee republicaine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            28,
+            38
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"armee republicaine irlandaise\"",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            29,
+            87
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arc triomphe etoile",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            30,
+            36
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arc +triomphe",
+          "normalizedQuery": "arc triomphe",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            18,
+            29
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arc triomphe etoile\"",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            38,
+            46
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arsene lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            42
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arsene +lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            17
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arsene lupin\"",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            13,
+            15
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre boole logique",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            31,
+            46
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +boole",
+          "normalizedQuery": "algebre boole",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            17,
+            21
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre boole logique\"",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            29,
+            33
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "fullFallback",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        }
+      ]
+    },
+    "TOP_100_COUNT": {
+      "rangefind": [
+        {
+          "query": "antoine meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            8,
+            13
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+antoine +meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            8,
+            8
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"antoine meillet\"",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            8,
+            12
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            9,
+            13
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            11,
+            12
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre lineaire\"",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            10,
+            11
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 6,
+          "duration": [
+            11,
+            14
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 6,
+          "duration": [
+            10,
+            10
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre generale\"",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 6,
+          "duration": [
+            18,
+            20
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "politique argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 3,
+          "duration": [
+            37,
+            41
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+politique +argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 3,
+          "duration": [
+            38,
+            41
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"politique argentine\"",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 3,
+          "duration": [
+            38,
+            49
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "armee republicaine irlandaise",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            17,
+            51
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+armee +republicaine",
+          "normalizedQuery": "armee republicaine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            22,
+            22
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"armee republicaine irlandaise\"",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            19,
+            19
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arc triomphe etoile",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            24,
+            32
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arc +triomphe",
+          "normalizedQuery": "arc triomphe",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            16,
+            17
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arc triomphe etoile\"",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            32,
+            34
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arsene lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            7,
+            9
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arsene +lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            10,
+            11
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arsene lupin\"",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            11,
+            25
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "packedDocs",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre boole logique",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            20,
+            43
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +boole",
+          "normalizedQuery": "algebre boole",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            15,
+            153
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre boole logique\"",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            22,
+            26
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        }
+      ]
+    },
+    "COUNT": {
+      "rangefind": [
+        {
+          "query": "antoine meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            6,
+            7
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+antoine +meillet",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            6,
+            6
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"antoine meillet\"",
+          "normalizedQuery": "antoine meillet",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            6,
+            8
+          ],
+          "top": "Antoine Meillet",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            7,
+            7
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +lineaire",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            7,
+            8
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre lineaire\"",
+          "normalizedQuery": "algebre lineaire",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            8,
+            9
+          ],
+          "top": "Algèbre linéaire",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 6,
+          "duration": [
+            8,
+            8
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +generale",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 6,
+          "duration": [
+            7,
+            7
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre generale\"",
+          "normalizedQuery": "algebre generale",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 6,
+          "duration": [
+            8,
+            8
+          ],
+          "top": "Algèbre générale",
+          "stats": {
+            "total": 6,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "politique argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 3,
+          "duration": [
+            30,
+            34
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+politique +argentine",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 3,
+          "duration": [
+            33,
+            41
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"politique argentine\"",
+          "normalizedQuery": "politique argentine",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 3,
+          "duration": [
+            30,
+            31
+          ],
+          "top": "Politique en Argentine",
+          "stats": {
+            "total": 3,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "armee republicaine irlandaise",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            14,
+            14
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+armee +republicaine",
+          "normalizedQuery": "armee republicaine",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            17,
+            20
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"armee republicaine irlandaise\"",
+          "normalizedQuery": "armee republicaine irlandaise",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            15,
+            17
+          ],
+          "top": "Armée républicaine irlandaise",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arc triomphe etoile",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            19,
+            21
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arc +triomphe",
+          "normalizedQuery": "arc triomphe",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            12,
+            12
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arc triomphe etoile\"",
+          "normalizedQuery": "arc triomphe etoile",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            18,
+            19
+          ],
+          "top": "Arc de triomphe de l'Étoile",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "arsene lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            5,
+            6
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+arsene +lupin",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            6,
+            6
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"arsene lupin\"",
+          "normalizedQuery": "arsene lupin",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 2,
+          "duration": [
+            6,
+            6
+          ],
+          "top": "Arsène Lupin",
+          "stats": {
+            "total": 2,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "algebre boole logique",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "union",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            15,
+            16
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "+algebre +boole",
+          "normalizedQuery": "algebre boole",
+          "tags": [
+            "intersection",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            12,
+            12
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        },
+        {
+          "query": "\"algebre boole logique\"",
+          "normalizedQuery": "algebre boole logique",
+          "tags": [
+            "phrase",
+            "generated"
+          ],
+          "count": 1,
+          "duration": [
+            15,
+            15
+          ],
+          "top": "Algèbre de Boole (logique)",
+          "stats": {
+            "total": 1,
+            "plannerLane": "segmentFanoutExact",
+            "docPayloadLane": "docPages",
+            "queryBundleHit": false,
+            "typoApplied": false
+          }
+        }
+      ]
+    }
+  },
+  "summary": {
+    "commands": {
+      "TOP_10": {
+        "queries": 24,
+        "supported": 24,
+        "bestUs": {
+          "mean": 25,
+          "p50": 16,
+          "p90": 76,
+          "max": 80
+        },
+        "medianRunUs": {
+          "mean": 25,
+          "p50": 16,
+          "p90": 76,
+          "max": 80
+        }
+      },
+      "TOP_100": {
+        "queries": 24,
+        "supported": 24,
+        "bestUs": {
+          "mean": 27,
+          "p50": 18,
+          "p90": 70,
+          "max": 88
+        },
+        "medianRunUs": {
+          "mean": 27,
+          "p50": 18,
+          "p90": 70,
+          "max": 88
+        }
+      },
+      "TOP_100_COUNT": {
+        "queries": 24,
+        "supported": 24,
+        "bestUs": {
+          "mean": 18,
+          "p50": 15,
+          "p90": 37,
+          "max": 38
+        },
+        "medianRunUs": {
+          "mean": 18,
+          "p50": 15,
+          "p90": 37,
+          "max": 38
+        }
+      },
+      "COUNT": {
+        "queries": 24,
+        "supported": 24,
+        "bestUs": {
+          "mean": 13,
+          "p50": 8,
+          "p90": 30,
+          "max": 33
+        },
+        "medianRunUs": {
+          "mean": 13,
+          "p50": 8,
+          "p90": 30,
+          "max": 33
+        }
+      }
+    }
+  },
+  "upstreamComparison": null,
+  "benchmarkArtifact": {
+    "format": "rfsearchbenchmarkgame-artifact-v1",
+    "kind": "search-benchmark-game",
+    "limit": 5000,
+    "limitSlug": "limit-5000",
+    "generatedAt": "2026-05-05T15:11:44.952Z",
+    "gitCommit": "59922a9-dirty",
+    "historyPath": "benchmarks/frwiki/history/search-benchmark-game/limit-5000/2026-05-05T15-11-44-952Z_59922a9-dirty.json",
+    "latestPath": "benchmarks/frwiki/latest/search-benchmark-game/limit-5000.json",
+    "summary": {
+      "commands": {
+        "TOP_10": {
+          "queries": 24,
+          "supported": 24,
+          "bestUs": {
+            "mean": 25,
+            "p50": 16,
+            "p90": 76,
+            "max": 80
+          },
+          "medianRunUs": {
+            "mean": 25,
+            "p50": 16,
+            "p90": 76,
+            "max": 80
+          }
+        },
+        "TOP_100": {
+          "queries": 24,
+          "supported": 24,
+          "bestUs": {
+            "mean": 27,
+            "p50": 18,
+            "p90": 70,
+            "max": 88
+          },
+          "medianRunUs": {
+            "mean": 27,
+            "p50": 18,
+            "p90": 70,
+            "max": 88
+          }
+        },
+        "TOP_100_COUNT": {
+          "queries": 24,
+          "supported": 24,
+          "bestUs": {
+            "mean": 18,
+            "p50": 15,
+            "p90": 37,
+            "max": 38
+          },
+          "medianRunUs": {
+            "mean": 18,
+            "p50": 15,
+            "p90": 37,
+            "max": 38
+          }
+        },
+        "COUNT": {
+          "queries": 24,
+          "supported": 24,
+          "bestUs": {
+            "mean": 13,
+            "p50": 8,
+            "p90": 30,
+            "max": 33
+          },
+          "medianRunUs": {
+            "mean": 13,
+            "p50": 8,
+            "p90": 30,
+            "max": 33
+          }
+        }
+      }
+    }
+  }
+}

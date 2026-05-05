@@ -174,6 +174,55 @@ corrected plans through normal postings. The quality harness keeps the removed
 delete-key sidecar baseline as a recorded artifact only, so Hit@10/MRR parity is
 visible without shipping `typo/` packs in the final index.
 
+Rangefind also has a compatibility harness for Quickwit's
+`search-benchmark-game` protocol:
+
+```bash
+npm run bench:frwiki:search-game
+```
+
+The harness reads the existing frwiki fixture, generates phrase/union/intersection
+query rows, runs the Search Benchmark Game command shapes (`TOP_10`, `TOP_100`,
+`TOP_100_COUNT`, and `COUNT` by default), and writes reports under:
+
+```text
+benchmarks/frwiki/latest/search-benchmark-game/
+benchmarks/frwiki/history/search-benchmark-game/
+```
+
+You can point it at an upstream checkout's query file and published result file
+when you want overlap rows against the official benchmark data:
+
+```bash
+npm run bench:frwiki:search-game -- \
+  --queries=/path/to/search-benchmark-game/queries.txt \
+  --upstream-results=/path/to/search-benchmark-game/results.json
+```
+
+This is intentionally a protocol-compatible local trend benchmark, not an
+official Search Benchmark Game submission. Rangefind is measured through its
+browser/static-index runtime over local HTTP range requests; `COUNT` and
+`TOP_K_COUNT` use exact Rangefind search with `size: 1` or `size: K` because the
+runtime does not expose a postings-only count command, and Lucene query syntax
+such as `+term` and quoted phrases is normalized to Rangefind query text while
+retaining the original tags in the report.
+
+For an upstream Search Benchmark Game checkout, the repo also includes an engine
+adapter in `scripts/search_benchmark_game/rangefind/`. Symlink or copy that
+directory into the upstream checkout's `engines/rangefind` directory, set
+`RANGEFIND_REPO=/path/to/rangefind` when needed, and run the normal upstream
+flow with `ENGINES=rangefind`. The adapter implements the expected `clean`,
+`compile`, `index`, and `serve` targets.
+
+Latest local 5k compatibility run:
+
+```text
+TOP_10:       best mean 0.03 ms, p50 0.02 ms, p90 0.08 ms
+TOP_100:      best mean 0.03 ms, p50 0.02 ms, p90 0.07 ms
+TOP_100_COUNT: best mean 0.02 ms, p50 0.01 ms, p90 0.04 ms
+COUNT:        best mean 0.01 ms, p50 0.01 ms, p90 0.03 ms
+```
+
 The known-title improvement still comes from a generic authority sidecar over
 configured label fields, not from Wikipedia-specific rules. The runtime probes a
 diacritic-preserving surface key first, so `Paris`, `Médecine`, `Victor Hugo`,
