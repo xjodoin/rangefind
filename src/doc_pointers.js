@@ -1,10 +1,8 @@
-import { DOC_ORDINAL_TABLE_MAGIC, DOC_POINTER_PAGE_MAGIC, fixedWidth, pushVarint, readFixedInt, readVarint, writeFixedInt } from "./binary.js";
+import { DOC_POINTER_PAGE_MAGIC, fixedWidth, pushVarint, readFixedInt, readVarint, writeFixedInt } from "./binary.js";
 import { assertMagic } from "./codec.js";
 
 export const DOC_POINTER_FORMAT = "rfdocptr-v1";
-export const DOC_ORDINAL_FORMAT = "rfdocord-v1";
 const DOC_POINTER_VERSION = 1;
-const DOC_ORDINAL_VERSION = 1;
 const SHA256_BYTES = 32;
 const SHA256_HEX = /^[0-9a-f]{64}$/iu;
 
@@ -190,73 +188,4 @@ export function parseDocPointerPage(buffer, options = {}) {
     entries[i] = decodeDocPointerRecord(buffer, meta.dataOffset + i * meta.recordBytes, meta, packTable);
   }
   return { ...meta, start: 0, entries };
-}
-
-function ordinalHeaderBytes(meta) {
-  const out = [...DOC_ORDINAL_TABLE_MAGIC];
-  pushVarint(out, DOC_ORDINAL_VERSION);
-  pushVarint(out, meta.count);
-  pushVarint(out, meta.width);
-  return Uint8Array.from(out);
-}
-
-export function buildDocOrdinalTable(layoutOrder, total) {
-  const ordinals = new Array(total);
-  for (let ordinal = 0; ordinal < layoutOrder.length; ordinal++) {
-    const doc = layoutOrder[ordinal];
-    if (doc < 0 || doc >= total || ordinals[doc] != null) {
-      throw new Error(`Rangefind doc ordinal table received invalid document id ${doc}.`);
-    }
-    ordinals[doc] = ordinal;
-  }
-  for (let doc = 0; doc < total; doc++) {
-    if (ordinals[doc] == null) throw new Error(`Rangefind doc ordinal table is missing document ${doc}.`);
-  }
-  const width = fixedWidth([Math.max(0, total - 1)]);
-  const meta = {
-    format: DOC_ORDINAL_FORMAT,
-    version: DOC_ORDINAL_VERSION,
-    count: total,
-    width,
-    recordBytes: width
-  };
-  const header = ordinalHeaderBytes(meta);
-  meta.dataOffset = header.length;
-  const buffer = Buffer.alloc(meta.dataOffset + total * width);
-  buffer.set(header, 0);
-  for (let doc = 0; doc < total; doc++) {
-    writeFixedInt(buffer, meta.dataOffset + doc * width, width, ordinals[doc]);
-  }
-  return { buffer, meta };
-}
-
-export function parseDocOrdinalHeader(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, DOC_ORDINAL_TABLE_MAGIC, "Unsupported Rangefind doc ordinal table");
-  const state = { pos: DOC_ORDINAL_TABLE_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== DOC_ORDINAL_VERSION) throw new Error(`Unsupported Rangefind doc ordinal table version ${version}`);
-  const count = readVarint(bytes, state);
-  const width = readVarint(bytes, state);
-  return {
-    format: DOC_ORDINAL_FORMAT,
-    version,
-    count,
-    width,
-    recordBytes: width,
-    dataOffset: state.pos
-  };
-}
-
-export function decodeDocOrdinalRecord(buffer, offset, meta) {
-  return readFixedInt(new Uint8Array(buffer), offset, meta.width);
-}
-
-export function parseDocOrdinalTable(buffer) {
-  const meta = parseDocOrdinalHeader(buffer);
-  const entries = new Array(meta.count);
-  for (let i = 0; i < meta.count; i++) {
-    entries[i] = decodeDocOrdinalRecord(buffer, meta.dataOffset + i * meta.recordBytes, meta);
-  }
-  return { ...meta, entries };
 }

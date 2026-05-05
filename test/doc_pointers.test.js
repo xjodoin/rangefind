@@ -2,13 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildDocPointerTable,
-  buildDocOrdinalTable,
-  decodeDocOrdinalRecord,
   decodeDocPointerRecord,
-  DOC_ORDINAL_FORMAT,
   DOC_POINTER_FORMAT,
-  parseDocOrdinalHeader,
-  parseDocOrdinalTable,
   parseDocPointerHeader,
   parseDocPointerPage
 } from "../src/doc_pointers.js";
@@ -62,19 +57,4 @@ test("dense doc pointer table rejects malformed object pointers", () => {
     ], new Map([["0000.hash.bin", 0]])),
     /SHA-256 checksum/
   );
-});
-
-test("dense doc ordinal table maps document ids to layout order", () => {
-  const { buffer, meta } = buildDocOrdinalTable([2, 0, 1], 3);
-  assert.equal(meta.format, DOC_ORDINAL_FORMAT);
-  assert.equal(meta.count, 3);
-  assert.equal(meta.width, 1);
-  assert.deepEqual(parseDocOrdinalHeader(buffer), meta);
-  assert.equal(decodeDocOrdinalRecord(buffer, meta.dataOffset, meta), 1);
-  assert.deepEqual(parseDocOrdinalTable(buffer).entries, [1, 2, 0]);
-});
-
-test("dense doc ordinal table rejects invalid layout orders", () => {
-  assert.throws(() => buildDocOrdinalTable([0, 0], 2), /invalid document id/);
-  assert.throws(() => buildDocOrdinalTable([0], 2), /missing document 1/);
 });

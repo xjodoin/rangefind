@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  rmSync,
   closeSync,
   readFileSync,
   readSync,
@@ -41,7 +42,7 @@ import {
   encodeDocValueSortPage
 } from "./doc_value_tree.js";
 import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
-import { buildDocOrdinalTable, buildDocPointerTableFromReader } from "./doc_pointers.js";
+import { buildDocPointerTableFromReader } from "./doc_pointers.js";
 import { eachJsonLine } from "./jsonl.js";
 import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
@@ -54,16 +55,6 @@ import { analyzeDocumentTerms, fieldIndexText } from "./scoring.js";
 import { addSegmentPosting, createSegmentBuilder, finishSegmentBuilder, flushSegment, shouldFlushSegment } from "./segment_builder.js";
 import { mergeSegmentsToPartitions, segmentMergeSummary } from "./segment_merge.js";
 import { writeSegmentManifest } from "./segment_manifest.js";
-import {
-  addTypoIndexTerm,
-  addTypoSurfacePairsToBuffer,
-  createTypoSurfacePairBuffer,
-  flushTypoSurfacePairBuffer,
-  createTypoRunBuffer,
-  reduceTypoRuns,
-  surfacePairsForFields,
-  typoOptions
-} from "./typo.js";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -617,7 +608,7 @@ async function finishDocPacks(out, spool, total, config) {
   const entryInFd = openSync(entryPath, "r");
   let pointerTable;
   try {
-    pointerTable = buildDocPointerTableFromReader(layout.order.length, packIndexes, ordinal => readPackedDocEntry(entryInFd, layout.order[ordinal], packFiles));
+    pointerTable = buildDocPointerTableFromReader(total, packIndexes, doc => readPackedDocEntry(entryInFd, doc, packFiles));
   } finally {
     closeSync(entryInFd);
   }
@@ -625,11 +616,6 @@ async function finishDocPacks(out, spool, total, config) {
   const file = `docs/pointers/${hashedFile("0000", hash, ".bin")}`;
   mkdirSync(resolve(out, "docs", "pointers"), { recursive: true });
   writeFileSync(resolve(out, file), pointerTable.buffer);
-  const ordinalTable = buildDocOrdinalTable(layout.order, total);
-  const ordinalHash = sha256Hex(ordinalTable.buffer);
-  const ordinalFile = `docs/ordinals/${hashedFile("0000", ordinalHash, ".bin")}`;
-  mkdirSync(resolve(out, "docs", "ordinals"), { recursive: true });
-  writeFileSync(resolve(out, ordinalFile), ordinalTable.buffer);
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
@@ -641,18 +627,11 @@ async function finishDocPacks(out, spool, total, config) {
     pointers: {
       ...pointerTable.meta,
       file,
-      order: "layout",
+      order: "doc-id",
       content_hash: hash,
       immutable: true,
       bytes: pointerTable.buffer.length,
-      pack_table: packTable(packWriter.packs),
-      ordinals: {
-        ...ordinalTable.meta,
-        file: ordinalFile,
-        content_hash: ordinalHash,
-        immutable: true,
-        bytes: ordinalTable.buffer.length
-      }
+      pack_table: packTable(packWriter.packs)
     },
     packs: packWriter.packs
   };
@@ -1658,8 +1637,7 @@ function applyAutoPostingLayout(config, measured, runData) {
 function analyzeDocForScan(doc, index, config, avgLens) {
   return {
     index,
-    selectedTerms: analyzeDocumentTerms(doc, config, avgLens),
-    typoSurfacePairs: [...surfacePairsForFields(doc, config.fields, (source, field) => fieldIndexText(source, field, config))]
+    selectedTerms: analyzeDocumentTerms(doc, config, avgLens)
   };
 }
 
@@ -1673,9 +1651,7 @@ function consumeScanDoc(state, doc, index, analysis) {
     queryBundleSeedBuffer,
     authorityBuffer,
     docSpool,
-    selectedTermSpool,
-    typoBuffer,
-    typoSurfacePairs
+    selectedTermSpool
   } = state;
   const selectedTerms = analysis.selectedTerms || [];
   writeSelectedTerms(selectedTermSpool, selectedTerms);
@@ -1684,10 +1660,8 @@ function consumeScanDoc(state, doc, index, analysis) {
   }
   addQueryBundleSeeds(queryBundleSeedBuffer, selectedTerms, config, doc);
   addAuthorityDoc(authorityBuffer, config, doc, index);
-  addTypoSurfacePairsToBuffer(typoSurfacePairs, analysis.typoSurfacePairs || []);
 
   if (shouldFlushSegment(segmentBuilder)) {
-    flushTypoSurfacePairBuffer(typoBuffer, typoSurfacePairs);
     flushSegment(segmentBuilder);
   }
 
@@ -1975,7 +1949,7 @@ function createPartitionReducerPool(config) {
   };
 }
 
-async function writePostingRuns(config, measured, dirs, typoBuffer) {
+async function writePostingRuns(config, measured, dirs) {
   const codes = createCodeStore(resolve(dirs.build, "codes"), config, measured.total, measured.dicts);
 
   const initialResults = [];
@@ -1984,7 +1958,6 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
   const authorityBuffer = createAuthorityRunBuffer(config, dirs.authorityRunsOut);
   const docSpool = createDocSpool(resolve(dirs.build, "docs"));
   const selectedTermSpool = createSelectedTermSpool(resolve(dirs.build, "terms"));
-  const typoSurfacePairs = createTypoSurfacePairBuffer();
   const state = {
     config,
     measured,
@@ -1994,9 +1967,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     queryBundleSeedBuffer,
     authorityBuffer,
     docSpool,
-    selectedTermSpool,
-    typoBuffer,
-    typoSurfacePairs
+    selectedTermSpool
   };
   let scanWorkerStats = [];
 
@@ -2006,7 +1977,6 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
     closeDocSpool(docSpool);
     closeSelectedTermSpool(selectedTermSpool);
   }
-  flushTypoSurfacePairBuffer(typoBuffer, typoSurfacePairs);
   const segments = finishSegmentBuilder(segmentBuilder);
   const authorityBaseShards = finishAuthorityRuns(authorityBuffer);
   const queryBundleSeeds = finalizeQueryBundleSeeds(queryBundleSeedBuffer, config);
@@ -2024,7 +1994,7 @@ async function writePostingRuns(config, measured, dirs, typoBuffer) {
   };
 }
 
-async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
+async function reduceRuns(config, measured, runData, dirs) {
   const filters = buildBlockFilters(config, measured.dicts);
   const started = performance.now();
   const usePartitionWorkers = partitionReducerWorkerCount(config) > 1;
@@ -2040,7 +2010,6 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
   const bundleTermSet = new Set(runData.queryBundleTerms || []);
   let partitionOutput = { packs: [], packBytes: 0, blockPacks: [], blockPackBytes: 0 };
   const workerCodesDescriptor = usePartitionWorkers ? codeStoreDescriptorForPartitionWorkers(runData.codes, config) : null;
-  let typoIndexTerms = 0;
   let stats;
   try {
     stats = await mergeSegmentsToPartitions({
@@ -2050,7 +2019,6 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       partitionConcurrency: usePartitionWorkers ? partitionPool.count : 1,
       onTerm: (term, df) => {
         if (bundleTermSet.has(term)) bundleDfs.set(term, df);
-        if (addTypoIndexTerm(typoBuffer, term, df, measured.total)) typoIndexTerms++;
       },
       onPartition: async (partition, sequence) => {
         if (usePartitionWorkers) {
@@ -2163,8 +2131,7 @@ async function reduceRuns(config, measured, runData, dirs, typoBuffer) {
       segmentPartitionAssemblyMs: stats.timings?.partitionAssemblyMs || 0
     },
     partitionSpoolBytes: stats.partitionSpoolBytes || 0,
-    partitionSpoolEntries: stats.partitionSpoolEntries || 0,
-    typoIndexTerms
+    partitionSpoolEntries: stats.partitionSpoolEntries || 0
   };
 }
 
@@ -2238,15 +2205,13 @@ function buildTelemetryDiskByteGroups(out, buildRootPath = resolve(out, "_build"
       resolve(out, "terms", "block-packs"),
       resolve(out, "terms", "directory"),
       resolve(out, "docs", "pointers"),
-      resolve(out, "docs", "ordinals"),
       resolve(out, "docs", "pages"),
       resolve(out, "doc-values", "sorted"),
       resolve(out, "filter-bitmaps", "manifest.json.gz"),
       resolve(out, "facets", "directory"),
       resolve(out, "bundles", "directory"),
       resolve(out, "authority", "directory"),
-      resolve(out, "segments"),
-      resolve(out, "typo")
+      resolve(out, "segments")
     ]
   };
 }
@@ -2302,11 +2267,8 @@ function minimalManifest(manifest) {
     sort_replicas: manifest.sort_replicas,
     query_bundles: manifest.query_bundles,
     authority: manifest.authority,
+    search: manifest.search,
     optimizer: manifest.optimizer,
-    typo: manifest.typo ? {
-      manifest: manifest.typo.manifest,
-      manifest_hash: manifest.typo.manifest_hash
-    } : null,
     stats: manifest.stats
   };
 }
@@ -2357,7 +2319,7 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
   });
 }
 
-const BUILD_RESUME_SCHEMA_VERSION = 1;
+const BUILD_RESUME_SCHEMA_VERSION = 3;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -2488,37 +2450,7 @@ function serializeSelectedTermSpool(spool) {
   };
 }
 
-function serializeTypoBuffer(buffer) {
-  if (!buffer) return null;
-  return {
-    runsOut: buffer.runsOut,
-    options: buffer.options,
-    terms: buffer.terms || 0,
-    deletePairs: buffer.deletePairs || 0,
-    lexiconPairs: buffer.lexiconPairs || 0,
-    shards: [...(buffer.shards || [])],
-    lexiconShards: [...(buffer.lexiconShards || [])]
-  };
-}
-
-function hydrateTypoBuffer(payload) {
-  if (!payload?.options?.enabled) return null;
-  return {
-    byShard: new Map(),
-    lexiconByShard: new Map(),
-    lines: 0,
-    lexiconLines: 0,
-    runsOut: payload.runsOut,
-    options: payload.options,
-    terms: payload.terms || 0,
-    deletePairs: payload.deletePairs || 0,
-    lexiconPairs: payload.lexiconPairs || 0,
-    shards: new Set(payload.shards || []),
-    lexiconShards: new Set(payload.lexiconShards || [])
-  };
-}
-
-function serializeScanStage(runData, measured, typoBuffer) {
+function serializeScanStage(runData, measured) {
   const codeDescriptor = runData.codes.descriptor();
   return {
     codeDescriptor: { ...codeDescriptor, dicts: serializeDicts(measured.dicts) },
@@ -2530,8 +2462,7 @@ function serializeScanStage(runData, measured, typoBuffer) {
     queryBundleSeeds: runData.queryBundleSeeds,
     queryBundleTerms: runData.queryBundleTerms,
     authorityBaseShards: runData.authorityBaseShards,
-    scanWorkerStats: runData.scanWorkerStats,
-    typoBuffer: serializeTypoBuffer(typoBuffer)
+    scanWorkerStats: runData.scanWorkerStats
   };
 }
 
@@ -2550,12 +2481,11 @@ function hydrateScanStage(payload, measured) {
   };
 }
 
-function serializeReducedStage(reduced, typoBuffer) {
+function serializeReducedStage(reduced) {
   return {
     ...reduced,
     finalShards: undefined,
-    bundleDfs: [...(reduced.bundleDfs || new Map()).entries()],
-    typoBuffer: serializeTypoBuffer(typoBuffer)
+    bundleDfs: [...(reduced.bundleDfs || new Map()).entries()]
   };
 }
 
@@ -2575,7 +2505,6 @@ export async function build({ configPath }) {
   const dirs = {
     out: config.output,
     build: config._buildRoot,
-    typoRunsOut: resolve(config._buildRoot, "typo-runs"),
     authorityRunsOut: resolve(config._buildRoot, "authority-runs")
   };
   const telemetry = createBuildTelemetry({
@@ -2588,6 +2517,8 @@ export async function build({ configPath }) {
   mkdirSync(resolve(dirs.out, "terms"), { recursive: true });
   mkdirSync(resolve(dirs.build, "stages"), { recursive: true });
   mkdirSync(dirs.authorityRunsOut, { recursive: true });
+  rmSync(resolve(dirs.out, "typo"), { recursive: true, force: true });
+  rmSync(resolve(dirs.out, "docs", "ordinals"), { recursive: true, force: true });
 
   let runData = null;
   try {
@@ -2600,16 +2531,12 @@ export async function build({ configPath }) {
       async () => serializeMeasured(await measure(config)),
       hydrateMeasured
     );
-    const typo = typoOptions(config);
-    let typoBuffer = null;
     const scanStage = readStage(config, "scan");
     if (scanStage) {
       runData = hydrateScanStage(scanStage, measured);
-      typoBuffer = hydrateTypoBuffer(scanStage.typoBuffer);
     } else {
-      typoBuffer = typo.enabled ? createTypoRunBuffer(dirs.typoRunsOut, typo) : null;
-      runData = await timeBuildPhase(telemetry, "scan-and-spool", () => writePostingRuns(config, measured, dirs, typoBuffer));
-      writeStage(config, "scan", serializeScanStage(runData, measured, typoBuffer));
+      runData = await timeBuildPhase(telemetry, "scan-and-spool", () => writePostingRuns(config, measured, dirs));
+      writeStage(config, "scan", serializeScanStage(runData, measured));
       maybeFailAfterStage(config, "scan");
     }
     recordBuildWorkers(telemetry, "scan-and-spool", runData.scanWorkerStats, {
@@ -2627,10 +2554,9 @@ export async function build({ configPath }) {
     let reduced;
     if (reduceStage) {
       reduced = hydrateReducedStage(reduceStage);
-      typoBuffer = hydrateTypoBuffer(reduceStage.typoBuffer) || typoBuffer;
     } else {
-      reduced = await timeBuildPhase(telemetry, "reduce-postings", () => reduceRuns(config, measured, runData, dirs, typoBuffer));
-      writeStage(config, "reduce", serializeReducedStage(reduced, typoBuffer));
+      reduced = await timeBuildPhase(telemetry, "reduce-postings", () => reduceRuns(config, measured, runData, dirs));
+      writeStage(config, "reduce", serializeReducedStage(reduced));
       maybeFailAfterStage(config, "reduce");
     }
     recordBuildWorkers(telemetry, "reduce-postings", reduced.workerStats, {
@@ -2658,8 +2584,7 @@ export async function build({ configPath }) {
       partition_reducer_credit_wait_ms: reduced.reduceTimings.partitionScheduler?.creditWaitMs || 0,
       partition_reducer_credit_waits: reduced.reduceTimings.partitionScheduler?.creditWaits || 0,
       partition_reducer_oversized_partitions: reduced.reduceTimings.partitionScheduler?.oversizedPartitions || 0,
-      partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
-      typo_index_terms: reduced.typoIndexTerms || 0
+      partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || ""
     });
     const segmentManifest = await runResumableStage(config, telemetry, "segment-manifest", "segment-manifest", () => writeSegmentManifest(dirs.out, {
       config,
@@ -2680,26 +2605,24 @@ export async function build({ configPath }) {
     let queryBundles;
     let authority;
     let docs;
-    let typoManifest;
     let docValues;
     let docValueSorted;
     let filterBitmaps;
     let facetDictionaries;
     const sidecarStage = readStage(config, "sidecars");
     if (sidecarStage) {
-      ({ sortReplicas, queryBundles, authority, docs, typoManifest, docValues, docValueSorted, filterBitmaps, facetDictionaries } = sidecarStage);
+      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries } = sidecarStage);
     } else {
       sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
       queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
       authority = await timeBuildPhase(telemetry, "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
       docs = await timeBuildPhase(telemetry, "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
       docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
-      typoManifest = await timeBuildPhase(telemetry, "typo", () => reduceTypoRuns(typoBuffer, dirs.out));
       docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
       docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
       filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
       facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
-      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, typoManifest, docValues, docValueSorted, filterBitmaps, facetDictionaries });
+      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries });
       maybeFailAfterStage(config, "sidecars");
     }
     addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
@@ -2730,7 +2653,7 @@ export async function build({ configPath }) {
         queryBundles: !!queryBundles,
         authority: !!authority,
         sortReplicas: sortReplicas.count > 0,
-        typoSidecar: !!typoManifest
+        mainIndexTypo: config.typoMode !== "off"
       },
     object_store: {
       format: OBJECT_STORE_FORMAT,
@@ -2752,9 +2675,7 @@ export async function build({ configPath }) {
         filterBitmaps: packTable(filterBitmaps.packs),
         facets: packTable(facetDictionaries.pack_objects),
         queryBundles: packTable(queryBundles?.packs),
-        authority: packTable(authority?.packs),
-        typo: packTable(typoManifest?.packs),
-        typoLexicon: packTable(typoManifest?.lexicon?.packs)
+        authority: packTable(authority?.packs)
       },
       dedupe: summarizeDedup(
         reduced.packs,
@@ -2766,16 +2687,13 @@ export async function build({ configPath }) {
         filterBitmaps.packs,
         facetDictionaries.pack_objects,
         queryBundles?.packs || [],
-        authority?.packs || [],
-        typoManifest?.packs || [],
-        typoManifest?.lexicon?.packs || []
+        authority?.packs || []
       ),
       directories: {
         terms: reduced.directory,
         facets: facetDictionaries.directory,
         queryBundles: queryBundles?.directory || null,
-        authority: authority?.directory || null,
-        typo: typoManifest?.directory || null
+        authority: authority?.directory || null
       },
       pointers: {
         docs: docs.pointers,
@@ -2875,29 +2793,18 @@ export async function build({ configPath }) {
         directory_bytes: authority.directory_bytes
       }
     } : null,
-    typo: typoManifest ? {
-      format: typoManifest.format,
-      compression: typoManifest.compression,
-      manifest: typoManifest.manifest,
-      manifest_hash: typoManifest.manifest_hash,
-      directory: typoManifest.directory,
-      shards: typoManifest.directory.entries,
-      packs: typoManifest.packs.length,
-      lexicon: typoManifest.lexicon ? {
-        format: typoManifest.lexicon.format,
-        directory: typoManifest.lexicon.directory,
-        shards: typoManifest.lexicon.directory.entries,
-        packs: typoManifest.lexicon.packs.length,
-        stats: typoManifest.lexicon.stats
-      } : null,
-      stats: {
-        ...typoManifest.stats,
-        pack_files: typoManifest.packs.length,
-        lexicon_pack_files: typoManifest.lexicon?.packs.length || 0,
-        lexicon_pack_bytes: typoManifest.lexicon?.stats?.pack_bytes || 0,
-        lexicon_directory_bytes: typoManifest.lexicon?.stats?.directory_bytes || 0
+    search: {
+      postingOrder: config.postingOrder,
+      typo: {
+        mode: config.typoMode,
+        trigger: config.typoTrigger,
+        maxEdits: config.typoMaxEdits,
+        maxTokenCandidates: config.typoMaxTokenCandidates,
+        maxQueryPlans: config.typoMaxQueryPlans,
+        maxCorrectedSearches: config.typoMaxCorrectedSearches,
+        maxShardLookups: config.typoMaxShardLookups
       }
-    } : null,
+    },
     stats: {
       terms: reduced.termCount,
       postings: reduced.postingCount,
@@ -2910,6 +2817,7 @@ export async function build({ configPath }) {
       posting_segment_storage: "range-pack-v1",
       posting_segment_format: POSTING_SEGMENT_FORMAT,
       posting_segment_block_storage: config.externalPostingBlocks === false ? "inline" : "range-pack-v1",
+      posting_order: config.postingOrder,
       posting_segment_directory_format: reduced.directory.format,
       posting_segment_directory_page_files: reduced.directory.page_files,
       posting_segment_directory_bytes: reduced.directory.total_bytes,
@@ -3037,7 +2945,13 @@ export async function build({ configPath }) {
       query_bundle_directory_bytes: queryBundles?.directory_bytes || 0,
       query_bundle_pack_files: queryBundles?.packs.length || 0,
       query_bundle_pack_bytes: queryBundles?.pack_bytes || 0,
-      typo_index_terms: reduced.typoIndexTerms || 0,
+      typo_mode: config.typoMode,
+      typo_trigger: config.typoTrigger,
+      typo_max_edits: config.typoMaxEdits,
+      typo_max_token_candidates: config.typoMaxTokenCandidates,
+      typo_max_query_plans: config.typoMaxQueryPlans,
+      typo_max_corrected_searches: config.typoMaxCorrectedSearches,
+      typo_max_shard_lookups: config.typoMaxShardLookups,
       authority_format: authority?.format || "",
       authority_fields: authority?.fields.length || 0,
       authority_keys: authority?.keys || 0,

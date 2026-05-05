@@ -4,21 +4,21 @@ import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPo
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns, decodeDocPagePointerRecord } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
-import { decodeDocOrdinalRecord, decodeDocPointerRecord } from "./doc_pointers.js";
+import { decodeDocPointerRecord } from "./doc_pointers.js";
 import { filterBitmapHas, parseFilterBitmap } from "./filter_bitmaps.js";
 import { verifyBlockPointer } from "./object_store.js";
 import { parseQueryBundle } from "./query_bundle_codec.js";
 import { decodeSegmentRows, parseSegmentTerms } from "./segment_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
-import { parseTypoLexiconShard } from "./typo_lexicon.js";
 import {
-  boundedDamerauLevenshtein,
-  parseTypoShard,
-  typoCandidateScore,
-  typoCandidatesForDeleteKey,
-  typoDeleteKeys,
+  bestMainIndexTypoDistance,
+  isTypoCorrectionToken,
+  mainIndexTypoCandidateScore,
+  mainIndexTypoProbeValues,
+  ngramOverlap,
+  normalizeMainIndexTypoOptions,
   typoMaxEditsFor
-} from "./typo_runtime.js";
+} from "./typo_main_index.js";
 
 const RERANK_CANDIDATES = 30;
 const DEPENDENCY_SCORE_SCALE = 0.12;
@@ -28,9 +28,8 @@ const POSTING_BLOCK_FRONTIER = 4;
 const FILTER_BITMAP_SPARSE_DOC_LIMIT = 256;
 const TYPO_CORRECTION_CANDIDATES_PER_TOKEN = 2;
 const TYPO_CORRECTION_PLAN_LIMIT = 6;
-const TYPO_CORRECTION_EXECUTION_PLAN_LIMIT = 1;
+const TYPO_CORRECTION_EXECUTION_PLAN_LIMIT = 3;
 const TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
-const TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 const DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
 const DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.12;
 const DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 1024;
@@ -64,12 +63,9 @@ function traceBucketFromPath(path) {
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/authority/packs/")) return "authority";
-  if (path.includes("/typo/lexicon-packs/") || path.includes("/typo/lexicon/")) return "typoLexicon";
-  if (path.includes("/typo/")) return "typo";
   if (path.includes("/sort-replicas/")) return "sortReplicas";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
-  if (path.includes("/docs/ordinals/")) return "docOrdinals";
   if (path.includes("/docs/pointers/")) return "docPointers";
   if (path.includes("/docs/pages/")) return "docPagePointers";
   if (path.includes("/docs/page-packs/")) return "docPages";
@@ -95,8 +91,6 @@ function traceLabelBucket(label) {
   if (value.startsWith("posting segment")) return "terms";
   if (value.startsWith("query bundle")) return "queryBundles";
   if (value.startsWith("authority shard")) return "authority";
-  if (value.startsWith("typo lexicon")) return "typoLexicon";
-  if (value.startsWith("typo shard")) return "typo";
   if (value.startsWith("sort replica doc pointer")) return "sortReplicaDocPointers";
   if (value.startsWith("sort replica doc page")) return "sortReplicaDocPages";
   if (value.startsWith("sort replica doc ")) return "sortReplicaDocs";
@@ -253,11 +247,8 @@ export async function createSearch(options = {}) {
   const shardCache = new Map();
   const queryBundleCache = new Map();
   const authorityShardCache = new Map();
-  const typoShardCache = new Map();
-  const typoLexiconShardCache = new Map();
   const segmentTermsCache = new Map();
   const segmentRowsCache = new Map();
-  const docOrdinalCache = new Map();
   const docPointerCache = new Map();
   const packedDocCache = new Map();
   const docPagePointerCache = new Map();
@@ -273,10 +264,6 @@ export async function createSearch(options = {}) {
   const sortReplicaDocPagePointerCache = new Map();
   const sortReplicaDocPageCache = new Map();
   const facetDictionaryCache = new Map();
-  let typoManifest = null;
-  let typoManifestPromise = null;
-  let typoDirectory = null;
-  let typoLexiconDirectory = null;
   let codes = null;
   let codesPromise = null;
   let fullManifestPromise = null;
@@ -300,7 +287,6 @@ export async function createSearch(options = {}) {
   let blockFilterFields = new Set((manifest.block_filters || []).map(filter => filter.name));
   const rangePlans = {
     default: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: 4 },
-    docOrdinals: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 4 * 1024, maxOverfetchRatio: Infinity },
     docPointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     docs: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
     docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
@@ -438,9 +424,11 @@ export async function createSearch(options = {}) {
     Math.floor(Number(options.docRangeBlockPruneInitialBatchSize || DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE))
   ));
   const docRangeImpactPlannerEnabled = options.docRangeImpactPlanner !== false;
+  const runtimeTypo = normalizeMainIndexTypoOptions(options, manifest);
   const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
-    TYPO_CORRECTION_PLAN_LIMIT,
-    Math.floor(Number(options.typoCorrectionExecutionPlans || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
+    runtimeTypo.maxQueryPlans || TYPO_CORRECTION_PLAN_LIMIT,
+    runtimeTypo.maxCorrectedSearches || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT,
+    Math.floor(Number(options.typoCorrectionExecutionPlans || runtimeTypo.maxCorrectedSearches || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
   ));
 
   function rangeGroups(items, kind = "default") {
@@ -827,23 +815,6 @@ export async function createSearch(options = {}) {
     return loadCodes();
   }
 
-  async function loadTypoManifest() {
-    if (typoManifest !== null) return typoManifest;
-    if (!typoManifestPromise) {
-      if (!manifest.typo?.manifest) {
-        typoManifest = false;
-        return typoManifest;
-      }
-      typoManifestPromise = fetch(new URL(manifest.typo.manifest, baseUrl))
-        .then(response => response.ok ? response.json() : false)
-        .catch(() => false);
-    }
-    typoManifest = await typoManifestPromise;
-    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory);
-    if (typoManifest?.lexicon?.directory) typoLexiconDirectory = createDirectoryState(typoManifest.lexicon.directory);
-    return typoManifest;
-  }
-
   async function loadShards(shards) {
     const wanted = [];
     const pending = [];
@@ -927,100 +898,6 @@ export async function createSearch(options = {}) {
     const out = new Map();
     await Promise.all(wanted.map(async (shard) => {
       const data = await authorityShardCache.get(shard);
-      if (data) out.set(shard, data);
-    }));
-    return out;
-  }
-
-  async function loadTypoShards(shards) {
-    const meta = await loadTypoManifest();
-    if (!meta) return new Map();
-
-    const wanted = [];
-    const pending = [];
-    const unique = new Map();
-    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
-    for (const { shard, entry } of unique.values()) {
-      wanted.push(shard);
-      if (typoShardCache.has(shard)) continue;
-      if (!entry) continue;
-      let resolve;
-      let reject;
-      const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      promise.catch(() => {});
-      typoShardCache.set(shard, promise);
-      pending.push({ shard, entry, resolve, reject });
-    }
-
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`typo/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          const inflated = await inflateGroupItem(compressed, group.start, item, `typo shard ${item.shard}`);
-          item.resolve(traceSpanSync("typo.parse", () => parseTypoShard(inflated)));
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          typoShardCache.delete(item.shard);
-          item.reject(error);
-        }
-        throw error;
-      }
-    }));
-
-    const out = new Map();
-    await Promise.all(wanted.map(async (shard) => {
-      const data = await typoShardCache.get(shard);
-      if (data) out.set(shard, data);
-    }));
-    return out;
-  }
-
-  async function loadTypoLexiconShards(shards) {
-    const meta = await loadTypoManifest();
-    if (!meta?.lexicon) return new Map();
-
-    const wanted = [];
-    const pending = [];
-    const unique = new Map();
-    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
-    for (const { shard, entry } of unique.values()) {
-      wanted.push(shard);
-      if (typoLexiconShardCache.has(shard)) continue;
-      if (!entry) continue;
-      let resolve;
-      let reject;
-      const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      promise.catch(() => {});
-      typoLexiconShardCache.set(shard, promise);
-      pending.push({ shard, entry, resolve, reject });
-    }
-
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`typo/lexicon-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          const inflated = await inflateGroupItem(compressed, group.start, item, `typo lexicon ${item.shard}`);
-          item.resolve(traceSpanSync("typoLexicon.parse", () => parseTypoLexiconShard(inflated)));
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          typoLexiconShardCache.delete(item.shard);
-          item.reject(error);
-        }
-        throw error;
-      }
-    }));
-
-    const out = new Map();
-    await Promise.all(wanted.map(async (shard) => {
-      const data = await typoLexiconShardCache.get(shard);
       if (data) out.set(shard, data);
     }));
     return out;
@@ -1469,49 +1346,10 @@ export async function createSearch(options = {}) {
       : Math.max(RERANK_CANDIDATES, k);
   }
 
-  async function loadDocOrdinals(indexes) {
-    const ordinalMeta = docPointers?.ordinals;
-    if (!ordinalMeta?.file) throw new Error("Rangefind index is missing dense doc ordinals.");
-    const pending = [];
-    const unique = [...new Set(indexes)];
-    for (const index of unique) {
-      if (docOrdinalCache.has(index)) continue;
-      let resolveOrdinal;
-      let rejectOrdinal;
-      const promise = new Promise((resolvePromise, rejectPromise) => {
-        resolveOrdinal = resolvePromise;
-        rejectOrdinal = rejectPromise;
-      });
-      promise.catch(() => {});
-      docOrdinalCache.set(index, promise);
-      const offset = ordinalMeta.dataOffset + index * ordinalMeta.recordBytes;
-      pending.push({
-        index,
-        entry: { pack: ordinalMeta.file, offset, length: ordinalMeta.recordBytes },
-        resolve: resolveOrdinal,
-        reject: rejectOrdinal
-      });
-    }
-
-    await Promise.all(rangeGroups(pending, "docOrdinals").map(async (group) => {
-      try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
-        for (const item of group.items) {
-          item.resolve(decodeDocOrdinalRecord(buffer, item.entry.offset - group.start, ordinalMeta));
-        }
-      } catch (error) {
-        for (const item of group.items) {
-          docOrdinalCache.delete(item.index);
-          item.reject(error);
-        }
-        throw error;
-      }
-    }));
-  }
-
   async function loadDocPointers(indexes) {
-    if (!docPointers?.file || docPointers.order !== "layout") throw new Error("Rangefind index is missing layout-ordered dense doc pointers.");
-    await loadDocOrdinals(indexes);
+    if (!docPointers?.file) throw new Error("Rangefind index is missing dense doc pointers.");
+    const order = docPointers.order || "doc-id";
+    if (order !== "doc-id") throw new Error(`Unsupported Rangefind doc pointer order ${order}`);
     const pending = [];
     const unique = [...new Set(indexes)];
     for (const index of unique) {
@@ -1524,8 +1362,7 @@ export async function createSearch(options = {}) {
       });
       promise.catch(() => {});
       docPointerCache.set(index, promise);
-      const ordinal = await docOrdinalCache.get(index);
-      const offset = docPointers.dataOffset + ordinal * docPointers.recordBytes;
+      const offset = docPointers.dataOffset + index * docPointers.recordBytes;
       pending.push({
         index,
         entry: { pack: docPointers.file, offset, length: docPointers.recordBytes },
@@ -3662,8 +3499,49 @@ export async function createSearch(options = {}) {
     return rangeImpact ? Math.min(blockImpact, rangeImpact) : blockImpact;
   }
 
+  function entryRemainingBlockMax(entry) {
+    if (!entry?.remainingBlockMaxImpact) {
+      const blocks = entry?.blocks || [];
+      const impacts = new Array(blocks.length + 1).fill(0);
+      const tieDocs = new Array(blocks.length + 1).fill(Infinity);
+      for (let index = blocks.length - 1; index >= 0; index--) {
+        const block = blocks[index] || {};
+        const impact = block.maxImpact || 0;
+        const tieDoc = block.maxImpactDoc ?? Infinity;
+        const nextImpact = impacts[index + 1] || 0;
+        const nextTieDoc = tieDocs[index + 1] ?? Infinity;
+        if (impact > nextImpact) {
+          impacts[index] = impact;
+          tieDocs[index] = tieDoc;
+        } else if (impact === nextImpact && impact > 0) {
+          impacts[index] = impact;
+          tieDocs[index] = Math.min(tieDoc, nextTieDoc);
+        } else {
+          impacts[index] = nextImpact;
+          tieDocs[index] = nextTieDoc;
+        }
+      }
+      entry.remainingBlockMaxImpact = impacts;
+      entry.remainingBlockMaxTieDoc = tieDocs;
+    }
+    return {
+      impacts: entry.remainingBlockMaxImpact,
+      tieDocs: entry.remainingBlockMaxTieDoc
+    };
+  }
+
+  function remainingBlockMaxImpact(cursor) {
+    const index = Math.max(0, Math.min(cursor.blockIndex || 0, cursor.entry.blocks?.length || 0));
+    return entryRemainingBlockMax(cursor.entry).impacts[index] || 0;
+  }
+
+  function remainingBlockMaxTieDoc(cursor) {
+    const index = Math.max(0, Math.min(cursor.blockIndex || 0, cursor.entry.blocks?.length || 0));
+    return entryRemainingBlockMax(cursor.entry).tieDocs[index] ?? Infinity;
+  }
+
   function remainingImpactForCursor(cursor, block, doc = null) {
-    const blockImpact = block?.maxImpact || 0;
+    const blockImpact = remainingBlockMaxImpact(cursor) || block?.maxImpact || 0;
     if (doc == null) return blockImpact;
     const rangeImpact = docRangeMaxForDoc(cursor.entry, doc);
     return rangeImpact == null ? blockImpact : Math.min(blockImpact, rangeImpact);
@@ -3680,7 +3558,7 @@ export async function createSearch(options = {}) {
       const block = cursor.entry.blocks[cursor.blockIndex];
       if (!block) continue;
       potential += remainingImpactForCursor(cursor, block, doc);
-      tieDocLowerBound = Math.max(tieDocLowerBound, block.maxImpactDoc ?? 0);
+      tieDocLowerBound = Math.max(tieDocLowerBound, remainingBlockMaxTieDoc(cursor));
       hasRemaining = true;
       terms++;
       if (cursor.isBase) baseTerms++;
@@ -3707,7 +3585,7 @@ export async function createSearch(options = {}) {
       if (cursor.isBase) baseTerms++;
       const ranges = cursor.entry.docRanges?.ranges;
       if (!ranges?.length) {
-        fallbackPotential += block.maxImpact || 0;
+        fallbackPotential += remainingBlockMaxImpact(cursor) || block.maxImpact || 0;
         continue;
       }
       hasRangeBounds = true;
@@ -4889,211 +4767,64 @@ export async function createSearch(options = {}) {
     };
   }
 
-  async function typoCandidatesForToken(token, debug) {
-    const meta = await loadTypoManifest();
-    if (!meta) return [];
-    const minLength = Math.max(2, (meta.min_surface_length || 4) - (meta.max_edits || 2));
-    const maxLength = meta.max_surface_length || meta.max_term_length || 24;
-    if (token.length < minLength || token.length > maxLength) return [];
-    if (!/^[a-z][a-z0-9]*$/u.test(token) || /^\d+$/u.test(token)) return [];
-
-    const maxEdits = typoMaxEditsFor(token, { maxEdits: meta.max_edits || 2 });
-    const deleteEnabled = token.length <= Math.max(1, Number(meta.delete_max_surface_length || 8));
-    const deleteKeys = deleteEnabled ? [...typoDeleteKeys(token, {
-      minTermLength: meta.min_term_length || 4,
-      maxEdits: meta.max_edits || 2
-    }, maxEdits)] : [];
-
-    async function candidatesForKeys(keys) {
-      const byShard = new Map();
-      for (const key of keys) {
-        const resolved = await resolveDirectoryShard(
-          key,
-          typoDirectory,
-          meta.base_shard_depth || 2,
-          meta.max_shard_depth || meta.base_shard_depth || 3
-        );
-        if (!resolved) continue;
-        if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, keys: [] });
-        byShard.get(resolved.shard).keys.push(key);
-      }
-
-      const candidates = new Map();
-      const loaded = await loadTypoShards([...byShard.values()]);
-      for (const [shard, bucket] of byShard) {
-        debug.shards.add(shard);
-        const data = loaded.get(shard);
-        if (!data) continue;
-        for (const key of bucket.keys) {
-          for (const candidate of typoCandidatesForDeleteKey(data, key)) {
-            if (candidate.surface === token) continue;
-            const candidateKey = `${candidate.surface}\u0001${candidate.term}`;
-            const previous = candidates.get(candidateKey);
-            if (!previous || candidate.df > previous.df) candidates.set(candidateKey, candidate);
-          }
-        }
-      }
-      return candidates;
+  async function typoCandidatesForToken(item, debug) {
+    const raw = String(item.raw || "");
+    const token = String(item.term || raw);
+    const scoringToken = isTypoCorrectionToken(raw) ? raw : token;
+    if (!isTypoCorrectionToken(scoringToken) || !isTypoCorrectionToken(token)) return [];
+    const maxEdits = typoMaxEditsFor(scoringToken, runtimeTypo);
+    const probeValues = mainIndexTypoProbeValues(raw, token, {
+      ...runtimeTypo,
+      maxShardLookups: Math.max(runtimeTypo.maxShardLookups * 2, 24)
+    });
+    const byShard = new Map();
+    for (const probe of probeValues) {
+      const resolved = await resolveDirectoryShard(
+        probe,
+        termDirectory,
+        manifest.stats?.base_shard_depth || 3,
+        manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
+      );
+      if (!resolved || byShard.has(resolved.shard)) continue;
+      if (!debug.shards.has(resolved.shard) && debug.shards.size + byShard.size >= runtimeTypo.maxShardLookups) break;
+      byShard.set(resolved.shard, resolved);
     }
 
-    function verifiedCandidates(candidates) {
-      const verified = [];
-      for (const candidate of candidates.values()) {
-        const distance = boundedDamerauLevenshtein(token, candidate.surface, maxEdits);
-        if (distance <= 0 || distance > maxEdits) continue;
-        verified.push({
-          ...candidate,
-          distance,
-          score: typoCandidateScore(token, candidate.surface, candidate.df, distance)
-        });
-      }
-      return verified;
-    }
-
-    function mergeVerified(left, right) {
-      const merged = new Map();
-      for (const candidate of [...left, ...right]) {
-        const key = `${candidate.surface}\u0001${candidate.term}`;
-        const previous = merged.get(key);
-        if (!previous || candidate.score > previous.score || (candidate.score === previous.score && candidate.df > previous.df)) {
-          merged.set(key, candidate);
-        }
-      }
-      return [...merged.values()];
-    }
-
-    function lexiconLowerBound(entries, value) {
-      let low = 0;
-      let high = entries.length;
-      while (low < high) {
-        const mid = Math.floor((low + high) / 2);
-        if (entries[mid].surface.localeCompare(value) < 0) low = mid + 1;
-        else high = mid;
-      }
-      return low;
-    }
-
-    function lexiconTrie(data) {
-      if (data.trie) return data.trie;
-      const root = { children: new Map(), entries: [] };
-      for (const entry of data.entries || []) {
-        let node = root;
-        for (const char of entry.surface) {
-          let child = node.children.get(char);
-          if (!child) {
-            child = { children: new Map(), entries: [] };
-            node.children.set(char, child);
-          }
-          node = child;
-        }
-        node.entries.push(entry);
-      }
-      data.trie = root;
-      return root;
-    }
-
-    function levenshteinAutomatonLexiconCandidates(data) {
-      const root = lexiconTrie(data);
-      const chars = [...token];
-      const initial = Array.from({ length: chars.length + 1 }, (_, index) => index);
-      const out = [];
-      let visited = 0;
-      const visit = (node, char, previousRow) => {
-        const current = [previousRow[0] + 1];
-        let rowMin = current[0];
-        for (let column = 1; column <= chars.length; column++) {
-          const insertCost = current[column - 1] + 1;
-          const deleteCost = previousRow[column] + 1;
-          const replaceCost = previousRow[column - 1] + (chars[column - 1] === char ? 0 : 1);
-          const value = Math.min(insertCost, deleteCost, replaceCost);
-          current[column] = value;
-          rowMin = Math.min(rowMin, value);
-        }
-        if (node.entries.length && current[chars.length] <= maxEdits) {
-          for (const entry of node.entries) {
-            visited++;
-            if (entry.surface === token || Math.abs(entry.surface.length - token.length) > maxEdits) continue;
-            const distance = boundedDamerauLevenshtein(token, entry.surface, maxEdits);
-            if (distance <= 0 || distance > maxEdits) continue;
-            out.push({
-              ...entry,
-              distance,
-              score: typoCandidateScore(token, entry.surface, entry.df, distance)
-            });
-          }
-        }
-        if (rowMin > maxEdits) return;
-        for (const [nextChar, child] of node.children) visit(child, nextChar, current);
-      };
-      for (const [char, child] of root.children) visit(child, char, initial);
-      return {
-        candidates: out
-          .sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term))
-          .slice(0, 64),
-        visited
-      };
-    }
-
-    async function verifiedLexiconCandidates() {
-      if (!meta.lexicon || !typoLexiconDirectory) return [];
-      if (token.length < (meta.lexicon.min_surface_length || meta.min_surface_length || 4)) return [];
-      const depth = meta.lexicon.shard_depth || 2;
-      const resolved = await resolveDirectoryShard(token, typoLexiconDirectory, depth, depth);
-      if (!resolved) return [];
-      const loaded = await loadTypoLexiconShards([{ shard: resolved.shard, entry: resolved.entry }]);
-      debug.lexiconShards.add(resolved.shard);
+    const loaded = await loadShards([...byShard.values()]);
+    const candidates = new Map();
+    for (const [shard, resolved] of byShard) {
+      debug.shards.add(shard);
       const data = loaded.get(resolved.shard);
-      const entries = data?.entries || [];
-      if (data) {
-        const automaton = levenshteinAutomatonLexiconCandidates(data);
-        debug.lexiconScanned += automaton.visited;
-        if (automaton.candidates.some(candidate => candidate.score >= 0.5)) return automaton.candidates;
-      }
-      const maxScan = Math.max(1, Number(meta.lexicon.max_scan_candidates || 2048));
-      const minScan = Math.min(maxScan, TYPO_LEXICON_MIN_SCAN_CANDIDATES);
-      const out = [];
-      let scanned = 0;
-      let left = lexiconLowerBound(entries, token) - 1;
-      let right = left + 1;
-      let scanRight = true;
-      while (scanned < maxScan && (left >= 0 || right < entries.length)) {
-        const entry = (scanRight && right < entries.length) || left < 0 ? entries[right++] : entries[left--];
-        scanRight = !scanRight;
-        scanned++;
-        if (!entry || entry.surface === token || Math.abs(entry.surface.length - token.length) > maxEdits) continue;
-        const distance = boundedDamerauLevenshtein(token, entry.surface, maxEdits);
+      if (!data) continue;
+      for (const [candidateTerm, entry] of data.terms) {
+        debug.scanned++;
+        if (candidateTerm === token || !isTypoCorrectionToken(candidateTerm)) continue;
+        if (Math.abs(candidateTerm.length - token.length) > maxEdits + 4) continue;
+        const overlap = Math.max(ngramOverlap(scoringToken, candidateTerm), ngramOverlap(token, candidateTerm));
+        if (overlap < (scoringToken.length <= 5 ? 0.2 : 0.25) && scoringToken[0] !== candidateTerm[0]) continue;
+        const bestDistance = bestMainIndexTypoDistance(scoringToken, candidateTerm, maxEdits);
+        let distance = bestDistance.distance;
+        let surface = bestDistance.surface;
+        if (distance > maxEdits && token !== scoringToken) {
+          const termDistance = bestMainIndexTypoDistance(token, candidateTerm, maxEdits);
+          distance = termDistance.distance;
+          surface = termDistance.surface;
+        }
         if (distance <= 0 || distance > maxEdits) continue;
-        out.push({
-          ...entry,
-          distance,
-          score: typoCandidateScore(token, entry.surface, entry.df, distance)
-        });
-        if (scanned >= minScan && out.some(candidate => candidate.score >= 0.5)) break;
+        const df = entry.df || 0;
+        const score = mainIndexTypoCandidateScore(scoringToken, surface, df, distance);
+        const candidate = { surface, term: candidateTerm, df, distance, score };
+        const previous = candidates.get(candidate.term);
+        if (!previous || candidate.score > previous.score || (candidate.score === previous.score && candidate.df > previous.df)) {
+          candidates.set(candidate.term, candidate);
+        }
       }
-      debug.lexiconScanned += scanned;
-      return out
-        .sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term))
-        .slice(0, 64);
     }
-
-    const candidates = deleteEnabled ? await candidatesForKeys([token]) : new Map();
-    let verified = verifiedCandidates(candidates);
-    if (deleteEnabled && !verified.some(candidate => candidate.score >= 0.5)) {
-      const remainingKeys = deleteKeys.filter(key => key !== token);
-      const fallback = await candidatesForKeys(remainingKeys);
-      for (const [key, candidate] of fallback) {
-        const previous = candidates.get(key);
-        if (!previous || candidate.df > previous.df) candidates.set(key, candidate);
-      }
-      verified = verifiedCandidates(candidates);
-    }
-    if (!verified.some(candidate => candidate.score >= 0.5)) {
-      verified = mergeVerified(verified, await verifiedLexiconCandidates());
-    }
-    debug.candidates += verified.length;
-    return verified
+    const verified = [...candidates.values()]
       .sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term))
-      .slice(0, 64);
+      .slice(0, runtimeTypo.maxTokenCandidates);
+    debug.candidates += verified.length;
+    return verified;
   }
 
   async function correctedTypoQuery(baseTerms, analyzedTerms) {
@@ -5105,16 +4836,17 @@ export async function createSearch(options = {}) {
     const presentTerms = new Map((await termEntries(baseTerms)).map(item => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some(term => !presentTerms.has(term));
     const plans = new Map();
-    const debug = { shards: new Set(), lexiconShards: new Set(), candidates: 0, lexiconScanned: 0 };
+    const debug = { shards: new Set(), candidates: 0, scanned: 0 };
 
     for (let index = 0; index < analyzedTerms.length; index++) {
       const item = analyzedTerms[index];
       if (presentTerms.has(item.term) && hasMissingTerms) continue;
-      const candidates = await typoCandidatesForToken(item.raw, debug);
+      const candidates = await typoCandidatesForToken(item, debug);
       const strongCandidates = candidates.filter(item => item.score >= 0.5);
       const bestScore = strongCandidates[0]?.score || 0;
       const minScore = bestScore >= 1 ? bestScore * TYPO_CORRECTION_RELATIVE_SCORE : 0.5;
-      for (const candidate of strongCandidates.filter(item => item.score >= minScore).slice(0, TYPO_CORRECTION_CANDIDATES_PER_TOKEN)) {
+      const perTokenLimit = runtimeTypo.maxTokenCandidates || TYPO_CORRECTION_CANDIDATES_PER_TOKEN;
+      for (const candidate of strongCandidates.filter(item => item.score >= minScore).slice(0, perTokenLimit)) {
         const corrected = baseTerms.slice();
         corrected[index] = candidate.term;
         if (corrected[index] === item.term) continue;
@@ -5138,7 +4870,7 @@ export async function createSearch(options = {}) {
 
     const sortedPlans = [...plans.values()].sort((a, b) => b.score - a.score || a.q.localeCompare(b.q));
     if (!sortedPlans.length) return null;
-    const selectedPlans = await rankTypoCorrectionPlans(sortedPlans.slice(0, TYPO_CORRECTION_PLAN_LIMIT));
+    const selectedPlans = await rankTypoCorrectionPlans(sortedPlans.slice(0, runtimeTypo.maxQueryPlans || TYPO_CORRECTION_PLAN_LIMIT));
     return {
       plans: selectedPlans,
       stats: {
@@ -5147,8 +4879,8 @@ export async function createSearch(options = {}) {
         typoCorrectionPlansEstimated: selectedPlans.filter(plan => Number.isFinite(plan.estimatedUpperBound)).length,
         typoCorrectionBestUpperBound: selectedPlans[0]?.estimatedUpperBound || 0,
         typoShardLookups: debug.shards.size,
-        typoLexiconShardLookups: debug.lexiconShards.size,
-        typoLexiconCandidatesScanned: debug.lexiconScanned
+        typoCandidateShardLookups: debug.shards.size,
+        typoCandidateTermsScanned: debug.scanned
       }
     };
   }
@@ -5228,8 +4960,21 @@ export async function createSearch(options = {}) {
     return traceSpan("typo.fallback", () => maybeTypoFallbackInner(params, response, baseTerms, analyzedTerms));
   }
 
+  function shouldAttemptTypoFallback(params, response) {
+    if (runtimeTypo.mode === "off") return false;
+    if (params.page !== 1 || params.sort) return false;
+    if (response.total === 0) return true;
+    if (runtimeTypo.trigger !== "zero-or-weak") return false;
+    return response.total <= (runtimeTypo.weakResultTotal || 0);
+  }
+
+  function typoCorrectionShouldReplace(original, corrected) {
+    if ((original.total || 0) <= 0) return (corrected.total || 0) > 0;
+    return (corrected.total || 0) >= Math.max((original.total || 0) + 2, (original.total || 0) * 1.5);
+  }
+
   async function maybeTypoFallbackInner(params, response, baseTerms, analyzedTerms) {
-    if (params.page !== 1 || response.total > 0) return response;
+    if (!shouldAttemptTypoFallback(params, response)) return response;
     const surfaceFallback = await maybeSurfaceExactFallback(params, response, baseTerms, analyzedTerms);
     if (surfaceFallback) return surfaceFallback;
     const correction = await correctedTypoQuery(baseTerms, analyzedTerms);
@@ -5253,6 +4998,24 @@ export async function createSearch(options = {}) {
 
     if (!best) {
       return { ...response, stats: { ...(response.stats || {}), typoAttempted: true, typoApplied: false, ...correction.stats, typoCorrectionPlansExecuted: executionPlans.length } };
+    }
+    if (!typoCorrectionShouldReplace(response, best.response)) {
+      return {
+        ...response,
+        suggestedQuery: best.plan.q,
+        suggestions: [{ q: best.plan.q, corrections: best.plan.corrections }],
+        stats: {
+          ...(response.stats || {}),
+          typoAttempted: true,
+          typoApplied: false,
+          typoSuggested: true,
+          typoOriginalTotal: response.total,
+          typoSuggestedQuery: best.plan.q,
+          typoCorrectionPlansExecuted: executionPlans.length,
+          typoCorrectedUpperBound: best.plan.estimatedUpperBound || 0,
+          ...correction.stats
+        }
+      };
     }
     return {
       ...best.response,

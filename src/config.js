@@ -66,7 +66,13 @@ export const DEFAULTS = {
   alwaysIndexFields: ["title", "categories"],
   resumeBuild: true,
   resumeDir: "_build/resume",
-  typo: false,
+  typoMode: "main-index",
+  typoTrigger: "zero-or-weak",
+  typoMaxEdits: 2,
+  typoMaxTokenCandidates: 8,
+  typoMaxQueryPlans: 5,
+  typoMaxCorrectedSearches: 3,
+  typoMaxShardLookups: 12,
   segmentFlushDocs: 0,
   segmentFlushBytes: 0,
   segmentMaxDocs: 0,
@@ -117,7 +123,22 @@ function applyIndexProfile(config, raw) {
     : DEFAULTS.alwaysIndexFields.slice();
   if (raw.resumeBuild == null) config.resumeBuild = config.indexProfile === "static-large";
   config.resumeDir = String(config.resumeDir || DEFAULTS.resumeDir);
+  config.typoMode = String(config.typoMode || DEFAULTS.typoMode).toLowerCase();
+  if (!["main-index", "off"].includes(config.typoMode)) config.typoMode = DEFAULTS.typoMode;
+  config.typoTrigger = String(config.typoTrigger || DEFAULTS.typoTrigger).toLowerCase();
+  if (!["zero", "zero-or-weak"].includes(config.typoTrigger)) config.typoTrigger = DEFAULTS.typoTrigger;
+  config.typoMaxEdits = clampInt(config.typoMaxEdits, DEFAULTS.typoMaxEdits, 1, 3);
+  config.typoMaxTokenCandidates = clampInt(config.typoMaxTokenCandidates, DEFAULTS.typoMaxTokenCandidates, 1, 32);
+  config.typoMaxQueryPlans = clampInt(config.typoMaxQueryPlans, DEFAULTS.typoMaxQueryPlans, 1, 32);
+  config.typoMaxCorrectedSearches = clampInt(config.typoMaxCorrectedSearches, DEFAULTS.typoMaxCorrectedSearches, 1, 8);
+  config.typoMaxShardLookups = clampInt(config.typoMaxShardLookups, DEFAULTS.typoMaxShardLookups, 1, 64);
   return config;
+}
+
+function clampInt(value, fallback, min, max) {
+  const parsed = Math.floor(Number(value ?? fallback));
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
 }
 
 export async function readConfig(configPath) {
@@ -131,7 +152,8 @@ export async function readConfig(configPath) {
     "reduceSortChunkBytes",
     "reduceLargeRunBytes",
     "reduceWorkerHeapMb",
-    "postingFlushLines"
+    "postingFlushLines",
+    "typo"
   ]) {
     delete activeRaw[key];
   }

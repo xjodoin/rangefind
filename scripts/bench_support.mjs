@@ -132,15 +132,17 @@ export function kb(bytes) {
   return bytes / 1024;
 }
 
-export function dirStats(path) {
+export function dirStats(path, options = {}) {
   if (!existsSync(path)) return { files: 0, bytes: 0 };
   const s = statSync(path);
   if (s.isFile()) return { files: 1, bytes: s.size };
   if (!s.isDirectory()) return { files: 0, bytes: 0 };
+  const skipNames = new Set(options.skipNames || []);
   let files = 0;
   let bytes = 0;
   for (const entry of readdirSync(path, { withFileTypes: true })) {
-    const child = dirStats(resolve(path, entry.name));
+    if (skipNames.has(entry.name)) continue;
+    const child = dirStats(resolve(path, entry.name), options);
     files += child.files;
     bytes += child.bytes;
   }

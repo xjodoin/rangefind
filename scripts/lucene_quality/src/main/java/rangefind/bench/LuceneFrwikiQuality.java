@@ -111,7 +111,7 @@ public final class LuceneFrwikiQuality {
     boosts.put("body", 1.0f);
     MultiFieldQueryParser parser = new MultiFieldQueryParser(new String[] { "title", "categories", "body" }, analyzer, boosts);
     parser.setDefaultOperator(profile.andOperator ? QueryParser.Operator.AND : QueryParser.Operator.OR);
-    Query parsed = parser.parse(QueryParser.escape(spec.q));
+    Query parsed = parser.parse(QueryParser.escape(spec.q.toLowerCase(Locale.ROOT)));
     if (!profile.exactTitleBoost) return parsed;
     BooleanQuery.Builder builder = new BooleanQuery.Builder();
     builder.add(parsed, BooleanClause.Occur.SHOULD);

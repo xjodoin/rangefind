@@ -1,16 +1,12 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { queryTerms } from "../src/analyzer.js";
 import { pushVarint } from "../src/binary.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "../src/directory.js";
 import { shardKey } from "../src/shards.js";
-import {
-  typoDeleteKeys,
-  typoMaxEditsFor
-} from "../src/typo_runtime.js";
 
 const DEFAULT_QUERIES = [
   "sante",
@@ -22,23 +18,12 @@ const DEFAULT_QUERIES = [
   "sante publique"
 ];
 
-const DEFAULT_TYPOS = [
-  "elecrtified",
-  "toitpotent",
-  "evotutif",
-  "vectrs",
-  "electrophysionogical",
-  "taipi",
-  "moderatprs"
-];
-
 const encoder = new TextEncoder();
 
 function parseArgs(argv) {
   const args = {
     index: "examples/basic/public/rangefind",
     queries: DEFAULT_QUERIES,
-    typoTokens: DEFAULT_TYPOS,
     pageBytes: [32 * 1024, 64 * 1024, 128 * 1024],
     prefixLength: 3,
     scales: [1, 10, 100],
@@ -48,7 +33,6 @@ function parseArgs(argv) {
     if (arg === "--json") args.json = true;
     else if (arg.startsWith("--index=")) args.index = arg.slice("--index=".length);
     else if (arg.startsWith("--queries=")) args.queries = arg.slice("--queries=".length).split("|").filter(Boolean);
-    else if (arg.startsWith("--typos=")) args.typoTokens = arg.slice("--typos=".length).split("|").filter(Boolean);
     else if (arg.startsWith("--page-bytes=")) args.pageBytes = arg.slice("--page-bytes=".length).split(",").map(Number).filter(Boolean);
     else if (arg.startsWith("--prefix-length=")) args.prefixLength = Number(arg.slice("--prefix-length=".length)) || args.prefixLength;
     else if (arg.startsWith("--scales=")) args.scales = arg.slice("--scales=".length).split(",").map(Number).filter(Boolean);
@@ -148,14 +132,6 @@ function currentPagedDirectory(loaded) {
       };
     }
   };
-}
-
-function loadTypoEntries(indexRoot, rootManifest) {
-  if (!rootManifest.typo?.manifest) return null;
-  const manifestPath = resolve(indexRoot, rootManifest.typo.manifest);
-  if (!existsSync(manifestPath)) return null;
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  return { manifest, manifestBytes: statSync(manifestPath).size, ...loadDirectoryEntries(indexRoot, manifest.directory) };
 }
 
 function scaledEntries(entries, scale) {
@@ -332,22 +308,6 @@ function termShardSets(queries, manifest, entries) {
   return queries.map(q => new Set(queryTerms(q).map(term => resolvedShard(term, depths, available)).filter(Boolean)));
 }
 
-function typoShardSets(tokens, manifest, entries) {
-  const available = new Set(entries.map(entry => entry.shard));
-  const depths = {
-    base: manifest.base_shard_depth || 2,
-    max: manifest.max_shard_depth || manifest.base_shard_depth || 3
-  };
-  return tokens.map((token) => {
-    const maxEdits = typoMaxEditsFor(token, { maxEdits: manifest.max_edits || 2 });
-    const keys = typoDeleteKeys(token, {
-      minTermLength: manifest.min_term_length || 5,
-      maxEdits: manifest.max_edits || 2
-    }, maxEdits);
-    return new Set([...keys].map(key => resolvedShard(key, depths, available)).filter(Boolean));
-  });
-}
-
 function printTable(title, rows) {
   console.log(`\n## ${title}\n`);
   console.log("| Layout | Files | Root KB | Total KB | Small files | P50 page KB | Cold req | Cold KB | Sequence req | Sequence KB |");
@@ -377,17 +337,12 @@ const indexRoot = resolve(args.index);
 const manifest = JSON.parse(readFileSync(resolve(indexRoot, "manifest.json"), "utf8"));
 const terms = loadTermEntries(indexRoot, manifest);
 const termSets = termShardSets(args.queries, manifest, terms.entries);
-const typo = loadTypoEntries(indexRoot, manifest);
-const typoSets = typo ? typoShardSets(args.typoTokens, typo.manifest, typo.entries) : [];
 
 const report = {
   index: indexRoot,
   termShards: terms.entries.length,
-  typoShards: typo?.entries.length || 0,
   queries: args.queries,
-  typoTokens: args.typoTokens,
-  terms: benchmark(terms.entries, termSets, args, { layout: currentPagedDirectory(terms) }),
-  typo: typo ? benchmark(typo.entries, typoSets, args, { layout: currentPagedDirectory(typo) }) : null
+  terms: benchmark(terms.entries, termSets, args, { layout: currentPagedDirectory(terms) })
 };
 
 if (args.json) {
@@ -395,8 +350,6 @@ if (args.json) {
 } else {
   console.log(`# Directory layout benchmark\n\nIndex: ${indexRoot}`);
   console.log(`Term shards: ${terms.entries.length.toLocaleString("en-US")}`);
-  if (typo) console.log(`Typo shards: ${typo.entries.length.toLocaleString("en-US")}`);
   for (const [scale, rows] of Object.entries(report.terms)) printTable(`Term directory, ${scale}x shards`, rows);
-  if (report.typo) for (const [scale, rows] of Object.entries(report.typo)) printTable(`Typo directory, ${scale}x shards`, rows);
   console.log("\nInterpretation: `global-named` is a fair global-directory replacement once shard names leave manifest.json. `prefix-N` is the naive many-small-files design. `paged-*` keeps file count bounded by target page size while only loading root plus touched pages.");
 }

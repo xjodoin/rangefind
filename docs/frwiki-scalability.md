@@ -4,8 +4,8 @@ Rangefind includes a reproducible scalability fixture for French Wikipedia.
 The fixture streams the official Wikimedia article dump, converts pages to
 JSONL, builds a static Rangefind index, writes a small browser search site, and
 records a local request/transfer benchmark with cold-transfer breakdowns for
-directory, term, posting-block, typo, doc-value, sorted doc-value, packed
-document payload, and doc-page payload fetches.
+directory, term, posting-block, main-index typo correction, doc-value, sorted
+doc-value, packed document payload, and doc-page payload fetches.
 The generated schema includes multi-value article tags, typed numeric fields,
 revision dates, and booleans so the scalability run also validates the typed
 filter/sort code paths.
@@ -154,25 +154,28 @@ The report is written to `frwiki-lucene-quality.json` in the fixture root. It
 contains Rangefind, Lucene OR, Lucene AND, and Lucene exact-title-boosted rows
 with Hit@1/Hit@3/Hit@10/MRR@10 metrics.
 
-Latest 500k quality run with the authority sidecar:
+Latest 500k quality run with main-index typo correction:
 
 ```text
-Rangefind known titles:       Hit@1 7/7, Hit@10 7/7, MRR@10 1.000
-Lucene title-boost known:     Hit@1 7/7, Hit@10 7/7, MRR@10 1.000
-Lucene BM25 OR/AND known:     Hit@1 6/7, Hit@10 7/7, MRR@10 0.893
-
-Rangefind typo judgments:     Hit@1 2/4, Hit@10 3/4, MRR@10 0.550
-Lucene title-boost typo:      Hit@1 1/4, Hit@10 1/4, MRR@10 0.250
+Rangefind known titles:       Hit@10 200/200, MRR@10 0.994
+Rangefind typo judgments:     Hit@10 135/200, MRR@10 0.640
+Removed sidecar baseline:     Hit@10 133/200, MRR@10 0.618
+Lucene title-boost typo:      Hit@10 114/200, MRR@10 0.451
+Guard false corrections:      0/50
+Typo runtime caps observed:   max 3 corrected searches, max 12 shard lookups
 ```
 
-The known-title improvement comes from a generic authority sidecar over
-configured label fields, not from Wikipedia-specific rules. On the 500k fixture
-it indexes the `title` field into 1.49M authority rows, split into 7,018
-point-read shards with a 4,096-row target, 15.0 MB of authority packs, and a
-359 KB paged directory. The runtime probes a diacritic-preserving surface key
-first, so `Paris`, `Médecine`, `Victor Hugo`, and `Québec` rank above
-homonymy/partial-title pages. Query bundles still short-circuit exact phrase
-queries such as `changement climatique` without touching authority.
+Typo correction now derives candidates from the main term directory and validates
+corrected plans through normal postings. The quality harness keeps the removed
+delete-key sidecar baseline as a recorded artifact only, so Hit@10/MRR parity is
+visible without shipping `typo/` packs in the final index.
+
+The known-title improvement still comes from a generic authority sidecar over
+configured label fields, not from Wikipedia-specific rules. The runtime probes a
+diacritic-preserving surface key first, so `Paris`, `Médecine`, `Victor Hugo`,
+and `Québec` rank above homonymy/partial-title pages. Query bundles still
+short-circuit exact phrase queries such as `changement climatique` without
+touching authority.
 
 Latest 500k cold-query rows after authority sharding:
 
@@ -186,29 +189,29 @@ fromage:                unchanged,    19 requests, 239.5 KB, authority miss 9.6 
 ```
 
 An older full 500k build took 3,642 seconds wall time with the removed
-base-shard worker reducer and peaked at about 2.39 GB RSS. The main remaining
-build bottleneck was the
-pre-existing typo-sidecar merge/reduction path; rebuilding only the authority
-sidecar from the same 500k JSONL took about 14 seconds.
+base-shard worker reducer and peaked at about 2.39 GB RSS. The old delete-key
+typo-sidecar merge/reduction path has since been removed; typo correction is now
+bounded at query time by main term-shard probes and corrected search plans.
 
 Newer indexes include `manifest.build` (`rfbuildtelemetry-v1`) with phase
 timings, peak RSS, selected-term spool bytes, raw document spool bytes, and
 compressed document spool bytes. Use those manifest counters alongside
 `/usr/bin/time` when comparing builder changes, because they identify whether a
 run moved time between ingestion, posting reduction, query bundles, typo
-reduction, document packs, and doc pages.
+candidate planning, document packs, and doc pages.
 
-Latest 50k builder-only worker-reducer sanity run, reusing the cached JSONL:
-89.1 seconds total build time, 22.1 seconds in `reduce-postings`, 180 output
-files, 188.2 MB index bytes, and 1.91 GB peak RSS. Reducer workers kept
-external posting blocks enabled and emitted 11 term packs plus 4 block packs.
-The run used bounded reducer worker code-store caches; the next validation
-point is the same path at 100k and 500k.
+Latest recorded scale run with main-index typo correction and doc-id document
+pointers:
 
-Latest 100k builder-only validation on the same path: 190.9 seconds total build
-time, 60.9 seconds in `reduce-postings`, 278 output files, 351.2 MB index
-bytes, and 2.17 GB peak RSS. The remaining build-memory target is reducer
-completion/worker aggregation before the next 500k run.
+```text
+100k: build 78.9s, 297.1 MiB published index, 0/25 invalid runtime rows
+500k: build 368.5s, 1385.4 MiB published index, 0/25 invalid runtime rows
+```
+
+The 500k non-typo cold runtime average was 26.7 requests and 300.5 KB, inside
+the +10% request/byte gate against the previous 25.5 request / 301.3 KB
+sidecar baseline. The two typo runtime rows stayed at max 3 corrected searches
+and max 12 main-term shard lookups.
 
 ## Local 50k Run
 
@@ -291,26 +294,25 @@ and pack strategy as terms and documents. The 50k manifest is 104.7 KB; the
 large category dictionary lives in `facets/packs/*.bin` and is fetched only when
 that facet is selected or a UI asks for its values.
 
-The current index uses `rfdir-v2` directory pages, a dense `rfdocord-v1`
-document ordinal table, a layout-ordered `rfdocptr-v1` document pointer table,
-and ZFS-inspired block pointers for every compressed object. Each pointer records
-physical length, logical length, codec/kind metadata, and a SHA-256 checksum that
-the browser runtime verifies before decompression. That adds directory/manifest
-bytes versus an unchecked format, but it makes range-fetched objects
-self-verifying and catches stale or corrupt CDN/object-store responses before
+The current index uses `rfdir-v2` directory pages, a dense doc-id-keyed
+`rfdocptr-v1` document pointer table, and ZFS-inspired block pointers for every
+compressed object. Each pointer records physical length, logical length,
+codec/kind metadata, and a SHA-256 checksum that the browser runtime verifies
+before decompression. That adds directory/manifest bytes versus an unchecked
+format, but it makes range-fetched objects self-verifying and catches stale or
+corrupt CDN/object-store responses before
 decoding.
 
 Dense doc pointers replace the previous document directory for text results.
-The ordinal table is keyed by original numeric document id and maps to a
-retrieval-local pointer ordinal. Document payloads and pointer records are
-written in the same locality order, derived from each document's strongest base
-term and impact score. Dense doc pages add a second result-payload lane for
-browse/filter/sort rows: the builder writes compressed binary column pages of 32
-display payloads in original document-id order, and the runtime uses that lane
-only when the requested result ids are dense enough to keep overfetch bounded.
-The measured rows show that this keeps dense browse payload requests low without
-hurting the text top-k lane, while sparse text results continue to use
-retrieval-local packed docs.
+The pointer table is keyed directly by original numeric document id, while
+document payload packs are still written in locality order derived from each
+document's strongest base term and impact score. Dense doc pages add a second
+result-payload lane for browse/filter/sort rows: the builder writes compressed
+binary column pages of 32 display payloads in original document-id order, and
+the runtime uses that lane only when the requested result ids are dense enough
+to keep overfetch bounded. The measured rows show that this keeps dense browse
+payload requests low without adding an ordinal lookup lane to text top-k rows,
+while sparse text results continue to use retrieval-local packed docs.
 
 ## Scale Run
 
@@ -348,10 +350,10 @@ sorted top-k grows from 18.8 KB to 24.6 KB when the corpus doubles, and dense
 unsorted range browse stays at 3 requests / 11.6 KB because it stops after one
 matching doc-value chunk and one doc page.
 
-Pack files, directory pages, directory roots, and the typo sidecar manifest are
-content-addressed with 24-hex-character SHA-256 name suffixes. The 50k run
-reported 114,972 exact compressed objects and no duplicate compressed objects to
-deduplicate, which is expected for real article/search shards. The dedup table
-remains useful for synthetic or repeated payloads, but the important CDN win here
-is that every heavy object can be served as immutable; only the main manifest
-needs revalidation.
+Pack files, directory pages, and directory roots are content-addressed with
+24-hex-character SHA-256 name suffixes. The 50k run reported 114,972 exact
+compressed objects and no duplicate compressed objects to deduplicate, which is
+expected for real article/search shards. The dedup table remains useful for
+synthetic or repeated payloads, but the important CDN win here is that every
+heavy object can be served as immutable; only the main manifest needs
+revalidation.

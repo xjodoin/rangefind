@@ -337,9 +337,14 @@ function writeConfig(args, docsPath) {
     targetPostingsPerDoc: 12,
     bodyIndexChars: 6000,
     alwaysIndexFields: ["title", "categories"],
-    maxExpansionTermsPerDoc: 0,
     queryBundles: false,
-    typo: false,
+    typoMode: "main-index",
+    typoTrigger: "zero-or-weak",
+    typoMaxEdits: 2,
+    typoMaxTokenCandidates: 8,
+    typoMaxQueryPlans: 5,
+    typoMaxCorrectedSearches: 3,
+    typoMaxShardLookups: 12,
     targetShardPostings: 45000,
     buildTelemetryPath: "wiki-search-build-telemetry.json",
     buildProgressLogMs: args.buildProgressLogMs,
@@ -349,7 +354,7 @@ function writeConfig(args, docsPath) {
     fields: [
       { name: "title", path: "title", weight: 6.0, b: 0.25, phrase: true, phraseWeight: 10, proximity: true, proximityWeight: 3, proximityWindow: 5 },
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
-      { name: "body", path: "body", weight: 1.0, b: 0.75, typo: false }
+      { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
     authority: [
       { name: "title", path: "title", weight: 1000000, exactWeight: 1000000, tokenWeight: 800000 }

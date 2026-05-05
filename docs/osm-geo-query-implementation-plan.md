@@ -47,7 +47,8 @@ Compatibility rules:
 
 - A config with no `geo` and no `sharding` keeps the current Rangefind output
   shape: root `manifest.json`, term directories, doc packs, doc-values, facets,
-  authority, typo sidecars, and query bundles as they work today.
+  authority, main-index typo correction metadata, and query bundles as they work
+  today.
 - Non-geo unsharded builds do not emit `manifest.shards`, `shard-packs/`,
   `global/`, or `geo/` files.
 - Non-geo sharded builds may emit `manifest.shards`, `shard-packs/`, and
@@ -60,7 +61,7 @@ Compatibility rules:
     unsupported-feature error.
   - If `manifest.shards` is present, use the deployment-shard planner before
     opening shard-local manifests.
-- The word "shard" already appears in the current text/authority/typo term
+- The word "shard" already appears in the current text/authority term
   directories. Geo planning should use names like `deploymentShard`,
   `geoShard`, or `shardDirectory` internally so the new planet-scale shard layer
   is not confused with existing term shards.
@@ -512,8 +513,6 @@ rangefind/
         packs/
           0000.<hash>.bin
       docs/
-        ordinals/
-          0000.<hash>.bin
         pointers/
           0000.<hash>.bin
         pages/

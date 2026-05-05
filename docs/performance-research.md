@@ -27,7 +27,7 @@ anchors for the next performance work:
   https://arxiv.org/abs/2504.17045
 - Schulz and Mihov, "Fast String Correction with Levenshtein Automata", plus
   Daciuk et al.'s minimal acyclic finite-state automata work: typo correction
-  should enumerate plausible lexicon paths before running corrected searches.
+  should enumerate plausible vocabulary paths before running corrected searches.
 - Column-store zone maps and PageIndex-style min/max metadata: page-level
   summaries let range predicates skip whole compression units before fetching
   column payload bytes. Rangefind applies the same idea to browser doc-values
@@ -65,10 +65,11 @@ generic for future doc-id-local layouts without regressing the present high-df
 path.
 
 Typo fallback now follows the same "estimate before execute" rule. The runtime
-builds a lazy trie over loaded lexicon shards, traverses it with a bounded
-Levenshtein dynamic-programming row, ranks correction plans by available
-term/range/block impact metadata, and executes the best correction plan by
-default instead of retrying several full searches.
+uses analyzer-normalized query tokens to probe bounded main term shards, filters
+the loaded vocabulary by length and n-gram overlap, verifies candidates with a
+bounded Damerau-Levenshtein pass, ranks correction plans by document frequency
+and posting upper-bound evidence, and executes only the strongest correction
+plans through the normal search path.
 
 The metadata browse path now uses the same pruning principle. Sorted numeric,
 date, and boolean fields get `rfdocvaluesortdir-v1` directories plus

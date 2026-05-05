@@ -186,13 +186,11 @@ var DIRECTORY_PAGE_MAGIC = [82, 70, 68, 80];
 var CODE_MAGIC = [82, 70, 67, 66];
 var DOC_VALUE_MAGIC = [82, 70, 86, 66];
 var FACET_DICT_MAGIC = [82, 70, 70, 68];
-var TYPO_SHARD_MAGIC = [82, 70, 84, 66];
 var DOC_PAGE_PAYLOAD_MAGIC = [82, 70, 80, 67];
 var DOC_VALUE_SORT_DIRECTORY_MAGIC = [82, 70, 68, 84];
 var DOC_VALUE_SORT_PAGE_MAGIC = [82, 70, 68, 86];
 var QUERY_BUNDLE_MAGIC = [82, 70, 81, 66];
 var AUTHORITY_SHARD_MAGIC = [82, 70, 65, 85];
-var TYPO_LEXICON_MAGIC = [82, 70, 84, 76];
 function readVarint(bytes, state) {
   let value = 0;
   let multiplier = 1;
@@ -999,9 +997,6 @@ function decodeDocPointerRecord(buffer, offset, meta, packTable = []) {
     checksum: { algorithm: "sha256", value }
   };
 }
-function decodeDocOrdinalRecord(buffer, offset, meta) {
-  return readFixedInt(new Uint8Array(buffer), offset, meta.width);
-}
 
 // src/doc_pages.js
 var DOC_PAGE_ENCODING = "rfdocpagecols-v1";
@@ -1439,100 +1434,85 @@ function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
   return groups;
 }
 
-// src/typo_lexicon.js
-var TYPO_LEXICON_FORMAT = "rftermlex-v2";
-var TYPO_LEXICON_VERSION = 2;
-function parseTypoLexiconShard(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, TYPO_LEXICON_MAGIC, "Unsupported Rangefind typo lexicon shard");
-  const state = { pos: TYPO_LEXICON_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== TYPO_LEXICON_VERSION) throw new Error("Unsupported Rangefind typo lexicon version");
-  const count = readVarint(bytes, state);
-  const entries = new Array(count);
-  for (let i = 0; i < count; i++) {
-    entries[i] = {
-      surface: readUtf8(bytes, state),
-      term: readUtf8(bytes, state),
-      df: readVarint(bytes, state)
-    };
-  }
-  const nodeCount = readVarint(bytes, state);
-  const rawNodes = new Array(nodeCount);
-  for (let i = 0; i < nodeCount; i++) {
-    const entryIds = new Array(readVarint(bytes, state));
-    for (let j = 0; j < entryIds.length; j++) entryIds[j] = readVarint(bytes, state);
-    const childCount = readVarint(bytes, state);
-    const children = new Array(childCount);
-    for (let j = 0; j < childCount; j++) children[j] = [readUtf8(bytes, state), readVarint(bytes, state)];
-    rawNodes[i] = { entryIds, children };
-  }
-  const nodes = rawNodes.map((node) => ({
-    children: /* @__PURE__ */ new Map(),
-    entries: node.entryIds.map((index) => entries[index]).filter(Boolean)
-  }));
-  for (let i = 0; i < rawNodes.length; i++) {
-    for (const [char, childIndex] of rawNodes[i].children) {
-      if (nodes[childIndex]) nodes[i].children.set(char, nodes[childIndex]);
-    }
-  }
-  return { format: TYPO_LEXICON_FORMAT, entries, trie: nodes[0] || { children: /* @__PURE__ */ new Map(), entries: [] }, trieNodes: nodes.length };
+// src/typo_main_index.js
+var COMMON_SUBSTITUTIONS = "aeiourstnlcmpdbfgvhqxyzkjw";
+var COMMON_SUFFIXES = [
+  "",
+  "s",
+  "e",
+  "es",
+  "er",
+  "eur",
+  "eurs",
+  "euse",
+  "ement",
+  "ements",
+  "ation",
+  "ations",
+  "ique",
+  "iques",
+  "ance",
+  "ances",
+  "ite",
+  "ites"
+];
+var MAIN_INDEX_TYPO_DEFAULTS = {
+  mode: "main-index",
+  trigger: "zero-or-weak",
+  maxEdits: 2,
+  maxTokenCandidates: 8,
+  maxQueryPlans: 5,
+  maxCorrectedSearches: 3,
+  maxShardLookups: 12,
+  weakResultTotal: 0
+};
+function normalizeMainIndexTypoOptions(options = {}, manifest = {}) {
+  const manifestOptions = manifest.search?.typo || {};
+  const mode = String(options.typoMode ?? manifestOptions.mode ?? MAIN_INDEX_TYPO_DEFAULTS.mode).toLowerCase();
+  const trigger = String(options.typoTrigger ?? manifestOptions.trigger ?? MAIN_INDEX_TYPO_DEFAULTS.trigger).toLowerCase();
+  return {
+    mode: mode === "off" || mode === "false" || mode === "none" ? "off" : "main-index",
+    trigger: trigger === "zero" ? "zero" : "zero-or-weak",
+    maxEdits: positiveInt(options.typoMaxEdits ?? manifestOptions.maxEdits, MAIN_INDEX_TYPO_DEFAULTS.maxEdits, 1, 3),
+    maxTokenCandidates: positiveInt(options.typoMaxTokenCandidates ?? manifestOptions.maxTokenCandidates, MAIN_INDEX_TYPO_DEFAULTS.maxTokenCandidates, 1, 32),
+    maxQueryPlans: positiveInt(options.typoMaxQueryPlans ?? manifestOptions.maxQueryPlans, MAIN_INDEX_TYPO_DEFAULTS.maxQueryPlans, 1, 32),
+    maxCorrectedSearches: positiveInt(options.typoMaxCorrectedSearches ?? manifestOptions.maxCorrectedSearches, MAIN_INDEX_TYPO_DEFAULTS.maxCorrectedSearches, 1, 8),
+    maxShardLookups: positiveInt(options.typoMaxShardLookups ?? manifestOptions.maxShardLookups, MAIN_INDEX_TYPO_DEFAULTS.maxShardLookups, 1, 64),
+    weakResultTotal: positiveInt(options.typoWeakResultTotal ?? manifestOptions.weakResultTotal, MAIN_INDEX_TYPO_DEFAULTS.weakResultTotal, 0, 10)
+  };
 }
-
-// src/typo_runtime.js
-function typoMaxEditsFor(term, options = {}) {
-  const max = options.maxEdits ?? 2;
+function typoMaxEditsFor(term, options = MAIN_INDEX_TYPO_DEFAULTS) {
+  const max = options.maxEdits ?? MAIN_INDEX_TYPO_DEFAULTS.maxEdits;
   return term.length >= 8 ? max : Math.min(1, max);
 }
-function typoDeleteKeys(term, options = {}, maxEdits = typoMaxEditsFor(term, options)) {
-  const minLength = (options.minTermLength ?? 4) - (options.maxEdits ?? 2);
-  const keys = /* @__PURE__ */ new Set([term]);
-  let frontier = /* @__PURE__ */ new Set([term]);
-  for (let edits = 1; edits <= maxEdits; edits++) {
-    const next = /* @__PURE__ */ new Set();
-    for (const value of frontier) {
-      if (value.length <= 1) continue;
-      for (let i = 0; i < value.length; i++) {
-        const key = value.slice(0, i) + value.slice(i + 1);
-        if (key.length < minLength) continue;
-        keys.add(key);
-        next.add(key);
-      }
+function isTypoCorrectionToken(token) {
+  return /^[a-z][a-z0-9]*$/u.test(token) && !/^\d+$/u.test(token) && token.length >= 3 && token.length <= 32;
+}
+function mainIndexTypoProbeValues(raw, term, options = MAIN_INDEX_TYPO_DEFAULTS) {
+  const max = Math.max(1, options.maxShardLookups || MAIN_INDEX_TYPO_DEFAULTS.maxShardLookups);
+  const seeds = [term, raw].map((value) => String(value || "")).filter(isTypoCorrectionToken);
+  const out = new Set(seeds);
+  const target = seeds.find((value) => value.length >= 4) || seeds[0] || "";
+  if (!target) return [];
+  const priorityPositions = [...new Set([0, 1, 2, 3, target.length - 1].filter((index) => index >= 0 && index < target.length))];
+  for (const i of priorityPositions) {
+    out.add(target.slice(0, i) + target.slice(i + 1));
+    if (out.size >= max) return [...out].filter(isTypoCorrectionToken).slice(0, max);
+  }
+  for (const i of priorityPositions.filter((index) => index < target.length - 1)) {
+    out.add(target.slice(0, i) + target[i + 1] + target[i] + target.slice(i + 2));
+    if (out.size >= max) return [...out].filter(isTypoCorrectionToken).slice(0, max);
+  }
+  const substitutionPositions = [...new Set([1, 0, 2, 3, target.length - 1].filter((index) => index >= 0 && index < target.length))];
+  for (const i of substitutionPositions) {
+    for (const char of COMMON_SUBSTITUTIONS) {
+      if (char === target[i]) continue;
+      out.add(target.slice(0, i) + char + target.slice(i + 1));
+      if (out.size >= max) break;
     }
-    frontier = next;
+    if (out.size >= max) break;
   }
-  return keys;
-}
-function parseTypoShard(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, TYPO_SHARD_MAGIC, "Unsupported Rangefind typo shard");
-  const state = { pos: TYPO_SHARD_MAGIC.length };
-  const pairCount = readVarint(bytes, state);
-  const pairs = new Array(pairCount);
-  for (let i = 0; i < pairCount; i++) {
-    pairs[i] = { surface: readUtf8(bytes, state), term: readUtf8(bytes, state), df: readVarint(bytes, state) };
-  }
-  const keyCount = readVarint(bytes, state);
-  const keys = /* @__PURE__ */ new Map();
-  let previous = "";
-  for (let i = 0; i < keyCount; i++) {
-    const prefix = readVarint(bytes, state);
-    const suffix = readUtf8(bytes, state);
-    const key = previous.slice(0, prefix) + suffix;
-    keys.set(key, { offset: readVarint(bytes, state), count: readVarint(bytes, state), candidates: null });
-    previous = key;
-  }
-  return { bytes, dataStart: state.pos, pairs, keys };
-}
-function typoCandidatesForDeleteKey(shard, key) {
-  const entry = shard.keys?.get(key);
-  if (!entry) return [];
-  if (entry.candidates) return entry.candidates;
-  const state = { pos: shard.dataStart + entry.offset };
-  const candidates = new Array(entry.count);
-  for (let i = 0; i < entry.count; i++) candidates[i] = shard.pairs[readVarint(shard.bytes, state)] || { surface: "", term: "", df: 0 };
-  entry.candidates = candidates;
-  return candidates;
+  return [...out].filter(isTypoCorrectionToken).slice(0, max);
 }
 function boundedDamerauLevenshtein(a, b, maxDistance) {
   if (a === b) return 0;
@@ -1557,6 +1537,47 @@ function boundedDamerauLevenshtein(a, b, maxDistance) {
   }
   return prev[b.length];
 }
+function bestMainIndexTypoDistance(token, candidate, maxEdits) {
+  let best = {
+    surface: candidate,
+    distance: boundedDamerauLevenshtein(token, candidate, maxEdits)
+  };
+  for (const suffix of COMMON_SUFFIXES) {
+    if (!suffix) continue;
+    const surface = `${candidate}${suffix}`;
+    if (Math.abs(surface.length - token.length) > maxEdits) continue;
+    const distance = boundedDamerauLevenshtein(token, surface, maxEdits);
+    if (distance < best.distance) best = { surface, distance };
+  }
+  return best;
+}
+function ngramOverlap(left, right) {
+  const n = Math.min(left.length, right.length) <= 5 ? 2 : 3;
+  const a = grams(left, n);
+  const b = grams(right, n);
+  if (!a.size || !b.size) return left[0] === right[0] ? 0.25 : 0;
+  let shared = 0;
+  for (const gram of a) if (b.has(gram)) shared++;
+  return shared / Math.max(a.size, b.size);
+}
+function mainIndexTypoCandidateScore(token, surface, df, distance) {
+  const prefix = commonPrefixLength(token, surface);
+  const sequenceSimilarity = lcsLength(token, surface) / Math.max(1, token.length);
+  const sameFirst = token[0] && token[0] === surface[0] ? 1.2 : -1.2;
+  const sameLast = token[token.length - 1] === surface[surface.length - 1] ? 0.8 : 0;
+  const lengthPenalty = Math.abs(token.length - surface.length) * 0.35;
+  return Math.log1p(df) * 0.35 + Math.min(prefix, 4) * 0.25 + sequenceSimilarity * 5 + sameFirst + sameLast - distance * 2.6 - lengthPenalty;
+}
+function positiveInt(value, fallback, min, max) {
+  const parsed = Math.floor(Number(value ?? fallback));
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+function grams(value, n) {
+  const out = /* @__PURE__ */ new Set();
+  for (let i = 0; i <= value.length - n; i++) out.add(value.slice(i, i + n));
+  return out;
+}
 function commonPrefixLength(a, b) {
   const max = Math.min(a.length, b.length);
   let i = 0;
@@ -1574,14 +1595,6 @@ function lcsLength(a, b) {
   }
   return previous[b.length];
 }
-function typoCandidateScore(token, surface, df, distance) {
-  const prefix = commonPrefixLength(token, surface);
-  const sequenceSimilarity = lcsLength(token, surface) / Math.max(1, token.length);
-  const sameFirst = token[0] && token[0] === surface[0] ? 1.2 : -1.6;
-  const sameLast = token[token.length - 1] === surface[surface.length - 1] ? 0.35 : 0;
-  const lengthPenalty = Math.abs(token.length - surface.length) * 0.25;
-  return Math.log1p(df) * 1.15 + Math.min(prefix, 4) * 0.15 + sequenceSimilarity * 4 + sameFirst + sameLast - distance * 2.35 - lengthPenalty;
-}
 
 // src/runtime.js
 var RERANK_CANDIDATES = 30;
@@ -1592,9 +1605,8 @@ var POSTING_BLOCK_FRONTIER = 4;
 var FILTER_BITMAP_SPARSE_DOC_LIMIT = 256;
 var TYPO_CORRECTION_CANDIDATES_PER_TOKEN = 2;
 var TYPO_CORRECTION_PLAN_LIMIT = 6;
-var TYPO_CORRECTION_EXECUTION_PLAN_LIMIT = 1;
+var TYPO_CORRECTION_EXECUTION_PLAN_LIMIT = 3;
 var TYPO_CORRECTION_RELATIVE_SCORE = 0.5;
-var TYPO_LEXICON_MIN_SCAN_CANDIDATES = 64;
 var DOC_RANGE_PLANNER_MIN_CANDIDATE_RANGES = 2;
 var DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.12;
 var DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 1024;
@@ -1625,12 +1637,9 @@ function traceBucketFromPath(path) {
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/authority/packs/")) return "authority";
-  if (path.includes("/typo/lexicon-packs/") || path.includes("/typo/lexicon/")) return "typoLexicon";
-  if (path.includes("/typo/")) return "typo";
   if (path.includes("/sort-replicas/")) return "sortReplicas";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
-  if (path.includes("/docs/ordinals/")) return "docOrdinals";
   if (path.includes("/docs/pointers/")) return "docPointers";
   if (path.includes("/docs/pages/")) return "docPagePointers";
   if (path.includes("/docs/page-packs/")) return "docPages";
@@ -1654,8 +1663,6 @@ function traceLabelBucket(label) {
   if (value.startsWith("posting segment")) return "terms";
   if (value.startsWith("query bundle")) return "queryBundles";
   if (value.startsWith("authority shard")) return "authority";
-  if (value.startsWith("typo lexicon")) return "typoLexicon";
-  if (value.startsWith("typo shard")) return "typo";
   if (value.startsWith("sort replica doc pointer")) return "sortReplicaDocPointers";
   if (value.startsWith("sort replica doc page")) return "sortReplicaDocPages";
   if (value.startsWith("sort replica doc ")) return "sortReplicaDocs";
@@ -1795,11 +1802,8 @@ async function createSearch(options = {}) {
   const shardCache = /* @__PURE__ */ new Map();
   const queryBundleCache = /* @__PURE__ */ new Map();
   const authorityShardCache = /* @__PURE__ */ new Map();
-  const typoShardCache = /* @__PURE__ */ new Map();
-  const typoLexiconShardCache = /* @__PURE__ */ new Map();
   const segmentTermsCache = /* @__PURE__ */ new Map();
   const segmentRowsCache = /* @__PURE__ */ new Map();
-  const docOrdinalCache = /* @__PURE__ */ new Map();
   const docPointerCache = /* @__PURE__ */ new Map();
   const packedDocCache = /* @__PURE__ */ new Map();
   const docPagePointerCache = /* @__PURE__ */ new Map();
@@ -1815,10 +1819,6 @@ async function createSearch(options = {}) {
   const sortReplicaDocPagePointerCache = /* @__PURE__ */ new Map();
   const sortReplicaDocPageCache = /* @__PURE__ */ new Map();
   const facetDictionaryCache = /* @__PURE__ */ new Map();
-  let typoManifest = null;
-  let typoManifestPromise = null;
-  let typoDirectory = null;
-  let typoLexiconDirectory = null;
   let codes = null;
   let codesPromise = null;
   let fullManifestPromise = null;
@@ -1842,7 +1842,6 @@ async function createSearch(options = {}) {
   let blockFilterFields = new Set((manifest.block_filters || []).map((filter) => filter.name));
   const rangePlans = {
     default: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: 4 },
-    docOrdinals: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 4 * 1024, maxOverfetchRatio: Infinity },
     docPointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     docs: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 8 * 1024, maxOverfetchRatio: Infinity },
     docPagePointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
@@ -1971,9 +1970,11 @@ async function createSearch(options = {}) {
     Math.floor(Number(options.docRangeBlockPruneInitialBatchSize || DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE))
   ));
   const docRangeImpactPlannerEnabled = options.docRangeImpactPlanner !== false;
+  const runtimeTypo = normalizeMainIndexTypoOptions(options, manifest);
   const typoCorrectionExecutionPlanLimit = Math.max(1, Math.min(
-    TYPO_CORRECTION_PLAN_LIMIT,
-    Math.floor(Number(options.typoCorrectionExecutionPlans || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
+    runtimeTypo.maxQueryPlans || TYPO_CORRECTION_PLAN_LIMIT,
+    runtimeTypo.maxCorrectedSearches || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT,
+    Math.floor(Number(options.typoCorrectionExecutionPlans || runtimeTypo.maxCorrectedSearches || TYPO_CORRECTION_EXECUTION_PLAN_LIMIT))
   ));
   function rangeGroups(items, kind = "default") {
     return groupRanges(items, rangePlans[kind] || rangePlans.default);
@@ -2317,20 +2318,6 @@ async function createSearch(options = {}) {
     if (docValues) return ensureDocValuesForDocs(fields, docs);
     return loadCodes();
   }
-  async function loadTypoManifest() {
-    if (typoManifest !== null) return typoManifest;
-    if (!typoManifestPromise) {
-      if (!manifest.typo?.manifest) {
-        typoManifest = false;
-        return typoManifest;
-      }
-      typoManifestPromise = fetch(new URL(manifest.typo.manifest, baseUrl)).then((response) => response.ok ? response.json() : false).catch(() => false);
-    }
-    typoManifest = await typoManifestPromise;
-    if (typoManifest) typoDirectory = createDirectoryState(typoManifest.directory);
-    if (typoManifest?.lexicon?.directory) typoLexiconDirectory = createDirectoryState(typoManifest.lexicon.directory);
-    return typoManifest;
-  }
   async function loadShards(shards) {
     const wanted = [];
     const pending = [];
@@ -2411,94 +2398,6 @@ async function createSearch(options = {}) {
     const out = /* @__PURE__ */ new Map();
     await Promise.all(wanted.map(async (shard) => {
       const data = await authorityShardCache.get(shard);
-      if (data) out.set(shard, data);
-    }));
-    return out;
-  }
-  async function loadTypoShards(shards) {
-    const meta = await loadTypoManifest();
-    if (!meta) return /* @__PURE__ */ new Map();
-    const wanted = [];
-    const pending = [];
-    const unique = /* @__PURE__ */ new Map();
-    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
-    for (const { shard, entry } of unique.values()) {
-      wanted.push(shard);
-      if (typoShardCache.has(shard)) continue;
-      if (!entry) continue;
-      let resolve;
-      let reject;
-      const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      promise.catch(() => {
-      });
-      typoShardCache.set(shard, promise);
-      pending.push({ shard, entry, resolve, reject });
-    }
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`typo/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          const inflated = await inflateGroupItem(compressed, group.start, item, `typo shard ${item.shard}`);
-          item.resolve(traceSpanSync("typo.parse", () => parseTypoShard(inflated)));
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          typoShardCache.delete(item.shard);
-          item.reject(error);
-        }
-        throw error;
-      }
-    }));
-    const out = /* @__PURE__ */ new Map();
-    await Promise.all(wanted.map(async (shard) => {
-      const data = await typoShardCache.get(shard);
-      if (data) out.set(shard, data);
-    }));
-    return out;
-  }
-  async function loadTypoLexiconShards(shards) {
-    const meta = await loadTypoManifest();
-    if (!meta?.lexicon) return /* @__PURE__ */ new Map();
-    const wanted = [];
-    const pending = [];
-    const unique = /* @__PURE__ */ new Map();
-    for (const item of shards) if (!unique.has(item.shard)) unique.set(item.shard, item);
-    for (const { shard, entry } of unique.values()) {
-      wanted.push(shard);
-      if (typoLexiconShardCache.has(shard)) continue;
-      if (!entry) continue;
-      let resolve;
-      let reject;
-      const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      promise.catch(() => {
-      });
-      typoLexiconShardCache.set(shard, promise);
-      pending.push({ shard, entry, resolve, reject });
-    }
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`typo/lexicon-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
-        await Promise.all(group.items.map(async (item) => {
-          const inflated = await inflateGroupItem(compressed, group.start, item, `typo lexicon ${item.shard}`);
-          item.resolve(traceSpanSync("typoLexicon.parse", () => parseTypoLexiconShard(inflated)));
-        }));
-      } catch (error) {
-        for (const item of group.items) {
-          typoLexiconShardCache.delete(item.shard);
-          item.reject(error);
-        }
-        throw error;
-      }
-    }));
-    const out = /* @__PURE__ */ new Map();
-    await Promise.all(wanted.map(async (shard) => {
-      const data = await typoLexiconShardCache.get(shard);
       if (data) out.set(shard, data);
     }));
     return out;
@@ -2903,48 +2802,10 @@ async function createSearch(options = {}) {
   function candidateLimitFor(baseTerms, k, rerank = true) {
     return rerank === false || !dependencyTerms(baseTerms).length ? k : Math.max(RERANK_CANDIDATES, k);
   }
-  async function loadDocOrdinals(indexes) {
-    const ordinalMeta = docPointers?.ordinals;
-    if (!ordinalMeta?.file) throw new Error("Rangefind index is missing dense doc ordinals.");
-    const pending = [];
-    const unique = [...new Set(indexes)];
-    for (const index of unique) {
-      if (docOrdinalCache.has(index)) continue;
-      let resolveOrdinal;
-      let rejectOrdinal;
-      const promise = new Promise((resolvePromise, rejectPromise) => {
-        resolveOrdinal = resolvePromise;
-        rejectOrdinal = rejectPromise;
-      });
-      promise.catch(() => {
-      });
-      docOrdinalCache.set(index, promise);
-      const offset = ordinalMeta.dataOffset + index * ordinalMeta.recordBytes;
-      pending.push({
-        index,
-        entry: { pack: ordinalMeta.file, offset, length: ordinalMeta.recordBytes },
-        resolve: resolveOrdinal,
-        reject: rejectOrdinal
-      });
-    }
-    await Promise.all(rangeGroups(pending, "docOrdinals").map(async (group) => {
-      try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
-        for (const item of group.items) {
-          item.resolve(decodeDocOrdinalRecord(buffer, item.entry.offset - group.start, ordinalMeta));
-        }
-      } catch (error) {
-        for (const item of group.items) {
-          docOrdinalCache.delete(item.index);
-          item.reject(error);
-        }
-        throw error;
-      }
-    }));
-  }
   async function loadDocPointers(indexes) {
-    if (!docPointers?.file || docPointers.order !== "layout") throw new Error("Rangefind index is missing layout-ordered dense doc pointers.");
-    await loadDocOrdinals(indexes);
+    if (!docPointers?.file) throw new Error("Rangefind index is missing dense doc pointers.");
+    const order = docPointers.order || "doc-id";
+    if (order !== "doc-id") throw new Error(`Unsupported Rangefind doc pointer order ${order}`);
     const pending = [];
     const unique = [...new Set(indexes)];
     for (const index of unique) {
@@ -2958,8 +2819,7 @@ async function createSearch(options = {}) {
       promise.catch(() => {
       });
       docPointerCache.set(index, promise);
-      const ordinal = await docOrdinalCache.get(index);
-      const offset = docPointers.dataOffset + ordinal * docPointers.recordBytes;
+      const offset = docPointers.dataOffset + index * docPointers.recordBytes;
       pending.push({
         index,
         entry: { pack: docPointers.file, offset, length: docPointers.recordBytes },
@@ -4932,8 +4792,46 @@ async function createSearch(options = {}) {
     const rangeImpact = docRangeMaxForIndex(entry, rangeIndex);
     return rangeImpact ? Math.min(blockImpact, rangeImpact) : blockImpact;
   }
+  function entryRemainingBlockMax(entry) {
+    if (!entry?.remainingBlockMaxImpact) {
+      const blocks = entry?.blocks || [];
+      const impacts = new Array(blocks.length + 1).fill(0);
+      const tieDocs = new Array(blocks.length + 1).fill(Infinity);
+      for (let index = blocks.length - 1; index >= 0; index--) {
+        const block = blocks[index] || {};
+        const impact = block.maxImpact || 0;
+        const tieDoc = block.maxImpactDoc ?? Infinity;
+        const nextImpact = impacts[index + 1] || 0;
+        const nextTieDoc = tieDocs[index + 1] ?? Infinity;
+        if (impact > nextImpact) {
+          impacts[index] = impact;
+          tieDocs[index] = tieDoc;
+        } else if (impact === nextImpact && impact > 0) {
+          impacts[index] = impact;
+          tieDocs[index] = Math.min(tieDoc, nextTieDoc);
+        } else {
+          impacts[index] = nextImpact;
+          tieDocs[index] = nextTieDoc;
+        }
+      }
+      entry.remainingBlockMaxImpact = impacts;
+      entry.remainingBlockMaxTieDoc = tieDocs;
+    }
+    return {
+      impacts: entry.remainingBlockMaxImpact,
+      tieDocs: entry.remainingBlockMaxTieDoc
+    };
+  }
+  function remainingBlockMaxImpact(cursor) {
+    const index = Math.max(0, Math.min(cursor.blockIndex || 0, cursor.entry.blocks?.length || 0));
+    return entryRemainingBlockMax(cursor.entry).impacts[index] || 0;
+  }
+  function remainingBlockMaxTieDoc(cursor) {
+    const index = Math.max(0, Math.min(cursor.blockIndex || 0, cursor.entry.blocks?.length || 0));
+    return entryRemainingBlockMax(cursor.entry).tieDocs[index] ?? Infinity;
+  }
   function remainingImpactForCursor(cursor, block, doc = null) {
-    const blockImpact = block?.maxImpact || 0;
+    const blockImpact = remainingBlockMaxImpact(cursor) || block?.maxImpact || 0;
     if (doc == null) return blockImpact;
     const rangeImpact = docRangeMaxForDoc(cursor.entry, doc);
     return rangeImpact == null ? blockImpact : Math.min(blockImpact, rangeImpact);
@@ -4949,7 +4847,7 @@ async function createSearch(options = {}) {
       const block = cursor.entry.blocks[cursor.blockIndex];
       if (!block) continue;
       potential += remainingImpactForCursor(cursor, block, doc);
-      tieDocLowerBound = Math.max(tieDocLowerBound, block.maxImpactDoc ?? 0);
+      tieDocLowerBound = Math.max(tieDocLowerBound, remainingBlockMaxTieDoc(cursor));
       hasRemaining = true;
       terms++;
       if (cursor.isBase) baseTerms++;
@@ -4975,7 +4873,7 @@ async function createSearch(options = {}) {
       if (cursor.isBase) baseTerms++;
       const ranges = cursor.entry.docRanges?.ranges;
       if (!ranges?.length) {
-        fallbackPotential += block.maxImpact || 0;
+        fallbackPotential += remainingBlockMaxImpact(cursor) || block.maxImpact || 0;
         continue;
       }
       hasRangeBounds = true;
@@ -6048,195 +5946,61 @@ async function createSearch(options = {}) {
       }
     };
   }
-  async function typoCandidatesForToken(token, debug) {
-    const meta = await loadTypoManifest();
-    if (!meta) return [];
-    const minLength = Math.max(2, (meta.min_surface_length || 4) - (meta.max_edits || 2));
-    const maxLength = meta.max_surface_length || meta.max_term_length || 24;
-    if (token.length < minLength || token.length > maxLength) return [];
-    if (!/^[a-z][a-z0-9]*$/u.test(token) || /^\d+$/u.test(token)) return [];
-    const maxEdits = typoMaxEditsFor(token, { maxEdits: meta.max_edits || 2 });
-    const deleteEnabled = token.length <= Math.max(1, Number(meta.delete_max_surface_length || 8));
-    const deleteKeys = deleteEnabled ? [...typoDeleteKeys(token, {
-      minTermLength: meta.min_term_length || 4,
-      maxEdits: meta.max_edits || 2
-    }, maxEdits)] : [];
-    async function candidatesForKeys(keys) {
-      const byShard = /* @__PURE__ */ new Map();
-      for (const key of keys) {
-        const resolved = await resolveDirectoryShard(
-          key,
-          typoDirectory,
-          meta.base_shard_depth || 2,
-          meta.max_shard_depth || meta.base_shard_depth || 3
-        );
-        if (!resolved) continue;
-        if (!byShard.has(resolved.shard)) byShard.set(resolved.shard, { shard: resolved.shard, entry: resolved.entry, keys: [] });
-        byShard.get(resolved.shard).keys.push(key);
-      }
-      const candidates2 = /* @__PURE__ */ new Map();
-      const loaded = await loadTypoShards([...byShard.values()]);
-      for (const [shard, bucket] of byShard) {
-        debug.shards.add(shard);
-        const data = loaded.get(shard);
-        if (!data) continue;
-        for (const key of bucket.keys) {
-          for (const candidate of typoCandidatesForDeleteKey(data, key)) {
-            if (candidate.surface === token) continue;
-            const candidateKey = `${candidate.surface}${candidate.term}`;
-            const previous = candidates2.get(candidateKey);
-            if (!previous || candidate.df > previous.df) candidates2.set(candidateKey, candidate);
-          }
-        }
-      }
-      return candidates2;
+  async function typoCandidatesForToken(item, debug) {
+    const raw = String(item.raw || "");
+    const token = String(item.term || raw);
+    const scoringToken = isTypoCorrectionToken(raw) ? raw : token;
+    if (!isTypoCorrectionToken(scoringToken) || !isTypoCorrectionToken(token)) return [];
+    const maxEdits = typoMaxEditsFor(scoringToken, runtimeTypo);
+    const probeValues = mainIndexTypoProbeValues(raw, token, {
+      ...runtimeTypo,
+      maxShardLookups: Math.max(runtimeTypo.maxShardLookups * 2, 24)
+    });
+    const byShard = /* @__PURE__ */ new Map();
+    for (const probe of probeValues) {
+      const resolved = await resolveDirectoryShard(
+        probe,
+        termDirectory,
+        manifest.stats?.base_shard_depth || 3,
+        manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
+      );
+      if (!resolved || byShard.has(resolved.shard)) continue;
+      if (!debug.shards.has(resolved.shard) && debug.shards.size + byShard.size >= runtimeTypo.maxShardLookups) break;
+      byShard.set(resolved.shard, resolved);
     }
-    function verifiedCandidates(candidates2) {
-      const verified2 = [];
-      for (const candidate of candidates2.values()) {
-        const distance = boundedDamerauLevenshtein(token, candidate.surface, maxEdits);
-        if (distance <= 0 || distance > maxEdits) continue;
-        verified2.push({
-          ...candidate,
-          distance,
-          score: typoCandidateScore(token, candidate.surface, candidate.df, distance)
-        });
-      }
-      return verified2;
-    }
-    function mergeVerified(left, right) {
-      const merged = /* @__PURE__ */ new Map();
-      for (const candidate of [...left, ...right]) {
-        const key = `${candidate.surface}${candidate.term}`;
-        const previous = merged.get(key);
-        if (!previous || candidate.score > previous.score || candidate.score === previous.score && candidate.df > previous.df) {
-          merged.set(key, candidate);
-        }
-      }
-      return [...merged.values()];
-    }
-    function lexiconLowerBound(entries, value) {
-      let low = 0;
-      let high = entries.length;
-      while (low < high) {
-        const mid = Math.floor((low + high) / 2);
-        if (entries[mid].surface.localeCompare(value) < 0) low = mid + 1;
-        else high = mid;
-      }
-      return low;
-    }
-    function lexiconTrie(data) {
-      if (data.trie) return data.trie;
-      const root = { children: /* @__PURE__ */ new Map(), entries: [] };
-      for (const entry of data.entries || []) {
-        let node = root;
-        for (const char of entry.surface) {
-          let child = node.children.get(char);
-          if (!child) {
-            child = { children: /* @__PURE__ */ new Map(), entries: [] };
-            node.children.set(char, child);
-          }
-          node = child;
-        }
-        node.entries.push(entry);
-      }
-      data.trie = root;
-      return root;
-    }
-    function levenshteinAutomatonLexiconCandidates(data) {
-      const root = lexiconTrie(data);
-      const chars = [...token];
-      const initial = Array.from({ length: chars.length + 1 }, (_, index) => index);
-      const out = [];
-      let visited = 0;
-      const visit = (node, char, previousRow) => {
-        const current = [previousRow[0] + 1];
-        let rowMin = current[0];
-        for (let column = 1; column <= chars.length; column++) {
-          const insertCost = current[column - 1] + 1;
-          const deleteCost = previousRow[column] + 1;
-          const replaceCost = previousRow[column - 1] + (chars[column - 1] === char ? 0 : 1);
-          const value = Math.min(insertCost, deleteCost, replaceCost);
-          current[column] = value;
-          rowMin = Math.min(rowMin, value);
-        }
-        if (node.entries.length && current[chars.length] <= maxEdits) {
-          for (const entry of node.entries) {
-            visited++;
-            if (entry.surface === token || Math.abs(entry.surface.length - token.length) > maxEdits) continue;
-            const distance = boundedDamerauLevenshtein(token, entry.surface, maxEdits);
-            if (distance <= 0 || distance > maxEdits) continue;
-            out.push({
-              ...entry,
-              distance,
-              score: typoCandidateScore(token, entry.surface, entry.df, distance)
-            });
-          }
-        }
-        if (rowMin > maxEdits) return;
-        for (const [nextChar, child] of node.children) visit(child, nextChar, current);
-      };
-      for (const [char, child] of root.children) visit(child, char, initial);
-      return {
-        candidates: out.sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, 64),
-        visited
-      };
-    }
-    async function verifiedLexiconCandidates() {
-      if (!meta.lexicon || !typoLexiconDirectory) return [];
-      if (token.length < (meta.lexicon.min_surface_length || meta.min_surface_length || 4)) return [];
-      const depth = meta.lexicon.shard_depth || 2;
-      const resolved = await resolveDirectoryShard(token, typoLexiconDirectory, depth, depth);
-      if (!resolved) return [];
-      const loaded = await loadTypoLexiconShards([{ shard: resolved.shard, entry: resolved.entry }]);
-      debug.lexiconShards.add(resolved.shard);
+    const loaded = await loadShards([...byShard.values()]);
+    const candidates = /* @__PURE__ */ new Map();
+    for (const [shard, resolved] of byShard) {
+      debug.shards.add(shard);
       const data = loaded.get(resolved.shard);
-      const entries = data?.entries || [];
-      if (data) {
-        const automaton = levenshteinAutomatonLexiconCandidates(data);
-        debug.lexiconScanned += automaton.visited;
-        if (automaton.candidates.some((candidate) => candidate.score >= 0.5)) return automaton.candidates;
-      }
-      const maxScan = Math.max(1, Number(meta.lexicon.max_scan_candidates || 2048));
-      const minScan = Math.min(maxScan, TYPO_LEXICON_MIN_SCAN_CANDIDATES);
-      const out = [];
-      let scanned = 0;
-      let left = lexiconLowerBound(entries, token) - 1;
-      let right = left + 1;
-      let scanRight = true;
-      while (scanned < maxScan && (left >= 0 || right < entries.length)) {
-        const entry = scanRight && right < entries.length || left < 0 ? entries[right++] : entries[left--];
-        scanRight = !scanRight;
-        scanned++;
-        if (!entry || entry.surface === token || Math.abs(entry.surface.length - token.length) > maxEdits) continue;
-        const distance = boundedDamerauLevenshtein(token, entry.surface, maxEdits);
+      if (!data) continue;
+      for (const [candidateTerm, entry] of data.terms) {
+        debug.scanned++;
+        if (candidateTerm === token || !isTypoCorrectionToken(candidateTerm)) continue;
+        if (Math.abs(candidateTerm.length - token.length) > maxEdits + 4) continue;
+        const overlap = Math.max(ngramOverlap(scoringToken, candidateTerm), ngramOverlap(token, candidateTerm));
+        if (overlap < (scoringToken.length <= 5 ? 0.2 : 0.25) && scoringToken[0] !== candidateTerm[0]) continue;
+        const bestDistance = bestMainIndexTypoDistance(scoringToken, candidateTerm, maxEdits);
+        let distance = bestDistance.distance;
+        let surface = bestDistance.surface;
+        if (distance > maxEdits && token !== scoringToken) {
+          const termDistance = bestMainIndexTypoDistance(token, candidateTerm, maxEdits);
+          distance = termDistance.distance;
+          surface = termDistance.surface;
+        }
         if (distance <= 0 || distance > maxEdits) continue;
-        out.push({
-          ...entry,
-          distance,
-          score: typoCandidateScore(token, entry.surface, entry.df, distance)
-        });
-        if (scanned >= minScan && out.some((candidate) => candidate.score >= 0.5)) break;
+        const df = entry.df || 0;
+        const score = mainIndexTypoCandidateScore(scoringToken, surface, df, distance);
+        const candidate = { surface, term: candidateTerm, df, distance, score };
+        const previous = candidates.get(candidate.term);
+        if (!previous || candidate.score > previous.score || candidate.score === previous.score && candidate.df > previous.df) {
+          candidates.set(candidate.term, candidate);
+        }
       }
-      debug.lexiconScanned += scanned;
-      return out.sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, 64);
     }
-    const candidates = deleteEnabled ? await candidatesForKeys([token]) : /* @__PURE__ */ new Map();
-    let verified = verifiedCandidates(candidates);
-    if (deleteEnabled && !verified.some((candidate) => candidate.score >= 0.5)) {
-      const remainingKeys = deleteKeys.filter((key) => key !== token);
-      const fallback = await candidatesForKeys(remainingKeys);
-      for (const [key, candidate] of fallback) {
-        const previous = candidates.get(key);
-        if (!previous || candidate.df > previous.df) candidates.set(key, candidate);
-      }
-      verified = verifiedCandidates(candidates);
-    }
-    if (!verified.some((candidate) => candidate.score >= 0.5)) {
-      verified = mergeVerified(verified, await verifiedLexiconCandidates());
-    }
+    const verified = [...candidates.values()].sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, runtimeTypo.maxTokenCandidates);
     debug.candidates += verified.length;
-    return verified.sort((a, b) => b.score - a.score || a.distance - b.distance || b.df - a.df || a.term.localeCompare(b.term)).slice(0, 64);
+    return verified;
   }
   async function correctedTypoQuery(baseTerms, analyzedTerms) {
     return traceSpan("typo.resolve", () => correctedTypoQueryInner(baseTerms, analyzedTerms));
@@ -6246,15 +6010,16 @@ async function createSearch(options = {}) {
     const presentTerms = new Map((await termEntries(baseTerms)).map((item) => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some((term) => !presentTerms.has(term));
     const plans = /* @__PURE__ */ new Map();
-    const debug = { shards: /* @__PURE__ */ new Set(), lexiconShards: /* @__PURE__ */ new Set(), candidates: 0, lexiconScanned: 0 };
+    const debug = { shards: /* @__PURE__ */ new Set(), candidates: 0, scanned: 0 };
     for (let index = 0; index < analyzedTerms.length; index++) {
       const item = analyzedTerms[index];
       if (presentTerms.has(item.term) && hasMissingTerms) continue;
-      const candidates = await typoCandidatesForToken(item.raw, debug);
+      const candidates = await typoCandidatesForToken(item, debug);
       const strongCandidates = candidates.filter((item2) => item2.score >= 0.5);
       const bestScore = strongCandidates[0]?.score || 0;
       const minScore = bestScore >= 1 ? bestScore * TYPO_CORRECTION_RELATIVE_SCORE : 0.5;
-      for (const candidate of strongCandidates.filter((item2) => item2.score >= minScore).slice(0, TYPO_CORRECTION_CANDIDATES_PER_TOKEN)) {
+      const perTokenLimit = runtimeTypo.maxTokenCandidates || TYPO_CORRECTION_CANDIDATES_PER_TOKEN;
+      for (const candidate of strongCandidates.filter((item2) => item2.score >= minScore).slice(0, perTokenLimit)) {
         const corrected = baseTerms.slice();
         corrected[index] = candidate.term;
         if (corrected[index] === item.term) continue;
@@ -6277,7 +6042,7 @@ async function createSearch(options = {}) {
     }
     const sortedPlans = [...plans.values()].sort((a, b) => b.score - a.score || a.q.localeCompare(b.q));
     if (!sortedPlans.length) return null;
-    const selectedPlans = await rankTypoCorrectionPlans(sortedPlans.slice(0, TYPO_CORRECTION_PLAN_LIMIT));
+    const selectedPlans = await rankTypoCorrectionPlans(sortedPlans.slice(0, runtimeTypo.maxQueryPlans || TYPO_CORRECTION_PLAN_LIMIT));
     return {
       plans: selectedPlans,
       stats: {
@@ -6286,8 +6051,8 @@ async function createSearch(options = {}) {
         typoCorrectionPlansEstimated: selectedPlans.filter((plan) => Number.isFinite(plan.estimatedUpperBound)).length,
         typoCorrectionBestUpperBound: selectedPlans[0]?.estimatedUpperBound || 0,
         typoShardLookups: debug.shards.size,
-        typoLexiconShardLookups: debug.lexiconShards.size,
-        typoLexiconCandidatesScanned: debug.lexiconScanned
+        typoCandidateShardLookups: debug.shards.size,
+        typoCandidateTermsScanned: debug.scanned
       }
     };
   }
@@ -6357,8 +6122,19 @@ async function createSearch(options = {}) {
   async function maybeTypoFallback(params, response, baseTerms, analyzedTerms) {
     return traceSpan("typo.fallback", () => maybeTypoFallbackInner(params, response, baseTerms, analyzedTerms));
   }
+  function shouldAttemptTypoFallback(params, response) {
+    if (runtimeTypo.mode === "off") return false;
+    if (params.page !== 1 || params.sort) return false;
+    if (response.total === 0) return true;
+    if (runtimeTypo.trigger !== "zero-or-weak") return false;
+    return response.total <= (runtimeTypo.weakResultTotal || 0);
+  }
+  function typoCorrectionShouldReplace(original, corrected) {
+    if ((original.total || 0) <= 0) return (corrected.total || 0) > 0;
+    return (corrected.total || 0) >= Math.max((original.total || 0) + 2, (original.total || 0) * 1.5);
+  }
   async function maybeTypoFallbackInner(params, response, baseTerms, analyzedTerms) {
-    if (params.page !== 1 || response.total > 0) return response;
+    if (!shouldAttemptTypoFallback(params, response)) return response;
     const surfaceFallback = await maybeSurfaceExactFallback(params, response, baseTerms, analyzedTerms);
     if (surfaceFallback) return surfaceFallback;
     const correction = await correctedTypoQuery(baseTerms, analyzedTerms);
@@ -6380,6 +6156,24 @@ async function createSearch(options = {}) {
     }
     if (!best) {
       return { ...response, stats: { ...response.stats || {}, typoAttempted: true, typoApplied: false, ...correction.stats, typoCorrectionPlansExecuted: executionPlans.length } };
+    }
+    if (!typoCorrectionShouldReplace(response, best.response)) {
+      return {
+        ...response,
+        suggestedQuery: best.plan.q,
+        suggestions: [{ q: best.plan.q, corrections: best.plan.corrections }],
+        stats: {
+          ...response.stats || {},
+          typoAttempted: true,
+          typoApplied: false,
+          typoSuggested: true,
+          typoOriginalTotal: response.total,
+          typoSuggestedQuery: best.plan.q,
+          typoCorrectionPlansExecuted: executionPlans.length,
+          typoCorrectedUpperBound: best.plan.estimatedUpperBound || 0,
+          ...correction.stats
+        }
+      };
     }
     return {
       ...best.response,

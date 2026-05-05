@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, copyFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, copyFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { gunzipSync } from "node:zlib";
 import { createSearch } from "../src/runtime.js";
 import { build } from "../src/builder.js";
 import { createBuildBenchmarkReport } from "../src/build_report.js";
@@ -420,8 +421,18 @@ function writeSite(args, docsPath) {
     output: "public/rangefind",
     idPath: "id",
     urlPath: "url",
-    maxTermsPerDoc: 180,
-    maxExpansionTermsPerDoc: 8,
+    indexProfile: "static-large",
+    targetPostingsPerDoc: 12,
+    bodyIndexChars: args.bodyChars,
+    alwaysIndexFields: ["title", "categories"],
+    typoMode: "main-index",
+    typoTrigger: "zero-or-weak",
+    typoMaxEdits: 2,
+    typoMaxTokenCandidates: 8,
+    typoMaxQueryPlans: 5,
+    typoMaxCorrectedSearches: 3,
+    typoMaxShardLookups: 12,
+    queryBundles: true,
     targetShardPostings: 45000,
     segmentMergeFanIn: 512,
     buildTelemetryPath: "frwiki-build-telemetry.json",
@@ -432,7 +443,7 @@ function writeSite(args, docsPath) {
     fields: [
       { name: "title", path: "title", weight: 5.5, b: 0.25, phrase: true, proximity: true, proximityWeight: 3, proximityWindow: 5 },
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
-      { name: "body", path: "body", weight: 1.0, b: 0.75, typo: false }
+      { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
     authority: [
       { name: "title", path: "title", weight: 1000000, exactWeight: 1000000, tokenWeight: 800000 }
@@ -759,6 +770,71 @@ function readBuildTelemetry(args) {
     || readJson(resolve(args.root, "public", "rangefind", "debug", "build-telemetry.json"));
 }
 
+function publishedIndexStats(root) {
+  const manifestPath = resolve(root, "manifest.json");
+  if (!existsSync(manifestPath)) return dirStats(root, { skipNames: ["_build"] });
+  const byBasename = new Map();
+  const walkFiles = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === "_build") continue;
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) {
+        walkFiles(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const rel = relative(root, full).replace(/\\/gu, "/");
+      const list = byBasename.get(entry.name) || [];
+      list.push(rel);
+      byBasename.set(entry.name, list);
+    }
+  };
+  walkFiles(root);
+
+  const files = new Set();
+  const processed = new Set();
+  const addFile = (relPath) => {
+    const normalized = String(relPath || "").replace(/^\.?\//u, "");
+    if (!normalized || normalized.includes("..")) return;
+    const full = resolve(root, normalized);
+    if (!full.startsWith(resolve(root)) || !existsSync(full) || !statSync(full).isFile()) return;
+    files.add(normalized);
+    if (processed.has(normalized)) return;
+    processed.add(normalized);
+    if (normalized.endsWith(".json") || normalized.endsWith(".json.gz")) {
+      try {
+        const raw = readFileSync(full);
+        const text = normalized.endsWith(".gz") ? gunzipSync(raw).toString("utf8") : raw.toString("utf8");
+        collect(JSON.parse(text));
+      } catch {
+        // Non-JSON gzip members are counted but not expanded.
+      }
+    }
+  };
+  const collect = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item);
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const item of Object.values(value)) collect(item);
+      return;
+    }
+    if (typeof value !== "string") return;
+    const normalized = value.replace(/^\.?\//u, "");
+    if (existsSync(resolve(root, normalized))) addFile(normalized);
+    const basename = normalized.split("/").pop();
+    for (const rel of byBasename.get(basename) || []) addFile(rel);
+  };
+
+  addFile("manifest.json");
+  addFile("manifest.min.json");
+  addFile("manifest.full.json");
+  let bytes = 0;
+  for (const file of files) bytes += statSync(resolve(root, file)).size;
+  return { files: files.size, bytes };
+}
+
 function writeBuilderBenchReport(args, options = {}) {
   const root = resolve(args.root, "public");
   const manifest = readJson(resolve(root, "rangefind", "manifest.min.json"))
@@ -770,7 +846,7 @@ function writeBuilderBenchReport(args, options = {}) {
   }
   const report = createBuildBenchmarkReport({
     telemetry,
-    index: dirStats(resolve(root, "rangefind")),
+    index: publishedIndexStats(resolve(root, "rangefind")),
     docs: meta?.docs || manifest?.total || args.limit,
     meta,
     mode: options.mode || "build"
@@ -814,12 +890,9 @@ function networkBucket(url) {
   if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
-  if (path.includes("/docs/ordinals/")) return "docOrdinals";
   if (path.includes("/docs/pointers/")) return "docPointers";
   if (path.includes("/docs/pages/")) return "docPagePointers";
   if (path.includes("/docs/page-packs/")) return "docPages";
-  if (path.includes("/typo/lexicon-packs/") || path.includes("/typo/lexicon/")) return "typoLexicon";
-  if (path.includes("/typo/")) return "typo";
   if (path.includes("/docs/")) return "docs";
   if (path.endsWith("/codes.bin.gz")) return "codes";
   return "other";
@@ -1230,8 +1303,10 @@ function compactRuntimeStats(stats = {}) {
     typoCorrectionBestUpperBound: stats.typoCorrectionBestUpperBound || 0,
     typoCorrectedUpperBound: stats.typoCorrectedUpperBound || 0,
     typoShardLookups: stats.typoShardLookups || 0,
-    typoLexiconShardLookups: stats.typoLexiconShardLookups || 0,
-    typoLexiconCandidatesScanned: stats.typoLexiconCandidatesScanned || 0,
+    typoCandidateShardLookups: stats.typoCandidateShardLookups || stats.typoShardLookups || 0,
+    typoCandidateTermsScanned: stats.typoCandidateTermsScanned || 0,
+    typoSuggested: Boolean(stats.typoSuggested),
+    typoSuggestedQuery: stats.typoSuggestedQuery || "",
     trace: compactRuntimeTrace(stats.trace)
   };
 }
@@ -1372,7 +1447,7 @@ async function benchFixture(args, options = {}) {
       fixture: "frwiki",
       generatedAt: new Date().toISOString(),
       root: repoRelativePath(root),
-      index: dirStats(resolve(root, "rangefind")),
+      index: publishedIndexStats(resolve(root, "rangefind")),
       rangefindStats: engine.manifest.stats,
       docPages: engine.manifest.docs?.pages ? {
         format: engine.manifest.docs.pages.format,

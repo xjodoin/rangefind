@@ -28,6 +28,13 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.deepEqual(config.alwaysIndexFields, ["title", "categories"]);
   assert.equal(config.resumeBuild, true);
   assert.equal(config.resumeDir, "_build/resume");
+  assert.equal(config.typoMode, "main-index");
+  assert.equal(config.typoTrigger, "zero-or-weak");
+  assert.equal(config.typoMaxEdits, 2);
+  assert.equal(config.typoMaxTokenCandidates, 8);
+  assert.equal(config.typoMaxQueryPlans, 5);
+  assert.equal(config.typoMaxCorrectedSearches, 3);
+  assert.equal(config.typoMaxShardLookups, 12);
   assert.equal(config.maxExpansionTermsPerDoc, 0);
   assert.equal(config.postingOrder, "doc-id");
   assert.equal(config.postingSegmentStreamMinBytes, 64 * 1024);
@@ -46,7 +53,6 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.segmentMergeMaxTempBytes, 512 * 1024 * 1024);
   assert.equal(config.finalSegmentTargetCount, 0);
   assert.equal(config.codecs.mode, "varint");
-  assert.equal(config.typo, false);
   assert.equal(config.buildProgressLogMs, 0);
 });
 
@@ -63,7 +69,8 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
     alwaysIndexFields: ["title"],
     maxExpansionTermsPerDoc: 3,
     partitionReducerInFlightBytes: 16,
-    typo: { enabled: true },
+    typoMode: "off",
+    typoMaxShardLookups: 4,
     codecs: { mode: "auto" }
   }));
   const config = await readConfig(configPath);
@@ -82,7 +89,8 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
   assert.equal(config.segmentMergeFanIn, 128);
   assert.equal(config.segmentMergeMaxTempBytes, 512 * 1024 * 1024);
   assert.equal(config.partitionReducerInFlightBytes, 16);
-  assert.deepEqual(config.typo, { enabled: true });
+  assert.equal(config.typoMode, "off");
+  assert.equal(config.typoMaxShardLookups, 4);
   assert.equal(config.codecs.mode, "auto");
 });
 

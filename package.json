@@ -69,6 +69,7 @@
     "bench:matrix": "node scripts/bench_matrix.mjs",
     "bench:directories": "node scripts/bench_directory_layouts.mjs",
     "bench:frwiki": "node scripts/frwiki_fixture.mjs all",
+    "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
     "bench:frwiki:lucene-quality": "node scripts/frwiki_lucene_quality.mjs",
     "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js dist/*.js examples/wiki-search/scripts/*.mjs examples/wiki-search/public/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
     "test": "node --test",

@@ -33,8 +33,6 @@ rangefind/
     packs/
       0000.<hash>.bin
   docs/
-    ordinals/
-      0000.<hash>.bin
     pointers/
       0000.<hash>.bin
     pages/
@@ -57,19 +55,6 @@ rangefind/
     directory-pages/
       0000.<hash>.bin.gz
     packs/
-      0000.<hash>.bin
-  typo/
-    manifest.<hash>.json
-    directory-root.<hash>.bin.gz
-    directory-pages/
-      0000.<hash>.bin.gz
-    packs/
-      0000.<hash>.bin
-    lexicon/
-      directory-root.<hash>.bin.gz
-      directory-pages/
-        0000.<hash>.bin.gz
-    lexicon-packs/
       0000.<hash>.bin
 ```
 
@@ -96,7 +81,7 @@ that can be fetched independently is described by the same pointer shape:
 ```
 
 Paged directory files use `rfdir-v2`, which stores those pointers next to each
-logical key. Layout-ordered doc pointer tables, doc-page pointer tables,
+logical key. Doc-id-keyed doc pointer tables, doc-page pointer tables,
 doc-value chunks, and external posting blocks embed the same pointer fields in
 their owning metadata. The browser verifies the compressed range bytes against
 the SHA-256 checksum before decompression, so stale CDN objects, partial uploads,
@@ -109,11 +94,11 @@ Pack files, directory pages, and directory roots use content-addressed immutable
 names. The numeric prefix keeps deterministic pack ordering, while the SHA-256
 hash suffix changes whenever the bytes change. Directory pages keep compact
 numeric pack indexes and resolve them through a `pack_table`, so filenames are
-CDN-safe without bloating every logical entry. The optional typo sidecar
-manifest is also content-addressed and referenced from the main manifest; it can
-include both short-token delete-key shards and compact long-token lexicon pages.
-Hosts can serve every hashed object with long-lived immutable cache headers;
-only the main `manifest.json` needs revalidation or versioned publication.
+CDN-safe without bloating every logical entry. Typo correction reuses the main
+term directory and posting packs, so hosts do not need to publish a separate
+correction sidecar. Hosts can serve every hashed object with long-lived
+immutable cache headers; only the main `manifest.json` needs revalidation or
+versioned publication.
 
 The pack writer can perform a narrow ZFS-style deduplication pass at build time.
 When enabled, it hashes each independently compressed object and reuses the same
@@ -153,13 +138,12 @@ chunks in doc-id order and stops after enough matches, preserving the dense
 doc-page payload lane. This gives both value-order pruning for sorted views and
 low-request dense browsing for broad filters.
 
-`docs/ordinals/*.bin` is a tiny fixed-record table keyed directly by numeric
-document id. It maps each document id to its retrieval-local layout ordinal.
-`docs/pointers/*.bin` is a dense fixed-record pointer table in that layout order.
-Result fetching no longer walks a generic string directory for documents. The
-runtime range-fetches small ordinal records, uses them to fetch nearby pointer
-records for text-local result sets, then range-fetches the referenced compressed
-document payloads from `docs/packs/*.bin`.
+`docs/pointers/*.bin` is a dense fixed-record pointer table keyed directly by
+numeric document id. Result fetching no longer walks a generic string directory
+or a separate ordinal table for documents. The builder can still write document
+payload packs in retrieval-local order, but the runtime fetches doc-id pointer
+records directly before range-fetching the referenced compressed payloads from
+`docs/packs/*.bin`.
 
 `docs/pages/*.bin` is a second dense pointer table keyed by document-id page,
 and `docs/page-packs/*.bin` stores `rfdocpagecols-v1` binary column pages in
@@ -194,8 +178,8 @@ directories under `_build/segments/`. Each segment contains a compact term
 directory and append-only posting rows, so the main indexing pass no longer
 builds one global posting run and sorts it at the end. The segment merger reads
 term streams with a heap, merges postings per term in doc-id order, and reuses
-that stream for prefix statistics, query-bundle df, typo index-term emission,
-and final partition emission.
+that stream for prefix statistics, query-bundle df, and final partition
+emission.
 
 `segments/manifest.json.gz` stores `rfsegmentmanifest-v1`, a checksummed
 summary of the immutable segments that produced the published index. The
@@ -298,7 +282,7 @@ counters, and reduce/merge worker timing so large-corpus regressions can be
 compared from the emitted index alone. When `buildProgressLogMs` is non-zero,
 the same telemetry layer writes live phase start, heartbeat, and completion
 lines to stderr with elapsed time, RSS, heap, temp bytes, pack bytes, and
-sidecar bytes. This keeps long scan, reduce, typo, and segment-publish phases
+sidecar bytes. This keeps long scan, reduce, segment-publish, and sidecar phases
 observable before the final telemetry file exists.
 
 Authority fields use the same file-backed run/reduce pattern as postings. Each

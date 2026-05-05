@@ -7,7 +7,7 @@ import { gunzipSync } from "node:zlib";
 import test from "node:test";
 import { build } from "../src/builder.js";
 import { parseDocPagePointerPage } from "../src/doc_pages.js";
-import { parseDocOrdinalTable, parseDocPointerPage } from "../src/doc_pointers.js";
+import { parseDocPointerPage } from "../src/doc_pointers.js";
 import { createSearch } from "../src/runtime.js";
 
 async function serveStatic(root) {
@@ -86,7 +86,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
     maxShardDepth: 3,
     targetShardPostings: 2,
     queryBundles: true,
-    typo: { enabled: true },
+    typoMode: "main-index",
+    typoMaxShardLookups: 12,
     segmentMergeFanIn: 512,
     postingBlockSize: 2,
     postingDocRangeBlockMax: true,
@@ -157,7 +158,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(minimalManifest.doc_values, undefined);
   assert.equal(minimalManifest.optimizer.path, "debug/index-optimizer.json");
   assert.ok(minimalManifest.block_filters);
-  assert.equal(minimalManifest.typo.directory, undefined);
+  assert.equal(minimalManifest.typo, undefined);
+  assert.equal(minimalManifest.search.typo.mode, "main-index");
   assert.equal(minimalManifest.facets.category.count, 5);
   assert.equal(manifest.features.checksummedObjects, true);
   assert.equal(manifest.features.contentAddressedObjects, true);
@@ -181,8 +183,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.docs.layout.raw_spool_bytes > 0);
   assert.ok(manifest.docs.layout.spool_bytes > 0);
   assert.equal(manifest.docs.pointers.format, "rfdocptr-v1");
-  assert.equal(manifest.docs.pointers.order, "layout");
-  assert.equal(manifest.docs.pointers.ordinals.format, "rfdocord-v1");
+  assert.equal(manifest.docs.pointers.order, "doc-id");
+  assert.equal(manifest.docs.pointers.ordinals, undefined);
   assert.equal(manifest.docs.pages.format, "rfdocpage-v1");
   assert.equal(manifest.docs.pages.encoding, "rfdocpagecols-v1");
   assert.deepEqual(manifest.docs.pages.fields, ["id", "title", "url", "category", "tags", "year", "temperature", "published", "featured", "bodySnippet"]);
@@ -190,7 +192,6 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.docs.pages.pointers.order, "doc-id-page");
   assert.equal(manifest.docs.pages.page_size, 32);
   assert.match(manifest.docs.pointers.file, /^docs\/pointers\/0000\.[0-9a-f]{24}\.bin$/u);
-  assert.match(manifest.docs.pointers.ordinals.file, /^docs\/ordinals\/0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.docs.pages.pointers.file, /^docs\/pages\/0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.docs.pointers.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.docs.pages.pointers.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
@@ -288,9 +289,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.stats.field_row_numeric_fields, 3);
   assert.equal(manifest.stats.field_row_boolean_fields, 1);
   assert.equal(manifest.stats.field_row_date_fields, 1);
-  assert.ok(manifest.stats.typo_index_terms > 0);
+  assert.equal(manifest.stats.typo_mode, "main-index");
+  assert.equal(manifest.stats.typo_max_shard_lookups, 12);
   assert.ok(await readFile(join(output, manifest.docs.pointers.file)));
-  assert.ok(await readFile(join(output, manifest.docs.pointers.ordinals.file)));
   assert.ok(await readFile(join(output, manifest.docs.pages.pointers.file)));
   assert.ok(await readFile(join(output, "docs", "packs", manifest.docs.pointers.pack_table[0])));
   assert.ok(await readFile(join(output, "docs", "page-packs", manifest.docs.pages.pointers.pack_table[0])));
@@ -347,9 +348,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, manifest.facet_dictionaries.directory.root)));
   assert.match(manifest.facet_dictionaries.directory.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.ok(await readFile(join(output, "facets", "packs", manifest.facet_dictionaries.directory.pack_table[0])));
-  assert.match(manifest.typo.manifest, /^typo\/manifest\.[0-9a-f]{24}\.json$/u);
-  assert.ok(await readFile(join(output, manifest.typo.manifest)));
-  assert.ok(await readFile(join(output, manifest.typo.directory.root)));
+  assert.equal(manifest.typo, undefined);
+  assert.equal(manifest.search.typo.mode, "main-index");
+  assert.equal((await readdir(output)).includes("typo"), false);
 
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());
@@ -499,12 +500,12 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(deletionTypo.results[0].title, "Static range search");
   assert.equal(deletionTypo.correctedQuery, "static range search");
   assert.equal(deletionTypo.stats.typoApplied, true);
-  assert.equal(deletionTypo.stats.typoShardLookups, 1);
+  assert.ok(deletionTypo.stats.typoShardLookups <= 12);
 
   const stemmedTypo = await search.search({ q: "elecrtified winding insulation", size: 3 });
   assert.equal(stemmedTypo.results[0].title, "Electrified winding insulation");
   assert.equal(stemmedTypo.stats.typoApplied, true);
-  assert.ok(stemmedTypo.stats.typoLexiconShardLookups > 0);
+  assert.ok(stemmedTypo.stats.typoCandidateTermsScanned > 0);
 
   const surfaceFallback = await search.search({ q: "paris", size: 3 });
   assert.equal(surfaceFallback.results[0].title, "Pariser cannon");
@@ -571,8 +572,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   const pointerTable = parseDocPointerPage(await readFile(join(output, manifest.docs.pointers.file)), {
     packTable: manifest.docs.pointers.pack_table
   });
-  const ordinalTable = parseDocOrdinalTable(await readFile(join(output, manifest.docs.pointers.ordinals.file)));
-  const firstDocPointer = pointerTable.entries[ordinalTable.entries[0]];
+  const firstDocPointer = pointerTable.entries[0];
   const docPack = join(output, "docs", "packs", firstDocPointer.pack);
   const corrupted = Buffer.from(await readFile(docPack));
   corrupted[firstDocPointer.offset] ^= 0xff;
@@ -604,7 +604,7 @@ test("builder can reduce posting partitions in worker-owned packs", async (t) =>
     postingBlockSize: 1,
     partitionReducerWorkers: 2,
     queryBundles: false,
-    typo: false,
+    typoMode: "off",
     baseShardDepth: 1,
     maxShardDepth: 2,
     targetShardPostings: 1,
@@ -885,6 +885,7 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
     baseShardDepth: 1,
     maxShardDepth: 1,
     targetShardPostings: 1000,
+    postingOrder: "impact",
     postingBlockSize: 1,
     blockFilterMaxFacetWords: 1,
     externalPostingBlockMinBlocks: 1,
@@ -988,6 +989,51 @@ test("runtime refills high-df posting block windows in batches", async (t) => {
   assert.equal(largePageFallback.stats.plannerFallbackReason, "top_k_limit");
   assert.equal(largePageFallback.stats.topKProofFailureReason, "top_k_limit");
   assert.equal(largePageFallback.stats.topKProofAttempts, 0);
+});
+
+test("doc-id posting order uses remaining suffix block max for tail proof", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-docid-suffix-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "0", title: "Low zero", body: "needle low", url: "/0" }),
+    JSON.stringify({ id: "1", title: "Low one", body: "needle low", url: "/1" }),
+    JSON.stringify({ id: "2", title: "Low two", body: "needle low", url: "/2" }),
+    JSON.stringify({ id: "3", title: "Low three", body: "needle low", url: "/3" }),
+    JSON.stringify({ id: "4", title: "Needle champion", body: "needle high", url: "/4" }),
+    JSON.stringify({ id: "5", title: "Low five", body: "needle low", url: "/5" })
+  ].join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    queryBundles: false,
+    authority: [],
+    postingOrder: "doc-id",
+    postingBlockSize: 2,
+    postingDocRangeBlockMax: false,
+    postingImpactTiers: false,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0,
+    fields: [
+      { name: "title", path: "title", weight: 20.0, b: 0.0 },
+      { name: "body", path: "body", weight: 1.0, b: 0.0 }
+    ],
+    display: ["title", "url"]
+  }));
+
+  await build({ configPath });
+  const manifest = JSON.parse(await readFile(join(output, "manifest.json"), "utf8"));
+  assert.equal(manifest.stats.posting_order, "doc-id");
+  const server = await serveStatic(join(root, "public"));
+  t.after(() => server.close());
+  const search = await createSearch({ baseUrl: server.baseUrl });
+  const fast = await search.search({ q: "needle", size: 1, rerank: false });
+  const exact = await search.search({ q: "needle", size: 1, exact: true, rerank: false });
+  assert.equal(exact.results[0].id, "4");
+  assert.equal(fast.results[0].id, exact.results[0].id);
+  assert.ok(fast.stats.blocksDecoded >= 3);
+  assert.equal(fast.stats.topKProven, true);
 });
 
 test("doc-range planner batches candidate blocks with inner proof stats", async (t) => {

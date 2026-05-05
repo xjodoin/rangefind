@@ -1,12 +1,10 @@
 import { parentPort } from "node:worker_threads";
-import { analyzeDocumentTerms, fieldIndexText } from "./scoring.js";
-import { surfacePairsForFields } from "./typo.js";
+import { analyzeDocumentTerms } from "./scoring.js";
 
 function analyzeDoc(doc, index, config, avgLens) {
   return {
     index,
-    selectedTerms: analyzeDocumentTerms(doc, config, avgLens),
-    typoSurfacePairs: [...surfacePairsForFields(doc, config.fields, (source, field) => fieldIndexText(source, field, config))]
+    selectedTerms: analyzeDocumentTerms(doc, config, avgLens)
   };
 }
 

@@ -39,9 +39,9 @@ a large thesis corpus.
   build telemetry.
 - Minimal runtime manifest with lazy full-manifest and telemetry sidecars.
 - Browser runtime with adaptive HTTP `Range` coalescing and bounded overfetch.
-- Optional typo-tolerance sidecar using delete-key shards for short tokens and
-  compact lexicon pages for longer tokens, fetched only when an exact first-page
-  query returns no results.
+- Main-index typo correction that uses bounded vocabulary shard probes and
+  executes only the strongest corrected searches when first-page results are
+  empty or weak.
 - Multi-value keyword facets with lazy dictionary loading.
 - Range-addressed typed numeric, date, and boolean doc-values for filters and
   sorting.
@@ -142,6 +142,13 @@ Create `rangefind.config.json`:
   "targetPostingsPerDoc": 12,
   "bodyIndexChars": 6000,
   "alwaysIndexFields": ["title", "category"],
+  "typoMode": "main-index",
+  "typoTrigger": "zero-or-weak",
+  "typoMaxEdits": 2,
+  "typoMaxTokenCandidates": 8,
+  "typoMaxQueryPlans": 5,
+  "typoMaxCorrectedSearches": 3,
+  "typoMaxShardLookups": 12,
   "display": ["id", "url", "title", "body", "category", "tags", "year", "published", "featured"],
   "fields": [
     { "name": "title", "path": "title", "weight": 4.5, "b": 0.55, "phrase": true },
@@ -161,11 +168,7 @@ Create `rangefind.config.json`:
   ],
   "booleans": [
     { "name": "featured", "path": "featured" }
-  ],
-  "typo": {
-    "enabled": true,
-    "maxEdits": 2
-  }
+  ]
 }
 ```
 
@@ -180,6 +183,10 @@ For large static corpora, `targetPostingsPerDoc` is the body-term budget.
 `bodyIndexChars` caps only the text considered by the indexer, while display
 payload size stays controlled by `display` entries. Terms from
 `alwaysIndexFields` are indexed before the body budget is applied.
+
+`typoMode: "main-index"` uses the normal term vocabulary for typo candidates
+instead of building a separate typo sidecar. Use `typoMode: "off"` to disable
+correction.
 
 `authority` fields build a separate packed sidecar for canonical labels such as
 titles, entity names, product names, slugs, and aliases. The runtime first tries
