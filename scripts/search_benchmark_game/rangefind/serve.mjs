@@ -8,7 +8,28 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(process.env.RANGEFIND_REPO || resolve(here, "../../.."));
 const { createSearch } = await import(pathToFileURL(resolve(repoRoot, "src/runtime.js")).href);
+const { analyzeTerms } = await import(pathToFileURL(resolve(repoRoot, "src/analyzer.js")).href);
 const { serveStatic } = await import(pathToFileURL(resolve(repoRoot, "scripts/bench_support.mjs")).href);
+
+function installFetchLimit(limit) {
+  const max = Math.max(1, Math.floor(Number(limit) || 64));
+  const nativeFetch = globalThis.fetch;
+  let active = 0;
+  const queue = [];
+  globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
+    const run = () => {
+      active++;
+      nativeFetch(input, init)
+        .then(resolve, reject)
+        .finally(() => {
+          active--;
+          queue.shift()?.();
+        });
+    };
+    if (active < max) run();
+    else queue.push(run);
+  });
+}
 
 function normalizeGameQuery(query) {
   return String(query || "")
@@ -33,6 +54,7 @@ function commandCounts(command) {
 }
 
 const indexPath = resolve(process.argv[2] || "index/public/rangefind");
+installFetchLimit(process.env.RANGEFIND_SBG_FETCH_CONCURRENCY);
 const server = await serveStatic(dirname(indexPath));
 const engine = await createSearch({ baseUrl: new URL(`${basename(indexPath)}/`, server.url) });
 
@@ -50,8 +72,17 @@ try {
       stdout.write("UNSUPPORTED\n");
       continue;
     }
-    const response = await engine.search({ q: normalizeGameQuery(rawQuery), size, exact: commandCounts(command) });
-    stdout.write(`${commandCounts(command) ? response.total : 1}\n`);
+    if (commandCounts(command)) {
+      stdout.write("UNSUPPORTED\n");
+      continue;
+    }
+    const q = normalizeGameQuery(rawQuery);
+    if (!analyzeTerms(q).length) {
+      stdout.write("1\n");
+      continue;
+    }
+    await engine.search({ q, size, exact: false });
+    stdout.write("1\n");
   }
 } finally {
   await server.close();

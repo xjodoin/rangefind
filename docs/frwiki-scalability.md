@@ -212,7 +212,11 @@ adapter in `scripts/search_benchmark_game/rangefind/`. Symlink or copy that
 directory into the upstream checkout's `engines/rangefind` directory, set
 `RANGEFIND_REPO=/path/to/rangefind` when needed, and run the normal upstream
 flow with `ENGINES=rangefind`. The adapter implements the expected `clean`,
-`compile`, `index`, and `serve` targets.
+`compile`, `index`, and `serve` targets. Its `index` target preserves the
+builder resume directory unless `RANGEFIND_SBG_FORCE=1` is set. The upstream
+adapter currently reports `UNSUPPORTED` for `COUNT` and `TOP_K_COUNT` commands;
+Rangefind's runtime does not yet expose a postings-only count path, and using
+the exact scorer for broad official queries can materialize too many postings.
 
 Latest local 5k compatibility run:
 

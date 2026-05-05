@@ -20,4 +20,4 @@ index:
 	fi
 
 serve:
-	RANGEFIND_REPO="$(RANGEFIND_REPO)" "$(NODE)" serve.mjs "$(INDEX_DIR)/public/rangefind"
+	@RANGEFIND_REPO="$(RANGEFIND_REPO)" "$(NODE)" serve.mjs "$(INDEX_DIR)/public/rangefind"
