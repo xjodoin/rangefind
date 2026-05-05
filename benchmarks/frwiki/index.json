@@ -1,6 +1,6 @@
 {
   "format": "rffrwikibench-index-v1",
-  "updatedAt": "2026-05-05T14:21:55.655Z",
+  "updatedAt": "2026-05-05T14:55:16.646Z",
   "latest": {
     "runtime:limit-1000000": {
       "format": "rffrwikibench-artifact-v1",
@@ -2007,9 +2007,9 @@
       "kind": "quality",
       "limit": 100000,
       "limitSlug": "limit-100000",
-      "generatedAt": "2026-05-05T14:19:30.117Z",
-      "gitCommit": "884539b-dirty",
-      "historyPath": "benchmarks/frwiki/history/quality/limit-100000/2026-05-05T14-19-30-117Z_884539b-dirty.json",
+      "generatedAt": "2026-05-05T14:55:16.579Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-100000/2026-05-05T14-55-16-579Z_4053ca6-dirty.json",
       "latestPath": "benchmarks/frwiki/latest/quality/limit-100000.json",
       "summary": {
         "judgments": {
@@ -2037,9 +2037,9 @@
       "kind": "quality",
       "limit": 500000,
       "limitSlug": "limit-500000",
-      "generatedAt": "2026-05-05T14:21:55.604Z",
-      "gitCommit": "884539b-dirty",
-      "historyPath": "benchmarks/frwiki/history/quality/limit-500000/2026-05-05T14-21-55-604Z_884539b-dirty.json",
+      "generatedAt": "2026-05-05T14:54:16.197Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-500000/2026-05-05T14-54-16-197Z_4053ca6-dirty.json",
       "latestPath": "benchmarks/frwiki/latest/quality/limit-500000.json",
       "summary": {
         "judgments": {
@@ -21418,6 +21418,186 @@
         "typoHit10": 0.675,
         "typoMrr10": 0.6396250000000001,
         "typoAppliedRate": 0.72,
+        "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rffrwikiquality-artifact-v1",
+      "kind": "quality",
+      "limit": 100000,
+      "limitSlug": "limit-100000",
+      "generatedAt": "2026-05-05T14:46:01.325Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-100000/2026-05-05T14-46-01-325Z_4053ca6-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/quality/limit-100000.json",
+      "summary": {
+        "judgments": {
+          "known": 5,
+          "typo": 5,
+          "guard": 1,
+          "typoMutations": {
+            "delete": 2,
+            "insert": 1,
+            "substitute": 1,
+            "transpose": 1,
+            "accent": 0,
+            "french": 0
+          }
+        },
+        "knownHit10": 1,
+        "typoHit10": 1,
+        "typoMrr10": 1,
+        "typoAppliedRate": 1,
+        "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rffrwikiquality-artifact-v1",
+      "kind": "quality",
+      "limit": 100000,
+      "limitSlug": "limit-100000",
+      "generatedAt": "2026-05-05T14:47:26.846Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-100000/2026-05-05T14-47-26-846Z_4053ca6-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/quality/limit-100000.json",
+      "summary": {
+        "judgments": {
+          "known": 200,
+          "typo": 200,
+          "guard": 50,
+          "typoMutations": {
+            "delete": 57,
+            "insert": 34,
+            "substitute": 33,
+            "transpose": 33,
+            "accent": 10,
+            "french": 33
+          }
+        },
+        "knownHit10": 1,
+        "typoHit10": 0.72,
+        "typoMrr10": 0.6909583333333331,
+        "typoAppliedRate": 0.75,
+        "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rffrwikiquality-artifact-v1",
+      "kind": "quality",
+      "limit": 100000,
+      "limitSlug": "limit-100000",
+      "generatedAt": "2026-05-05T14:48:25.544Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-100000/2026-05-05T14-48-25-544Z_4053ca6-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/quality/limit-100000.json",
+      "summary": {
+        "judgments": {
+          "known": 200,
+          "typo": 200,
+          "guard": 50,
+          "typoMutations": {
+            "delete": 57,
+            "insert": 34,
+            "substitute": 33,
+            "transpose": 33,
+            "accent": 10,
+            "french": 33
+          }
+        },
+        "knownHit10": 1,
+        "typoHit10": 0.72,
+        "typoMrr10": 0.6909583333333331,
+        "typoAppliedRate": 0.75,
+        "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rffrwikiquality-artifact-v1",
+      "kind": "quality",
+      "limit": 500000,
+      "limitSlug": "limit-500000",
+      "generatedAt": "2026-05-05T14:50:50.652Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-500000/2026-05-05T14-50-50-652Z_4053ca6-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/quality/limit-500000.json",
+      "summary": {
+        "judgments": {
+          "known": 200,
+          "typo": 200,
+          "guard": 50,
+          "typoMutations": {
+            "delete": 57,
+            "insert": 34,
+            "substitute": 33,
+            "transpose": 33,
+            "accent": 10,
+            "french": 33
+          }
+        },
+        "knownHit10": 1,
+        "typoHit10": 0.675,
+        "typoMrr10": 0.6396250000000001,
+        "typoAppliedRate": 0.72,
+        "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rffrwikiquality-artifact-v1",
+      "kind": "quality",
+      "limit": 500000,
+      "limitSlug": "limit-500000",
+      "generatedAt": "2026-05-05T14:54:16.197Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-500000/2026-05-05T14-54-16-197Z_4053ca6-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/quality/limit-500000.json",
+      "summary": {
+        "judgments": {
+          "known": 200,
+          "typo": 200,
+          "guard": 50,
+          "typoMutations": {
+            "delete": 57,
+            "insert": 34,
+            "substitute": 33,
+            "transpose": 33,
+            "accent": 10,
+            "french": 33
+          }
+        },
+        "knownHit10": 1,
+        "typoHit10": 0.675,
+        "typoMrr10": 0.6396250000000001,
+        "typoAppliedRate": 0.72,
+        "guardFalseCorrectionRate": 0
+      }
+    },
+    {
+      "format": "rffrwikiquality-artifact-v1",
+      "kind": "quality",
+      "limit": 100000,
+      "limitSlug": "limit-100000",
+      "generatedAt": "2026-05-05T14:55:16.579Z",
+      "gitCommit": "4053ca6-dirty",
+      "historyPath": "benchmarks/frwiki/history/quality/limit-100000/2026-05-05T14-55-16-579Z_4053ca6-dirty.json",
+      "latestPath": "benchmarks/frwiki/latest/quality/limit-100000.json",
+      "summary": {
+        "judgments": {
+          "known": 200,
+          "typo": 200,
+          "guard": 50,
+          "typoMutations": {
+            "delete": 57,
+            "insert": 34,
+            "substitute": 33,
+            "transpose": 33,
+            "accent": 10,
+            "french": 33
+          }
+        },
+        "knownHit10": 1,
+        "typoHit10": 0.72,
+        "typoMrr10": 0.6909583333333331,
+        "typoAppliedRate": 0.75,
         "guardFalseCorrectionRate": 0
       }
     }

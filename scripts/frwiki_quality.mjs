@@ -24,6 +24,8 @@ function parseArgs(argv) {
     json: false,
     lucene: true,
     forceLucene: false,
+    tantivy: true,
+    forceTantivy: false,
     sidecarBaseline: "",
     runtime: "",
     artifactKind: "quality"
@@ -32,6 +34,8 @@ function parseArgs(argv) {
     if (arg === "--json") args.json = true;
     else if (arg === "--no-lucene") args.lucene = false;
     else if (arg === "--force-lucene") args.forceLucene = true;
+    else if (arg === "--no-tantivy") args.tantivy = false;
+    else if (arg === "--force-tantivy") args.forceTantivy = true;
     else if (arg.startsWith("--root=")) args.root = arg.slice("--root=".length);
     else if (arg.startsWith("--docs=")) args.docs = arg.slice("--docs=".length);
     else if (arg.startsWith("--public=")) args.public = arg.slice("--public=".length);
@@ -245,9 +249,22 @@ function commandAvailable(command) {
   }
 }
 
+function commandWorks(command, commandArgs = ["--version"]) {
+  try {
+    execFileSync(command, commandArgs, { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function run(command, commandArgs, options = {}) {
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(command, commandArgs, { stdio: options.stdio || "inherit", cwd: options.cwd || process.cwd() });
+    const child = spawn(command, commandArgs, {
+      stdio: options.stdio || "inherit",
+      cwd: options.cwd || process.cwd(),
+      env: options.env || process.env
+    });
     child.on("error", rejectRun);
     child.on("close", code => {
       if (code === 0) resolveRun();
@@ -256,16 +273,19 @@ function run(command, commandArgs, options = {}) {
   });
 }
 
+function externalQueries(queries) {
+  return queries
+    .filter(query => query.set === "known" || query.set === "typo")
+    .map(query => ({ set: query.set, label: query.label, q: query.q, expectedTitle: query.expectedTitle }));
+}
+
 async function luceneReport(args, queries) {
   if (!args.lucene) return { skipped: true, reason: "disabled" };
   if (!commandAvailable("mvn") || !commandAvailable("java")) return { skipped: true, reason: "maven_or_java_unavailable" };
   mkdirSync(args.work, { recursive: true });
   const queryPath = resolve(args.work, "queries.json");
   const luceneReportPath = resolve(args.work, "lucene-report.json");
-  const luceneQueries = queries
-    .filter(query => query.set === "known" || query.set === "typo")
-    .map(query => ({ set: query.set, label: query.label, q: query.q, expectedTitle: query.expectedTitle }));
-  writeFileSync(queryPath, JSON.stringify(luceneQueries, null, 2));
+  writeFileSync(queryPath, JSON.stringify(externalQueries(queries), null, 2));
   try {
     const mavenProject = resolve("scripts/lucene_quality/pom.xml");
     const classpathPath = resolve(args.work, "classpath.txt");
@@ -283,6 +303,45 @@ async function luceneReport(args, queries) {
       ...(args.forceLucene ? ["--force"] : [])
     ]);
     return JSON.parse(readFileSync(luceneReportPath, "utf8"));
+  } catch (error) {
+    return { skipped: true, reason: error?.message || String(error) };
+  }
+}
+
+async function tantivyReport(args, queries) {
+  if (!args.tantivy) return { skipped: true, reason: "disabled" };
+  mkdirSync(args.work, { recursive: true });
+  const queryPath = resolve(args.work, "tantivy-queries.json");
+  const tantivyReportPath = resolve(args.work, "tantivy-report.json");
+  writeFileSync(queryPath, JSON.stringify(externalQueries(queries), null, 2));
+  const manifestPath = resolve("scripts/tantivy_quality/Cargo.toml");
+  const indexPath = resolve(args.work, "tantivy-index");
+  const cargoArgs = [
+    "run",
+    "--release",
+    "--manifest-path",
+    manifestPath,
+    "--",
+    resolve(args.docs),
+    indexPath,
+    queryPath,
+    tantivyReportPath,
+    String(args.size),
+    ...(args.forceTantivy ? ["--force"] : [])
+  ];
+  try {
+    const cargo = process.env.TANTIVY_CARGO || "cargo";
+    const cargoEnv = {
+      ...process.env,
+      CARGO_HOME: resolve("scripts/tantivy_quality/target/cargo-home"),
+      CARGO_TARGET_DIR: resolve("scripts/tantivy_quality/target")
+    };
+    if (commandWorks(cargo, ["--version"])) {
+      await run(cargo, cargoArgs, { env: cargoEnv });
+    } else {
+      return { skipped: true, reason: "cargo_unavailable" };
+    }
+    return JSON.parse(readFileSync(tantivyReportPath, "utf8"));
   } catch (error) {
     return { skipped: true, reason: error?.message || String(error) };
   }
@@ -379,6 +438,15 @@ function printSummary(report) {
   console.log(`Rangefind known Hit@10 ${(rf.known.metrics.hit10 * 100).toFixed(1)}% MRR@10 ${rf.known.metrics.mrr10.toFixed(3)}`);
   console.log(`Rangefind typo  Hit@10 ${(rf.typo.metrics.hit10 * 100).toFixed(1)}% MRR@10 ${rf.typo.metrics.mrr10.toFixed(3)} Applied ${(rf.typo.appliedRate * 100).toFixed(1)}%`);
   console.log(`Rangefind guard false corrections ${(rf.guard.falseCorrectionRate * 100).toFixed(1)}%`);
+  const tantivy = report.engines.tantivy;
+  if (tantivy?.profiles) {
+    const best = Object.entries(tantivy.profiles)
+      .map(([name, profile]) => ({ name, typo: profile.typo.metrics.hit10, mrr: profile.typo.metrics.mrr10 }))
+      .sort((a, b) => b.typo - a.typo || b.mrr - a.mrr)[0];
+    if (best) console.log(`Tantivy best typo ${best.name}: Hit@10 ${(best.typo * 100).toFixed(1)}% MRR@10 ${best.mrr.toFixed(3)}`);
+  } else if (tantivy?.skipped) {
+    console.log(`Tantivy skipped: ${tantivy.reason}`);
+  }
   console.log(`Report: ${report.benchmarkArtifact.latestPath}`);
 }
 
@@ -386,6 +454,7 @@ const args = parseArgs(process.argv.slice(2));
 const judgments = await selectJudgments(args);
 const rfRows = await rangefindRows(args, judgments.queries);
 const lucene = await luceneReport(args, judgments.queries);
+const tantivy = await tantivyReport(args, judgments.queries);
 const sidecarBaseline = args.artifactKind === "quality-sidecar" ? null : loadSidecarBaseline(args);
 const report = {
   fixture: "frwiki-quality",
@@ -411,7 +480,8 @@ const report = {
   } : null,
   engines: {
     rangefind: rangefindReport(rfRows),
-    lucene
+    lucene,
+    tantivy
   }
 };
 writeBenchmarkArtifact(args, report);

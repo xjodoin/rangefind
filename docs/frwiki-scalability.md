@@ -143,16 +143,19 @@ the exact exhaustive scorer is not the same final behavior being measured, but
 they still validate expected result counts, selected filters, sort order, and
 runtime-lane flags.
 
-The Lucene quality comparison builds a local Lucene BM25 index over the same
-JSONL fixture and compares known-title and typo judgments against Rangefind:
+The external quality comparison builds local Lucene and Tantivy BM25 indexes
+over the same JSONL fixture and compares known-title and typo judgments against
+Rangefind:
 
 ```bash
-npm run bench:frwiki:lucene-quality -- --root=/tmp/rangefind-frwiki-500k-current
+npm run bench:frwiki:quality -- --root=/tmp/rangefind-frwiki-500k-current
 ```
 
-The report is written to `frwiki-lucene-quality.json` in the fixture root. It
-contains Rangefind, Lucene OR, Lucene AND, and Lucene exact-title-boosted rows
-with Hit@1/Hit@3/Hit@10/MRR@10 metrics.
+The report is written to `benchmarks/frwiki/latest/quality/`. It contains
+Rangefind rows plus Lucene and Tantivy OR, AND, and exact-title-boosted rows
+with Hit@1/Hit@3/Hit@10/MRR@10 metrics. Tantivy also records a bounded
+title-fuzzy profile as a search-engine fuzzy anchor. Install the Rust toolchain
+with Homebrew when the local machine does not already have `cargo`.
 
 Latest 500k quality run with main-index typo correction:
 
@@ -161,6 +164,7 @@ Rangefind known titles:       Hit@10 200/200, MRR@10 0.994
 Rangefind typo judgments:     Hit@10 135/200, MRR@10 0.640
 Removed sidecar baseline:     Hit@10 133/200, MRR@10 0.618
 Lucene title-boost typo:      Hit@10 114/200, MRR@10 0.451
+Tantivy title-fuzzy typo:     Hit@10 137/200, MRR@10 0.501
 Guard false corrections:      0/50
 Typo runtime caps observed:   max 3 corrected searches, max 12 shard lookups
 ```
