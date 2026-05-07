@@ -79,6 +79,28 @@ function finishActiveWriters(id) {
   };
 }
 
+async function reduceOnePartition(common, partition) {
+  const started = performance.now();
+  const { config, filters, id, total, codes, packWriter, blockWriter } = common;
+  const encoded = buildPostingSegmentChunks(partitionTermEntries(partition), total, codes, filters, config, writeBlockWith(blockWriter));
+  const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
+    kind: "posting-segment",
+    codec: encoded.format || POSTING_SEGMENT_FORMAT,
+    logicalLength: encoded.logicalLength,
+    streamMinBytes: config.postingSegmentStreamMinBytes
+  });
+  return {
+    id,
+    name: partition.name,
+    entry: resolvePackEntry(packWriter, entry),
+    stats: encoded.stats,
+    inputBytes: partitionInputBytes(partition),
+    rows: partitionRowCount(partition),
+    terms: partitionTermCount(partition),
+    ms: performance.now() - started
+  };
+}
+
 async function reducePartition(message) {
   const started = performance.now();
   const {
@@ -98,23 +120,20 @@ async function reducePartition(message) {
   const codes = codeStoreForDescriptor(codesDescriptor);
   const packWriter = termWriterFor(termsOutDir, targetBytes, sharedCounter(termPackCounter));
   const blockWriter = blockWriterFor(config, blockOutDir, blockTargetBytes, sharedCounter(blockPackCounter));
-  const encoded = buildPostingSegmentChunks(partitionTermEntries(partition), total, codes, filters, config, writeBlockWith(blockWriter));
-  const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
-    kind: "posting-segment",
-    codec: encoded.format || POSTING_SEGMENT_FORMAT,
-    logicalLength: encoded.logicalLength,
-    streamMinBytes: config.postingSegmentStreamMinBytes
-  });
-  return {
-    id,
-    name: partition.name,
-    entry: resolvePackEntry(packWriter, entry),
-    stats: encoded.stats,
-    inputBytes: partitionInputBytes(partition),
-    rows: partitionRowCount(partition),
-    terms: partitionTermCount(partition),
-    ms: performance.now() - started
-  };
+  if (Array.isArray(message.partitions)) {
+    const common = { config, filters, id, total, codes, packWriter, blockWriter };
+    const results = [];
+    for (const item of message.partitions) results.push(await reduceOnePartition(common, item));
+    return {
+      id,
+      results,
+      inputBytes: results.reduce((sum, result) => sum + (result.inputBytes || 0), 0),
+      rows: results.reduce((sum, result) => sum + (result.rows || 0), 0),
+      terms: results.reduce((sum, result) => sum + (result.terms || 0), 0),
+      ms: performance.now() - started
+    };
+  }
+  return reduceOnePartition({ config, filters, id, total, codes, packWriter, blockWriter }, partition);
 }
 
 parentPort.on("message", async (message) => {

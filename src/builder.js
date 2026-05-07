@@ -2040,8 +2040,8 @@ function postReducePartition(worker, message) {
   });
 }
 
-function createPartitionReducerPool(config) {
-  const count = partitionReducerWorkerCount(config);
+function createPartitionReducerPool(config, countOverride = 0) {
+  const count = Math.max(1, Math.floor(Number(countOverride || partitionReducerWorkerCount(config))));
   const termPackCounterBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const blockPackCounterBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const explicitCredit = Math.max(0, Math.floor(Number(config.partitionReducerInFlightBytes || 0)));
@@ -2101,6 +2101,26 @@ function createPartitionReducerPool(config) {
           entry.inputBytes += result.inputBytes || inputBytes;
           entry.reduceMs += result.ms || 0;
           return { ...result, worker: entry.index };
+        })
+        .finally(() => {
+          activeInputBytes -= inputBytes;
+          active.delete(promise);
+          available.push(entry);
+        });
+      active.add(promise);
+      return promise;
+    },
+    async reduceBatch(partitions, message) {
+      const inputBytes = partitions.reduce((sum, partition) => sum + partitionInputBytes(partition), 0);
+      const entry = await checkoutWorker(inputBytes);
+      const id = nextId++;
+      const promise = postReducePartition(entry.worker, { ...message, id, partitions })
+        .then((result) => {
+          const results = result.results || [];
+          entry.tasks += results.length;
+          entry.inputBytes += result.inputBytes || inputBytes;
+          entry.reduceMs += result.ms || results.reduce((sum, item) => sum + (item.ms || 0), 0);
+          return results.map(item => ({ ...item, worker: entry.index }));
         })
         .finally(() => {
           activeInputBytes -= inputBytes;
@@ -2200,8 +2220,9 @@ async function writePostingRuns(config, measured, dirs) {
 async function reduceRuns(config, measured, runData, dirs) {
   const filters = buildBlockFilters(config, measured.dicts);
   const started = performance.now();
-  const usePartitionWorkers = partitionReducerWorkerCount(config) > 1;
-  const partitionPool = usePartitionWorkers ? createPartitionReducerPool(config) : null;
+  const reducerWorkers = partitionReducerWorkerCount(config);
+  const usePartitionWorkers = reducerWorkers > 1;
+  const partitionPool = usePartitionWorkers ? createPartitionReducerPool(config, reducerWorkers) : null;
   const packWriter = usePartitionWorkers ? null : createAppendOnlyPackWriter(resolve(dirs.out, "terms", "packs"), config.packBytes);
   const directorySpool = createDirectoryEntrySpool(resolve(dirs.build, "terms-directory.run"));
   const blockPackWriter = usePartitionWorkers || config.externalPostingBlocks === false
@@ -2253,7 +2274,27 @@ async function reduceRuns(config, measured, runData, dirs) {
         appendDirectoryEntry(directorySpool, partition.name, entry);
         finalShards.add(partition.name);
         return partition.name;
-      }
+      },
+      onPartitions: usePartitionWorkers ? async (partitions) => {
+        const results = await partitionPool.reduceBatch(partitions, {
+          config,
+          codesDescriptor: workerCodesDescriptor,
+          filters,
+          termsOutDir: resolve(dirs.out, "terms", "packs"),
+          blockOutDir: resolve(dirs.out, "terms", "block-packs"),
+          termPackCounter: partitionPool.termPackCounterBuffer,
+          blockPackCounter: partitionPool.blockPackCounterBuffer,
+          targetBytes: config.packBytes,
+          blockTargetBytes: config.postingBlockPackBytes,
+          total: measured.total
+        });
+        for (const result of results) {
+          addPostingSegmentStats(blockStats, result.stats);
+          appendDirectoryEntry(directorySpool, result.name, result.entry);
+          finalShards.add(result.name);
+        }
+        return results.map(result => result.name);
+      } : null
     });
     if (usePartitionWorkers) partitionOutput = await partitionPool.finish();
   } finally {

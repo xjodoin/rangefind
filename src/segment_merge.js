@@ -367,6 +367,7 @@ export async function mergeSegmentsToPartitions(options) {
     config,
     onTerm,
     onPartition,
+    onPartitions,
     partitionConcurrency = 1
   } = options;
   mkdirSync(scratchDir, { recursive: true });
@@ -386,8 +387,16 @@ export async function mergeSegmentsToPartitions(options) {
     const tierMergeMs = performance.now() - tierStart;
     const partitionStart = performance.now();
     const partitions = [];
+    let pendingBatch = [];
+    let pendingBatchBytes = 0;
     const pendingPartitions = [];
     const activePartitions = new Set();
+    const batchMaxPartitions = onPartitions
+      ? Math.max(1, Math.floor(Number(config.partitionReducerBatchMaxPartitions || 8)))
+      : 1;
+    const batchMaxBytes = onPartitions
+      ? Math.max(1, Math.floor(Number(config.partitionReducerBatchMaxBytes || 1024 * 1024)))
+      : 0;
     function hasCredit(inputBytes) {
       return !creditLimitBytes || activeInputBytes === 0 || activeInputBytes + inputBytes <= creditLimitBytes;
     }
@@ -418,6 +427,64 @@ export async function mergeSegmentsToPartitions(options) {
       activePartitions.add(promise);
       pendingPartitions.push(promise);
       promise.finally(() => activePartitions.delete(promise));
+    }
+    async function queuePartitionBatch(items) {
+      if (!items.length) return;
+      if (!onPartitions || items.length === 1) {
+        for (const item of items) await queuePartition(item);
+        return;
+      }
+      const inputBytes = items.reduce((sum, item) => sum + (item.inputBytes || item.length || 0), 0);
+      const started = performance.now();
+      let waited = false;
+      while (activePartitions.size >= maxConcurrency || !hasCredit(inputBytes)) {
+        waited = true;
+        await Promise.race(activePartitions);
+      }
+      if (waited) {
+        creditWaits++;
+        creditWaitMs += performance.now() - started;
+      }
+      if (creditLimitBytes && inputBytes > creditLimitBytes && activeInputBytes === 0) oversizedPartitions++;
+      activeInputBytes += inputBytes;
+      maxActiveInputBytes = Math.max(maxActiveInputBytes, activeInputBytes);
+      const firstSequence = sequence;
+      sequence += items.length;
+      const promise = Promise.resolve(onPartitions(items, firstSequence))
+        .then(results => {
+          if (!Array.isArray(results) || results.length !== items.length) {
+            throw new Error("Rangefind partition reducer batch returned an unexpected result count.");
+          }
+          for (let i = 0; i < results.length; i++) {
+            partitions.push({ sequence: firstSequence + i, result: results[i] });
+          }
+          return results;
+        })
+        .finally(() => {
+          activeInputBytes -= inputBytes;
+        });
+      activePartitions.add(promise);
+      pendingPartitions.push(promise);
+      promise.finally(() => activePartitions.delete(promise));
+    }
+    async function flushPartitionBatch() {
+      if (!pendingBatch.length) return;
+      const items = pendingBatch;
+      pendingBatch = [];
+      pendingBatchBytes = 0;
+      await queuePartitionBatch(items);
+    }
+    async function queueCompletedPartition(partition) {
+      partitionSpoolBytes += partition.inputBytes;
+      if (!onPartitions || batchMaxPartitions <= 1) {
+        await queuePartition(partition);
+        return;
+      }
+      pendingBatch.push(partition);
+      pendingBatchBytes += partition.inputBytes || partition.length || 0;
+      if (pendingBatch.length >= batchMaxPartitions || pendingBatchBytes >= batchMaxBytes) {
+        await flushPartitionBatch();
+      }
     }
     function newStreamingPartition(name) {
       return {
@@ -452,17 +519,16 @@ export async function mergeSegmentsToPartitions(options) {
     for await (const { term, rows } of mergedSegmentTermRows(tiered.segments)) {
       const name = partitionNameForTerm(term, reduced.prefixCounts, config);
       if (current && name !== current.name) {
-        await queuePartition(current);
-        partitionSpoolBytes += current.inputBytes;
+        await queueCompletedPartition(current);
         current = null;
       }
       if (!current) current = newStreamingPartition(name);
       addStreamingPartitionTerm(current, term, rows);
     }
     if (current) {
-      await queuePartition(current);
-      partitionSpoolBytes += current.inputBytes;
+      await queueCompletedPartition(current);
     }
+    await flushPartitionBatch();
     await Promise.all(pendingPartitions);
     return {
       terms: reduced.terms,
