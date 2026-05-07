@@ -6,6 +6,20 @@ function addWeighted(scores, term, weight) {
   scores.set(term, (scores.get(term) || 0) + weight);
 }
 
+function addCount(counts, term) {
+  counts.set(term, (counts.get(term) || 0) + 1);
+}
+
+function termCountsFromTerms(terms) {
+  const counts = new Map();
+  for (const term of terms || []) addCount(counts, term);
+  return counts;
+}
+
+function queryBundleSeedLimit(field, config = {}) {
+  return Math.max(0, Math.floor(Number(field.queryBundleSeedMaxTokens ?? config.queryBundleSeedMaxFieldTokens ?? 512)));
+}
+
 export function fieldText(doc, field) {
   return String(getPath(doc, field.path, ""));
 }
@@ -21,10 +35,23 @@ export function fieldIndexText(doc, field, config = {}) {
   return limit > 0 && !isAlwaysIndexField(field, config) && text.length > limit ? text.slice(0, limit) : text;
 }
 
+export function analyzeFieldText(doc, field, config = {}) {
+  const text = fieldIndexText(doc, field, config);
+  const terms = tokenize(text, { unique: false });
+  return {
+    text,
+    terms,
+    counts: termCountsFromTerms(terms),
+    length: terms.length
+  };
+}
+
 export function addFieldScores(doc, field, avgLen, scores, options = {}) {
-  const text = options.text ?? fieldIndexText(doc, field, options.config || {});
-  const counts = termCounts(text);
-  const len = [...counts.values()].reduce((sum, n) => sum + n, 0);
+  const analysis = options.analysis || null;
+  const text = analysis ? analysis.text : options.text ?? fieldIndexText(doc, field, options.config || {});
+  const terms = analysis?.terms || null;
+  const counts = analysis?.counts || termCounts(text);
+  const len = analysis?.length ?? [...counts.values()].reduce((sum, n) => sum + n, 0);
   const b = field.b ?? 0.75;
   const norm = 1 - b + b * (len / Math.max(1, avgLen));
   for (const [term, tf] of counts) {
@@ -32,10 +59,10 @@ export function addFieldScores(doc, field, avgLen, scores, options = {}) {
   }
 
   if (field.phrase) {
-    const terms = tokenize(text, { unique: false });
+    const phraseTerms = terms || tokenize(text, { unique: false });
     for (const n of [2, 3]) {
-      for (let i = 0; i <= terms.length - n; i++) {
-        addWeighted(scores, terms.slice(i, i + n).join("_"), field.phraseWeight ?? 8);
+      for (let i = 0; i <= phraseTerms.length - n; i++) {
+        addWeighted(scores, phraseTerms.slice(i, i + n).join("_"), field.phraseWeight ?? 8);
       }
     }
   }
@@ -43,8 +70,8 @@ export function addFieldScores(doc, field, avgLen, scores, options = {}) {
 
 export function addFieldExpansionScores(doc, field, scores, options = {}) {
   if (!field.proximity && !field.proximityWeight) return;
-  const text = options.text ?? fieldIndexText(doc, field, options.config || {});
-  const terms = tokenize(text, { unique: false }).slice(0, field.maxProximityTokens ?? 96);
+  const text = options.analysis ? options.analysis.text : options.text ?? fieldIndexText(doc, field, options.config || {});
+  const terms = (options.analysis?.terms || tokenize(text, { unique: false })).slice(0, field.maxProximityTokens ?? 96);
   const window = field.proximityWindow ?? 5;
   const weight = field.proximityWeight ?? 3.5;
   const seen = new Set();
@@ -95,19 +122,33 @@ export function selectBudgetedDocTerms(alwaysScores, baseScores, expansionScores
 }
 
 export function analyzeDocumentTerms(doc, config, avgLens) {
+  return analyzeDocumentForIndex(doc, config, avgLens).selectedTerms;
+}
+
+export function analyzeDocumentForIndex(doc, config, avgLens, options = {}) {
   const always = new Map();
   const weighted = new Map();
   const expansion = new Map();
-  for (const field of config.fields) {
-    const text = fieldIndexText(doc, field, config);
-    addFieldScores(doc, field, avgLens[field.name], isAlwaysIndexField(field, config) ? always : weighted, { text, config });
-    if (!isAlwaysIndexField(field, config)) addFieldExpansionScores(doc, field, expansion, { text, config });
+  const alwaysNames = new Set((config.alwaysIndexFields || []).map(String));
+  const includeFieldTerms = Boolean(options.includeFieldTerms);
+  const fieldTerms = includeFieldTerms ? new Array(config.fields.length).fill(null) : null;
+  for (let index = 0; index < config.fields.length; index++) {
+    const field = config.fields[index];
+    const analysis = analyzeFieldText(doc, field, config);
+    const alwaysField = alwaysNames.has(String(field.name || "")) || alwaysNames.has(String(field.path || ""));
+    addFieldScores(doc, field, avgLens[field.name], alwaysField ? always : weighted, { analysis, config });
+    if (!alwaysField) addFieldExpansionScores(doc, field, expansion, { analysis, config });
+    if (includeFieldTerms && field.queryBundles !== false) {
+      const limit = queryBundleSeedLimit(field, config);
+      if (limit) fieldTerms[index] = analysis.terms.slice(0, limit);
+    }
   }
-  return selectBudgetedDocTerms(
+  const selectedTerms = selectBudgetedDocTerms(
     bm25fScores(always, config.bm25fK1),
     bm25fScores(weighted, config.bm25fK1),
     expansion,
     config.targetPostingsPerDoc,
     config.maxExpansionTermsPerDoc
   );
+  return fieldTerms ? { selectedTerms, fieldTerms } : { selectedTerms };
 }

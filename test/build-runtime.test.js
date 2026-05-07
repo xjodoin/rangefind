@@ -180,7 +180,6 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.docs.layout.format, "rflocal-doc-v1");
   assert.equal(manifest.docs.layout.strategy, "primary-base-term-impact");
   assert.ok(manifest.docs.layout.primary_terms > 0);
-  assert.ok(manifest.docs.layout.raw_spool_bytes > 0);
   assert.ok(manifest.docs.layout.spool_bytes > 0);
   assert.equal(manifest.docs.pointers.format, "rfdocptr-v1");
   assert.equal(manifest.docs.pointers.order, "doc-id");
@@ -195,6 +194,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.match(manifest.docs.pages.pointers.file, /^docs\/pages\/0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.docs.pointers.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.docs.pages.pointers.pack_table[0], /^0000\.[0-9a-f]{24}\.bin$/u);
+  assert.match(manifest.object_store.pack_table.docs[0], /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.object_store.pack_table.docPages[0], /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.match(manifest.object_store.pack_table.postingBlocks[0], /^0000\.[0-9a-f]{24}\.bin$/u);
   assert.equal(manifest.directory.format, "rfdir-v2");
@@ -206,8 +206,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.build.memory_samples.every(sample => sample.phase && sample.rss > 0));
   assert.ok(manifest.build.counters.selected_term_spool_bytes > 0);
   assert.ok(manifest.build.counters.selected_term_spool_terms > 0);
-  assert.ok(manifest.build.counters.doc_raw_spool_bytes > 0);
   assert.ok(manifest.build.counters.doc_gzip_spool_bytes > 0);
+  assert.ok(manifest.build.counters.doc_page_spool_bytes > 0);
+  assert.ok(manifest.build.counters.doc_page_spool_pages > 0);
   assert.ok(manifest.build.counters.segment_files > 0);
   assert.ok(manifest.build.counters.segment_postings > 0);
   assert.equal(manifest.build.counters.field_row_fields, 6);
@@ -218,6 +219,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.build.phases.some(phase => phase.name === "scan-and-spool" && phase.ms >= 0 && phase.cpu.user_us >= 0 && phase.peakMemory.rss > 0 && phase.disk.delta.build >= 0));
   assert.ok(manifest.build.phases.some(phase => phase.name === "reduce-postings" && phase.ms >= 0 && phase.disk.delta.final_packs >= 0 && phase.disk.delta.sidecars >= 0));
   assert.ok(manifest.build.phases.some(phase => phase.name === "query-bundles" && phase.ms >= 0));
+  assert.ok(manifest.build.workers.some(group => group.phase === "measure" && group.count === 2 && group.workers.every(worker => worker.mode === "worker-thread")));
   assert.ok(manifest.build.workers.some(group => group.phase === "scan-and-spool" && group.count === 2 && group.workers.every(worker => worker.mode === "worker-thread")));
   assert.ok(manifest.build.workers.some(group => group.phase === "reduce-postings" && group.count >= 1 && group.workers[0].tasks >= 1));
   const telemetryFile = JSON.parse(await readFile(join(root, "build-telemetry.json"), "utf8"));
@@ -227,8 +229,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.build_peak_rss > 0);
   assert.ok(manifest.stats.selected_term_spool_bytes > 0);
   assert.ok(manifest.stats.selected_term_spool_terms > 0);
-  assert.ok(manifest.stats.doc_raw_spool_bytes > 0);
   assert.ok(manifest.stats.doc_gzip_spool_bytes > 0);
+  assert.ok(manifest.stats.doc_page_spool_bytes > 0);
+  assert.ok(manifest.stats.doc_page_spool_pages > 0);
   assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v6");
   assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
   assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
@@ -388,6 +391,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(results.stats.shards > 0);
   assert.equal(results.stats.docPayloadLane, "docPages");
   assert.equal(results.stats.docPayloadAdaptive, true);
+  assert.equal(results.stats.docPayloadForced, false);
 
   const exactResults = await search.search({ q: "static range search", size: 3, exact: true });
   assert.deepEqual(

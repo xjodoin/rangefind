@@ -106,8 +106,20 @@ var DEFAULT_STOPWORDS = /* @__PURE__ */ new Set([
   "votre",
   "vous"
 ]);
+var TOKEN_RE = /[a-z0-9]+/gu;
 function fold(text) {
   return String(text || "").normalize("NFKD").toLowerCase().replace(/[\u0300-\u036f]/g, "").replace(/œ/g, "oe").replace(/æ/g, "ae");
+}
+function isSingleDigit(value) {
+  if (value.length !== 1) return false;
+  const code = value.charCodeAt(0);
+  return code >= 48 && code <= 57;
+}
+function normalizedToken(raw, minLength, stopwords) {
+  if (raw.length < minLength && !isSingleDigit(raw) || stopwords.has(raw)) return "";
+  const token = stem(raw);
+  if (token.length < minLength && !isSingleDigit(token) || stopwords.has(token)) return "";
+  return token;
 }
 function stem(token) {
   if (token.length < 5 || /^\d+$/u.test(token)) return token;
@@ -118,13 +130,17 @@ function tokenize(text, options = {}) {
   const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const unique = options.unique !== false;
   const out = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const raw of fold(text).split(/[^a-z0-9]+/u)) {
-    if (raw.length < minLength && !/^\d$/.test(raw) || stopwords.has(raw)) continue;
-    const token = stem(raw);
-    if (token.length < minLength && !/^\d$/.test(token) || stopwords.has(token)) continue;
-    if (unique && seen.has(token)) continue;
-    seen.add(token);
+  const seen = unique ? /* @__PURE__ */ new Set() : null;
+  const folded = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while (match = TOKEN_RE.exec(folded)) {
+    const token = normalizedToken(match[0], minLength, stopwords);
+    if (!token) continue;
+    if (seen) {
+      if (seen.has(token)) continue;
+      seen.add(token);
+    }
     out.push(token);
   }
   return out;
@@ -134,10 +150,13 @@ function analyzeTerms(text, options = {}) {
   const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const out = [];
   const seen = /* @__PURE__ */ new Set();
-  for (const raw of fold(text).split(/[^a-z0-9]+/u)) {
-    if (raw.length < minLength && !/^\d$/.test(raw) || stopwords.has(raw)) continue;
-    const term = stem(raw);
-    if (term.length < minLength && !/^\d$/.test(term) || stopwords.has(term) || seen.has(term)) continue;
+  const folded = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while (match = TOKEN_RE.exec(folded)) {
+    const raw = match[0];
+    const term = normalizedToken(raw, minLength, stopwords);
+    if (!term || seen.has(term)) continue;
     seen.add(term);
     out.push({ raw, term });
   }
@@ -2731,6 +2750,7 @@ async function createSearch(options = {}) {
           docPayloadPages: resultContext.docPayloadPages,
           docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
           docPayloadAdaptive: resultContext.docPayloadAdaptive,
+          docPayloadForced: resultContext.docPayloadForced,
           rerankCandidates: 0,
           dependencyFeatures: 0,
           dependencyTermsMatched: 0,
@@ -2950,7 +2970,7 @@ async function createSearch(options = {}) {
       try {
         const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
         for (const item of group.items) {
-          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
+          const pointer = decodeDocPagePointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
           item.resolve(pointer);
         }
       } catch (error) {
@@ -4654,6 +4674,7 @@ async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         rerankCandidates: 0,
         dependencyFeatures: 0,
         dependencyTermsMatched: 0,
@@ -5728,6 +5749,7 @@ async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -5908,6 +5930,7 @@ async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -5994,6 +6017,7 @@ async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -6077,6 +6101,7 @@ async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -6420,7 +6445,8 @@ async function createSearch(options = {}) {
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
-        docPayloadAdaptive: resultContext.docPayloadAdaptive
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced
       }
     };
   }

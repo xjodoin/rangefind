@@ -1266,6 +1266,7 @@ export async function createSearch(options = {}) {
           docPayloadPages: resultContext.docPayloadPages,
           docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
           docPayloadAdaptive: resultContext.docPayloadAdaptive,
+          docPayloadForced: resultContext.docPayloadForced,
           rerankCandidates: 0,
           dependencyFeatures: 0,
           dependencyTermsMatched: 0,
@@ -1504,7 +1505,7 @@ export async function createSearch(options = {}) {
       try {
         const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
         for (const item of group.items) {
-          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
+          const pointer = decodeDocPagePointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
           item.resolve(pointer);
         }
       } catch (error) {
@@ -3347,6 +3348,7 @@ export async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         rerankCandidates: 0,
         dependencyFeatures: 0,
         dependencyTermsMatched: 0,
@@ -4526,6 +4528,7 @@ export async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -4725,6 +4728,7 @@ export async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -4818,6 +4822,7 @@ export async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -4907,6 +4912,7 @@ export async function createSearch(options = {}) {
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
         docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced,
         ...reranked.stats
       }
     };
@@ -5282,7 +5288,8 @@ export async function createSearch(options = {}) {
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
-        docPayloadAdaptive: resultContext.docPayloadAdaptive
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced
       }
     };
   }

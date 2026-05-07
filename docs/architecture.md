@@ -140,9 +140,9 @@ low-request dense browsing for broad filters.
 
 `docs/pointers/*.bin` is a dense fixed-record pointer table keyed directly by
 numeric document id. Result fetching no longer walks a generic string directory
-or a separate ordinal table for documents. The builder can still write document
-payload packs in retrieval-local order, but the runtime fetches doc-id pointer
-records directly before range-fetching the referenced compressed payloads from
+or a separate ordinal table for documents. The builder writes document payload
+packs in retrieval-local order, and the runtime fetches doc-id pointer records
+directly before range-fetching the referenced compressed payloads from
 `docs/packs/*.bin`.
 
 `docs/pages/*.bin` is a second dense pointer table keyed by document-id page,
@@ -306,14 +306,14 @@ Document packs contain independently compressed result-display payloads written
 in retrieval-local order. The builder spools compressed payloads to disk during
 ingestion, computes a compact locality record from each document's strongest
 base terms, then assembles final packs by primary term and impact. The dense
-ordinal table preserves direct lookup by original document id. Payloads contain
+pointer table preserves direct lookup by original document id. Payloads contain
 only configured display fields, not necessarily the full indexed text. A display
 object can set `maxChars` to cap a returned string field while the corresponding
 indexed field remains uncapped for scoring. This keeps random result-fetch
 traffic bounded for long documents and avoids over-fetching a whole JSON chunk
-for one result. The same spool is also read into fixed-size doc pages for dense
-metadata browsing; that duplicates display payload bytes, but it removes the
-ordinal and random pointer fan-out when a result page is contiguous enough.
+for one result. The same display payloads are also written into fixed-size doc
+pages for dense metadata browsing; that duplicates payload bytes, but it removes
+random pointer fan-out when a result page is contiguous enough.
 
 ## Retrieval Model
 

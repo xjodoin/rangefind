@@ -32,7 +32,7 @@ import {
 } from "./codec.js";
 import { getPath, readConfig } from "./config.js";
 import { DOC_LAYOUT_FORMAT, docLayoutRecord } from "./doc_layout.js";
-import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, encodeDocPageColumns } from "./doc_pages.js";
+import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, decodeDocPageColumns, encodeDocPageColumns } from "./doc_pages.js";
 import { writeDirectoryFiles, writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
 import { appendDirectoryEntry, createDirectoryEntrySpool, sortedDirectoryEntrySpool } from "./directory_spool.js";
 import {
@@ -51,7 +51,7 @@ import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resol
 import { partitionInputBytes, partitionTermEntries } from "./reduced_terms.js";
 import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
-import { analyzeDocumentTerms, fieldIndexText } from "./scoring.js";
+import { analyzeDocumentForIndex, fieldIndexText } from "./scoring.js";
 import { addSegmentPosting, createSegmentBuilder, finishSegmentBuilder, flushSegment, shouldFlushSegment } from "./segment_builder.js";
 import { mergeSegmentsToPartitions, segmentMergeSummary } from "./segment_merge.js";
 import { writeSegmentManifest } from "./segment_manifest.js";
@@ -121,30 +121,182 @@ function facetValues(doc, facet) {
   }));
 }
 
-async function measure(config) {
-  const fieldTotals = Object.fromEntries(config.fields.map(field => [field.name, 0]));
-  const dicts = Object.fromEntries(config.facets.map(facet => [facet.name, { ids: new Map(), values: [{ value: "", label: "", n: 0 }] }]));
-  let total = 0;
+function createMeasureAccumulator(config) {
+  return {
+    fieldTotals: Object.fromEntries(config.fields.map(field => [field.name, 0])),
+    dicts: Object.fromEntries(config.facets.map(facet => [facet.name, { ids: new Map(), values: [{ value: "", label: "", n: 0 }] }])),
+    total: 0
+  };
+}
+
+function mergeMeasureSummary(accumulator, config, summary) {
+  accumulator.total += summary.total || 0;
+  for (const field of config.fields) {
+    accumulator.fieldTotals[field.name] += summary.fieldTotals?.[field.name] || 0;
+  }
+  for (const facet of config.facets) {
+    const dict = accumulator.dicts[facet.name];
+    for (const item of summary.facets?.[facet.name] || []) {
+      const code = addDict(dict, item.value, item.label);
+      dict.values[code].n += item.n || 0;
+    }
+  }
+}
+
+function finalizeMeasure(accumulator, config, workerStats) {
+  return {
+    total: accumulator.total,
+    avgLens: Object.fromEntries(config.fields.map(field => [
+      field.name,
+      Math.max(1, accumulator.fieldTotals[field.name] / Math.max(1, accumulator.total))
+    ])),
+    dicts: accumulator.dicts,
+    workerStats
+  };
+}
+
+async function measureSequential(config) {
+  const started = performance.now();
+  const accumulator = createMeasureAccumulator(config);
   await eachJsonLine(config.input, async (doc) => {
-    total++;
+    accumulator.total++;
     for (const field of config.fields) {
-      fieldTotals[field.name] += tokenize(fieldIndexText(doc, field, config), { unique: false }).length;
+      accumulator.fieldTotals[field.name] += tokenize(fieldIndexText(doc, field, config), { unique: false }).length;
     }
     for (const facet of config.facets) {
       for (const item of facetValues(doc, facet)) {
-        const code = addDict(dicts[facet.name], item.value, item.label);
-        dicts[facet.name].values[code].n++;
+        const dict = accumulator.dicts[facet.name];
+        const code = addDict(dict, item.value, item.label);
+        dict.values[code].n++;
       }
     }
   });
-  return {
-    total,
-    avgLens: Object.fromEntries(config.fields.map(field => [
-      field.name,
-      Math.max(1, fieldTotals[field.name] / Math.max(1, total))
-    ])),
-    dicts
-  };
+  return finalizeMeasure(accumulator, config, [{
+    worker: 0,
+    docs: accumulator.total,
+    batches: accumulator.total ? 1 : 0,
+    analysisMs: performance.now() - started,
+    mode: "main-thread"
+  }]);
+}
+
+function measureBatchDocs(config) {
+  const fallback = Math.max(512, scanBatchDocs(config) * 4);
+  return Math.max(1, Math.floor(Number(config.measureBatchDocs || fallback)));
+}
+
+function postMeasureBatch(worker, message) {
+  return new Promise((resolveBatch, rejectBatch) => {
+    function cleanup() {
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+    }
+    function onMessage(response) {
+      if (response.id !== message.id) return;
+      cleanup();
+      if (response.error) rejectBatch(new Error(response.error));
+      else resolveBatch(response);
+    }
+    function onError(error) {
+      cleanup();
+      rejectBatch(error);
+    }
+    function onExit(code) {
+      cleanup();
+      if (code !== 0) rejectBatch(new Error(`Rangefind measure worker exited with code ${code}.`));
+    }
+    worker.on("message", onMessage);
+    worker.once("error", onError);
+    worker.once("exit", onExit);
+    worker.postMessage(message);
+  });
+}
+
+async function measureWithWorkers(config) {
+  const workerCount = scanWorkerCount(config);
+  const batchDocs = measureBatchDocs(config);
+  const accumulator = createMeasureAccumulator(config);
+  const workers = Array.from({ length: workerCount }, (_, index) => ({
+    index,
+    worker: new Worker(new URL("./measure_worker.js", import.meta.url), { type: "module" }),
+    docs: 0,
+    batches: 0,
+    inputBytes: 0,
+    analysisMs: 0
+  }));
+  const available = workers.slice();
+  const active = new Set();
+  const pending = new Map();
+  let nextBatch = 0;
+  let nextMerge = 0;
+
+  function drainPending() {
+    while (pending.has(nextMerge)) {
+      const response = pending.get(nextMerge);
+      pending.delete(nextMerge);
+      mergeMeasureSummary(accumulator, config, response);
+      nextMerge++;
+    }
+  }
+
+  async function waitForWorker() {
+    while (!available.length) await Promise.race(active);
+    return available.pop();
+  }
+
+  async function queueBatch(lines) {
+    const entry = await waitForWorker();
+    const id = nextBatch++;
+    const started = performance.now();
+    const promise = postMeasureBatch(entry.worker, { id, lines, config })
+      .then((response) => {
+        entry.docs += response.total || 0;
+        entry.batches++;
+        entry.inputBytes += response.inputBytes || 0;
+        entry.analysisMs += performance.now() - started;
+        pending.set(id, response);
+        drainPending();
+      })
+      .finally(() => {
+        active.delete(promise);
+        available.push(entry);
+      });
+    active.add(promise);
+  }
+
+  try {
+    const rl = createInterface({ input: createReadStream(config.input), crlfDelay: Infinity });
+    let batch = [];
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      batch.push(line);
+      if (batch.length >= batchDocs) {
+        await queueBatch(batch);
+        batch = [];
+      }
+    }
+    if (batch.length) await queueBatch(batch);
+    while (active.size) await Promise.race(active);
+    drainPending();
+    if (pending.size) throw new Error("Rangefind measure workers finished out of order.");
+  } finally {
+    await Promise.allSettled(workers.map(entry => entry.worker.terminate()));
+  }
+
+  return finalizeMeasure(accumulator, config, workers.map(entry => ({
+    worker: entry.index,
+    tasks: entry.batches,
+    docs: entry.docs,
+    batches: entry.batches,
+    inputBytes: entry.inputBytes,
+    analysisMs: entry.analysisMs,
+    mode: "worker-thread"
+  })));
+}
+
+async function measure(config) {
+  return scanWorkerCount(config) > 1 ? measureWithWorkers(config) : measureSequential(config);
 }
 
 function queryBundlesEnabled(config) {
@@ -182,7 +334,7 @@ function addQueryBundleSeed(buffer, baseTerms, selected, docKeys) {
   buffer.counts.set(key, (buffer.counts.get(key) || 0) + 1);
 }
 
-function addQueryBundleSeeds(buffer, selectedTerms, config, doc) {
+function addQueryBundleSeeds(buffer, selectedTerms, config, doc, fieldTerms = null) {
   if (!buffer.enabled) return;
   const selected = new Set(selectedTerms.map(([term]) => term));
   const docKeys = new Set();
@@ -191,10 +343,11 @@ function addQueryBundleSeeds(buffer, selectedTerms, config, doc) {
     if (!isBundlePhraseTerm(term, config)) continue;
     addQueryBundleSeed(buffer, term.split("_"), selected, docKeys);
   }
-  for (const field of config.fields) {
+  for (let fieldIndex = 0; fieldIndex < config.fields.length; fieldIndex++) {
+    const field = config.fields[fieldIndex];
     const limit = Math.max(0, Math.floor(Number(field.queryBundleSeedMaxTokens ?? config.queryBundleSeedMaxFieldTokens ?? 512)));
     if (!limit || field.queryBundles === false) continue;
-    const terms = tokenize(fieldIndexText(doc, field, config), { unique: false }).slice(0, limit);
+    const terms = fieldTerms?.[fieldIndex] || tokenize(fieldIndexText(doc, field, config), { unique: false }).slice(0, limit);
     for (let n = 2; n <= maxTerms; n++) {
       for (let i = 0; i <= terms.length - n; i++) {
         const baseTerms = terms.slice(i, i + n);
@@ -269,34 +422,56 @@ function hashedFile(prefix, hash, suffix) {
 const DOC_SPOOL_ENTRY_BYTES = 24;
 const PACKED_DOC_ENTRY_BYTES = 60;
 
-function createDocSpool(outDir) {
+function createDocSpool(outDir, config = {}) {
   mkdirSync(outDir, { recursive: true });
   const path = resolve(outDir, "payloads.bin");
   const entryPath = resolve(outDir, "payloads.idx");
-  const rawPath = resolve(outDir, "payloads.raw.bin");
-  const rawEntryPath = resolve(outDir, "payloads.raw.idx");
   const layoutPath = resolve(outDir, "layout.jsonl");
+  const pagePath = resolve(outDir, "pages.bin");
+  const pageEntryPath = resolve(outDir, "pages.idx");
   return {
     path,
     entryPath,
-    rawPath,
-    rawEntryPath,
     layoutPath,
     fd: openSync(path, "w"),
     entryFd: openSync(entryPath, "w"),
-    rawFd: openSync(rawPath, "w"),
-    rawEntryFd: openSync(rawEntryPath, "w"),
     layoutFd: openSync(layoutPath, "w"),
     offset: 0,
-    rawOffset: 0,
     bytes: 0,
-    rawBytes: 0,
-    layoutDocs: 0
+    layoutDocs: 0,
+    pagePath,
+    pageEntryPath,
+    pageFd: openSync(pagePath, "w"),
+    pageEntryFd: openSync(pageEntryPath, "w"),
+    pageSize: Math.max(1, Math.floor(Number(config.docPageSize || 32))),
+    pageFields: docPayloadFieldNames(config),
+    pageBuffer: [],
+    pageOffset: 0,
+    pageBytes: 0,
+    pageDocs: 0,
+    pageCount: 0
   };
 }
 
+function flushDocPageSpool(spool) {
+  if (!spool?.pageBuffer?.length || spool.pageFd == null || spool.pageEntryFd == null) return;
+  const source = encodeDocPageColumns(spool.pageBuffer, spool.pageFields || []);
+  writeSync(spool.pageFd, source, 0, source.length, spool.pageOffset);
+  writeDocSpoolEntry(spool.pageEntryFd, spool.pageCount, {
+    offset: spool.pageOffset,
+    length: source.length,
+    logicalLength: source.length
+  });
+  spool.pageOffset += source.length;
+  spool.pageBytes += source.length;
+  spool.pageDocs += spool.pageBuffer.length;
+  spool.pageCount++;
+  spool.pageBuffer.length = 0;
+}
+
 function closeDocSpool(spool) {
-  for (const key of ["fd", "entryFd", "rawFd", "rawEntryFd", "layoutFd"]) {
+  flushDocPageSpool(spool);
+  for (const key of ["fd", "entryFd", "layoutFd", "pageFd", "pageEntryFd"]) {
     if (spool[key] == null) continue;
     closeSync(spool[key]);
     spool[key] = null;
@@ -333,12 +508,6 @@ function readDocSpoolEntry(fd, index) {
 
 function writeSpooledDoc(spool, payload, index, layoutRecord) {
   const bytes = Buffer.from(JSON.stringify(payload));
-  writeSync(spool.rawFd, bytes, 0, bytes.length, spool.rawOffset);
-  writeDocSpoolEntry(spool.rawEntryFd, index, {
-    offset: spool.rawOffset,
-    length: bytes.length,
-    logicalLength: bytes.length
-  });
   const compressed = gzipSync(bytes, { level: 6 });
   writeSync(spool.fd, compressed, 0, compressed.length, spool.offset);
   writeDocSpoolEntry(spool, index, {
@@ -348,10 +517,13 @@ function writeSpooledDoc(spool, payload, index, layoutRecord) {
   });
   writeSync(spool.layoutFd, `${JSON.stringify(layoutRecord)}\n`);
   spool.layoutDocs++;
-  spool.rawOffset += bytes.length;
-  spool.rawBytes += bytes.length;
   spool.offset += compressed.length;
   spool.bytes += compressed.length;
+
+  const expectedIndex = spool.pageDocs + spool.pageBuffer.length;
+  if (index !== expectedIndex) throw new Error(`Rangefind doc page spool expected document ${expectedIndex} but received ${index}.`);
+  spool.pageBuffer.push(payload);
+  if (spool.pageBuffer.length >= spool.pageSize) flushDocPageSpool(spool);
 }
 
 function readSpooledDoc(fd, entry) {
@@ -621,8 +793,7 @@ async function finishDocPacks(out, spool, total, config) {
     compression: "gzip-member",
     layout: {
       ...layout.summary,
-      spool_bytes: spool.bytes,
-      raw_spool_bytes: spool.rawBytes
+      spool_bytes: spool.bytes
     },
     pointers: {
       ...pointerTable.meta,
@@ -640,23 +811,18 @@ async function finishDocPacks(out, spool, total, config) {
 function finishDocPages(out, spool, total, config) {
   const pageSize = Math.max(1, Math.floor(Number(config.docPageSize || 32)));
   const fields = docPayloadFieldNames(config);
-  const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes || config.docPackBytes);
+  const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes);
   const entries = [];
-  const fd = openSync(spool.rawPath, "r");
-  const spoolEntryFd = openSync(spool.rawEntryPath, "r");
+  const fd = openSync(spool.pagePath, "r");
+  const spoolEntryFd = openSync(spool.pageEntryPath, "r");
   try {
     for (let pageStart = 0, pageIndex = 0; pageStart < total; pageStart += pageSize, pageIndex++) {
-      const pageEnd = Math.min(total, pageStart + pageSize);
-      const docs = [];
-      for (let index = pageStart; index < pageEnd; index++) {
-        const entry = readDocSpoolEntry(spoolEntryFd, index);
-        docs.push(JSON.parse(readSpooledDoc(fd, entry).toString("utf8")));
-      }
-      const source = encodeDocPageColumns(docs, fields);
+      const entry = readDocSpoolEntry(spoolEntryFd, pageIndex);
+      const source = readSpooledDoc(fd, entry);
       const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
         kind: "doc-page",
         codec: DOC_PAGE_FORMAT,
-        logicalLength: source.length
+        logicalLength: entry.logicalLength
       });
       entries[pageIndex] = packed;
     }
@@ -689,6 +855,43 @@ function finishDocPages(out, spool, total, config) {
       pack_table: packTable(packWriter.packs)
     },
     packs: packWriter.packs
+  };
+}
+
+function openDocPageSpoolReader(spool, config, cacheLimit = 1024) {
+  const fd = openSync(spool.pagePath, "r");
+  const entryFd = openSync(spool.pageEntryPath, "r");
+  const pageSize = Math.max(1, Math.floor(Number(spool.pageSize || config.docPageSize || 32)));
+  const fields = spool.pageFields || docPayloadFieldNames(config);
+  const maxCachePages = Math.max(1, Math.floor(Number(cacheLimit || 1024)));
+  const cache = new Map();
+
+  function readPage(pageIndex) {
+    if (cache.has(pageIndex)) {
+      const docs = cache.get(pageIndex);
+      cache.delete(pageIndex);
+      cache.set(pageIndex, docs);
+      return docs;
+    }
+    const entry = readDocSpoolEntry(entryFd, pageIndex);
+    const docs = decodeDocPageColumns(readSpooledDoc(fd, entry), fields, pageIndex * pageSize);
+    cache.set(pageIndex, docs);
+    while (cache.size > maxCachePages) cache.delete(cache.keys().next().value);
+    return docs;
+  }
+
+  return {
+    doc(index) {
+      const pageIndex = Math.floor(index / pageSize);
+      const page = readPage(pageIndex);
+      const doc = page[index - pageIndex * pageSize];
+      if (!doc) throw new Error(`Rangefind doc page spool is missing document ${index}.`);
+      return doc;
+    },
+    close() {
+      closeSync(fd);
+      closeSync(entryFd);
+    }
   };
 }
 
@@ -1194,18 +1397,15 @@ function writeSortReplicaDocPages(out, config, replica, rows, spool) {
   const fields = [...new Set([...docPayloadFieldNames(config), "index"])];
   const packBase = `sort-replicas/${replica.id}/docs/page-packs`;
   const pointerBase = `sort-replicas/${replica.id}/docs/pages`;
-  const packWriter = createAppendOnlyPackWriter(resolve(out, packBase), config.sortReplicaDocPagePackBytes || config.docPagePackBytes || config.docPackBytes);
+  const packWriter = createAppendOnlyPackWriter(resolve(out, packBase), config.sortReplicaDocPagePackBytes || config.docPagePackBytes);
   const entries = [];
-  const fd = openSync(spool.rawPath, "r");
-  const spoolEntryFd = openSync(spool.rawEntryPath, "r");
+  const reader = openDocPageSpoolReader(spool, config, config.sortReplicaDocPageSourceCachePages);
   try {
     for (let pageStart = 0, pageIndex = 0; pageStart < rows.length; pageStart += pageSize, pageIndex++) {
       const pageEnd = Math.min(rows.length, pageStart + pageSize);
       const docs = [];
       for (let rank = pageStart; rank < pageEnd; rank++) {
-        const doc = rows[rank].doc;
-        const entry = readDocSpoolEntry(spoolEntryFd, doc);
-        docs.push(JSON.parse(readSpooledDoc(fd, entry).toString("utf8")));
+        docs.push(reader.doc(rows[rank].doc));
       }
       const source = encodeDocPageColumns(docs, fields);
       const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
@@ -1216,8 +1416,7 @@ function writeSortReplicaDocPages(out, config, replica, rows, spool) {
       entries[pageIndex] = packed;
     }
   } finally {
-    closeSync(fd);
-    closeSync(spoolEntryFd);
+    reader.close();
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
@@ -1635,9 +1834,13 @@ function applyAutoPostingLayout(config, measured, runData) {
 }
 
 function analyzeDocForScan(doc, index, config, avgLens) {
+  const analysis = analyzeDocumentForIndex(doc, config, avgLens, {
+    includeFieldTerms: queryBundlesEnabled(config)
+  });
   return {
     index,
-    selectedTerms: analyzeDocumentTerms(doc, config, avgLens)
+    selectedTerms: analysis.selectedTerms,
+    fieldTerms: analysis.fieldTerms || null
   };
 }
 
@@ -1658,7 +1861,7 @@ function consumeScanDoc(state, doc, index, analysis) {
   for (const [term, score] of selectedTerms) {
     addSegmentPosting(segmentBuilder, term, index, Math.max(1, Math.round(score * 1000)));
   }
-  addQueryBundleSeeds(queryBundleSeedBuffer, selectedTerms, config, doc);
+  addQueryBundleSeeds(queryBundleSeedBuffer, selectedTerms, config, doc, analysis.fieldTerms);
   addAuthorityDoc(authorityBuffer, config, doc, index);
 
   if (shouldFlushSegment(segmentBuilder)) {
@@ -1956,7 +2159,7 @@ async function writePostingRuns(config, measured, dirs) {
   const segmentBuilder = createSegmentBuilder(resolve(dirs.build, "segments"), config);
   const queryBundleSeedBuffer = createQueryBundleSeedBuffer(config);
   const authorityBuffer = createAuthorityRunBuffer(config, dirs.authorityRunsOut);
-  const docSpool = createDocSpool(resolve(dirs.build, "docs"));
+  const docSpool = createDocSpool(resolve(dirs.build, "docs"), config);
   const selectedTermSpool = createSelectedTermSpool(resolve(dirs.build, "terms"));
   const state = {
     config,
@@ -2319,7 +2522,7 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
   });
 }
 
-const BUILD_RESUME_SCHEMA_VERSION = 3;
+const BUILD_RESUME_SCHEMA_VERSION = 4;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -2416,7 +2619,8 @@ function serializeMeasured(measured) {
   return {
     total: measured.total,
     avgLens: measured.avgLens,
-    dicts: serializeDicts(measured.dicts)
+    dicts: serializeDicts(measured.dicts),
+    workerStats: measured.workerStats || []
   };
 }
 
@@ -2424,7 +2628,8 @@ function hydrateMeasured(payload) {
   return {
     total: payload.total,
     avgLens: payload.avgLens || {},
-    dicts: hydrateDicts(payload.dicts)
+    dicts: hydrateDicts(payload.dicts),
+    workerStats: payload.workerStats || []
   };
 }
 
@@ -2432,12 +2637,16 @@ function serializeDocSpool(spool) {
   return {
     path: spool.path,
     entryPath: spool.entryPath,
-    rawPath: spool.rawPath,
-    rawEntryPath: spool.rawEntryPath,
     layoutPath: spool.layoutPath,
     bytes: spool.bytes || 0,
-    rawBytes: spool.rawBytes || 0,
-    layoutDocs: spool.layoutDocs || 0
+    layoutDocs: spool.layoutDocs || 0,
+    pagePath: spool.pagePath,
+    pageEntryPath: spool.pageEntryPath,
+    pageSize: spool.pageSize || 0,
+    pageFields: spool.pageFields || [],
+    pageBytes: spool.pageBytes || 0,
+    pageDocs: spool.pageDocs || 0,
+    pageCount: spool.pageCount || 0
   };
 }
 
@@ -2531,6 +2740,10 @@ export async function build({ configPath }) {
       async () => serializeMeasured(await measure(config)),
       hydrateMeasured
     );
+    recordBuildWorkers(telemetry, "measure", measured.workerStats, {
+      configured_workers: scanWorkerCount(config),
+      batch_docs: measureBatchDocs(config)
+    });
     const scanStage = readStage(config, "scan");
     if (scanStage) {
       runData = hydrateScanStage(scanStage, measured);
@@ -2545,8 +2758,9 @@ export async function build({ configPath }) {
     });
     addBuildCounter(telemetry, "selected_term_spool_bytes", runData.selectedTermSpool.bytes);
     addBuildCounter(telemetry, "selected_term_spool_terms", runData.selectedTermSpool.terms);
-    addBuildCounter(telemetry, "doc_raw_spool_bytes", runData.docSpool.rawBytes);
-    addBuildCounter(telemetry, "doc_gzip_spool_bytes", runData.docSpool.bytes);
+    addBuildCounter(telemetry, "doc_gzip_spool_bytes", runData.docSpool.bytes || 0);
+    addBuildCounter(telemetry, "doc_page_spool_bytes", runData.docSpool.pageBytes || 0);
+    addBuildCounter(telemetry, "doc_page_spool_pages", runData.docSpool.pageCount || 0);
     addBuildCounter(telemetry, "segment_files", runData.segments.length);
     addBuildCounter(telemetry, "segment_postings", runData.segmentSummary.postings);
     applyAutoPostingLayout(config, measured, runData);
@@ -2812,8 +3026,9 @@ export async function build({ configPath }) {
       build_peak_rss: buildTelemetry.peak_rss,
       selected_term_spool_bytes: runData.selectedTermSpool.bytes,
       selected_term_spool_terms: runData.selectedTermSpool.terms,
-      doc_raw_spool_bytes: runData.docSpool.rawBytes,
-      doc_gzip_spool_bytes: runData.docSpool.bytes,
+      doc_gzip_spool_bytes: runData.docSpool.bytes || 0,
+      doc_page_spool_bytes: runData.docSpool.pageBytes || 0,
+      doc_page_spool_pages: runData.docSpool.pageCount || 0,
       posting_segment_storage: "range-pack-v1",
       posting_segment_format: POSTING_SEGMENT_FORMAT,
       posting_segment_block_storage: config.externalPostingBlocks === false ? "inline" : "range-pack-v1",

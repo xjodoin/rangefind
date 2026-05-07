@@ -1,10 +1,14 @@
 import { parentPort } from "node:worker_threads";
-import { analyzeDocumentTerms } from "./scoring.js";
+import { analyzeDocumentForIndex } from "./scoring.js";
 
 function analyzeDoc(doc, index, config, avgLens) {
+  const analysis = analyzeDocumentForIndex(doc, config, avgLens, {
+    includeFieldTerms: config.queryBundles !== false && Math.max(0, Number(config.queryBundleMaxKeys || 0)) > 0
+  });
   return {
     index,
-    selectedTerms: analyzeDocumentTerms(doc, config, avgLens)
+    selectedTerms: analysis.selectedTerms,
+    fieldTerms: analysis.fieldTerms || null
   };
 }
 
