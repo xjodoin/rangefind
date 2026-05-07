@@ -12,6 +12,8 @@ export const DEFAULT_STOPWORDS = new Set([
   "vous"
 ]);
 
+const TOKEN_RE = /[a-z0-9]+/gu;
+
 export function fold(text) {
   return String(text || "")
     .normalize("NFKD")
@@ -19,6 +21,19 @@ export function fold(text) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/œ/g, "oe")
     .replace(/æ/g, "ae");
+}
+
+function isSingleDigit(value) {
+  if (value.length !== 1) return false;
+  const code = value.charCodeAt(0);
+  return code >= 48 && code <= 57;
+}
+
+function normalizedToken(raw, minLength, stopwords) {
+  if ((raw.length < minLength && !isSingleDigit(raw)) || stopwords.has(raw)) return "";
+  const token = stem(raw);
+  if ((token.length < minLength && !isSingleDigit(token)) || stopwords.has(token)) return "";
+  return token;
 }
 
 export function stem(token) {
@@ -35,21 +50,32 @@ export function tokenize(text, options = {}) {
   const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const unique = options.unique !== false;
   const out = [];
-  const seen = new Set();
-  for (const raw of fold(text).split(/[^a-z0-9]+/u)) {
-    if ((raw.length < minLength && !/^\d$/.test(raw)) || stopwords.has(raw)) continue;
-    const token = stem(raw);
-    if ((token.length < minLength && !/^\d$/.test(token)) || stopwords.has(token)) continue;
-    if (unique && seen.has(token)) continue;
-    seen.add(token);
+  const seen = unique ? new Set() : null;
+  const folded = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while ((match = TOKEN_RE.exec(folded))) {
+    const token = normalizedToken(match[0], minLength, stopwords);
+    if (!token) continue;
+    if (seen) {
+      if (seen.has(token)) continue;
+      seen.add(token);
+    }
     out.push(token);
   }
   return out;
 }
 
 export function termCounts(text, options = {}) {
+  const minLength = options.minLength ?? 2;
+  const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const counts = new Map();
-  for (const token of tokenize(text, { ...options, unique: false })) {
+  const folded = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while ((match = TOKEN_RE.exec(folded))) {
+    const token = normalizedToken(match[0], minLength, stopwords);
+    if (!token) continue;
     counts.set(token, (counts.get(token) || 0) + 1);
   }
   return counts;
@@ -59,12 +85,13 @@ export function surfaceStemPairs(text, options = {}) {
   const minLength = options.minLength ?? 2;
   const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const pairs = new Map();
-  for (const raw of fold(text).split(/[^a-z0-9]+/u)) {
-    if ((raw.length < minLength && !/^\d$/.test(raw)) || stopwords.has(raw)) continue;
-    const token = stem(raw);
-    if ((token.length >= minLength || /^\d$/.test(token)) && !stopwords.has(token)) {
-      pairs.set(raw, token);
-    }
+  const folded = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while ((match = TOKEN_RE.exec(folded))) {
+    const raw = match[0];
+    const token = normalizedToken(raw, minLength, stopwords);
+    if (token) pairs.set(raw, token);
   }
   return pairs;
 }
@@ -74,10 +101,13 @@ export function analyzeTerms(text, options = {}) {
   const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const out = [];
   const seen = new Set();
-  for (const raw of fold(text).split(/[^a-z0-9]+/u)) {
-    if ((raw.length < minLength && !/^\d$/.test(raw)) || stopwords.has(raw)) continue;
-    const term = stem(raw);
-    if ((term.length < minLength && !/^\d$/.test(term)) || stopwords.has(term) || seen.has(term)) continue;
+  const folded = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while ((match = TOKEN_RE.exec(folded))) {
+    const raw = match[0];
+    const term = normalizedToken(raw, minLength, stopwords);
+    if (!term || seen.has(term)) continue;
     seen.add(term);
     out.push({ raw, term });
   }

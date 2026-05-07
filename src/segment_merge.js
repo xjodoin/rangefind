@@ -101,6 +101,42 @@ async function* mergedSegmentTermRows(segments, onTerm) {
   }
 }
 
+function* mergedSegmentTermStats(segments) {
+  // Builder segments are disjoint doc slices, so directory df values are enough
+  // for prefix planning; the posting rows are decoded only during final reduce.
+  const readers = segments.map((segment, index) => {
+    const data = readSegmentDirectory(segment);
+    return {
+      index,
+      terms: data.terms,
+      position: 0,
+      get current() {
+        return this.terms[this.position] || null;
+      }
+    };
+  });
+  const heap = new MinHeap((left, right) => left.term.localeCompare(right.term) || left.reader - right.reader);
+  for (const reader of readers) {
+    if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
+  }
+
+  while (heap.size) {
+    const first = heap.pop();
+    const term = first.term;
+    const matches = [first.reader];
+    while (heap.size && heap.items[0].term === term) matches.push(heap.pop().reader);
+    let df = 0;
+    for (const readerIndex of matches) {
+      const reader = readers[readerIndex];
+      const entry = reader.current;
+      df += Math.max(0, Math.floor(Number(entry?.df ?? entry?.count ?? 0)));
+      reader.position++;
+      if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
+    }
+    yield { term, df };
+  }
+}
+
 function mergeSortedReaderRows(readers, matches, out) {
   const rowHeap = new MinHeap((left, right) => left.doc - right.doc || left.reader - right.reader);
   for (const readerIndex of matches) {
@@ -153,10 +189,10 @@ async function measureMergedSegmentTerms(segments, config, onTerm) {
   const prefixCounts = new Map();
   let terms = 0;
   let postings = 0;
-  for await (const { term, rows } of mergedSegmentTermRows(segments, onTerm)) {
-    const df = postingRowCount(rows);
+  for (const { term, df } of mergedSegmentTermStats(segments)) {
     terms++;
     postings += df;
+    onTerm?.(term, df);
     addPrefixCounts(prefixCounts, term, df, config);
   }
   return { terms, postings, prefixCounts };
