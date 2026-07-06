@@ -1978,6 +1978,11 @@ async function createSearch(options = {}) {
   }
   const postingBlockFrontier = Math.max(1, Math.min(16, Math.floor(Number(options.postingBlockFrontier || POSTING_BLOCK_FRONTIER))));
   const topKProofCheckInterval = Math.max(1, Math.min(4096, Math.floor(Number(options.topKProofCheckInterval || 1))));
+  const topKProofCheckIntervalMax = Math.max(
+    topKProofCheckInterval,
+    Math.min(4096, Math.floor(Number(options.topKProofCheckIntervalMax || 32)))
+  );
+  const topKProofCheckScoresPerBlock = Math.max(1, Math.floor(Number(options.topKProofCheckScoresPerBlock || 2048)));
   const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget || 0)));
   const docValueSortPageBatchSize = Math.max(1, Math.min(
     64,
@@ -5838,19 +5843,27 @@ async function createSearch(options = {}) {
     let frontierWantedBlocks = 0;
     let frontierMax = 0;
     let filterSummaryProofBlocks = 0;
+    let currentProofInterval = topKProofCheckInterval;
     let blocksSinceProofCheck = topKProofCheckInterval;
     let budgetExhausted = false;
     const proofStats = createTopKProofStats({ hasFilters, blockFilterPlan });
+    function proofFailed() {
+      blocksSinceProofCheck = 0;
+      currentProofInterval = Math.min(
+        topKProofCheckIntervalMax,
+        Math.max(topKProofCheckInterval, Math.floor(scores.size / topKProofCheckScoresPerBlock))
+      );
+    }
     while (true) {
       const active = cursors.filter((cursor) => advanceCursor(cursor, blockFilterPlan));
       if (!active.length) {
         exhausted = true;
         break;
       }
-      if (blocksSinceProofCheck >= topKProofCheckInterval) {
+      if (blocksSinceProofCheck >= currentProofInterval) {
         stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
-        blocksSinceProofCheck = 0;
         if (stable) break;
+        proofFailed();
       }
       active.sort((a, b) => cursorSuperblockImpact(b) - cursorSuperblockImpact(a) || cursorImpact(b) - cursorImpact(a));
       const frontier = active.slice(0, postingBlockFrontier);
@@ -5872,10 +5885,10 @@ async function createSearch(options = {}) {
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRows(cursor, rows2, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
         blocksSinceProofCheck++;
-        if (blocksSinceProofCheck >= topKProofCheckInterval) {
+        if (blocksSinceProofCheck >= currentProofInterval) {
           stable = stableTopK(scores, hits, masks, cursors, minShouldMatch, candidateK, blockFilterPlan, proofStats);
-          blocksSinceProofCheck = 0;
           if (stable) break;
+          proofFailed();
         }
         if (topKBlockBudget > 0 && blocksDecoded >= topKBlockBudget) {
           budgetExhausted = true;
