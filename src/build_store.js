@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readSync, statSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { docValueFields } from "./codec.js";
 
@@ -208,9 +208,25 @@ function createReader(descriptor, openMode) {
       return {
         ...descriptor,
         dicts: undefined,
-        fields: fields.map(({ fd, indexFd, cache, offset, ...field }) => ({ ...field })),
+        fields: fields.map(({ fd, indexFd, cache, offset, dataView, indexView, ...field }) => ({ ...field })),
         cacheChunks
       };
+    },
+    preload(maxBytes) {
+      const limit = Math.max(0, Math.floor(Number(maxBytes || 0)));
+      let totalBytes = 0;
+      for (const field of fields) {
+        if (field.dataView) continue;
+        totalBytes += statSync(field.path).size;
+        if (field.indexPath) totalBytes += statSync(field.indexPath).size;
+      }
+      if (limit && totalBytes > limit) return false;
+      for (const field of fields) {
+        if (field.dataView) continue;
+        field.dataView = readFileSync(field.path);
+        if (field.indexPath) field.indexView = readFileSync(field.indexPath);
+      }
+      return true;
     },
     close() {
       for (const field of fields) {

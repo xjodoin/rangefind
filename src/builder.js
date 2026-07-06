@@ -770,7 +770,7 @@ async function finishDocPacks(out, spool, total, config) {
   const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
   const entryPath = buildPath(config, "docs", "doc-pack-entries.bin");
   const entryOutFd = openSync(entryPath, "w");
-  const preloadLimit = Math.max(0, Math.floor(Number(config.docPackSpoolPreloadMaxBytes ?? 1536 * 1024 * 1024)));
+  const preloadLimit = Math.max(0, Math.floor(Number(config.docPackSpoolPreloadMaxBytes ?? 2560 * 1024 * 1024)));
   const preload = spool.bytes > 0 && spool.bytes <= preloadLimit;
   const payloadBytes = preload ? readFileSync(spool.path) : null;
   const entryTable = preload ? readFileSync(spool.entryPath) : null;
@@ -3137,6 +3137,7 @@ export async function build({ configPath }) {
       mergePolicy: reduced.mergePolicy,
       publishSegments: true
     }));
+    runData.codes.preload?.(Math.max(0, Math.floor(Number(config.codeStorePreloadMaxBytes ?? 1536 * 1024 * 1024))));
     const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
     addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
     addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
