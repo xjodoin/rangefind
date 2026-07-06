@@ -15,9 +15,9 @@
 </form>
 <div id="out"></div>
 <script type="module">
-  import { createSearch } from "../../../src/runtime.js";
+  import { createSearch } from "./runtime.browser.js";
 
-  const engine = await createSearch({ baseUrl: "./rangefind/" });
+  const engine = await createSearch({ baseUrl: new URL("./rangefind/", location.href).href });
   const form = document.querySelector("#form");
   const input = document.querySelector("#q");
   const out = document.querySelector("#out");

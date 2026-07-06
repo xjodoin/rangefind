@@ -1,6 +1,6 @@
 {
   "name": "rangefind",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",
@@ -54,11 +54,19 @@
     "examples/wiki-search/public/app.js",
     "README.md",
     "LICENSE",
-    "CONTRIBUTING.md"
+    "CONTRIBUTING.md",
+    "examples/osm-geo/README.md",
+    "examples/osm-geo/public/index.html",
+    "examples/osm-geo/public/app.js",
+    "examples/osm-geo/public/styles.css",
+    "examples/wiki-search/scripts/embed.mjs",
+    "CHANGELOG.md",
+    "!scripts/tantivy_quality",
+    "!scripts/lucene_quality"
   ],
   "scripts": {
     "build:browser": "node scripts/build_browser_bundle.mjs",
-    "build:example": "node bin/rangefind.js build --config examples/basic/rangefind.config.json",
+    "build:example": "node scripts/build_browser_bundle.mjs && node bin/rangefind.js build --config examples/basic/rangefind.config.json && cp dist/runtime.browser.js examples/basic/public/runtime.browser.js",
     "build:wiki-site": "npm run build:browser && node examples/wiki-search/scripts/build.mjs",
     "build:wiki-site:full": "npm run build:browser && node examples/wiki-search/scripts/build.mjs --limit=0",
     "build:wiki-site:fr:full": "npm run build:browser && node examples/wiki-search/scripts/build.mjs --dump-url=https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pages-articles.xml.bz2 --wiki=frwiki --limit=0",

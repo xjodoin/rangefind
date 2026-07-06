@@ -85,7 +85,9 @@ they optimize for smaller sites. Rangefind is for the case where you want:
 
 ## Quick Start
 
-Demo: https://xjodoin.github.io/rangefind/
+Demos: https://xjodoin.github.io/rangefind/ — an OpenStreetMap map search
+(175k places with autocomplete, viewport geo queries, and nearest-neighbor)
+and the minimal example, both served as pure static files.
 
 ```bash
 npm install

@@ -3,6 +3,7 @@ dist/*
 !dist/
 !dist/runtime.browser.js
 examples/basic/public/rangefind/
+examples/basic/public/runtime.browser.js
 examples/frwiki/data/
 examples/frwiki/public/
 examples/frwiki/rangefind.config.json

@@ -7,7 +7,9 @@ on:
       - "bin/**"
       - "src/**"
       - "scripts/**"
+      - "site/**"
       - "examples/basic/**"
+      - "examples/osm-geo/**"
       - "package.json"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -34,10 +36,29 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - run: npm run build:example
+
+      - name: Build minimal example
+        run: npm run build:example
+
+      - name: Cache OSM extract
+        uses: actions/cache@v4
+        with:
+          path: examples/osm-geo/data/luxembourg-latest.osm.pbf
+          key: osm-pbf-luxembourg-v1
+
+      - name: Build OSM map demo (Luxembourg)
+        run: node scripts/osm_fixture.mjs all --region=luxembourg --root=examples/osm-geo
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/basic _site/map
+          cp site/index.html _site/index.html
+          cp -R examples/basic/public/. _site/basic/
+          cp -R examples/osm-geo/public/. _site/map/
+
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: examples/basic/public
+          path: _site
       - id: deployment
         uses: actions/deploy-pages@v5

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rangefind — static search over HTTP ranges</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 17px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+      color: #17201b;
+      background: #fbfcfb;
+    }
+    main { max-width: 860px; margin: 0 auto; padding: 48px 20px 64px; }
+    h1 { font-size: 2.2rem; margin: 0 0 6px; }
+    .tagline { color: #4a5a50; margin: 0 0 28px; font-size: 1.08rem; }
+    .demos { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 26px 0; }
+    .demo {
+      display: block;
+      padding: 18px;
+      border: 1px solid #d8ded9;
+      border-radius: 10px;
+      background: #fff;
+      text-decoration: none;
+      color: inherit;
+      box-shadow: 0 8px 24px rgba(23, 32, 27, 0.06);
+    }
+    .demo:hover { border-color: #006b63; }
+    .demo strong { display: block; color: #004c47; margin-bottom: 4px; font-size: 1.05rem; }
+    .demo span { color: #4a5a50; font-size: 0.92rem; }
+    h2 { font-size: 1.15rem; margin: 34px 0 10px; }
+    ul { padding-left: 20px; color: #33413a; }
+    li { margin: 4px 0; }
+    a { color: #006b63; }
+    code { background: #eef2ef; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+    footer { margin-top: 40px; color: #66766c; font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Rangefind</h1>
+    <p class="tagline">
+      A static search engine for large sites: the index is plain files on any
+      static host, and the browser queries it with HTTP <code>Range</code>
+      requests. No server, no search provider.
+    </p>
+
+    <div class="demos">
+      <a class="demo" href="map/">
+        <strong>OSM place search →</strong>
+        <span>175k OpenStreetMap places on a live map: search-as-you-type
+        autocomplete, viewport geo queries, and exact nearest-neighbor —
+        all from static files.</span>
+      </a>
+      <a class="demo" href="basic/">
+        <strong>Minimal example →</strong>
+        <span>The five-document quick-start index: BM25F text search with
+        facets, filters, and typo correction in a single HTML page.</span>
+      </a>
+      <a class="demo" href="https://github.com/xjodoin/rangefind">
+        <strong>Source &amp; docs →</strong>
+        <span>Architecture notes, benchmarks, and the full example projects
+        (Wikipedia search with semantic hybrid retrieval, geo, vectors).</span>
+      </a>
+    </div>
+
+    <h2>What the engine does</h2>
+    <ul>
+      <li>BM25F text search with typo correction and exact-label rescue</li>
+      <li>Facets with per-query counts, typed filters, and sorted browse</li>
+      <li>Search-as-you-type autocomplete (first keystroke ≈ one small fetch)</li>
+      <li>Lucene-style geo queries: viewport, radius, exact nearest-neighbor</li>
+      <li>Hybrid semantic search from an int8 IVF vector index</li>
+      <li>Snippets and highlight ranges, analyzer-consistent</li>
+      <li>Incremental publishing: deltas as new generations, CDN caches intact</li>
+    </ul>
+
+    <h2>Try it on your site</h2>
+    <p>
+      <code>npm install rangefind</code>, point the builder at newline-delimited
+      JSON, and deploy the output directory to any static host that supports
+      HTTP range requests. The <a href="https://github.com/xjodoin/rangefind#build-a-custom-index">README</a>
+      walks through the config.
+    </p>
+
+    <footer>
+      MIT licensed. Map demo data © OpenStreetMap contributors.
+    </footer>
+  </main>
+</body>
+</html>
