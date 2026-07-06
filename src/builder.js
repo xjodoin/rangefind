@@ -706,6 +706,65 @@ function readPackedDocEntry(fd, doc, packFiles) {
   };
 }
 
+function docPageWorkerCount(config) {
+  const explicit = Math.max(0, Math.floor(Number(config.docPageWorkers || 0)));
+  return Math.max(1, explicit || Math.floor(Number(config.builderWorkerCount || 1)));
+}
+
+async function createDocPageWorkerPool(config, options = {}) {
+  const count = Math.max(1, Math.floor(Number(options.count ?? docPageWorkerCount(config))));
+  if (count <= 1) return null;
+  const workers = Array.from({ length: count }, () => new Worker(new URL("./doc_page_worker.js", import.meta.url), { type: "module" }));
+  await Promise.all(workers.map((worker, index) => postScanBatch(worker, {
+    type: "init",
+    id: `init-${index}`,
+    payloadPath: options.payloadPath || null,
+    payloadEntryPath: options.payloadEntryPath || null,
+    fields: options.fields || [],
+    gzipLevel: options.gzipLevel ?? 6
+  })));
+  const available = workers.slice();
+  const waiters = [];
+  let nextId = 0;
+
+  function acquire() {
+    if (available.length) return Promise.resolve(available.pop());
+    return new Promise(resolveWaiter => waiters.push(resolveWaiter));
+  }
+
+  function release(worker) {
+    const waiter = waiters.shift();
+    if (waiter) waiter(worker);
+    else available.push(worker);
+  }
+
+  return {
+    count,
+    async run(message) {
+      const worker = await acquire();
+      try {
+        return await postScanBatch(worker, { ...message, id: nextId++ });
+      } finally {
+        release(worker);
+      }
+    },
+    async close() {
+      await Promise.allSettled(workers.map((worker, index) => postScanBatch(worker, { type: "close", id: `close-${index}` })));
+      await Promise.allSettled(workers.map(worker => worker.terminate()));
+    }
+  };
+}
+
+async function mapWorkerBatchesOrdered(pool, batches, handle) {
+  const inFlight = [];
+  const limit = pool.count + 1;
+  for (const batch of batches) {
+    inFlight.push(pool.run(batch));
+    while (inFlight.length >= limit) await handle(await inFlight.shift());
+  }
+  while (inFlight.length) await handle(await inFlight.shift());
+}
+
 async function finishDocPacks(out, spool, total, config) {
   const layout = await sortedLayoutOrder(spool, total, config);
   const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
@@ -762,27 +821,52 @@ async function finishDocPacks(out, spool, total, config) {
   };
 }
 
-function finishDocPages(out, spool, total, config) {
+async function finishDocPages(out, spool, total, config) {
   const pageSize = Math.max(1, Math.floor(Number(config.docPageSize || 32)));
   const fields = docPayloadFieldNames(config);
   const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "page-packs"), config.docPagePackBytes);
   const entries = [];
   const fd = openSync(spool.pagePath, "r");
   const spoolEntryFd = openSync(spool.pageEntryPath, "r");
+  const pool = await createDocPageWorkerPool(config, { gzipLevel: 6 });
+  const pageCount = Math.ceil(total / pageSize);
   try {
-    for (let pageStart = 0, pageIndex = 0; pageStart < total; pageStart += pageSize, pageIndex++) {
-      const entry = readDocSpoolEntry(spoolEntryFd, pageIndex);
-      const source = readSpooledDoc(fd, entry);
-      const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
-        kind: "doc-page",
-        codec: DOC_PAGE_FORMAT,
-        logicalLength: entry.logicalLength
+    if (pool) {
+      const batchPages = 256;
+      function* sourceBatches() {
+        for (let pageIndex = 0; pageIndex < pageCount; pageIndex += batchPages) {
+          const items = [];
+          for (let page = pageIndex; page < Math.min(pageCount, pageIndex + batchPages); page++) {
+            const entry = readDocSpoolEntry(spoolEntryFd, page);
+            items.push({ key: page, bytes: readSpooledDoc(fd, entry) });
+          }
+          yield { kind: "gzip", items };
+        }
+      }
+      await mapWorkerBatchesOrdered(pool, sourceBatches(), (response) => {
+        for (const item of response.items) {
+          entries[item.key] = writePackedShard(packWriter, docPageKey(item.key), toBatchBuffer(item.compressed), {
+            kind: "doc-page",
+            codec: DOC_PAGE_FORMAT,
+            logicalLength: item.logicalLength
+          });
+        }
       });
-      entries[pageIndex] = packed;
+    } else {
+      for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+        const entry = readDocSpoolEntry(spoolEntryFd, pageIndex);
+        const source = readSpooledDoc(fd, entry);
+        entries[pageIndex] = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
+          kind: "doc-page",
+          codec: DOC_PAGE_FORMAT,
+          logicalLength: entry.logicalLength
+        });
+      }
     }
   } finally {
     closeSync(fd);
     closeSync(spoolEntryFd);
+    await pool?.close();
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
@@ -1302,24 +1386,50 @@ function encodeSortReplicaRankChunk(rows, start, end) {
   return buffer;
 }
 
-function writeSortReplicaRankMap(out, config, replica, rows) {
+async function writeSortReplicaRankMap(out, config, replica, rows) {
   const chunkSize = sortReplicaRankChunkSize(config);
   const basePath = `sort-replicas/${replica.id}/rank-packs`;
   const packWriter = createPackWriter(resolve(out, basePath), config.sortReplicaPackBytes || config.packBytes);
   const chunks = [];
-  for (let start = 0; start < rows.length; start += chunkSize) {
-    const end = Math.min(rows.length, start + chunkSize);
-    const encoded = encodeSortReplicaRankChunk(rows, start, end);
-    const entry = writePackedShard(packWriter, `${replica.id}\u0000${start}`, gzipSync(encoded, { level: 6 }), {
+  const pool = await createDocPageWorkerPool(config, { gzipLevel: 6 });
+
+  function addChunk(start, compressed, logicalLength) {
+    const entry = writePackedShard(packWriter, `${replica.id}\u0000${start}`, compressed, {
       kind: "sort-replica-rank-map",
       codec: SORT_REPLICA_RANK_MAP_FORMAT,
-      logicalLength: encoded.length
+      logicalLength
     });
     chunks.push({
       start,
-      count: end - start,
+      count: Math.min(chunkSize, rows.length - start),
       ...entry
     });
+  }
+
+  if (pool) {
+    try {
+      const batchChunks = 64;
+      function* chunkBatches() {
+        for (let batchStart = 0; batchStart < rows.length; batchStart += chunkSize * batchChunks) {
+          const items = [];
+          const batchEnd = Math.min(rows.length, batchStart + chunkSize * batchChunks);
+          for (let start = batchStart; start < batchEnd; start += chunkSize) {
+            items.push({ key: start, bytes: encodeSortReplicaRankChunk(rows, start, Math.min(rows.length, start + chunkSize)) });
+          }
+          yield { kind: "gzip", items };
+        }
+      }
+      await mapWorkerBatchesOrdered(pool, chunkBatches(), (response) => {
+        for (const item of response.items) addChunk(item.key, toBatchBuffer(item.compressed), item.logicalLength);
+      });
+    } finally {
+      await pool.close();
+    }
+  } else {
+    for (let start = 0; start < rows.length; start += chunkSize) {
+      const encoded = encodeSortReplicaRankChunk(rows, start, Math.min(rows.length, start + chunkSize));
+      addChunk(start, gzipSync(encoded, { level: 6 }), encoded.length);
+    }
   }
   finalizePackWriter(packWriter);
   const packFiles = packTable(packWriter.packs);
@@ -1346,31 +1456,68 @@ function sortReplicaDocPageSize(config) {
   return Math.max(1, Math.floor(Number(config.sortReplicaDocPageSize || config.docPageSize || 32)));
 }
 
-function writeSortReplicaDocPages(out, config, replica, rows, spool) {
+async function writeSortReplicaDocPages(out, config, replica, rows, spool) {
   const pageSize = sortReplicaDocPageSize(config);
   const fields = [...new Set([...docPayloadFieldNames(config), "index"])];
   const packBase = `sort-replicas/${replica.id}/docs/page-packs`;
   const pointerBase = `sort-replicas/${replica.id}/docs/pages`;
   const packWriter = createAppendOnlyPackWriter(resolve(out, packBase), config.sortReplicaDocPagePackBytes || config.docPagePackBytes);
   const entries = [];
-  const reader = openDocPageSpoolReader(spool, config, config.sortReplicaDocPageSourceCachePages);
-  try {
-    for (let pageStart = 0, pageIndex = 0; pageStart < rows.length; pageStart += pageSize, pageIndex++) {
-      const pageEnd = Math.min(rows.length, pageStart + pageSize);
-      const docs = [];
-      for (let rank = pageStart; rank < pageEnd; rank++) {
-        docs.push(reader.doc(rows[rank].doc));
+  const pool = await createDocPageWorkerPool(config, {
+    payloadPath: spool.path,
+    payloadEntryPath: spool.entryPath,
+    fields,
+    gzipLevel: 6
+  });
+  if (pool) {
+    try {
+      const batchPages = 64;
+      const pageCount = Math.ceil(rows.length / pageSize);
+      function* pageBatches() {
+        for (let batchStart = 0; batchStart < pageCount; batchStart += batchPages) {
+          const pages = [];
+          for (let pageIndex = batchStart; pageIndex < Math.min(pageCount, batchStart + batchPages); pageIndex++) {
+            const pageStart = pageIndex * pageSize;
+            const pageEnd = Math.min(rows.length, pageStart + pageSize);
+            const docIds = new Uint32Array(pageEnd - pageStart);
+            for (let rank = pageStart; rank < pageEnd; rank++) docIds[rank - pageStart] = rows[rank].doc;
+            pages.push({ pageIndex, docIds });
+          }
+          yield { kind: "rank-pages", pages };
+        }
       }
-      const source = encodeDocPageColumns(docs, fields);
-      const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
-        kind: "sort-replica-doc-page",
-        codec: DOC_PAGE_FORMAT,
-        logicalLength: source.length
+      await mapWorkerBatchesOrdered(pool, pageBatches(), (response) => {
+        for (const page of response.pages) {
+          entries[page.pageIndex] = writePackedShard(packWriter, docPageKey(page.pageIndex), toBatchBuffer(page.compressed), {
+            kind: "sort-replica-doc-page",
+            codec: DOC_PAGE_FORMAT,
+            logicalLength: page.logicalLength
+          });
+        }
       });
-      entries[pageIndex] = packed;
+    } finally {
+      await pool.close();
     }
-  } finally {
-    reader.close();
+  } else {
+    const reader = openDocPageSpoolReader(spool, config, config.sortReplicaDocPageSourceCachePages);
+    try {
+      for (let pageStart = 0, pageIndex = 0; pageStart < rows.length; pageStart += pageSize, pageIndex++) {
+        const pageEnd = Math.min(rows.length, pageStart + pageSize);
+        const docs = [];
+        for (let rank = pageStart; rank < pageEnd; rank++) {
+          docs.push(reader.doc(rows[rank].doc));
+        }
+        const source = encodeDocPageColumns(docs, fields);
+        const packed = writePackedShard(packWriter, docPageKey(pageIndex), gzipSync(source, { level: 6 }), {
+          kind: "sort-replica-doc-page",
+          codec: DOC_PAGE_FORMAT,
+          logicalLength: source.length
+        });
+        entries[pageIndex] = packed;
+      }
+    } finally {
+      reader.close();
+    }
   }
   finalizePackWriter(packWriter);
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
@@ -1552,10 +1699,11 @@ async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docS
     const docToRank = new Int32Array(measured.total);
     docToRank.fill(-1);
     for (let rank = 0; rank < rows.length; rank++) docToRank[rows[rank].doc] = rank;
-    const rankMap = writeSortReplicaRankMap(dirs.out, config, definition, rows);
-    const docPages = writeSortReplicaDocPages(dirs.out, config, definition, rows, docSpool);
+    const rankMap = await writeSortReplicaRankMap(dirs.out, config, definition, rows);
+    const docPagesPromise = writeSortReplicaDocPages(dirs.out, config, definition, rows, docSpool);
     const segmentData = await buildSortReplicaSegments(config, dirs, selectedTermSpool, definition, docToRank);
     const reduced = await reduceSortReplicaSegments(config, measured, dirs, definition, segmentData, rows.length);
+    const docPages = await docPagesPromise;
 
     aggregate.docs += rows.length;
     aggregate.terms += reduced.termCount;
