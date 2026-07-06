@@ -12,9 +12,12 @@ import {
   numericValue,
   queryBundlesEnabled,
   queryBundleSeedCandidatesForDoc,
+  rawPath,
   suggestEnabled,
-  suggestRowsForDoc
+  suggestRowsForDoc,
+  vectorsEnabled
 } from "./scan_doc.js";
+import { normalizeVector, vectorFromValue } from "./vector_index.js";
 import { analyzeDocumentForIndex } from "./scoring.js";
 import { addSegmentPosting, createSegmentBuilder, finishSegmentBuilder, flushSegment, shouldFlushSegment } from "./segment_builder.js";
 
@@ -31,6 +34,7 @@ function initState(message) {
     pageFields: docPayloadFieldNames(config),
     authorityFields: authorityEnabled(config) ? authorityFields(config) : [],
     suggestEnabled: suggestEnabled(config),
+    vectorsEnabled: vectorsEnabled(config),
     initialResultLimit: Math.max(0, Math.floor(Number(config.initialResultLimit || 0)))
   };
 }
@@ -56,6 +60,15 @@ function processBatch({ id, baseIndex, lines }) {
   // Aggregated per batch so duplicate surfaces (chains, repeated street
   // names) collapse before crossing the worker boundary.
   const suggest = state.suggestEnabled ? new Map() : null;
+  // One dense Float32 block per vector field per batch; a NaN in the first
+  // component marks a missing vector.
+  const vectorsOut = state.vectorsEnabled
+    ? config.vectors.map(field => {
+        const block = new Float32Array(n * field.dims);
+        block.fill(Number.NaN);
+        return block;
+      })
+    : null;
   let pagePayloads = [];
 
   for (let i = 0; i < n; i++) {
@@ -107,6 +120,14 @@ function processBatch({ id, baseIndex, lines }) {
     if (bundleCandidates) {
       bundleCandidates[i] = queryBundleSeedCandidatesForDoc(config, selectedTerms, analysis.fieldTerms, doc);
     }
+    if (vectorsOut) {
+      for (let f = 0; f < config.vectors.length; f++) {
+        const field = config.vectors[f];
+        const vector = vectorFromValue(rawPath(doc, field.path, null), field.dims);
+        const normalized = vector ? normalizeVector(vector) : null;
+        if (normalized) vectorsOut[f].set(normalized, i * field.dims);
+      }
+    }
     if (suggest) {
       for (const [surface, weight, tokenPrefixes] of suggestRowsForDoc(config, doc)) {
         const existing = suggest.get(surface);
@@ -149,6 +170,7 @@ function processBatch({ id, baseIndex, lines }) {
           rows: [...suggest.values()]
         }
       : null,
+    vectors: vectorsOut,
     analysisMs: performance.now() - started
   };
 }

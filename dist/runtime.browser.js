@@ -216,6 +216,8 @@ var GEO_LEAF_PAGE_MAGIC = [82, 70, 71, 76];
 var SUGGEST_ROOT_MAGIC = [82, 70, 83, 82];
 var SUGGEST_BRANCH_PAGE_MAGIC = [82, 70, 83, 66];
 var SUGGEST_PAGE_MAGIC = [82, 70, 83, 71];
+var VECTOR_ROOT_MAGIC = [82, 70, 86, 82];
+var VECTOR_CLUSTER_PAGE_MAGIC = [82, 70, 86, 67];
 function readVarint(bytes, state) {
   let value = 0;
   let multiplier = 1;
@@ -1601,10 +1603,142 @@ function applyHighlights(results, termSet, options = {}) {
   return results;
 }
 
+// src/vector_index.js
+var VECTOR_ROOT_FORMAT = "rfvecroot-v1";
+var VECTOR_CLUSTER_PAGE_FORMAT = "rfveccluster-v1";
+var FORMAT_VERSION3 = 1;
+function vectorFromValue(value, dims) {
+  if (value == null || value === "") return null;
+  let out;
+  if (Array.isArray(value)) {
+    if (value.length !== dims) return null;
+    out = Float32Array.from(value, Number);
+  } else if (typeof value === "string") {
+    const bytes = Buffer.from(value, "base64");
+    if (bytes.length !== dims * 4) return null;
+    out = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
+  } else {
+    return null;
+  }
+  for (let i = 0; i < out.length; i++) {
+    if (!Number.isFinite(out[i])) return null;
+  }
+  return out;
+}
+function normalizeVector(vector) {
+  let norm = 0;
+  for (let i = 0; i < vector.length; i++) norm += vector[i] * vector[i];
+  if (!(norm > 0)) return null;
+  const inverse = 1 / Math.sqrt(norm);
+  for (let i = 0; i < vector.length; i++) vector[i] *= inverse;
+  return vector;
+}
+function dotInt8(query, bytes, offset, dims, scale) {
+  let sum = 0;
+  for (let i = 0; i < dims; i++) sum += query[i] * bytes[offset + i];
+  return sum * scale;
+}
+function applyPermutation(vector, offset, permutation, target) {
+  for (let d = 0; d < permutation.length; d++) target[d] = vector[offset + permutation[d]];
+  return target;
+}
+function readObjectPointer2(bytes, state, packTable, target) {
+  const packIndex = readVarint(bytes, state);
+  target.pack = packTable[packIndex];
+  target.offset = readVarint(bytes, state);
+  target.length = readVarint(bytes, state);
+  target.physicalLength = readVarint(bytes, state);
+  target.logicalLength = readVarint(bytes, state) || null;
+  const algorithm = readUtf8(bytes, state);
+  const value = readUtf8(bytes, state);
+  target.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
+  return target;
+}
+function decodeVectorClusterPage(buffer, expected = {}) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, VECTOR_CLUSTER_PAGE_MAGIC, "Unsupported Rangefind vector cluster page");
+  const state = { pos: VECTOR_CLUSTER_PAGE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind vector cluster page version ${version}`);
+  const field = readUtf8(bytes, state);
+  if (expected.name && expected.name !== field) throw new Error(`Rangefind vector cluster page field mismatch: ${field}`);
+  const clusterIndex = readVarint(bytes, state);
+  const coarseDims = readVarint(bytes, state);
+  const count = readVarint(bytes, state);
+  const view = new DataView(bytes.buffer, bytes.byteOffset);
+  let pos = state.pos;
+  const docs = new Uint32Array(count);
+  for (let i = 0; i < count; i++, pos += 4) docs[i] = view.getUint32(pos, true);
+  const ordinals = new Uint32Array(count);
+  for (let i = 0; i < count; i++, pos += 4) ordinals[i] = view.getUint32(pos, true);
+  const scales = new Float32Array(count);
+  for (let i = 0; i < count; i++, pos += 4) scales[i] = view.getFloat32(pos, true);
+  const codes = new Int8Array(bytes.buffer, bytes.byteOffset + pos, count * coarseDims);
+  pos += count * coarseDims;
+  if (pos !== bytes.length) throw new Error("Rangefind vector cluster page has trailing bytes.");
+  return { field, clusterIndex, coarseDims, count, docs, ordinals, scales, codes };
+}
+function parseVectorRoot(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, VECTOR_ROOT_MAGIC, "Unsupported Rangefind vector root");
+  const state = { pos: VECTOR_ROOT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind vector root version ${version}`);
+  const field = readUtf8(bytes, state);
+  const metric = readUtf8(bytes, state);
+  const dims = readVarint(bytes, state);
+  const coarseDims = readVarint(bytes, state);
+  const total = readVarint(bytes, state);
+  const permutation = new Uint16Array(dims);
+  for (let d = 0; d < dims; d++) permutation[d] = readVarint(bytes, state);
+  const packCount = readVarint(bytes, state);
+  const packTable = new Array(packCount);
+  for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
+  const clusterCount = readVarint(bytes, state);
+  const view = new DataView(bytes.buffer, bytes.byteOffset);
+  const centroidScales = new Float32Array(clusterCount);
+  let pos = state.pos;
+  for (let c = 0; c < clusterCount; c++, pos += 4) centroidScales[c] = view.getFloat32(pos, true);
+  const centroidCodes = new Int8Array(bytes.buffer, bytes.byteOffset + pos, clusterCount * dims);
+  pos += clusterCount * dims;
+  state.pos = pos;
+  const clusters = new Array(clusterCount);
+  for (let c = 0; c < clusterCount; c++) {
+    const count = readVarint(bytes, state);
+    clusters[c] = readObjectPointer2(bytes, state, packTable, { index: c, count });
+  }
+  const refineRowBytes = readVarint(bytes, state);
+  const refineRowsPerPack = readVarint(bytes, state);
+  const refinePackCount = readVarint(bytes, state);
+  const refinePacks = new Array(refinePackCount);
+  for (let i = 0; i < refinePackCount; i++) refinePacks[i] = readUtf8(bytes, state);
+  if (state.pos !== bytes.length) throw new Error("Rangefind vector root has trailing bytes.");
+  return {
+    format: VECTOR_ROOT_FORMAT,
+    pageFormat: VECTOR_CLUSTER_PAGE_FORMAT,
+    field,
+    metric,
+    dims,
+    coarseDims,
+    total,
+    permutation,
+    packTable,
+    clusterCount,
+    centroidScales,
+    centroidCodes,
+    clusters,
+    refine: {
+      rowBytes: refineRowBytes,
+      rowsPerPack: refineRowsPerPack,
+      packs: refinePacks
+    }
+  };
+}
+
 // src/suggest_index.js
 var SUGGEST_ROOT_FORMAT = "rfsuggestroot-v1";
 var SUGGEST_PAGE_FORMAT = "rfsuggestpage-v1";
-var FORMAT_VERSION3 = 1;
+var FORMAT_VERSION4 = 1;
 var FLAG_DISPLAY_EQUALS_KEY = 1;
 function suggestKey(value) {
   return fold(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
@@ -1614,7 +1748,7 @@ function decodeSuggestPage(buffer) {
   assertMagic(bytes, SUGGEST_PAGE_MAGIC, "Unsupported Rangefind suggest page");
   const state = { pos: SUGGEST_PAGE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind suggest page version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest page version ${version}`);
   const count = readVarint(bytes, state);
   const entries = new Array(count);
   let previousKey = "";
@@ -1631,7 +1765,7 @@ function decodeSuggestPage(buffer) {
   if (state.pos !== bytes.length) throw new Error("Rangefind suggest page has trailing bytes.");
   return { count, entries };
 }
-function readObjectPointer2(bytes, state, packTable, target) {
+function readObjectPointer3(bytes, state, packTable, target) {
   const packIndex = readVarint(bytes, state);
   target.pack = packTable[packIndex];
   target.offset = readVarint(bytes, state);
@@ -1648,14 +1782,14 @@ function readPageSummary(bytes, state, packTable, previousMinKey, index) {
   const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
   const maxWeight = readVarint(bytes, state);
   const count = readVarint(bytes, state);
-  return readObjectPointer2(bytes, state, packTable, { index, minKey, maxWeight, count });
+  return readObjectPointer3(bytes, state, packTable, { index, minKey, maxWeight, count });
 }
 function parseSuggestRoot(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, SUGGEST_ROOT_MAGIC, "Unsupported Rangefind suggest root");
   const state = { pos: SUGGEST_ROOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind suggest root version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest root version ${version}`);
   const total = readVarint(bytes, state);
   const pageSize = readVarint(bytes, state);
   const pageCount = readVarint(bytes, state);
@@ -1694,7 +1828,7 @@ function parseSuggestRoot(buffer) {
       const branchCount = readVarint(bytes, state);
       const firstPageIndex = readVarint(bytes, state);
       const branchPageCount = readVarint(bytes, state);
-      branches[i] = readObjectPointer2(bytes, state, packTable, {
+      branches[i] = readObjectPointer3(bytes, state, packTable, {
         index: i,
         minKey,
         maxWeight,
@@ -1713,7 +1847,7 @@ function parseSuggestRoot(buffer) {
   for (let i = 0; i < hotCount; i++) {
     const prefix = readUtf8(bytes, state);
     const count = readVarint(bytes, state);
-    hot.set(prefix, readObjectPointer2(bytes, state, packTable, {
+    hot.set(prefix, readObjectPointer3(bytes, state, packTable, {
       index: pageCount + i,
       prefix,
       count
@@ -1728,7 +1862,7 @@ function decodeSuggestBranchPage(buffer, packTable) {
   assertMagic(bytes, SUGGEST_BRANCH_PAGE_MAGIC, "Unsupported Rangefind suggest branch page");
   const state = { pos: SUGGEST_BRANCH_PAGE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind suggest branch page version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest branch page version ${version}`);
   const branchIndex = readVarint(bytes, state);
   const firstPageIndex = readVarint(bytes, state);
   const count = readVarint(bytes, state);
@@ -2372,6 +2506,8 @@ async function createSearch(options = {}) {
   let suggestRootPromise = null;
   const suggestPageCache = /* @__PURE__ */ new Map();
   const suggestBranchPageCache = /* @__PURE__ */ new Map();
+  const vectorRootCache = /* @__PURE__ */ new Map();
+  const vectorClusterPageCache = /* @__PURE__ */ new Map();
   const sortReplicaDirectoryCache = /* @__PURE__ */ new Map();
   const sortReplicaShardCache = /* @__PURE__ */ new Map();
   const sortReplicaRankCache = /* @__PURE__ */ new Map();
@@ -2421,6 +2557,8 @@ async function createSearch(options = {}) {
     postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     geoLeafPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     suggestPages: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    vectorClusterPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    vectorRefine: { mergeGapBytes: 16 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: 8 },
     ...options.rangePlans || {}
   };
   async function ensureFullManifest() {
@@ -7592,6 +7730,7 @@ async function createSearch(options = {}) {
     return rows;
   }
   async function executeSearch(params = {}) {
+    if (params.vector) return executeHybridSearch(params);
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
@@ -7765,6 +7904,200 @@ async function createSearch(options = {}) {
     }
     return response;
   }
+  function vectorFieldMeta(name) {
+    const fields = manifest.vectors?.fields || {};
+    const fieldNames = Object.keys(fields);
+    if (!fieldNames.length) throw new Error("Rangefind: this index has no vector fields (configure `vectors` at build time).");
+    const field = name || (fieldNames.length === 1 ? fieldNames[0] : "");
+    const meta = fields[field];
+    if (!meta) throw new Error(`Rangefind: unknown vector field "${name || ""}".`);
+    return meta;
+  }
+  async function loadVectorRoot(meta) {
+    if (!vectorRootCache.has(meta.name)) {
+      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseVectorRoot);
+      promise.catch(() => {
+        vectorRootCache.delete(meta.name);
+      });
+      vectorRootCache.set(meta.name, promise);
+    }
+    return vectorRootCache.get(meta.name);
+  }
+  function normalizedQueryVector(value, dims) {
+    const vector = value instanceof Float32Array ? value.length === dims ? Float32Array.from(value) : null : vectorFromValue(value, dims);
+    const normalized = vector ? normalizeVector(vector) : null;
+    if (!normalized) throw new Error(`Rangefind: vector queries need ${dims} finite dimensions.`);
+    return normalized;
+  }
+  async function vectorTopK(params = {}) {
+    const meta = vectorFieldMeta(params.field);
+    const root = await loadVectorRoot(meta);
+    const query = applyPermutation(
+      normalizedQueryVector(params.vector, root.dims),
+      0,
+      root.permutation,
+      new Float32Array(root.dims)
+    );
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const nprobe = Math.max(1, Math.min(root.clusterCount, Math.floor(Number(params.nprobe || 8))));
+    const refineFactor = Math.max(1, Math.min(64, Math.floor(Number(params.refineFactor || 8))));
+    const centroidOrder = [];
+    for (let c = 0; c < root.clusterCount; c++) {
+      centroidOrder.push([c, dotInt8(query, root.centroidCodes, c * root.dims, root.dims, root.centroidScales[c])]);
+    }
+    centroidOrder.sort((a, b) => b[1] - a[1]);
+    const probed = centroidOrder.slice(0, nprobe).map(([c]) => root.clusters[c]);
+    const pageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
+    const pages = await loadPackedPages({
+      field: meta.name,
+      entries: probed,
+      cache: vectorClusterPageCache,
+      cacheKey: (field, index) => `${field} ${index}`,
+      decode: (inflated) => decodeVectorClusterPage(inflated, { name: meta.name }),
+      label: "vector cluster page",
+      packDir: meta.pack_dir,
+      rangePlan: "vectorClusterPages",
+      stats: pageFetchStats
+    });
+    const candidates = [];
+    let scanned = 0;
+    for (const page of pages) {
+      for (let i = 0; i < page.count; i++) {
+        scanned++;
+        candidates.push([
+          page.docs[i],
+          page.ordinals[i],
+          dotInt8(query, page.codes, i * page.coarseDims, page.coarseDims, page.scales[i])
+        ]);
+      }
+    }
+    candidates.sort((a, b) => b[2] - a[2] || a[0] - b[0]);
+    const shortlist = candidates.slice(0, Math.max(k, Math.min(candidates.length, k * refineFactor)));
+    let rows;
+    let refineGroups = 0;
+    if (params.refine === false || !shortlist.length) {
+      rows = shortlist.slice(0, k).map(([doc, , score]) => [doc, score]);
+    } else {
+      const items = shortlist.map(([doc, ordinal, coarseScore]) => ({
+        doc,
+        coarseScore,
+        entry: {
+          pack: root.refine.packs[Math.floor(ordinal / root.refine.rowsPerPack)],
+          offset: ordinal % root.refine.rowsPerPack * root.refine.rowBytes,
+          length: root.refine.rowBytes
+        }
+      }));
+      const groups = rangeGroups(items, "vectorRefine");
+      refineGroups = groups.length;
+      const scored = [];
+      await Promise.all(groups.map(async (group) => {
+        const bytes = new Uint8Array(await fetchRange(new URL(`${meta.refine_pack_dir}/${group.pack}`, baseUrl), group.start, group.end - group.start));
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const codes2 = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        for (const item of group.items) {
+          const at = item.entry.offset - group.start;
+          const scale = view.getFloat32(at, true);
+          scored.push([item.doc, dotInt8(query, codes2, at + 4, root.dims, scale)]);
+        }
+      }));
+      scored.sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+      rows = scored.slice(0, k);
+    }
+    return {
+      rows,
+      stats: {
+        vectorField: meta.name,
+        vectorClusters: root.clusterCount,
+        vectorClustersProbed: nprobe,
+        vectorClusterPagesFetched: pageFetchStats.fetched,
+        vectorCandidatesScanned: scanned,
+        vectorCandidatesRefined: params.refine === false ? 0 : shortlist.length,
+        vectorRefineFetchGroups: refineGroups
+      }
+    };
+  }
+  async function executeVectorSearch(params = {}) {
+    const { rows, stats } = await vectorTopK(params);
+    const resultContext = { hasTextTerms: false, preferDocPages: false };
+    const results = params.includeResults === false ? rows.map(([index, score]) => ({ index, score })) : await rowsToResults(rows, resultContext);
+    return {
+      total: rows.length,
+      results,
+      stats: { ...stats, exact: false, approximate: true }
+    };
+  }
+  async function executeHybridSearch(params) {
+    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
+    const page = Math.max(1, Number(params.page || 1));
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const q = String(params.q || "").trim();
+    const filters = params.filters || {};
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    const [textResponse, vectorResponse] = await Promise.all([
+      q ? executeSearch({ ...params, vector: void 0, hybrid: void 0, highlight: void 0, includeResults: false, size: poolSize, page: 1 }) : null,
+      vectorTopK({ ...params.hybrid || {}, field: params.vectorField, vector: params.vector, k: poolSize })
+    ]);
+    let vectorRows = vectorResponse.rows;
+    if (hasFilters && vectorRows.length) {
+      await ensureFacetDictionaries(filters);
+      const filterPlan = makeDocFilterPlan(filters);
+      const codeData = await valueStoreForFilterPlan(filterPlan, vectorRows.map(([doc]) => doc));
+      vectorRows = vectorRows.filter(([doc]) => passesFilterPlan(doc, codeData, filterPlan));
+    }
+    if (!q) {
+      const offset2 = (page - 1) * size;
+      const rows2 = vectorRows.slice(offset2, offset2 + size);
+      const results2 = await rowsToResults(rows2, { hasTextTerms: false, preferDocPages: false });
+      return {
+        total: vectorRows.length,
+        results: results2,
+        page,
+        size,
+        approximate: true,
+        stats: { ...vectorResponse.stats, exact: false }
+      };
+    }
+    const fused = /* @__PURE__ */ new Map();
+    const addRanked = (list, key) => {
+      list.forEach((doc, rank) => {
+        const entry = fused.get(doc) || { doc, score: 0, lanes: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.lanes[key] = rank + 1;
+        fused.set(doc, entry);
+      });
+    };
+    addRanked((textResponse?.results || []).map((item) => item.index), "text");
+    addRanked(vectorRows.map(([doc]) => doc), "vector");
+    const ranked = [...fused.values()].sort((a, b) => b.score - a.score || a.doc - b.doc);
+    const offset = (page - 1) * size;
+    const rows = ranked.slice(offset, offset + size).map((entry) => [entry.doc, entry.score]);
+    const resultContext = { hasTextTerms: !!q, preferDocPages: false };
+    const results = await rowsToResults(rows, resultContext);
+    for (const result of results) {
+      const entry = fused.get(result.index);
+      if (entry) result.hybrid = entry.lanes;
+    }
+    if (params.highlight && q && results.length) {
+      const highlightOptions = params.highlight === true ? {} : params.highlight;
+      applyHighlights(results, highlightTermSet(q, textResponse?.correctedQuery), highlightOptions);
+    }
+    return {
+      total: ranked.length,
+      results,
+      page,
+      size,
+      approximate: true,
+      stats: {
+        hybrid: true,
+        hybridPool: poolSize,
+        hybridTextResults: textResponse?.results?.length || 0,
+        hybridVectorResults: vectorRows.length,
+        ...vectorResponse.stats,
+        textLane: textResponse?.stats?.plannerLane || (q ? "text" : "none")
+      }
+    };
+  }
   function suggestCandidateRun(summaries, prefix, upper) {
     if (!summaries?.length) return [];
     let lo = 0;
@@ -7936,11 +8269,24 @@ async function createSearch(options = {}) {
       }
     };
   }
+  async function vectorSearch(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("vector.total", () => executeVectorSearch(params)));
+    if (!trace) return response;
+    return {
+      ...response,
+      stats: {
+        ...response.stats || {},
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
+  }
   return {
     manifest,
     search,
     count,
     suggest,
+    vectorSearch,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,

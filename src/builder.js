@@ -33,8 +33,22 @@ import {
   rawPath,
   suggestEnabled,
   suggestRowsForDoc,
-  valueList
+  valueList,
+  vectorsEnabled
 } from "./scan_doc.js";
+import {
+  applyPermutation,
+  encodeVectorClusterPage,
+  encodeVectorRoot,
+  nearestCentroid,
+  normalizeVector,
+  quantizeVector,
+  trainCentroids,
+  trainDimensionPermutation,
+  VECTOR_CLUSTER_PAGE_FORMAT,
+  VECTOR_ROOT_FORMAT,
+  vectorFromValue
+} from "./vector_index.js";
 import {
   addSuggestionRow,
   encodeSuggestBranchPage,
@@ -1663,6 +1677,207 @@ async function writeSuggestIndex(out, config, suggestRows) {
   };
 }
 
+function forEachSpooledVector(spool, dims, handler) {
+  const fd = openSync(spool.file, "r");
+  const rowBytes = dims * 4;
+  const batchRows = 4096;
+  const buffer = Buffer.alloc(batchRows * rowBytes);
+  try {
+    let row = 0;
+    while (row < spool.rows) {
+      const rows = Math.min(batchRows, spool.rows - row);
+      const bytes = rows * rowBytes;
+      if (readSync(fd, buffer, 0, bytes, row * rowBytes) !== bytes) {
+        throw new Error("Rangefind vector spool ended early.");
+      }
+      const block = new Float32Array(buffer.buffer, buffer.byteOffset, rows * dims);
+      for (let i = 0; i < rows; i++) {
+        if (!Number.isNaN(block[i * dims])) handler(row + i, block, i * dims);
+      }
+      row += rows;
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function vectorCoarseDims(config, dims) {
+  const configured = Math.floor(Number(config.vectorCoarseDims || 0));
+  if (configured > 0) return Math.min(dims, Math.max(8, configured));
+  return Math.min(dims, Math.max(Math.min(32, dims), Math.round(dims / 4)));
+}
+
+async function writeVectorIndexes(out, config, vectorSpools) {
+  if (!vectorsEnabled(config) || !vectorSpools?.length) return null;
+  const fields = {};
+  let packBytesTotal = 0;
+  let directoryBytes = 0;
+
+  for (const spoolInfo of vectorSpools) {
+    const field = config.vectors.find(item => item.name === spoolInfo.name);
+    if (!field) continue;
+    const dims = field.dims;
+    const coarseDims = vectorCoarseDims(config, dims);
+    const refineRowBytes = 4 + dims;
+    const refineRowsPerPack = Math.max(1, Math.floor((config.vectorPackBytes || 4 * 1024 * 1024) / refineRowBytes));
+    const fieldDir = safeObjectName(field.name);
+    const refineWriter = createAppendOnlyPackWriter(
+      resolve(out, "vectors", fieldDir, "refine-packs"),
+      refineRowsPerPack * refineRowBytes + 1
+    );
+    const trainSample = Math.max(1000, Math.floor(Number(config.vectorTrainSample || 20000)));
+    const sampleStride = Math.max(1, Math.floor(spoolInfo.rows / trainSample));
+
+    // Pass 1 (sample): collect a strided training sample, learn the
+    // variance-descending dimension permutation (so the coarse prefix used
+    // for candidate ranking carries the most informative components), and
+    // train coarse centroids in permuted space.
+    const sampleRows = [];
+    let sampled = 0;
+    forEachSpooledVector(spoolInfo, dims, (row, block, offset) => {
+      if (sampled % sampleStride === 0 && sampleRows.length < trainSample) {
+        sampleRows.push(Float32Array.from(block.subarray(offset, offset + dims)));
+      }
+      sampled += 1;
+    });
+    const rawSample = new Float32Array(sampleRows.length * dims);
+    for (let i = 0; i < sampleRows.length; i++) rawSample.set(sampleRows[i], i * dims);
+    const permutation = trainDimensionPermutation(rawSample, dims);
+    const sample = new Float32Array(rawSample.length);
+    const permuteScratch = new Float32Array(dims);
+    for (let i = 0; i < sampleRows.length; i++) {
+      sample.set(applyPermutation(rawSample, i * dims, permutation, permuteScratch), i * dims);
+    }
+    const clusterTarget = Math.max(64, Math.floor(Number(config.vectorClusterTargetDocs || 512)));
+    const clusterGoal = Math.max(1, Math.min(4096, Math.ceil(sampled / clusterTarget)));
+    const { centroids, clusterCount } = trainCentroids(sample, dims, clusterGoal, {
+      coarseDims,
+      iterations: Math.max(2, Math.floor(Number(config.vectorKmeansIterations || 6)))
+    });
+
+    // Pass 2: permute each vector, write its refine row (full-dim int8 +
+    // scale, addressed by ordinal), assign it to a centroid, and build the
+    // cluster rows (doc id, ordinal, coarse-prefix scale, int8 codes).
+    const buckets = Array.from({ length: clusterCount }, () => ({ docs: [], ordinals: [], scales: [], codes: [] }));
+    let vectorCount = 0;
+    let chunk = Buffer.alloc(refineRowsPerPack * refineRowBytes);
+    let chunkRows = 0;
+    let chunkIndex = 0;
+    const flushChunk = () => {
+      if (!chunkRows) return;
+      writePackedShard(refineWriter, `refine ${chunkIndex++}`, chunk.subarray(0, chunkRows * refineRowBytes), {
+        kind: "vector-refine-rows",
+        compression: "none",
+        logicalLength: chunkRows * refineRowBytes
+      });
+      chunkRows = 0;
+    };
+    const codesScratch = new Int8Array(dims);
+    forEachSpooledVector(spoolInfo, dims, (row, block, offset) => {
+      const permuted = applyPermutation(block, offset, permutation, permuteScratch);
+      const scale = quantizeVector(permuted, codesScratch, 0);
+      const at = chunkRows * refineRowBytes;
+      chunk.writeFloatLE(scale, at);
+      chunk.set(Buffer.from(codesScratch.buffer, 0, dims), at + 4);
+      chunkRows += 1;
+      if (chunkRows === refineRowsPerPack) flushChunk();
+
+      const cluster = nearestCentroid(permuted, 0, centroids, clusterCount, dims, coarseDims);
+      const bucket = buckets[cluster];
+      const coarse = new Int8Array(coarseDims);
+      const coarseScale = quantizeVector(permuted.subarray(0, coarseDims), coarse, 0);
+      bucket.docs.push(row);
+      bucket.ordinals.push(vectorCount);
+      bucket.scales.push(coarseScale);
+      bucket.codes.push(coarse);
+      vectorCount += 1;
+    });
+    flushChunk();
+    finalizePackWriter(refineWriter);
+
+    const packWriter = createPackWriter(resolve(out, "vectors", fieldDir, "packs"), config.vectorPackBytes || 4 * 1024 * 1024);
+    const clusters = new Array(clusterCount);
+    for (let c = 0; c < clusterCount; c++) {
+      const bucket = buckets[c];
+      const codes = new Int8Array(bucket.docs.length * coarseDims);
+      for (let i = 0; i < bucket.codes.length; i++) codes.set(bucket.codes[i], i * coarseDims);
+      const encoded = encodeVectorClusterPage({
+        field: field.name,
+        clusterIndex: c,
+        coarseDims,
+        docs: bucket.docs,
+        ordinals: bucket.ordinals,
+        scales: bucket.scales,
+        codes
+      });
+      const entry = writePackedShard(packWriter, `${field.name} cluster ${c}`, gzipSync(encoded, { level: 6 }), {
+        kind: "vector-cluster-page",
+        codec: VECTOR_CLUSTER_PAGE_FORMAT,
+        logicalLength: encoded.length
+      });
+      clusters[c] = { count: bucket.docs.length, entry };
+    }
+    finalizePackWriter(packWriter);
+    const packFiles = packTable(packWriter.packs);
+    const packIndexes = new Map(packFiles.map((file, index) => [file, index]));
+    const root = encodeVectorRoot({
+      field: field.name,
+      dims,
+      coarseDims,
+      metric: field.metric,
+      total: vectorCount,
+      permutation,
+      centroids,
+      clusterCount,
+      clusters,
+      refine: {
+        rowBytes: refineRowBytes,
+        rowsPerPack: refineRowsPerPack,
+        packs: packTable(refineWriter.packs)
+      },
+      packTable: packFiles,
+      packIndexes
+    });
+    const compressed = gzipSync(root.buffer, { level: 6 });
+    const hash = sha256Hex(compressed);
+    mkdirSync(resolve(out, "vectors"), { recursive: true });
+    const file = `vectors/${hashedFile(fieldDir, hash, ".bin.gz")}`;
+    writeFileSync(resolve(out, file), compressed);
+    directoryBytes += compressed.length;
+    packBytesTotal += packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0)
+      + refineWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0);
+
+    fields[field.name] = {
+      name: field.name,
+      metric: field.metric,
+      dims,
+      coarse_dims: coarseDims,
+      total: vectorCount,
+      clusters: clusterCount,
+      pack_dir: `vectors/${fieldDir}/packs`,
+      refine_pack_dir: `vectors/${fieldDir}/refine-packs`,
+      directory: {
+        format: VECTOR_ROOT_FORMAT,
+        compression: "gzip-member",
+        file,
+        content_hash: hash,
+        immutable: true,
+        bytes: compressed.length,
+        logical_bytes: root.buffer.length
+      }
+    };
+  }
+
+  return {
+    storage: "range-pack-v1",
+    directory_format: VECTOR_ROOT_FORMAT,
+    page_format: VECTOR_CLUSTER_PAGE_FORMAT,
+    fields,
+    directory_bytes: directoryBytes,
+    pack_bytes: packBytesTotal
+  };
+}
+
 function sortReplicaKey(field, order) {
   return `${field}:${order === "desc" ? "desc" : "asc"}`;
 }
@@ -2461,6 +2676,8 @@ function consumeScanBatch(state, response) {
       mergeSuggestSurface(state.suggestBuffer, surfaces[r], rows[r][0], rows[r][1], rows[r][2] === 1);
     }
   }
+
+  appendVectorBatch(state.vectorSpools, response, n);
 }
 
 function mergeSuggestSurface(buffer, surface, count, weight, tokenPrefixes) {
@@ -2472,6 +2689,53 @@ function mergeSuggestSurface(buffer, surface, count, weight, tokenPrefixes) {
   } else {
     buffer.set(surface, [count, weight, tokenPrefixes ? 1 : 0]);
   }
+}
+
+// Vectors spool straight to disk as fixed-width Float32 rows (NaN in the
+// first component marks a missing vector); millions of embeddings never sit
+// in builder memory.
+function createVectorSpools(config, dirs) {
+  if (!vectorsEnabled(config)) return null;
+  const spools = [];
+  for (const field of config.vectors) {
+    const file = resolve(dirs.build, `vectors-${safeObjectName(field.name)}.f32`);
+    spools.push({ field, file, fd: openSync(file, "w"), rows: 0 });
+  }
+  return spools;
+}
+
+function appendVectorBatch(spools, response, docs) {
+  if (!spools || !response.vectors) return;
+  for (let f = 0; f < spools.length; f++) {
+    const spool = spools[f];
+    const block = response.vectors[f];
+    const buffer = Buffer.from(block.buffer, block.byteOffset, docs * spool.field.dims * 4);
+    writeSync(spool.fd, buffer, 0, buffer.length);
+    spool.rows += docs;
+  }
+}
+
+function appendVectorDoc(spools, config, doc) {
+  if (!spools) return;
+  for (const spool of spools) {
+    const vector = vectorFromValue(rawPath(doc, spool.field.path, null), spool.field.dims);
+    const normalized = vector ? normalizeVector(vector) : null;
+    const row = normalized || (() => {
+      const missing = new Float32Array(spool.field.dims);
+      missing.fill(Number.NaN);
+      return missing;
+    })();
+    writeSync(spool.fd, Buffer.from(row.buffer, row.byteOffset, spool.field.dims * 4));
+    spool.rows += 1;
+  }
+}
+
+function finishVectorSpools(spools) {
+  if (!spools) return null;
+  return spools.map(spool => {
+    closeSync(spool.fd);
+    return { name: spool.field.name, file: spool.file, rows: spool.rows };
+  });
 }
 
 // Spools the aggregated (surface, count, weight, tokenPrefixes) rows so the
@@ -2528,6 +2792,7 @@ function consumeScanDoc(state, doc, index, analysis) {
       mergeSuggestSurface(state.suggestBuffer, surface, 1, weight, tokenPrefixes);
     }
   }
+  appendVectorDoc(state.vectorSpools, config, doc);
 
   if (shouldFlushSegment(segmentBuilder)) {
     flushSegment(segmentBuilder);
@@ -2869,6 +3134,7 @@ async function writePostingRuns(config, measured, dirs) {
     queryBundleSeedBuffer,
     authorityBuffer,
     suggestBuffer: suggestEnabled(config) ? new Map() : null,
+    vectorSpools: createVectorSpools(config, dirs),
     docSpool,
     selectedTermSpool
   };
@@ -2891,6 +3157,7 @@ async function writePostingRuns(config, measured, dirs) {
   const authorityBaseShards = finishAuthorityRuns(authorityBuffer);
   const queryBundleSeeds = finalizeQueryBundleSeeds(queryBundleSeedBuffer, config);
   const suggestRows = finishSuggestRows(state.suggestBuffer, dirs);
+  const vectorSpools = finishVectorSpools(state.vectorSpools);
   return {
     codes,
     initialResults,
@@ -2902,6 +3169,7 @@ async function writePostingRuns(config, measured, dirs) {
     queryBundleTerms: queryBundleTerms(queryBundleSeeds),
     authorityBaseShards,
     suggestRows,
+    vectorSpools,
     scanWorkerStats
   };
 }
@@ -3197,6 +3465,7 @@ function minimalManifest(manifest) {
     sorts: manifest.sorts,
     geo: manifest.geo,
     suggest: manifest.suggest,
+    vectors: manifest.vectors,
     block_filters: manifest.block_filters,
     directory: manifest.directory,
     sort_replicas: manifest.sort_replicas,
@@ -3404,6 +3673,7 @@ function serializeScanStage(runData, measured) {
     queryBundleTerms: runData.queryBundleTerms,
     authorityBaseShards: runData.authorityBaseShards,
     suggestRows: runData.suggestRows,
+    vectorSpools: runData.vectorSpools,
     scanWorkerStats: runData.scanWorkerStats
   };
 }
@@ -3420,6 +3690,7 @@ function hydrateScanStage(payload, measured) {
     queryBundleTerms: payload.queryBundleTerms || [],
     authorityBaseShards: payload.authorityBaseShards || [],
     suggestRows: payload.suggestRows || null,
+    vectorSpools: payload.vectorSpools || null,
     scanWorkerStats: payload.scanWorkerStats || []
   };
 }
@@ -3560,9 +3831,10 @@ export async function build({ configPath }) {
     let facetDictionaries;
     let geoTrees;
     let suggest;
+    let vectors;
     const sidecarStage = readStage(config, "sidecars");
     if (sidecarStage) {
-      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest } = sidecarStage);
+      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest, vectors } = sidecarStage);
     } else {
       sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
       queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
@@ -3573,9 +3845,10 @@ export async function build({ configPath }) {
       docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
       geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows, reduced.filters));
       suggest = await timeBuildPhase(telemetry, "suggest", () => writeSuggestIndex(dirs.out, config, runData.suggestRows));
+      vectors = await timeBuildPhase(telemetry, "vectors", () => writeVectorIndexes(dirs.out, config, runData.vectorSpools));
       filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
       facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
-      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest });
+      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest, vectors });
       maybeFailAfterStage(config, "sidecars");
     }
     addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
@@ -3608,7 +3881,8 @@ export async function build({ configPath }) {
         sortReplicas: sortReplicas.count > 0,
         mainIndexTypo: config.typoMode !== "off",
         geo: !!geoTrees && Object.keys(geoTrees.fields).length > 0,
-        suggest: !!suggest && suggest.total > 0
+        suggest: !!suggest && suggest.total > 0,
+        vectors: !!vectors && Object.keys(vectors.fields).length > 0
       },
     object_store: {
       format: OBJECT_STORE_FORMAT,
@@ -3704,6 +3978,14 @@ export async function build({ configPath }) {
           fields: geoTrees.fields,
           packs: geoTrees.packs.length,
           pack_table: geoTrees.pack_table
+        }
+      : null,
+    vectors: vectors
+      ? {
+          storage: vectors.storage,
+          directory_format: vectors.directory_format,
+          page_format: vectors.page_format,
+          fields: vectors.fields
         }
       : null,
     suggest: suggest

@@ -28,3 +28,4 @@ examples/wiki-search/wiki-search-build-telemetry.json
 target/
 .claude/
 .playwright-mcp/
+examples/vector-bench/

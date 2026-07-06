@@ -440,6 +440,41 @@ Query execution is exact top-k:
 Deeper keystrokes narrow the same key range, so they usually hit pages the
 session already cached and cost zero requests.
 
+## Vector Index
+
+`vectors` config fields build a range-addressed IVF index for cosine
+similarity over embeddings supplied in the JSONL (float arrays or base64
+float32). Vectors are L2-normalized, dimension-permuted variance-descending
+(a permutation learned from the training sample preserves dot products and
+makes the leading dimensions the most informative), and int8-quantized with
+one scale per vector.
+
+```text
+vectors/
+  <field>.<hash>.bin.gz        # root: int8 centroids, cluster pointers,
+                               # dimension permutation, refine layout
+  <field>/packs/               # cluster pages: doc ids, refine ordinals,
+    0000.<hash>.bin            # scales, int8 coarse-dim rows (gzip members)
+  <field>/refine-packs/        # fixed-width full-dim int8 rows addressed by
+    0000.<hash>.bin            # ordinal * rowBytes (raw, random access)
+```
+
+Query execution (`vectorSearch` / hybrid `search({ q, vector })`):
+
+1. Score the query against int8 centroids from the root (fetched once per
+   session) and pick the top `nprobe` clusters.
+2. Fetch those cluster pages and rank candidates on the coarse dimension
+   prefix (default dims/4).
+3. Re-score the best `k × refineFactor` candidates against full-dimension
+   int8 rows fetched from the refine store through coalesced range requests,
+   and return the exact-int8 top k.
+4. Hybrid queries run the text lane in parallel and fuse with reciprocal
+   rank fusion; filters verify on both lanes.
+
+The builder streams spooled vectors twice (sample/train, then
+quantize/assign/pack), so embeddings never sit in memory; 100k × 256-dim
+vectors index in ~2 s.
+
 ## Why Custom Binary
 
 The hot path is term-keyed inverted-list lookup, not columnar analytics. The

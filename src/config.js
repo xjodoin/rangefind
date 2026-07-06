@@ -10,6 +10,11 @@ export const DEFAULTS = {
   suggestMaxTokenKeys: 4,
   suggestMinKeyLength: 1,
   suggestHotListSize: 64,
+  vectorPackBytes: 4 * 1024 * 1024,
+  vectorTrainSample: 20000,
+  vectorKmeansIterations: 6,
+  vectorClusterTargetDocs: 512,
+  vectorCoarseDims: 0,
   docValueChunkSize: 2048,
   docValueLookupChunkSize: 2048,
   filterBitmaps: true,
@@ -153,6 +158,21 @@ export function geoComponentFieldNames(geoField) {
   return { lat: `${geoField.name}.lat`, lon: `${geoField.name}.lon` };
 }
 
+function normalizeVectorFields(raw) {
+  const fields = Array.isArray(raw) ? raw : [];
+  return fields.map(field => {
+    const name = String(field?.name || "").trim();
+    if (!name) throw new Error("Rangefind vector fields need a name.");
+    const dims = Math.floor(Number(field.dims));
+    if (!Number.isFinite(dims) || dims < 2 || dims > 4096) {
+      throw new Error(`Rangefind vector field "${name}" needs dims between 2 and 4096.`);
+    }
+    const metric = String(field.metric || "cosine").toLowerCase();
+    if (metric !== "cosine") throw new Error(`Rangefind vector field "${name}" supports only the cosine metric.`);
+    return { name, path: String(field.path || name), dims, metric };
+  });
+}
+
 function normalizeSuggestFields(raw) {
   const fields = Array.isArray(raw) ? raw : [];
   return fields.map(field => {
@@ -231,6 +251,7 @@ export async function readConfig(configPath) {
     sortReplicas: raw.sortReplicas || [],
     geo: normalizeGeoFields(raw.geo),
     suggest: normalizeSuggestFields(raw.suggest),
+    vectors: normalizeVectorFields(raw.vectors),
     display: raw.display || ["title", "url"],
     authority: raw.authority || DEFAULTS.authority
   }, raw));

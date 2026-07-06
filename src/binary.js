@@ -17,6 +17,8 @@ export const GEO_LEAF_PAGE_MAGIC = [0x52, 0x46, 0x47, 0x4c]; // RFGL
 export const SUGGEST_ROOT_MAGIC = [0x52, 0x46, 0x53, 0x52]; // RFSR
 export const SUGGEST_BRANCH_PAGE_MAGIC = [0x52, 0x46, 0x53, 0x42]; // RFSB
 export const SUGGEST_PAGE_MAGIC = [0x52, 0x46, 0x53, 0x47]; // RFSG
+export const VECTOR_ROOT_MAGIC = [0x52, 0x46, 0x56, 0x52]; // RFVR
+export const VECTOR_CLUSTER_PAGE_MAGIC = [0x52, 0x46, 0x56, 0x43]; // RFVC
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));

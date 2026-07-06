@@ -21,6 +21,14 @@ import {
 import { decodeDocPointerRecord } from "./doc_pointers.js";
 import { applyHighlights, highlightTermSet } from "./highlight.js";
 import {
+  applyPermutation,
+  decodeVectorClusterPage,
+  dotInt8,
+  normalizeVector,
+  parseVectorRoot,
+  vectorFromValue
+} from "./vector_index.js";
+import {
   decodeSuggestBranchPage,
   decodeSuggestPage,
   parseSuggestRoot,
@@ -288,6 +296,8 @@ export async function createSearch(options = {}) {
   let suggestRootPromise = null;
   const suggestPageCache = new Map();
   const suggestBranchPageCache = new Map();
+  const vectorRootCache = new Map();
+  const vectorClusterPageCache = new Map();
   const sortReplicaDirectoryCache = new Map();
   const sortReplicaShardCache = new Map();
   const sortReplicaRankCache = new Map();
@@ -337,6 +347,8 @@ export async function createSearch(options = {}) {
     postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     geoLeafPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     suggestPages: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
+    vectorClusterPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    vectorRefine: { mergeGapBytes: 16 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: 8 },
     ...(options.rangePlans || {})
   };
 
@@ -6016,6 +6028,7 @@ export async function createSearch(options = {}) {
   }
 
   async function executeSearch(params = {}) {
+    if (params.vector) return executeHybridSearch(params);
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
@@ -6201,6 +6214,235 @@ export async function createSearch(options = {}) {
       };
     }
     return response;
+  }
+
+  function vectorFieldMeta(name) {
+    const fields = manifest.vectors?.fields || {};
+    const fieldNames = Object.keys(fields);
+    if (!fieldNames.length) throw new Error("Rangefind: this index has no vector fields (configure `vectors` at build time).");
+    const field = name || (fieldNames.length === 1 ? fieldNames[0] : "");
+    const meta = fields[field];
+    if (!meta) throw new Error(`Rangefind: unknown vector field "${name || ""}".`);
+    return meta;
+  }
+
+  async function loadVectorRoot(meta) {
+    if (!vectorRootCache.has(meta.name)) {
+      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseVectorRoot);
+      promise.catch(() => {
+        vectorRootCache.delete(meta.name);
+      });
+      vectorRootCache.set(meta.name, promise);
+    }
+    return vectorRootCache.get(meta.name);
+  }
+
+  function normalizedQueryVector(value, dims) {
+    const vector = value instanceof Float32Array
+      ? (value.length === dims ? Float32Array.from(value) : null)
+      : vectorFromValue(value, dims);
+    const normalized = vector ? normalizeVector(vector) : null;
+    if (!normalized) throw new Error(`Rangefind: vector queries need ${dims} finite dimensions.`);
+    return normalized;
+  }
+
+  // IVF traversal: score int8 centroids, open the top nprobe cluster pages,
+  // rank candidates on the coarse dimension prefix, then re-score the best
+  // candidates against full-dimension int8 rows fetched from the fixed-width
+  // refine store (addressed by ordinal — no per-document pointers).
+  async function vectorTopK(params = {}) {
+    const meta = vectorFieldMeta(params.field);
+    const root = await loadVectorRoot(meta);
+    // The index stores vectors with dimensions permuted variance-descending;
+    // the query enters the same space once here.
+    const query = applyPermutation(
+      normalizedQueryVector(params.vector, root.dims),
+      0,
+      root.permutation,
+      new Float32Array(root.dims)
+    );
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const nprobe = Math.max(1, Math.min(root.clusterCount, Math.floor(Number(params.nprobe || 8))));
+    const refineFactor = Math.max(1, Math.min(64, Math.floor(Number(params.refineFactor || 8))));
+
+    const centroidOrder = [];
+    for (let c = 0; c < root.clusterCount; c++) {
+      centroidOrder.push([c, dotInt8(query, root.centroidCodes, c * root.dims, root.dims, root.centroidScales[c])]);
+    }
+    centroidOrder.sort((a, b) => b[1] - a[1]);
+    const probed = centroidOrder.slice(0, nprobe).map(([c]) => root.clusters[c]);
+
+    const pageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
+    const pages = await loadPackedPages({
+      field: meta.name,
+      entries: probed,
+      cache: vectorClusterPageCache,
+      cacheKey: (field, index) => `${field} ${index}`,
+      decode: inflated => decodeVectorClusterPage(inflated, { name: meta.name }),
+      label: "vector cluster page",
+      packDir: meta.pack_dir,
+      rangePlan: "vectorClusterPages",
+      stats: pageFetchStats
+    });
+
+    const candidates = [];
+    let scanned = 0;
+    for (const page of pages) {
+      for (let i = 0; i < page.count; i++) {
+        scanned++;
+        candidates.push([
+          page.docs[i],
+          page.ordinals[i],
+          dotInt8(query, page.codes, i * page.coarseDims, page.coarseDims, page.scales[i])
+        ]);
+      }
+    }
+    candidates.sort((a, b) => b[2] - a[2] || a[0] - b[0]);
+    const shortlist = candidates.slice(0, Math.max(k, Math.min(candidates.length, k * refineFactor)));
+
+    let rows;
+    let refineGroups = 0;
+    if (params.refine === false || !shortlist.length) {
+      rows = shortlist.slice(0, k).map(([doc, , score]) => [doc, score]);
+    } else {
+      const items = shortlist.map(([doc, ordinal, coarseScore]) => ({
+        doc,
+        coarseScore,
+        entry: {
+          pack: root.refine.packs[Math.floor(ordinal / root.refine.rowsPerPack)],
+          offset: (ordinal % root.refine.rowsPerPack) * root.refine.rowBytes,
+          length: root.refine.rowBytes
+        }
+      }));
+      const groups = rangeGroups(items, "vectorRefine");
+      refineGroups = groups.length;
+      const scored = [];
+      await Promise.all(groups.map(async (group) => {
+        const bytes = new Uint8Array(await fetchRange(new URL(`${meta.refine_pack_dir}/${group.pack}`, baseUrl), group.start, group.end - group.start));
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const codes = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        for (const item of group.items) {
+          const at = item.entry.offset - group.start;
+          const scale = view.getFloat32(at, true);
+          scored.push([item.doc, dotInt8(query, codes, at + 4, root.dims, scale)]);
+        }
+      }));
+      scored.sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+      rows = scored.slice(0, k);
+    }
+
+    return {
+      rows,
+      stats: {
+        vectorField: meta.name,
+        vectorClusters: root.clusterCount,
+        vectorClustersProbed: nprobe,
+        vectorClusterPagesFetched: pageFetchStats.fetched,
+        vectorCandidatesScanned: scanned,
+        vectorCandidatesRefined: params.refine === false ? 0 : shortlist.length,
+        vectorRefineFetchGroups: refineGroups
+      }
+    };
+  }
+
+  async function executeVectorSearch(params = {}) {
+    const { rows, stats } = await vectorTopK(params);
+    const resultContext = { hasTextTerms: false, preferDocPages: false };
+    const results = params.includeResults === false
+      ? rows.map(([index, score]) => ({ index, score }))
+      : await rowsToResults(rows, resultContext);
+    return {
+      total: rows.length,
+      results,
+      stats: { ...stats, exact: false, approximate: true }
+    };
+  }
+
+  // Hybrid text + vector retrieval fused with reciprocal rank fusion; user
+  // filters are enforced on both lanes (the vector lane verifies candidates
+  // against doc values before fusion).
+  async function executeHybridSearch(params) {
+    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
+    const page = Math.max(1, Number(params.page || 1));
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const q = String(params.q || "").trim();
+    const filters = params.filters || {};
+    const hasFilters = Object.keys(filters.facets || {}).length
+      || Object.keys(filters.numbers || {}).length
+      || Object.keys(filters.booleans || {}).length;
+
+    const [textResponse, vectorResponse] = await Promise.all([
+      q
+        ? executeSearch({ ...params, vector: undefined, hybrid: undefined, highlight: undefined, includeResults: false, size: poolSize, page: 1 })
+        : null,
+      vectorTopK({ ...(params.hybrid || {}), field: params.vectorField, vector: params.vector, k: poolSize })
+    ]);
+
+    let vectorRows = vectorResponse.rows;
+    if (hasFilters && vectorRows.length) {
+      await ensureFacetDictionaries(filters);
+      const filterPlan = makeDocFilterPlan(filters);
+      const codeData = await valueStoreForFilterPlan(filterPlan, vectorRows.map(([doc]) => doc));
+      vectorRows = vectorRows.filter(([doc]) => passesFilterPlan(doc, codeData, filterPlan));
+    }
+
+    // Without a text lane this is a plain (optionally filtered) vector
+    // search; return real similarity scores instead of fusion ranks.
+    if (!q) {
+      const offset = (page - 1) * size;
+      const rows = vectorRows.slice(offset, offset + size);
+      const results = await rowsToResults(rows, { hasTextTerms: false, preferDocPages: false });
+      return {
+        total: vectorRows.length,
+        results,
+        page,
+        size,
+        approximate: true,
+        stats: { ...vectorResponse.stats, exact: false }
+      };
+    }
+
+    const fused = new Map();
+    const addRanked = (list, key) => {
+      list.forEach((doc, rank) => {
+        const entry = fused.get(doc) || { doc, score: 0, lanes: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.lanes[key] = rank + 1;
+        fused.set(doc, entry);
+      });
+    };
+    addRanked((textResponse?.results || []).map(item => item.index), "text");
+    addRanked(vectorRows.map(([doc]) => doc), "vector");
+
+    const ranked = [...fused.values()].sort((a, b) => b.score - a.score || a.doc - b.doc);
+    const offset = (page - 1) * size;
+    const rows = ranked.slice(offset, offset + size).map(entry => [entry.doc, entry.score]);
+    const resultContext = { hasTextTerms: !!q, preferDocPages: false };
+    const results = await rowsToResults(rows, resultContext);
+    for (const result of results) {
+      const entry = fused.get(result.index);
+      if (entry) result.hybrid = entry.lanes;
+    }
+    if (params.highlight && q && results.length) {
+      const highlightOptions = params.highlight === true ? {} : params.highlight;
+      applyHighlights(results, highlightTermSet(q, textResponse?.correctedQuery), highlightOptions);
+    }
+    return {
+      total: ranked.length,
+      results,
+      page,
+      size,
+      approximate: true,
+      stats: {
+        hybrid: true,
+        hybridPool: poolSize,
+        hybridTextResults: textResponse?.results?.length || 0,
+        hybridVectorResults: vectorRows.length,
+        ...vectorResponse.stats,
+        textLane: textResponse?.stats?.plannerLane || (q ? "text" : "none")
+      }
+    };
   }
 
   // Pages cover contiguous slices of key-sorted entries; a prefix query
@@ -6405,11 +6647,25 @@ export async function createSearch(options = {}) {
     };
   }
 
+  async function vectorSearch(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("vector.total", () => executeVectorSearch(params)));
+    if (!trace) return response;
+    return {
+      ...response,
+      stats: {
+        ...(response.stats || {}),
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
+  }
+
   return {
     manifest,
     search,
     count,
     suggest,
+    vectorSearch,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,

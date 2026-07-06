@@ -50,6 +50,10 @@ export function suggestEnabled(config) {
   return Array.isArray(config.suggest) && config.suggest.length > 0;
 }
 
+export function vectorsEnabled(config) {
+  return Array.isArray(config.vectors) && config.vectors.length > 0;
+}
+
 // Rows are [surface, weight, tokenPrefixes]; the caller aggregates duplicate
 // surfaces before anything crosses a worker boundary.
 export function suggestRowsForDoc(config, doc) {

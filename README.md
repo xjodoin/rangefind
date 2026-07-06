@@ -55,6 +55,11 @@ a large thesis corpus.
   diacritic-folded prefix and mid-label token matching, popularity or custom
   weights, exact best-first top-k with per-page weight proofs, and
   precomputed hot pages so a first keystroke costs one small fetch.
+- Hybrid semantic search from a range-addressed IVF vector index: int8
+  quantized embeddings, coarse-dimension candidate pages plus a fixed-width
+  full-dimension refine store, cosine top-k, and reciprocal-rank fusion with
+  the text lane — no server, no vector database.
+- Analyzer-consistent snippets and highlight ranges on search results.
 - OpenStreetMap example and benchmark fixture with exhaustive geo oracles.
 - Tiny runnable example.
 
