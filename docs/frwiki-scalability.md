@@ -330,6 +330,20 @@ Cold-query transfer stayed inside the previous baselines at both scales
 118.8 ms / 29.6 requests / 327.0 KB), so the indexing speedup does not change
 runtime retrieval behavior.
 
+A 1,000,000-document fixture built in 206.2s at 4.80 GiB peak RSS (an older
+recorded 1M run took 4,276.5s), producing a 1,876 MiB published index with
+0/25 invalid runtime rows and 16/16 exact top-k agreement.
+
+Broad single-term queries also got faster at query time: the tail-proof loop
+used to re-run the full stable-top-k proof after every decoded posting block,
+which made tie-heavy doc-ordered terms such as `Paris` spend most of their
+latency re-sorting tens of thousands of scored candidates. Failed proofs are
+now rescheduled proportionally to the scored-candidate volume
+(`topKProofCheckScoresPerBlock`, capped by `topKProofCheckIntervalMax`), which
+kept requests/bytes identical and exact top-k at 16/16 while cutting average
+cold text latency from 118.1 ms to about 40 ms at 500k and from 252 ms to
+about 61 ms at 1M (Paris: 1,235 ms to 221 ms at 1M).
+
 The 500k non-typo cold runtime average was 26.7 requests and 300.5 KB, inside
 the +10% request/byte gate against the previous 25.5 request / 301.3 KB
 sidecar baseline. The two typo runtime rows stayed at max 3 corrected searches
