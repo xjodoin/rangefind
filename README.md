@@ -60,6 +60,11 @@ a large thesis corpus.
   full-dimension refine store, cosine top-k, and reciprocal-rank fusion with
   the text lane — no server, no vector database.
 - Analyzer-consistent snippets and highlight ranges on search results.
+- Incremental publishing: `rangefind build --update` adds small delta
+  generations over an existing index — unchanged pack bytes keep their
+  content-addressed names (and CDN cache entries), replaced documents
+  tombstone their old version, and the runtime merges generations with
+  scores that stay exactly comparable.
 - Per-query facet counts with exact-or-flagged semantics: dictionary-backed
   global counts, exact counts over budgeted match sets, and bounded
   chunk-sampled estimates for very large result sets.

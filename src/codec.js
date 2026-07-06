@@ -310,9 +310,19 @@ export function summarizeBlockFilters(filters, codes, docs) {
   return Object.fromEntries((filters || []).map((filter, index) => [filter.name, summary[index]]));
 }
 
-function encodePostings(rows, total, codes, filters, config) {
+function encodePostings(rows, total, codes, filters, config, term = "") {
   const df = postingRowCount(rows);
-  const idf = Math.log(1 + (total - df + 0.5) / (df + 0.5));
+  // Generational delta builds replicate the base generations' frozen corpus
+  // statistics (same total, same df for vocabulary the base knows), so a
+  // document added by a delta scores identically to the same document in the
+  // base build — exact cross-generation comparability. Terms new to the
+  // corpus fall back to delta-local df. Only the idf input is overridden;
+  // `df` keeps meaning "rows in this posting list" everywhere else.
+  const overrides = config._scoringOverrides || null;
+  const frozenDf = overrides?.dfBase?.get(term);
+  const statisticalDf = frozenDf !== undefined ? frozenDf : df;
+  const effectiveTotal = overrides?.total || total;
+  const idf = Math.log(1 + (effectiveTotal - statisticalDf + 0.5) / (statisticalDf + 0.5));
   const docs = new Int32Array(df);
   const impacts = new Int32Array(df);
   let maxImpact = 0;
@@ -820,7 +830,7 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     ? entries.slice().sort((a, b) => a[0].localeCompare(b[0]))
     : entries;
   for (const [term, rows] of orderedEntries) {
-    const postings = encodePostings(rows, total, codes, filters, config);
+    const postings = encodePostings(rows, total, codes, filters, config, term);
     const plannerStats = postings.codecPlan?.stats || {};
     stats.codecPlannerSampledTerms += plannerStats.sampledTerms || 0;
     stats.codecPlannerSampledBlocks += plannerStats.sampledBlocks || 0;

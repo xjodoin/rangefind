@@ -1,8 +1,10 @@
 import {
+  copyFileSync,
   createReadStream,
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   rmSync,
   closeSync,
   readFileSync,
@@ -14,7 +16,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
@@ -67,6 +69,7 @@ import {
   buildFacetDictionary,
   buildPostingSegmentChunks,
   docValueFields,
+  parsePostingSegment,
   POSTING_SEGMENT_FORMAT,
   summarizeBlockFilters
 } from "./codec.js";
@@ -85,6 +88,7 @@ import {
 } from "./geo_tree.js";
 import { DOC_LAYOUT_FORMAT, docLayoutRecord } from "./doc_layout.js";
 import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, decodeDocPageColumns, encodeDocPageColumns } from "./doc_pages.js";
+import { parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { writeDirectoryFiles, writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
 import { appendDirectoryEntry, createDirectoryEntrySpool, sortedDirectoryEntrySpool } from "./directory_spool.js";
 import {
@@ -149,6 +153,7 @@ function mergeMeasureSummary(accumulator, config, summary) {
 function finalizeMeasure(accumulator, config, workerStats) {
   return {
     total: accumulator.total,
+    fieldTotals: { ...accumulator.fieldTotals },
     avgLens: Object.fromEntries(config.fields.map(field => [
       field.name,
       Math.max(1, accumulator.fieldTotals[field.name] / Math.max(1, accumulator.total))
@@ -1878,6 +1883,173 @@ async function writeVectorIndexes(out, config, vectorSpools) {
   };
 }
 
+// External-id → local doc index map, written with every build so future
+// `--update` runs can tombstone replaced documents. Loaded only by the
+// builder, never by the runtime.
+function writeIdMap(out, config, total, docSpool) {
+  const reader = openDocPageSpoolReader(docSpool, config, 64);
+  const lines = [];
+  const chunks = [];
+  try {
+    for (let index = 0; index < total; index++) {
+      lines.push(JSON.stringify([String(reader.doc(index)?.id ?? index), index]));
+      if (lines.length >= 20000) {
+        chunks.push(`${lines.join("\n")}\n`);
+        lines.length = 0;
+      }
+    }
+  } finally {
+    reader.close();
+  }
+  if (lines.length) chunks.push(`${lines.join("\n")}\n`);
+  const file = "docs/id-map.jsonl.gz";
+  writeFileSync(resolve(out, file), gzipSync(chunks.join(""), { level: 6 }));
+  return { file, docs: total };
+}
+
+function readIdMapFile(path) {
+  const entries = [];
+  const source = gunzipSync(readFileSync(path)).toString("utf8");
+  for (const line of source.split("\n")) {
+    if (line) entries.push(JSON.parse(line));
+  }
+  return entries;
+}
+
+// Streams a previous generation's published term shards from local disk and
+// accumulates per-term document frequencies, so delta builds bake impact
+// scores with corpus-wide idf. Works against any existing index — no extra
+// sidecar format is required.
+function collectGenerationDf(genDir, genManifest, dfBase) {
+  const directory = genManifest.directory;
+  if (!directory?.root) throw new Error(`Rangefind update: no term directory descriptor for ${genDir}.`);
+  const root = parseDirectoryRoot(gunzipSync(readFileSync(resolve(genDir, directory.root))));
+  const pagesDir = String(directory.pages || "terms/directory-pages/").replace(/\/?$/u, "/");
+  const packCache = new Map();
+  for (const page of root.pages) {
+    const pageBuffer = gunzipSync(readFileSync(resolve(genDir, `${pagesDir}${page.file}`)));
+    const entries = parseDirectoryPage(pageBuffer, { packTable: directory.pack_table || [] });
+    for (const entry of entries.values()) {
+      let pack = packCache.get(entry.pack);
+      if (!pack) {
+        pack = readFileSync(resolve(genDir, "terms", "packs", entry.pack));
+        packCache.set(entry.pack, pack);
+      }
+      const shardBytes = gunzipSync(pack.subarray(entry.offset, entry.offset + entry.length));
+      // The generation manifest is required: per-term block-filter summaries
+      // inside shard payloads are sized by manifest.block_filters.
+      const shard = parsePostingSegment(shardBytes, genManifest);
+      for (const [term, termEntry] of shard.terms) {
+        dfBase.set(term, (dfBase.get(term) || 0) + (termEntry.df || 0));
+      }
+    }
+  }
+}
+
+function generationDirName(index) {
+  return `gen-${String(index).padStart(4, "0")}`;
+}
+
+async function prepareGenerationalUpdate(config) {
+  const rootDir = config.output;
+  const rootManifestPath = resolve(rootDir, "manifest.json");
+  if (!existsSync(rootManifestPath)) {
+    throw new Error("Rangefind update: no existing index to update (run a full build first).");
+  }
+  const rootManifest = JSON.parse(readFileSync(rootManifestPath, "utf8"));
+  let generations;
+  if (Array.isArray(rootManifest.generations)) {
+    generations = rootManifest.generations;
+  } else {
+    if (!rootManifest.field_stats || !rootManifest.id_map) {
+      throw new Error("Rangefind update: the base index predates generational support; rebuild it once with this version.");
+    }
+    // Wrap the existing single index as generation 0 without touching any of
+    // its pack bytes; only its manifests get stable generation-scoped names.
+    const genManifestMin = "manifest.gen0000.min.json";
+    const genManifestFull = "manifest.gen0000.json";
+    if (!existsSync(resolve(rootDir, genManifestMin))) {
+      copyFileSync(resolve(rootDir, "manifest.min.json"), resolve(rootDir, genManifestMin));
+      copyFileSync(resolve(rootDir, "manifest.json"), resolve(rootDir, genManifestFull));
+    }
+    generations = [{
+      path: "",
+      manifest: genManifestMin,
+      total: rootManifest.total,
+      field_stats: rootManifest.field_stats,
+      id_map: rootManifest.id_map,
+      tombstones: []
+    }];
+  }
+
+  const genIndex = generations.length;
+  const genDir = generationDirName(genIndex);
+  let prevTotal = 0;
+  const prevFieldTotals = {};
+  const idMap = new Map();
+  const dfBase = new Map();
+  for (let g = 0; g < generations.length; g++) {
+    const generation = generations[g];
+    prevTotal += generation.total || 0;
+    for (const [field, tokens] of Object.entries(generation.field_stats?.field_totals || {})) {
+      prevFieldTotals[field] = (prevFieldTotals[field] || 0) + tokens;
+    }
+    const genRoot = resolve(rootDir, generation.path || ".");
+    const genManifest = JSON.parse(readFileSync(resolve(rootDir, generation.manifest), "utf8"));
+    const tombstoned = new Set(generation.tombstones || []);
+    for (const [externalId, localIndex] of readIdMapFile(resolve(genRoot, generation.id_map))) {
+      if (!tombstoned.has(localIndex)) idMap.set(externalId, [g, localIndex]);
+    }
+    collectGenerationDf(genRoot, genManifest, dfBase);
+  }
+
+  // Delta builds run the reducer on the main thread so the df map is shared,
+  // not cloned per worker; deltas are small by definition.
+  config.output = resolve(rootDir, genDir);
+  config.partitionReducerWorkers = 0;
+  config.resumeBuild = false;
+  config._buildRoot = resolve(config.output, "_build");
+  mkdirSync(resolve(config.output), { recursive: true });
+  return { rootDir, rootManifest, generations, genIndex, genDir, prevTotal, prevFieldTotals, idMap, dfBase };
+}
+
+function writeGenerationalRoot(generational, deltaManifest, config) {
+  const { rootDir, generations, genDir, idMap } = generational;
+  const deltaIdMap = readIdMapFile(resolve(config.output, deltaManifest.id_map));
+  let replaced = 0;
+  for (const [externalId] of deltaIdMap) {
+    const previous = idMap.get(externalId);
+    if (!previous) continue;
+    const [genIndexPrev, localIndex] = previous;
+    generations[genIndexPrev].tombstones = generations[genIndexPrev].tombstones || [];
+    generations[genIndexPrev].tombstones.push(localIndex);
+    replaced += 1;
+  }
+  generations.push({
+    path: `${genDir}/`,
+    manifest: `${genDir}/manifest.min.json`,
+    total: deltaManifest.total,
+    field_stats: deltaManifest.field_stats,
+    id_map: deltaManifest.id_map,
+    tombstones: []
+  });
+  const aliveTotal = generations.reduce(
+    (sum, generation) => sum + (generation.total || 0) - (generation.tombstones?.length || 0),
+    0
+  );
+  const root = {
+    version: 1,
+    engine: "rangefind",
+    features: { generations: true },
+    generations,
+    total: aliveTotal,
+    built_at: new Date().toISOString()
+  };
+  writeFileSync(resolve(rootDir, "manifest.min.json"), JSON.stringify(root));
+  writeFileSync(resolve(rootDir, "manifest.json"), JSON.stringify(root, null, 2));
+  return { replaced, aliveTotal, generations: generations.length };
+}
+
 function sortReplicaKey(field, order) {
   return `${field}:${order === "desc" ? "desc" : "asc"}`;
 }
@@ -3456,6 +3628,8 @@ function minimalManifest(manifest) {
       facet_dictionaries: "facets/manifest.json.gz"
     },
     total: manifest.total,
+    field_stats: manifest.field_stats,
+    id_map: manifest.id_map,
     docs: manifest.docs,
     initial_results: manifest.initial_results,
     fields: manifest.fields,
@@ -3619,6 +3793,7 @@ function hydrateDicts(dicts) {
 function serializeMeasured(measured) {
   return {
     total: measured.total,
+    fieldTotals: measured.fieldTotals || {},
     avgLens: measured.avgLens,
     dicts: serializeDicts(measured.dicts),
     workerStats: measured.workerStats || []
@@ -3628,6 +3803,7 @@ function serializeMeasured(measured) {
 function hydrateMeasured(payload) {
   return {
     total: payload.total,
+    fieldTotals: payload.fieldTotals || {},
     avgLens: payload.avgLens || {},
     dicts: hydrateDicts(payload.dicts),
     workerStats: payload.workerStats || []
@@ -3710,8 +3886,9 @@ function hydrateReducedStage(payload) {
   };
 }
 
-export async function build({ configPath }) {
+export async function build({ configPath, update = false }) {
   const config = await readConfig(configPath);
+  const generational = update ? await prepareGenerationalUpdate(config) : null;
   const fingerprint = config.resumeBuild ? buildFingerprint(config) : "scratch";
   config._buildRoot = config.resumeBuild
     ? resolve(config.output, config.resumeDir, fingerprint)
@@ -3749,6 +3926,15 @@ export async function build({ configPath }) {
       configured_workers: scanWorkerCount(config),
       batch_docs: measureBatchDocs(config)
     });
+    if (generational) {
+      // Freeze field-length normalization at the base generations' averages
+      // so a delta document scores exactly as it would have in the base
+      // build — the property cross-generation merging depends on.
+      measured.avgLens = Object.fromEntries(config.fields.map(field => [
+        field.name,
+        Math.max(1, (generational.prevFieldTotals[field.name] || 0) / Math.max(1, generational.prevTotal))
+      ]));
+    }
     const scanStage = readStage(config, "scan");
     if (scanStage) {
       runData = hydrateScanStage(scanStage, measured);
@@ -3761,6 +3947,14 @@ export async function build({ configPath }) {
       configured_workers: scanWorkerCount(config),
       batch_docs: scanBatchDocs(config)
     });
+    if (generational) {
+      // Set after scan so the df map never gets structured-cloned into scan
+      // workers; only the (main-thread) reducer bakes idf.
+      config._scoringOverrides = {
+        total: generational.prevTotal,
+        dfBase: generational.dfBase
+      };
+    }
     addBuildCounter(telemetry, "selected_term_spool_bytes", runData.selectedTermSpool.bytes);
     addBuildCounter(telemetry, "selected_term_spool_terms", runData.selectedTermSpool.terms);
     addBuildCounter(telemetry, "doc_gzip_spool_bytes", runData.docSpool.bytes || 0);
@@ -3846,6 +4040,7 @@ export async function build({ configPath }) {
       geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows, reduced.filters));
       suggest = await timeBuildPhase(telemetry, "suggest", () => writeSuggestIndex(dirs.out, config, runData.suggestRows));
       vectors = await timeBuildPhase(telemetry, "vectors", () => writeVectorIndexes(dirs.out, config, runData.vectorSpools));
+      docs.id_map = await timeBuildPhase(telemetry, "id-map", () => writeIdMap(dirs.out, config, measured.total, runData.docSpool));
       filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
       facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
       writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest, vectors });
@@ -3948,6 +4143,11 @@ export async function build({ configPath }) {
       posting_count: segmentManifest.postingCount
     },
     total: measured.total,
+    field_stats: {
+      total: measured.total,
+      field_totals: measured.fieldTotals || {}
+    },
+    id_map: docs.id_map?.file || null,
     docs,
     doc_values: {
       storage: docValues.storage,
@@ -4315,6 +4515,10 @@ export async function build({ configPath }) {
     if (config.buildTelemetryPath) {
       mkdirSync(dirname(config.buildTelemetryPath), { recursive: true });
       writeFileSync(config.buildTelemetryPath, JSON.stringify(buildTelemetry, null, 2));
+    }
+    if (generational) {
+      const summary = writeGenerationalRoot(generational, manifest, config);
+      console.log(`Rangefind: generation ${generational.genDir} added (${measured.total.toLocaleString()} docs, ${summary.replaced.toLocaleString()} replaced, ${summary.generations} generations, ${summary.aliveTotal.toLocaleString()} alive docs)`);
     }
     console.log(`Rangefind: built ${measured.total.toLocaleString()} docs, ${reduced.shards.length.toLocaleString()} posting segments, ${reduced.packs.length.toLocaleString()} packs`);
   } catch (error) {

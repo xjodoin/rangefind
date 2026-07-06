@@ -45,6 +45,18 @@ existing codec works unchanged). The root manifest lists generations with
 their doc counts, global scoring statistics (merged term df / field length
 totals), and a tombstone set.
 
+> **Status**: Phase 1 shipped. `rangefind build --update` adds a delta
+> generation over an existing index; the runtime transparently merges text
+> search (with filters, highlights, facet counts), suggestions, and counts
+> across generations, with clear errors for the Phase 3 lanes (geo, vectors,
+> sorted browse). One refinement over the original design below: instead of
+> *merging* global statistics, delta builds **replicate the base
+> generations' frozen statistics** (same total, same df for known
+> vocabulary via a local scan of the base's term shards, same field-length
+> averages) — a document added by a delta scores byte-identically to the
+> same document in the base build, which is exactly the property
+> cross-generation merging needs. Statistics refresh at compaction.
+
 ### Write path (`rangefind build --update`)
 
 1. Load the previous root manifest and the external-id → (generation,

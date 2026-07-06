@@ -269,8 +269,13 @@ export async function createSearch(options = {}) {
     return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder.decode(inflated)));
   }
 
-  const manifest = await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
+  const manifest = options.manifestName
+    ? await fetchJsonIfOk(options.manifestName)
+    : await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
+  if (Array.isArray(manifest.generations)) {
+    return createGenerationalSearch(manifest, options, baseUrl);
+  }
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
   const termDirectory = createDirectoryState(manifest.directory);
   const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
@@ -6832,16 +6837,175 @@ export async function createSearch(options = {}) {
     };
   }
 
+  async function hydrateRows(rows, context = {}) {
+    return rowsToResults(rows, context);
+  }
+
   return {
     manifest,
     search,
     count,
     suggest,
     vectorSearch,
+    hydrateRows,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,
     loadFacetValues: loadFacetDictionary
+  };
+}
+
+// Generational indexes published by `rangefind build --update`: every
+// generation is a complete single index; this layer fans queries out and
+// merges results. Scores are comparable by construction — delta builds bake
+// impact scores with corpus-wide document frequencies and totals.
+async function createGenerationalSearch(root, options, baseUrl) {
+  const generations = root.generations;
+  const engines = await Promise.all(generations.map(generation => {
+    const path = generation.path || "";
+    const manifestName = generation.manifest?.startsWith(path) && path
+      ? generation.manifest.slice(path.length)
+      : generation.manifest || "manifest.min.json";
+    return createSearch({
+      ...options,
+      baseUrl: new URL(path || "./", baseUrl).href,
+      manifestName,
+      maxPageSize: 1000
+    });
+  }));
+  const tombstones = generations.map(generation => new Set(generation.tombstones || []));
+  const tombstoneTotal = tombstones.reduce((sum, set) => sum + set.size, 0);
+
+  function unsupported(feature) {
+    return new Error(`Rangefind: ${feature} is not yet supported on generational indexes (see docs/incremental-publishing-plan.md).`);
+  }
+
+  async function search(params = {}) {
+    if (params.geo || params.vector) throw unsupported(params.geo ? "geo search" : "vector search");
+    if (params.sort) throw unsupported("sorted browse");
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+
+    const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
+      ...params,
+      includeResults: false,
+      highlight: undefined,
+      page: 1,
+      size: Math.min(1000, offset + size + tombstones[genIndex].size)
+    })));
+
+    const merged = [];
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const row of responses[genIndex].results || []) {
+        if (tombstones[genIndex].has(row.index)) continue;
+        merged.push({ generation: genIndex, index: row.index, score: row.score || 0 });
+      }
+    }
+    if (q) merged.sort((a, b) => b.score - a.score || a.generation - b.generation || a.index - b.index);
+    const pageRows = merged.slice(offset, offset + size);
+
+    // Hydrate per generation, then reassemble in merged order.
+    const byGeneration = new Map();
+    for (const row of pageRows) {
+      if (!byGeneration.has(row.generation)) byGeneration.set(row.generation, []);
+      byGeneration.get(row.generation).push(row);
+    }
+    const hydrated = new Map();
+    await Promise.all([...byGeneration.entries()].map(async ([genIndex, rows]) => {
+      const results = await engines[genIndex].hydrateRows(rows.map(row => [row.index, row.score]));
+      rows.forEach((row, i) => {
+        hydrated.set(`${genIndex}:${row.index}`, { ...results[i], generation: genIndex });
+      });
+    }));
+    const results = pageRows
+      .map(row => hydrated.get(`${row.generation}:${row.index}`))
+      .filter(Boolean);
+
+    const correctedQuery = responses.map(response => response.correctedQuery).find(Boolean);
+    if (params.highlight && results.length && q) {
+      const highlightOptions = params.highlight === true ? {} : params.highlight;
+      applyHighlights(results, highlightTermSet(q, correctedQuery), highlightOptions);
+    }
+
+    let facets;
+    if (params.facets) {
+      facets = {};
+      for (const response of responses) {
+        for (const [field, data] of Object.entries(response.facets || {})) {
+          const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: new Map() });
+          target.exact = target.exact && data.exact !== false;
+          for (const item of data.values) {
+            const existing = target.byValue.get(item.value);
+            if (existing) existing.count += item.count;
+            else target.byValue.set(item.value, { ...item });
+          }
+        }
+      }
+      for (const data of Object.values(facets)) {
+        data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+        delete data.byValue;
+      }
+    }
+
+    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0) - tombstoneTotal;
+    const approximate = tombstoneTotal > 0 || responses.some(response => response.approximate);
+    return {
+      total: Math.max(results.length, total),
+      results,
+      page,
+      size,
+      approximate,
+      ...(correctedQuery ? { correctedQuery, corrections: responses.find(r => r.correctedQuery)?.corrections } : {}),
+      ...(facets ? { facets } : {}),
+      stats: {
+        generations: engines.length,
+        generationTotals: responses.map(response => response.total || 0),
+        tombstones: tombstoneTotal
+      }
+    };
+  }
+
+  async function suggest(params = {}) {
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const responses = await Promise.all(engines.map(engine => engine.suggest(params)));
+    const merged = new Map();
+    for (const response of responses) {
+      for (const item of response.suggestions) {
+        const existing = merged.get(item.text);
+        if (existing) {
+          existing.count += item.count;
+          existing.weight = Math.max(existing.weight, item.weight);
+        } else {
+          merged.set(item.text, { ...item });
+        }
+      }
+    }
+    const suggestions = [...merged.values()]
+      .sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1))
+      .slice(0, size);
+    return { q: params.q || "", suggestions, stats: { generations: engines.length } };
+  }
+
+  async function count(params = {}) {
+    const responses = await Promise.all(engines.map(engine => engine.count(params)));
+    return {
+      total: responses.reduce((sum, response) => sum + (response.total || 0), 0),
+      totalExact: tombstoneTotal === 0 && responses.every(response => response.totalExact),
+      approximate: tombstoneTotal > 0 || responses.some(response => response.approximate),
+      stats: { generations: engines.length, tombstones: tombstoneTotal }
+    };
+  }
+
+  return {
+    manifest: root,
+    generations: engines,
+    search,
+    suggest,
+    count,
+    vectorSearch: () => Promise.reject(unsupported("vector search")),
+    loadFacetValues: field => engines[0].loadFacetValues(field)
   };
 }
 
