@@ -313,6 +313,23 @@ pointers:
 500k: build 368.5s, 1385.4 MiB published index, 0/25 invalid runtime rows
 ```
 
+After moving scan-document work into worker threads (JSONL parse, analysis,
+payload gzip, spool encoding, per-worker posting segments), keeping one open
+file descriptor per pack with incremental content hashing, compressing
+doc-page/rank-map objects in a worker pool, reducing sort-replica partitions
+through the partition worker pool, and scaling worker counts to machine
+parallelism, the same fixture builds:
+
+```text
+100k: build  24.1s (was 78.9s), 0/25 invalid runtime rows, exact top-k 16/16
+500k: build 115.6s (was 368.5s), 0/25 invalid runtime rows, exact top-k 16/16
+```
+
+Cold-query transfer stayed inside the previous baselines at both scales
+(500k average 118.1 ms, 29.7 requests, 327.0 KB versus the previous
+118.8 ms / 29.6 requests / 327.0 KB), so the indexing speedup does not change
+runtime retrieval behavior.
+
 The 500k non-typo cold runtime average was 26.7 requests and 300.5 KB, inside
 the +10% request/byte gate against the previous 25.5 request / 301.3 KB
 sidecar baseline. The two typo runtime rows stayed at max 3 corrected searches
