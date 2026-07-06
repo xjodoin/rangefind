@@ -27,3 +27,4 @@ examples/wiki-search/wiki-search-build-telemetry.json
 *.tgz
 target/
 .claude/
+.playwright-mcp/
