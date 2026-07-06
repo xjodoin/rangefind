@@ -330,3 +330,25 @@ main {
   border-radius: 3px;
   padding: 0 1px;
 }
+
+.facet-chip-row {
+  margin: 0 0 10px;
+}
+
+.facet-chip {
+  cursor: pointer;
+  border: 1px solid #cad7d0;
+  background: #f1f7f5;
+  font: inherit;
+  font-size: 0.78rem;
+}
+
+.facet-chip:hover {
+  background: #e2efe9;
+}
+
+.facet-chip.active {
+  background: var(--accent);
+  border-color: var(--accent-strong);
+  color: #fff;
+}

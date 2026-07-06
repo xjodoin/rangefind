@@ -85,6 +85,7 @@ function searchParams() {
     filters,
     sort,
     highlight: { fields: ["title", "body"], maxChars: 300 },
+    facets: { fields: ["category"], size: 8 },
     trace: true
   };
 }
@@ -170,6 +171,31 @@ function renderStats(response, elapsedMs) {
   }));
 }
 
+function renderFacetChips(facet) {
+  let row = document.querySelector("#facetChips");
+  if (!row) {
+    row = document.createElement("div");
+    row.id = "facetChips";
+    row.className = "chip-row facet-chip-row";
+    resultSummary.parentElement.after(row);
+  }
+  row.replaceChildren();
+  if (!facet?.values?.length) return;
+  for (const item of facet.values) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "chip facet-chip";
+    const active = categoryInput.value.trim() === item.value;
+    if (active) chip.classList.add("active");
+    chip.textContent = `${item.label} ${facet.exact ? "" : "~"}${formatNumber(item.count)}`;
+    chip.addEventListener("click", () => {
+      categoryInput.value = active ? "" : item.value;
+      runSearch();
+    });
+    row.append(chip);
+  }
+}
+
 async function runSearch() {
   if (!engine) return;
   writeUrlState();
@@ -185,6 +211,7 @@ async function runSearch() {
     correctionSummary.textContent = response.correctedQuery ? `Showing ${response.correctedQuery}` : "";
     renderStats(response, elapsedMs);
     renderResults(response.results || []);
+    renderFacetChips(response.facets?.category);
   } catch (error) {
     resultSummary.textContent = "Search failed";
     runtimeStats.replaceChildren();

@@ -69,6 +69,8 @@ const GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
 const GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 const GEO_TEXT_MAX_CANDIDATE_POINTS = 100000;
 const GEO_TEXT_SORT_MAX_DF = 200000;
+const FACET_COUNT_MAX_CHUNKS = 32;
+const FACET_COUNT_SIZE = 10;
 const textDecoder = new TextDecoder();
 let activeRuntimeTrace = null;
 
@@ -478,6 +480,9 @@ export async function createSearch(options = {}) {
   )));
   const geoTextSortMaxDf = Math.max(0, Math.floor(Number(
     options.geoTextSortMaxDf ?? GEO_TEXT_SORT_MAX_DF
+  )));
+  const facetCountMaxChunks = Math.max(1, Math.floor(Number(
+    options.facetCountMaxChunks ?? FACET_COUNT_MAX_CHUNKS
   )));
   const docRangePlannerEnabled = options.docRangePlanner !== false;
   const docRangeBlockPruneBatchSize = Math.max(1, Math.min(
@@ -6594,6 +6599,169 @@ export async function createSearch(options = {}) {
     };
   }
 
+  function normalizeFacetsParam(param) {
+    if (!param) return null;
+    const fields = Array.isArray(param) ? param : param.fields;
+    if (!Array.isArray(fields) || !fields.length) return null;
+    const size = Math.max(1, Math.min(100, Math.floor(Number((Array.isArray(param) ? 0 : param.size) || FACET_COUNT_SIZE))));
+    return { fields: fields.map(String), size };
+  }
+
+  async function facetTopValues(field, counts, size) {
+    const dictionary = await loadFacetDictionary(field);
+    const out = [];
+    for (const [code, count] of counts) {
+      const item = dictionary?.[code];
+      if (!item || !item.value) continue;
+      out.push({ value: item.value, label: item.label || item.value, count });
+    }
+    out.sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+    return out.slice(0, size);
+  }
+
+  // Global distribution straight from the facet dictionaries (counted at
+  // build time) — the unfiltered case costs zero extra fetches.
+  async function facetCountsFromDictionary(fields, size) {
+    const out = {};
+    for (const field of fields) {
+      const dictionary = await loadFacetDictionary(field);
+      const values = (dictionary || [])
+        .filter(item => item.value)
+        .map(item => ({ value: item.value, label: item.label || item.value, count: item.n || 0 }))
+        .sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1))
+        .slice(0, size);
+      out[field] = { values, exact: true, source: "dictionary" };
+    }
+    return out;
+  }
+
+  // Counts facet codes over an enumeration grouped by doc-value chunk. When
+  // the enumeration spans more chunks than the budget, a strided chunk
+  // sample is counted and scaled — sampling whole chunks keeps fetch counts
+  // bounded no matter how many documents match.
+  async function facetCountsOverChunks({ fields, size, docsByChunk, verify }) {
+    const chunkIndexes = [...docsByChunk.keys()].sort((a, b) => a - b);
+    let sampledChunks = chunkIndexes;
+    const sampled = chunkIndexes.length > facetCountMaxChunks;
+    if (sampled) {
+      const stride = chunkIndexes.length / facetCountMaxChunks;
+      sampledChunks = Array.from({ length: facetCountMaxChunks }, (_, i) => chunkIndexes[Math.floor(i * stride)]);
+    }
+    const loadFields = verify ? [...new Set([...fields, ...verify.fields])] : fields;
+    const codeData = await ensureDocValueChunkIndexes(loadFields, sampledChunks);
+    const tallies = new Map(fields.map(field => [field, new Map()]));
+    let counted = 0;
+    let rawInSample = 0;
+    for (const chunkIndex of sampledChunks) {
+      for (const doc of docsByChunk.get(chunkIndex)) {
+        rawInSample += 1;
+        if (verify && !passesFilterPlan(doc, codeData, verify.plan)) continue;
+        counted += 1;
+        for (const field of fields) {
+          const value = valueForDoc(codeData, field, doc);
+          if (!value?.codes) continue;
+          const tally = tallies.get(field);
+          for (const code of value.codes) tally.set(code, (tally.get(code) || 0) + 1);
+        }
+      }
+    }
+    // Scale sampled counts by the fraction of the enumeration that was
+    // inspected — unbiased under uniform verification rates, and never
+    // dependent on early-stopped response totals.
+    let totalEnumerated = 0;
+    for (const docs of docsByChunk.values()) totalEnumerated += docs.length;
+    const scale = sampled && rawInSample > 0 ? totalEnumerated / rawInSample : 1;
+    const out = {};
+    for (const field of fields) {
+      const scaledCounts = new Map();
+      for (const [code, count] of tallies.get(field)) scaledCounts.set(code, Math.round(count * scale));
+      out[field] = {
+        values: await facetTopValues(field, scaledCounts, size),
+        exact: !sampled,
+        sampled_docs: counted
+      };
+    }
+    return out;
+  }
+
+  function groupDocsByChunk(docs) {
+    const chunkSize = Math.max(1, docValues?.chunk_size || manifest.total || 1);
+    const byChunk = new Map();
+    for (const doc of docs) {
+      const chunk = Math.floor(doc / chunkSize);
+      let list = byChunk.get(chunk);
+      if (!list) {
+        list = [];
+        byChunk.set(chunk, list);
+      }
+      list.push(doc);
+    }
+    return byChunk;
+  }
+
+  async function computeFacetCounts(params, response) {
+    const facetsParam = normalizeFacetsParam(params.facets);
+    if (!facetsParam) return;
+    if (params.vector || params.geo) {
+      response.stats = { ...(response.stats || {}), facetCountLane: "unsupported-lane" };
+      return;
+    }
+    const q = String(params.q || "").trim();
+    const filters = params.filters || {};
+    const hasFilters = Object.keys(filters.facets || {}).length
+      || Object.keys(filters.numbers || {}).length
+      || Object.keys(filters.booleans || {}).length;
+    await ensureFacetDictionaries(filters);
+
+    if (!q && !hasFilters) {
+      response.facets = await facetCountsFromDictionary(facetsParam.fields, facetsParam.size);
+      response.stats = { ...(response.stats || {}), facetCountLane: "dictionary" };
+      return;
+    }
+
+    await ensureDocValuesManifest();
+    const filterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+
+    if (q) {
+      const match = await collectTextMatchDocs(analyzeTerms(q).map(item => item.term));
+      if (!match) {
+        // Posting volume above budget: fall back to the global distribution,
+        // clearly flagged, instead of guessing from a biased top-k pool.
+        response.facets = await facetCountsFromDictionary(facetsParam.fields, facetsParam.size);
+        for (const field of facetsParam.fields) {
+          if (response.facets[field]) response.facets[field].exact = false;
+        }
+        response.stats = { ...(response.stats || {}), facetCountLane: "global-fallback" };
+        return;
+      }
+      response.facets = await facetCountsOverChunks({
+        fields: facetsParam.fields,
+        size: facetsParam.size,
+        docsByChunk: groupDocsByChunk(match.docs),
+        verify: filterPlan ? { plan: filterPlan, fields: filterPlanFields(filterPlan) } : null
+      });
+      response.stats = { ...(response.stats || {}), facetCountLane: "text-match-set" };
+      return;
+    }
+
+    // Filtered browse: candidate chunks from the numeric/facet summaries,
+    // every doc verified against the filter plan while tallying.
+    const chunkSize = Math.max(1, docValues?.chunk_size || manifest.total || 1);
+    const docsByChunk = new Map();
+    for (const chunkIndex of candidateDocValueChunks(filterPlan)) {
+      const start = chunkIndex * chunkSize;
+      const end = Math.min(manifest.total, start + chunkSize);
+      docsByChunk.set(chunkIndex, Array.from({ length: end - start }, (_, i) => start + i));
+    }
+    response.facets = await facetCountsOverChunks({
+      fields: facetsParam.fields,
+      size: facetsParam.size,
+      docsByChunk,
+      verify: { plan: filterPlan, fields: filterPlanFields(filterPlan) }
+    });
+    response.stats = { ...(response.stats || {}), facetCountLane: "chunk-scan" };
+  }
+
   async function executeCount(params = {}) {
     const q = String(params.q || "").trim();
     const filters = params.filters || {};
@@ -6608,7 +6776,11 @@ export async function createSearch(options = {}) {
 
   async function search(params = {}) {
     const trace = params.trace || options.trace ? createRuntimeTrace() : null;
-    const response = await withRuntimeTrace(trace, () => traceSpan("search.total", () => executeSearch(params)));
+    const response = await withRuntimeTrace(trace, () => traceSpan("search.total", async () => {
+      const searchResponse = await executeSearch(params);
+      if (params.facets) await traceSpan("facets.count", () => computeFacetCounts(params, searchResponse));
+      return searchResponse;
+    }));
     if (!trace) return response;
     return {
       ...response,
