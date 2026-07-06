@@ -60,6 +60,9 @@ a large thesis corpus.
   full-dimension refine store, cosine top-k, and reciprocal-rank fusion with
   the text lane — no server, no vector database.
 - Analyzer-consistent snippets and highlight ranges on search results.
+- Per-query facet counts with exact-or-flagged semantics: dictionary-backed
+  global counts, exact counts over budgeted match sets, and bounded
+  chunk-sampled estimates for very large result sets.
 - OpenStreetMap example and benchmark fixture with exhaustive geo oracles.
 - Tiny runnable example.
 
@@ -292,6 +295,21 @@ Ranking uses an optional `weightPath` (for example population or importance)
 and falls back to popularity — how many documents share the surface. Each
 keystroke costs at most a few small range requests; repeat keystrokes in a
 session are usually served entirely from cache.
+
+Facet counts for filter UIs come back with the search response:
+
+```js
+const result = await engine.search({ q: "static", facets: ["tags"] });
+// result.facets.tags = { values: [{ value: "range", label: "range", count: 12 }, ...], exact: true }
+```
+
+Hybrid semantic search takes a query embedding from the host (for example
+transformers.js in the browser) and fuses it with the text lane:
+
+```js
+const result = await engine.search({ q: "map search", vector: queryEmbedding });
+const nearest = await engine.vectorSearch({ vector: queryEmbedding, k: 10 });
+```
 
 Typo fallback is automatic. For example, if `statik search` has no exact
 first-page hits but `static search` does, the response includes:
