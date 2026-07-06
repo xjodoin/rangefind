@@ -334,6 +334,34 @@ A 1,000,000-document fixture built in 206.2s at 4.80 GiB peak RSS (an older
 recorded 1M run took 4,276.5s), producing a 1,876 MiB published index with
 0/25 invalid runtime rows and 16/16 exact top-k agreement.
 
+## Full French Wikipedia
+
+The complete `frwiki/latest` article dump (2,753,081 articles from 5,981,193
+dump pages) now builds and queries end to end:
+
+```text
+Docs indexed:   2,753,081
+Clean build:    628.5s wall (10.5 minutes) from cached JSONL
+Peak RSS:       4.36 GiB
+Published:      4.92 GiB, 1,658 files, 1,920 B/doc
+Runtime rows:   25/25 valid, exact top-k 16/16
+Cold queries:   123.3 ms avg, 46.9 requests, 969.7 KB avg transfer
+```
+
+Three multi-million-document cliffs had to be removed to get there:
+
+- Partition reduce workers thrashed the chunked code-store cache once the
+  corpus outgrew 64 cached chunks (about 1M docs), making reduce-postings
+  superlinear (30+ minutes before being aborted). Doc-value files are now
+  preloaded into SharedArrayBuffers shared across reduce workers
+  (`codeStoreWorkerPreloadMaxBytes`), which brought the phase to 85s.
+- The same cache thrash hit sorted doc-value page summaries on the main
+  thread (951.8s); the main code store now preloads after posting reduction
+  (`codeStorePreloadMaxBytes`), bringing doc-value-sorted to 9.9s.
+- Authority base shards that split an astral code point produced lone
+  surrogates that crashed `encodeURIComponent`; malformed shard names now
+  use UTF-16 unit hex file names.
+
 Broad single-term queries also got faster at query time: the tail-proof loop
 used to re-run the full stable-top-k proof after every decoded posting block,
 which made tie-heavy doc-ordered terms such as `Paris` spend most of their
