@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { authorityKeysForValue, AUTHORITY_FORMAT, buildAuthorityShard } from "./authority_codec.js";
@@ -61,7 +61,7 @@ export function createAuthorityRunBuffer(config, outDir) {
 function flushAuthorityBuffer(buffer) {
   if (!buffer.enabled) return;
   for (const [shard, records] of buffer.byShard) {
-    appendFileSync(resolve(buffer.runsOut, `${shard}.run`), Buffer.concat(records));
+    appendFileSync(resolve(buffer.runsOut, shardRunFileName(shard)), Buffer.concat(records));
     records.length = 0;
   }
   buffer.byShard.clear();
@@ -115,6 +115,23 @@ export function finishAuthorityRuns(buffer) {
   return [...(buffer.baseShards || [])].sort();
 }
 
+function lonePairSafeName(value) {
+  return Array.from(value, char => char.charCodeAt(0).toString(16)).join("-") || "empty";
+}
+
+function safeShardDirName(shard) {
+  // Base shards can start with a lone surrogate when a shard prefix splits an
+  // astral code point, which encodeURIComponent and utf8 filenames reject or
+  // collapse; encode such names as UTF-16 unit hex instead.
+  const value = String(shard);
+  return value.isWellFormed() ? encodeURIComponent(value) : lonePairSafeName(value);
+}
+
+function shardRunFileName(shard) {
+  const value = String(shard);
+  return value.isWellFormed() ? `${value}.run` : `${lonePairSafeName(value)}.run`;
+}
+
 export async function reduceAuthorityRuns(config, dirs, baseShards) {
   if (!authorityEnabled(config) || !baseShards?.length) return null;
   const shardConfig = authorityShardConfig(config);
@@ -124,11 +141,17 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
   let keyCount = 0;
   let rowCount = 0;
   mkdirSync(resolve(dirs.out, "authority"), { recursive: true });
+  const processedRuns = new Set();
   for (const baseShard of baseShards) {
-    const runPath = resolve(dirs.authorityRunsOut, `${baseShard}.run`);
+    const preferredPath = resolve(dirs.authorityRunsOut, shardRunFileName(baseShard));
+    // Older builds spooled malformed shard names through the filesystem's
+    // replacement-character mangling; fall back so resumed builds still reduce.
+    const runPath = existsSync(preferredPath) ? preferredPath : resolve(dirs.authorityRunsOut, `${baseShard}.run`);
+    if (processedRuns.has(runPath) || !existsSync(runPath)) continue;
+    processedRuns.add(runPath);
     const stats = await reduceRunToPartitions({
       runPath,
-      scratchDir: resolve(dirs.build || resolve(dirs.out, "_build"), "authority-reduce-sort", encodeURIComponent(baseShard)),
+      scratchDir: resolve(dirs.build || resolve(dirs.out, "_build"), "authority-reduce-sort", safeShardDirName(baseShard)),
       config: shardConfig,
       onPartition: (partition) => {
         const buffer = buildAuthorityShard(partition.entries, { maxRows: config.authorityMaxRowsPerKey });
