@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rangefind OSM Place Search</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="map"></div>
+  <aside class="panel">
+    <header class="panel-header">
+      <h1>Rangefind OSM Search</h1>
+      <p id="indexMeta">Loading index…</p>
+    </header>
+    <div class="search-box">
+      <input id="queryInput" type="search" placeholder="Search places… (try: boulangerie)" autocomplete="off" autofocus>
+      <ul id="suggestList" hidden></ul>
+    </div>
+    <label class="area-toggle">
+      <input id="areaToggle" type="checkbox" checked>
+      Search visible map area
+    </label>
+    <p id="statusLine"></p>
+    <ul id="resultList"></ul>
+  </aside>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

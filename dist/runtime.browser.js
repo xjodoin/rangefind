@@ -1503,6 +1503,104 @@ function decodeGeoBranchPage(buffer, packTable, blockFilters = [], expected = {}
   return { field, branchIndex, firstLeafIndex, bbox, leaves };
 }
 
+// src/highlight.js
+var WORD_RE = /[\p{L}\p{M}\p{N}]+/gu;
+function highlightTermSet(query, correctedQuery = "") {
+  const terms = /* @__PURE__ */ new Set();
+  for (const item of analyzeTerms(String(query || ""))) terms.add(item.term);
+  for (const item of analyzeTerms(String(correctedQuery || ""))) terms.add(item.term);
+  return terms;
+}
+function wordMatches(word, termSet) {
+  const folded = fold(word);
+  if (termSet.has(folded)) return true;
+  const stemmed = stem(folded);
+  return stemmed !== folded && termSet.has(stemmed);
+}
+function findMatchRanges(text, termSet) {
+  const ranges = [];
+  if (!termSet?.size) return ranges;
+  WORD_RE.lastIndex = 0;
+  let match;
+  while (match = WORD_RE.exec(text)) {
+    if (wordMatches(match[0], termSet)) {
+      ranges.push([match.index, match.index + match[0].length]);
+    }
+  }
+  return ranges;
+}
+function distinctTermsIn(text, ranges, from, to, termSet) {
+  const seen = /* @__PURE__ */ new Set();
+  for (const [start, end] of ranges) {
+    if (start < from || end > to) continue;
+    seen.add(stem(fold(text.slice(start, end))));
+  }
+  return seen.size;
+}
+function highlightText(text, termSet, options = {}) {
+  const raw = String(text || "");
+  if (!raw) return null;
+  const maxChars = Math.max(40, Math.floor(Number(options.maxChars ?? 240)));
+  const ranges = findMatchRanges(raw, termSet);
+  if (!ranges.length) return null;
+  let windowStart = 0;
+  if (raw.length > maxChars) {
+    let best = { distinct: -1, count: -1, start: 0 };
+    for (const [start] of ranges) {
+      const candidate = Math.max(0, Math.min(start - 30, raw.length - maxChars));
+      const to2 = candidate + maxChars;
+      const distinct = distinctTermsIn(raw, ranges, candidate, to2, termSet);
+      const count = ranges.filter(([s, e]) => s >= candidate && e <= to2).length;
+      if (distinct > best.distinct || distinct === best.distinct && count > best.count) {
+        best = { distinct, count, start: candidate };
+      }
+    }
+    windowStart = best.start;
+  }
+  let from = windowStart;
+  let to = Math.min(raw.length, from + maxChars);
+  if (from > 0) {
+    const nextSpace = raw.indexOf(" ", from);
+    if (nextSpace !== -1 && nextSpace < from + 24) from = nextSpace + 1;
+  }
+  if (to < raw.length) {
+    const previousSpace = raw.lastIndexOf(" ", to);
+    if (previousSpace > from + maxChars / 2) to = previousSpace;
+  }
+  const prefix = from > 0 ? "\u2026 " : "";
+  const suffix = to < raw.length ? " \u2026" : "";
+  const snippetRanges = [];
+  for (const [start, end] of ranges) {
+    if (start < from || end > to) continue;
+    snippetRanges.push([start - from + prefix.length, end - from + prefix.length]);
+  }
+  if (!snippetRanges.length) return null;
+  return {
+    text: prefix + raw.slice(from, to) + suffix,
+    ranges: snippetRanges,
+    matches: snippetRanges.length
+  };
+}
+function applyHighlights(results, termSet, options = {}) {
+  const wanted = Array.isArray(options.fields) && options.fields.length ? options.fields : null;
+  const maxChars = options.maxChars;
+  for (const result of results) {
+    const highlights = {};
+    let any = false;
+    for (const [field, value] of Object.entries(result)) {
+      if (typeof value !== "string" || !value) continue;
+      if (wanted ? !wanted.includes(field) : field === "id" || field === "url") continue;
+      const highlight = highlightText(value, termSet, { maxChars });
+      if (highlight) {
+        highlights[field] = highlight;
+        any = true;
+      }
+    }
+    if (any) result.highlights = highlights;
+  }
+  return results;
+}
+
 // src/suggest_index.js
 var SUGGEST_ROOT_FORMAT = "rfsuggestroot-v1";
 var SUGGEST_PAGE_FORMAT = "rfsuggestpage-v1";
@@ -7612,6 +7710,14 @@ async function createSearch(options = {}) {
     const includeResults = params.includeResults !== false;
     const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults }, response, baseTerms, analyzedTerms);
     const rerankedResponse = await maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, includeResults, authority: params.authority }, typoResponse);
+    if (params.highlight && includeResults && rerankedResponse?.results?.length) {
+      const highlightOptions = params.highlight === true ? {} : params.highlight;
+      applyHighlights(
+        rerankedResponse.results,
+        highlightTermSet(q, rerankedResponse.correctedQuery),
+        highlightOptions
+      );
+    }
     if (geoPlan?.docSetStats) {
       rerankedResponse.stats = {
         ...rerankedResponse.stats || {},

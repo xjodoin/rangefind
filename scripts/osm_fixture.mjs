@@ -15,7 +15,7 @@
 //   node scripts/osm_fixture.mjs all --region=luxembourg
 //   node scripts/osm_fixture.mjs all --region=quebec
 
-import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
@@ -276,6 +276,8 @@ function writeSite(args) {
   };
   mkdirSync(resolve(args.root, "public"), { recursive: true });
   writeFileSync(configPath, JSON.stringify(config, null, 2));
+  const bundle = resolve("dist/runtime.browser.js");
+  if (existsSync(bundle)) copyFileSync(bundle, resolve(args.root, "public", "runtime.browser.js"));
   return configPath;
 }
 

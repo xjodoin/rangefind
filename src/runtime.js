@@ -19,6 +19,7 @@ import {
   pointToBoxMaxDistanceMetersE7
 } from "./geo_tree.js";
 import { decodeDocPointerRecord } from "./doc_pointers.js";
+import { applyHighlights, highlightTermSet } from "./highlight.js";
 import {
   decodeSuggestBranchPage,
   decodeSuggestPage,
@@ -6145,6 +6146,14 @@ export async function createSearch(options = {}) {
     const includeResults = params.includeResults !== false;
     const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults }, response, baseTerms, analyzedTerms);
     const rerankedResponse = await maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, includeResults, authority: params.authority }, typoResponse);
+    if (params.highlight && includeResults && rerankedResponse?.results?.length) {
+      const highlightOptions = params.highlight === true ? {} : params.highlight;
+      applyHighlights(
+        rerankedResponse.results,
+        highlightTermSet(q, rerankedResponse.correctedQuery),
+        highlightOptions
+      );
+    }
     if (geoPlan?.docSetStats) {
       rerankedResponse.stats = {
         ...(rerankedResponse.stats || {}),

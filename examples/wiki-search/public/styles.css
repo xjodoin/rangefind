@@ -323,3 +323,10 @@ main {
     justify-content: flex-start;
   }
 }
+
+.result-body mark, .result-title mark {
+  background: #ffe9a8;
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}

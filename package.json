@@ -64,6 +64,7 @@
     "build:wiki-site:fr:full": "npm run build:browser && node examples/wiki-search/scripts/build.mjs --dump-url=https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pages-articles.xml.bz2 --wiki=frwiki --limit=0",
     "serve:example": "node scripts/serve.mjs examples/basic/public 5178",
     "serve:wiki-site": "node scripts/serve.mjs examples/wiki-search/public 5182",
+    "serve:osm-geo": "node scripts/serve.mjs examples/osm-geo/public 5184",
     "bench:quality": "npm run build:example && node scripts/bench_quality.mjs",
     "bench:performance": "npm run build:example && node scripts/bench_performance.mjs",
     "bench:matrix": "node scripts/bench_matrix.mjs",

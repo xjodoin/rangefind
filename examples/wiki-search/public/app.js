@@ -84,8 +84,28 @@ function searchParams() {
     size: Number(sizeSelect.value) || 10,
     filters,
     sort,
+    highlight: { fields: ["title", "body"], maxChars: 300 },
     trace: true
   };
+}
+
+// Highlights arrive as plain text plus offset ranges, so rendering builds
+// text nodes and <mark> elements without any HTML passing through.
+function renderHighlighted(node, highlight, fallbackText) {
+  if (!highlight?.ranges?.length) {
+    node.textContent = fallbackText;
+    return;
+  }
+  node.replaceChildren();
+  let cursor = 0;
+  for (const [start, end] of highlight.ranges) {
+    if (start > cursor) node.append(highlight.text.slice(cursor, start));
+    const mark = document.createElement("mark");
+    mark.textContent = highlight.text.slice(start, end);
+    node.append(mark);
+    cursor = end;
+  }
+  if (cursor < highlight.text.length) node.append(highlight.text.slice(cursor));
 }
 
 function resultMeta(item) {
@@ -115,9 +135,9 @@ function renderResults(items) {
     const chips = node.querySelector(".chip-row");
 
     title.href = item.url || "#";
-    title.textContent = escapeText(item.title || item.id);
+    renderHighlighted(title, item.highlights?.title, escapeText(item.title || item.id));
     meta.textContent = resultMeta(item);
-    body.textContent = escapeText(item.body || "").slice(0, 520);
+    renderHighlighted(body, item.highlights?.body, escapeText(item.body || "").slice(0, 520));
 
     for (const value of (item.categoryList || []).slice(0, 6)) {
       const chip = document.createElement("span");

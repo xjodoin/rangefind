@@ -1,0 +1,135 @@
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+.panel {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 10;
+  width: min(380px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.96);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(10, 25, 15, 0.25);
+  overflow: hidden;
+}
+
+.panel-header {
+  padding: 14px 16px 8px;
+}
+
+.panel-header h1 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.panel-header p {
+  margin: 4px 0 0;
+  font-size: 0.78rem;
+  color: #4a5a50;
+}
+
+.search-box {
+  position: relative;
+  padding: 0 16px;
+}
+
+.search-box input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid #b8c4bd;
+  border-radius: 8px;
+  font-size: 1rem;
+}
+
+#suggestList {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  top: calc(100% + 4px);
+  z-index: 20;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #fff;
+  border: 1px solid #b8c4bd;
+  border-radius: 8px;
+  box-shadow: 0 10px 24px rgba(20, 35, 25, 0.18);
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+#suggestList li {
+  padding: 8px 12px;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#suggestList li .count {
+  color: #7a8a80;
+  font-size: 0.8rem;
+}
+
+#suggestList li:hover, #suggestList li.active {
+  background: #eef4ef;
+}
+
+.area-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px 0;
+  font-size: 0.85rem;
+  color: #33413a;
+}
+
+#statusLine {
+  margin: 8px 16px 0;
+  font-size: 0.78rem;
+  color: #4a5a50;
+  min-height: 1em;
+}
+
+#resultList {
+  margin: 8px 0 0;
+  padding: 0 0 8px;
+  list-style: none;
+  overflow-y: auto;
+}
+
+#resultList li {
+  padding: 9px 16px;
+  border-top: 1px solid #edf1ee;
+  cursor: pointer;
+}
+
+#resultList li:hover {
+  background: #eef4ef;
+}
+
+#resultList .name {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+#resultList .meta {
+  margin-top: 2px;
+  font-size: 0.78rem;
+  color: #66766c;
+}

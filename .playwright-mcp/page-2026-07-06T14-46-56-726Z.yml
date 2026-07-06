@@ -1,0 +1,24 @@
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - region "Map" [ref=e3]
+    - generic:
+      - generic [ref=e4]:
+        - button "Zoom in" [ref=e5] [cursor=pointer]
+        - button "Zoom out" [ref=e7] [cursor=pointer]
+        - button "Reset bearing to north" [ref=e9]
+      - group [ref=e11]:
+        - generic "Toggle attribution" [ref=e12] [cursor=pointer]
+        - generic [ref=e13]:
+          - text: © OpenStreetMap contributors |
+          - link "MapLibre" [ref=e14] [cursor=pointer]:
+            - /url: https://maplibre.org/
+  - complementary [ref=e15]:
+    - generic [ref=e16]:
+      - heading "Rangefind OSM Search" [level=1] [ref=e17]
+      - paragraph [ref=e18]: 175 276 places · 175 276 geo points · static index over HTTP ranges
+    - 'searchbox "Search places… (try: boulangerie)" [active] [ref=e20]'
+    - generic [ref=e21]:
+      - checkbox "Search visible map area" [checked] [ref=e22]
+      - text: Search visible map area
+    - paragraph [ref=e23]
+    - list [ref=e24]
