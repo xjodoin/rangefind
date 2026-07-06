@@ -69,6 +69,8 @@
     "bench:matrix": "node scripts/bench_matrix.mjs",
     "bench:directories": "node scripts/bench_directory_layouts.mjs",
     "bench:frwiki": "node scripts/frwiki_fixture.mjs all",
+    "bench:osm-geo": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
+    "bench:osm-geo:quebec": "node scripts/osm_fixture.mjs all --region=quebec && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
     "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
     "bench:frwiki:lucene-quality": "node scripts/frwiki_lucene_quality.mjs",
     "bench:frwiki:search-game": "node scripts/search_benchmark_game.mjs",

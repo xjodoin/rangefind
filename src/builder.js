@@ -43,7 +43,18 @@ import {
   docValueFields,
   POSTING_SEGMENT_FORMAT
 } from "./codec.js";
-import { getPath, readConfig } from "./config.js";
+import { geoComponentFieldNames, getPath, readConfig } from "./config.js";
+import {
+  buildGeoTreeLeaves,
+  encodeGeoBranchPage,
+  encodeGeoLeafPage,
+  encodeGeoTreeRoot,
+  GEO_BRANCH_PAGE_FORMAT,
+  GEO_LEAF_PAGE_FORMAT,
+  GEO_TREE_ROOT_FORMAT,
+  latToE7,
+  lonToE7
+} from "./geo_tree.js";
 import { DOC_LAYOUT_FORMAT, docLayoutRecord } from "./doc_layout.js";
 import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, decodeDocPageColumns, encodeDocPageColumns } from "./doc_pages.js";
 import { writeDirectoryFiles, writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
@@ -1216,12 +1227,26 @@ function nextSortPageEnd(rows, start, pageSize) {
   return end;
 }
 
+function geoComponentNames(config) {
+  const names = new Set();
+  for (const geoField of config.geo || []) {
+    const components = geoComponentFieldNames(geoField);
+    names.add(components.lat);
+    names.add(components.lon);
+  }
+  return names;
+}
+
 function writeDocValueSortedIndexes(out, config, total, codes) {
   const pageSize = Math.max(1, Math.floor(Number(config.docValueSortedPageSize || 512)));
   const packWriter = createPackWriter(resolve(out, "doc-values", "sorted-packs"), config.docValueSortedPackBytes || config.docValuePackBytes);
   const fields = {};
-  const sourceFields = (codes.fields || docValueFields(config, codes)).filter(field => field.kind !== "facet");
-  const summaryFields = sourceFields.map(field => ({ name: field.name, kind: field.kind, type: field.type }));
+  const geoComponents = geoComponentNames(config);
+  // Geo coordinate components stay out of the sorted trees (their spatial
+  // index lives in the geo tree) but remain page summary fields for pruning.
+  const nonFacetFields = (codes.fields || docValueFields(config, codes)).filter(field => field.kind !== "facet");
+  const sourceFields = nonFacetFields.filter(field => !geoComponents.has(field.name));
+  const summaryFields = nonFacetFields.map(field => ({ name: field.name, kind: field.kind, type: field.type }));
   const pagesByField = new Map();
 
   for (const field of sourceFields) {
@@ -1315,6 +1340,157 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
 
 function packTable(packs) {
   return (packs || []).map(pack => pack.file);
+}
+
+function writeGeoTrees(out, config, total, codes) {
+  if (!config.geo?.length) return null;
+  const leafSize = Math.max(16, Math.floor(Number(config.geoLeafSize || 512)));
+  const packWriter = createPackWriter(resolve(out, "geo", "point-packs"), config.geoPackBytes || config.docValuePackBytes);
+  const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
+  const fields = {};
+  const rootsByField = new Map();
+
+  for (const geoField of config.geo) {
+    const components = geoComponentFieldNames(geoField);
+    const latsE7 = new Int32Array(total);
+    const lonsE7 = new Int32Array(total);
+    const docs = new Uint32Array(total);
+    let count = 0;
+    for (let start = 0; start < total; start += readChunkSize) {
+      const end = Math.min(total, start + readChunkSize);
+      const latRows = codeRows(codes, components.lat, start, end);
+      const lonRows = codeRows(codes, components.lon, start, end);
+      for (let row = 0; row < latRows.length; row++) {
+        const latE7 = latToE7(latRows[row]);
+        const lonE7 = lonToE7(lonRows[row]);
+        if (latE7 == null || lonE7 == null) continue;
+        latsE7[count] = latE7;
+        lonsE7[count] = lonE7;
+        docs[count] = start + row;
+        count += 1;
+      }
+    }
+    const points = {
+      latsE7: latsE7.subarray(0, count),
+      lonsE7: lonsE7.subarray(0, count),
+      docs: docs.subarray(0, count)
+    };
+    const leaves = buildGeoTreeLeaves(points.latsE7, points.lonsE7, points.docs, leafSize);
+    for (let leafIndex = 0; leafIndex < leaves.length; leafIndex++) {
+      const leaf = leaves[leafIndex];
+      const encoded = encodeGeoLeafPage(geoField.name, points.latsE7, points.lonsE7, points.docs, leaf);
+      leaf.entry = writePackedShard(packWriter, `${geoField.name}\u0000${leafIndex}`, gzipSync(encoded, { level: 6 }), {
+        kind: "geo-leaf-page",
+        codec: GEO_LEAF_PAGE_FORMAT,
+        logicalLength: encoded.length
+      });
+    }
+    const bbox = leaves.length
+      ? {
+          minLatE7: Math.min(...leaves.map(leaf => leaf.minLatE7)),
+          maxLatE7: Math.max(...leaves.map(leaf => leaf.maxLatE7)),
+          minLonE7: Math.min(...leaves.map(leaf => leaf.minLonE7)),
+          maxLonE7: Math.max(...leaves.map(leaf => leaf.maxLonE7))
+        }
+      : { minLatE7: 0, maxLatE7: 0, minLonE7: 0, maxLonE7: 0 };
+    rootsByField.set(geoField.name, { geoField, total: count, bbox, leaves });
+  }
+
+  // Large trees page their leaf tables into lazily fetched branch pages so
+  // the root a browser downloads cold stays small at any point count. Branch
+  // pages reference leaf objects by pack INDEX, which stays stable when
+  // finalizePackWriter renames packs to their content-addressed names.
+  const branchLeaves = Math.max(2, Math.floor(Number(config.geoBranchLeaves || 256)));
+  const provisionalPackIndexes = () => new Map(packTable(packWriter.packs).map((file, index) => [file, index]));
+  for (const state of rootsByField.values()) {
+    if (state.leaves.length <= branchLeaves * 2) continue;
+    const packIndexesNow = provisionalPackIndexes();
+    state.branches = [];
+    for (let start = 0; start < state.leaves.length; start += branchLeaves) {
+      const slice = state.leaves.slice(start, start + branchLeaves);
+      const branch = {
+        minLatE7: Math.min(...slice.map(leaf => leaf.minLatE7)),
+        maxLatE7: Math.max(...slice.map(leaf => leaf.maxLatE7)),
+        minLonE7: Math.min(...slice.map(leaf => leaf.minLonE7)),
+        maxLonE7: Math.max(...slice.map(leaf => leaf.maxLonE7)),
+        count: slice.reduce((sum, leaf) => sum + leaf.count, 0),
+        firstLeafIndex: start,
+        leafCount: slice.length
+      };
+      const encoded = encodeGeoBranchPage({
+        field: state.geoField.name,
+        branchIndex: state.branches.length,
+        firstLeafIndex: start,
+        bbox: branch,
+        leaves: slice,
+        packIndexes: packIndexesNow
+      });
+      branch.entry = writePackedShard(packWriter, `${state.geoField.name} branch ${start}`, gzipSync(encoded, { level: 6 }), {
+        kind: "geo-branch-page",
+        codec: GEO_BRANCH_PAGE_FORMAT,
+        logicalLength: encoded.length
+      });
+      state.branches.push(branch);
+    }
+  }
+
+  finalizePackWriter(packWriter);
+  const packFiles = packTable(packWriter.packs);
+  const packIndexes = new Map(packFiles.map((file, index) => [file, index]));
+  let directoryBytes = 0;
+  mkdirSync(resolve(out, "geo"), { recursive: true });
+
+  for (const { geoField, total: fieldTotal, bbox, leaves, branches } of rootsByField.values()) {
+    const root = encodeGeoTreeRoot({
+      field: geoField.name,
+      total: fieldTotal,
+      leafSize,
+      leafCount: leaves.length,
+      bbox,
+      leaves: branches ? null : leaves,
+      branches: branches || null,
+      packTable: packFiles,
+      packIndexes
+    });
+    const compressed = gzipSync(root.buffer, { level: 6 });
+    const hash = sha256Hex(compressed);
+    const file = `geo/${hashedFile(safeObjectName(geoField.name), hash, ".bin.gz")}`;
+    writeFileSync(resolve(out, file), compressed);
+    directoryBytes += compressed.length;
+    fields[geoField.name] = {
+      name: geoField.name,
+      lat_component: geoComponentFieldNames(geoField).lat,
+      lon_component: geoComponentFieldNames(geoField).lon,
+      total: fieldTotal,
+      leaf_size: leafSize,
+      leaves: leaves.length,
+      levels: branches ? 2 : 1,
+      branches: branches ? branches.length : 0,
+      bbox,
+      directory: {
+        format: GEO_TREE_ROOT_FORMAT,
+        compression: "gzip-member",
+        file,
+        content_hash: hash,
+        immutable: true,
+        bytes: compressed.length,
+        logical_bytes: root.buffer.length
+      }
+    };
+  }
+
+  return {
+    storage: "range-pack-v1",
+    compression: "gzip-member",
+    directory_format: GEO_TREE_ROOT_FORMAT,
+    page_format: GEO_LEAF_PAGE_FORMAT,
+    leaf_size: leafSize,
+    fields,
+    packs: packWriter.packs,
+    pack_table: packFiles,
+    directory_bytes: directoryBytes,
+    pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0)
+  };
 }
 
 function sortReplicaKey(field, order) {
@@ -2793,6 +2969,7 @@ function minimalManifest(manifest) {
     numbers: manifest.numbers,
     booleans: manifest.booleans,
     sorts: manifest.sorts,
+    geo: manifest.geo,
     block_filters: manifest.block_filters,
     directory: manifest.directory,
     sort_replicas: manifest.sort_replicas,
@@ -3152,9 +3329,10 @@ export async function build({ configPath }) {
     let docValueSorted;
     let filterBitmaps;
     let facetDictionaries;
+    let geoTrees;
     const sidecarStage = readStage(config, "sidecars");
     if (sidecarStage) {
-      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries } = sidecarStage);
+      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees } = sidecarStage);
     } else {
       sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
       queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
@@ -3163,9 +3341,10 @@ export async function build({ configPath }) {
       docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
       docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
       docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
+      geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows));
       filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
       facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
-      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries });
+      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees });
       maybeFailAfterStage(config, "sidecars");
     }
     addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
@@ -3196,7 +3375,8 @@ export async function build({ configPath }) {
         queryBundles: !!queryBundles,
         authority: !!authority,
         sortReplicas: sortReplicas.count > 0,
-        mainIndexTypo: config.typoMode !== "off"
+        mainIndexTypo: config.typoMode !== "off",
+        geo: !!geoTrees && Object.keys(geoTrees.fields).length > 0
       },
     object_store: {
       format: OBJECT_STORE_FORMAT,
@@ -3218,7 +3398,8 @@ export async function build({ configPath }) {
         filterBitmaps: packTable(filterBitmaps.packs),
         facets: packTable(facetDictionaries.pack_objects),
         queryBundles: packTable(queryBundles?.packs),
-        authority: packTable(authority?.packs)
+        authority: packTable(authority?.packs),
+        geo: packTable(geoTrees?.packs)
       },
       dedupe: summarizeDedup(
         reduced.packs,
@@ -3230,7 +3411,8 @@ export async function build({ configPath }) {
         filterBitmaps.packs,
         facetDictionaries.pack_objects,
         queryBundles?.packs || [],
-        authority?.packs || []
+        authority?.packs || [],
+        geoTrees?.packs || []
       ),
       directories: {
         terms: reduced.directory,
@@ -3278,6 +3460,18 @@ export async function build({ configPath }) {
       packs: docValueSorted.packs.length,
       pack_table: docValueSorted.pack_table
     },
+    geo: geoTrees
+      ? {
+          storage: geoTrees.storage,
+          compression: geoTrees.compression,
+          directory_format: geoTrees.directory_format,
+          page_format: geoTrees.page_format,
+          leaf_size: geoTrees.leaf_size,
+          fields: geoTrees.fields,
+          packs: geoTrees.packs.length,
+          pack_table: geoTrees.pack_table
+        }
+      : null,
     sort_replicas: sortReplicas,
     filter_bitmaps: {
       storage: filterBitmaps.storage,
@@ -3292,7 +3486,12 @@ export async function build({ configPath }) {
     fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
     facets: Object.fromEntries(Object.entries(facetDictionaries.fields).map(([name, field]) => [name, { count: field.count }])),
     facet_dictionaries: facetDictionaries,
-    numbers: config.numbers.map(n => ({ name: n.name, type: normalizedNumberType(n), sortable: n.sortable !== false })),
+    numbers: config.numbers.map(n => ({
+      name: n.name,
+      type: normalizedNumberType(n),
+      sortable: n.sortable !== false,
+      ...(n.geoComponent ? { geo_component: n.geoComponent } : {})
+    })),
     booleans: (config.booleans || []).map(n => ({ name: n.name, sortable: n.sortable !== false })),
     sorts: config.sorts || [],
     block_filters: reduced.filters,

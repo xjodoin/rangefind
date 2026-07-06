@@ -11,6 +11,10 @@ examples/frwiki/frwiki-builder-bench.json
 examples/frwiki/frwiki-build-telemetry.json
 examples/frwiki/frwiki-scale-bench.json
 examples/frwiki/scale/
+examples/osm-geo/data/
+examples/osm-geo/public/
+examples/osm-geo/rangefind.config.json
+examples/osm-geo/*.json
 examples/wiki-search/data/
 examples/wiki-search/public/rangefind/
 examples/wiki-search/public/runtime.browser.js

@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 export const DEFAULTS = {
+  geoLeafSize: 512,
+  geoPackBytes: 4 * 1024 * 1024,
   docValueChunkSize: 2048,
   docValueLookupChunkSize: 2048,
   filterBitmaps: true,
@@ -141,6 +143,41 @@ function clampInt(value, fallback, min, max) {
   return Math.max(min, Math.min(max, parsed));
 }
 
+export function geoComponentFieldNames(geoField) {
+  return { lat: `${geoField.name}.lat`, lon: `${geoField.name}.lon` };
+}
+
+function normalizeGeoFields(raw) {
+  const fields = Array.isArray(raw) ? raw : [];
+  return fields.map(field => {
+    const name = String(field?.name || "").trim();
+    if (!name) throw new Error("Rangefind geo fields need a name.");
+    if (!field.latPath || !field.lonPath) throw new Error(`Rangefind geo field "${name}" needs latPath and lonPath.`);
+    return { name, latPath: String(field.latPath), lonPath: String(field.lonPath) };
+  });
+}
+
+// Every geo field also stores its coordinates as hidden double doc-values so
+// text searches can verify geo filters per doc through the existing numeric
+// filter machinery (including posting-block range pruning).
+function appendGeoComponentNumbers(config) {
+  const existing = new Set(config.numbers.map(number => number.name));
+  for (const geoField of config.geo) {
+    const components = geoComponentFieldNames(geoField);
+    for (const [axis, name] of Object.entries(components)) {
+      if (existing.has(name)) throw new Error(`Rangefind geo field "${geoField.name}" collides with number field "${name}".`);
+      config.numbers.push({
+        name,
+        path: axis === "lat" ? geoField.latPath : geoField.lonPath,
+        type: "double",
+        sortable: false,
+        geoComponent: geoField.name
+      });
+    }
+  }
+  return config;
+}
+
 export async function readConfig(configPath) {
   const full = resolve(configPath);
   const base = configDir(full);
@@ -157,7 +194,7 @@ export async function readConfig(configPath) {
   ]) {
     delete activeRaw[key];
   }
-  return applyIndexProfile({
+  return appendGeoComponentNumbers(applyIndexProfile({
     ...DEFAULTS,
     ...activeRaw,
     codecs: { ...DEFAULTS.codecs, ...(raw.codecs || {}) },
@@ -169,13 +206,14 @@ export async function readConfig(configPath) {
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
     facets: raw.facets || [],
-    numbers: raw.numbers || [],
+    numbers: (raw.numbers || []).map(number => ({ ...number })),
     booleans: raw.booleans || [],
     sorts: raw.sorts || [],
     sortReplicas: raw.sortReplicas || [],
+    geo: normalizeGeoFields(raw.geo),
     display: raw.display || ["title", "url"],
     authority: raw.authority || DEFAULTS.authority
-  }, raw);
+  }, raw));
 }
 
 export function getPath(object, path, fallback = "") {

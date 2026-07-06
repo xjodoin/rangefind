@@ -11,6 +11,9 @@ export const DOC_VALUE_SORT_DIRECTORY_MAGIC = [0x52, 0x46, 0x44, 0x54]; // RFDT
 export const DOC_VALUE_SORT_PAGE_MAGIC = [0x52, 0x46, 0x44, 0x56]; // RFDV
 export const QUERY_BUNDLE_MAGIC = [0x52, 0x46, 0x51, 0x42]; // RFQB
 export const AUTHORITY_SHARD_MAGIC = [0x52, 0x46, 0x41, 0x55]; // RFAU
+export const GEO_TREE_ROOT_MAGIC = [0x52, 0x46, 0x47, 0x52]; // RFGR
+export const GEO_BRANCH_PAGE_MAGIC = [0x52, 0x46, 0x47, 0x42]; // RFGB
+export const GEO_LEAF_PAGE_MAGIC = [0x52, 0x46, 0x47, 0x4c]; // RFGL
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));

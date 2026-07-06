@@ -56,6 +56,10 @@ rangefind/
       0000.<hash>.bin.gz
     packs/
       0000.<hash>.bin
+  geo/
+    location.<hash>.bin.gz
+    point-packs/
+      0000.<hash>.bin
 ```
 
 `manifest.json` is small enough for page initialization. It lists schema,
@@ -340,6 +344,55 @@ for the sort field and evaluate filters with page summaries before touching
 per-document chunks. Filter-only browse requests use doc-id chunk summaries and
 early stop as soon as `offset + size` matching documents are found, which keeps
 the returned ids dense enough for binary doc pages.
+
+## Geo Point Trees
+
+Geo fields configured as `{ "name": "location", "latPath": "lat", "lonPath":
+"lon" }` produce a Lucene-`LatLonPoint`-style static point index adapted to
+range requests:
+
+- Coordinates are stored as fixed-precision E7 integers (about 1 cm), exactly
+  like Lucene's encoding.
+- The builder bulk-loads a KD tree by recursively splitting points on the
+  physically wider dimension (longitude spans shrink by cos(latitude)) until
+  leaves hold `geoLeafSize` points (default 512). Leaves are written in
+  depth-first order so spatially adjacent leaves stay adjacent inside
+  `geo/point-packs/*.bin` and coalesce into few range requests.
+- Each leaf page stores its bounding box plus delta-encoded fixed-width
+  lat/lon/doc columns, individually gzipped and checksummed like every other
+  range object.
+- A gzipped tree root (`geo/<field>.<hash>.bin.gz`) is loaded lazily on the
+  first geo query. Small trees list every leaf inline; large trees are
+  two-level: the root lists branch entries (bbox, point count, object pointer)
+  whose leaf tables live in lazily fetched branch pages inside the same point
+  packs. A branch page covers `geoBranchLeaves` leaves (default 256), so the
+  cold root stays a few KB at any point count and a query only downloads the
+  branch pages its constraint intersects.
+
+Every geo field also registers hidden `location.lat`/`location.lon` double
+doc-values. Bounding-box constraints rewrite into numeric range filters over
+those columns, so text-plus-geo queries inherit doc-value chunk pruning,
+sorted-page summaries, and posting-block range pruning without new machinery.
+
+Query lanes:
+
+- **Browse** (`q: ""` with `geo.box` or `geo.near`): intersecting leaves are
+  visited in pack order with adaptive batching; leaves fully contained in the
+  query skip per-point verification; radius queries verify with Haversine.
+- **Nearest** (`geo.sort: "distance"`): best-first traversal by exact
+  point-to-cell distance with a top-k boundary proof — traversal stops when no
+  unvisited leaf can beat the current k-th distance, which typically touches
+  only 1-3 leaves.
+- **Text plus geo**: when the geo constraint covers at most
+  `geoTextMaxCandidatePoints` points (default 100k), the runtime resolves the
+  matching doc-id set from the tree first and filters postings against it;
+  otherwise it falls back to per-document doc-value verification. Distance
+  boost (`geo.boost`) applies Lucene's `weight * pivot / (pivot + distance)`
+  shape to the returned page window.
+
+Point-to-box minimum and maximum spherical distances are exact (including
+antimeridian wrap, facing-away meridians, and antipodal interiors), so radius
+pruning and containment proofs never drop a matching document.
 
 ## Why Custom Binary
 

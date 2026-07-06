@@ -47,6 +47,10 @@ a large thesis corpus.
   sorting.
 - Lazy binary sorted doc-value trees for range-pruned top-k sort and doc-order
   early-stop browsing.
+- Lucene-style geo point fields with a range-addressed static KD tree:
+  bounding-box and radius filters, exact nearest-neighbor distance sort with
+  early-stop proofs, text-plus-geo filtering, and distance boosts.
+- OpenStreetMap example and benchmark fixture with exhaustive geo oracles.
 - Tiny runnable example.
 
 ## Why This Exists
@@ -223,6 +227,38 @@ const result = await engine.search({
   sort: { field: "published", order: "desc" }
 });
 ```
+
+Geo fields index one point per document into a range-addressed static KD tree
+(Lucene `LatLonPoint`-style, E7 fixed precision):
+
+```json
+{
+  "geo": [{ "name": "location", "latPath": "lat", "lonPath": "lon" }]
+}
+```
+
+```js
+// Places inside a map viewport (empty-query browse).
+await engine.search({ q: "", geo: { box: { minLat: 45.45, maxLat: 45.62, minLon: -73.7, maxLon: -73.45 } } });
+
+// Exact nearest neighbors, sorted by distance with early-stop proofs.
+await engine.search({ q: "", geo: { near: { lat: 45.5017, lon: -73.5673 }, sort: "distance" } });
+
+// Text search restricted to a radius, plus a Lucene-style distance boost.
+await engine.search({
+  q: "bakery",
+  geo: {
+    near: { lat: 45.5017, lon: -73.5673, radiusMeters: 5000 },
+    boost: { weight: 2, pivotMeters: 500 }
+  }
+});
+```
+
+Results include `distanceMeters` whenever `geo.near` is present. Radius and
+box filters are exact (bounding-box prune plus Haversine verification), and
+`stats` reports the tree traversal (`geoLane`, `geoLeavesVisited`,
+`geoPointsScanned`, ...). See `examples/osm-geo/` for an OpenStreetMap-scale
+example and benchmark.
 
 Typo fallback is automatic. For example, if `statik search` has no exact
 first-page hits but `static search` does, the response includes:
