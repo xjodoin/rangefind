@@ -17,6 +17,7 @@ import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createFetchMeter, kb, mean, quantile, serveStatic } from "./bench_support.mjs";
+import { analyzeTerms, tokenize } from "../src/analyzer.js";
 import { createSearch } from "../src/runtime.js";
 import { haversineMetersE7, latToE7, lonToE7, boxContainsPointE7 } from "../src/geo_tree.js";
 
@@ -47,6 +48,7 @@ async function loadPoints(path) {
       name: doc.name,
       category: doc.category || "",
       tokens: `${doc.name} ${doc.body || ""}`.toLowerCase(),
+      tokenSet: new Set(tokenize(`${doc.name} ${doc.body || ""} ${(doc.aliases || []).join(" ")}`)),
       latE7,
       lonE7
     });
@@ -140,6 +142,10 @@ async function main() {
       }
     },
     { name: "text-radius-5km", params: { q: "restaurant", geo: { near: near5km } } },
+    {
+      name: "text-nearest",
+      params: { q: "restaurant", geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" } }
+    },
     { name: "text-viewport", params: { q: "pharmacie", geo: { box: wideViewport } } },
     {
       name: "text-radius-boost",
@@ -236,6 +242,19 @@ async function main() {
       const expectedDistances = nearestExpected.map(item => Math.round(item.dist * 10) / 10);
       if (JSON.stringify(nearestDistances) !== JSON.stringify(expectedDistances)) {
         failures.push(`nearest: distances ${JSON.stringify(nearestDistances.slice(0, 5))} != ${JSON.stringify(expectedDistances.slice(0, 5))}`);
+      }
+
+      const textNearest = await engine.search({
+        q: "restaurant",
+        geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" },
+        size: 20
+      });
+      const restaurantTerm = analyzeTerms("restaurant")[0].term;
+      const textNearestExpected = oracleRadius(points, center, Infinity, point => point.tokenSet.has(restaurantTerm)).slice(0, 20);
+      const textNearestDistances = textNearest.results.map(result => result.distanceMeters);
+      const textNearestExpectedDistances = textNearestExpected.map(item => Math.round(item.dist * 10) / 10);
+      if (JSON.stringify(textNearestDistances) !== JSON.stringify(textNearestExpectedDistances)) {
+        failures.push(`text-nearest: distances ${JSON.stringify(textNearestDistances.slice(0, 5))} != ${JSON.stringify(textNearestExpectedDistances.slice(0, 5))}`);
       }
 
       const textRadius = await engine.search({ q: "restaurant", geo: { near: near5km }, size: 100 });

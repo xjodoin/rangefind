@@ -49,7 +49,8 @@ a large thesis corpus.
   early-stop browsing.
 - Lucene-style geo point fields with a range-addressed static KD tree:
   bounding-box and radius filters, exact nearest-neighbor distance sort with
-  early-stop proofs, text-plus-geo filtering, and distance boosts.
+  early-stop proofs (with or without a text query), text-plus-geo filtering,
+  per-cell filter summaries, and distance boosts.
 - OpenStreetMap example and benchmark fixture with exhaustive geo oracles.
 - Tiny runnable example.
 
@@ -243,6 +244,9 @@ await engine.search({ q: "", geo: { box: { minLat: 45.45, maxLat: 45.62, minLon:
 
 // Exact nearest neighbors, sorted by distance with early-stop proofs.
 await engine.search({ q: "", geo: { near: { lat: 45.5017, lon: -73.5673 }, sort: "distance" } });
+
+// Exact nearest matches for a text query ("closest bakeries first").
+await engine.search({ q: "bakery", geo: { near: { lat: 45.5017, lon: -73.5673 }, sort: "distance" } });
 
 // Text search restricted to a radius, plus a Lucene-style distance boost.
 await engine.search({

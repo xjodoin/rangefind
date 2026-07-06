@@ -53,6 +53,7 @@ const GEO_LEAF_PAGE_BATCH_SIZE = 16;
 const GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
 const GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 const GEO_TEXT_MAX_CANDIDATE_POINTS = 100000;
+const GEO_TEXT_SORT_MAX_DF = 200000;
 const textDecoder = new TextDecoder();
 let activeRuntimeTrace = null;
 
@@ -452,6 +453,9 @@ export async function createSearch(options = {}) {
   const geoTextMaxCandidatePoints = Math.max(0, Math.floor(Number(
     options.geoTextMaxCandidatePoints ?? GEO_TEXT_MAX_CANDIDATE_POINTS
   )));
+  const geoTextSortMaxDf = Math.max(0, Math.floor(Number(
+    options.geoTextSortMaxDf ?? GEO_TEXT_SORT_MAX_DF
+  )));
   const docRangePlannerEnabled = options.docRangePlanner !== false;
   const docRangeBlockPruneBatchSize = Math.max(1, Math.min(
     2048,
@@ -723,7 +727,8 @@ export async function createSearch(options = {}) {
     const meta = geoFieldMeta(field);
     if (!meta?.directory?.file) return null;
     if (!geoTreeRootCache.has(field)) {
-      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseGeoTreeRoot);
+      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl))
+        .then(buffer => parseGeoTreeRoot(buffer, manifest.block_filters || []));
       promise.catch(() => {
         geoTreeRootCache.delete(field);
       });
@@ -799,7 +804,7 @@ export async function createSearch(options = {}) {
       branches,
       geoBranchPageCache,
       (fieldName, index) => `${fieldName} branch ${index}`,
-      inflated => decodeGeoBranchPage(inflated, root.packTable, { name: field }),
+      inflated => decodeGeoBranchPage(inflated, root.packTable, manifest.block_filters || [], { name: field }),
       "geo branch page",
       stats
     );
@@ -2014,7 +2019,10 @@ export async function createSearch(options = {}) {
     return false;
   }
 
-  function geoLeafCandidate(geoPlan, leaf) {
+  function geoLeafCandidate(geoPlan, leaf, blockFilterPlan = null) {
+    // Per-leaf/per-branch filter summaries prove some cells cannot contain a
+    // matching document, so their pages are never fetched.
+    if (blockFilterPlan && leaf.filters && !blockMayPass(leaf, blockFilterPlan)) return null;
     const near = geoPlan.near;
     const radius = near?.radiusMeters ?? null;
     if (radius != null) {
@@ -2047,7 +2055,7 @@ export async function createSearch(options = {}) {
   // arrive in globally non-decreasing min-distance order (each leaf's min
   // distance is at least its branch's), which the nearest lane's early-stop
   // proof relies on.
-  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking) {
+  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, blockFilterPlan = null) {
     const { counters, leafFetchStats, branchFetchStats } = tracking;
     const firstBatch = Math.min(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, geoLeafPageBatchSize);
 
@@ -2065,7 +2073,7 @@ export async function createSearch(options = {}) {
     function leafCandidates(leaves) {
       const out = [];
       for (const leaf of leaves) {
-        const candidate = geoLeafCandidate(geoPlan, leaf);
+        const candidate = geoLeafCandidate(geoPlan, leaf, blockFilterPlan);
         if (candidate) out.push(candidate);
       }
       counters.candidateLeaves += out.length;
@@ -2080,7 +2088,7 @@ export async function createSearch(options = {}) {
 
     const branchCandidates = [];
     for (const branch of root.branches) {
-      const candidate = geoLeafCandidate(geoPlan, branch);
+      const candidate = geoLeafCandidate(geoPlan, branch, blockFilterPlan);
       if (candidate) branchCandidates.push(candidate);
     }
     counters.candidateBranches = branchCandidates.length;
@@ -2580,6 +2588,44 @@ export async function createSearch(options = {}) {
         postingsAccepted: total
       }
     };
+  }
+
+  // Exact set of docs matching the analyzed query terms under the same
+  // minShouldMatch rule as count(). Used by text + distance sort, where the
+  // geo tree orders results and text match is a membership predicate.
+  // Returns null when the posting volume exceeds `geoTextSortMaxDf`.
+  async function collectTextMatchDocs(baseTerms) {
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const entries = await termEntries(baseTerms);
+    const presentBaseTerms = new Set(entries.map(item => item.term));
+    const stats = {
+      terms: baseTerms.length,
+      minShouldMatch,
+      termEntriesVisited: entries.length,
+      blocksDecoded: 0,
+      postingsDecoded: 0
+    };
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return { docs: new Set(), stats };
+    }
+    const totalDf = entries.reduce((sum, item) => sum + (item.entry.df || item.entry.count || 0), 0);
+    if (totalDf > geoTextSortMaxDf) return null;
+    const CounterArray = counterArrayForBaseTerms(baseTerms);
+    const counters = new CounterArray(Math.max(0, manifest.total || 0));
+    for (const { shard, entry } of entries) {
+      const postings = await decodeEntryPostings(shard, entry);
+      stats.blocksDecoded += entry.blocks?.length || 0;
+      stats.postingsDecoded += Math.floor(postings.length / 2);
+      for (let index = 0; index < postings.length; index += 2) {
+        const doc = postings[index];
+        if (doc >= 0 && doc < counters.length) counters[doc]++;
+      }
+    }
+    const docs = new Set();
+    for (let doc = 0; doc < counters.length; doc++) {
+      if (counters[doc] >= minShouldMatch) docs.add(doc);
+    }
+    return { docs, stats };
   }
 
   function makeSortPlan(sort) {
@@ -3303,11 +3349,11 @@ export async function createSearch(options = {}) {
     return Math.round(distance * 10) / 10;
   }
 
-  async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters }) {
-    return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters }));
+  async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
+    return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs }));
   }
 
-  async function runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters }) {
+  async function runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
     const root = await loadGeoTreeRoot(geoPlan.field);
     if (!root) return null;
     const offset = (page - 1) * size;
@@ -3325,6 +3371,7 @@ export async function createSearch(options = {}) {
       ? [...new Set(filterPlanFields(docFilterPlan))].filter(field => !bitmapCovered.has(field))
       : [];
 
+    const geoBlockFilterPlan = docFilterPlan?.active ? makeBlockFilterPlan(filters) : null;
     const best = [];
     const collected = [];
     const distances = new Map();
@@ -3336,7 +3383,7 @@ export async function createSearch(options = {}) {
     const tracking = geoTraversalTracking();
     const kthDistance = () => (best.length >= k ? best[k - 1].dist : Infinity);
 
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking)) {
+    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, geoBlockFilterPlan)) {
       if (distanceSorted && best.length >= k && candidate.minDist > kthDistance()) {
         stoppedEarly = true;
         break;
@@ -3360,6 +3407,7 @@ export async function createSearch(options = {}) {
         }
         if (distanceSorted && best.length >= k && dist > kthDistance()) continue;
         const doc = docs[i];
+        if (textMatchDocs && !textMatchDocs.has(doc)) continue;
         if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         pointsAccepted++;
         if (distanceSorted) {
@@ -3408,7 +3456,7 @@ export async function createSearch(options = {}) {
       approximate: !exactTotal,
       stats: {
         exact: distanceSorted ? true : exactTotal,
-        geoLane: distanceSorted ? "nearest" : "browse",
+        geoLane: (distanceSorted ? "nearest" : "browse") + (textMatchDocs ? "Text" : ""),
         geoField: geoPlan.field,
         geoDistanceSorted: distanceSorted,
         geoTreeLevels: root.levels,
@@ -5912,10 +5960,7 @@ export async function createSearch(options = {}) {
     const filters = geoPlan ? withGeoFilters(userFilters, geoPlan) : userFilters;
     const sort = params.sort || null;
     const sortPlan = makeSortPlan(sort);
-    if (geoPlan?.sort) {
-      if (q) throw new Error("Rangefind: geo.sort \"distance\" currently supports empty-query browse only.");
-      if (sortPlan) throw new Error("Rangefind: use either sort or geo.sort, not both.");
-    }
+    if (geoPlan?.sort && sortPlan) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
 
     if (!q) {
@@ -5986,6 +6031,37 @@ export async function createSearch(options = {}) {
 
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map(item => item.term);
+    if (geoPlan?.sort) {
+      // Exact text + distance sort: resolve the full text match set once,
+      // then let the geo tree order it with the nearest early-stop proof.
+      const match = await collectTextMatchDocs(baseTerms);
+      if (!match) {
+        throw new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+      }
+      const hasUserFilters = Object.keys(userFilters.facets || {}).length
+        || Object.keys(userFilters.numbers || {}).length
+        || Object.keys(userFilters.booleans || {}).length;
+      if (hasUserFilters) await ensureDocValuesManifest();
+      await ensureFacetDictionaries(userFilters);
+      const geoResponse = await runGeoBrowse({
+        page,
+        size,
+        filters: userFilters,
+        geoPlan,
+        hasFilters: hasUserFilters,
+        textMatchDocs: match.docs
+      });
+      if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for distance sort.");
+      geoResponse.stats = {
+        ...(geoResponse.stats || {}),
+        textMatchDocs: match.docs.size,
+        textMatchTerms: match.stats.terms,
+        textMatchMinShouldMatch: match.stats.minShouldMatch,
+        textMatchBlocksDecoded: match.stats.blocksDecoded,
+        textMatchPostingsDecoded: match.stats.postingsDecoded
+      };
+      return geoResponse;
+    }
     if (geoPlan?.filtered) await buildGeoDocSetIfCheap(geoPlan);
     if (params.exact) await ensureFullManifest();
     else if (sortPlan) await ensureDocValueSortedManifest();

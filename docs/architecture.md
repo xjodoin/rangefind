@@ -389,6 +389,17 @@ Query lanes:
   otherwise it falls back to per-document doc-value verification. Distance
   boost (`geo.boost`) applies Lucene's `weight * pivot / (pivot + distance)`
   shape to the returned page window.
+- **Text plus distance sort** (`q` with `geo.sort: "distance"`): the runtime
+  resolves the exact text match set from postings (same minShouldMatch rule
+  as `count()`, bounded by `geoTextSortMaxDf`, default 200k postings), then
+  the nearest lane orders it with the usual early-stop proof — "closest
+  bakeries first" is exact.
+
+Leaf and branch entries also carry posting-block-style filter summaries
+(facet words, numeric min/max, boolean bounds), so facet/boolean/numeric
+filters prune cells that provably contain no match before any page is
+fetched — a sparse-category nearest query touches only the cells where the
+category exists.
 
 Point-to-box minimum and maximum spherical distances are exact (including
 antimeridian wrap, facing-away meridians, and antipodal interiors), so radius

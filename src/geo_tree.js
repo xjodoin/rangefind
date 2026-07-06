@@ -8,7 +8,7 @@ import {
   readVarint,
   writeFixedInt
 } from "./binary.js";
-import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
+import { assertMagic, pushUtf8, readBlockFilterSummary, readUtf8, writeBlockFilterSummary } from "./codec.js";
 
 export const GEO_TREE_ROOT_FORMAT = "rfgeotreeroot-v1";
 export const GEO_BRANCH_PAGE_FORMAT = "rfgeobranchpage-v1";
@@ -363,22 +363,67 @@ function readObjectPointer(bytes, state, packTable, target) {
   return target;
 }
 
-function pushLeafEntry(out, leaf, base, packIndexes) {
+// Filter summaries mirror posting-block summaries so the runtime can prune
+// leaves and branches with the existing blockMayPass logic. A complete
+// default is written for missing entries; partial summaries would desync the
+// fixed field-order layout on read.
+function completeFilterSummary(blockFilters, summary) {
+  const out = {};
+  for (const filter of blockFilters) {
+    const item = summary?.[filter.name];
+    if (filter.kind === "facet") {
+      out[filter.name] = { words: item?.words?.length === filter.words ? item.words : new Array(filter.words).fill(0) };
+    } else {
+      out[filter.name] = { min: item?.min ?? null, max: item?.max ?? null };
+    }
+  }
+  return out;
+}
+
+export function mergeBlockFilterSummaries(blockFilters, summaries) {
+  const merged = completeFilterSummary(blockFilters, null);
+  for (const summary of summaries) {
+    for (const filter of blockFilters) {
+      const item = summary?.[filter.name];
+      const target = merged[filter.name];
+      if (filter.kind === "facet") {
+        for (let w = 0; w < filter.words; w++) target.words[w] |= item?.words?.[w] || 0;
+      } else {
+        if (Number.isFinite(item?.min)) target.min = target.min == null ? item.min : Math.min(target.min, item.min);
+        if (Number.isFinite(item?.max)) target.max = target.max == null ? item.max : Math.max(target.max, item.max);
+      }
+    }
+  }
+  return merged;
+}
+
+function pushFilterSummary(out, blockFilters, summary) {
+  if (!blockFilters?.length) return;
+  writeBlockFilterSummary(out, blockFilters, completeFilterSummary(blockFilters, summary));
+}
+
+function readFilterSummary(bytes, state, blockFilters) {
+  if (!blockFilters?.length) return null;
+  return readBlockFilterSummary(bytes, state, { block_filters: blockFilters });
+}
+
+function pushLeafEntry(out, leaf, base, packIndexes, blockFilters) {
   pushVarint(out, leaf.minLatE7 - base.minLatE7);
   pushVarint(out, leaf.maxLatE7 - leaf.minLatE7);
   pushVarint(out, leaf.minLonE7 - base.minLonE7);
   pushVarint(out, leaf.maxLonE7 - leaf.minLonE7);
   pushVarint(out, leaf.count);
   pushObjectPointer(out, leaf.entry, packIndexes);
+  pushFilterSummary(out, blockFilters, leaf.summary);
 }
 
-function readLeafEntry(bytes, state, base, packTable, index) {
+function readLeafEntry(bytes, state, base, packTable, index, blockFilters) {
   const minLatE7 = base.minLatE7 + readVarint(bytes, state);
   const maxLatE7 = minLatE7 + readVarint(bytes, state);
   const minLonE7 = base.minLonE7 + readVarint(bytes, state);
   const maxLonE7 = minLonE7 + readVarint(bytes, state);
   const count = readVarint(bytes, state);
-  return readObjectPointer(bytes, state, packTable, {
+  const leaf = readObjectPointer(bytes, state, packTable, {
     index,
     minLatE7,
     maxLatE7,
@@ -386,12 +431,14 @@ function readLeafEntry(bytes, state, base, packTable, index) {
     maxLonE7,
     count
   });
+  leaf.filters = readFilterSummary(bytes, state, blockFilters);
+  return leaf;
 }
 
 // The tree root is single-level (leaf entries inline) for small point sets
 // and two-level for large ones: the root lists branch entries whose leaf
 // tables live in lazily fetched, range-addressed branch pages.
-export function encodeGeoTreeRoot({ field, total, leafSize, leafCount, bbox, leaves, branches, packTable, packIndexes }) {
+export function encodeGeoTreeRoot({ field, total, leafSize, leafCount, bbox, leaves, branches, packTable, packIndexes, blockFilters }) {
   const out = [...GEO_TREE_ROOT_MAGIC];
   pushVarint(out, FORMAT_VERSION);
   pushUtf8(out, field);
@@ -406,9 +453,11 @@ export function encodeGeoTreeRoot({ field, total, leafSize, leafCount, bbox, lea
   for (const pack of packTable) pushUtf8(out, pack);
   const levels = branches ? 2 : 1;
   out.push(levels);
+  const summaryFilters = blockFilters?.length ? blockFilters : null;
+  out.push(summaryFilters ? 1 : 0);
   if (levels === 1) {
     pushVarint(out, leaves.length);
-    for (const leaf of leaves) pushLeafEntry(out, leaf, bbox, packIndexes);
+    for (const leaf of leaves) pushLeafEntry(out, leaf, bbox, packIndexes, summaryFilters);
   } else {
     pushVarint(out, branches.length);
     for (const branch of branches) {
@@ -420,6 +469,7 @@ export function encodeGeoTreeRoot({ field, total, leafSize, leafCount, bbox, lea
       pushVarint(out, branch.firstLeafIndex);
       pushVarint(out, branch.leafCount);
       pushObjectPointer(out, branch.entry, packIndexes);
+      pushFilterSummary(out, summaryFilters, branch.summary);
     }
   }
   return {
@@ -437,7 +487,7 @@ export function encodeGeoTreeRoot({ field, total, leafSize, leafCount, bbox, lea
   };
 }
 
-export function parseGeoTreeRoot(buffer) {
+export function parseGeoTreeRoot(buffer, blockFilters = []) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, GEO_TREE_ROOT_MAGIC, "Unsupported Rangefind geo tree root");
   const state = { pos: GEO_TREE_ROOT_MAGIC.length };
@@ -456,6 +506,11 @@ export function parseGeoTreeRoot(buffer) {
   const packTable = new Array(packCount);
   for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
   const levels = bytes[state.pos++];
+  const hasSummaries = bytes[state.pos++] === 1;
+  if (hasSummaries && !blockFilters?.length) {
+    throw new Error("Rangefind geo tree root has filter summaries but no block_filters manifest was provided.");
+  }
+  const summaryFilters = hasSummaries ? blockFilters : null;
   const root = {
     format: GEO_TREE_ROOT_FORMAT,
     pageFormat: GEO_LEAF_PAGE_FORMAT,
@@ -464,6 +519,7 @@ export function parseGeoTreeRoot(buffer) {
     leafSize,
     leafCount,
     levels,
+    hasSummaries,
     bbox,
     packTable,
     leaves: null,
@@ -472,7 +528,7 @@ export function parseGeoTreeRoot(buffer) {
   if (levels === 1) {
     const count = readVarint(bytes, state);
     const leaves = new Array(count);
-    for (let i = 0; i < count; i++) leaves[i] = readLeafEntry(bytes, state, bbox, packTable, i);
+    for (let i = 0; i < count; i++) leaves[i] = readLeafEntry(bytes, state, bbox, packTable, i, summaryFilters);
     root.leaves = leaves;
   } else if (levels === 2) {
     const count = readVarint(bytes, state);
@@ -485,7 +541,7 @@ export function parseGeoTreeRoot(buffer) {
       const pointCount = readVarint(bytes, state);
       const firstLeafIndex = readVarint(bytes, state);
       const branchLeafCount = readVarint(bytes, state);
-      branches[i] = readObjectPointer(bytes, state, packTable, {
+      const branch = readObjectPointer(bytes, state, packTable, {
         index: i,
         minLatE7: branchMinLat,
         maxLatE7: branchMaxLat,
@@ -495,6 +551,8 @@ export function parseGeoTreeRoot(buffer) {
         firstLeafIndex,
         leafCount: branchLeafCount
       });
+      branch.filters = readFilterSummary(bytes, state, summaryFilters);
+      branches[i] = branch;
     }
     root.branches = branches;
   } else {
@@ -504,7 +562,7 @@ export function parseGeoTreeRoot(buffer) {
   return root;
 }
 
-export function encodeGeoBranchPage({ field, branchIndex, firstLeafIndex, bbox, leaves, packIndexes }) {
+export function encodeGeoBranchPage({ field, branchIndex, firstLeafIndex, bbox, leaves, packIndexes, blockFilters }) {
   const out = [...GEO_BRANCH_PAGE_MAGIC];
   pushVarint(out, FORMAT_VERSION);
   pushUtf8(out, field);
@@ -514,12 +572,14 @@ export function encodeGeoBranchPage({ field, branchIndex, firstLeafIndex, bbox, 
   pushVarint(out, bbox.maxLatE7 - bbox.minLatE7);
   pushZigzag(out, bbox.minLonE7);
   pushVarint(out, bbox.maxLonE7 - bbox.minLonE7);
+  const summaryFilters = blockFilters?.length ? blockFilters : null;
+  out.push(summaryFilters ? 1 : 0);
   pushVarint(out, leaves.length);
-  for (const leaf of leaves) pushLeafEntry(out, leaf, bbox, packIndexes);
+  for (const leaf of leaves) pushLeafEntry(out, leaf, bbox, packIndexes, summaryFilters);
   return Buffer.from(Uint8Array.from(out));
 }
 
-export function decodeGeoBranchPage(buffer, packTable, expected = {}) {
+export function decodeGeoBranchPage(buffer, packTable, blockFilters = [], expected = {}) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, GEO_BRANCH_PAGE_MAGIC, "Unsupported Rangefind geo branch page");
   const state = { pos: GEO_BRANCH_PAGE_MAGIC.length };
@@ -534,10 +594,15 @@ export function decodeGeoBranchPage(buffer, packTable, expected = {}) {
   const minLonE7 = readZigzag(bytes, state);
   const maxLonE7 = minLonE7 + readVarint(bytes, state);
   const bbox = { minLatE7, maxLatE7, minLonE7, maxLonE7 };
+  const hasSummaries = bytes[state.pos++] === 1;
+  if (hasSummaries && !blockFilters?.length) {
+    throw new Error("Rangefind geo branch page has filter summaries but no block_filters manifest was provided.");
+  }
+  const summaryFilters = hasSummaries ? blockFilters : null;
   const count = readVarint(bytes, state);
   const leaves = new Array(count);
   for (let i = 0; i < count; i++) {
-    leaves[i] = readLeafEntry(bytes, state, bbox, packTable, firstLeafIndex + i);
+    leaves[i] = readLeafEntry(bytes, state, bbox, packTable, firstLeafIndex + i, summaryFilters);
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind geo branch page has trailing bytes.");
   return { field, branchIndex, firstLeafIndex, bbox, leaves };

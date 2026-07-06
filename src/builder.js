@@ -41,7 +41,8 @@ import {
   buildFacetDictionary,
   buildPostingSegmentChunks,
   docValueFields,
-  POSTING_SEGMENT_FORMAT
+  POSTING_SEGMENT_FORMAT,
+  summarizeBlockFilters
 } from "./codec.js";
 import { geoComponentFieldNames, getPath, readConfig } from "./config.js";
 import {
@@ -53,7 +54,8 @@ import {
   GEO_LEAF_PAGE_FORMAT,
   GEO_TREE_ROOT_FORMAT,
   latToE7,
-  lonToE7
+  lonToE7,
+  mergeBlockFilterSummaries
 } from "./geo_tree.js";
 import { DOC_LAYOUT_FORMAT, docLayoutRecord } from "./doc_layout.js";
 import { buildDocPagePointerTable, DOC_PAGE_ENCODING, DOC_PAGE_FORMAT, decodeDocPageColumns, encodeDocPageColumns } from "./doc_pages.js";
@@ -1342,8 +1344,9 @@ function packTable(packs) {
   return (packs || []).map(pack => pack.file);
 }
 
-function writeGeoTrees(out, config, total, codes) {
+function writeGeoTrees(out, config, total, codes, blockFilters) {
   if (!config.geo?.length) return null;
+  const summaryFilters = Array.isArray(blockFilters) && blockFilters.length ? blockFilters : null;
   const leafSize = Math.max(16, Math.floor(Number(config.geoLeafSize || 512)));
   const packWriter = createPackWriter(resolve(out, "geo", "point-packs"), config.geoPackBytes || config.docValuePackBytes);
   const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
@@ -1384,6 +1387,9 @@ function writeGeoTrees(out, config, total, codes) {
         codec: GEO_LEAF_PAGE_FORMAT,
         logicalLength: encoded.length
       });
+      if (summaryFilters) {
+        leaf.summary = summarizeBlockFilters(summaryFilters, codes, points.docs.subarray(leaf.start, leaf.end));
+      }
     }
     const bbox = leaves.length
       ? {
@@ -1417,13 +1423,17 @@ function writeGeoTrees(out, config, total, codes) {
         firstLeafIndex: start,
         leafCount: slice.length
       };
+      if (summaryFilters) {
+        branch.summary = mergeBlockFilterSummaries(summaryFilters, slice.map(leaf => leaf.summary));
+      }
       const encoded = encodeGeoBranchPage({
         field: state.geoField.name,
         branchIndex: state.branches.length,
         firstLeafIndex: start,
         bbox: branch,
         leaves: slice,
-        packIndexes: packIndexesNow
+        packIndexes: packIndexesNow,
+        blockFilters: summaryFilters
       });
       branch.entry = writePackedShard(packWriter, `${state.geoField.name} branch ${start}`, gzipSync(encoded, { level: 6 }), {
         kind: "geo-branch-page",
@@ -1450,7 +1460,8 @@ function writeGeoTrees(out, config, total, codes) {
       leaves: branches ? null : leaves,
       branches: branches || null,
       packTable: packFiles,
-      packIndexes
+      packIndexes,
+      blockFilters: summaryFilters
     });
     const compressed = gzipSync(root.buffer, { level: 6 });
     const hash = sha256Hex(compressed);
@@ -3341,7 +3352,7 @@ export async function build({ configPath }) {
       docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
       docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
       docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
-      geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows));
+      geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows, reduced.filters));
       filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
       facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
       writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees });

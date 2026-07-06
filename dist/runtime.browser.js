@@ -1376,13 +1376,17 @@ function readObjectPointer(bytes, state, packTable, target) {
   target.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
   return target;
 }
-function readLeafEntry(bytes, state, base, packTable, index) {
+function readFilterSummary(bytes, state, blockFilters) {
+  if (!blockFilters?.length) return null;
+  return readBlockFilterSummary(bytes, state, { block_filters: blockFilters });
+}
+function readLeafEntry(bytes, state, base, packTable, index, blockFilters) {
   const minLatE7 = base.minLatE7 + readVarint(bytes, state);
   const maxLatE7 = minLatE7 + readVarint(bytes, state);
   const minLonE7 = base.minLonE7 + readVarint(bytes, state);
   const maxLonE7 = minLonE7 + readVarint(bytes, state);
   const count = readVarint(bytes, state);
-  return readObjectPointer(bytes, state, packTable, {
+  const leaf = readObjectPointer(bytes, state, packTable, {
     index,
     minLatE7,
     maxLatE7,
@@ -1390,8 +1394,10 @@ function readLeafEntry(bytes, state, base, packTable, index) {
     maxLonE7,
     count
   });
+  leaf.filters = readFilterSummary(bytes, state, blockFilters);
+  return leaf;
 }
-function parseGeoTreeRoot(buffer) {
+function parseGeoTreeRoot(buffer, blockFilters = []) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, GEO_TREE_ROOT_MAGIC, "Unsupported Rangefind geo tree root");
   const state = { pos: GEO_TREE_ROOT_MAGIC.length };
@@ -1410,6 +1416,11 @@ function parseGeoTreeRoot(buffer) {
   const packTable = new Array(packCount);
   for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
   const levels = bytes[state.pos++];
+  const hasSummaries = bytes[state.pos++] === 1;
+  if (hasSummaries && !blockFilters?.length) {
+    throw new Error("Rangefind geo tree root has filter summaries but no block_filters manifest was provided.");
+  }
+  const summaryFilters = hasSummaries ? blockFilters : null;
   const root = {
     format: GEO_TREE_ROOT_FORMAT,
     pageFormat: GEO_LEAF_PAGE_FORMAT,
@@ -1418,6 +1429,7 @@ function parseGeoTreeRoot(buffer) {
     leafSize,
     leafCount,
     levels,
+    hasSummaries,
     bbox,
     packTable,
     leaves: null,
@@ -1426,7 +1438,7 @@ function parseGeoTreeRoot(buffer) {
   if (levels === 1) {
     const count = readVarint(bytes, state);
     const leaves = new Array(count);
-    for (let i = 0; i < count; i++) leaves[i] = readLeafEntry(bytes, state, bbox, packTable, i);
+    for (let i = 0; i < count; i++) leaves[i] = readLeafEntry(bytes, state, bbox, packTable, i, summaryFilters);
     root.leaves = leaves;
   } else if (levels === 2) {
     const count = readVarint(bytes, state);
@@ -1439,7 +1451,7 @@ function parseGeoTreeRoot(buffer) {
       const pointCount = readVarint(bytes, state);
       const firstLeafIndex = readVarint(bytes, state);
       const branchLeafCount = readVarint(bytes, state);
-      branches[i] = readObjectPointer(bytes, state, packTable, {
+      const branch = readObjectPointer(bytes, state, packTable, {
         index: i,
         minLatE7: branchMinLat,
         maxLatE7: branchMaxLat,
@@ -1449,6 +1461,8 @@ function parseGeoTreeRoot(buffer) {
         firstLeafIndex,
         leafCount: branchLeafCount
       });
+      branch.filters = readFilterSummary(bytes, state, summaryFilters);
+      branches[i] = branch;
     }
     root.branches = branches;
   } else {
@@ -1457,7 +1471,7 @@ function parseGeoTreeRoot(buffer) {
   if (state.pos !== bytes.length) throw new Error("Rangefind geo tree root has trailing bytes.");
   return root;
 }
-function decodeGeoBranchPage(buffer, packTable, expected = {}) {
+function decodeGeoBranchPage(buffer, packTable, blockFilters = [], expected = {}) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, GEO_BRANCH_PAGE_MAGIC, "Unsupported Rangefind geo branch page");
   const state = { pos: GEO_BRANCH_PAGE_MAGIC.length };
@@ -1472,10 +1486,15 @@ function decodeGeoBranchPage(buffer, packTable, expected = {}) {
   const minLonE7 = readZigzag(bytes, state);
   const maxLonE7 = minLonE7 + readVarint(bytes, state);
   const bbox = { minLatE7, maxLatE7, minLonE7, maxLonE7 };
+  const hasSummaries = bytes[state.pos++] === 1;
+  if (hasSummaries && !blockFilters?.length) {
+    throw new Error("Rangefind geo branch page has filter summaries but no block_filters manifest was provided.");
+  }
+  const summaryFilters = hasSummaries ? blockFilters : null;
   const count = readVarint(bytes, state);
   const leaves = new Array(count);
   for (let i = 0; i < count; i++) {
-    leaves[i] = readLeafEntry(bytes, state, bbox, packTable, firstLeafIndex + i);
+    leaves[i] = readLeafEntry(bytes, state, bbox, packTable, firstLeafIndex + i, summaryFilters);
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind geo branch page has trailing bytes.");
   return { field, branchIndex, firstLeafIndex, bbox, leaves };
@@ -1905,6 +1924,7 @@ var GEO_LEAF_PAGE_BATCH_SIZE = 16;
 var GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
 var GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 var GEO_TEXT_MAX_CANDIDATE_POINTS = 1e5;
+var GEO_TEXT_SORT_MAX_DF = 2e5;
 var textDecoder4 = new TextDecoder();
 var activeRuntimeTrace = null;
 function nowMs() {
@@ -2273,6 +2293,9 @@ async function createSearch(options = {}) {
   const geoTextMaxCandidatePoints = Math.max(0, Math.floor(Number(
     options.geoTextMaxCandidatePoints ?? GEO_TEXT_MAX_CANDIDATE_POINTS
   )));
+  const geoTextSortMaxDf = Math.max(0, Math.floor(Number(
+    options.geoTextSortMaxDf ?? GEO_TEXT_SORT_MAX_DF
+  )));
   const docRangePlannerEnabled = options.docRangePlanner !== false;
   const docRangeBlockPruneBatchSize = Math.max(1, Math.min(
     2048,
@@ -2517,7 +2540,7 @@ async function createSearch(options = {}) {
     const meta = geoFieldMeta(field);
     if (!meta?.directory?.file) return null;
     if (!geoTreeRootCache.has(field)) {
-      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseGeoTreeRoot);
+      const promise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then((buffer) => parseGeoTreeRoot(buffer, manifest.block_filters || []));
       promise.catch(() => {
         geoTreeRootCache.delete(field);
       });
@@ -2586,7 +2609,7 @@ async function createSearch(options = {}) {
       branches,
       geoBranchPageCache,
       (fieldName, index) => `${fieldName} branch ${index}`,
-      (inflated) => decodeGeoBranchPage(inflated, root.packTable, { name: field }),
+      (inflated) => decodeGeoBranchPage(inflated, root.packTable, manifest.block_filters || [], { name: field }),
       "geo branch page",
       stats
     );
@@ -3697,7 +3720,8 @@ async function createSearch(options = {}) {
     }
     return false;
   }
-  function geoLeafCandidate(geoPlan, leaf) {
+  function geoLeafCandidate(geoPlan, leaf, blockFilterPlan = null) {
+    if (blockFilterPlan && leaf.filters && !blockMayPass(leaf, blockFilterPlan)) return null;
     const near = geoPlan.near;
     const radius = near?.radiusMeters ?? null;
     if (radius != null) {
@@ -3723,7 +3747,7 @@ async function createSearch(options = {}) {
       geoDefinite: true
     };
   }
-  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking) {
+  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, blockFilterPlan = null) {
     const { counters, leafFetchStats, branchFetchStats } = tracking;
     const firstBatch = Math.min(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, geoLeafPageBatchSize);
     async function* yieldLeafBatches(candidates) {
@@ -3739,7 +3763,7 @@ async function createSearch(options = {}) {
     function leafCandidates(leaves) {
       const out = [];
       for (const leaf of leaves) {
-        const candidate = geoLeafCandidate(geoPlan, leaf);
+        const candidate = geoLeafCandidate(geoPlan, leaf, blockFilterPlan);
         if (candidate) out.push(candidate);
       }
       counters.candidateLeaves += out.length;
@@ -3752,7 +3776,7 @@ async function createSearch(options = {}) {
     }
     const branchCandidates = [];
     for (const branch of root.branches) {
-      const candidate = geoLeafCandidate(geoPlan, branch);
+      const candidate = geoLeafCandidate(geoPlan, branch, blockFilterPlan);
       if (candidate) branchCandidates.push(candidate);
     }
     counters.candidateBranches = branchCandidates.length;
@@ -4190,6 +4214,39 @@ async function createSearch(options = {}) {
         postingsAccepted: total
       }
     };
+  }
+  async function collectTextMatchDocs(baseTerms) {
+    const minShouldMatch = minShouldMatchFor(baseTerms);
+    const entries = await termEntries(baseTerms);
+    const presentBaseTerms = new Set(entries.map((item) => item.term));
+    const stats = {
+      terms: baseTerms.length,
+      minShouldMatch,
+      termEntriesVisited: entries.length,
+      blocksDecoded: 0,
+      postingsDecoded: 0
+    };
+    if (presentBaseTerms.size < Math.max(1, minShouldMatch)) {
+      return { docs: /* @__PURE__ */ new Set(), stats };
+    }
+    const totalDf = entries.reduce((sum, item) => sum + (item.entry.df || item.entry.count || 0), 0);
+    if (totalDf > geoTextSortMaxDf) return null;
+    const CounterArray = counterArrayForBaseTerms(baseTerms);
+    const counters = new CounterArray(Math.max(0, manifest.total || 0));
+    for (const { shard, entry } of entries) {
+      const postings = await decodeEntryPostings(shard, entry);
+      stats.blocksDecoded += entry.blocks?.length || 0;
+      stats.postingsDecoded += Math.floor(postings.length / 2);
+      for (let index = 0; index < postings.length; index += 2) {
+        const doc = postings[index];
+        if (doc >= 0 && doc < counters.length) counters[doc]++;
+      }
+    }
+    const docs = /* @__PURE__ */ new Set();
+    for (let doc = 0; doc < counters.length; doc++) {
+      if (counters[doc] >= minShouldMatch) docs.add(doc);
+    }
+    return { docs, stats };
   }
   function makeSortPlan(sort) {
     if (!sort) return null;
@@ -4853,10 +4910,10 @@ async function createSearch(options = {}) {
   function roundedDistanceMeters(distance) {
     return Math.round(distance * 10) / 10;
   }
-  async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters }) {
-    return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters }));
+  async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
+    return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs }));
   }
-  async function runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters }) {
+  async function runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
     const root = await loadGeoTreeRoot(geoPlan.field);
     if (!root) return null;
     const offset = (page - 1) * size;
@@ -4868,6 +4925,7 @@ async function createSearch(options = {}) {
     const bitmapStore = docFilterPlan?.active ? await filterBitmapStoreForPlan(docFilterPlan) : null;
     const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
     const residualFilterFields = docFilterPlan?.active ? [...new Set(filterPlanFields(docFilterPlan))].filter((field) => !bitmapCovered.has(field)) : [];
+    const geoBlockFilterPlan = docFilterPlan?.active ? makeBlockFilterPlan(filters) : null;
     const best = [];
     const collected = [];
     const distances = /* @__PURE__ */ new Map();
@@ -4878,7 +4936,7 @@ async function createSearch(options = {}) {
     let stoppedEarly = false;
     const tracking = geoTraversalTracking();
     const kthDistance = () => best.length >= k ? best[k - 1].dist : Infinity;
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking)) {
+    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, geoBlockFilterPlan)) {
       if (distanceSorted && best.length >= k && candidate.minDist > kthDistance()) {
         stoppedEarly = true;
         break;
@@ -4902,6 +4960,7 @@ async function createSearch(options = {}) {
         }
         if (distanceSorted && best.length >= k && dist > kthDistance()) continue;
         const doc = docs[i];
+        if (textMatchDocs && !textMatchDocs.has(doc)) continue;
         if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         pointsAccepted++;
         if (distanceSorted) {
@@ -4947,7 +5006,7 @@ async function createSearch(options = {}) {
       approximate: !exactTotal,
       stats: {
         exact: distanceSorted ? true : exactTotal,
-        geoLane: distanceSorted ? "nearest" : "browse",
+        geoLane: (distanceSorted ? "nearest" : "browse") + (textMatchDocs ? "Text" : ""),
         geoField: geoPlan.field,
         geoDistanceSorted: distanceSorted,
         geoTreeLevels: root.levels,
@@ -7246,10 +7305,7 @@ async function createSearch(options = {}) {
     const filters = geoPlan ? withGeoFilters(userFilters, geoPlan) : userFilters;
     const sort = params.sort || null;
     const sortPlan = makeSortPlan(sort);
-    if (geoPlan?.sort) {
-      if (q) throw new Error('Rangefind: geo.sort "distance" currently supports empty-query browse only.');
-      if (sortPlan) throw new Error("Rangefind: use either sort or geo.sort, not both.");
-    }
+    if (geoPlan?.sort && sortPlan) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     if (!q) {
       if (sortPlan) await ensureDocValueSortedManifest();
@@ -7312,6 +7368,33 @@ async function createSearch(options = {}) {
     }
     const analyzedTerms = analyzeTerms(q);
     const baseTerms = analyzedTerms.map((item) => item.term);
+    if (geoPlan?.sort) {
+      const match = await collectTextMatchDocs(baseTerms);
+      if (!match) {
+        throw new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+      }
+      const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
+      if (hasUserFilters) await ensureDocValuesManifest();
+      await ensureFacetDictionaries(userFilters);
+      const geoResponse = await runGeoBrowse({
+        page,
+        size,
+        filters: userFilters,
+        geoPlan,
+        hasFilters: hasUserFilters,
+        textMatchDocs: match.docs
+      });
+      if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for distance sort.");
+      geoResponse.stats = {
+        ...geoResponse.stats || {},
+        textMatchDocs: match.docs.size,
+        textMatchTerms: match.stats.terms,
+        textMatchMinShouldMatch: match.stats.minShouldMatch,
+        textMatchBlocksDecoded: match.stats.blocksDecoded,
+        textMatchPostingsDecoded: match.stats.postingsDecoded
+      };
+      return geoResponse;
+    }
     if (geoPlan?.filtered) await buildGeoDocSetIfCheap(geoPlan);
     if (params.exact) await ensureFullManifest();
     else if (sortPlan) await ensureDocValueSortedManifest();

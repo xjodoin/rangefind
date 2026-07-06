@@ -297,6 +297,19 @@ function placeFixtureDocs() {
       lon: i % 2 === 0 ? 179.9 + random() * 0.099 : -179.9 - random() * 0.099
     });
   }
+  // A category that exists only in one tight cluster, to exercise per-leaf
+  // filter summary pruning.
+  for (let i = 0; i < 16; i++) {
+    docs.push({
+      id: `obs-${i}`,
+      title: `Quebec observatory ${i}`,
+      body: "An observatory near Quebec City.",
+      category: "observatory",
+      rating: (i % 50) / 10,
+      lat: 46.8 + random() * 0.01,
+      lon: -71.25 + random() * 0.01
+    });
+  }
   // One doc with no coordinates: text-searchable, geo-invisible.
   docs.push({ id: "nowhere", title: "Nowhere bakery", body: "A bakery with no coordinates.", category: "bakery", rating: 5 });
   return docs;
@@ -404,6 +417,25 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
       .slice(0, 5);
     assert.deepEqual(filteredNearest.results.map(result => result.title), filteredExpected.map(item => item.title));
 
+    // Per-leaf filter summaries prune cells that provably lack the facet, so
+    // a sparse-category nearest query touches almost no leaves.
+    const obsNearest = await engine.search({
+      q: "",
+      filters: { facets: { category: ["observatory"] } },
+      geo: { near: center, sort: "distance" },
+      size: 5
+    });
+    const obsExpected = points
+      .filter(point => point.category === "observatory")
+      .map(point => ({ title: point.title, dist: haversineMetersE7(centerE7.latE7, centerE7.lonE7, point.latE7, point.lonE7) }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 5);
+    assert.deepEqual(obsNearest.results.map(result => result.title), obsExpected.map(item => item.title));
+    assert.ok(
+      obsNearest.stats.geoCandidateLeaves <= 4,
+      `filter summaries should prune to the observatory cells, saw ${obsNearest.stats.geoCandidateLeaves}`
+    );
+
     // Text search restricted to a radius (also covers the no-coordinates doc).
     const textRadius = await engine.search({ q: "bakery", geo: { near: { ...center, radiusMeters: radius } }, size: 100 });
     const textRadiusExpected = radiusExpected.filter(point => point.category === "bakery");
@@ -491,9 +523,42 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
       engine.search({ q: "", geo: { field: "unknown", box } }),
       /unknown geo field/
     );
+    // Text + exact distance sort: nearest bakeries in true distance order.
+    const textNearest = await engine.search({ q: "bakery", geo: { near: center, sort: "distance" }, size: 5 });
+    const textNearestExpected = points
+      .filter(point => point.category === "bakery")
+      .map(point => ({ title: point.title, dist: haversineMetersE7(centerE7.latE7, centerE7.lonE7, point.latE7, point.lonE7) }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 5);
+    assert.deepEqual(textNearest.results.map(result => result.title), textNearestExpected.map(item => item.title));
+    assert.deepEqual(
+      textNearest.results.map(result => result.distanceMeters),
+      textNearestExpected.map(item => Math.round(item.dist * 10) / 10)
+    );
+    assert.equal(textNearest.stats.geoLane, "nearestText");
+    assert.equal(textNearest.stats.exact, true);
+    assert.ok(textNearest.stats.textMatchDocs >= textNearestExpected.length);
+    assert.ok(!textNearest.results.some(result => result.title === "Nowhere bakery"));
+
+    // Text + distance sort composes with facet and numeric filters.
+    const filteredTextNearest = await engine.search({
+      q: "montreal",
+      filters: { numbers: { rating: { min: 2 } } },
+      geo: { near: center, sort: "distance" },
+      size: 5
+    });
+    const filteredTextExpected = points
+      .filter(point => point.title.startsWith("Montreal") && point.rating >= 2)
+      .map(point => ({ title: point.title, dist: haversineMetersE7(centerE7.latE7, centerE7.lonE7, point.latE7, point.lonE7) }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 5);
+    assert.deepEqual(filteredTextNearest.results.map(result => result.title), filteredTextExpected.map(item => item.title));
+
+    // The posting budget produces a clear error instead of silent truncation.
+    const tinyBudget = await createSearch({ baseUrl: server.baseUrl, geoTextSortMaxDf: 1 });
     await assert.rejects(
-      engine.search({ q: "bakery", geo: { near: center, sort: "distance" } }),
-      /empty-query browse only/
+      tinyBudget.search({ q: "bakery", geo: { near: center, sort: "distance" } }),
+      /geoTextSortMaxDf/
     );
   } finally {
     await server.close();
