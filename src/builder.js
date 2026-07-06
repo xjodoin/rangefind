@@ -770,12 +770,25 @@ async function finishDocPacks(out, spool, total, config) {
   const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
   const entryPath = buildPath(config, "docs", "doc-pack-entries.bin");
   const entryOutFd = openSync(entryPath, "w");
-  const fd = openSync(spool.path, "r");
-  const spoolEntryFd = openSync(spool.entryPath, "r");
+  const preloadLimit = Math.max(0, Math.floor(Number(config.docPackSpoolPreloadMaxBytes ?? 1536 * 1024 * 1024)));
+  const preload = spool.bytes > 0 && spool.bytes <= preloadLimit;
+  const payloadBytes = preload ? readFileSync(spool.path) : null;
+  const entryTable = preload ? readFileSync(spool.entryPath) : null;
+  const fd = preload ? null : openSync(spool.path, "r");
+  const spoolEntryFd = preload ? null : openSync(spool.entryPath, "r");
   try {
     for (const index of layout.order) {
-      const entry = readDocSpoolEntry(spoolEntryFd, index);
-      const packed = writePackedShard(packWriter, docIndexKey(index), readSpooledDoc(fd, entry), {
+      const entry = preload
+        ? {
+            offset: readBigUInt(entryTable, index * DOC_SPOOL_ENTRY_BYTES),
+            length: readBigUInt(entryTable, index * DOC_SPOOL_ENTRY_BYTES + 8),
+            logicalLength: readBigUInt(entryTable, index * DOC_SPOOL_ENTRY_BYTES + 16)
+          }
+        : readDocSpoolEntry(spoolEntryFd, index);
+      const compressed = preload
+        ? payloadBytes.subarray(entry.offset, entry.offset + entry.length)
+        : readSpooledDoc(fd, entry);
+      const packed = writePackedShard(packWriter, docIndexKey(index), compressed, {
         kind: "doc",
         codec: "json-v1",
         logicalLength: entry.logicalLength
@@ -783,8 +796,8 @@ async function finishDocPacks(out, spool, total, config) {
       writePackedDocEntry(entryOutFd, index, packed);
     }
   } finally {
-    closeSync(fd);
-    closeSync(spoolEntryFd);
+    if (fd != null) closeSync(fd);
+    if (spoolEntryFd != null) closeSync(spoolEntryFd);
     closeSync(entryOutFd);
   }
   finalizePackWriter(packWriter);

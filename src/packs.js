@@ -59,8 +59,19 @@ function nextPackIndex(writer) {
   return index;
 }
 
+const PACK_WRITE_BUFFER_BYTES = 1024 * 1024;
+
+function flushPackBuffer(writer) {
+  if (!writer.pending?.length) return;
+  const chunk = writer.pending.length === 1 ? writer.pending[0] : Buffer.concat(writer.pending, writer.pendingBytes);
+  writeSync(writer.fd, chunk, 0, chunk.length);
+  writer.pending.length = 0;
+  writer.pendingBytes = 0;
+}
+
 function closeCurrentPack(writer) {
   if (writer.fd == null) return;
+  flushPackBuffer(writer);
   closeSync(writer.fd);
   writer.fd = null;
   const pack = writer.packs[writer.packs.length - 1];
@@ -80,11 +91,15 @@ function openPack(writer) {
   Object.defineProperty(pack, "path", { value: writer.path, writable: true, enumerable: false, configurable: true });
   Object.defineProperty(pack, "hasher", { value: createHash("sha256"), writable: true, enumerable: false, configurable: true });
   writer.packs.push(pack);
+  writer.pending = [];
+  writer.pendingBytes = 0;
   writer.fd = openSync(writer.path, "w");
 }
 
 function appendToPack(writer, chunk) {
-  writeSync(writer.fd, chunk, 0, chunk.length);
+  writer.pending.push(chunk);
+  writer.pendingBytes += chunk.length;
+  if (writer.pendingBytes >= PACK_WRITE_BUFFER_BYTES) flushPackBuffer(writer);
   const pack = writer.packs[writer.packs.length - 1];
   pack.hasher.update(chunk);
 }
