@@ -19,6 +19,34 @@ const resultTemplate = document.querySelector("#resultTemplate");
 let engine;
 let siteMeta = {};
 
+// Semantic hybrid search: the query embeds in the browser with the same
+// MiniLM model the build used, loaded lazily on first use.
+const semanticLabel = document.querySelector("#semanticLabel");
+const semanticInput = document.querySelector("#semanticInput");
+let embedderPromise = null;
+
+async function loadEmbedder() {
+  if (!embedderPromise) {
+    embedderPromise = (async () => {
+      resultSummary.textContent = "Loading semantic model (first use only)...";
+      const { pipeline } = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1");
+      return pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { dtype: "q8" });
+    })();
+    embedderPromise.catch(() => {
+      embedderPromise = null;
+    });
+  }
+  return embedderPromise;
+}
+
+async function embedQuery(q) {
+  const extractor = await loadEmbedder();
+  const output = await extractor(q, { pooling: "mean", normalize: true });
+  const vector = Array.from(output.data);
+  output.dispose?.();
+  return vector;
+}
+
 function formatNumber(value) {
   return new Intl.NumberFormat().format(Number(value || 0));
 }
@@ -140,7 +168,13 @@ function renderResults(items) {
     meta.textContent = resultMeta(item);
     renderHighlighted(body, item.highlights?.body, escapeText(item.body || "").slice(0, 520));
 
-    for (const value of (item.categoryList || []).slice(0, 6)) {
+    // Display payloads flatten arrays to strings, so guard the chip list.
+    const categoryChips = Array.isArray(item.categoryList)
+      ? item.categoryList
+      : item.category
+        ? [item.category]
+        : [];
+    for (const value of categoryChips.slice(0, 6)) {
       const chip = document.createElement("span");
       chip.className = "chip";
       chip.textContent = value;
@@ -202,6 +236,13 @@ async function runSearch() {
   const params = searchParams();
   resultSummary.textContent = "Searching...";
   correctionSummary.textContent = "";
+  try {
+    if (semanticInput?.checked && params.q && engine.manifest.features?.vectors) {
+      params.vector = await embedQuery(params.q);
+    }
+  } catch (error) {
+    resultSummary.textContent = `Semantic model failed to load (${error?.message || error}); using text search`;
+  }
   const started = performance.now();
   try {
     const response = await engine.search(params);
@@ -238,6 +279,7 @@ async function boot() {
   engine = await createSearch({ baseUrl: new URL("./rangefind/", location.href).href });
   const docs = siteMeta.docs || engine.manifest.total || 0;
   docCount.textContent = docs ? formatNumber(docs) : "-";
+  if (engine.manifest.features?.vectors) semanticLabel.hidden = false;
   await runSearch();
 }
 
@@ -296,7 +338,7 @@ form.addEventListener("submit", event => {
   runSearch();
 });
 
-for (const control of [sortSelect, sizeSelect, hasCategoriesInput, longBodyInput, shortTitleInput]) {
+for (const control of [sortSelect, sizeSelect, hasCategoriesInput, longBodyInput, shortTitleInput, semanticInput]) {
   control.addEventListener("change", runSearch);
 }
 

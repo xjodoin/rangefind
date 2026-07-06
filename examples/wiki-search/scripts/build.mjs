@@ -21,11 +21,13 @@ function parseArgs(argv) {
     limit: Number(process.env.WIKI_LIMIT || 50000),
     bodyChars: Number(process.env.WIKI_BODY_CHARS || 12000),
     jsonl: process.env.WIKI_JSONL || "",
+    embed: process.env.WIKI_EMBED === "1",
     force: false,
     buildProgressLogMs: Number(process.env.WIKI_BUILD_PROGRESS_MS || 15000)
   };
   for (const arg of argv) {
     if (arg === "--force") args.force = true;
+    else if (arg === "--embed") args.embed = true;
     else if (arg.startsWith("--dump-url=")) args.dumpUrl = arg.slice("--dump-url=".length);
     else if (arg.startsWith("--wiki=")) args.wiki = arg.slice("--wiki=".length);
     else if (arg.startsWith("--limit=")) args.limit = Number(arg.slice("--limit=".length)) || 0;
@@ -363,6 +365,9 @@ function writeConfig(args, docsPath) {
     suggest: [
       { path: "title" }
     ],
+    ...(args.embed
+      ? { vectors: [{ name: "embedding", path: "embedding", dims: 384 }] }
+      : {}),
     facets: [
       { name: "category", path: "category" },
       { name: "articleTags", path: "articleTags" }
@@ -418,6 +423,10 @@ async function main() {
   mkdirSync(resolve(ROOT, "public"), { recursive: true });
   syncRuntimeBundle();
   const docsPath = await writeDocs(args);
+  if (args.embed) {
+    const { embedJsonl } = await import("./embed.mjs");
+    await embedJsonl({ input: docsPath, output: docsPath });
+  }
   const configPath = writeConfig(args, docsPath);
   await build({ configPath });
   writeSiteMeta(args);
