@@ -1,0 +1,108 @@
+{
+  "format": "rfbuilderbench-v1",
+  "mode": "builder-only",
+  "generatedAt": "2026-07-06T00:01:46.524Z",
+  "docs": 100000,
+  "index": {
+    "files": 204,
+    "bytes": 311415224,
+    "bytesPerDoc": 3114.15224
+  },
+  "builder": {
+    "totalMs": 72.114584,
+    "peakRss": 134987776,
+    "peakHeapUsed": 34147192,
+    "peakHeapTotal": 103055360,
+    "peakExternal": 3639452,
+    "peakArrayBuffers": 38780,
+    "memorySampleCount": 0,
+    "memorySamplePeakRss": 0,
+    "memorySamplePeakHeapUsed": 0,
+    "phaseCount": 0,
+    "phaseSampleCount": 0,
+    "tempPeakBytes": 0,
+    "tempWrittenBytes": 0,
+    "outputWrittenBytes": 0,
+    "finalPackBytes": 0,
+    "sidecarBytes": 0,
+    "writeAmplification": 0
+  },
+  "counters": {
+    "selected_term_spool_bytes": 19339657,
+    "selected_term_spool_terms": 2066942,
+    "doc_gzip_spool_bytes": 62066456,
+    "doc_page_spool_bytes": 95496191,
+    "doc_page_spool_pages": 3125,
+    "segment_files": 9,
+    "segment_postings": 2066942,
+    "field_row_fields": 8,
+    "field_row_facet_fields": 2,
+    "field_row_numeric_fields": 5,
+    "field_row_boolean_fields": 1,
+    "field_row_date_fields": 1,
+    "sort_replica_count": 1,
+    "sort_replica_docs": 100000,
+    "sort_replica_postings": 2066942,
+    "sort_replica_doc_page_pack_bytes": 40713239
+  },
+  "workers": [
+    {
+      "phase": "measure",
+      "count": 4,
+      "tasks": 196,
+      "docs": 100000,
+      "inputBytes": 473083255,
+      "analysisMs": 11357.899916999999,
+      "reduceMs": 0,
+      "finishMs": 0,
+      "mode": "worker-thread"
+    },
+    {
+      "phase": "scan-and-spool",
+      "count": 4,
+      "tasks": 0,
+      "docs": 100000,
+      "inputBytes": 0,
+      "analysisMs": 53588.851909000026,
+      "reduceMs": 0,
+      "finishMs": 0,
+      "mode": "worker-thread"
+    },
+    {
+      "phase": "reduce-postings",
+      "count": 4,
+      "tasks": 9399,
+      "docs": 0,
+      "inputBytes": 18957847,
+      "analysisMs": 0,
+      "reduceMs": 8440.786501000039,
+      "finishMs": 10.72833200000241,
+      "mode": "worker-thread"
+    }
+  ],
+  "phases": [],
+  "meta": {
+    "schemaVersion": 3,
+    "dumpUrl": "https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pages-articles.xml.bz2",
+    "limit": 100000,
+    "bodyChars": 6000,
+    "docs": 100000,
+    "pagesRead": 139804,
+    "builtAt": "2026-05-03T03:54:14.578Z",
+    "source": "cache",
+    "cacheDocs": 100000
+  },
+  "benchmarkArtifact": {
+    "format": "rffrwikibench-artifact-v1",
+    "kind": "builder",
+    "limit": 100000,
+    "limitSlug": "limit-100000",
+    "generatedAt": "2026-07-06T00:01:46.524Z",
+    "gitCommit": "17eff59-dirty",
+    "command": "all",
+    "runs": 3,
+    "size": 10,
+    "historyPath": "benchmarks/frwiki/history/builder/limit-100000/2026-07-06T00-01-46-524Z_17eff59-dirty.json",
+    "latestPath": "benchmarks/frwiki/latest/builder/limit-100000.json"
+  }
+}
