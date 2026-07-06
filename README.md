@@ -147,6 +147,11 @@ CPU time, disk byte deltas, and segment counters.
 
 ## Build A Custom Index
 
+> For the complete configuration schema, every tuning knob, the full runtime
+> API, and deployment requirements, see the
+> **[SDK reference](docs/sdk-reference.md)**. The walkthrough below is the
+> quick version.
+
 Create newline-delimited JSON:
 
 ```json
