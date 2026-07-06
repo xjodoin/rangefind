@@ -1,7 +1,8 @@
-# Rangefind SDK Reference
+# Rangefind Reference
 
 Complete reference for configuring, tuning, building, deploying, and querying
-a Rangefind index. For the conceptual overview and format internals see
+a Rangefind index — configuration schema, build tuning, the runtime API, and
+deployment. For the conceptual overview and format internals see
 [`architecture.md`](architecture.md); for feature-specific benchmarks see the
 `*-benchmarks.md` docs.
 
