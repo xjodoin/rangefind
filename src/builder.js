@@ -1593,45 +1593,86 @@ async function reduceSortReplicaSegments(config, measured, dirs, replica, segmen
   const replicaConfig = sortReplicaBuildConfig(config);
   const termsBase = resolve(dirs.out, "sort-replicas", replica.id, "terms");
   const scratchDir = resolve(dirs.build, "sort-replicas", replica.id, "segment-merge");
-  const packWriter = createAppendOnlyPackWriter(resolve(termsBase, "packs"), config.sortReplicaPackBytes || config.packBytes);
-  const blockPackWriter = config.externalPostingBlocks === false
+  const reducerWorkers = partitionReducerWorkerCount(config);
+  const usePartitionWorkers = reducerWorkers > 1 && segmentData.segments.length > 0;
+  const partitionPool = usePartitionWorkers ? createPartitionReducerPool(config, reducerWorkers) : null;
+  const packTargetBytes = config.sortReplicaPackBytes || config.packBytes;
+  const blockTargetBytes = config.sortReplicaPostingBlockPackBytes || config.postingBlockPackBytes;
+  const packWriter = usePartitionWorkers ? null : createAppendOnlyPackWriter(resolve(termsBase, "packs"), packTargetBytes);
+  const blockPackWriter = usePartitionWorkers || config.externalPostingBlocks === false
     ? null
-    : createAppendOnlyPackWriter(resolve(termsBase, "block-packs"), config.sortReplicaPostingBlockPackBytes || config.postingBlockPackBytes);
+    : createAppendOnlyPackWriter(resolve(termsBase, "block-packs"), blockTargetBytes);
   const directorySpool = createDirectoryEntrySpool(resolve(dirs.build, "sort-replicas", replica.id, "terms-directory.run"));
   const finalShards = new Set();
   const blockStats = emptyPostingSegmentStats();
+  let partitionOutput = { packs: [], packBytes: 0, blockPacks: [], blockPackBytes: 0 };
   let stats = { terms: 0, postings: 0, mergeTiers: [], mergePolicy: null, timings: {}, partitionSpoolBytes: 0, partitionSpoolEntries: 0 };
 
   if (segmentData.segments.length) {
-    stats = await mergeSegmentsToPartitions({
-      segments: segmentData.segments,
-      scratchDir,
+    const workerMessage = {
       config: replicaConfig,
-      partitionConcurrency: 1,
-      onPartition: async (partition) => {
-        const encoded = buildFinalPostingSegmentChunks(partitionTermEntries(partition), totalRanks, null, [], replicaConfig, blockPackWriter);
-        addPostingSegmentStats(blockStats, encoded.stats);
-        const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
-          kind: "posting-segment",
-          codec: encoded.format || POSTING_SEGMENT_FORMAT,
-          logicalLength: encoded.logicalLength,
-          streamMinBytes: replicaConfig.postingSegmentStreamMinBytes
-        });
-        appendDirectoryEntry(directorySpool, partition.name, entry);
-        finalShards.add(partition.name);
-        return partition.name;
-      }
-    });
+      codesDescriptor: null,
+      filters: [],
+      termsOutDir: resolve(termsBase, "packs"),
+      blockOutDir: resolve(termsBase, "block-packs"),
+      termPackCounter: partitionPool?.termPackCounterBuffer,
+      blockPackCounter: partitionPool?.blockPackCounterBuffer,
+      targetBytes: packTargetBytes,
+      blockTargetBytes,
+      total: totalRanks
+    };
+    try {
+      stats = await mergeSegmentsToPartitions({
+        segments: segmentData.segments,
+        scratchDir,
+        config: replicaConfig,
+        partitionConcurrency: usePartitionWorkers ? partitionPool.count : 1,
+        onPartition: async (partition) => {
+          if (usePartitionWorkers) {
+            const result = await partitionPool.reduce(partition, workerMessage);
+            addPostingSegmentStats(blockStats, result.stats);
+            appendDirectoryEntry(directorySpool, partition.name, result.entry);
+            finalShards.add(partition.name);
+            return partition.name;
+          }
+          const encoded = buildFinalPostingSegmentChunks(partitionTermEntries(partition), totalRanks, null, [], replicaConfig, blockPackWriter);
+          addPostingSegmentStats(blockStats, encoded.stats);
+          const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
+            kind: "posting-segment",
+            codec: encoded.format || POSTING_SEGMENT_FORMAT,
+            logicalLength: encoded.logicalLength,
+            streamMinBytes: replicaConfig.postingSegmentStreamMinBytes
+          });
+          appendDirectoryEntry(directorySpool, partition.name, entry);
+          finalShards.add(partition.name);
+          return partition.name;
+        },
+        onPartitions: usePartitionWorkers ? async (partitions) => {
+          const results = await partitionPool.reduceBatch(partitions, workerMessage);
+          for (const result of results) {
+            addPostingSegmentStats(blockStats, result.stats);
+            appendDirectoryEntry(directorySpool, result.name, result.entry);
+            finalShards.add(result.name);
+          }
+          return results.map(result => result.name);
+        } : null
+      });
+      if (usePartitionWorkers) partitionOutput = await partitionPool.finish();
+    } finally {
+      await partitionPool?.close();
+    }
   }
 
   if (blockPackWriter) finalizePackWriter(blockPackWriter);
-  finalizePackWriter(packWriter);
-  const termPacks = packWriter.packs;
-  const blockPacks = blockPackWriter?.packs || [];
+  if (packWriter) finalizePackWriter(packWriter);
+  const termPacks = usePartitionWorkers ? partitionOutput.packs.sort(comparePackFiles) : packWriter.packs;
+  const blockPacks = usePartitionWorkers ? partitionOutput.blockPacks.sort(comparePackFiles) : (blockPackWriter?.packs || []);
+  const termPackBytes = usePartitionWorkers ? partitionOutput.packBytes : packWriter.bytes;
+  const blockPackBytes = usePartitionWorkers ? partitionOutput.blockPackBytes : (blockPackWriter?.bytes || 0);
   const packIndexes = new Map(termPacks.map((pack, index) => [pack.file, index]));
   const directoryEntries = directorySpool.entries
     ? sortedDirectoryEntrySpool(directorySpool, {
-        packNameMap: packWriter.packNameMap,
+        packNameMap: packWriter?.packNameMap,
         packIndexes,
         chunkEntries: config.directorySortChunkEntries
       })
@@ -1653,8 +1694,8 @@ async function reduceSortReplicaSegments(config, measured, dirs, replica, segmen
     blockStats,
     termCount: stats.terms || 0,
     postingCount: stats.postings || 0,
-    packBytes: packWriter.bytes,
-    blockPackBytes: blockPackWriter?.bytes || 0,
+    packBytes: termPackBytes,
+    blockPackBytes,
     directoryBytes: directory.total_bytes,
     directorySpoolBytes: directorySpool.bytes,
     directorySpoolEntries: directorySpool.entries,
