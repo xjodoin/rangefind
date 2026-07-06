@@ -2,6 +2,7 @@
 
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, copyFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { availableParallelism } from "node:os";
 import { relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { gunzipSync } from "node:zlib";
@@ -437,9 +438,9 @@ function writeSite(args, docsPath) {
     segmentMergeFanIn: 512,
     buildTelemetryPath: "frwiki-build-telemetry.json",
     buildProgressLogMs: args.buildProgressLogMs,
-    scanWorkers: 4,
+    scanWorkers: Math.max(4, Math.min(10, availableParallelism() - 4)),
     scanBatchDocs: 128,
-    builderWorkerCount: 4,
+    builderWorkerCount: Math.max(4, Math.min(8, Math.floor(availableParallelism() / 2))),
     fields: [
       { name: "title", path: "title", weight: 5.5, b: 0.25, phrase: true, proximity: true, proximityWeight: 3, proximityWindow: 5 },
       { name: "categories", path: "categories", weight: 2.0, b: 0.0 },
