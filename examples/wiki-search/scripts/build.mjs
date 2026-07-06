@@ -360,6 +360,9 @@ function writeConfig(args, docsPath) {
     authority: [
       { name: "title", path: "title", weight: 1000000, exactWeight: 1000000, tokenWeight: 800000 }
     ],
+    suggest: [
+      { path: "title" }
+    ],
     facets: [
       { name: "category", path: "category" },
       { name: "articleTags", path: "articleTags" }

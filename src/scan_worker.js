@@ -11,7 +11,9 @@ import {
   facetValues,
   numericValue,
   queryBundlesEnabled,
-  queryBundleSeedCandidatesForDoc
+  queryBundleSeedCandidatesForDoc,
+  suggestEnabled,
+  suggestRowsForDoc
 } from "./scan_doc.js";
 import { analyzeDocumentForIndex } from "./scoring.js";
 import { addSegmentPosting, createSegmentBuilder, finishSegmentBuilder, flushSegment, shouldFlushSegment } from "./segment_builder.js";
@@ -28,6 +30,7 @@ function initState(message) {
     pageSize: Math.max(1, Math.floor(Number(config.docPageSize || 32))),
     pageFields: docPayloadFieldNames(config),
     authorityFields: authorityEnabled(config) ? authorityFields(config) : [],
+    suggestEnabled: suggestEnabled(config),
     initialResultLimit: Math.max(0, Math.floor(Number(config.initialResultLimit || 0)))
   };
 }
@@ -50,6 +53,9 @@ function processBatch({ id, baseIndex, lines }) {
   const booleansOut = (config.booleans || []).map(() => new Int8Array(n));
   const authority = { keys: [], docs: [], scores: [] };
   const bundleCandidates = state.includeFieldTerms ? new Array(n) : null;
+  // Aggregated per batch so duplicate surfaces (chains, repeated street
+  // names) collapse before crossing the worker boundary.
+  const suggest = state.suggestEnabled ? new Map() : null;
   let pagePayloads = [];
 
   for (let i = 0; i < n; i++) {
@@ -101,6 +107,18 @@ function processBatch({ id, baseIndex, lines }) {
     if (bundleCandidates) {
       bundleCandidates[i] = queryBundleSeedCandidatesForDoc(config, selectedTerms, analysis.fieldTerms, doc);
     }
+    if (suggest) {
+      for (const [surface, weight, tokenPrefixes] of suggestRowsForDoc(config, doc)) {
+        const existing = suggest.get(surface);
+        if (existing) {
+          existing[0] += 1;
+          if (weight > existing[1]) existing[1] = weight;
+          if (tokenPrefixes) existing[2] = 1;
+        } else {
+          suggest.set(surface, [1, weight, tokenPrefixes ? 1 : 0]);
+        }
+      }
+    }
   }
   if (pagePayloads.length) {
     pageColumns.push(encodeDocPageColumns(pagePayloads, state.pageFields));
@@ -125,6 +143,12 @@ function processBatch({ id, baseIndex, lines }) {
     booleans: booleansOut,
     authority,
     bundleCandidates,
+    suggest: suggest
+      ? {
+          surfaces: [...suggest.keys()],
+          rows: [...suggest.values()]
+        }
+      : null,
     analysisMs: performance.now() - started
   };
 }

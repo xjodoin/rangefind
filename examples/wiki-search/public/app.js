@@ -194,8 +194,58 @@ async function boot() {
   await runSearch();
 }
 
+const suggestList = document.querySelector("#suggestList");
+let suggestTimer = null;
+let suggestToken = 0;
+
+function hideSuggestions() {
+  suggestList.hidden = true;
+  suggestList.replaceChildren();
+}
+
+async function showSuggestions() {
+  const q = queryInput.value.trim();
+  const token = ++suggestToken;
+  if (!engine?.manifest?.features?.suggest || q.length < 1) {
+    hideSuggestions();
+    return;
+  }
+  try {
+    const response = await engine.suggest({ q, size: 8 });
+    if (token !== suggestToken) return;
+    if (!response.suggestions.length) {
+      hideSuggestions();
+      return;
+    }
+    suggestList.replaceChildren(...response.suggestions.map(item => {
+      const li = document.createElement("li");
+      li.textContent = item.text;
+      li.addEventListener("mousedown", event => {
+        event.preventDefault();
+        queryInput.value = item.text;
+        hideSuggestions();
+        runSearch();
+      });
+      return li;
+    }));
+    suggestList.hidden = false;
+  } catch {
+    hideSuggestions();
+  }
+}
+
+queryInput.addEventListener("input", () => {
+  clearTimeout(suggestTimer);
+  suggestTimer = setTimeout(showSuggestions, 80);
+});
+queryInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
+queryInput.addEventListener("keydown", event => {
+  if (event.key === "Escape") hideSuggestions();
+});
+
 form.addEventListener("submit", event => {
   event.preventDefault();
+  hideSuggestions();
   runSearch();
 });
 

@@ -51,6 +51,10 @@ a large thesis corpus.
   bounding-box and radius filters, exact nearest-neighbor distance sort with
   early-stop proofs (with or without a text query), text-plus-geo filtering,
   per-cell filter summaries, and distance boosts.
+- Search-as-you-type autocomplete from a range-addressed suggestion sidecar:
+  diacritic-folded prefix and mid-label token matching, popularity or custom
+  weights, exact best-first top-k with per-page weight proofs, and
+  precomputed hot pages so a first keystroke costs one small fetch.
 - OpenStreetMap example and benchmark fixture with exhaustive geo oracles.
 - Tiny runnable example.
 
@@ -263,6 +267,26 @@ box filters are exact (bounding-box prune plus Haversine verification), and
 `stats` reports the tree traversal (`geoLane`, `geoLeavesVisited`,
 `geoPointsScanned`, ...). See `examples/osm-geo/` for an OpenStreetMap-scale
 example and benchmark.
+
+Search-as-you-type suggestions come from a dedicated static sidecar:
+
+```json
+{
+  "suggest": [{ "path": "title" }]
+}
+```
+
+```js
+const { suggestions } = await engine.suggest({ q: "boul", size: 8 });
+// [{ text: "Boulangerie Fischer", weight: 12, count: 12 }, ...]
+```
+
+Matching is prefix-based over diacritic-folded keys ("montre" finds
+"Montréal") and covers mid-label tokens ("eiffel" finds "Tour Eiffel").
+Ranking uses an optional `weightPath` (for example population or importance)
+and falls back to popularity — how many documents share the surface. Each
+keystroke costs at most a few small range requests; repeat keystrokes in a
+session are usually served entirely from cache.
 
 Typo fallback is automatic. For example, if `statik search` has no exact
 first-page hits but `static search` does, the response includes:

@@ -267,6 +267,10 @@ function writeSite(args) {
     geo: [
       { name: "location", latPath: "lat", lonPath: "lon" }
     ],
+    suggest: [
+      { path: "name", weightPath: "population" },
+      { path: "aliases" }
+    ],
     display: ["name", "url", "category", "type", "lat", "lon"],
     buildProgressLogMs: args.buildProgressLogMs
   };

@@ -4,6 +4,12 @@ import { dirname, resolve } from "node:path";
 export const DEFAULTS = {
   geoLeafSize: 512,
   geoPackBytes: 4 * 1024 * 1024,
+  suggestPageSize: 256,
+  suggestBranchPages: 256,
+  suggestPackBytes: 4 * 1024 * 1024,
+  suggestMaxTokenKeys: 4,
+  suggestMinKeyLength: 1,
+  suggestHotListSize: 64,
   docValueChunkSize: 2048,
   docValueLookupChunkSize: 2048,
   filterBitmaps: true,
@@ -147,6 +153,19 @@ export function geoComponentFieldNames(geoField) {
   return { lat: `${geoField.name}.lat`, lon: `${geoField.name}.lon` };
 }
 
+function normalizeSuggestFields(raw) {
+  const fields = Array.isArray(raw) ? raw : [];
+  return fields.map(field => {
+    const path = String(field?.path || field?.name || "").trim();
+    if (!path) throw new Error("Rangefind suggest fields need a path.");
+    return {
+      path,
+      weightPath: field.weightPath ? String(field.weightPath) : "",
+      tokenPrefixes: field.tokenPrefixes !== false
+    };
+  });
+}
+
 function normalizeGeoFields(raw) {
   const fields = Array.isArray(raw) ? raw : [];
   return fields.map(field => {
@@ -211,6 +230,7 @@ export async function readConfig(configPath) {
     sorts: raw.sorts || [],
     sortReplicas: raw.sortReplicas || [],
     geo: normalizeGeoFields(raw.geo),
+    suggest: normalizeSuggestFields(raw.suggest),
     display: raw.display || ["title", "url"],
     authority: raw.authority || DEFAULTS.authority
   }, raw));

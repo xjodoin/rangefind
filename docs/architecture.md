@@ -60,6 +60,10 @@ rangefind/
     location.<hash>.bin.gz
     point-packs/
       0000.<hash>.bin
+  suggest/
+    root.<hash>.bin.gz
+    packs/
+      0000.<hash>.bin
 ```
 
 `manifest.json` is small enough for page initialization. It lists schema,
@@ -404,6 +408,37 @@ category exists.
 Point-to-box minimum and maximum spherical distances are exact (including
 antimeridian wrap, facing-away meridians, and antipodal interiors), so radius
 pruning and containment proofs never drop a matching document.
+
+## Suggestion Sidecar
+
+`suggest` config fields build a search-as-you-type sidecar keyed by
+diacritic-folded, punctuation-collapsed surfaces (every script preserved).
+Each surface also emits token-suffix keys so "eiffel" completes to "Tour
+Eiffel". Duplicate surfaces aggregate during the scan — inside each scan
+worker per batch, then once on the main thread — so builder cost stays a
+single pass and the spooled row count is the number of unique surfaces, not
+documents.
+
+The on-disk layout mirrors the other sidecars: suggestion entries sorted by
+key are packed into gzip-member pages (front-coded keys, display text,
+weight, count) with a root directory of per-page `minKey` + `maxWeight`
+summaries, branch-paged above a size threshold like the geo tree.
+
+Query execution is exact top-k:
+
+- The prefix maps to one contiguous run of candidate pages (two binary
+  searches over `minKey`s).
+- Candidates are visited best-first by `maxWeight`; traversal stops when the
+  current k-th suggestion outweighs every unvisited page's maximum — the
+  same block-max proof the posting scheduler uses.
+- Results are deduplicated by display text; ranking is weight (explicit
+  `weightPath` or document popularity), then key, then text.
+- Single-character prefixes — the widest ranges and the first keystroke of
+  every session — are answered from precomputed per-character hot pages: one
+  small fetch, already ranked and deduplicated.
+
+Deeper keystrokes narrow the same key range, so they usually hit pages the
+session already cached and cost zero requests.
 
 ## Why Custom Binary
 

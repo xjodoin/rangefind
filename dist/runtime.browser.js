@@ -213,6 +213,9 @@ var AUTHORITY_SHARD_MAGIC = [82, 70, 65, 85];
 var GEO_TREE_ROOT_MAGIC = [82, 70, 71, 82];
 var GEO_BRANCH_PAGE_MAGIC = [82, 70, 71, 66];
 var GEO_LEAF_PAGE_MAGIC = [82, 70, 71, 76];
+var SUGGEST_ROOT_MAGIC = [82, 70, 83, 82];
+var SUGGEST_BRANCH_PAGE_MAGIC = [82, 70, 83, 66];
+var SUGGEST_PAGE_MAGIC = [82, 70, 83, 71];
 function readVarint(bytes, state) {
   let value = 0;
   let multiplier = 1;
@@ -1500,6 +1503,147 @@ function decodeGeoBranchPage(buffer, packTable, blockFilters = [], expected = {}
   return { field, branchIndex, firstLeafIndex, bbox, leaves };
 }
 
+// src/suggest_index.js
+var SUGGEST_ROOT_FORMAT = "rfsuggestroot-v1";
+var SUGGEST_PAGE_FORMAT = "rfsuggestpage-v1";
+var FORMAT_VERSION3 = 1;
+var FLAG_DISPLAY_EQUALS_KEY = 1;
+function suggestKey(value) {
+  return fold(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
+}
+function decodeSuggestPage(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, SUGGEST_PAGE_MAGIC, "Unsupported Rangefind suggest page");
+  const state = { pos: SUGGEST_PAGE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind suggest page version ${version}`);
+  const count = readVarint(bytes, state);
+  const entries = new Array(count);
+  let previousKey = "";
+  for (let i = 0; i < count; i++) {
+    const lcp = readVarint(bytes, state);
+    const key = previousKey.slice(0, lcp) + readUtf8(bytes, state);
+    const flags = bytes[state.pos++];
+    const display = flags & FLAG_DISPLAY_EQUALS_KEY ? key : readUtf8(bytes, state);
+    const weight = readVarint(bytes, state);
+    const entryCount = readVarint(bytes, state);
+    entries[i] = { key, display, weight, count: entryCount };
+    previousKey = key;
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind suggest page has trailing bytes.");
+  return { count, entries };
+}
+function readObjectPointer2(bytes, state, packTable, target) {
+  const packIndex = readVarint(bytes, state);
+  target.pack = packTable[packIndex];
+  target.offset = readVarint(bytes, state);
+  target.length = readVarint(bytes, state);
+  target.physicalLength = readVarint(bytes, state);
+  target.logicalLength = readVarint(bytes, state) || null;
+  const algorithm = readUtf8(bytes, state);
+  const value = readUtf8(bytes, state);
+  target.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
+  return target;
+}
+function readPageSummary(bytes, state, packTable, previousMinKey, index) {
+  const lcp = readVarint(bytes, state);
+  const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
+  const maxWeight = readVarint(bytes, state);
+  const count = readVarint(bytes, state);
+  return readObjectPointer2(bytes, state, packTable, { index, minKey, maxWeight, count });
+}
+function parseSuggestRoot(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, SUGGEST_ROOT_MAGIC, "Unsupported Rangefind suggest root");
+  const state = { pos: SUGGEST_ROOT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind suggest root version ${version}`);
+  const total = readVarint(bytes, state);
+  const pageSize = readVarint(bytes, state);
+  const pageCount = readVarint(bytes, state);
+  const packCount = readVarint(bytes, state);
+  const packTable = new Array(packCount);
+  for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
+  const levels = bytes[state.pos++];
+  const root = {
+    format: SUGGEST_ROOT_FORMAT,
+    pageFormat: SUGGEST_PAGE_FORMAT,
+    total,
+    pageSize,
+    pageCount,
+    levels,
+    packTable,
+    pages: null,
+    branches: null
+  };
+  if (levels === 1) {
+    const count = readVarint(bytes, state);
+    const pages = new Array(count);
+    let previousMinKey = "";
+    for (let i = 0; i < count; i++) {
+      pages[i] = readPageSummary(bytes, state, packTable, previousMinKey, i);
+      previousMinKey = pages[i].minKey;
+    }
+    root.pages = pages;
+  } else if (levels === 2) {
+    const count = readVarint(bytes, state);
+    const branches = new Array(count);
+    let previousMinKey = "";
+    for (let i = 0; i < count; i++) {
+      const lcp = readVarint(bytes, state);
+      const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
+      const maxWeight = readVarint(bytes, state);
+      const branchCount = readVarint(bytes, state);
+      const firstPageIndex = readVarint(bytes, state);
+      const branchPageCount = readVarint(bytes, state);
+      branches[i] = readObjectPointer2(bytes, state, packTable, {
+        index: i,
+        minKey,
+        maxWeight,
+        count: branchCount,
+        firstPageIndex,
+        pageCount: branchPageCount
+      });
+      previousMinKey = minKey;
+    }
+    root.branches = branches;
+  } else {
+    throw new Error(`Unsupported Rangefind suggest root levels ${levels}`);
+  }
+  const hotCount = readVarint(bytes, state);
+  const hot = /* @__PURE__ */ new Map();
+  for (let i = 0; i < hotCount; i++) {
+    const prefix = readUtf8(bytes, state);
+    const count = readVarint(bytes, state);
+    hot.set(prefix, readObjectPointer2(bytes, state, packTable, {
+      index: pageCount + i,
+      prefix,
+      count
+    }));
+  }
+  root.hot = hot;
+  if (state.pos !== bytes.length) throw new Error("Rangefind suggest root has trailing bytes.");
+  return root;
+}
+function decodeSuggestBranchPage(buffer, packTable) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, SUGGEST_BRANCH_PAGE_MAGIC, "Unsupported Rangefind suggest branch page");
+  const state = { pos: SUGGEST_BRANCH_PAGE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind suggest branch page version ${version}`);
+  const branchIndex = readVarint(bytes, state);
+  const firstPageIndex = readVarint(bytes, state);
+  const count = readVarint(bytes, state);
+  const pages = new Array(count);
+  let previousMinKey = "";
+  for (let i = 0; i < count; i++) {
+    pages[i] = readPageSummary(bytes, state, packTable, previousMinKey, firstPageIndex + i);
+    previousMinKey = pages[i].minKey;
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind suggest branch page has trailing bytes.");
+  return { branchIndex, firstPageIndex, pages };
+}
+
 // src/filter_bitmaps.js
 var FILTER_BITMAP_MAGIC = [82, 70, 66, 77];
 var FILTER_BITMAP_FORMAT = "rffilterbitmap-v1";
@@ -2127,6 +2271,9 @@ async function createSearch(options = {}) {
   const geoTreeRootCache = /* @__PURE__ */ new Map();
   const geoBranchPageCache = /* @__PURE__ */ new Map();
   const geoLeafPageCache = /* @__PURE__ */ new Map();
+  let suggestRootPromise = null;
+  const suggestPageCache = /* @__PURE__ */ new Map();
+  const suggestBranchPageCache = /* @__PURE__ */ new Map();
   const sortReplicaDirectoryCache = /* @__PURE__ */ new Map();
   const sortReplicaShardCache = /* @__PURE__ */ new Map();
   const sortReplicaRankCache = /* @__PURE__ */ new Map();
@@ -2175,6 +2322,7 @@ async function createSearch(options = {}) {
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     geoLeafPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    suggestPages: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     ...options.rangePlans || {}
   };
   async function ensureFullManifest() {
@@ -2548,7 +2696,7 @@ async function createSearch(options = {}) {
     }
     return geoTreeRootCache.get(field);
   }
-  async function loadGeoPages(field, entries, cache, cacheKey, decode, label, stats = null) {
+  async function loadPackedPages({ field, entries, cache, cacheKey, decode, label, packDir, rangePlan, stats = null }) {
     const wanted = [];
     const pending = [];
     const seen = /* @__PURE__ */ new Set();
@@ -2569,7 +2717,7 @@ async function createSearch(options = {}) {
       cache.set(key, promise);
       pending.push({ field, pageIndex: entry.index, entry, resolve: resolvePage, reject: rejectPage });
     }
-    const groups = rangeGroups(pending, "geoLeafPages");
+    const groups = rangeGroups(pending, rangePlan);
     if (stats) {
       stats.wanted += wanted.length;
       stats.fetched += pending.length;
@@ -2577,10 +2725,10 @@ async function createSearch(options = {}) {
     }
     await Promise.all(groups.map(async (group) => {
       try {
-        const compressed = await fetchRange(new URL(`geo/point-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        const compressed = await fetchRange(new URL(`${packDir}/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `${label} ${item.field}:${item.pageIndex}`);
-          item.resolve(traceSpanSync("geo.decodePage", () => decode(inflated)));
+          item.resolve(traceSpanSync(`${label}.decode`, () => decode(inflated)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -2591,6 +2739,56 @@ async function createSearch(options = {}) {
       }
     }));
     return Promise.all(wanted.map((index) => cache.get(cacheKey(field, index))));
+  }
+  async function loadGeoPages(field, entries, cache, cacheKey, decode, label, stats = null) {
+    return loadPackedPages({
+      field,
+      entries,
+      cache,
+      cacheKey,
+      decode,
+      label,
+      packDir: "geo/point-packs",
+      rangePlan: "geoLeafPages",
+      stats
+    });
+  }
+  async function loadSuggestRoot() {
+    const meta = manifest.suggest;
+    if (!meta?.directory?.file) return null;
+    if (!suggestRootPromise) {
+      suggestRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseSuggestRoot);
+      suggestRootPromise.catch(() => {
+        suggestRootPromise = null;
+      });
+    }
+    return suggestRootPromise;
+  }
+  async function loadSuggestPages(root, pages, stats = null) {
+    return loadPackedPages({
+      field: "suggest",
+      entries: pages,
+      cache: suggestPageCache,
+      cacheKey: (field, index) => `${field} ${index}`,
+      decode: decodeSuggestPage,
+      label: "suggest page",
+      packDir: "suggest/packs",
+      rangePlan: "suggestPages",
+      stats
+    });
+  }
+  async function loadSuggestBranchPages(root, branches, stats = null) {
+    return loadPackedPages({
+      field: "suggest",
+      entries: branches,
+      cache: suggestBranchPageCache,
+      cacheKey: (field, index) => `${field} branch ${index}`,
+      decode: (inflated) => decodeSuggestBranchPage(inflated, root.packTable),
+      label: "suggest branch page",
+      packDir: "suggest/packs",
+      rangePlan: "suggestPages",
+      stats
+    });
   }
   async function loadGeoLeafPages(field, leaves, stats = null) {
     return loadGeoPages(
@@ -7461,6 +7659,128 @@ async function createSearch(options = {}) {
     }
     return response;
   }
+  function suggestCandidateRun(summaries, prefix, upper) {
+    if (!summaries?.length) return [];
+    let lo = 0;
+    let hi = summaries.length;
+    while (lo < hi) {
+      const mid = lo + hi >> 1;
+      if (summaries[mid].minKey < prefix) lo = mid + 1;
+      else hi = mid;
+    }
+    const start = Math.max(0, lo - 1);
+    let lo2 = start;
+    let hi2 = summaries.length;
+    while (lo2 < hi2) {
+      const mid = lo2 + hi2 >> 1;
+      if (summaries[mid].minKey <= upper) lo2 = mid + 1;
+      else hi2 = mid;
+    }
+    const end = lo2 - 1;
+    if (end < start) return [];
+    return summaries.slice(start, end + 1);
+  }
+  async function executeSuggest(params = {}) {
+    if (!manifest.suggest?.directory?.file) {
+      throw new Error("Rangefind: this index has no suggestion sidecar (configure `suggest` fields at build time).");
+    }
+    const q = String(params.q || "");
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const prefix = suggestKey(q);
+    if (!prefix) {
+      return { q, prefix, suggestions: [], stats: { exact: true, suggestPagesVisited: 0, suggestEntriesScanned: 0 } };
+    }
+    const root = await loadSuggestRoot();
+    const upper = prefix + String.fromCharCode(65535);
+    const pageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
+    const branchFetchStats = { wanted: 0, fetched: 0, groups: 0 };
+    if (prefix.length === 1 && root.hot?.size) {
+      const hotEntry = root.hot.get(prefix);
+      if (!hotEntry || size <= hotEntry.count) {
+        const hotPage = hotEntry ? (await loadSuggestPages(root, [hotEntry], pageFetchStats))[0] : null;
+        const suggestions = (hotPage?.entries || []).slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 }));
+        return {
+          q,
+          prefix,
+          suggestions,
+          stats: {
+            exact: true,
+            suggestLane: "hot",
+            suggestPagesVisited: hotPage ? 1 : 0,
+            suggestPagesFetched: pageFetchStats.fetched,
+            suggestEntriesScanned: hotPage?.entries.length || 0
+          }
+        };
+      }
+    }
+    let summaries;
+    if (root.levels === 1) {
+      summaries = suggestCandidateRun(root.pages, prefix, upper);
+    } else {
+      const branchRun = suggestCandidateRun(root.branches, prefix, upper);
+      const branchPages = await loadSuggestBranchPages(root, branchRun, branchFetchStats);
+      summaries = [];
+      for (const branchPage of branchPages) {
+        summaries.push(...suggestCandidateRun(branchPage.pages, prefix, upper));
+      }
+    }
+    const ordered = summaries.slice().sort((a, b) => b.maxWeight - a.maxWeight || a.index - b.index);
+    const best = /* @__PURE__ */ new Map();
+    let entriesScanned = 0;
+    let pagesVisited = 0;
+    const kthWeight = () => {
+      if (best.size < size) return -1;
+      const weights = [...best.values()].map((item) => item.weight).sort((a, b) => b - a);
+      return weights[size - 1];
+    };
+    let batch = 2;
+    for (let position = 0; position < ordered.length; ) {
+      const boundary = kthWeight();
+      if (boundary >= 0 && ordered[position].maxWeight < boundary) break;
+      const slice = ordered.slice(position, position + batch);
+      batch = Math.min(batch * 2, 8);
+      const pages = await loadSuggestPages(root, slice, pageFetchStats);
+      for (const page of pages) {
+        pagesVisited++;
+        const entries = page.entries;
+        let lo = 0;
+        let hi = entries.length;
+        while (lo < hi) {
+          const mid = lo + hi >> 1;
+          if (entries[mid].key < prefix) lo = mid + 1;
+          else hi = mid;
+        }
+        for (let i = lo; i < entries.length; i++) {
+          const entry = entries[i];
+          if (!entry.key.startsWith(prefix)) break;
+          entriesScanned++;
+          const existing = best.get(entry.display);
+          if (!existing || entry.weight > existing.weight || entry.weight === existing.weight && entry.key < existing.key) {
+            best.set(entry.display, { text: entry.display, key: entry.key, weight: entry.weight, count: entry.count });
+          }
+        }
+      }
+      position += slice.length;
+    }
+    const ranked = [...best.values()].sort((a, b) => b.weight - a.weight || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0) || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0)).slice(0, size);
+    return {
+      q,
+      prefix,
+      suggestions: ranked.map(({ text, weight, count: count2 }) => ({ text, weight, count: count2 })),
+      stats: {
+        exact: true,
+        suggestLane: "range",
+        suggestLevels: root.levels,
+        suggestCandidatePages: summaries.length,
+        suggestPagesVisited: pagesVisited,
+        suggestPagesPrefetched: pageFetchStats.wanted,
+        suggestPagesFetched: pageFetchStats.fetched,
+        suggestPageFetchGroups: pageFetchStats.groups,
+        suggestBranchPagesFetched: branchFetchStats.fetched,
+        suggestEntriesScanned: entriesScanned
+      }
+    };
+  }
   async function executeCount(params = {}) {
     const q = String(params.q || "").trim();
     const filters = params.filters || {};
@@ -7498,10 +7818,23 @@ async function createSearch(options = {}) {
       }
     };
   }
+  async function suggest(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("suggest.total", () => executeSuggest(params)));
+    if (!trace) return response;
+    return {
+      ...response,
+      stats: {
+        ...response.stats || {},
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
+  }
   return {
     manifest,
     search,
     count,
+    suggest,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,

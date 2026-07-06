@@ -19,6 +19,12 @@ import {
   pointToBoxMaxDistanceMetersE7
 } from "./geo_tree.js";
 import { decodeDocPointerRecord } from "./doc_pointers.js";
+import {
+  decodeSuggestBranchPage,
+  decodeSuggestPage,
+  parseSuggestRoot,
+  suggestKey
+} from "./suggest_index.js";
 import { filterBitmapHas, parseFilterBitmap } from "./filter_bitmaps.js";
 import { verifyBlockPointer } from "./object_store.js";
 import { parseQueryBundle } from "./query_bundle_codec.js";
@@ -278,6 +284,9 @@ export async function createSearch(options = {}) {
   const geoTreeRootCache = new Map();
   const geoBranchPageCache = new Map();
   const geoLeafPageCache = new Map();
+  let suggestRootPromise = null;
+  const suggestPageCache = new Map();
+  const suggestBranchPageCache = new Map();
   const sortReplicaDirectoryCache = new Map();
   const sortReplicaShardCache = new Map();
   const sortReplicaRankCache = new Map();
@@ -326,6 +335,7 @@ export async function createSearch(options = {}) {
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     geoLeafPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
+    suggestPages: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     ...(options.rangePlans || {})
   };
 
@@ -737,10 +747,10 @@ export async function createSearch(options = {}) {
     return geoTreeRootCache.get(field);
   }
 
-  // Generic batch loader for geo pages (leaf or branch) living in
-  // geo/point-packs. `entries` carry their own object pointers and a stable
+  // Generic batch loader for range-packed pages (geo leaf/branch, suggest
+  // page/branch). `entries` carry their own object pointers and a stable
   // `index` used for caching.
-  async function loadGeoPages(field, entries, cache, cacheKey, decode, label, stats = null) {
+  async function loadPackedPages({ field, entries, cache, cacheKey, decode, label, packDir, rangePlan, stats = null }) {
     const wanted = [];
     const pending = [];
     const seen = new Set();
@@ -761,7 +771,7 @@ export async function createSearch(options = {}) {
       pending.push({ field, pageIndex: entry.index, entry, resolve: resolvePage, reject: rejectPage });
     }
 
-    const groups = rangeGroups(pending, "geoLeafPages");
+    const groups = rangeGroups(pending, rangePlan);
     if (stats) {
       stats.wanted += wanted.length;
       stats.fetched += pending.length;
@@ -769,10 +779,10 @@ export async function createSearch(options = {}) {
     }
     await Promise.all(groups.map(async (group) => {
       try {
-        const compressed = await fetchRange(new URL(`geo/point-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+        const compressed = await fetchRange(new URL(`${packDir}/${group.pack}`, baseUrl), group.start, group.end - group.start);
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `${label} ${item.field}:${item.pageIndex}`);
-          item.resolve(traceSpanSync("geo.decodePage", () => decode(inflated)));
+          item.resolve(traceSpanSync(`${label}.decode`, () => decode(inflated)));
         }));
       } catch (error) {
         for (const item of group.items) {
@@ -784,6 +794,60 @@ export async function createSearch(options = {}) {
     }));
 
     return Promise.all(wanted.map(index => cache.get(cacheKey(field, index))));
+  }
+
+  async function loadGeoPages(field, entries, cache, cacheKey, decode, label, stats = null) {
+    return loadPackedPages({
+      field,
+      entries,
+      cache,
+      cacheKey,
+      decode,
+      label,
+      packDir: "geo/point-packs",
+      rangePlan: "geoLeafPages",
+      stats
+    });
+  }
+
+  async function loadSuggestRoot() {
+    const meta = manifest.suggest;
+    if (!meta?.directory?.file) return null;
+    if (!suggestRootPromise) {
+      suggestRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseSuggestRoot);
+      suggestRootPromise.catch(() => {
+        suggestRootPromise = null;
+      });
+    }
+    return suggestRootPromise;
+  }
+
+  async function loadSuggestPages(root, pages, stats = null) {
+    return loadPackedPages({
+      field: "suggest",
+      entries: pages,
+      cache: suggestPageCache,
+      cacheKey: (field, index) => `${field} ${index}`,
+      decode: decodeSuggestPage,
+      label: "suggest page",
+      packDir: "suggest/packs",
+      rangePlan: "suggestPages",
+      stats
+    });
+  }
+
+  async function loadSuggestBranchPages(root, branches, stats = null) {
+    return loadPackedPages({
+      field: "suggest",
+      entries: branches,
+      cache: suggestBranchPageCache,
+      cacheKey: (field, index) => `${field} branch ${index}`,
+      decode: inflated => decodeSuggestBranchPage(inflated, root.packTable),
+      label: "suggest branch page",
+      packDir: "suggest/packs",
+      rangePlan: "suggestPages",
+      stats
+    });
   }
 
   async function loadGeoLeafPages(field, leaves, stats = null) {
@@ -6130,6 +6194,155 @@ export async function createSearch(options = {}) {
     return response;
   }
 
+  // Pages cover contiguous slices of key-sorted entries; a prefix query
+  // touches one contiguous run of pages, located with two binary searches.
+  // The run start uses a lower bound: when more entries share a key than fit
+  // in one page, several consecutive pages carry the SAME minKey, and every
+  // page from the first equal one onward can hold matching entries.
+  function suggestCandidateRun(summaries, prefix, upper) {
+    if (!summaries?.length) return [];
+    let lo = 0;
+    let hi = summaries.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (summaries[mid].minKey < prefix) lo = mid + 1;
+      else hi = mid;
+    }
+    const start = Math.max(0, lo - 1);
+    let lo2 = start;
+    let hi2 = summaries.length;
+    while (lo2 < hi2) {
+      const mid = (lo2 + hi2) >> 1;
+      if (summaries[mid].minKey <= upper) lo2 = mid + 1;
+      else hi2 = mid;
+    }
+    const end = lo2 - 1;
+    if (end < start) return [];
+    return summaries.slice(start, end + 1);
+  }
+
+  async function executeSuggest(params = {}) {
+    if (!manifest.suggest?.directory?.file) {
+      throw new Error("Rangefind: this index has no suggestion sidecar (configure `suggest` fields at build time).");
+    }
+    const q = String(params.q || "");
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const prefix = suggestKey(q);
+    if (!prefix) {
+      return { q, prefix, suggestions: [], stats: { exact: true, suggestPagesVisited: 0, suggestEntriesScanned: 0 } };
+    }
+    const root = await loadSuggestRoot();
+    const upper = prefix + String.fromCharCode(0xffff);
+    const pageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
+    const branchFetchStats = { wanted: 0, fetched: 0, groups: 0 };
+
+    // Single-character prefixes are the widest and most common query; a
+    // precomputed hot page answers them with one small fetch, already
+    // ranked and deduplicated.
+    if (prefix.length === 1 && root.hot?.size) {
+      const hotEntry = root.hot.get(prefix);
+      // A missing hot entry means no key starts with this character. A hot
+      // page only proves the top `count` suggestions, so deeper requests
+      // fall through to the exact range lane.
+      if (!hotEntry || size <= hotEntry.count) {
+        const hotPage = hotEntry ? (await loadSuggestPages(root, [hotEntry], pageFetchStats))[0] : null;
+        const suggestions = (hotPage?.entries || [])
+          .slice(0, size)
+          .map(({ display, weight, count }) => ({ text: display, weight, count }));
+        return {
+          q,
+          prefix,
+          suggestions,
+          stats: {
+            exact: true,
+            suggestLane: "hot",
+            suggestPagesVisited: hotPage ? 1 : 0,
+            suggestPagesFetched: pageFetchStats.fetched,
+            suggestEntriesScanned: hotPage?.entries.length || 0
+          }
+        };
+      }
+    }
+    let summaries;
+    if (root.levels === 1) {
+      summaries = suggestCandidateRun(root.pages, prefix, upper);
+    } else {
+      const branchRun = suggestCandidateRun(root.branches, prefix, upper);
+      const branchPages = await loadSuggestBranchPages(root, branchRun, branchFetchStats);
+      summaries = [];
+      for (const branchPage of branchPages) {
+        summaries.push(...suggestCandidateRun(branchPage.pages, prefix, upper));
+      }
+    }
+
+    // Best-first by per-page max weight with a block-max stop proof: once the
+    // current k-th suggestion outweighs every unvisited page's maximum, no
+    // unvisited entry can change the top k.
+    const ordered = summaries.slice().sort((a, b) => b.maxWeight - a.maxWeight || a.index - b.index);
+    const best = new Map();
+    let entriesScanned = 0;
+    let pagesVisited = 0;
+    const kthWeight = () => {
+      if (best.size < size) return -1;
+      const weights = [...best.values()].map(item => item.weight).sort((a, b) => b - a);
+      return weights[size - 1];
+    };
+    let batch = 2;
+    for (let position = 0; position < ordered.length;) {
+      const boundary = kthWeight();
+      if (boundary >= 0 && ordered[position].maxWeight < boundary) break;
+      const slice = ordered.slice(position, position + batch);
+      batch = Math.min(batch * 2, 8);
+      const pages = await loadSuggestPages(root, slice, pageFetchStats);
+      for (const page of pages) {
+        pagesVisited++;
+        const entries = page.entries;
+        let lo = 0;
+        let hi = entries.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (entries[mid].key < prefix) lo = mid + 1;
+          else hi = mid;
+        }
+        for (let i = lo; i < entries.length; i++) {
+          const entry = entries[i];
+          if (!entry.key.startsWith(prefix)) break;
+          entriesScanned++;
+          const existing = best.get(entry.display);
+          if (!existing
+            || entry.weight > existing.weight
+            || (entry.weight === existing.weight && entry.key < existing.key)) {
+            best.set(entry.display, { text: entry.display, key: entry.key, weight: entry.weight, count: entry.count });
+          }
+        }
+      }
+      position += slice.length;
+    }
+
+    const ranked = [...best.values()]
+      .sort((a, b) => b.weight - a.weight
+        || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+        || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0))
+      .slice(0, size);
+    return {
+      q,
+      prefix,
+      suggestions: ranked.map(({ text, weight, count }) => ({ text, weight, count })),
+      stats: {
+        exact: true,
+        suggestLane: "range",
+        suggestLevels: root.levels,
+        suggestCandidatePages: summaries.length,
+        suggestPagesVisited: pagesVisited,
+        suggestPagesPrefetched: pageFetchStats.wanted,
+        suggestPagesFetched: pageFetchStats.fetched,
+        suggestPageFetchGroups: pageFetchStats.groups,
+        suggestBranchPagesFetched: branchFetchStats.fetched,
+        suggestEntriesScanned: entriesScanned
+      }
+    };
+  }
+
   async function executeCount(params = {}) {
     const q = String(params.q || "").trim();
     const filters = params.filters || {};
@@ -6170,10 +6383,24 @@ export async function createSearch(options = {}) {
     };
   }
 
+  async function suggest(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("suggest.total", () => executeSuggest(params)));
+    if (!trace) return response;
+    return {
+      ...response,
+      stats: {
+        ...(response.stats || {}),
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
+  }
+
   return {
     manifest,
     search,
     count,
+    suggest,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,

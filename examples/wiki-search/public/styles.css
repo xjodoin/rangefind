@@ -104,6 +104,35 @@ main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
+  position: relative;
+}
+
+.suggest-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 114px;
+  z-index: 30;
+  margin: 0;
+  padding: 6px 0;
+  list-style: none;
+  border: 1px solid #b8c4bd;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(20, 35, 25, 0.18);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.suggest-list li {
+  padding: 9px 16px;
+  font-size: 1rem;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.suggest-list li:hover {
+  background: #eef4ef;
 }
 
 .query-row input {

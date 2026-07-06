@@ -14,6 +14,9 @@ export const AUTHORITY_SHARD_MAGIC = [0x52, 0x46, 0x41, 0x55]; // RFAU
 export const GEO_TREE_ROOT_MAGIC = [0x52, 0x46, 0x47, 0x52]; // RFGR
 export const GEO_BRANCH_PAGE_MAGIC = [0x52, 0x46, 0x47, 0x42]; // RFGB
 export const GEO_LEAF_PAGE_MAGIC = [0x52, 0x46, 0x47, 0x4c]; // RFGL
+export const SUGGEST_ROOT_MAGIC = [0x52, 0x46, 0x53, 0x52]; // RFSR
+export const SUGGEST_BRANCH_PAGE_MAGIC = [0x52, 0x46, 0x53, 0x42]; // RFSB
+export const SUGGEST_PAGE_MAGIC = [0x52, 0x46, 0x53, 0x47]; // RFSG
 
 export function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));
