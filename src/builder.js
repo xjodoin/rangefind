@@ -19,7 +19,20 @@ import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms, tokenize } from "./analyzer.js";
-import { addAuthorityDoc, createAuthorityRunBuffer, finishAuthorityRuns, reduceAuthorityRuns } from "./authority_index.js";
+import { addAuthorityDoc, addAuthorityRecord, createAuthorityRunBuffer, finishAuthorityRuns, reduceAuthorityRuns } from "./authority_index.js";
+import {
+  booleanValue,
+  docPayload,
+  docPayloadFieldNames,
+  encodeSelectedTerms,
+  facetValues,
+  isBundlePhraseTerm,
+  normalizedNumberType,
+  numericValue,
+  queryBundlesEnabled,
+  rawPath,
+  valueList
+} from "./scan_doc.js";
 import { addBuildCounter, createBuildTelemetry, finishBuildTelemetry, recordBuildWorkers, timeBuildPhase } from "./build_telemetry.js";
 import { createCodeStore, openCodeStore } from "./build_store.js";
 import {
@@ -70,55 +83,6 @@ function addDict(dict, value, label = value) {
   dict.ids.set(key, id);
   dict.values.push({ value: key, label: String(label || key), n: 0 });
   return id;
-}
-
-function rawPath(object, path, fallback = "") {
-  if (!path) return fallback;
-  let value = object;
-  for (const part of String(path).split(".")) {
-    if (value == null) return fallback;
-    value = value[part];
-  }
-  return value ?? fallback;
-}
-
-function valueList(value) {
-  if (Array.isArray(value)) return value;
-  if (value == null || value === "") return [];
-  return [value];
-}
-
-function normalizedNumberType(field) {
-  return String(field.type || "int").toLowerCase();
-}
-
-function numericValue(doc, field) {
-  const value = rawPath(doc, field.path);
-  if (value == null || value === "") return null;
-  const type = normalizedNumberType(field);
-  if (type === "date") {
-    const time = value instanceof Date ? value.getTime() : Date.parse(String(value));
-    return Number.isFinite(time) ? time : null;
-  }
-  const number = Number(value);
-  if (!Number.isFinite(number)) return null;
-  if (type === "float" || type === "double") return number;
-  return Math.round(number);
-}
-
-function booleanValue(doc, field) {
-  const value = rawPath(doc, field.path);
-  if (value === true || value === 1 || value === "true" || value === "1") return true;
-  if (value === false || value === 0 || value === "false" || value === "0") return false;
-  return null;
-}
-
-function facetValues(doc, facet) {
-  const labels = valueList(rawPath(doc, facet.labelPath || facet.path));
-  return valueList(rawPath(doc, facet.path)).map((value, index) => ({
-    value,
-    label: labels[index] ?? value
-  }));
 }
 
 function createMeasureAccumulator(config) {
@@ -299,17 +263,6 @@ async function measure(config) {
   return scanWorkerCount(config) > 1 ? measureWithWorkers(config) : measureSequential(config);
 }
 
-function queryBundlesEnabled(config) {
-  return config.queryBundles !== false && Math.max(0, Number(config.queryBundleMaxKeys || 0)) > 0;
-}
-
-function isBundlePhraseTerm(term, config) {
-  if (!term || term.startsWith("n_") || !term.includes("_")) return false;
-  const parts = term.split("_").filter(Boolean);
-  const maxTerms = Math.max(2, Math.min(3, Math.floor(Number(config.queryBundleMaxTerms || 3))));
-  return parts.length >= 2 && parts.length <= maxTerms && parts.every(part => part && !part.includes("_"));
-}
-
 function createQueryBundleSeedBuffer(config) {
   const maxKeys = Math.max(0, Math.floor(Number(config.queryBundleMaxKeys || 0)));
   const factor = Math.max(1, Number(config.queryBundleSeedCandidateFactor || 4));
@@ -377,32 +330,6 @@ function queryBundleTerms(seeds) {
   return [...terms].sort();
 }
 
-function docPayload(doc, config, index) {
-  const payload = { id: String(getPath(doc, config.idPath || "id", index)), index };
-  for (const item of config.display) {
-    if (typeof item === "string") {
-      payload[item] = getPath(doc, item);
-    } else {
-      let value = getPath(doc, item.path);
-      const maxChars = Number(item.maxChars || 0);
-      if (maxChars > 0 && typeof value === "string" && value.length > maxChars) {
-        value = value.slice(0, maxChars).trimEnd();
-      }
-      payload[item.name] = value;
-    }
-  }
-  if (!payload.title) payload.title = payload.id;
-  if (!payload.url) payload.url = getPath(doc, config.urlPath || "url", "");
-  return payload;
-}
-
-function docPayloadFieldNames(config) {
-  const fields = ["id"];
-  for (const item of config.display) fields.push(typeof item === "string" ? item : item.name);
-  fields.push("title", "url");
-  return [...new Set(fields)].filter(field => field && field !== "index");
-}
-
 function docIndexKey(index) {
   return String(index).padStart(8, "0");
 }
@@ -449,19 +376,45 @@ function createDocSpool(outDir, config = {}) {
     pageOffset: 0,
     pageBytes: 0,
     pageDocs: 0,
-    pageCount: 0
+    pageCount: 0,
+    writeQueues: new Map()
   };
+}
+
+const DOC_SPOOL_FLUSH_BYTES = 4 * 1024 * 1024;
+
+function queueSpoolWrite(spool, key, fd, chunk) {
+  let queue = spool.writeQueues.get(key);
+  if (!queue) {
+    queue = { fd, pending: [], pendingBytes: 0 };
+    spool.writeQueues.set(key, queue);
+  }
+  queue.pending.push(chunk);
+  queue.pendingBytes += chunk.length;
+  if (queue.pendingBytes >= DOC_SPOOL_FLUSH_BYTES) flushSpoolWrites(spool, key);
+}
+
+function flushSpoolWrites(spool, key = null) {
+  if (!spool.writeQueues) return;
+  for (const [queueKey, queue] of spool.writeQueues) {
+    if (key != null && queueKey !== key) continue;
+    if (!queue.pending.length) continue;
+    const chunk = Buffer.concat(queue.pending, queue.pendingBytes);
+    writeSync(queue.fd, chunk, 0, chunk.length);
+    queue.pending.length = 0;
+    queue.pendingBytes = 0;
+  }
 }
 
 function flushDocPageSpool(spool) {
   if (!spool?.pageBuffer?.length || spool.pageFd == null || spool.pageEntryFd == null) return;
   const source = encodeDocPageColumns(spool.pageBuffer, spool.pageFields || []);
-  writeSync(spool.pageFd, source, 0, source.length, spool.pageOffset);
-  writeDocSpoolEntry(spool.pageEntryFd, spool.pageCount, {
+  queueSpoolWrite(spool, "page", spool.pageFd, Buffer.from(source.buffer, source.byteOffset, source.length));
+  queueSpoolWrite(spool, "pageEntry", spool.pageEntryFd, encodeDocSpoolEntry({
     offset: spool.pageOffset,
     length: source.length,
     logicalLength: source.length
-  });
+  }));
   spool.pageOffset += source.length;
   spool.pageBytes += source.length;
   spool.pageDocs += spool.pageBuffer.length;
@@ -471,6 +424,7 @@ function flushDocPageSpool(spool) {
 
 function closeDocSpool(spool) {
   flushDocPageSpool(spool);
+  flushSpoolWrites(spool);
   for (const key of ["fd", "entryFd", "layoutFd", "pageFd", "pageEntryFd"]) {
     if (spool[key] == null) continue;
     closeSync(spool[key]);
@@ -486,12 +440,17 @@ function readBigUInt(buffer, offset) {
   return Number(buffer.readBigUInt64LE(offset));
 }
 
-function writeDocSpoolEntry(spoolOrFd, index, entry) {
-  const fd = typeof spoolOrFd === "number" ? spoolOrFd : spoolOrFd.entryFd;
-  const buffer = Buffer.alloc(DOC_SPOOL_ENTRY_BYTES);
+function encodeDocSpoolEntry(entry) {
+  const buffer = Buffer.allocUnsafe(DOC_SPOOL_ENTRY_BYTES);
   writeBigUInt(buffer, 0, entry.offset);
   writeBigUInt(buffer, 8, entry.length);
   writeBigUInt(buffer, 16, entry.logicalLength);
+  return buffer;
+}
+
+function writeDocSpoolEntry(spoolOrFd, index, entry) {
+  const fd = typeof spoolOrFd === "number" ? spoolOrFd : spoolOrFd.entryFd;
+  const buffer = encodeDocSpoolEntry(entry);
   writeSync(fd, buffer, 0, buffer.length, index * DOC_SPOOL_ENTRY_BYTES);
 }
 
@@ -506,16 +465,17 @@ function readDocSpoolEntry(fd, index) {
   };
 }
 
-function writeSpooledDoc(spool, payload, index, layoutRecord) {
-  const bytes = Buffer.from(JSON.stringify(payload));
-  const compressed = gzipSync(bytes, { level: 6 });
-  writeSync(spool.fd, compressed, 0, compressed.length, spool.offset);
-  writeDocSpoolEntry(spool, index, {
+function writeSpooledDoc(spool, payload, index, layoutRecord, precompressed = null) {
+  const bytes = precompressed ? null : Buffer.from(JSON.stringify(payload));
+  const compressed = precompressed?.compressed || gzipSync(bytes, { level: 6 });
+  const logicalLength = precompressed?.logicalLength ?? bytes.length;
+  queueSpoolWrite(spool, "payload", spool.fd, compressed);
+  queueSpoolWrite(spool, "entry", spool.entryFd, encodeDocSpoolEntry({
     offset: spool.offset,
     length: compressed.length,
-    logicalLength: bytes.length
-  });
-  writeSync(spool.layoutFd, `${JSON.stringify(layoutRecord)}\n`);
+    logicalLength
+  }));
+  queueSpoolWrite(spool, "layout", spool.layoutFd, Buffer.from(`${JSON.stringify(layoutRecord)}\n`));
   spool.layoutDocs++;
   spool.offset += compressed.length;
   spool.bytes += compressed.length;
@@ -539,40 +499,34 @@ function createSelectedTermSpool(outDir) {
   return {
     path,
     fd: openSync(path, "w"),
+    pending: [],
+    pendingBytes: 0,
     docs: 0,
     terms: 0,
     bytes: 0
   };
 }
 
+function flushSelectedTermSpool(spool) {
+  if (!spool?.pending?.length) return;
+  const chunk = Buffer.concat(spool.pending, spool.pendingBytes);
+  writeSync(spool.fd, chunk, 0, chunk.length);
+  spool.pending.length = 0;
+  spool.pendingBytes = 0;
+}
+
 function closeSelectedTermSpool(spool) {
   if (!spool || spool.fd == null) return;
+  flushSelectedTermSpool(spool);
   closeSync(spool.fd);
   spool.fd = null;
 }
 
-function encodeSelectedTerms(selectedTerms) {
-  const terms = selectedTerms.map(([term, score]) => [String(term || ""), Math.max(1, Math.round(score * 1000))]);
-  let bytes = varintLength(terms.length);
-  const encodedTerms = terms.map(([term, score]) => {
-    const termBytes = textEncoder.encode(term);
-    bytes += varintLength(termBytes.length) + termBytes.length + varintLength(score);
-    return [termBytes, score];
-  });
-  const out = Buffer.allocUnsafe(bytes);
-  let pos = writeVarint(out, 0, encodedTerms.length);
-  for (const [termBytes, score] of encodedTerms) {
-    pos = writeVarint(out, pos, termBytes.length);
-    out.set(termBytes, pos);
-    pos += termBytes.length;
-    pos = writeVarint(out, pos, score);
-  }
-  return out;
-}
-
-function writeSelectedTerms(spool, selectedTerms) {
-  const bytes = encodeSelectedTerms(selectedTerms);
-  writeSync(spool.fd, bytes, 0, bytes.length);
+function writeSelectedTerms(spool, selectedTerms, encoded = null) {
+  const bytes = encoded || encodeSelectedTerms(selectedTerms);
+  spool.pending.push(bytes);
+  spool.pendingBytes += bytes.length;
+  if (spool.pendingBytes >= 1024 * 1024) flushSelectedTermSpool(spool);
   spool.docs++;
   spool.terms += selectedTerms.length;
   spool.bytes += bytes.length;
@@ -1844,6 +1798,115 @@ function analyzeDocForScan(doc, index, config, avgLens) {
   };
 }
 
+function mergeQueryBundleSeedCandidates(buffer, candidates) {
+  if (!buffer.enabled || !candidates) return;
+  for (const { key, baseTerms } of candidates) {
+    if (!buffer.seeds.has(key)) {
+      if (buffer.seeds.size >= buffer.maxSeedCandidates) continue;
+      buffer.seeds.set(key, {
+        key,
+        baseTerms,
+        expandedTerms: expandedTermsFromBaseTerms(baseTerms)
+      });
+    }
+    buffer.counts.set(key, (buffer.counts.get(key) || 0) + 1);
+  }
+}
+
+function toBatchBuffer(value) {
+  return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function consumeScanBatch(state, response) {
+  const {
+    config,
+    measured,
+    codes,
+    initialResults,
+    queryBundleSeedBuffer,
+    authorityBuffer,
+    docSpool,
+    selectedTermSpool
+  } = state;
+  const n = response.docs;
+  const baseIndex = response.baseIndex;
+
+  const payloadBytes = toBatchBuffer(response.payloadBytes);
+  queueSpoolWrite(docSpool, "payload", docSpool.fd, payloadBytes);
+  const entriesBuffer = Buffer.allocUnsafe(n * DOC_SPOOL_ENTRY_BYTES);
+  for (let i = 0; i < n; i++) {
+    writeBigUInt(entriesBuffer, i * DOC_SPOOL_ENTRY_BYTES, docSpool.offset);
+    writeBigUInt(entriesBuffer, i * DOC_SPOOL_ENTRY_BYTES + 8, response.payloadLengths[i]);
+    writeBigUInt(entriesBuffer, i * DOC_SPOOL_ENTRY_BYTES + 16, response.payloadLogicalLengths[i]);
+    docSpool.offset += response.payloadLengths[i];
+    docSpool.bytes += response.payloadLengths[i];
+  }
+  queueSpoolWrite(docSpool, "entry", docSpool.entryFd, entriesBuffer);
+  queueSpoolWrite(docSpool, "layout", docSpool.layoutFd, toBatchBuffer(response.layoutBytes));
+  docSpool.layoutDocs += n;
+
+  for (let page = 0; page < response.pageColumns.length; page++) {
+    const source = toBatchBuffer(response.pageColumns[page]);
+    queueSpoolWrite(docSpool, "page", docSpool.pageFd, source);
+    queueSpoolWrite(docSpool, "pageEntry", docSpool.pageEntryFd, encodeDocSpoolEntry({
+      offset: docSpool.pageOffset,
+      length: source.length,
+      logicalLength: source.length
+    }));
+    docSpool.pageOffset += source.length;
+    docSpool.pageBytes += source.length;
+    docSpool.pageDocs += response.pageDocCounts[page];
+    docSpool.pageCount++;
+  }
+
+  const termBytes = toBatchBuffer(response.termBytes);
+  selectedTermSpool.pending.push(termBytes);
+  selectedTermSpool.pendingBytes += termBytes.length;
+  if (selectedTermSpool.pendingBytes >= 1024 * 1024) flushSelectedTermSpool(selectedTermSpool);
+  selectedTermSpool.docs += n;
+  selectedTermSpool.bytes += termBytes.length;
+  for (let i = 0; i < n; i++) selectedTermSpool.terms += response.termCounts[i];
+
+  for (const payload of response.initialPayloads) {
+    if (initialResults.length < config.initialResultLimit) initialResults.push(payload);
+  }
+
+  for (let f = 0; f < config.facets.length; f++) {
+    const facet = config.facets[f];
+    const dict = measured.dicts[facet.name];
+    const rows = response.facets[f];
+    for (let i = 0; i < n; i++) {
+      const items = rows[i];
+      const values = new Array(items.length);
+      for (let v = 0; v < items.length; v++) values[v] = addDict(dict, items[v][0], items[v][1]);
+      codes.set(facet.name, baseIndex + i, { codes: values });
+    }
+  }
+  for (let f = 0; f < config.numbers.length; f++) {
+    const rows = response.numbers[f];
+    for (let i = 0; i < n; i++) {
+      codes.set(config.numbers[f].name, baseIndex + i, Number.isNaN(rows[i]) ? null : rows[i]);
+    }
+  }
+  for (let f = 0; f < (config.booleans || []).length; f++) {
+    const rows = response.booleans[f];
+    for (let i = 0; i < n; i++) {
+      codes.set(config.booleans[f].name, baseIndex + i, rows[i] < 0 ? null : rows[i] > 0);
+    }
+  }
+
+  if (authorityBuffer.enabled && response.authority) {
+    const { keys, docs, scores } = response.authority;
+    for (let r = 0; r < keys.length; r++) {
+      addAuthorityRecord(authorityBuffer, config, keys[r], docs[r], scores[r]);
+    }
+  }
+
+  if (response.bundleCandidates) {
+    for (let i = 0; i < n; i++) mergeQueryBundleSeedCandidates(queryBundleSeedBuffer, response.bundleCandidates[i]);
+  }
+}
+
 function consumeScanDoc(state, doc, index, analysis) {
   const {
     config,
@@ -1929,12 +1992,13 @@ function postScanBatch(worker, message) {
   });
 }
 
-async function scanWithWorkers(state) {
+async function scanWithWorkers(state, dirs) {
   const workerCount = scanWorkerCount(state.config);
-  const batchDocs = scanBatchDocs(state.config);
+  const pageSize = state.docSpool.pageSize;
+  const batchDocs = Math.max(pageSize, Math.ceil(scanBatchDocs(state.config) / pageSize) * pageSize);
   const workers = Array.from({ length: workerCount }, (_, index) => ({
     index,
-    worker: new Worker(new URL("./analyze_worker.js", import.meta.url), { type: "module" }),
+    worker: new Worker(new URL("./scan_worker.js", import.meta.url), { type: "module" }),
     docs: 0,
     batches: 0,
     analysisMs: 0
@@ -1947,11 +2011,9 @@ async function scanWithWorkers(state) {
 
   function drainPending() {
     while (pending.has(nextWrite)) {
-      const { batch, response } = pending.get(nextWrite);
+      const response = pending.get(nextWrite);
       pending.delete(nextWrite);
-      for (let i = 0; i < batch.length; i++) {
-        consumeScanDoc(state, batch[i].doc, batch[i].index, response.docs[i]);
-      }
+      consumeScanBatch(state, response);
       nextWrite++;
     }
   }
@@ -1961,20 +2023,15 @@ async function scanWithWorkers(state) {
     return available.pop();
   }
 
-  async function queueBatch(batch) {
+  async function queueBatch(lines, baseIndex) {
     const entry = await waitForWorker();
     const id = nextBatch++;
     const started = performance.now();
-    const promise = postScanBatch(entry.worker, {
-      id,
-      docs: batch,
-      config: state.config,
-      avgLens: state.measured.avgLens
-    }).then((response) => {
-      entry.docs += batch.length;
+    const promise = postScanBatch(entry.worker, { id, baseIndex, lines }).then((response) => {
+      entry.docs += lines.length;
       entry.batches++;
       entry.analysisMs += performance.now() - started;
-      pending.set(id, { batch, response });
+      pending.set(id, response);
       drainPending();
     }).finally(() => {
       active.delete(promise);
@@ -1983,33 +2040,53 @@ async function scanWithWorkers(state) {
     active.add(promise);
   }
 
+  let segments = [];
   try {
+    await Promise.all(workers.map((entry, index) => postScanBatch(entry.worker, {
+      type: "init",
+      id: `init-${index}`,
+      config: state.config,
+      avgLens: state.measured.avgLens,
+      segmentsDir: resolve(dirs.build, "segments", `worker-${String(index).padStart(2, "0")}`),
+      segmentIdPrefix: `segment-w${String(index).padStart(2, "0")}`
+    })));
     const rl = createInterface({ input: createReadStream(state.config.input), crlfDelay: Infinity });
     let index = 0;
+    let baseIndex = 0;
     let batch = [];
     for await (const line of rl) {
       if (!line.trim()) continue;
-      batch.push({ doc: JSON.parse(line), index: index++ });
+      batch.push(line);
+      index++;
       if (batch.length >= batchDocs) {
-        await queueBatch(batch);
+        await queueBatch(batch, baseIndex);
+        baseIndex = index;
         batch = [];
       }
     }
-    if (batch.length) await queueBatch(batch);
+    if (batch.length) await queueBatch(batch, baseIndex);
     while (active.size) await Promise.race(active);
     drainPending();
     if (pending.size) throw new Error("Rangefind scan workers finished out of order.");
+    const finished = await Promise.all(workers.map((entry, index) => postScanBatch(entry.worker, {
+      type: "finish",
+      id: `finish-${index}`
+    })));
+    segments = finished.flatMap(response => response.segments || []);
   } finally {
     await Promise.allSettled(workers.map(entry => entry.worker.terminate()));
   }
 
-  return workers.map(entry => ({
-    worker: entry.index,
-    docs: entry.docs,
-    batches: entry.batches,
-    analysisMs: entry.analysisMs,
-    mode: "worker-thread"
-  }));
+  return {
+    segments,
+    workerStats: workers.map(entry => ({
+      worker: entry.index,
+      docs: entry.docs,
+      batches: entry.batches,
+      analysisMs: entry.analysisMs,
+      mode: "worker-thread"
+    }))
+  };
 }
 
 function postReducePartition(worker, message) {
@@ -2193,14 +2270,21 @@ async function writePostingRuns(config, measured, dirs) {
     selectedTermSpool
   };
   let scanWorkerStats = [];
+  let workerSegments = null;
 
   try {
-    scanWorkerStats = scanWorkerCount(config) > 1 ? await scanWithWorkers(state) : await scanSequential(state);
+    if (scanWorkerCount(config) > 1) {
+      const scanned = await scanWithWorkers(state, dirs);
+      scanWorkerStats = scanned.workerStats;
+      workerSegments = scanned.segments;
+    } else {
+      scanWorkerStats = await scanSequential(state);
+    }
   } finally {
     closeDocSpool(docSpool);
     closeSelectedTermSpool(selectedTermSpool);
   }
-  const segments = finishSegmentBuilder(segmentBuilder);
+  const segments = workerSegments ?? finishSegmentBuilder(segmentBuilder);
   const authorityBaseShards = finishAuthorityRuns(authorityBuffer);
   const queryBundleSeeds = finalizeQueryBundleSeeds(queryBundleSeedBuffer, config);
   return {

@@ -1,17 +1,38 @@
-import { appendFileSync, mkdirSync, rmSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { encodeRunRecord, readRunRecords } from "./runs.js";
 
 const DIRECTORY_ENTRY_SCHEMA = ["string", "string", "number", "number", "number", "string", "string"];
+const SPOOL_FLUSH_BYTES = 256 * 1024;
 
 export function createDirectoryEntrySpool(path) {
   mkdirSync(dirname(path), { recursive: true });
   return {
     format: "rfdirectoryspool-v1",
     path,
+    fd: null,
+    pending: [],
+    pendingBytes: 0,
     entries: 0,
     bytes: 0
   };
+}
+
+export function flushDirectoryEntrySpool(spool) {
+  if (!spool?.pending?.length) return;
+  if (spool.fd == null) spool.fd = openSync(spool.path, "w");
+  const chunk = Buffer.concat(spool.pending, spool.pendingBytes);
+  writeSync(spool.fd, chunk, 0, chunk.length);
+  spool.pending.length = 0;
+  spool.pendingBytes = 0;
+}
+
+export function closeDirectoryEntrySpool(spool) {
+  flushDirectoryEntrySpool(spool);
+  if (spool?.fd != null) {
+    closeSync(spool.fd);
+    spool.fd = null;
+  }
 }
 
 export function appendDirectoryEntry(spool, shard, entry) {
@@ -25,7 +46,9 @@ export function appendDirectoryEntry(spool, shard, entry) {
     entry.checksum.algorithm || "sha256",
     entry.checksum.value
   ]);
-  appendFileSync(spool.path, record);
+  spool.pending.push(record);
+  spool.pendingBytes += record.length;
+  if (spool.pendingBytes >= SPOOL_FLUSH_BYTES) flushDirectoryEntrySpool(spool);
   spool.entries++;
   spool.bytes += record.length;
   return entry;
@@ -72,7 +95,8 @@ function encodeEntry(entry) {
 }
 
 function writeChunk(path, entries) {
-  for (const entry of entries) appendFileSync(path, encodeEntry(entry));
+  const records = entries.map(encodeEntry);
+  writeFileSync(path, Buffer.concat(records));
 }
 
 class EntryHeap {
@@ -132,6 +156,7 @@ async function* readChunkEntries(path, options) {
 
 export async function* sortedDirectoryEntrySpool(spool, options = {}) {
   const chunkEntries = Math.max(1, Math.floor(Number(options.chunkEntries || 16384)));
+  if (typeof spool === "object") closeDirectoryEntrySpool(spool);
   const sourcePath = spool.path || spool;
   const tempDir = resolve(dirname(sourcePath), `directory-sort-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const chunks = [];

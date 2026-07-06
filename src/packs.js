@@ -1,4 +1,4 @@
-import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { resolve } from "node:path";
@@ -12,6 +12,7 @@ export function createPackWriter(outDir, targetBytes, options = {}) {
     index: -1,
     file: "",
     path: "",
+    fd: null,
     offset: 0,
     bytes: 0,
     entryCount: 0,
@@ -58,15 +59,34 @@ function nextPackIndex(writer) {
   return index;
 }
 
+function closeCurrentPack(writer) {
+  if (writer.fd == null) return;
+  closeSync(writer.fd);
+  writer.fd = null;
+  const pack = writer.packs[writer.packs.length - 1];
+  if (pack && pack.hasher) {
+    Object.defineProperty(pack, "contentDigest", { value: pack.hasher.digest("hex"), writable: true, enumerable: false, configurable: true });
+    Object.defineProperty(pack, "hasher", { value: null, writable: true, enumerable: false, configurable: true });
+  }
+}
+
 function openPack(writer) {
+  closeCurrentPack(writer);
   const index = nextPackIndex(writer);
   writer.file = `${String(index).padStart(4, "0")}.bin`;
   writer.path = resolve(writer.outDir, writer.file);
   writer.offset = 0;
   const pack = { index, file: writer.file, bytes: 0, shards: 0, objects: 0, references: 0, dedupedObjects: 0, dedupedBytes: 0 };
   Object.defineProperty(pack, "path", { value: writer.path, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(pack, "hasher", { value: createHash("sha256"), writable: true, enumerable: false, configurable: true });
   writer.packs.push(pack);
-  writeFileSync(writer.path, "");
+  writer.fd = openSync(writer.path, "w");
+}
+
+function appendToPack(writer, chunk) {
+  writeSync(writer.fd, chunk, 0, chunk.length);
+  const pack = writer.packs[writer.packs.length - 1];
+  pack.hasher.update(chunk);
 }
 
 export function writePackedShard(writer, shard, compressed, metadata = {}) {
@@ -102,7 +122,7 @@ export function writePackedShard(writer, shard, compressed, metadata = {}) {
     return entry;
   }
   if (!writer.file || (writer.offset > 0 && writer.offset + compressed.length > writer.targetBytes)) openPack(writer);
-  appendFileSync(writer.path, compressed);
+  appendToPack(writer, compressed);
   const entry = {
     pack: writer.file,
     offset: writer.offset,
@@ -154,24 +174,21 @@ export async function writePackedShardChunks(writer, shard, chunks, metadata = {
     value: ""
   };
   const hash = createHash(checksum.algorithm);
-  const out = createWriteStream(writer.path, { flags: "a" });
   const gzip = createGzip({ level: metadata.gzipLevel ?? 6 });
   let physicalLength = 0;
   const finished = new Promise((resolveDone, rejectDone) => {
     const reject = (error) => {
       gzip.destroy();
-      out.destroy();
       rejectDone(error);
     };
     gzip.once("error", reject);
-    out.once("error", reject);
-    out.once("finish", resolveDone);
+    gzip.once("end", resolveDone);
   });
   gzip.on("data", chunk => {
     physicalLength += chunk.length;
     hash.update(chunk);
+    appendToPack(writer, chunk);
   });
-  gzip.pipe(out);
   for (const chunk of chunks || []) {
     if (!gzip.write(chunk)) await once(gzip, "drain");
   }
@@ -204,10 +221,10 @@ export async function writePackedShardChunks(writer, shard, chunks, metadata = {
 
 export function finalizePackWriter(writer) {
   if (writer.finalized) return writer;
+  closeCurrentPack(writer);
   const nameMap = new Map();
   for (const pack of writer.packs) {
-    const bytes = readFileSync(pack.path);
-    const hash = sha256Hex(bytes);
+    const hash = pack.contentDigest;
     const prefix = String(pack.index).padStart(4, "0");
     const file = `${prefix}.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}.bin`;
     const path = resolve(writer.outDir, file);

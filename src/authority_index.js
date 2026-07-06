@@ -68,7 +68,23 @@ function flushAuthorityBuffer(buffer) {
   buffer.lines = 0;
 }
 
-function addAuthorityRecord(buffer, config, key, doc, score) {
+export function authorityRecordsForDoc(fields, doc) {
+  const records = [];
+  const seen = new Set();
+  for (const field of fields || []) {
+    for (const value of valueList(rawPath(doc, field.path))) {
+      for (const { key, kind } of authorityKeysForValue(value, field)) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const score = kind === "surface" ? field.surfaceWeight : kind === "exact" ? field.exactWeight : field.tokenWeight;
+        records.push({ key, score });
+      }
+    }
+  }
+  return records;
+}
+
+export function addAuthorityRecord(buffer, config, key, doc, score) {
   if (!key || score <= 0) return;
   const shard = baseShardFor(key, buffer.shardConfig || authorityShardConfig(config));
   if (!buffer.byShard.has(shard)) buffer.byShard.set(shard, []);

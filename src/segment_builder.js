@@ -161,11 +161,12 @@ function segmentMeta(id, terms, postingCount, termsBytes, postingBytes, docMin, 
   };
 }
 
-export function createSegmentBuilder(outDir, config = {}) {
+export function createSegmentBuilder(outDir, config = {}, options = {}) {
   mkdirSync(outDir, { recursive: true });
   return {
     outDir,
     config,
+    idPrefix: options.idPrefix || "segment",
     nextId: 0,
     postings: new Map(),
     postingCount: 0,
@@ -225,7 +226,7 @@ export function flushSegment(builder, reason = builder.pendingFlushReason || "fi
   if (reason === "single-doc-bytes") {
     throw new Error(`Rangefind segment flush limit exceeded by one document: approx ${builder.approxBytes} bytes > ${builder.maxBytes} bytes.`);
   }
-  const id = `segment-${String(builder.nextId++).padStart(6, "0")}`;
+  const id = `${builder.idPrefix}-${String(builder.nextId++).padStart(6, "0")}`;
   const dir = resolve(builder.outDir, id);
   mkdirSync(dir, { recursive: true });
   const postingsPath = resolve(dir, "postings.bin");
