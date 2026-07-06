@@ -1,0 +1,56 @@
+name: Publish to npm
+
+# Publishes the package when a GitHub Release is published (draft a release
+# for a v* tag to trigger it), or on manual dispatch.
+#
+# Auth uses npm Trusted Publishing (OIDC): no NPM_TOKEN secret is stored.
+# One-time setup on npmjs.com → package → Settings → Trusted Publisher:
+#   Provider: GitHub Actions
+#   Repository: xjodoin/rangefind
+#   Workflow:   publish.yml
+#   Environment: (leave blank)
+#
+# Fallback to a token instead of OIDC: add an `NPM_TOKEN` repo secret and set
+#   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+# on the publish step; the `id-token` permission still enables provenance.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for trusted publishing + provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      # Trusted publishing (OIDC) needs a recent npm CLI.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+      - run: npm run test:all
+
+      # Guard: the tag must match the package version so a release can't
+      # publish a mismatched version.
+      - name: Verify tag matches package version
+        if: github.event_name == 'release'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Release tag ($TAG) does not match package.json version ($PKG)"
+            exit 1
+          fi
+
+      - name: Publish
+        run: npm publish --provenance --access public
