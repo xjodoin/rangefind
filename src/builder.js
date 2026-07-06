@@ -34,7 +34,7 @@ import {
   valueList
 } from "./scan_doc.js";
 import { addBuildCounter, createBuildTelemetry, finishBuildTelemetry, recordBuildWorkers, timeBuildPhase } from "./build_telemetry.js";
-import { createCodeStore, openCodeStore } from "./build_store.js";
+import { createCodeStore, openCodeStore, preloadCodeStoreDescriptor } from "./build_store.js";
 import {
   buildBlockFilters,
   buildDocValueChunk,
@@ -1925,10 +1925,11 @@ function codeStoreDescriptorForPartitionWorkers(codes, config) {
   const totalChunks = Math.max(1, Math.ceil(Math.max(0, Number(descriptor.total || 0)) / cacheDocs));
   const maxAuto = Math.max(1, Math.floor(Number(config.codeStoreWorkerMaxAutoCacheChunks || 64)));
   const cacheChunks = explicit || Math.min(maxAuto, totalChunks);
-  return {
+  const preloadMaxBytes = Math.max(0, Math.floor(Number(config.codeStoreWorkerPreloadMaxBytes ?? 1536 * 1024 * 1024)));
+  return preloadCodeStoreDescriptor({
     ...descriptor,
     cacheChunks
-  };
+  }, preloadMaxBytes);
 }
 
 function scanBatchDocs(config) {

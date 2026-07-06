@@ -1,6 +1,45 @@
-import { closeSync, mkdirSync, openSync, readSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readSync, statSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
 import { docValueFields } from "./codec.js";
+
+function readFileIntoShared(path) {
+  const size = statSync(path).size;
+  const shared = new SharedArrayBuffer(size);
+  const view = Buffer.from(shared);
+  const fd = openSync(path, "r");
+  try {
+    let offset = 0;
+    while (offset < size) {
+      const bytesRead = readSync(fd, view, offset, Math.min(size - offset, 1 << 26), offset);
+      if (!bytesRead) throw new Error(`Rangefind build code store could not preload ${path}.`);
+      offset += bytesRead;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return shared;
+}
+
+export function preloadCodeStoreDescriptor(descriptor, maxBytes) {
+  if (!descriptor?.fields?.length) return descriptor;
+  const limit = Math.max(0, Math.floor(Number(maxBytes || 0)));
+  if (!limit) return descriptor;
+  let total = 0;
+  for (const field of descriptor.fields) {
+    total += statSync(field.path).size;
+    if (field.indexPath) total += statSync(field.indexPath).size;
+  }
+  if (total > limit) return descriptor;
+  return {
+    ...descriptor,
+    preloadedBytes: total,
+    fields: descriptor.fields.map(field => ({
+      ...field,
+      sharedData: readFileIntoShared(field.path),
+      sharedIndex: field.indexPath ? readFileIntoShared(field.indexPath) : null
+    }))
+  };
+}
 
 export const CODE_STORE_FORMAT = "rf-build-code-store-v1";
 const FACET_INDEX_BYTES = 16;
@@ -48,8 +87,10 @@ function readValue(buffer, field, row) {
 function createReader(descriptor, openMode) {
   const fields = descriptor.fields.map(field => ({
     ...field,
-    fd: openSync(field.path, openMode),
-    indexFd: field.kind === "facet" ? openSync(field.indexPath, openMode) : null,
+    fd: field.sharedData ? null : openSync(field.path, openMode),
+    indexFd: field.kind === "facet" && !field.sharedData ? openSync(field.indexPath, openMode) : null,
+    dataView: field.sharedData ? Buffer.from(field.sharedData) : null,
+    indexView: field.sharedIndex ? Buffer.from(field.sharedIndex) : null,
     cache: new Map(),
     bytesPerDoc: field.bytesPerDoc || bytesPerDoc(field),
     offset: 0
@@ -75,6 +116,14 @@ function createReader(descriptor, openMode) {
   }
 
   function readFacetValue(field, doc) {
+    if (field.indexView) {
+      const offset = readBigUInt(field.indexView, doc * FACET_INDEX_BYTES);
+      const length = readBigUInt(field.indexView, doc * FACET_INDEX_BYTES + 8);
+      if (!length) return { codes: [] };
+      const codes = new Array(length / 4);
+      for (let i = 0; i < codes.length; i++) codes[i] = field.dataView.readUInt32LE(offset + i * 4);
+      return { codes };
+    }
     const index = Buffer.alloc(FACET_INDEX_BYTES);
     const indexBytes = readSync(field.indexFd, index, 0, index.length, doc * FACET_INDEX_BYTES);
     if (indexBytes !== index.length) throw new Error(`Rangefind build code store ended before facet ${field.name} row ${doc}.`);
@@ -122,6 +171,9 @@ function createReader(descriptor, openMode) {
     get(name, doc) {
       if (doc < 0 || doc >= total) return null;
       const field = fieldFor(name);
+      if (field.dataView) {
+        return field.kind === "facet" ? readFacetValue(field, doc) : readValue(field.dataView, field, doc);
+      }
       const chunkIndex = Math.floor(doc / cacheDocs);
       const chunk = cacheGet(field, chunkIndex, (start, count) => field.kind === "facet"
         ? { start, count, values: readFacetChunk(field, start, count) }
@@ -135,7 +187,17 @@ function createReader(descriptor, openMode) {
       const safeStart = Math.max(0, Math.min(total, start));
       const safeCount = Math.max(0, Math.min(count, total - safeStart));
       if (field.kind === "facet") {
+        if (field.dataView) {
+          const out = new Array(safeCount);
+          for (let row = 0; row < safeCount; row++) out[row] = readFacetValue(field, safeStart + row);
+          return out;
+        }
         return readFacetChunk(field, safeStart, safeCount);
+      }
+      if (field.dataView) {
+        const out = new Array(safeCount);
+        for (let row = 0; row < safeCount; row++) out[row] = readValue(field.dataView, field, safeStart + row);
+        return out;
       }
       const buffer = readRange(field, safeStart, safeCount);
       const out = new Array(safeCount);
