@@ -238,7 +238,9 @@ export function flushSegment(builder, reason = builder.pendingFlushReason || "fi
   let postingCount = 0;
   let docMin = null;
   let docMax = null;
-  for (const [term, sourceRows] of [...builder.postings.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+  // Code-unit order: segment files must sort terms exactly the way the
+  // merge heap and directory comparisons do, for every script.
+  for (const [term, sourceRows] of [...builder.postings.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
     const rows = finishRows(sourceRows);
     const { buffer, docMin: termDocMin, docMax: termDocMax } = encodeRows(rows);
     postingBuffers.push(buffer);

@@ -1,4 +1,5 @@
-import { analyzeTerms, expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms, queryTerms, tokenize } from "./analyzer.js";
+import { expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms } from "./analyzer.js";
+import { analyzerFromManifest } from "./analysis.js";
 import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
@@ -276,6 +277,9 @@ export async function createSearch(options = {}) {
   if (Array.isArray(manifest.generations)) {
     return createGenerationalSearch(manifest, options, baseUrl);
   }
+  // The manifest's analysis profile reconstructs the exact analyzer the
+  // builder used, so query terms always live in the index's term space.
+  const analyzer = analyzerFromManifest(manifest);
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
   const termDirectory = createDirectoryState(manifest.directory);
   const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
@@ -2535,6 +2539,35 @@ export async function createSearch(options = {}) {
 
   function minShouldMatchFor(baseTerms) {
     return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+  }
+
+  // Multilingual base-plan selection: the detected query language may not
+  // match the language the relevant documents were indexed in, and the base
+  // terms drive minShouldMatch, phrase bundles, proximity, and typo
+  // correction. When the primary plan's stems are missing from the term
+  // directory, the alternate-language plan with the most indexed stems takes
+  // over. Directory shard loads are cached, so the winning plan's lookups
+  // are reused by the search itself.
+  async function resolveQueryPlan(q) {
+    const plan = analyzer.queryPlan(q);
+    if (!plan.altPlans?.length || !plan.baseTerms.length) return plan;
+    async function presentCount(baseTerms) {
+      const entries = await termEntries(baseTerms);
+      const found = new Set(entries.map(item => item.term));
+      return baseTerms.filter(term => found.has(term)).length;
+    }
+    const primaryPresent = await presentCount(plan.baseTerms);
+    if (primaryPresent >= Math.max(1, minShouldMatchFor(plan.baseTerms))) return plan;
+    let best = plan;
+    let bestPresent = primaryPresent;
+    for (const alt of plan.altPlans) {
+      const altPresent = await presentCount(alt.baseTerms);
+      if (altPresent > bestPresent) {
+        best = { ...plan, language: alt.language, analyzedTerms: alt.analyzedTerms, baseTerms: alt.baseTerms };
+        bestPresent = altPresent;
+      }
+    }
+    return best;
   }
 
   function collectEligibleScores(scores, hits, minShouldMatch) {
@@ -5936,8 +5969,8 @@ export async function createSearch(options = {}) {
     const authorityQuery = String(response.correctedQuery || response.surfaceFallbackQuery || params.q || "").trim();
     if (!authorityQuery || resultTitleMatchesQuery(response.results?.[0], authorityQuery)) return response;
 
-    const authorityTerms = analyzeTerms(authorityQuery).map(item => item.term);
-    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms).filter(item => item.key);
+    const authorityTerms = analyzer.queryPlan(authorityQuery).baseTerms;
+    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms, { analyzer }).filter(item => item.key);
     const surfaceKeys = [...new Set(keyPlans.filter(item => item.kind === "surface").map(item => item.key))];
     const exactKeys = [...new Set(keyPlans.filter(item => item.kind === "exact").map(item => item.key))];
     const tokenKeys = [...new Set(keyPlans.filter(item => item.kind === "tokens").map(item => item.key))];
@@ -6117,8 +6150,9 @@ export async function createSearch(options = {}) {
       };
     }
 
-    const analyzedTerms = analyzeTerms(q);
-    const baseTerms = analyzedTerms.map(item => item.term);
+    const queryAnalysis = await resolveQueryPlan(q);
+    const analyzedTerms = queryAnalysis.analyzedTerms;
+    const baseTerms = queryAnalysis.baseTerms;
     if (geoPlan?.sort) {
       // Exact text + distance sort: resolve the full text match set once,
       // then let the geo tree order it with the nearest early-stop proof.
@@ -6161,7 +6195,7 @@ export async function createSearch(options = {}) {
       filters,
       sort,
       baseTerms,
-      terms: queryTerms(q),
+      terms: queryAnalysis.terms,
       rerank: params.rerank,
       includeResults: params.includeResults !== false,
       plannerFallbackReason: params.exact ? "exact_requested" : "full_scan"
@@ -6173,8 +6207,8 @@ export async function createSearch(options = {}) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
       applyHighlights(
         rerankedResponse.results,
-        highlightTermSet(q, rerankedResponse.correctedQuery),
-        highlightOptions
+        highlightTermSet(q, rerankedResponse.correctedQuery, analyzer),
+        { ...highlightOptions, analyzer }
       );
     }
     if (geoPlan?.docSetStats) {
@@ -6436,7 +6470,7 @@ export async function createSearch(options = {}) {
     }
     if (params.highlight && q && results.length) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
-      applyHighlights(results, highlightTermSet(q, textResponse?.correctedQuery), highlightOptions);
+      applyHighlights(results, highlightTermSet(q, textResponse?.correctedQuery, analyzer), { ...highlightOptions, analyzer });
     }
     return {
       total: ranked.length,
@@ -6728,7 +6762,7 @@ export async function createSearch(options = {}) {
     const filterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
 
     if (q) {
-      const match = await collectTextMatchDocs(analyzeTerms(q).map(item => item.term));
+      const match = await collectTextMatchDocs((await resolveQueryPlan(q)).baseTerms);
       if (!match) {
         // Posting volume above budget: fall back to the global distribution,
         // clearly flagged, instead of guessing from a biased top-k pool.
@@ -6774,8 +6808,7 @@ export async function createSearch(options = {}) {
     if (hasFilters || params.sort || params.geo) {
       throw new Error("Rangefind count currently supports text-only queries without filters, sort, or geo.");
     }
-    const analyzedTerms = analyzeTerms(q);
-    const baseTerms = analyzedTerms.map(item => item.term);
+    const baseTerms = (await resolveQueryPlan(q)).baseTerms;
     return runCountSearch({ q, baseTerms });
   }
 
@@ -6843,6 +6876,7 @@ export async function createSearch(options = {}) {
 
   return {
     manifest,
+    analyzer,
     search,
     count,
     suggest,
@@ -6926,7 +6960,10 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const correctedQuery = responses.map(response => response.correctedQuery).find(Boolean);
     if (params.highlight && results.length && q) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
-      applyHighlights(results, highlightTermSet(q, correctedQuery), highlightOptions);
+      // Generations are built with one frozen analysis profile, so the
+      // first engine's analyzer speaks for all of them.
+      const genAnalyzer = engines[0]?.analyzer;
+      applyHighlights(results, highlightTermSet(q, correctedQuery, genAnalyzer), { ...highlightOptions, analyzer: genAnalyzer });
     }
 
     let facets;

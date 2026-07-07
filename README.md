@@ -60,6 +60,13 @@ a large thesis corpus.
   full-dimension refine store, cosine top-k, and reciprocal-rank fusion with
   the text lane — no server, no vector database.
 - Analyzer-consistent snippets and highlight ranges on search results.
+- Multilingual analysis (`analysis` config): per-document language detection
+  or an explicit language field, per-language light stemmers and stopwords
+  for 20+ languages, script-aware Unicode folding (Latin, Greek, Cyrillic,
+  Arabic, Hebrew, Devanagari), dictionary-free CJK bigram tokenization that
+  is deterministic across Node and every browser, cross-language query
+  expansion with index-evidence base-plan selection, and the whole profile
+  frozen into the manifest so query analysis always matches the index.
 - Incremental publishing: `rangefind build --update` adds small delta
   generations over an existing index — unchanged pack bytes keep their
   content-addressed names (and CDN cache entries), replaced documents

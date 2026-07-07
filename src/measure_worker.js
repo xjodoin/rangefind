@@ -1,5 +1,5 @@
 import { parentPort } from "node:worker_threads";
-import { tokenize } from "./analyzer.js";
+import { analyzerForConfig } from "./analysis.js";
 import { fieldIndexText } from "./scoring.js";
 
 function rawPath(object, path, fallback = "") {
@@ -48,8 +48,10 @@ function measureLines(lines, config) {
     inputBytes += Buffer.byteLength(line) + 1;
     const doc = JSON.parse(line);
     total++;
+    const analyzer = analyzerForConfig(config);
+    const docLang = analyzer.docLanguage(doc, config);
     for (const field of config.fields) {
-      fieldTotals[field.name] += tokenize(fieldIndexText(doc, field, config), { unique: false }).length;
+      fieldTotals[field.name] += analyzer.tokenize(fieldIndexText(doc, field, config), { unique: false, lang: docLang }).length;
     }
     for (const facet of config.facets) {
       const dict = facets[facet.name];

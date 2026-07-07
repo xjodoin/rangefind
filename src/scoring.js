@@ -1,4 +1,5 @@
-import { proximityTerm, termCounts, tokenize } from "./analyzer.js";
+import { proximityTerm } from "./analyzer.js";
+import { analyzerForConfig } from "./analysis.js";
 import { getPath } from "./config.js";
 
 function addWeighted(scores, term, weight) {
@@ -35,22 +36,27 @@ export function fieldIndexText(doc, field, config = {}) {
   return limit > 0 && !isAlwaysIndexField(field, config) && text.length > limit ? text.slice(0, limit) : text;
 }
 
-export function analyzeFieldText(doc, field, config = {}) {
+export function analyzeFieldText(doc, field, config = {}, options = {}) {
+  const analyzer = options.analyzer || analyzerForConfig(config);
+  const lang = options.lang ?? analyzer.docLanguage(doc, config);
   const text = fieldIndexText(doc, field, config);
-  const terms = tokenize(text, { unique: false });
+  const terms = analyzer.tokenize(text, { unique: false, lang });
   return {
     text,
     terms,
     counts: termCountsFromTerms(terms),
-    length: terms.length
+    length: terms.length,
+    lang
   };
 }
 
 export function addFieldScores(doc, field, avgLen, scores, options = {}) {
   const analysis = options.analysis || null;
+  const analyzer = options.analyzer || analyzerForConfig(options.config || {});
   const text = analysis ? analysis.text : options.text ?? fieldIndexText(doc, field, options.config || {});
+  const lang = analysis?.lang ?? options.lang ?? analyzer.docLanguage(doc, options.config || {});
   const terms = analysis?.terms || null;
-  const counts = analysis?.counts || termCounts(text);
+  const counts = analysis?.counts || analyzer.termCounts(text, { lang });
   const len = analysis?.length ?? [...counts.values()].reduce((sum, n) => sum + n, 0);
   const b = field.b ?? 0.75;
   const norm = 1 - b + b * (len / Math.max(1, avgLen));
@@ -59,7 +65,7 @@ export function addFieldScores(doc, field, avgLen, scores, options = {}) {
   }
 
   if (field.phrase) {
-    const phraseTerms = terms || tokenize(text, { unique: false });
+    const phraseTerms = terms || analyzer.tokenize(text, { unique: false, lang });
     for (const n of [2, 3]) {
       for (let i = 0; i <= phraseTerms.length - n; i++) {
         addWeighted(scores, phraseTerms.slice(i, i + n).join("_"), field.phraseWeight ?? 8);
@@ -70,8 +76,10 @@ export function addFieldScores(doc, field, avgLen, scores, options = {}) {
 
 export function addFieldExpansionScores(doc, field, scores, options = {}) {
   if (!field.proximity && !field.proximityWeight) return;
+  const analyzer = options.analyzer || analyzerForConfig(options.config || {});
   const text = options.analysis ? options.analysis.text : options.text ?? fieldIndexText(doc, field, options.config || {});
-  const terms = (options.analysis?.terms || tokenize(text, { unique: false })).slice(0, field.maxProximityTokens ?? 96);
+  const lang = options.analysis?.lang ?? options.lang ?? analyzer.docLanguage(doc, options.config || {});
+  const terms = (options.analysis?.terms || analyzer.tokenize(text, { unique: false, lang })).slice(0, field.maxProximityTokens ?? 96);
   const window = field.proximityWindow ?? 5;
   const weight = field.proximityWeight ?? 3.5;
   const seen = new Set();
@@ -132,9 +140,11 @@ export function analyzeDocumentForIndex(doc, config, avgLens, options = {}) {
   const alwaysNames = new Set((config.alwaysIndexFields || []).map(String));
   const includeFieldTerms = Boolean(options.includeFieldTerms);
   const fieldTerms = includeFieldTerms ? new Array(config.fields.length).fill(null) : null;
+  const analyzer = analyzerForConfig(config);
+  const lang = analyzer.docLanguage(doc, config);
   for (let index = 0; index < config.fields.length; index++) {
     const field = config.fields[index];
-    const analysis = analyzeFieldText(doc, field, config);
+    const analysis = analyzeFieldText(doc, field, config, { analyzer, lang });
     const alwaysField = alwaysNames.has(String(field.name || "")) || alwaysNames.has(String(field.path || ""));
     addFieldScores(doc, field, avgLens[field.name], alwaysField ? always : weighted, { analysis, config });
     if (!alwaysField) addFieldExpansionScores(doc, field, expansion, { analysis, config });

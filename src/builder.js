@@ -20,7 +20,8 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
-import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms, tokenize } from "./analyzer.js";
+import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms } from "./analyzer.js";
+import { analyzerForConfig } from "./analysis.js";
 import { addAuthorityDoc, addAuthorityRecord, createAuthorityRunBuffer, finishAuthorityRuns, reduceAuthorityRuns } from "./authority_index.js";
 import {
   booleanValue,
@@ -107,7 +108,7 @@ import { createAppendOnlyPackWriter, createPackWriter, finalizePackWriter, resol
 import { partitionInputBytes, partitionTermEntries } from "./reduced_terms.js";
 import { addQueryBundleRow, createQueryBundleCollector, queryBundleCollectorResults, writeQueryBundleObjects } from "./query_bundles.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
-import { analyzeDocumentForIndex, fieldIndexText } from "./scoring.js";
+import { analyzeDocumentForIndex, analyzeFieldText, fieldIndexText } from "./scoring.js";
 import { addSegmentPosting, createSegmentBuilder, finishSegmentBuilder, flushSegment, shouldFlushSegment } from "./segment_builder.js";
 import { mergeSegmentsToPartitions, segmentMergeSummary } from "./segment_merge.js";
 import { writeSegmentManifest } from "./segment_manifest.js";
@@ -166,10 +167,12 @@ function finalizeMeasure(accumulator, config, workerStats) {
 async function measureSequential(config) {
   const started = performance.now();
   const accumulator = createMeasureAccumulator(config);
+  const analyzer = analyzerForConfig(config);
   await eachJsonLine(config.input, async (doc) => {
     accumulator.total++;
+    const docLang = analyzer.docLanguage(doc, config);
     for (const field of config.fields) {
-      accumulator.fieldTotals[field.name] += tokenize(fieldIndexText(doc, field, config), { unique: false }).length;
+      accumulator.fieldTotals[field.name] += analyzer.tokenize(fieldIndexText(doc, field, config), { unique: false, lang: docLang }).length;
     }
     for (const facet of config.facets) {
       for (const item of facetValues(doc, facet)) {
@@ -344,7 +347,7 @@ function addQueryBundleSeeds(buffer, selectedTerms, config, doc, fieldTerms = nu
     const field = config.fields[fieldIndex];
     const limit = Math.max(0, Math.floor(Number(field.queryBundleSeedMaxTokens ?? config.queryBundleSeedMaxFieldTokens ?? 512)));
     if (!limit || field.queryBundles === false) continue;
-    const terms = fieldTerms?.[fieldIndex] || tokenize(fieldIndexText(doc, field, config), { unique: false }).slice(0, limit);
+    const terms = fieldTerms?.[fieldIndex] || analyzeFieldText(doc, field, config).terms.slice(0, limit);
     for (let n = 2; n <= maxTerms; n++) {
       for (let i = 0; i <= terms.length - n; i++) {
         const baseTerms = terms.slice(i, i + n);
@@ -1996,6 +1999,15 @@ async function prepareGenerationalUpdate(config) {
     }
     const genRoot = resolve(rootDir, generation.path || ".");
     const genManifest = JSON.parse(readFileSync(resolve(rootDir, generation.manifest), "utf8"));
+    // Generations share one term space: a delta built with a different
+    // analysis profile would emit incomparable terms, so scores could never
+    // merge. Frozen like the field stats.
+    if (stableJson(genManifest.analysis || null) !== stableJson(config.analysis || null)) {
+      throw new Error(
+        "Rangefind update: the analysis profile differs from the existing index; " +
+        "keep the same `analysis` config for delta builds or run a full rebuild."
+      );
+    }
     const tombstoned = new Set(generation.tombstones || []);
     for (const [externalId, localIndex] of readIdMapFile(resolve(genRoot, generation.id_map))) {
       if (!tombstoned.has(localIndex)) idMap.set(externalId, [g, localIndex]);
@@ -3645,6 +3657,7 @@ function minimalManifest(manifest) {
     sort_replicas: manifest.sort_replicas,
     query_bundles: manifest.query_bundles,
     authority: manifest.authority,
+    analysis: manifest.analysis || null,
     search: manifest.search,
     optimizer: manifest.optimizer,
     stats: manifest.stats
@@ -3697,7 +3710,10 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
   });
 }
 
-const BUILD_RESUME_SCHEMA_VERSION = 4;
+// v5: segment/directory sort order switched from localeCompare to code-unit
+// comparison; resumed stages sorted under the old collation cannot mix with
+// the new order.
+const BUILD_RESUME_SCHEMA_VERSION = 5;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -4269,6 +4285,7 @@ export async function build({ configPath, update = false }) {
         directory_bytes: authority.directory_bytes
       }
     } : null,
+    analysis: config.analysis || null,
     search: {
       postingOrder: config.postingOrder,
       typo: {

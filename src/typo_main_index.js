@@ -53,7 +53,9 @@ export function typoMaxEditsFor(term, options = MAIN_INDEX_TYPO_DEFAULTS) {
 }
 
 export function isTypoCorrectionToken(token) {
-  return /^[a-z][a-z0-9]*$/u.test(token) && !/^\d+$/u.test(token) && token.length >= 3 && token.length <= 32;
+  // Any-script letters: legacy indexes only ever contain [a-z0-9] terms, so
+  // widening this predicate cannot change their correction candidates.
+  return /^\p{L}[\p{L}\p{N}]*$/u.test(token) && !/^\d+$/u.test(token) && token.length >= 3 && token.length <= 32;
 }
 
 export function mainIndexTypoProbeValues(raw, term, options = MAIN_INDEX_TYPO_DEFAULTS) {

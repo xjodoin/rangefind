@@ -1,7 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { normalizeAnalysisConfig } from "./analysis.js";
 
 export const DEFAULTS = {
+  analysis: null,
   geoLeafSize: 512,
   geoPackBytes: 4 * 1024 * 1024,
   suggestPageSize: 256,
@@ -236,6 +238,7 @@ export async function readConfig(configPath) {
   return appendGeoComponentNumbers(applyIndexProfile({
     ...DEFAULTS,
     ...activeRaw,
+    analysis: normalizeAnalysisConfig(raw.analysis),
     codecs: { ...DEFAULTS.codecs, ...(raw.codecs || {}) },
     input: resolveFrom(base, raw.input),
     output: resolveFrom(base, raw.output || "public/rangefind"),

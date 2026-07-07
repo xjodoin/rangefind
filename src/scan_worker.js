@@ -1,5 +1,6 @@
 import { parentPort } from "node:worker_threads";
 import { gzipSync } from "node:zlib";
+import { analyzerForConfig } from "./analysis.js";
 import { authorityEnabled, authorityFields, authorityRecordsForDoc } from "./authority_index.js";
 import { docLayoutRecord } from "./doc_layout.js";
 import { encodeDocPageColumns } from "./doc_pages.js";
@@ -112,7 +113,7 @@ function processBatch({ id, baseIndex, lines }) {
       const value = booleanValue(doc, (config.booleans || [])[f]);
       booleansOut[f][i] = value == null ? -1 : value ? 1 : 0;
     }
-    for (const record of authorityRecordsForDoc(state.authorityFields, doc)) {
+    for (const record of authorityRecordsForDoc(state.authorityFields, doc, analyzerForConfig(config))) {
       authority.keys.push(record.key);
       authority.docs.push(index);
       authority.scores.push(record.score);

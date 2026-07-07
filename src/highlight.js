@@ -1,45 +1,37 @@
-import { analyzeTerms, fold, stem } from "./analyzer.js";
+import { LEGACY_ANALYZER } from "./analysis.js";
 
 // Word scanning runs over the RAW display text (folding can change string
 // length, so positions found in folded text would not map back). Combining
-// marks stay inside words so decomposed accents highlight correctly.
-const WORD_RE = /[\p{L}\p{M}\p{N}]+/gu;
+// marks stay inside words so decomposed accents highlight correctly. ー and
+// 々 are Script=Common but only occur inside CJK words.
+const WORD_RE = /[\p{L}\p{M}\p{N}ー々]+/gu;
 
-export function highlightTermSet(query, correctedQuery = "") {
-  const terms = new Set();
-  for (const item of analyzeTerms(String(query || ""))) terms.add(item.term);
-  for (const item of analyzeTerms(String(correctedQuery || ""))) terms.add(item.term);
-  return terms;
-}
-
-function wordMatches(word, termSet) {
-  const folded = fold(word);
-  if (termSet.has(folded)) return true;
-  const stemmed = stem(folded);
-  return stemmed !== folded && termSet.has(stemmed);
+export function highlightTermSet(query, correctedQuery = "", analyzer = LEGACY_ANALYZER) {
+  return analyzer.highlightTerms(query, correctedQuery);
 }
 
 // Finds [start, end) ranges of query-term occurrences in raw text using the
-// same fold+stem normalization the indexer applies, so "montreal" highlights
-// "Montréal" and "walk" highlights "walking".
-export function findMatchRanges(text, termSet) {
+// same normalization the indexer applies, so "montreal" highlights
+// "Montréal" and "walk" highlights "walking". The analyzer decides how a
+// word matches: whole-word for alphabetic scripts, per-bigram for CJK.
+export function findMatchRanges(text, termSet, analyzer = LEGACY_ANALYZER) {
   const ranges = [];
   if (!termSet?.size) return ranges;
   WORD_RE.lastIndex = 0;
   let match;
   while ((match = WORD_RE.exec(text))) {
-    if (wordMatches(match[0], termSet)) {
-      ranges.push([match.index, match.index + match[0].length]);
+    for (const [start, end] of analyzer.wordMatchRanges(match[0], termSet)) {
+      ranges.push([match.index + start, match.index + end]);
     }
   }
   return ranges;
 }
 
-function distinctTermsIn(text, ranges, from, to, termSet) {
+function distinctTermsIn(text, ranges, from, to, analyzer) {
   const seen = new Set();
   for (const [start, end] of ranges) {
     if (start < from || end > to) continue;
-    seen.add(stem(fold(text.slice(start, end))));
+    seen.add(analyzer.canonicalTerm(text.slice(start, end)));
   }
   return seen.size;
 }
@@ -48,10 +40,11 @@ function distinctTermsIn(text, ranges, from, to, termSet) {
 // terms (ties: most matches, then earliest), snaps it to word boundaries,
 // and returns the snippet text with match ranges rebased onto it.
 export function highlightText(text, termSet, options = {}) {
+  const analyzer = options.analyzer || LEGACY_ANALYZER;
   const raw = String(text || "");
   if (!raw) return null;
   const maxChars = Math.max(40, Math.floor(Number(options.maxChars ?? 240)));
-  const ranges = findMatchRanges(raw, termSet);
+  const ranges = findMatchRanges(raw, termSet, analyzer);
   if (!ranges.length) return null;
 
   let windowStart = 0;
@@ -63,7 +56,7 @@ export function highlightText(text, termSet, options = {}) {
     for (const [start] of ranges) {
       const candidate = Math.max(0, Math.min(start - 30, raw.length - maxChars));
       const to = candidate + maxChars;
-      const distinct = distinctTermsIn(raw, ranges, candidate, to, termSet);
+      const distinct = distinctTermsIn(raw, ranges, candidate, to, analyzer);
       const count = ranges.filter(([s, e]) => s >= candidate && e <= to).length;
       if (distinct > best.distinct || (distinct === best.distinct && count > best.count)) {
         best = { distinct, count, start: candidate };
@@ -105,13 +98,14 @@ export function highlightText(text, termSet, options = {}) {
 export function applyHighlights(results, termSet, options = {}) {
   const wanted = Array.isArray(options.fields) && options.fields.length ? options.fields : null;
   const maxChars = options.maxChars;
+  const analyzer = options.analyzer || LEGACY_ANALYZER;
   for (const result of results) {
     const highlights = {};
     let any = false;
     for (const [field, value] of Object.entries(result)) {
       if (typeof value !== "string" || !value) continue;
       if (wanted ? !wanted.includes(field) : field === "id" || field === "url") continue;
-      const highlight = highlightText(value, termSet, { maxChars });
+      const highlight = highlightText(value, termSet, { maxChars, analyzer });
       if (highlight) {
         highlights[field] = highlight;
         any = true;

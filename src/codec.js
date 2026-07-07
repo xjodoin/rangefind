@@ -826,8 +826,10 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     docRangeBlockEntries: 0
   };
 
+  // Code-unit order (not localeCompare): shard payload term order must be
+  // reproducible across ICU versions and match directory key comparisons.
   const orderedEntries = Array.isArray(entries)
-    ? entries.slice().sort((a, b) => a[0].localeCompare(b[0]))
+    ? entries.slice().sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     : entries;
   for (const [term, rows] of orderedEntries) {
     const postings = encodePostings(rows, total, codes, filters, config, term);

@@ -78,8 +78,17 @@ function hydrateRecord(record, options) {
   };
 }
 
+// Code-unit comparison, never localeCompare: the runtime binary-searches
+// directory pages with plain `<` (compareDirectoryKeys), and ICU collation
+// disagrees with code-unit order once shard keys leave ASCII (CJK bigram
+// terms). Collation is also ICU-version-dependent, so it would make packs
+// non-reproducible across Node versions.
+function compareCodeUnits(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function compareEntries(left, right) {
-  return left.shard.localeCompare(right.shard) || left.pack.localeCompare(right.pack) || left.offset - right.offset;
+  return compareCodeUnits(left.shard, right.shard) || compareCodeUnits(left.pack, right.pack) || left.offset - right.offset;
 }
 
 function encodeEntry(entry) {

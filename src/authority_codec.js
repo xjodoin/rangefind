@@ -1,5 +1,6 @@
 import { AUTHORITY_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
-import { fold, tokenize } from "./analyzer.js";
+import { fold } from "./analyzer.js";
+import { LEGACY_ANALYZER } from "./analysis.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 
 export const AUTHORITY_FORMAT = "rfauth-v1";
@@ -29,21 +30,30 @@ export function authorityTokenKeyFromTerms(terms) {
   return key ? `${TOKEN_PREFIX}${key}` : "";
 }
 
+// Token keys detect the value's language from the value text itself (never
+// from surrounding document or query context), so the builder and the
+// runtime derive identical keys for identical strings by construction.
+function authorityTokens(value, analyzer) {
+  const lang = analyzer.detectLanguage(String(value || ""));
+  return analyzer.tokenize(value, { unique: false, lang });
+}
+
 export function authorityKeysForValue(value, options = {}) {
+  const analyzer = options.analyzer || LEGACY_ANALYZER;
   const out = [];
   const surface = options.surface !== false ? authorityNormalizeRawSurface(value) : "";
   if (surface) out.push({ key: `${SURFACE_PREFIX}${surface}`, kind: "surface" });
   const exact = options.exact !== false ? authorityNormalizeSurface(value) : "";
   if (exact && !out.some(item => item.key === `${EXACT_PREFIX}${exact}`)) out.push({ key: `${EXACT_PREFIX}${exact}`, kind: "exact" });
   if (options.tokens !== false) {
-    const tokenKey = authorityTokenKeyFromTerms(tokenize(value, { unique: false }));
+    const tokenKey = authorityTokenKeyFromTerms(authorityTokens(value, analyzer));
     if (tokenKey && !out.some(item => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
   }
   return out;
 }
 
-export function authorityKeysForQuery(query, baseTerms) {
-  const out = authorityKeysForValue(query);
+export function authorityKeysForQuery(query, baseTerms, options = {}) {
+  const out = authorityKeysForValue(query, { analyzer: options.analyzer });
   const tokenKey = authorityTokenKeyFromTerms(baseTerms);
   if (tokenKey && !out.some(item => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
   return out;

@@ -68,12 +68,12 @@ function flushAuthorityBuffer(buffer) {
   buffer.lines = 0;
 }
 
-export function authorityRecordsForDoc(fields, doc) {
+export function authorityRecordsForDoc(fields, doc, analyzer = null) {
   const records = [];
   const seen = new Set();
   for (const field of fields || []) {
     for (const value of valueList(rawPath(doc, field.path))) {
-      for (const { key, kind } of authorityKeysForValue(value, field)) {
+      for (const { key, kind } of authorityKeysForValue(value, analyzer ? { ...field, analyzer } : field)) {
         if (seen.has(key)) continue;
         seen.add(key);
         const score = kind === "surface" ? field.surfaceWeight : kind === "exact" ? field.exactWeight : field.tokenWeight;

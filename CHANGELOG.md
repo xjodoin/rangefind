@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Multilingual analysis** (`analysis` config block, `multi-v1` profile):
+  per-document language via `languageField` or script + stopword detection;
+  per-language light stemmers (en, fr, de, es, it, pt, nl, sv, no, da, fi,
+  ru, el, ar, hi) and stopword lists (those plus tr, pl, cs, hu, ro, id);
+  script-aware folding (ß→ss, ø→o, Greek tonos + final sigma, Arabic
+  harakat/alef/alef-maqsura, Hebrew niqqud, ё→е, width folding); and
+  dictionary-free CJK bigram tokenization (Han/Kana/Hangul/Thai-class),
+  deterministic across Node and every browser by construction — no
+  `Intl.Segmenter`, no ICU dictionaries. Queries analyze in every configured
+  language: the detected language drives phrases/proximity/typo, all
+  languages' stems join the retrieval union under the skip-search term
+  budget, and the runtime swaps to an alternate base plan when the primary
+  language's stems have no postings. The profile is stored in the manifest,
+  so the browser reconstructs the exact builder analyzer; `build --update`
+  refuses deltas whose profile differs from the existing generations.
+  Highlighting matches across languages and marks exact CJK bigram spans.
+  Indexes without an `analysis` block keep the legacy analyzer unchanged.
+
+### Fixed
+
+- Term order in posting segments, shard payloads, and the range directory
+  now uses code-unit comparison instead of `localeCompare`. ICU collation
+  disagrees with the runtime's binary-search key order outside ASCII, which
+  made any index containing CJK terms unsearchable, and it made pack bytes
+  depend on the build machine's ICU version. Resume schema bumped to v5 so
+  stale collation-ordered intermediate stages cannot mix into new builds.
+- Main-index typo correction now accepts candidate tokens in any script
+  (previously Latin-only).
+
 ## 0.2.0 — 2026-07-06
 
 The "full search product" release: geo, autocomplete, semantic hybrid,

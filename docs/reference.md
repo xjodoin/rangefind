@@ -166,6 +166,59 @@ Global text knobs: `bm25fK1` (default `1.2`), `targetPostingsPerDoc` (default
 indexed body text), and `alwaysIndexFields` (default `["title","categories"]`,
 indexed before the budget is applied).
 
+### `analysis` — multilingual text analysis
+
+Without an `analysis` block, Rangefind keeps its legacy analyzer (Latin-only
+tokens, combined English/French suffix stripping) — existing indexes and
+configs behave byte-for-byte the same. Adding the block switches the index to
+the `multi-v1` profile:
+
+```json
+{
+  "analysis": {
+    "languages": ["fr", "en", "de", "ja"],
+    "languageField": "lang"
+  }
+}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `languages` | `["en"]` | ISO 639 codes the corpus contains (BCP47 tags reduce to their primary subtag). |
+| `primary` | first language | Fallback language when detection is inconclusive. |
+| `languageField` | — | Dotted path to a per-document language code; wins over detection. |
+| `detect` | `true` | Detect each document's language by script and stopword profile. |
+| `stemming` | `"light"` | `"light"` (per-language light stemmers) or `"off"`. |
+| `stopwords` | `"default"` | `"default"` (per-language lists) or `"off"`. |
+| `foldDiacritics` | `true` | Fold accents (`Montréal` → `montreal`); also folds ß→ss, ø→o, Greek tonos, Arabic harakat, ё→е. |
+| `minLength` | `2` | Minimum token length for alphabetic tokens (never applies to CJK). |
+
+How it works:
+
+- **Tokenization is deterministic in every environment.** Unicode word runs
+  split at script boundaries; Han, Kana, Hangul, and Thai-class runs become
+  overlapping character bigrams (the Lucene CJKAnalyzer approach). No
+  `Intl.Segmenter`, no ICU dictionaries — the browser must reproduce the
+  builder's tokens exactly, and dictionary segmentation differs per engine.
+- **Each document is analyzed in its own language** (explicit
+  `languageField`, else script histogram + stopword voting, else `primary`),
+  selecting that language's stopword list and light stemmer. Light stemmers
+  ship for `en fr de es it pt nl sv no da fi ru el ar hi`; stopword lists
+  additionally for `tr pl cs hu ro id`. Other codes fold and tokenize but
+  pass through unstemmed.
+- **Queries analyze in every configured language.** The detected query
+  language provides the base plan (phrases, proximity, typo correction), all
+  languages' stems join the retrieval term union (capped at the planner's
+  skip-search budget), and the runtime swaps to an alternate language's base
+  plan when the primary's stems have no postings — so a German query against
+  a mostly-French index still ranks exactly.
+- **The profile is frozen into the manifest.** The runtime reconstructs the
+  identical analyzer from `manifest.analysis`; `build --update` refuses a
+  delta whose profile differs from the existing generations.
+- Highlighting is analyzer-aware: accented words highlight from unaccented
+  queries in any configured language, and CJK matches highlight the exact
+  bigram span, not the whole run.
+
 ### `facets`
 
 Multi-value keyword metadata for filtering, counting, and block pruning.

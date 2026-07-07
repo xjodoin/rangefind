@@ -5,6 +5,13 @@ import { createPostingRowBuffer, appendPostingRow, copyPostingRows, postingRowCo
 import { readSegmentDirectory, readSegmentRowsFromFdInto, writeSegmentFromTermRows } from "./segment_builder.js";
 import { shardKey } from "./shards.js";
 
+// Code-unit term order, matching segment_builder's write order and the
+// directory's compareDirectoryKeys. localeCompare is ICU-dependent and can
+// even report distinct terms as equal, which would merge their postings.
+function compareTermCodeUnits(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 class MinHeap {
   constructor(compare) {
     this.compare = compare;
@@ -69,7 +76,7 @@ function segmentReaders(segments) {
 
 async function* mergedSegmentTermRows(segments, onTerm) {
   const readers = segmentReaders(segments);
-  const heap = new MinHeap((left, right) => left.term.localeCompare(right.term) || left.reader - right.reader);
+  const heap = new MinHeap((left, right) => compareTermCodeUnits(left.term, right.term) || left.reader - right.reader);
   const mergedRows = createPostingRowBuffer(0);
   for (const reader of readers) {
     if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
@@ -115,7 +122,7 @@ function* mergedSegmentTermStats(segments) {
       }
     };
   });
-  const heap = new MinHeap((left, right) => left.term.localeCompare(right.term) || left.reader - right.reader);
+  const heap = new MinHeap((left, right) => compareTermCodeUnits(left.term, right.term) || left.reader - right.reader);
   for (const reader of readers) {
     if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
   }

@@ -1,6 +1,6 @@
-import { queryBundleKeyFromBaseTerms, tokenize } from "./analyzer.js";
+import { queryBundleKeyFromBaseTerms } from "./analyzer.js";
 import { getPath } from "./config.js";
-import { fieldIndexText } from "./scoring.js";
+import { analyzeFieldText, fieldIndexText } from "./scoring.js";
 import { varintLength, writeVarint } from "./runs.js";
 
 const textEncoder = new TextEncoder();
@@ -155,7 +155,7 @@ export function queryBundleSeedCandidatesForDoc(config, selectedTerms, fieldTerm
     const field = config.fields[fieldIndex];
     const limit = Math.max(0, Math.floor(Number(field.queryBundleSeedMaxTokens ?? config.queryBundleSeedMaxFieldTokens ?? 512)));
     if (!limit || field.queryBundles === false) continue;
-    const terms = fieldTerms?.[fieldIndex] || tokenize(fieldIndexText(doc, field, config), { unique: false }).slice(0, limit);
+    const terms = fieldTerms?.[fieldIndex] || analyzeFieldText(doc, field, config).terms.slice(0, limit);
     for (let n = 2; n <= maxTerms; n++) {
       for (let i = 0; i <= terms.length - n; i++) {
         const baseTerms = terms.slice(i, i + n);

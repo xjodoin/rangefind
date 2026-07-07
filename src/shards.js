@@ -24,7 +24,9 @@ export function partitionEntries(entries, config, depth = config.baseShardDepth)
     groups.get(key).push(entry);
   }
   return [...groups.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0]))
+    // Code-unit order to match compareDirectoryKeys; localeCompare breaks
+    // the directory's binary-search invariant for non-ASCII shard keys.
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .flatMap(([, group]) => partitionEntries(group, config, depth + 1));
 }
 

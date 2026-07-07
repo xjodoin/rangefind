@@ -131,10 +131,10 @@ function tokenize(text, options = {}) {
   const unique = options.unique !== false;
   const out = [];
   const seen = unique ? /* @__PURE__ */ new Set() : null;
-  const folded = fold(text);
+  const folded2 = fold(text);
   TOKEN_RE.lastIndex = 0;
   let match;
-  while (match = TOKEN_RE.exec(folded)) {
+  while (match = TOKEN_RE.exec(folded2)) {
     const token = normalizedToken(match[0], minLength, stopwords);
     if (!token) continue;
     if (seen) {
@@ -145,15 +145,29 @@ function tokenize(text, options = {}) {
   }
   return out;
 }
+function termCounts(text, options = {}) {
+  const minLength = options.minLength ?? 2;
+  const stopwords = options.stopwords || DEFAULT_STOPWORDS;
+  const counts = /* @__PURE__ */ new Map();
+  const folded2 = fold(text);
+  TOKEN_RE.lastIndex = 0;
+  let match;
+  while (match = TOKEN_RE.exec(folded2)) {
+    const token = normalizedToken(match[0], minLength, stopwords);
+    if (!token) continue;
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  return counts;
+}
 function analyzeTerms(text, options = {}) {
   const minLength = options.minLength ?? 2;
   const stopwords = options.stopwords || DEFAULT_STOPWORDS;
   const out = [];
   const seen = /* @__PURE__ */ new Set();
-  const folded = fold(text);
+  const folded2 = fold(text);
   TOKEN_RE.lastIndex = 0;
   let match;
-  while (match = TOKEN_RE.exec(folded)) {
+  while (match = TOKEN_RE.exec(folded2)) {
     const raw = match[0];
     const term = normalizedToken(raw, minLength, stopwords);
     if (!term || seen.has(term)) continue;
@@ -196,6 +210,1842 @@ function proximityTerm(left, right) {
   if (!left || !right || left === right) return "";
   const [a, b] = left < right ? [left, right] : [right, left];
   return `n_${a}_${b}`;
+}
+
+// src/analysis_fold.js
+var LATIN_EXTRAS_RE = /[ßœæøđłı]/g;
+var LATIN_EXTRAS = {
+  "\xDF": "ss",
+  // ß
+  "\u0153": "oe",
+  // œ
+  "\xE6": "ae",
+  // æ
+  "\xF8": "o",
+  // ø
+  "\u0111": "d",
+  // đ
+  "\u0142": "l",
+  // ł
+  "\u0131": "i"
+  // dotless ı
+};
+var ARABIC_MARKS_RE = /[\u0640\u064b-\u065f\u0670]/g;
+var HEBREW_MARKS_RE = /[\u0591-\u05c7]/g;
+var COMBINING_MARKS_RE = /[\u0300-\u036f]/g;
+function foldMulti(text, options = {}) {
+  const foldDiacritics = options.foldDiacritics !== false;
+  let out = String(text || "").normalize("NFKD").toLowerCase().replace(LATIN_EXTRAS_RE, (ch) => LATIN_EXTRAS[ch]);
+  if (foldDiacritics) out = out.replace(COMBINING_MARKS_RE, "");
+  return out.replace(/ς/g, "\u03C3").replace(ARABIC_MARKS_RE, "").replace(/ٱ/g, "\u0627").replace(/ى/g, "\u064A").replace(HEBREW_MARKS_RE, "");
+}
+
+// src/analysis_data.js
+var RAW_STOPWORDS = {
+  en: [
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "not",
+    "of",
+    "on",
+    "or",
+    "she",
+    "than",
+    "that",
+    "the",
+    "their",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "under",
+    "was",
+    "we",
+    "were",
+    "which",
+    "will",
+    "with",
+    "within",
+    "would",
+    "you",
+    "your"
+  ],
+  fr: [
+    "au",
+    "aux",
+    "avec",
+    "ce",
+    "ces",
+    "cette",
+    "dans",
+    "de",
+    "des",
+    "du",
+    "elle",
+    "en",
+    "et",
+    "eux",
+    "il",
+    "ils",
+    "je",
+    "la",
+    "le",
+    "les",
+    "leur",
+    "leurs",
+    "lui",
+    "ma",
+    "mais",
+    "me",
+    "mes",
+    "moi",
+    "mon",
+    "ne",
+    "nos",
+    "notre",
+    "nous",
+    "on",
+    "ou",
+    "o\xF9",
+    "par",
+    "pas",
+    "pour",
+    "qu",
+    "que",
+    "qui",
+    "sa",
+    "se",
+    "ses",
+    "son",
+    "sur",
+    "ta",
+    "te",
+    "tes",
+    "toi",
+    "ton",
+    "tu",
+    "un",
+    "une",
+    "vos",
+    "votre",
+    "vous",
+    "y"
+  ],
+  de: [
+    "aber",
+    "als",
+    "am",
+    "an",
+    "auch",
+    "auf",
+    "aus",
+    "bei",
+    "bin",
+    "bis",
+    "das",
+    "dass",
+    "dem",
+    "den",
+    "der",
+    "des",
+    "die",
+    "durch",
+    "ein",
+    "eine",
+    "einem",
+    "einen",
+    "einer",
+    "eines",
+    "er",
+    "es",
+    "f\xFCr",
+    "hat",
+    "hatte",
+    "ich",
+    "ihr",
+    "im",
+    "in",
+    "ist",
+    "mit",
+    "nach",
+    "nicht",
+    "noch",
+    "nur",
+    "oder",
+    "sein",
+    "sich",
+    "sie",
+    "sind",
+    "so",
+    "\xFCber",
+    "um",
+    "und",
+    "vom",
+    "von",
+    "vor",
+    "war",
+    "was",
+    "wie",
+    "wird",
+    "zu",
+    "zum",
+    "zur"
+  ],
+  es: [
+    "a",
+    "al",
+    "algo",
+    "como",
+    "con",
+    "de",
+    "del",
+    "el",
+    "ella",
+    "ellas",
+    "ellos",
+    "en",
+    "entre",
+    "era",
+    "es",
+    "esta",
+    "este",
+    "esto",
+    "fue",
+    "ha",
+    "han",
+    "hay",
+    "la",
+    "las",
+    "le",
+    "les",
+    "lo",
+    "los",
+    "m\xE1s",
+    "me",
+    "mi",
+    "muy",
+    "no",
+    "nos",
+    "o",
+    "para",
+    "pero",
+    "por",
+    "que",
+    "se",
+    "ser",
+    "si",
+    "sin",
+    "sobre",
+    "son",
+    "su",
+    "sus",
+    "tambi\xE9n",
+    "te",
+    "tiene",
+    "un",
+    "una",
+    "uno",
+    "y",
+    "ya",
+    "yo"
+  ],
+  it: [
+    "a",
+    "ad",
+    "ai",
+    "al",
+    "alla",
+    "alle",
+    "anche",
+    "che",
+    "chi",
+    "ci",
+    "come",
+    "con",
+    "da",
+    "dai",
+    "dal",
+    "dalla",
+    "degli",
+    "dei",
+    "del",
+    "della",
+    "delle",
+    "dello",
+    "di",
+    "e",
+    "ed",
+    "era",
+    "gli",
+    "ha",
+    "hanno",
+    "i",
+    "il",
+    "in",
+    "la",
+    "le",
+    "lo",
+    "loro",
+    "ma",
+    "mi",
+    "ne",
+    "nel",
+    "nella",
+    "non",
+    "o",
+    "per",
+    "pi\xF9",
+    "quella",
+    "quello",
+    "questa",
+    "questo",
+    "se",
+    "si",
+    "sono",
+    "su",
+    "sua",
+    "sul",
+    "sulla",
+    "suo",
+    "un",
+    "una",
+    "uno",
+    "\xE8"
+  ],
+  pt: [
+    "a",
+    "ao",
+    "aos",
+    "as",
+    "\xE0s",
+    "com",
+    "como",
+    "da",
+    "das",
+    "de",
+    "dela",
+    "dele",
+    "do",
+    "dos",
+    "e",
+    "\xE9",
+    "ela",
+    "ele",
+    "em",
+    "entre",
+    "era",
+    "foi",
+    "for",
+    "isso",
+    "isto",
+    "j\xE1",
+    "mais",
+    "mas",
+    "me",
+    "mesmo",
+    "na",
+    "n\xE3o",
+    "nas",
+    "no",
+    "nos",
+    "o",
+    "os",
+    "ou",
+    "para",
+    "pela",
+    "pelo",
+    "por",
+    "que",
+    "se",
+    "sem",
+    "ser",
+    "seu",
+    "sua",
+    "s\xE3o",
+    "tamb\xE9m",
+    "tem",
+    "um",
+    "uma",
+    "voc\xEA"
+  ],
+  nl: [
+    "aan",
+    "als",
+    "bij",
+    "dan",
+    "dat",
+    "de",
+    "der",
+    "des",
+    "deze",
+    "die",
+    "dit",
+    "door",
+    "een",
+    "en",
+    "er",
+    "haar",
+    "heeft",
+    "het",
+    "hij",
+    "hun",
+    "ik",
+    "in",
+    "is",
+    "je",
+    "kan",
+    "maar",
+    "met",
+    "naar",
+    "niet",
+    "nog",
+    "of",
+    "om",
+    "onder",
+    "ook",
+    "op",
+    "over",
+    "te",
+    "tot",
+    "uit",
+    "van",
+    "voor",
+    "was",
+    "wat",
+    "wordt",
+    "zijn",
+    "zo"
+  ],
+  sv: [
+    "att",
+    "av",
+    "den",
+    "det",
+    "de",
+    "dem",
+    "der",
+    "du",
+    "efter",
+    "ej",
+    "eller",
+    "en",
+    "ett",
+    "f\xF6r",
+    "fr\xE5n",
+    "han",
+    "hans",
+    "har",
+    "hon",
+    "i",
+    "inte",
+    "jag",
+    "kan",
+    "man",
+    "med",
+    "men",
+    "mot",
+    "n\xE4r",
+    "och",
+    "om",
+    "p\xE5",
+    "samma",
+    "sig",
+    "sin",
+    "sitt",
+    "som",
+    "till",
+    "under",
+    "upp",
+    "var",
+    "vad",
+    "vid",
+    "vi",
+    "\xE4n",
+    "\xE4r",
+    "\xF6ver"
+  ],
+  no: [
+    "at",
+    "av",
+    "da",
+    "de",
+    "den",
+    "der",
+    "det",
+    "din",
+    "du",
+    "eller",
+    "en",
+    "er",
+    "et",
+    "etter",
+    "for",
+    "fra",
+    "ha",
+    "han",
+    "hans",
+    "har",
+    "hun",
+    "hva",
+    "hvor",
+    "i",
+    "ikke",
+    "jeg",
+    "kan",
+    "man",
+    "med",
+    "men",
+    "mot",
+    "n\xE5r",
+    "og",
+    "om",
+    "opp",
+    "over",
+    "p\xE5",
+    "seg",
+    "sin",
+    "sitt",
+    "skal",
+    "som",
+    "til",
+    "under",
+    "var",
+    "ved",
+    "vi",
+    "vil",
+    "v\xE6re",
+    "\xE5"
+  ],
+  da: [
+    "af",
+    "alle",
+    "at",
+    "da",
+    "de",
+    "den",
+    "der",
+    "det",
+    "dette",
+    "dig",
+    "din",
+    "du",
+    "efter",
+    "eller",
+    "en",
+    "er",
+    "et",
+    "for",
+    "fra",
+    "han",
+    "hans",
+    "har",
+    "havde",
+    "hun",
+    "hvad",
+    "hvor",
+    "i",
+    "ikke",
+    "jeg",
+    "kan",
+    "man",
+    "med",
+    "men",
+    "mod",
+    "n\xE5r",
+    "og",
+    "om",
+    "op",
+    "over",
+    "p\xE5",
+    "sig",
+    "sin",
+    "skal",
+    "som",
+    "til",
+    "under",
+    "var",
+    "ved",
+    "vi",
+    "vil",
+    "v\xE6re",
+    "\xE5r"
+  ],
+  fi: [
+    "ett\xE4",
+    "ei",
+    "he",
+    "h\xE4n",
+    "ja",
+    "jo",
+    "jos",
+    "kanssa",
+    "kuin",
+    "kun",
+    "me",
+    "mik\xE4",
+    "mit\xE4",
+    "mutta",
+    "my\xF6s",
+    "ne",
+    "niin",
+    "nyt",
+    "olen",
+    "oli",
+    "olla",
+    "on",
+    "ovat",
+    "se",
+    "sen",
+    "siit\xE4",
+    "sin\xE4",
+    "tai",
+    "t\xE4m\xE4",
+    "te",
+    "vain",
+    "voi",
+    "viel\xE4"
+  ],
+  ru: [
+    "\u0430",
+    "\u0431\u044B",
+    "\u0431\u044B\u043B",
+    "\u0432",
+    "\u0432\u044B",
+    "\u0434\u0430",
+    "\u0434\u043B\u044F",
+    "\u0434\u043E",
+    "\u0435\u0433\u043E",
+    "\u0435\u0435",
+    "\u0435\u0441\u043B\u0438",
+    "\u0435\u0441\u0442\u044C",
+    "\u0436\u0435",
+    "\u0437\u0430",
+    "\u0438",
+    "\u0438\u0437",
+    "\u0438\u043B\u0438",
+    "\u0438\u0445",
+    "\u043A",
+    "\u043A\u0430\u043A",
+    "\u043A\u043E",
+    "\u043A\u043E\u0433\u0434\u0430",
+    "\u043A\u0442\u043E",
+    "\u043C\u044B",
+    "\u043D\u0430",
+    "\u043D\u0435",
+    "\u043D\u0435\u0433\u043E",
+    "\u043D\u0435\u0435",
+    "\u043D\u0438",
+    "\u043D\u043E",
+    "\u043E",
+    "\u043E\u0431",
+    "\u043E\u043D",
+    "\u043E\u043D\u0430",
+    "\u043E\u043D\u0438",
+    "\u043E\u043D\u043E",
+    "\u043E\u0442",
+    "\u043F\u043E",
+    "\u043F\u043E\u0434",
+    "\u043F\u0440\u0438",
+    "\u0441",
+    "\u0441\u043E",
+    "\u0442\u0430\u043A",
+    "\u0442\u0430\u043A\u0436\u0435",
+    "\u0442\u043E",
+    "\u0442\u043E\u0433\u043E",
+    "\u0442\u043E\u043B\u044C\u043A\u043E",
+    "\u0442\u043E\u043C",
+    "\u0442\u044B",
+    "\u0443",
+    "\u0443\u0436\u0435",
+    "\u0447\u0442\u043E",
+    "\u0447\u0442\u043E\u0431\u044B",
+    "\u044D\u0442\u0430",
+    "\u044D\u0442\u0438",
+    "\u044D\u0442\u043E",
+    "\u044D\u0442\u043E\u0442",
+    "\u044F"
+  ],
+  el: [
+    "\u03B1\u03BB\u03BB\u03AC",
+    "\u03B1\u03C0\u03CC",
+    "\u03B3\u03B9\u03B1",
+    "\u03B4\u03B5\u03BD",
+    "\u03B5\u03AF\u03BD\u03B1\u03B9",
+    "\u03B5\u03BD",
+    "\u03AD\u03BD\u03B1",
+    "\u03AD\u03BD\u03B1\u03BD",
+    "\u03B5\u03BD\u03CC\u03C2",
+    "\u03B5\u03C0\u03AF",
+    "\u03B7",
+    "\u03AE",
+    "\u03B8\u03B1",
+    "\u03BA\u03B1\u03B9",
+    "\u03BA\u03B1\u03C4\u03AC",
+    "\u03BC\u03B5",
+    "\u03BC\u03B9\u03B1",
+    "\u03BD\u03B1",
+    "\u03BF",
+    "\u03BF\u03B9",
+    "\u03CC\u03C0\u03C9\u03C2",
+    "\u03CC\u03C4\u03B9",
+    "\u03BF\u03C5",
+    "\u03C0\u03B1\u03C1\u03AC",
+    "\u03C0\u03BF\u03C5",
+    "\u03C0\u03C1\u03BF\u03C2",
+    "\u03C0\u03C9\u03C2",
+    "\u03C3\u03B5",
+    "\u03C3\u03C4\u03B7",
+    "\u03C3\u03C4\u03B7\u03BD",
+    "\u03C3\u03C4\u03BF",
+    "\u03C3\u03C4\u03BF\u03BD",
+    "\u03C4\u03B1",
+    "\u03C4\u03B7\u03BD",
+    "\u03C4\u03B7\u03C2",
+    "\u03C4\u03B9",
+    "\u03C4\u03B9\u03C2",
+    "\u03C4\u03BF",
+    "\u03C4\u03BF\u03BD",
+    "\u03C4\u03BF\u03C5",
+    "\u03C4\u03C9\u03BD",
+    "\u03C9\u03C2"
+  ],
+  ar: [
+    "\u0627\u0644",
+    "\u0625\u0644\u0649",
+    "\u0627\u0644\u0649",
+    "\u0623\u0646",
+    "\u0627\u0646",
+    "\u0623\u0648",
+    "\u0627\u0648",
+    "\u0625\u0646",
+    "\u0627\u0644\u062A\u064A",
+    "\u0627\u0644\u0630\u064A",
+    "\u0628\u0639\u062F",
+    "\u0628\u064A\u0646",
+    "\u062B\u0645",
+    "\u062D\u062A\u0649",
+    "\u0639\u0644\u0649",
+    "\u0639\u0646",
+    "\u0639\u0646\u062F",
+    "\u063A\u064A\u0631",
+    "\u0641\u064A",
+    "\u0642\u0628\u0644",
+    "\u0642\u062F",
+    "\u0643\u0627\u0646",
+    "\u0643\u0627\u0646\u062A",
+    "\u0643\u0644",
+    "\u0643\u0645\u0627",
+    "\u0644\u0627",
+    "\u0644\u0645",
+    "\u0644\u0646",
+    "\u0644\u0647",
+    "\u0644\u0647\u0627",
+    "\u0645\u0627",
+    "\u0645\u0639",
+    "\u0645\u0646",
+    "\u0645\u0646\u0630",
+    "\u0647\u0630\u0627",
+    "\u0647\u0630\u0647",
+    "\u0647\u0648",
+    "\u0647\u064A",
+    "\u0648",
+    "\u0648\u0644\u0627",
+    "\u0648\u0645\u0627",
+    "\u0648\u0645\u0646",
+    "\u064A\u0643\u0648\u0646"
+  ],
+  hi: [
+    "\u0905\u0917\u0930",
+    "\u0914\u0930",
+    "\u0907\u0928",
+    "\u0907\u0938",
+    "\u0909\u0928",
+    "\u0909\u0938",
+    "\u090F\u0915",
+    "\u090F\u0935\u0902",
+    "\u0915\u0930",
+    "\u0915\u0930\u0928\u093E",
+    "\u0915\u093E",
+    "\u0915\u093F",
+    "\u0915\u093F\u092F\u093E",
+    "\u0915\u0940",
+    "\u0915\u0947",
+    "\u0915\u094B",
+    "\u0917\u092F\u093E",
+    "\u091C\u092C",
+    "\u091C\u094B",
+    "\u0924\u0915",
+    "\u0924\u0925\u093E",
+    "\u0924\u094B",
+    "\u0925\u093E",
+    "\u0925\u0940",
+    "\u0925\u0947",
+    "\u0928\u0939\u0940\u0902",
+    "\u0928\u0947",
+    "\u092A\u0930",
+    "\u092B\u093F\u0930",
+    "\u092C\u093E\u0926",
+    "\u092D\u0940",
+    "\u092E\u0948\u0902",
+    "\u092E\u0947\u0902",
+    "\u092F\u0939",
+    "\u092F\u093E",
+    "\u092F\u0947",
+    "\u0935\u0939",
+    "\u0935\u0947",
+    "\u0938\u0947",
+    "\u0939\u0940",
+    "\u0939\u0948",
+    "\u0939\u0948\u0902",
+    "\u0939\u094B",
+    "\u0939\u094B\u0924\u093E"
+  ],
+  tr: [
+    "acaba",
+    "ama",
+    "ancak",
+    "bir",
+    "bu",
+    "da",
+    "daha",
+    "de",
+    "de\u011Fil",
+    "gibi",
+    "hem",
+    "hep",
+    "her",
+    "ile",
+    "ise",
+    "i\xE7in",
+    "kadar",
+    "ki",
+    "mi",
+    "m\u0131",
+    "mu",
+    "m\xFC",
+    "ne",
+    "o",
+    "olan",
+    "olarak",
+    "sonra",
+    "\u015Fu",
+    "ve",
+    "veya",
+    "ya",
+    "yani"
+  ],
+  pl: [
+    "aby",
+    "ale",
+    "by\u0142",
+    "by\u0142a",
+    "by\u0142o",
+    "by\u0107",
+    "co",
+    "czy",
+    "dla",
+    "do",
+    "go",
+    "i",
+    "ich",
+    "jak",
+    "jako",
+    "je",
+    "jego",
+    "jej",
+    "jest",
+    "ju\u017C",
+    "lub",
+    "ma",
+    "na",
+    "nie",
+    "o",
+    "od",
+    "oraz",
+    "po",
+    "pod",
+    "przez",
+    "si\u0119",
+    "s\u0105",
+    "ta",
+    "tak",
+    "tak\u017Ce",
+    "te",
+    "tego",
+    "tej",
+    "ten",
+    "to",
+    "tym",
+    "w",
+    "we",
+    "z",
+    "za",
+    "ze",
+    "\u017Ce"
+  ],
+  cs: [
+    "a",
+    "aby",
+    "ale",
+    "ani",
+    "bude",
+    "byl",
+    "byla",
+    "bylo",
+    "b\xFDt",
+    "co",
+    "co\u017E",
+    "do",
+    "i",
+    "jak",
+    "jako",
+    "je",
+    "jeho",
+    "jej\xED",
+    "jen",
+    "je\u0161t\u011B",
+    "jsem",
+    "jsou",
+    "k",
+    "kde",
+    "kdy\u017E",
+    "kter\xE1",
+    "kter\xE9",
+    "kter\xFD",
+    "ma",
+    "mezi",
+    "na",
+    "nebo",
+    "nen\xED",
+    "o",
+    "od",
+    "po",
+    "pod",
+    "pro",
+    "p\u0159ed",
+    "s",
+    "se",
+    "si",
+    "tak",
+    "tak\xE9",
+    "tato",
+    "ten",
+    "to",
+    "tohoto",
+    "toto",
+    "u",
+    "v",
+    "ve",
+    "v\u0161ak",
+    "z",
+    "za",
+    "\u017Ee"
+  ],
+  id: [
+    "ada",
+    "adalah",
+    "akan",
+    "atau",
+    "bahwa",
+    "dan",
+    "dari",
+    "dengan",
+    "di",
+    "dia",
+    "ia",
+    "ini",
+    "itu",
+    "juga",
+    "kami",
+    "karena",
+    "ke",
+    "kita",
+    "lebih",
+    "oleh",
+    "pada",
+    "para",
+    "saya",
+    "sebagai",
+    "sudah",
+    "telah",
+    "tidak",
+    "untuk",
+    "yang"
+  ],
+  hu: [
+    "a",
+    "az",
+    "azt",
+    "be",
+    "csak",
+    "de",
+    "egy",
+    "el",
+    "ez",
+    "ezt",
+    "fel",
+    "hogy",
+    "is",
+    "ki",
+    "le",
+    "lesz",
+    "meg",
+    "mint",
+    "mit",
+    "nem",
+    "pedig",
+    "s",
+    "\xE9s",
+    "vagy",
+    "van",
+    "volt"
+  ],
+  ro: [
+    "a",
+    "acest",
+    "aceast\u0103",
+    "al",
+    "ale",
+    "care",
+    "ce",
+    "cu",
+    "de",
+    "din",
+    "dup\u0103",
+    "el",
+    "ea",
+    "este",
+    "fi",
+    "fost",
+    "\xEEn",
+    "\xEEntre",
+    "la",
+    "le",
+    "lor",
+    "lui",
+    "mai",
+    "nu",
+    "o",
+    "pe",
+    "pentru",
+    "prin",
+    "sa",
+    "sau",
+    "se",
+    "\u0219i",
+    "sunt",
+    "un",
+    "una",
+    "unei",
+    "unui"
+  ]
+};
+function rawStopwordLists() {
+  return RAW_STOPWORDS;
+}
+var STOPWORD_LANGUAGES = Object.freeze(Object.keys(RAW_STOPWORDS));
+
+// src/analysis_stemmers.js
+var VOWELS = new Set("aeiouy");
+function hasVowel(token) {
+  for (const ch of token) if (VOWELS.has(ch)) return true;
+  return false;
+}
+function undouble(token) {
+  const n = token.length;
+  if (n < 4) return token;
+  const last = token[n - 1];
+  if (token[n - 2] !== last || VOWELS.has(last) || "lsz".includes(last)) return token;
+  return token.slice(0, -1);
+}
+function folded(suffixes) {
+  return suffixes.map((suffix) => foldMulti(suffix));
+}
+function stripOne(token, suffixes, minStem) {
+  for (const suffix of suffixes) {
+    if (token.length - suffix.length >= minStem && token.endsWith(suffix)) {
+      return token.slice(0, token.length - suffix.length);
+    }
+  }
+  return token;
+}
+function stemEnglish(token) {
+  let t = token;
+  if (t.length > 4 && t.endsWith("ies") && !t.endsWith("eies") && !t.endsWith("aies")) {
+    t = `${t.slice(0, -3)}y`;
+  } else if (t.length > 3 && t.endsWith("es") && !t.endsWith("aes") && !t.endsWith("ees") && !t.endsWith("oes")) {
+    t = t.slice(0, -1);
+  } else if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss") && !t.endsWith("us") && !t.endsWith("is")) {
+    t = t.slice(0, -1);
+  }
+  if (t.length > 5 && t.endsWith("ing") && hasVowel(t.slice(0, -3))) {
+    t = undouble(t.slice(0, -3));
+  } else if (t.length > 4 && t.endsWith("ed") && hasVowel(t.slice(0, -2))) {
+    t = undouble(t.slice(0, -2));
+  }
+  return t;
+}
+var FRENCH_SUFFIXES = folded([
+  "issement",
+  "atrice",
+  "ateur",
+  "ation",
+  "ement",
+  "euse",
+  "ante",
+  "ence",
+  "it\xE9",
+  "eur",
+  "ive",
+  "ant",
+  "ent",
+  "\xE9e",
+  "if",
+  "er",
+  "ez",
+  "e"
+]);
+function stemFrench(token) {
+  let t = token;
+  if (t.length > 5 && t.endsWith("eaux")) return t.slice(0, -1);
+  if (t.length > 4 && t.endsWith("aux")) return `${t.slice(0, -2)}l`;
+  if (t.length > 3 && (t.endsWith("x") || t.endsWith("s") || t.endsWith("z"))) t = t.slice(0, -1);
+  t = stripOne(t, FRENCH_SUFFIXES, 3);
+  return undouble(t);
+}
+var GERMAN_SUFFIXES = folded([
+  "heiten",
+  "ungen",
+  "heit",
+  "ung",
+  "isch",
+  "ern",
+  "en",
+  "er",
+  "es",
+  "em",
+  "e"
+]);
+function stemGerman(token) {
+  let t = stripOne(token, GERMAN_SUFFIXES, 3);
+  if (t.length > 3 && t.endsWith("s") && "bdfghklmnt".includes(t[t.length - 2])) {
+    t = t.slice(0, -1);
+  }
+  return t;
+}
+function stemSpanish(token) {
+  let t = token;
+  if (t.length > 4 && t.endsWith("ces")) return `${t.slice(0, -3)}z`;
+  if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) t = t.slice(0, -1);
+  if (t.length > 3 && (t.endsWith("o") || t.endsWith("a") || t.endsWith("e"))) t = t.slice(0, -1);
+  return t;
+}
+function stemItalian(token) {
+  let t = token;
+  if (t.length > 3 && "aeio".includes(t[t.length - 1])) t = t.slice(0, -1);
+  return undouble(t);
+}
+function stemPortuguese(token) {
+  let t = token;
+  if (t.length > 5 && t.endsWith("oes")) return `${t.slice(0, -3)}ao`;
+  if (t.length > 4 && t.endsWith("aes")) return `${t.slice(0, -3)}ao`;
+  if (t.length > 4 && t.endsWith("ais")) return `${t.slice(0, -2)}l`;
+  if (t.length > 4 && t.endsWith("eis")) return `${t.slice(0, -2)}l`;
+  if (t.length > 4 && t.endsWith("ois")) return `${t.slice(0, -2)}l`;
+  if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) t = t.slice(0, -1);
+  if (t.length > 3 && (t.endsWith("a") || t.endsWith("e") || t.endsWith("o"))) t = t.slice(0, -1);
+  return t;
+}
+function stemDutch(token) {
+  let t = token;
+  if (t.length > 5 && t.endsWith("jes")) return t.slice(0, -3);
+  if (t.length > 4 && t.endsWith("je")) return t.slice(0, -2);
+  if (t.length > 4 && t.endsWith("en")) return undouble(t.slice(0, -2));
+  if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) return t.slice(0, -1);
+  if (t.length > 4 && t.endsWith("e")) return t.slice(0, -1);
+  return t;
+}
+var SWEDISH_SUFFIXES = folded([
+  "arnas",
+  "ernas",
+  "ornas",
+  "arna",
+  "erna",
+  "orna",
+  "ande",
+  "aste",
+  "aren",
+  "are",
+  "ast",
+  "ens",
+  "ans",
+  "or",
+  "ar",
+  "er",
+  "en",
+  "et",
+  "as",
+  "es",
+  "at",
+  "a",
+  "e",
+  "s"
+]);
+function stemSwedish(token) {
+  return stripOne(token, SWEDISH_SUFFIXES, 3);
+}
+var NORWEGIAN_SUFFIXES = folded([
+  "endes",
+  "enes",
+  "erne",
+  "eren",
+  "ede",
+  "ene",
+  "ens",
+  "ers",
+  "ets",
+  "en",
+  "er",
+  "es",
+  "et",
+  "a",
+  "e",
+  "s"
+]);
+function stemNorwegian(token) {
+  return stripOne(token, NORWEGIAN_SUFFIXES, 3);
+}
+var DANISH_SUFFIXES = folded([
+  "erendes",
+  "erende",
+  "endes",
+  "erne",
+  "ende",
+  "ene",
+  "ens",
+  "ers",
+  "ets",
+  "en",
+  "er",
+  "es",
+  "et",
+  "e",
+  "s"
+]);
+function stemDanish(token) {
+  return stripOne(token, DANISH_SUFFIXES, 3);
+}
+var FINNISH_ENCLITICS = folded(["kaan", "k\xE4\xE4n", "kin", "han", "h\xE4n", "pa", "p\xE4", "ko", "k\xF6"]);
+var FINNISH_SUFFIXES = folded([
+  "issa",
+  "iss\xE4",
+  "ista",
+  "ist\xE4",
+  "illa",
+  "ill\xE4",
+  "ilta",
+  "ilt\xE4",
+  "ille",
+  "ssa",
+  "ss\xE4",
+  "sta",
+  "st\xE4",
+  "lla",
+  "ll\xE4",
+  "lta",
+  "lt\xE4",
+  "lle",
+  "ksi",
+  "tta",
+  "tt\xE4",
+  "nsa",
+  "ns\xE4",
+  "aan",
+  "een",
+  "iin",
+  "in",
+  "en",
+  "an",
+  "\xE4n"
+]);
+function stemFinnish(token) {
+  let t = stripOne(token, FINNISH_ENCLITICS, 4);
+  t = stripOne(t, FINNISH_SUFFIXES, 3);
+  return t;
+}
+var RUSSIAN_SUFFIXES = folded([
+  "\u0438\u044F\u043C\u0438",
+  "\u044F\u043C\u0438",
+  "\u0430\u043C\u0438",
+  "\u0438\u044F\u0445",
+  "\u0438\u044F\u043C",
+  "\u0438\u0435\u043C",
+  "\u0435\u0433\u043E",
+  "\u043E\u0433\u043E",
+  "\u0435\u043C\u0443",
+  "\u043E\u043C\u0443",
+  "\u0438\u043C\u0438",
+  "\u044B\u043C\u0438",
+  "\u0430\u0445",
+  "\u044F\u0445",
+  "\u0430\u043C",
+  "\u044F\u043C",
+  "\u043E\u043C",
+  "\u0435\u043C",
+  "\u0438\u043C",
+  "\u044B\u043C",
+  "\u043E\u0432",
+  "\u0435\u0432",
+  "\u0435\u0439",
+  "\u0438\u0439",
+  "\u044B\u0439",
+  "\u043E\u0439",
+  "\u0430\u044F",
+  "\u044F\u044F",
+  "\u0443\u044E",
+  "\u044E\u044E",
+  "\u043E\u0435",
+  "\u0435\u0435",
+  "\u044B\u0435",
+  "\u0438\u0435",
+  "\u044C\u044F",
+  "\u044C\u0435",
+  "\u044C\u044E",
+  "\u0438\u044F",
+  "\u0438\u044E",
+  "\u0430",
+  "\u044F",
+  "\u043E",
+  "\u0435",
+  "\u0438",
+  "\u044B",
+  "\u0443",
+  "\u044E",
+  "\u044C"
+]);
+function stemRussian(token) {
+  return stripOne(token, RUSSIAN_SUFFIXES, 3);
+}
+var GREEK_SUFFIXES = folded([
+  "\u03BC\u03B1\u03C4\u03C9\u03BD",
+  "\u03BC\u03B1\u03C4\u03B1",
+  "\u03BF\u03C5\u03C3",
+  "\u03B5\u03C9\u03BD",
+  "\u03B5\u03B9\u03C3",
+  "\u03BF\u03C2",
+  "\u03B5\u03C2",
+  "\u03B1\u03C2",
+  "\u03B7\u03C2",
+  "\u03C9\u03BD",
+  "\u03BF\u03B9",
+  "\u03B1\u03B9",
+  "\u03BF",
+  "\u03B7",
+  "\u03B1",
+  "\u03B9"
+]);
+function stemGreek(token) {
+  return stripOne(token, GREEK_SUFFIXES, 3);
+}
+var ARABIC_PREFIXES = ["\u0648\u0627\u0644", "\u0628\u0627\u0644", "\u0643\u0627\u0644", "\u0641\u0627\u0644", "\u0627\u0644", "\u0644\u0644"];
+var ARABIC_SUFFIXES = ["\u0647\u0627", "\u0627\u0646", "\u0627\u062A", "\u0648\u0646", "\u064A\u0646", "\u064A\u0647", "\u064A\u0629", "\u0647", "\u0629", "\u064A"];
+function stemArabic(token) {
+  let t = token;
+  if (t.length > 3 && t.startsWith("\u0648")) t = t.slice(1);
+  for (const prefix of ARABIC_PREFIXES) {
+    if (t.length - prefix.length >= 2 && t.startsWith(prefix)) {
+      t = t.slice(prefix.length);
+      break;
+    }
+  }
+  for (const suffix of ARABIC_SUFFIXES) {
+    if (t.length - suffix.length >= 2 && t.endsWith(suffix)) {
+      t = t.slice(0, t.length - suffix.length);
+    }
+  }
+  return t;
+}
+var HINDI_SUFFIXES_LONG = ["\u093E\u090F\u0917\u0940", "\u093E\u090F\u0917\u093E", "\u093E\u0913\u0917\u0940", "\u093E\u0913\u0917\u0947", "\u090F\u0902\u0917\u0940", "\u090F\u0902\u0917\u0947", "\u0942\u0902\u0917\u0940", "\u0942\u0902\u0917\u093E", "\u093E\u0924\u0940\u0902", "\u0928\u093E\u0913\u0902", "\u0928\u093E\u090F\u0902", "\u0924\u093E\u0913\u0902", "\u0924\u093E\u090F\u0902", "\u093F\u092F\u093E\u0901", "\u093F\u092F\u094B\u0902", "\u093F\u092F\u093E\u0902"];
+var HINDI_SUFFIXES_MID = ["\u093E\u0915\u0930", "\u093E\u0907\u090F", "\u093E\u0908\u0902", "\u093E\u092F\u093E", "\u0947\u0917\u0940", "\u0947\u0917\u093E", "\u094B\u0917\u0940", "\u094B\u0917\u0947", "\u093E\u0928\u0947", "\u093E\u0928\u093E", "\u093E\u0924\u0947", "\u093E\u0924\u0940", "\u093E\u0924\u093E", "\u0924\u0940\u0902", "\u093E\u0913\u0902", "\u093E\u090F\u0902", "\u0941\u0913\u0902", "\u0941\u090F\u0902", "\u0941\u0906\u0902"];
+var HINDI_SUFFIXES_SHORT = ["\u0915\u0930", "\u093E\u0913", "\u093F\u090F", "\u093E\u0908", "\u093E\u090F", "\u0928\u0947", "\u0928\u0940", "\u0928\u093E", "\u0924\u0947", "\u0940\u0902", "\u0924\u0940", "\u0924\u093E", "\u093E\u0901", "\u093E\u0902", "\u094B\u0902", "\u0947\u0902"];
+var HINDI_SUFFIXES_MIN = ["\u094B", "\u0947", "\u0942", "\u0941", "\u0940", "\u093F", "\u093E"];
+function stemHindi(token) {
+  if (token.length > 5) {
+    const t = stripOne(token, HINDI_SUFFIXES_LONG, token.length - 4);
+    if (t !== token) return t;
+  }
+  if (token.length > 4) {
+    const t = stripOne(token, HINDI_SUFFIXES_MID, token.length - 3);
+    if (t !== token) return t;
+  }
+  if (token.length > 3) {
+    const t = stripOne(token, HINDI_SUFFIXES_SHORT, token.length - 2);
+    if (t !== token) return t;
+  }
+  if (token.length > 2) {
+    return stripOne(token, HINDI_SUFFIXES_MIN, token.length - 1);
+  }
+  return token;
+}
+var STEMMERS = {
+  en: stemEnglish,
+  fr: stemFrench,
+  de: stemGerman,
+  es: stemSpanish,
+  it: stemItalian,
+  pt: stemPortuguese,
+  nl: stemDutch,
+  sv: stemSwedish,
+  no: stemNorwegian,
+  da: stemDanish,
+  fi: stemFinnish,
+  ru: stemRussian,
+  el: stemGreek,
+  ar: stemArabic,
+  hi: stemHindi
+};
+var STEMMER_LANGUAGES = Object.freeze(Object.keys(STEMMERS));
+function stemmerFor(language) {
+  return STEMMERS[language] || null;
+}
+
+// src/analysis.js
+var ANALYSIS_PROFILE_MULTI = "multi-v1";
+var QUERY_TERM_BUDGET = 30;
+var WORD_RE = /[\p{L}\p{M}\p{N}ー々]+/gu;
+var BIGRAM_CHAR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}ー々]/u;
+var SCRIPT_RES = {
+  latin: /\p{Script=Latin}/u,
+  cyrillic: /\p{Script=Cyrillic}/u,
+  greek: /\p{Script=Greek}/u,
+  arabic: /\p{Script=Arabic}/u,
+  hebrew: /\p{Script=Hebrew}/u,
+  devanagari: /\p{Script=Devanagari}/u,
+  han: /\p{Script=Han}/u,
+  kana: /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
+  hangul: /\p{Script=Hangul}/u,
+  thai: /\p{Script=Thai}/u
+};
+var LANG_SCRIPT = {
+  ru: "cyrillic",
+  uk: "cyrillic",
+  bg: "cyrillic",
+  sr: "cyrillic",
+  be: "cyrillic",
+  mk: "cyrillic",
+  el: "greek",
+  ar: "arabic",
+  fa: "arabic",
+  ur: "arabic",
+  he: "hebrew",
+  yi: "hebrew",
+  hi: "devanagari",
+  mr: "devanagari",
+  ne: "devanagari",
+  th: "thai",
+  zh: "han",
+  ja: "kana",
+  ko: "hangul"
+};
+function scriptForLanguage(language) {
+  return LANG_SCRIPT[language] || "latin";
+}
+function isSingleDigit2(value) {
+  if (value.length !== 1) return false;
+  const code = value.charCodeAt(0);
+  return code >= 48 && code <= 57;
+}
+function pathValue(object, path) {
+  if (!path) return "";
+  let value = object;
+  for (const part of String(path).split(".")) {
+    if (value == null) return "";
+    value = value[part];
+  }
+  if (Array.isArray(value)) return value.join(" ");
+  return value == null ? "" : String(value);
+}
+var LANGUAGE_CODE_RE = /^[a-z]{2,3}$/;
+function normalizeLanguageCode(value) {
+  const code = String(value || "").trim().toLowerCase().split(/[-_]/)[0];
+  return LANGUAGE_CODE_RE.test(code) ? code : "";
+}
+function splitScriptRuns(word) {
+  const runs = [];
+  let current = "";
+  let currentBigram = false;
+  for (const ch of word) {
+    const bigram = BIGRAM_CHAR_RE.test(ch);
+    if (current && bigram === currentBigram) {
+      current += ch;
+    } else {
+      if (current) runs.push({ text: current, bigram: currentBigram });
+      current = ch;
+      currentBigram = bigram;
+    }
+  }
+  if (current) runs.push({ text: current, bigram: currentBigram });
+  return runs;
+}
+function bigramTokens(run, out) {
+  const chars = [...run];
+  if (chars.length === 1) {
+    out.push(chars[0]);
+    return;
+  }
+  for (let i = 0; i < chars.length - 1; i++) {
+    out.push(chars[i] + chars[i + 1]);
+  }
+}
+function createMultiAnalyzer(profile) {
+  const foldOptions = { foldDiacritics: profile.foldDiacritics };
+  const fold2 = (text) => foldMulti(text, foldOptions);
+  const stopwordSets = /* @__PURE__ */ new Map();
+  const rawLists = rawStopwordLists();
+  function stopwordsFor(language) {
+    if (profile.stopwords === "off") return EMPTY_SET;
+    let set = stopwordSets.get(language);
+    if (!set) {
+      set = new Set((rawLists[language] || []).map((word) => fold2(word)).filter(Boolean));
+      stopwordSets.set(language, set);
+    }
+    return set;
+  }
+  function stemFor(language) {
+    return profile.stemming === "light" ? stemmerFor(language) : null;
+  }
+  function normalizeAlphaToken(raw, language, stopwords, stemmer) {
+    if (raw.length < profile.minLength && !isSingleDigit2(raw)) return "";
+    if (stopwords.has(raw)) return "";
+    const term = stemmer ? stemmer(raw) : raw;
+    if (term.length < profile.minLength && !isSingleDigit2(term)) return "";
+    if (stopwords.has(term)) return "";
+    return term;
+  }
+  function emitTokens(text, language, callback) {
+    const lang = profile.languages.includes(language) ? language : profile.primary;
+    const stopwords = stopwordsFor(lang);
+    const stemmer = stemFor(lang);
+    const folded2 = fold2(text);
+    WORD_RE.lastIndex = 0;
+    let match;
+    const bigrams = [];
+    while (match = WORD_RE.exec(folded2)) {
+      for (const run of splitScriptRuns(match[0])) {
+        if (run.bigram) {
+          bigrams.length = 0;
+          bigramTokens(run.text, bigrams);
+          for (const token of bigrams) callback(token, token);
+        } else {
+          const term = normalizeAlphaToken(run.text, lang, stopwords, stemmer);
+          if (term) callback(run.text, term);
+        }
+      }
+    }
+  }
+  function tokenize2(text, options = {}) {
+    const unique = options.unique !== false;
+    const out = [];
+    const seen = unique ? /* @__PURE__ */ new Set() : null;
+    emitTokens(text, options.lang || "", (raw, term) => {
+      if (seen) {
+        if (seen.has(term)) return;
+        seen.add(term);
+      }
+      out.push(term);
+    });
+    return out;
+  }
+  function termCounts2(text, options = {}) {
+    const counts = /* @__PURE__ */ new Map();
+    emitTokens(text, options.lang || "", (raw, term) => {
+      counts.set(term, (counts.get(term) || 0) + 1);
+    });
+    return counts;
+  }
+  function analyzeTerms2(text, options = {}) {
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    emitTokens(text, options.lang || "", (raw, term) => {
+      if (seen.has(term)) return;
+      seen.add(term);
+      out.push({ raw, term });
+    });
+    return out;
+  }
+  function scriptCounts(text) {
+    const sample = String(text || "").slice(0, 1600);
+    const counts = {};
+    for (const ch of sample) {
+      for (const [script, re] of Object.entries(SCRIPT_RES)) {
+        if (re.test(ch)) {
+          counts[script] = (counts[script] || 0) + 1;
+          break;
+        }
+      }
+    }
+    return counts;
+  }
+  function stopwordVote(text, candidates) {
+    if (candidates.length === 1) return candidates[0];
+    const folded2 = fold2(String(text || "").slice(0, 1600));
+    const words = folded2.match(WORD_RE) || [];
+    let best = "";
+    let bestHits = 0;
+    let secondHits = 0;
+    for (const language of candidates) {
+      const set = profile.stopwords === "off" ? new Set((rawLists[language] || []).map((word) => fold2(word))) : stopwordsFor(language);
+      let hits = 0;
+      for (const word of words) if (set.has(word)) hits++;
+      if (hits > bestHits) {
+        secondHits = bestHits;
+        bestHits = hits;
+        best = language;
+      } else if (hits > secondHits) {
+        secondHits = hits;
+      }
+    }
+    return bestHits >= 2 && bestHits > secondHits ? best : "";
+  }
+  function detectLanguage(text) {
+    const counts = scriptCounts(text);
+    const kana = counts.kana || 0;
+    const han = counts.han || 0;
+    const hangul = counts.hangul || 0;
+    if (kana > 0 && profile.languages.includes("ja")) return "ja";
+    if (hangul > 0 && profile.languages.includes("ko")) return "ko";
+    if (han > 0) {
+      if (profile.languages.includes("zh")) return "zh";
+      if (profile.languages.includes("ja")) return "ja";
+    }
+    let dominant = "";
+    let dominantCount = 0;
+    for (const [script, count] of Object.entries(counts)) {
+      if (script === "han" || script === "kana" || script === "hangul") continue;
+      if (count > dominantCount) {
+        dominant = script;
+        dominantCount = count;
+      }
+    }
+    if (!dominant) return "";
+    const candidates = profile.languages.filter((language) => scriptForLanguage(language) === dominant);
+    if (candidates.length === 1) return candidates[0];
+    if (!candidates.length) return "";
+    return stopwordVote(text, candidates) || "";
+  }
+  function docLanguage(doc, config) {
+    if (profile.languageField) {
+      const explicit = normalizeLanguageCode(pathValue(doc, profile.languageField));
+      if (explicit && profile.languages.includes(explicit)) return explicit;
+    }
+    if (profile.detect) {
+      const parts = [];
+      let length = 0;
+      for (const field of config?.fields || []) {
+        const value = pathValue(doc, field.path);
+        if (!value) continue;
+        parts.push(value.slice(0, 800));
+        length += Math.min(value.length, 800);
+        if (length >= 1600) break;
+      }
+      const detected = detectLanguage(parts.join(" "));
+      if (detected) return detected;
+    }
+    return profile.primary;
+  }
+  function queryPlan(text) {
+    const language = detectLanguage(text) || profile.primary;
+    const analyzedTerms = analyzeTerms2(text, { lang: language });
+    const baseTerms = analyzedTerms.map((item) => item.term);
+    const terms = new Set(expandedTermsFromBaseTerms(baseTerms));
+    const altPlans = [];
+    const seenPlans = /* @__PURE__ */ new Set([baseTerms.join("\0")]);
+    for (const alt of profile.languages) {
+      if (alt === language) continue;
+      const altAnalyzed = analyzeTerms2(text, { lang: alt });
+      if (!altAnalyzed.length) continue;
+      const altBase = altAnalyzed.map((item) => item.term);
+      const key = altBase.join("\0");
+      if (seenPlans.has(key)) continue;
+      seenPlans.add(key);
+      altPlans.push({ language: alt, analyzedTerms: altAnalyzed, baseTerms: altBase });
+    }
+    for (const alt of altPlans) {
+      for (const term of alt.baseTerms) {
+        if (terms.size >= QUERY_TERM_BUDGET) break;
+        terms.add(term);
+      }
+    }
+    for (const alt of altPlans) {
+      for (const term of expandedTermsFromBaseTerms(alt.baseTerms)) {
+        if (terms.size >= QUERY_TERM_BUDGET) break;
+        terms.add(term);
+      }
+    }
+    return { language, analyzedTerms, baseTerms, terms: [...terms], altPlans };
+  }
+  function queryTerms2(text) {
+    return queryPlan(text).terms;
+  }
+  function highlightTerms(query, correctedQuery = "") {
+    const terms = /* @__PURE__ */ new Set();
+    for (const language of profile.languages) {
+      for (const item of analyzeTerms2(String(query || ""), { lang: language })) terms.add(item.term);
+      if (correctedQuery) {
+        for (const item of analyzeTerms2(String(correctedQuery || ""), { lang: language })) terms.add(item.term);
+      }
+    }
+    return terms;
+  }
+  function wordMatchRanges(word, termSet) {
+    const ranges = [];
+    let offset = 0;
+    for (const run of splitScriptRuns(word)) {
+      if (run.bigram) {
+        const chars = [...run.text];
+        if (chars.length === 1) {
+          if (termSet.has(chars[0])) ranges.push([offset, offset + chars[0].length]);
+        } else {
+          let charOffset = offset;
+          for (let i = 0; i < chars.length - 1; i++) {
+            const bigram = chars[i] + chars[i + 1];
+            if (termSet.has(bigram)) {
+              const start = charOffset;
+              const end = charOffset + chars[i].length + chars[i + 1].length;
+              const previous = ranges[ranges.length - 1];
+              if (previous && previous[1] >= start) previous[1] = end;
+              else ranges.push([start, end]);
+            }
+            charOffset += chars[i].length;
+          }
+        }
+        offset += run.text.length;
+      } else {
+        const folded2 = fold2(run.text);
+        let matched = termSet.has(folded2);
+        if (!matched && profile.stemming === "light") {
+          for (const language of profile.languages) {
+            const stemmer = stemmerFor(language);
+            if (stemmer && termSet.has(stemmer(folded2))) {
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (matched) ranges.push([offset, offset + run.text.length]);
+        offset += run.text.length;
+      }
+    }
+    return ranges;
+  }
+  function canonicalTerm(word) {
+    const foldedWord = fold2(word);
+    const stemmer = stemFor(profile.primary);
+    return stemmer ? stemmer(foldedWord) : foldedWord;
+  }
+  return {
+    isMultilingual: true,
+    profile,
+    languages: profile.languages,
+    fold: fold2,
+    tokenize: tokenize2,
+    termCounts: termCounts2,
+    analyzeTerms: analyzeTerms2,
+    detectLanguage,
+    docLanguage,
+    queryPlan,
+    queryTerms: queryTerms2,
+    highlightTerms,
+    wordMatchRanges,
+    canonicalTerm
+  };
+}
+var EMPTY_SET = /* @__PURE__ */ new Set();
+var LEGACY_ANALYZER = {
+  isMultilingual: false,
+  profile: null,
+  languages: [],
+  fold,
+  tokenize: (text, options = {}) => tokenize(text, options),
+  termCounts: (text, options = {}) => termCounts(text, options),
+  analyzeTerms: (text) => analyzeTerms(text),
+  detectLanguage: () => "",
+  docLanguage: () => "",
+  queryPlan(text) {
+    const analyzedTerms = analyzeTerms(text);
+    return {
+      language: "",
+      analyzedTerms,
+      baseTerms: analyzedTerms.map((item) => item.term),
+      terms: queryTerms(text),
+      altPlans: []
+    };
+  },
+  queryTerms: (text) => queryTerms(text),
+  highlightTerms(query, correctedQuery = "") {
+    const terms = /* @__PURE__ */ new Set();
+    for (const item of analyzeTerms(String(query || ""))) terms.add(item.term);
+    for (const item of analyzeTerms(String(correctedQuery || ""))) terms.add(item.term);
+    return terms;
+  },
+  wordMatchRanges(word, termSet) {
+    const folded2 = fold(word);
+    if (termSet.has(folded2)) return [[0, word.length]];
+    const stemmed = stem(folded2);
+    if (stemmed !== folded2 && termSet.has(stemmed)) return [[0, word.length]];
+    return [];
+  },
+  canonicalTerm(word) {
+    return stem(fold(word));
+  }
+};
+function createAnalyzer(profile) {
+  if (!profile) return LEGACY_ANALYZER;
+  if (profile.profile !== ANALYSIS_PROFILE_MULTI) {
+    throw new Error(`Rangefind analysis profile "${profile.profile}" is not supported by this runtime; upgrade rangefind.`);
+  }
+  return createMultiAnalyzer(profile);
+}
+var manifestAnalyzers = /* @__PURE__ */ new WeakMap();
+function analyzerFromManifest(manifest) {
+  if (!manifest || typeof manifest !== "object") return LEGACY_ANALYZER;
+  let analyzer = manifestAnalyzers.get(manifest);
+  if (!analyzer) {
+    analyzer = createAnalyzer(manifest.analysis || null);
+    manifestAnalyzers.set(manifest, analyzer);
+  }
+  return analyzer;
 }
 
 // src/binary.js
@@ -846,20 +2696,25 @@ function authorityTokenKeyFromTerms(terms) {
   const key = (terms || []).map((term) => String(term || "")).filter(Boolean).join(" ");
   return key ? `${TOKEN_PREFIX}${key}` : "";
 }
+function authorityTokens(value, analyzer) {
+  const lang = analyzer.detectLanguage(String(value || ""));
+  return analyzer.tokenize(value, { unique: false, lang });
+}
 function authorityKeysForValue(value, options = {}) {
+  const analyzer = options.analyzer || LEGACY_ANALYZER;
   const out = [];
   const surface = options.surface !== false ? authorityNormalizeRawSurface(value) : "";
   if (surface) out.push({ key: `${SURFACE_PREFIX}${surface}`, kind: "surface" });
   const exact = options.exact !== false ? authorityNormalizeSurface(value) : "";
   if (exact && !out.some((item) => item.key === `${EXACT_PREFIX}${exact}`)) out.push({ key: `${EXACT_PREFIX}${exact}`, kind: "exact" });
   if (options.tokens !== false) {
-    const tokenKey = authorityTokenKeyFromTerms(tokenize(value, { unique: false }));
+    const tokenKey = authorityTokenKeyFromTerms(authorityTokens(value, analyzer));
     if (tokenKey && !out.some((item) => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
   }
   return out;
 }
-function authorityKeysForQuery(query, baseTerms) {
-  const out = authorityKeysForValue(query);
+function authorityKeysForQuery(query, baseTerms, options = {}) {
+  const out = authorityKeysForValue(query, { analyzer: options.analyzer });
   const tokenKey = authorityTokenKeyFromTerms(baseTerms);
   if (tokenKey && !out.some((item) => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
   return out;
@@ -1506,44 +3361,36 @@ function decodeGeoBranchPage(buffer, packTable, blockFilters = [], expected = {}
 }
 
 // src/highlight.js
-var WORD_RE = /[\p{L}\p{M}\p{N}]+/gu;
-function highlightTermSet(query, correctedQuery = "") {
-  const terms = /* @__PURE__ */ new Set();
-  for (const item of analyzeTerms(String(query || ""))) terms.add(item.term);
-  for (const item of analyzeTerms(String(correctedQuery || ""))) terms.add(item.term);
-  return terms;
+var WORD_RE2 = /[\p{L}\p{M}\p{N}ー々]+/gu;
+function highlightTermSet(query, correctedQuery = "", analyzer = LEGACY_ANALYZER) {
+  return analyzer.highlightTerms(query, correctedQuery);
 }
-function wordMatches(word, termSet) {
-  const folded = fold(word);
-  if (termSet.has(folded)) return true;
-  const stemmed = stem(folded);
-  return stemmed !== folded && termSet.has(stemmed);
-}
-function findMatchRanges(text, termSet) {
+function findMatchRanges(text, termSet, analyzer = LEGACY_ANALYZER) {
   const ranges = [];
   if (!termSet?.size) return ranges;
-  WORD_RE.lastIndex = 0;
+  WORD_RE2.lastIndex = 0;
   let match;
-  while (match = WORD_RE.exec(text)) {
-    if (wordMatches(match[0], termSet)) {
-      ranges.push([match.index, match.index + match[0].length]);
+  while (match = WORD_RE2.exec(text)) {
+    for (const [start, end] of analyzer.wordMatchRanges(match[0], termSet)) {
+      ranges.push([match.index + start, match.index + end]);
     }
   }
   return ranges;
 }
-function distinctTermsIn(text, ranges, from, to, termSet) {
+function distinctTermsIn(text, ranges, from, to, analyzer) {
   const seen = /* @__PURE__ */ new Set();
   for (const [start, end] of ranges) {
     if (start < from || end > to) continue;
-    seen.add(stem(fold(text.slice(start, end))));
+    seen.add(analyzer.canonicalTerm(text.slice(start, end)));
   }
   return seen.size;
 }
 function highlightText(text, termSet, options = {}) {
+  const analyzer = options.analyzer || LEGACY_ANALYZER;
   const raw = String(text || "");
   if (!raw) return null;
   const maxChars = Math.max(40, Math.floor(Number(options.maxChars ?? 240)));
-  const ranges = findMatchRanges(raw, termSet);
+  const ranges = findMatchRanges(raw, termSet, analyzer);
   if (!ranges.length) return null;
   let windowStart = 0;
   if (raw.length > maxChars) {
@@ -1551,7 +3398,7 @@ function highlightText(text, termSet, options = {}) {
     for (const [start] of ranges) {
       const candidate = Math.max(0, Math.min(start - 30, raw.length - maxChars));
       const to2 = candidate + maxChars;
-      const distinct = distinctTermsIn(raw, ranges, candidate, to2, termSet);
+      const distinct = distinctTermsIn(raw, ranges, candidate, to2, analyzer);
       const count = ranges.filter(([s, e]) => s >= candidate && e <= to2).length;
       if (distinct > best.distinct || distinct === best.distinct && count > best.count) {
         best = { distinct, count, start: candidate };
@@ -1586,13 +3433,14 @@ function highlightText(text, termSet, options = {}) {
 function applyHighlights(results, termSet, options = {}) {
   const wanted = Array.isArray(options.fields) && options.fields.length ? options.fields : null;
   const maxChars = options.maxChars;
+  const analyzer = options.analyzer || LEGACY_ANALYZER;
   for (const result of results) {
     const highlights = {};
     let any = false;
     for (const [field, value] of Object.entries(result)) {
       if (typeof value !== "string" || !value) continue;
       if (wanted ? !wanted.includes(field) : field === "id" || field === "url") continue;
-      const highlight = highlightText(value, termSet, { maxChars });
+      const highlight = highlightText(value, termSet, { maxChars, analyzer });
       if (highlight) {
         highlights[field] = highlight;
         any = true;
@@ -2170,7 +4018,7 @@ function typoMaxEditsFor(term, options = MAIN_INDEX_TYPO_DEFAULTS) {
   return term.length >= 8 ? max : Math.min(1, max);
 }
 function isTypoCorrectionToken(token) {
-  return /^[a-z][a-z0-9]*$/u.test(token) && !/^\d+$/u.test(token) && token.length >= 3 && token.length <= 32;
+  return /^\p{L}[\p{L}\p{N}]*$/u.test(token) && !/^\d+$/u.test(token) && token.length >= 3 && token.length <= 32;
 }
 function mainIndexTypoProbeValues(raw, term, options = MAIN_INDEX_TYPO_DEFAULTS) {
   const max = Math.max(1, options.maxShardLookups || MAIN_INDEX_TYPO_DEFAULTS.maxShardLookups);
@@ -2484,6 +4332,7 @@ async function createSearch(options = {}) {
   if (Array.isArray(manifest.generations)) {
     return createGenerationalSearch(manifest, options, baseUrl);
   }
+  const analyzer = analyzerFromManifest(manifest);
   const verifyChecksums = options.verifyChecksums !== false && !!(manifest.features?.checksummedObjects || manifest.object_store?.checksum);
   const termDirectory = createDirectoryState(manifest.directory);
   const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
@@ -4529,6 +6378,27 @@ async function createSearch(options = {}) {
   }
   function minShouldMatchFor(baseTerms) {
     return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+  }
+  async function resolveQueryPlan(q) {
+    const plan = analyzer.queryPlan(q);
+    if (!plan.altPlans?.length || !plan.baseTerms.length) return plan;
+    async function presentCount(baseTerms) {
+      const entries = await termEntries(baseTerms);
+      const found = new Set(entries.map((item) => item.term));
+      return baseTerms.filter((term) => found.has(term)).length;
+    }
+    const primaryPresent = await presentCount(plan.baseTerms);
+    if (primaryPresent >= Math.max(1, minShouldMatchFor(plan.baseTerms))) return plan;
+    let best = plan;
+    let bestPresent = primaryPresent;
+    for (const alt of plan.altPlans) {
+      const altPresent = await presentCount(alt.baseTerms);
+      if (altPresent > bestPresent) {
+        best = { ...plan, language: alt.language, analyzedTerms: alt.analyzedTerms, baseTerms: alt.baseTerms };
+        bestPresent = altPresent;
+      }
+    }
+    return best;
   }
   function collectEligibleScores(scores, hits, minShouldMatch) {
     return [...scores.entries()].filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch)).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
@@ -7645,8 +9515,8 @@ async function createSearch(options = {}) {
     if (hasFilters) return response;
     const authorityQuery = String(response.correctedQuery || response.surfaceFallbackQuery || params.q || "").trim();
     if (!authorityQuery || resultTitleMatchesQuery(response.results?.[0], authorityQuery)) return response;
-    const authorityTerms = analyzeTerms(authorityQuery).map((item) => item.term);
-    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms).filter((item) => item.key);
+    const authorityTerms = analyzer.queryPlan(authorityQuery).baseTerms;
+    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms, { analyzer }).filter((item) => item.key);
     const surfaceKeys = [...new Set(keyPlans.filter((item) => item.kind === "surface").map((item) => item.key))];
     const exactKeys = [...new Set(keyPlans.filter((item) => item.kind === "exact").map((item) => item.key))];
     const tokenKeys = [...new Set(keyPlans.filter((item) => item.kind === "tokens").map((item) => item.key))];
@@ -7809,8 +9679,9 @@ async function createSearch(options = {}) {
         }
       };
     }
-    const analyzedTerms = analyzeTerms(q);
-    const baseTerms = analyzedTerms.map((item) => item.term);
+    const queryAnalysis = await resolveQueryPlan(q);
+    const analyzedTerms = queryAnalysis.analyzedTerms;
+    const baseTerms = queryAnalysis.baseTerms;
     if (geoPlan?.sort) {
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
@@ -7849,7 +9720,7 @@ async function createSearch(options = {}) {
       filters,
       sort,
       baseTerms,
-      terms: queryTerms(q),
+      terms: queryAnalysis.terms,
       rerank: params.rerank,
       includeResults: params.includeResults !== false,
       plannerFallbackReason: params.exact ? "exact_requested" : "full_scan"
@@ -7861,8 +9732,8 @@ async function createSearch(options = {}) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
       applyHighlights(
         rerankedResponse.results,
-        highlightTermSet(q, rerankedResponse.correctedQuery),
-        highlightOptions
+        highlightTermSet(q, rerankedResponse.correctedQuery, analyzer),
+        { ...highlightOptions, analyzer }
       );
     }
     if (geoPlan?.docSetStats) {
@@ -8088,7 +9959,7 @@ async function createSearch(options = {}) {
     }
     if (params.highlight && q && results.length) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
-      applyHighlights(results, highlightTermSet(q, textResponse?.correctedQuery), highlightOptions);
+      applyHighlights(results, highlightTermSet(q, textResponse?.correctedQuery, analyzer), { ...highlightOptions, analyzer });
     }
     return {
       total: ranked.length,
@@ -8329,7 +10200,7 @@ async function createSearch(options = {}) {
     await ensureDocValuesManifest();
     const filterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     if (q) {
-      const match = await collectTextMatchDocs(analyzeTerms(q).map((item) => item.term));
+      const match = await collectTextMatchDocs((await resolveQueryPlan(q)).baseTerms);
       if (!match) {
         response.facets = await facetCountsFromDictionary(facetsParam.fields, facetsParam.size);
         for (const field of facetsParam.fields) {
@@ -8369,8 +10240,7 @@ async function createSearch(options = {}) {
     if (hasFilters || params.sort || params.geo) {
       throw new Error("Rangefind count currently supports text-only queries without filters, sort, or geo.");
     }
-    const analyzedTerms = analyzeTerms(q);
-    const baseTerms = analyzedTerms.map((item) => item.term);
+    const baseTerms = (await resolveQueryPlan(q)).baseTerms;
     return runCountSearch({ q, baseTerms });
   }
   async function search(params = {}) {
@@ -8432,6 +10302,7 @@ async function createSearch(options = {}) {
   }
   return {
     manifest,
+    analyzer,
     search,
     count,
     suggest,
@@ -8499,7 +10370,8 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const correctedQuery = responses.map((response) => response.correctedQuery).find(Boolean);
     if (params.highlight && results.length && q) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
-      applyHighlights(results, highlightTermSet(q, correctedQuery), highlightOptions);
+      const genAnalyzer = engines[0]?.analyzer;
+      applyHighlights(results, highlightTermSet(q, correctedQuery, genAnalyzer), { ...highlightOptions, analyzer: genAnalyzer });
     }
     let facets;
     if (params.facets) {
