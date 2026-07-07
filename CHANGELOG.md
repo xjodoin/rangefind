@@ -20,7 +20,10 @@
   so the browser reconstructs the exact builder analyzer; `build --update`
   refuses deltas whose profile differs from the existing generations.
   Highlighting matches across languages and marks exact CJK bigram spans.
-  Indexes without an `analysis` block keep the legacy analyzer unchanged.
+  This is now the only analyzer; a config with no `analysis` block uses the
+  default profile (English plus French). The previous Latin-only analyzer
+  and its module (`src/analyzer.js`) were removed, and the language-agnostic
+  phrase/proximity/bundle term helpers moved to `src/terms.js`.
 
 ### Fixed
 

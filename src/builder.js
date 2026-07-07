@@ -20,7 +20,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
-import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms } from "./analyzer.js";
+import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms } from "./terms.js";
 import { analyzerForConfig } from "./analysis.js";
 import { addAuthorityDoc, addAuthorityRecord, createAuthorityRunBuffer, finishAuthorityRuns, reduceAuthorityRuns } from "./authority_index.js";
 import {
@@ -2001,8 +2001,9 @@ async function prepareGenerationalUpdate(config) {
     const genManifest = JSON.parse(readFileSync(resolve(rootDir, generation.manifest), "utf8"));
     // Generations share one term space: a delta built with a different
     // analysis profile would emit incomparable terms, so scores could never
-    // merge. Frozen like the field stats.
-    if (stableJson(genManifest.analysis || null) !== stableJson(config.analysis || null)) {
+    // merge. Frozen like the field stats. Both sides use the resolved
+    // profile so a default and an explicit-but-identical block still match.
+    if (stableJson(genManifest.analysis || null) !== stableJson(analyzerForConfig(config).profile)) {
       throw new Error(
         "Rangefind update: the analysis profile differs from the existing index; " +
         "keep the same `analysis` config for delta builds or run a full rebuild."
@@ -4285,7 +4286,9 @@ export async function build({ configPath, update = false }) {
         directory_bytes: authority.directory_bytes
       }
     } : null,
-    analysis: config.analysis || null,
+    // Record the resolved profile (the default is explicit, never null), so
+    // the runtime always reconstructs the exact analyzer used at build time.
+    analysis: analyzerForConfig(config).profile,
     search: {
       postingOrder: config.postingOrder,
       typo: {

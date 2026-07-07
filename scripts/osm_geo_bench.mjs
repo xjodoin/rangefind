@@ -17,7 +17,7 @@ import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createFetchMeter, kb, mean, quantile, serveStatic } from "./bench_support.mjs";
-import { analyzeTerms, tokenize } from "../src/analyzer.js";
+import { DEFAULT_ANALYZER } from "../src/analysis.js";
 import { createSearch } from "../src/runtime.js";
 import { haversineMetersE7, latToE7, lonToE7, boxContainsPointE7 } from "../src/geo_tree.js";
 
@@ -48,7 +48,7 @@ async function loadPoints(path) {
       name: doc.name,
       category: doc.category || "",
       tokens: `${doc.name} ${doc.body || ""}`.toLowerCase(),
-      tokenSet: new Set(tokenize(`${doc.name} ${doc.body || ""} ${(doc.aliases || []).join(" ")}`)),
+      tokenSet: new Set(DEFAULT_ANALYZER.tokenize(`${doc.name} ${doc.body || ""} ${(doc.aliases || []).join(" ")}`)),
       latE7,
       lonE7
     });
@@ -249,7 +249,7 @@ async function main() {
         geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" },
         size: 20
       });
-      const restaurantTerm = analyzeTerms("restaurant")[0].term;
+      const restaurantTerm = DEFAULT_ANALYZER.analyzeTerms("restaurant")[0].term;
       const textNearestExpected = oracleRadius(points, center, Infinity, point => point.tokenSet.has(restaurantTerm)).slice(0, 20);
       const textNearestDistances = textNearest.results.map(result => result.distanceMeters);
       const textNearestExpectedDistances = textNearestExpected.map(item => Math.round(item.dist * 10) / 10);

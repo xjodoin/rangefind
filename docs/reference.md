@@ -168,10 +168,10 @@ indexed before the budget is applied).
 
 ### `analysis` — multilingual text analysis
 
-Without an `analysis` block, Rangefind keeps its legacy analyzer (Latin-only
-tokens, combined English/French suffix stripping) — existing indexes and
-configs behave byte-for-byte the same. Adding the block switches the index to
-the `multi-v1` profile:
+Rangefind has one analyzer, the `multi-v1` profile. Omitting the `analysis`
+block selects the default profile — English plus French (`["en", "fr"]`,
+primary English) — reflecting this corpus's heritage; set the block to tune
+languages and behavior:
 
 ```json
 {
@@ -184,7 +184,7 @@ the `multi-v1` profile:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `languages` | `["en"]` | ISO 639 codes the corpus contains (BCP47 tags reduce to their primary subtag). |
+| `languages` | `["en", "fr"]` | ISO 639 codes the corpus contains (BCP47 tags reduce to their primary subtag). |
 | `primary` | first language | Fallback language when detection is inconclusive. |
 | `languageField` | — | Dotted path to a per-document language code; wins over detection. |
 | `detect` | `true` | Detect each document's language by script and stopword profile. |

@@ -4,7 +4,7 @@ import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } 
 import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { basename, dirname, resolve } from "node:path";
-import { analyzeTerms } from "../src/analyzer.js";
+import { DEFAULT_ANALYZER } from "../src/analysis.js";
 import { createSearch } from "../src/runtime.js";
 import { mean, quantile, serveStatic } from "./bench_support.mjs";
 
@@ -228,7 +228,7 @@ async function runQuery(engine, command, query, options = {}) {
     };
   }
 
-  const hasTerms = Boolean(query.query && analyzeTerms(query.query).length);
+  const hasTerms = Boolean(query.query && DEFAULT_ANALYZER.analyzeTerms(query.query).length);
   if (commandCounts(command)) {
     let searchResponse = null;
     if (hasTerms && commandTopKCounts(command)) {

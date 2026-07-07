@@ -5,7 +5,7 @@ import {
   pushVarint,
   readVarint
 } from "./binary.js";
-import { fold } from "./analyzer.js";
+import { foldMulti } from "./analysis_fold.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 
 export const SUGGEST_ROOT_FORMAT = "rfsuggestroot-v1";
@@ -19,7 +19,7 @@ const FLAG_DISPLAY_EQUALS_KEY = 1;
 // and keep letters/numbers from every script, so "Saint-Denis" is reachable
 // by typing "saint d" and "Montréal" by "montre".
 export function suggestKey(value) {
-  return fold(value)
+  return foldMulti(value)
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/gu, " ");

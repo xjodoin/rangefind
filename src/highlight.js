@@ -1,4 +1,4 @@
-import { LEGACY_ANALYZER } from "./analysis.js";
+import { DEFAULT_ANALYZER } from "./analysis.js";
 
 // Word scanning runs over the RAW display text (folding can change string
 // length, so positions found in folded text would not map back). Combining
@@ -6,7 +6,7 @@ import { LEGACY_ANALYZER } from "./analysis.js";
 // 々 are Script=Common but only occur inside CJK words.
 const WORD_RE = /[\p{L}\p{M}\p{N}ー々]+/gu;
 
-export function highlightTermSet(query, correctedQuery = "", analyzer = LEGACY_ANALYZER) {
+export function highlightTermSet(query, correctedQuery = "", analyzer = DEFAULT_ANALYZER) {
   return analyzer.highlightTerms(query, correctedQuery);
 }
 
@@ -14,7 +14,7 @@ export function highlightTermSet(query, correctedQuery = "", analyzer = LEGACY_A
 // same normalization the indexer applies, so "montreal" highlights
 // "Montréal" and "walk" highlights "walking". The analyzer decides how a
 // word matches: whole-word for alphabetic scripts, per-bigram for CJK.
-export function findMatchRanges(text, termSet, analyzer = LEGACY_ANALYZER) {
+export function findMatchRanges(text, termSet, analyzer = DEFAULT_ANALYZER) {
   const ranges = [];
   if (!termSet?.size) return ranges;
   WORD_RE.lastIndex = 0;
@@ -40,7 +40,7 @@ function distinctTermsIn(text, ranges, from, to, analyzer) {
 // terms (ties: most matches, then earliest), snaps it to word boundaries,
 // and returns the snippet text with match ranges rebased onto it.
 export function highlightText(text, termSet, options = {}) {
-  const analyzer = options.analyzer || LEGACY_ANALYZER;
+  const analyzer = options.analyzer || DEFAULT_ANALYZER;
   const raw = String(text || "");
   if (!raw) return null;
   const maxChars = Math.max(40, Math.floor(Number(options.maxChars ?? 240)));
@@ -98,7 +98,7 @@ export function highlightText(text, termSet, options = {}) {
 export function applyHighlights(results, termSet, options = {}) {
   const wanted = Array.isArray(options.fields) && options.fields.length ? options.fields : null;
   const maxChars = options.maxChars;
-  const analyzer = options.analyzer || LEGACY_ANALYZER;
+  const analyzer = options.analyzer || DEFAULT_ANALYZER;
   for (const result of results) {
     const highlights = {};
     let any = false;

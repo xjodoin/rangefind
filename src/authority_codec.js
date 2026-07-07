@@ -1,6 +1,6 @@
 import { AUTHORITY_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
-import { fold } from "./analyzer.js";
-import { LEGACY_ANALYZER } from "./analysis.js";
+import { foldMulti } from "./analysis_fold.js";
+import { DEFAULT_ANALYZER } from "./analysis.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 
 export const AUTHORITY_FORMAT = "rfauth-v1";
@@ -19,7 +19,7 @@ export function authorityNormalizeRawSurface(value) {
 }
 
 export function authorityNormalizeSurface(value) {
-  return fold(value)
+  return foldMulti(value)
     .replace(/[^a-z0-9]+/gu, " ")
     .trim()
     .replace(/\s+/gu, " ");
@@ -39,7 +39,7 @@ function authorityTokens(value, analyzer) {
 }
 
 export function authorityKeysForValue(value, options = {}) {
-  const analyzer = options.analyzer || LEGACY_ANALYZER;
+  const analyzer = options.analyzer || DEFAULT_ANALYZER;
   const out = [];
   const surface = options.surface !== false ? authorityNormalizeRawSurface(value) : "";
   if (surface) out.push({ key: `${SURFACE_PREFIX}${surface}`, kind: "surface" });

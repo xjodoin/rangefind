@@ -468,13 +468,16 @@ test("authority shard codec round-trips exact and token rows", () => {
 });
 
 test("authority keys keep surface-exact accents separate from folded exact lookup", () => {
+  // Token key uses the default analyzer's stem of the value ("paris" keeps
+  // its -is ending under the primary English lane); surface and folded-exact
+  // keys are analyzer-independent.
   assert.deepEqual(
     authorityKeysForValue("Paris").map(item => item.key),
-    ["r|paris", "x|paris", "t|pari"]
+    ["r|paris", "x|paris", "t|paris"]
   );
   assert.deepEqual(
     authorityKeysForValue("Pâris").map(item => item.key),
-    ["r|pâris", "x|paris", "t|pari"]
+    ["r|pâris", "x|paris", "t|paris"]
   );
 });
 

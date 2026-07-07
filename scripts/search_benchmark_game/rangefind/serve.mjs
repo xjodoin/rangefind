@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(process.env.RANGEFIND_REPO || resolve(here, "../../.."));
 const { createSearch } = await import(pathToFileURL(resolve(repoRoot, "src/runtime.js")).href);
-const { analyzeTerms } = await import(pathToFileURL(resolve(repoRoot, "src/analyzer.js")).href);
+const { DEFAULT_ANALYZER } = await import(pathToFileURL(resolve(repoRoot, "src/analysis.js")).href);
 const { serveStatic } = await import(pathToFileURL(resolve(repoRoot, "scripts/bench_support.mjs")).href);
 
 function delay(ms) {
@@ -103,7 +103,7 @@ try {
       continue;
     }
     const q = normalizeGameQuery(rawQuery);
-    const hasTerms = analyzeTerms(q).length > 0;
+    const hasTerms = DEFAULT_ANALYZER.analyzeTerms(q).length > 0;
     if (commandCounts(command)) {
       if (!hasTerms) {
         stdout.write("0\n");

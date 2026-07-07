@@ -1,4 +1,4 @@
-import { proximityTerm } from "./analyzer.js";
+import { proximityTerm } from "./terms.js";
 import { analyzerForConfig } from "./analysis.js";
 import { getPath } from "./config.js";
 

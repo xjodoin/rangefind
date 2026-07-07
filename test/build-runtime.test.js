@@ -70,7 +70,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
     JSON.stringify({ id: "f", title: "Collection note", body: "Another low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-02", featured: false, url: "/f" }),
     JSON.stringify({ id: "g", title: "Dataset appendix", body: "A repeated low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-03", featured: false, url: "/g" }),
     JSON.stringify({ id: "h", title: "Legacy material", body: "A final low impact search mention for block skipping coverage.", category: "archive", tags: ["filler"], year: 2024, temperature: 2, published: "2024-01-04", featured: false, url: "/h" }),
-    JSON.stringify({ id: "i", title: "Pariser cannon", body: "Surface exact fallback should prefer indexed raw terms before typo lookup.", category: "archive", tags: ["filler"], year: 2023, temperature: 2, published: "2023-01-04", featured: false, url: "/i" })
+    JSON.stringify({ id: "i", title: "Surface exact fixture", body: "Only reachable through blortsing, indexed as a raw surface token before typo lookup.", category: "archive", tags: ["filler"], year: 2023, temperature: 2, published: "2023-01-04", featured: false, url: "/i" })
   ].join("\n"));
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
@@ -511,8 +511,11 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(stemmedTypo.stats.typoApplied, true);
   assert.ok(stemmedTypo.stats.typoCandidateTermsScanned > 0);
 
-  const surfaceFallback = await search.search({ q: "paris", size: 3 });
-  assert.equal(surfaceFallback.results[0].title, "Pariser cannon");
+  // Surface-exact fallback: "blorts" light-stems to "blort" (no postings),
+  // but the unstemmed surface "blorts" is indexed via the token "blortsing",
+  // so the runtime retries the raw surface rather than a typo correction.
+  const surfaceFallback = await search.search({ q: "blorts", size: 3 });
+  assert.equal(surfaceFallback.results[0].title, "Surface exact fixture");
   assert.equal(surfaceFallback.stats.surfaceFallbackApplied, true);
   assert.equal(surfaceFallback.stats.typoAttempted, false);
 

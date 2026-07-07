@@ -1,4 +1,4 @@
-import { queryBundleKeyFromBaseTerms } from "./analyzer.js";
+import { queryBundleKeyFromBaseTerms } from "./terms.js";
 import { getPath } from "./config.js";
 import { analyzeFieldText, fieldIndexText } from "./scoring.js";
 import { varintLength, writeVarint } from "./runs.js";

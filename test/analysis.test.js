@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
-  LEGACY_ANALYZER,
+  DEFAULT_ANALYSIS_LANGUAGES,
+  DEFAULT_ANALYZER,
   analyzerForConfig,
   analyzerFromManifest,
   createAnalyzer,
@@ -13,7 +14,6 @@ import {
 } from "../src/analysis.js";
 import { foldMulti } from "../src/analysis_fold.js";
 import { stemmerFor } from "../src/analysis_stemmers.js";
-import { analyzeTerms, fold, queryTerms, tokenize } from "../src/analyzer.js";
 import { findMatchRanges, highlightTermSet } from "../src/highlight.js";
 import { build } from "../src/builder.js";
 import { createSearch } from "../src/runtime.js";
@@ -43,8 +43,10 @@ test("foldMulti folds scripts deterministically", () => {
 });
 
 test("analysis profile normalization validates and canonicalizes", () => {
-  assert.equal(normalizeAnalysisConfig(null), null);
-  assert.equal(normalizeAnalysisConfig(undefined), null);
+  // A missing block resolves to the default profile, never null.
+  assert.deepEqual(normalizeAnalysisConfig(null).languages, DEFAULT_ANALYSIS_LANGUAGES);
+  assert.deepEqual(normalizeAnalysisConfig(undefined).languages, DEFAULT_ANALYSIS_LANGUAGES);
+  assert.deepEqual(normalizeAnalysisConfig(false).languages, DEFAULT_ANALYSIS_LANGUAGES);
   const profile = normalizeAnalysisConfig({ languages: ["FR", "en", "fr"], primary: "en" });
   assert.equal(profile.profile, "multi-v1");
   assert.deepEqual(profile.languages, ["fr", "en"]);
@@ -176,23 +178,18 @@ test("query plans keep primary sequence and union alternate stems within budget"
   assert.ok(longPlan.terms.length <= 30, `terms ${longPlan.terms.length}`);
 });
 
-test("legacy analyzer instance matches analyzer.js exactly", () => {
-  const samples = [
-    "Learning to walk before running",
-    "Les châteaux de la Loire",
-    "mixed CASE Text-With—punctuation 42"
-  ];
-  for (const sample of samples) {
-    assert.deepEqual(LEGACY_ANALYZER.tokenize(sample, { unique: false }), tokenize(sample, { unique: false }));
-    assert.deepEqual(LEGACY_ANALYZER.analyzeTerms(sample), analyzeTerms(sample));
-    assert.deepEqual(LEGACY_ANALYZER.queryPlan(sample).terms, queryTerms(sample));
-    assert.equal(LEGACY_ANALYZER.fold(sample), fold(sample));
-  }
-  assert.equal(LEGACY_ANALYZER.docLanguage({ title: "anything" }, {}), "");
-  // No analysis profile anywhere → legacy instance.
-  assert.equal(analyzerForConfig({}), LEGACY_ANALYZER);
-  assert.equal(analyzerFromManifest({}), LEGACY_ANALYZER);
-  assert.ok(analyzerFromManifest({ analysis: normalizeAnalysisConfig({ languages: ["fr"] }) }).isMultilingual);
+test("config and manifest without an analysis block get the default analyzer", () => {
+  // No profile anywhere → the shared default analyzer instance.
+  assert.equal(analyzerForConfig({}), DEFAULT_ANALYZER);
+  assert.equal(analyzerFromManifest({}), DEFAULT_ANALYZER);
+  assert.deepEqual(DEFAULT_ANALYZER.languages, DEFAULT_ANALYSIS_LANGUAGES);
+  // The default analyzer folds accents and light-stems in its primary (en).
+  assert.deepEqual(DEFAULT_ANALYZER.tokenize("Learning the café houses", { unique: false }), ["learn", "cafe", "house"]);
+  // French light stemming is available on the fr lane (e.g. doc detection).
+  assert.deepEqual(DEFAULT_ANALYZER.tokenize("châteaux", { unique: false, lang: "fr" }), ["chateau"]);
+  // An explicit profile builds a distinct analyzer bound to that manifest.
+  const frOnly = analyzerFromManifest({ analysis: normalizeAnalysisConfig({ languages: ["fr"] }) });
+  assert.deepEqual(frOnly.languages, ["fr"]);
 });
 
 test("highlighting matches across languages and scripts", () => {
@@ -277,7 +274,7 @@ test("multilingual index is searchable end to end in every language", async (t) 
   const site = await serveStatic(join(root, "public"));
   t.after(() => site.close());
   const client = await createSearch({ baseUrl: site.baseUrl });
-  assert.ok(client.analyzer.isMultilingual);
+  assert.deepEqual(client.analyzer.languages, ["fr", "en", "de", "ru", "ja"]);
 
   async function expectTopHit(query, id) {
     const response = await client.search({ q: query, size: 3 });

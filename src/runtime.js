@@ -1,4 +1,4 @@
-import { expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms } from "./analyzer.js";
+import { expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms } from "./terms.js";
 import { analyzerFromManifest } from "./analysis.js";
 import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";

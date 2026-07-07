@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { queryTerms } from "../src/analyzer.js";
+import { DEFAULT_ANALYZER } from "../src/analysis.js";
 import { pushVarint } from "../src/binary.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "../src/directory.js";
 import { shardKey } from "../src/shards.js";
@@ -305,7 +305,7 @@ function termShardSets(queries, manifest, entries) {
     base: manifest.stats?.base_shard_depth || 3,
     max: manifest.stats?.max_shard_depth || manifest.stats?.base_shard_depth || 5
   };
-  return queries.map(q => new Set(queryTerms(q).map(term => resolvedShard(term, depths, available)).filter(Boolean)));
+  return queries.map(q => new Set(DEFAULT_ANALYZER.queryTerms(q).map(term => resolvedShard(term, depths, available)).filter(Boolean)));
 }
 
 function printTable(title, rows) {

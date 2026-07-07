@@ -1,4 +1,5 @@
-// Multilingual analysis for Rangefind ("multi-v1" profile).
+// Text analysis for Rangefind ("multi-v1" profile) — the one and only
+// analyzer.
 //
 // One serializable profile object fully determines analysis behavior. The
 // builder stores the profile in the manifest and the browser runtime
@@ -13,19 +14,11 @@
 // bigrams (the CJKAnalyzer approach), which needs no dictionary and is
 // exactly reproducible everywhere.
 //
-// Indexes without an analysis profile keep the legacy English/French
-// analyzer in analyzer.js, byte-for-byte.
+// A config with no `analysis` block gets DEFAULT_ANALYSIS_PROFILE (English
+// plus French, matching this corpus's heritage); there is no separate
+// legacy analyzer.
 
-import {
-  DEFAULT_STOPWORDS as LEGACY_STOPWORDS,
-  analyzeTerms as legacyAnalyzeTerms,
-  expandedTermsFromBaseTerms,
-  fold as legacyFold,
-  queryTerms as legacyQueryTerms,
-  stem as legacyStem,
-  termCounts as legacyTermCounts,
-  tokenize as legacyTokenize
-} from "./analyzer.js";
+import { expandedTermsFromBaseTerms } from "./terms.js";
 import { foldMulti } from "./analysis_fold.js";
 import { rawStopwordLists } from "./analysis_data.js";
 import { stemmerFor } from "./analysis_stemmers.js";
@@ -96,11 +89,16 @@ function normalizeLanguageCode(value) {
   return LANGUAGE_CODE_RE.test(code) ? code : "";
 }
 
-// Turns the user-facing `analysis` config block into the canonical
-// serializable profile the manifest stores. Returns null when the block is
-// absent (legacy analyzer).
+// Default analysis when a config omits the `analysis` block: English plus
+// French, reflecting this corpus's heritage (French Wikipedia fixtures, a
+// French thesis corpus). Callers get a real analyzer, never null.
+export const DEFAULT_ANALYSIS_LANGUAGES = ["en", "fr"];
+
+// Turns the user-facing `analysis` block into the canonical serializable
+// profile the manifest stores. A missing/false block yields the default
+// profile — there is no "no analyzer" state.
 export function normalizeAnalysisConfig(raw) {
-  if (raw == null || raw === false) return null;
+  if (raw == null || raw === false) return normalizeAnalysisConfig({ languages: DEFAULT_ANALYSIS_LANGUAGES });
   if (typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("Rangefind analysis config must be an object.");
   }
@@ -448,7 +446,6 @@ function createMultiAnalyzer(profile) {
   }
 
   return {
-    isMultilingual: true,
     profile,
     languages: profile.languages,
     fold,
@@ -467,50 +464,14 @@ function createMultiAnalyzer(profile) {
 
 const EMPTY_SET = new Set();
 
-// The legacy analyzer as an instance with the same surface, so call sites
-// can hold one object regardless of profile. Behavior is identical to the
-// module functions in analyzer.js.
-export const LEGACY_ANALYZER = {
-  isMultilingual: false,
-  profile: null,
-  languages: [],
-  fold: legacyFold,
-  tokenize: (text, options = {}) => legacyTokenize(text, options),
-  termCounts: (text, options = {}) => legacyTermCounts(text, options),
-  analyzeTerms: (text) => legacyAnalyzeTerms(text),
-  detectLanguage: () => "",
-  docLanguage: () => "",
-  queryPlan(text) {
-    const analyzedTerms = legacyAnalyzeTerms(text);
-    return {
-      language: "",
-      analyzedTerms,
-      baseTerms: analyzedTerms.map(item => item.term),
-      terms: legacyQueryTerms(text),
-      altPlans: []
-    };
-  },
-  queryTerms: (text) => legacyQueryTerms(text),
-  highlightTerms(query, correctedQuery = "") {
-    const terms = new Set();
-    for (const item of legacyAnalyzeTerms(String(query || ""))) terms.add(item.term);
-    for (const item of legacyAnalyzeTerms(String(correctedQuery || ""))) terms.add(item.term);
-    return terms;
-  },
-  wordMatchRanges(word, termSet) {
-    const folded = legacyFold(word);
-    if (termSet.has(folded)) return [[0, word.length]];
-    const stemmed = legacyStem(folded);
-    if (stemmed !== folded && termSet.has(stemmed)) return [[0, word.length]];
-    return [];
-  },
-  canonicalTerm(word) {
-    return legacyStem(legacyFold(word));
-  }
-};
+// The profile a config with no `analysis` block resolves to, and a shared
+// analyzer built from it for callers that have no config/manifest in hand
+// (highlight helpers, sidecar surface normalization, benchmark scripts).
+export const DEFAULT_ANALYSIS_PROFILE = normalizeAnalysisConfig(null);
+export const DEFAULT_ANALYZER = createMultiAnalyzer(DEFAULT_ANALYSIS_PROFILE);
 
 export function createAnalyzer(profile) {
-  if (!profile) return LEGACY_ANALYZER;
+  if (!profile) return DEFAULT_ANALYZER;
   if (profile.profile !== ANALYSIS_PROFILE_MULTI) {
     throw new Error(`Rangefind analysis profile "${profile.profile}" is not supported by this runtime; upgrade rangefind.`);
   }
@@ -523,7 +484,7 @@ const configAnalyzers = new WeakMap();
 // serializable config, so worker processes that receive config as JSON get
 // an identical instance.
 export function analyzerForConfig(config) {
-  if (!config || typeof config !== "object") return LEGACY_ANALYZER;
+  if (!config || typeof config !== "object") return DEFAULT_ANALYZER;
   let analyzer = configAnalyzers.get(config);
   if (!analyzer) {
     analyzer = createAnalyzer(config.analysis || null);
@@ -537,7 +498,7 @@ const manifestAnalyzers = new WeakMap();
 // Runtime-side accessor: the manifest's analysis profile decides which
 // analyzer queries run through.
 export function analyzerFromManifest(manifest) {
-  if (!manifest || typeof manifest !== "object") return LEGACY_ANALYZER;
+  if (!manifest || typeof manifest !== "object") return DEFAULT_ANALYZER;
   let analyzer = manifestAnalyzers.get(manifest);
   if (!analyzer) {
     analyzer = createAnalyzer(manifest.analysis || null);
@@ -545,7 +506,3 @@ export function analyzerFromManifest(manifest) {
   }
   return analyzer;
 }
-
-// Legacy stopwords re-export keeps the "one obvious import" property for
-// callers that need the default set alongside profile-aware code.
-export { LEGACY_STOPWORDS };
