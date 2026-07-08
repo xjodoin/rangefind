@@ -40,9 +40,6 @@
     "./analysis": "./src/analysis.js",
     "./terms": "./src/terms.js"
   },
-  "workspaces": [
-    "packages/*"
-  ],
   "files": [
     "bin/",
     "dist/",
