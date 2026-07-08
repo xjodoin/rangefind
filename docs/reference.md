@@ -624,6 +624,166 @@ Notable fields:
   `hybrid`, `hybridPool`.
 - With `trace: true`: `stats.trace` with per-bucket fetch counts and bytes.
 
+### Search UI component
+
+`<rangefind-search>` is a drop-in Web Component that wraps `engine.search` /
+`engine.suggest` in an accessible combobox. It ships in the package bundle at
+`rangefind/element` (`dist/rangefind-search.js`) and registers the
+`rangefind-search` custom element on import.
+
+```html
+<script type="module" src="/dist/rangefind-search.js"></script>
+<rangefind-search src="/rangefind/"></rangefind-search>
+```
+
+Build it with `npm run build:element`, which emits `dist/rangefind-search.js`
+(self-contained ESM, bundles the runtime, zero dependencies) and
+`dist/rangefind-search.css` (the optional theme).
+
+**Light DOM + headless.** The element renders into its own light DOM — no
+shadow root — and injects no styling of its own. That is deliberate: the host
+page's CSS (Tailwind utilities, global stylesheets, the optional theme) applies
+directly to the rendered parts. The one exception is the visually-hidden
+`aria-live` status region, whose inline `sr-only` styles are an accessibility
+affordance, not theming.
+
+#### Attributes
+
+All optional except `src`.
+
+| Attribute | Default | Purpose |
+| --- | --- | --- |
+| `src` | — (required) | Index base URL, passed to `createSearch({ baseUrl })`. |
+| `placeholder` | `Search` | Input placeholder. |
+| `label` | `Search` | `aria-label` for the combobox. |
+| `page-size` | `8` | Results per query (`size`, 1–100). |
+| `debounce` | `150` | Debounce in ms before searching (0–5000). |
+| `min-length` | `1` | Minimum query length before searching. |
+| `highlight` | on | `<mark>` matched terms. `highlight="false"` disables. |
+| `suggest` | `auto` | Autocomplete. `auto` = on iff the index has a suggest sidecar; `true`/`false` force it. |
+| `router` | off | Sync `?q=` to the URL (`history.replaceState`) and seed from it on load. |
+| `open-on-focus` | off | Reopen results when the input regains focus. |
+| `hotkey` | off | Press `/` anywhere (outside inputs) to focus the box. |
+| `empty-text` | `No results` | Shown when a query has no matches. |
+| `loading-text` | `Searching…` | Announced while a query is in flight. |
+| `error-text` | `Search is unavailable.` | Shown on an engine/search failure. |
+
+#### Class hooks
+
+Every rendered part carries a stable namespaced class you can target with your
+own CSS or the theme:
+
+| Class | Element |
+| --- | --- |
+| `rf-search` | Host element (root). |
+| `rf-search__input` | The `role="combobox"` input. |
+| `rf-search__panel` | Popup container (has `hidden` when closed). |
+| `rf-search__suggest` | Suggestions `role="listbox"`. |
+| `rf-search__suggest-item` | A suggestion `role="option"`. |
+| `rf-search__list` | Results `role="listbox"`. |
+| `rf-search__option` | A result option (an `<a>` to `result.url`). |
+| `rf-search__option-title` | Result title (highlighted). |
+| `rf-search__option-snippet` | Result snippet (highlighted). |
+| `rf-search__option-url` | Result URL line. |
+| `rf-search__mark` | Highlight `<mark>` inside title/snippet. |
+| `rf-search__empty` | No-results / error message. |
+| `rf-search__status` | Visually-hidden `aria-live` status. |
+
+#### Per-part class injection
+
+Add classes to any part additively (the hook class is always kept and leads).
+Two equivalent mechanisms:
+
+- **`*-class` attributes** — one per part, ideal for Tailwind:
+  `input-class`, `panel-class`, `suggest-class`, `suggest-item-class`,
+  `list-class`, `option-class`, `option-title-class`, `option-snippet-class`,
+  `option-url-class`, `mark-class`, `empty-class`, `status-class`, `root-class`.
+
+  ```html
+  <rangefind-search src="/rangefind/"
+    input-class="w-full border rounded px-3 py-2"
+    mark-class="bg-yellow-200"></rangefind-search>
+  ```
+
+- **`.classNames` JS property** — an object keyed by the camelCase part name
+  (`input`, `panel`, `suggest`, `suggestItem`, `list`, `option`, `optionTitle`,
+  `optionSnippet`, `optionUrl`, `mark`, `empty`, `status`, `root`) for
+  framework/programmatic use:
+
+  ```js
+  document.querySelector("rangefind-search").classNames = {
+    input: "w-full border rounded px-3 py-2",
+    mark: "bg-yellow-200"
+  };
+  ```
+
+Merging is deduplicated: `rf-search__input` + attribute classes +
+`.classNames.input`, in that order.
+
+#### Events
+
+All `CustomEvent`s bubble and are `composed` so frameworks can listen anywhere:
+
+| Event | `detail` | Fired when |
+| --- | --- | --- |
+| `rangefind:search` | `{ query, response }` | A search resolves. |
+| `rangefind:select` | `{ result }` | A result is chosen (click or Enter). |
+| `rangefind:error` | `{ error }` | The engine fails to load or a query throws. |
+
+`.searchOptions` (JS property) merges extra params into every call:
+`{ create: {...}, search: {...} }` pass through to `createSearch` and
+`engine.search` respectively (e.g. filters, facets, sort).
+
+#### Accessibility
+
+Implements the [WAI-ARIA combobox pattern](https://www.w3.org/WAI/ARIA/apg/patterns/combobox/):
+the input is `role="combobox"` with `aria-autocomplete="list"`,
+`aria-expanded`, `aria-controls`, and `aria-activedescendant`; the popup lists
+are `role="listbox"` and options are `role="option"` with unique ids and
+`aria-selected`. Focus stays on the input while navigating. Keyboard map:
+
+| Key | Action |
+| --- | --- |
+| ArrowDown / ArrowUp | Move the active option (wraps); opens a closed panel. |
+| Home / End | Jump to first / last option. |
+| Enter | Activate the active option (navigate or fill from a suggestion); with no active option, run the query now. |
+| Escape | Close the panel; if already closed, clear the input. |
+| Tab | Close the panel and move focus on. |
+| `/` | Focus the box (only with the `hotkey` attribute). |
+
+#### Default theme
+
+`dist/rangefind-search.css` is an opt-in, framework-free stylesheet targeting
+the hook classes, with light and dark palettes (`prefers-color-scheme`) driven
+by CSS custom properties on `.rf-search` (e.g. `--rf-accent`, `--rf-radius`).
+Link it only when you are not styling the component yourself:
+
+```html
+<link rel="stylesheet" href="/dist/rangefind-search.css">
+```
+
+#### React usage
+
+Web Components work in React via plain JSX — set string attributes and attach
+events with a ref:
+
+```jsx
+import "rangefind/element";
+
+function Search() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    const onSelect = e => console.log(e.detail.result.url);
+    el.addEventListener("rangefind:select", onSelect);
+    // Object config (Tailwind classes, extra search params) goes via properties:
+    el.classNames = { input: "w-full border rounded px-3 py-2" };
+    return () => el.removeEventListener("rangefind:select", onSelect);
+  }, []);
+  return <rangefind-search ref={ref} src="/rangefind/" placeholder="Search…" />;
+}
+```
+
 ---
 
 ## Incremental publishing

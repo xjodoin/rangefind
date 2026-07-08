@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rangefind &lt;rangefind-search&gt; — Tailwind</title>
+<!--
+  The SAME component styled purely with Tailwind (Play CDN) and `*-class`
+  attributes. NO default theme CSS is loaded — this proves the light-DOM,
+  headless design lets a utility-class framework style every part.
+  Build first: `npm run build:element` + `npm run build:example`.
+  Serve:       `npm run serve:example`  →  http://localhost:5178/component-tailwind.html
+-->
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="h-full bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+  <main class="mx-auto max-w-xl px-4 py-10">
+    <h1 class="text-2xl font-semibold">Rangefind search component</h1>
+    <p class="mt-1 text-slate-500 dark:text-slate-400">
+      Styled entirely with Tailwind utility classes passed through
+      <code>*-class</code> attributes — no theme stylesheet.
+    </p>
+
+    <div class="mt-6">
+      <rangefind-search
+        src="./rangefind/"
+        placeholder="Search the docs…"
+        label="Search the docs"
+        hotkey
+        class="relative block"
+        input-class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/30 dark:border-slate-700 dark:bg-slate-900"
+        panel-class="absolute inset-x-0 z-40 mt-2 max-h-[60vh] overflow-y-auto rounded-lg border border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
+        suggest-class="list-none border-b border-slate-200 p-1 dark:border-slate-700"
+        suggest-item-class="cursor-pointer rounded px-3 py-1.5 text-slate-500 hover:bg-slate-100 aria-selected:bg-slate-100 aria-selected:text-slate-900 dark:hover:bg-slate-800 dark:aria-selected:bg-slate-800 dark:aria-selected:text-slate-100"
+        list-class="list-none p-1"
+        option-class="block rounded px-3 py-2 no-underline hover:bg-slate-100 aria-selected:bg-blue-50 dark:hover:bg-slate-800 dark:aria-selected:bg-blue-500/20"
+        option-title-class="block font-semibold leading-snug"
+        option-snippet-class="mt-0.5 block text-sm text-slate-500 dark:text-slate-400"
+        option-url-class="mt-0.5 block truncate text-xs text-blue-600 dark:text-blue-400"
+        mark-class="rounded bg-yellow-200 px-0.5 text-inherit dark:bg-yellow-500/40"
+        empty-class="px-3 py-4 text-center text-slate-500 dark:text-slate-400"></rangefind-search>
+    </div>
+  </main>
+
+  <script type="module" src="./rangefind-search.js"></script>
+</body>
+</html>

@@ -2,8 +2,12 @@ node_modules/
 dist/*
 !dist/
 !dist/runtime.browser.js
+!dist/rangefind-search.js
+!dist/rangefind-search.css
 examples/basic/public/rangefind/
 examples/basic/public/runtime.browser.js
+examples/basic/public/rangefind-search.js
+examples/basic/public/rangefind-search.css
 examples/frwiki/data/
 examples/frwiki/public/
 examples/frwiki/rangefind.config.json

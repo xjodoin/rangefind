@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rangefind &lt;rangefind-search&gt; — default theme</title>
+<!--
+  Two-line drop-in with the OPTIONAL default theme.
+  Build first: `npm run build:element` (bundle) + `npm run build:example` (index).
+  Serve:       `npm run serve:example`  →  http://localhost:5178/component.html
+-->
+<link rel="stylesheet" href="./rangefind-search.css">
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 640px; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  p.hint { color: #6b7280; }
+</style>
+
+<h1>Rangefind search component</h1>
+<p class="hint">Headless web component with the opt-in default theme stylesheet.
+Type a query (e.g. <code>range</code>, <code>static</code>, <code>search</code>).</p>
+
+<rangefind-search
+  src="./rangefind/"
+  placeholder="Search the docs…"
+  label="Search the docs"
+  hotkey
+  router></rangefind-search>
+
+<!-- The theme file is copied next to the bundle by the build script; here we
+     load both from the served public root. -->
+<script type="module" src="./rangefind-search.js"></script>
+<script type="module">
+  // Optional: demonstrate the events any framework can hook into.
+  const el = document.querySelector("rangefind-search");
+  el.addEventListener("rangefind:search", e => console.log("search", e.detail.query, e.detail.response.total));
+  el.addEventListener("rangefind:select", e => console.log("select", e.detail.result.url));
+  el.addEventListener("rangefind:error", e => console.warn("error", e.detail.error));
+</script>

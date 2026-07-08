@@ -142,6 +142,56 @@ Per-document language comes from `<html lang="…">` and the page description fr
 `<meta name="description">`. See the
 [reference guide](docs/reference.md#crawling-a-static-site) for the full rules.
 
+## Search UI Component
+
+Pair the crawler with a drop-in search box. `<rangefind-search>` is a
+framework-agnostic Web Component: two lines of HTML give any static site a
+polished, accessible search box (WAI-ARIA combobox, keyboard navigation,
+instant results, autocomplete).
+
+```html
+<script type="module" src="https://unpkg.com/rangefind/dist/rangefind-search.js"></script>
+<rangefind-search src="/rangefind/"></rangefind-search>
+```
+
+It renders into its **light DOM** and ships **no styling** of its own, so it
+composes with whatever CSS you already use. Style it three ways: the optional
+theme stylesheet, your own CSS via the `rf-search*` hook classes, or utility
+classes passed per part. Here it is styled purely with Tailwind — no theme CSS:
+
+```html
+<script src="https://cdn.tailwindcss.com"></script>
+<script type="module" src="https://unpkg.com/rangefind/dist/rangefind-search.js"></script>
+
+<rangefind-search
+  src="/rangefind/"
+  placeholder="Search…"
+  input-class="w-full rounded-lg border px-3 py-2"
+  panel-class="absolute inset-x-0 mt-2 rounded-lg border bg-white shadow-xl"
+  option-class="block rounded px-3 py-2 hover:bg-slate-100 aria-selected:bg-blue-50"
+  option-title-class="font-semibold"
+  option-snippet-class="text-sm text-slate-500"
+  mark-class="bg-yellow-200"></rangefind-search>
+```
+
+Prefer the batteries-included look? Link the opt-in theme (light + dark) and
+skip the `*-class` attributes:
+
+```html
+<link rel="stylesheet" href="https://unpkg.com/rangefind/dist/rangefind-search.css">
+<rangefind-search src="/rangefind/" placeholder="Search…"></rangefind-search>
+```
+
+Works in plain HTML, React, Vue, Svelte, and Angular — Web Components are
+universal. It emits `rangefind:search`, `rangefind:select`, and
+`rangefind:error` events, and takes `.classNames` / `.searchOptions` JS
+properties for programmatic use. Build the bundle with `npm run build:element`;
+try it against the basic example (`npm run build:example && npm run
+serve:example`) at `/component.html` (theme) and `/component-tailwind.html`
+(Tailwind). See the
+[reference guide](docs/reference.md#search-ui-component) for every attribute,
+the full class-hook list, events, and accessibility notes.
+
 ## Full Wikipedia Search Site
 
 The `examples/wiki-search` project is a fuller static search application for

@@ -33,6 +33,7 @@
   "exports": {
     ".": "./src/runtime.js",
     "./browser": "./dist/runtime.browser.js",
+    "./element": "./dist/rangefind-search.js",
     "./builder": "./src/builder.js",
     "./analysis": "./src/analysis.js",
     "./terms": "./src/terms.js"
@@ -46,6 +47,8 @@
     "examples/basic/docs.jsonl",
     "examples/basic/rangefind.config.json",
     "examples/basic/public/index.html",
+    "examples/basic/public/component.html",
+    "examples/basic/public/component-tailwind.html",
     "examples/frwiki/README.md",
     "examples/wiki-search/README.md",
     "examples/wiki-search/package.json",
@@ -67,6 +70,7 @@
   ],
   "scripts": {
     "build:browser": "node scripts/build_browser_bundle.mjs",
+    "build:element": "node scripts/build_element_bundle.mjs",
     "build:example": "node scripts/build_browser_bundle.mjs && node bin/rangefind.js build --config examples/basic/rangefind.config.json && cp dist/runtime.browser.js examples/basic/public/runtime.browser.js",
     "build:wiki-site": "npm run build:browser && node examples/wiki-search/scripts/build.mjs",
     "build:wiki-site:full": "npm run build:browser && node examples/wiki-search/scripts/build.mjs --limit=0",
@@ -90,7 +94,7 @@
     "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js dist/*.js examples/wiki-search/scripts/*.mjs examples/wiki-search/public/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
     "test": "node --test",
     "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",
-    "test:all": "npm run build:browser && npm run check && npm test && npm run test:smoke"
+    "test:all": "npm run build:browser && npm run build:element && npm run check && npm test && npm run test:smoke"
   },
   "devDependencies": {
     "esbuild": "^0.25.12"
