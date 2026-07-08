@@ -1,0 +1,47 @@
+{{- /*
+  Rangefind search box for Hugo.
+
+  Copy this file into your site at layouts/partials/rangefind-search.html,
+  then include it from any layout with:
+
+      {{ partial "rangefind-search.html" . }}
+
+  It assumes you have vendored the search UI bundle into Hugo's static/
+  directory (Hugo copies static/ verbatim to the site root):
+
+      static/rangefind-search.js    (from node_modules/rangefind/dist/)
+      static/rangefind-search.css
+
+  and that you have built the index into public/rangefind (the default), i.e.
+  ran `rangefind build public` after `hugo`.
+
+  Every URL below is passed through Hugo's `relURL` template function so it
+  respects your site's baseURL and any subpath deploy (e.g. a project served
+  from https://user.github.io/repo/). Use `absURL` instead if you specifically
+  need absolute URLs.
+*/ -}}
+
+{{/* The optional default theme. Delete this line if you style the component
+     yourself (it renders into light DOM, so your own CSS applies directly). */}}
+<link rel="stylesheet" href="{{ "rangefind-search.css" | relURL }}">
+
+{{/* The Web Component bundle. It is a self-contained ES module that also
+     bundles the query runtime, so it must be loaded as type="module". */}}
+<script type="module" src="{{ "rangefind-search.js" | relURL }}"></script>
+
+{{/* The custom element. `src` is the index base URL, resolved with relURL so
+     it points at public/rangefind/ under whatever baseURL/subpath you deploy
+     to. The trailing slash matters. */}}
+<rangefind-search
+  src="{{ "rangefind/" | relURL }}"
+  placeholder="Search the docs"
+  {{/* Uncomment to sync ?q= to the URL and seed the box from it on load: */}}
+  {{/* router */}}
+
+  {{/* Per-part class hooks for Tailwind-style styling. These are the real
+       attribute names from src/element_util.js — uncomment and adjust: */}}
+  {{/* input-class="w-full rounded border px-3 py-2" */}}
+  {{/* panel-class="mt-1 rounded border bg-white shadow-lg" */}}
+  {{/* option-class="block px-3 py-2 hover:bg-gray-100" */}}
+  {{/* mark-class="bg-yellow-200" */}}
+></rangefind-search>

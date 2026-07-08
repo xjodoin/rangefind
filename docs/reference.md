@@ -23,6 +23,7 @@ deployment. For the conceptual overview and format internals see
   - [`engine.search(params)`](#enginesearchparams)
   - [`engine.count` / `suggest` / `vectorSearch`](#other-query-methods)
   - [Response `stats`](#response-stats)
+- [Static site generator adapters](#static-site-generator-adapters)
 - [Incremental publishing](#incremental-publishing)
 - [Deployment requirements](#deployment-requirements)
 - [Tuning recipes](#tuning-recipes)
@@ -783,6 +784,65 @@ function Search() {
   return <rangefind-search ref={ref} src="/rangefind/" placeholder="Search…" />;
 }
 ```
+
+---
+
+## Static site generator adapters
+
+The crawler (["Crawling a static site"](#crawling-a-static-site)) and the
+[search component](#search-ui-component) compose with any static site
+generator: an adapter runs the crawl right after the generator writes its
+build output and copies the component's client assets in alongside it, so
+adding search is a matter of installing a package rather than wiring a
+post-build script by hand.
+
+Three generators have a real, Node-based plugin system, so those adapters are
+genuine npm packages under `packages/`, tested against the real tool's own
+build API/CLI:
+
+- **[Astro](packages/rangefind-astro)** — `rangefind-astro` hooks
+  `astro:build:done`, and ships a `<RangefindSearch />` component that's a
+  thin, faithful passthrough to `<rangefind-search>` (same props, same
+  `*-class` injection, headless by default).
+- **[Eleventy](packages/eleventy-plugin-rangefind)** — `eleventy-plugin-rangefind`
+  hooks the `eleventy.after` event and registers a universal `{%
+  rangefindSearch %}` shortcode (works across Nunjucks/Liquid/Markdown/11ty.js)
+  that renders the same markup.
+- **[Docusaurus](packages/docusaurus-plugin-rangefind)** — `docusaurus-plugin-rangefind`
+  hooks the `postBuild(props)` lifecycle and `injectHtmlTags()` to load the
+  script/theme site-wide; it deliberately does **not** auto-render a search
+  box (that would duplicate it on every page) — drop `<rangefind-search>` into
+  a navbar `html` item, an MDX page, or a swizzled component instead.
+
+Two generators have no JS/Python plugin loader of their own, so their
+"adapters" are the honest equivalent — a documented recipe plus enough
+templating glue that nothing needs hand-editing beyond one include:
+
+- **[Hugo](integrations/hugo)** — a single Go binary with no plugin system.
+  The recipe is `hugo && rangefind build public` (Rangefind's crawler needs
+  nothing more than a directory of built HTML) plus a copy-paste
+  `layouts/partials/rangefind-search.html` that resolves every asset URL
+  through Hugo's own `relURL` function, so it respects `baseURL` and subpath
+  deploys.
+- **[MkDocs](integrations/mkdocs-rangefind)** — a real, pip-installable Python
+  plugin (`mkdocs-rangefind`, published to PyPI once released) registered on
+  the standard `mkdocs.plugins` entry point. Its `on_post_build` hook shells
+  out to the Node CLI (`npx rangefind build <site_dir> --output ... --base-url
+  ...`) since there is no way to run Rangefind's Node indexing logic from pure
+  Python, and its `on_post_page` hook injects the widget into every rendered
+  page automatically (or, in `placement: manual` mode, injects just the
+  script/theme tags so you hand-place `<rangefind-search>` in a theme
+  override).
+
+Every adapter is verified end to end against the real tool, not a mock: a
+real `astro build` / `eleventy.write()` / `docusaurus build`, a
+Homebrew-installed `hugo` binary, and a pip-installed `mkdocs` — each crawling
+a small fixture site and then confirming, through Rangefind's own runtime
+served over real HTTP Range requests, that a search actually returns the
+right page. See each package's own README for its full option list; the
+component options themselves (attributes, class hooks, events) are documented
+once, under ["Search UI component"](#search-ui-component) above, rather than
+duplicated per adapter.
 
 ---
 

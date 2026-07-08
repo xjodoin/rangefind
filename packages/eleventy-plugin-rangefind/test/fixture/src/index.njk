@@ -1,0 +1,9 @@
+---
+layout: base.njk
+title: Home
+description: Eleventy fixture home content for search testing
+---
+<p>Eleventy fixture home content for search testing. This page demonstrates the
+Rangefind plugin indexing a real Eleventy build and mounting the search box.</p>
+
+{% rangefindSearch { placeholder: "Search the docs", theme: true, pageSize: 5, inputClass: "rf-input w-full" } %}

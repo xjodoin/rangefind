@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="{{ .Site.Language.Lang }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ .Title }} · {{ .Site.Title }}</title>
+    {{/* Render the search box in the page head so its script/link/element
+         tags are present in the built HTML the fixture test asserts on. */}}
+    {{ partial "rangefind-search.html" . }}
+  </head>
+  <body>
+    <main>
+      {{ block "main" . }}{{ end }}
+    </main>
+  </body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "name": "eleventy-plugin-rangefind",
+  "version": "0.2.0",
+  "description": "Eleventy plugin that indexes your built site with Rangefind (static index + HTTP Range requests, no search server) and drops in the search Web Component.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "Xavier Jodoin <xavier@jodoin.me>",
+  "keywords": [
+    "eleventy",
+    "eleventy-plugin",
+    "search",
+    "static-search",
+    "rangefind",
+    "range-requests"
+  ],
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "for f in index.js src/*.js test/*.js test/fixture/*.js test/fixture/src/_includes/*.njk; do case \"$f\" in *.js) node --check \"$f\";; esac; done",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "rangefind": "file:../.."
+  },
+  "peerDependencies": {
+    "@11ty/eleventy": ">=2.0.0"
+  },
+  "devDependencies": {
+    "@11ty/eleventy": "^3.0.0"
+  }
+}

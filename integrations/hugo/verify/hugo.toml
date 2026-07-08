@@ -1,0 +1,5 @@
+baseURL = "http://localhost:1313/"
+title = "Rangefind Hugo Fixture"
+
+# Keep the fixture output deterministic and easy to assert against.
+disableKinds = ["RSS", "sitemap", "taxonomy", "term"]

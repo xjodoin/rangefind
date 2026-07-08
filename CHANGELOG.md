@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Static site generator adapters**: real, independently installable
+  packages for [Astro](packages/rangefind-astro) (`astro:build:done` +
+  `<RangefindSearch />`), [Eleventy](packages/eleventy-plugin-rangefind)
+  (`eleventy.after` + a universal `{% rangefindSearch %}` shortcode), and
+  [Docusaurus](packages/docusaurus-plugin-rangefind) (`postBuild` +
+  `injectHtmlTags`), each running the crawler against the generator's own
+  build output and copying the search component's assets in automatically.
+  [Hugo](integrations/hugo) (no plugin system — a documented
+  `hugo && rangefind build public` recipe plus a `relURL`-based partial) and
+  [MkDocs](integrations/mkdocs-rangefind) (a real pip-installable Python
+  plugin on `on_post_build`/`on_post_page` that shells out to the Node CLI)
+  round out the five. Every adapter is verified end to end against the real
+  tool — a real Astro/Eleventy/Docusaurus build, a Homebrew-installed Hugo
+  binary, and a pip-installed MkDocs — crawling a fixture site and confirming
+  the index is actually searchable through Rangefind's own runtime.
+
 - **Multilingual analysis** (`analysis` config block, `multi-v1` profile):
   per-document language via `languageField` or script + stopword detection;
   per-language light stemmers (en, fr, de, es, it, pt, nl, sv, no, da, fi,

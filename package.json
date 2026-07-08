@@ -34,10 +34,15 @@
     ".": "./src/runtime.js",
     "./browser": "./dist/runtime.browser.js",
     "./element": "./dist/rangefind-search.js",
+    "./element.css": "./dist/rangefind-search.css",
     "./builder": "./src/builder.js",
+    "./crawler": "./src/crawler.js",
     "./analysis": "./src/analysis.js",
     "./terms": "./src/terms.js"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "files": [
     "bin/",
     "dist/",
@@ -92,7 +97,7 @@
     "bench:frwiki:search-game": "node scripts/search_benchmark_game.mjs",
     "bench:frwiki:search-game-profile": "node scripts/search_benchmark_game_profile.mjs",
     "check": "for f in bin/rangefind.js src/*.js scripts/*.mjs test/*.js dist/*.js examples/wiki-search/scripts/*.mjs examples/wiki-search/public/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
     "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",
     "test:all": "npm run build:browser && npm run build:element && npm run check && npm test && npm run test:smoke"
   },

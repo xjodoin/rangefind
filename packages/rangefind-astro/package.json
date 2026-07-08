@@ -1,0 +1,46 @@
+{
+  "name": "rangefind-astro",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Astro integration for Rangefind — builds a static search index at `astro build` time and ships a drop-in search component.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Xavier Jodoin <xavier@jodoin.me>",
+  "keywords": [
+    "astro",
+    "astro-integration",
+    "astro-component",
+    "search",
+    "static-search",
+    "rangefind"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./RangefindSearch.astro": "./src/RangefindSearch.astro",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/build.test.js"
+  },
+  "dependencies": {
+    "rangefind": "file:../.."
+  },
+  "peerDependencies": {
+    "astro": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "astro": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "astro": "^5.13.0"
+  }
+}

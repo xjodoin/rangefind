@@ -1,0 +1,3 @@
+node_modules/
+test/fixture/_site/
+test/fixture/node_modules/

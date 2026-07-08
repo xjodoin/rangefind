@@ -192,6 +192,30 @@ serve:example`) at `/component.html` (theme) and `/component-tailwind.html`
 [reference guide](docs/reference.md#search-ui-component) for every attribute,
 the full class-hook list, events, and accessibility notes.
 
+## Static Site Generator Adapters
+
+The crawler and the search component compose naturally with any static site
+generator's own build lifecycle — an adapter runs the crawl right after the
+generator writes its output and drops the client assets in for you, so there's
+nothing to wire up by hand beyond installing it.
+
+| Generator | Package | How it hooks in |
+| --- | --- | --- |
+| [Astro](https://astro.build) | [`rangefind-astro`](packages/rangefind-astro) | Real integration on `astro:build:done`, plus a `<RangefindSearch />` component. |
+| [Eleventy](https://www.11ty.dev) | [`eleventy-plugin-rangefind`](packages/eleventy-plugin-rangefind) | Real plugin on `eleventy.after`, plus a universal `{% rangefindSearch %}` shortcode. |
+| [Docusaurus](https://docusaurus.io) | [`docusaurus-plugin-rangefind`](packages/docusaurus-plugin-rangefind) | Real plugin on `postBuild` + `injectHtmlTags`; drop `<rangefind-search>` into a navbar item or MDX. |
+| [Hugo](https://gohugo.io) | [`integrations/hugo`](integrations/hugo) | Hugo has no plugin loader, so this is a `hugo && rangefind build public` recipe plus a copy-paste partial. |
+| [MkDocs](https://www.mkdocs.org) | [`mkdocs-rangefind`](integrations/mkdocs-rangefind) (PyPI) | A real Python plugin (`on_post_build` / `on_post_page`) that shells out to the Node CLI and auto-injects the widget into every page. |
+
+Astro, Eleventy, and Docusaurus are each real, independently installable
+packages under `packages/` (built with zero dependencies beyond the target
+generator itself); Hugo and MkDocs live under `integrations/` since neither
+has an npm-based plugin system of its own. Every one of them is verified
+end to end against the real tool — a real Astro/Eleventy/Docusaurus build, a
+Homebrew-installed Hugo binary, and a pip-installed MkDocs — crawling a
+fixture site and confirming the resulting index actually answers a search
+query. See each package's own README for install instructions and options.
+
 ## Full Wikipedia Search Site
 
 The `examples/wiki-search` project is a fuller static search application for

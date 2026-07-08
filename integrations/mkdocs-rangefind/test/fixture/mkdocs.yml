@@ -1,0 +1,11 @@
+site_name: Rangefind MkDocs Fixture
+site_url: https://example.com/
+docs_dir: docs
+site_dir: site
+
+plugins:
+  - rangefind:
+      # Point the CLI at the local repo checkout via the node_modules symlink
+      # the test creates, so the build works offline in CI.
+      node_command: npx
+      theme: true

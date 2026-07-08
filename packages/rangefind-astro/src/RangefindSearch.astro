@@ -1,0 +1,45 @@
+---
+// Thin, faithful passthrough to the `<rangefind-search>` web component. All
+// behavior lives in the component itself; this only wires up the client asset
+// URLs and maps props onto the element's real attributes (see the monorepo's
+// docs/reference.md "Search UI component" section for every attribute + class
+// hook). Headless by default — the optional theme stylesheet is linked only
+// when `theme` is truthy.
+
+// The web component's real config attributes (from src/rangefind_search_element.js
+// CONFIG_ATTRS). `src` is handled explicitly below.
+const CONFIG_ATTRS = [
+  "placeholder", "page-size", "debounce", "min-length", "highlight",
+  "suggest", "router", "open-on-focus", "hotkey", "label", "empty-text",
+  "loading-text", "error-text"
+];
+
+const {
+  src = "/rangefind/",
+  assetsBase = "/_rangefind/",
+  theme = false,
+  placeholder,
+  ...rest
+} = Astro.props;
+
+// Build the attribute map for the custom element. Only known config attributes
+// and per-part `*-class` attributes pass through — nothing is invented.
+const attrs = { src };
+if (placeholder !== undefined && placeholder !== null) attrs.placeholder = placeholder;
+for (const [key, value] of Object.entries(rest)) {
+  if (value === undefined || value === null) continue;
+  if (!CONFIG_ATTRS.includes(key) && !/-class$/.test(key)) continue;
+  // Faithful boolean mapping: `true` -> bare attribute, `false` -> "false"
+  // (so e.g. highlight={false} actually disables it), else the string value.
+  if (value === true) attrs[key] = "";
+  else if (value === false) attrs[key] = "false";
+  else attrs[key] = String(value);
+}
+
+const base = String(assetsBase).endsWith("/") ? assetsBase : `${assetsBase}/`;
+const scriptSrc = `${base}rangefind-search.js`;
+const styleHref = `${base}rangefind-search.css`;
+---
+{theme && <link rel="stylesheet" href={styleHref} />}
+<script is:inline type="module" src={scriptSrc}></script>
+<rangefind-search {...attrs}></rangefind-search>

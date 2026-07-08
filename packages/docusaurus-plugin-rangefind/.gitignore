@@ -1,0 +1,4 @@
+node_modules/
+test/fixture/build/
+test/fixture/.docusaurus/
+test/fixture/node_modules/

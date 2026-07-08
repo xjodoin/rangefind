@@ -1,0 +1,6 @@
+{
+  "name": "rangefind-docusaurus-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal Docusaurus site for docusaurus-plugin-rangefind's end-to-end test. Dependencies are resolved from the parent package's node_modules."
+}

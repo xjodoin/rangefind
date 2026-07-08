@@ -1,0 +1,12 @@
+# Python / packaging artifacts, scoped to this integration directory.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Test artifacts written during the run.
+.pytest_cache/
+test/fixture/site/
+test/fixture/node_modules/
