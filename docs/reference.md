@@ -58,7 +58,8 @@ Package exports:
 | `rangefind` → `src/runtime.js` | `createSearch` (Node ESM source) |
 | `rangefind/browser` → `dist/runtime.browser.js` | bundled ESM runtime for the browser |
 | `rangefind/builder` → `src/builder.js` | `build({ configPath })` |
-| `rangefind/analyzer` → `src/analyzer.js` | `tokenize`, `fold`, `stem`, `analyzeTerms` |
+| `rangefind/analysis` → `src/analysis.js` | `createAnalyzer`, `analyzerForConfig`, `analyzerFromManifest`, `normalizeAnalysisConfig`, `DEFAULT_ANALYZER` |
+| `rangefind/terms` → `src/terms.js` | term/query-bundle helpers (`expandedTermsFromBaseTerms`, `queryBundleKeysFromBaseTerms`, …) |
 | `rangefind` bin | the `rangefind build` CLI |
 
 In the browser, import the bundle so no source resolution is needed:
@@ -91,6 +92,73 @@ import { build } from "rangefind/builder";
 await build({ configPath: "rangefind.config.json" });
 await build({ configPath: "delta.config.json", update: true });
 ```
+
+### Crawling a static site
+
+Instead of authoring JSONL, point Rangefind at a built static site and it
+extracts and indexes the HTML directly:
+
+```bash
+rangefind build ./dist [--output <dir>] [--base-url <url>] [--root <dir>]
+```
+
+- `<dir>` — the directory to crawl (mutually exclusive with `--config`).
+- `--output` — index output directory (default `<dir>/rangefind`). A nested
+  output directory is pruned from the crawl automatically.
+- `--base-url` — URL prefix or origin for result URLs (default `"/"`). A path
+  like `/blog/` prefixes every URL; an absolute origin like
+  `https://example.com/` produces absolute URLs.
+- `--root` — directory whose relative paths define ids and URLs (default
+  `<dir>`); useful when scanning a subtree of a larger site.
+
+The crawler walks every `.html`/`.htm` file (skipping dotfiles and
+`node_modules`), extracts each page, writes a JSONL corpus plus an inferred
+config to a temp work dir, and runs the normal builder against them. The work
+dir is removed on success and preserved (with its path logged) on failure.
+
+**Extraction rules.** For each page:
+
+- **Title** — first non-empty of a `data-rangefind-meta="title"` value, the
+  first `<h1>`, then `<title>`.
+- **Headings** — the text of `<h1>`–`<h4>`, space-joined, into a `headings`
+  field.
+- **Body** — if any element carries `data-rangefind-body`, only the text inside
+  those; otherwise the text of `<main>`, else `<article>`, else `<body>`. The
+  subtrees of `<script>`, `<style>`, `<template>`, `<noscript>`, `<nav>`,
+  `<aside>`, and any element with `data-rangefind-ignore` or `hidden` are always
+  excluded. `<header>`/`<footer>` are excluded only when the fallback `<body>`
+  region is selected (no `<main>` or `<article>` present) — inside a real
+  `<main>`/`<article>` region they are trusted as content, so an in-article
+  post header and its `<h1>` are indexed. Whitespace is collapsed and HTML
+  entities (named and numeric) are decoded.
+- **Language** — `<html lang="fr-CA">` reduces to its primary subtag (`fr`) and
+  becomes the per-document `lang` field.
+- **Description** — `<meta name="description">` becomes a `description` field.
+- **URL** — an `index.html` collapses to its directory URL with a trailing
+  slash (`docs/guide/index.html` → `/docs/guide/`); any other page becomes a
+  pretty, extension-less path (`about.html` → `/about`).
+- **Id** — the collapsed URL slug (`docs/guide`), falling back to the raw
+  relative path on collision so ids stay unique and deterministic.
+
+**`data-rangefind-*` attributes** (the `rangefind` namespace mirrors Pagefind):
+
+| Attribute | Effect |
+| --- | --- |
+| `data-rangefind-body` | Restrict body indexing to the marked elements only. |
+| `data-rangefind-ignore` | Drop this element's subtree; on `<html>` or `<body>` the whole page is skipped. |
+| `data-rangefind-meta="name"` | Capture the element text as metadata `name`. The `"name:attr"` form reads the named attribute instead (e.g. `data-rangefind-meta="date:datetime"`). First value wins. |
+| `data-rangefind-filter="key"` | Add the element text as a facet value under `key`; the same key may repeat for multi-valued facets. |
+| `data-rangefind-sort="key"` | Use the element text as a sort value under `key`. |
+
+**Inferred config.** Only fields that actually appear are configured. `title`
+(weight 4.5, phrase), `headings` (weight 2.0), and `body` (weight 1.0) become
+text fields; each `data-rangefind-filter` key becomes a `facets` entry;
+`display` is `["title", "url"]` plus `description` (when present) and a 300-char
+`excerpt` from the body; `analysis` uses the union of discovered `lang` values
+(or the `["en", "fr"]` default) with `languageField: "lang"`. Each
+`data-rangefind-sort` key whose values all parse as numbers or dates becomes a
+sortable `numbers` column; keys with non-numeric values are exposed as facets
+instead. `resumeBuild` is disabled for crawl builds.
 
 ### Output
 

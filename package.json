@@ -34,7 +34,8 @@
     ".": "./src/runtime.js",
     "./browser": "./dist/runtime.browser.js",
     "./builder": "./src/builder.js",
-    "./analyzer": "./src/analyzer.js"
+    "./analysis": "./src/analysis.js",
+    "./terms": "./src/terms.js"
   },
   "files": [
     "bin/",

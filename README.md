@@ -14,6 +14,9 @@ a large thesis corpus.
 ## What Is Implemented
 
 - JSONL document input.
+- Static-site crawler: `rangefind build ./dist` indexes built HTML directly,
+  with `data-rangefind-*` attributes for body scoping, metadata, facets, and
+  sorts.
 - Schema-driven weighted fields.
 - BM25F-style field scoring.
 - Phrase signals for title/heading fields.
@@ -104,6 +107,40 @@ npm run serve:example
 ```
 
 Open `http://localhost:5178/`.
+
+## Crawl A Static Site
+
+If you already have a built static site (from any generator), point Rangefind at
+the output directory and it indexes the HTML directly — no JSONL to author:
+
+```bash
+npx rangefind build ./dist
+```
+
+This crawls every `.html`/`.htm` file under `./dist`, extracts the title,
+headings, and main body text, and writes the index to `./dist/rangefind` (change
+it with `--output`). Result URLs default to site-root paths (`--base-url` sets a
+prefix or origin, e.g. `--base-url https://example.com/`). Deploy the site and
+load the index with `createSearch({ baseUrl: "/rangefind/" })`.
+
+Content selection follows the document: the crawler indexes `<main>`, else
+`<article>`, else `<body>`, and always drops `<script>`, `<style>`, `<nav>`, and
+`<aside>`. `<header>`/`<footer>` are dropped only when the fallback `<body>`
+region is used (no `<main>`/`<article>`), so an in-article post header and its
+`<h1>` are still indexed. Opt-in `data-rangefind-*` attributes
+(mirroring Pagefind's vocabulary) tune it:
+
+| Attribute | Effect |
+| --- | --- |
+| `data-rangefind-body` | Index only the text inside marked elements. |
+| `data-rangefind-ignore` | Drop this subtree (on `<html>`/`<body>` skips the page). |
+| `data-rangefind-meta="name"` | Capture element text as metadata `name` (`"name:attr"` reads an attribute). |
+| `data-rangefind-filter="key"` | Add the element text as a facet value under `key`. |
+| `data-rangefind-sort="key"` | Use the element text as a sortable value `key`. |
+
+Per-document language comes from `<html lang="…">` and the page description from
+`<meta name="description">`. See the
+[reference guide](docs/reference.md#crawling-a-static-site) for the full rules.
 
 ## Full Wikipedia Search Site
 

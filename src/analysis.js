@@ -351,13 +351,13 @@ function createMultiAnalyzer(profile) {
     // budget (SKIP_MAX_TERMS) so extra languages never silently push a
     // query onto the full-scan path.
     const altPlans = [];
-    const seenPlans = new Set([baseTerms.join(" ")]);
+    const seenPlans = new Set([baseTerms.join("\0")]);
     for (const alt of profile.languages) {
       if (alt === language) continue;
       const altAnalyzed = analyzeTerms(text, { lang: alt });
       if (!altAnalyzed.length) continue;
       const altBase = altAnalyzed.map(item => item.term);
-      const key = altBase.join(" ");
+      const key = altBase.join("\0");
       if (seenPlans.has(key)) continue;
       seenPlans.add(key);
       altPlans.push({ language: alt, analyzedTerms: altAnalyzed, baseTerms: altBase });
