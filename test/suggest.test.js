@@ -301,6 +301,54 @@ test("suggestions agree with an exhaustive oracle (branch-paged root)", async ()
   });
 });
 
+test("title authority provides bounded autocomplete without a suggestion sidecar", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-authority-suggest-"));
+  const docsPath = join(root, "docs.jsonl");
+  const output = join(root, "public", "rangefind");
+  const configPath = join(root, "rangefind.config.json");
+  const titles = [
+    "Artificial intelligence",
+    "Artificial Intelligence Act",
+    "Artificial Intelligence: A Modern Approach",
+    "Artificial intelligence and copyright",
+    "Café Alpha",
+    "Cafe Beta"
+  ];
+  await writeFile(docsPath, titles.map((title, id) => JSON.stringify({ id, title, body: title })).join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    fields: [{ name: "title", path: "title", weight: 4.5, b: 0.55 }],
+    authority: [{ name: "title", path: "title" }],
+    authorityBaseShardDepth: 3,
+    authorityMaxShardDepth: 8,
+    authorityTargetShardRows: 1,
+    display: ["title"]
+  }));
+  await build({ configPath });
+  const manifest = JSON.parse(await readFile(join(output, "manifest.min.json"), "utf8"));
+  assert.equal(manifest.features.suggest, false);
+  assert.ok(manifest.authority.shards > 1);
+  const server = await serveStatic(join(root, "public"));
+  try {
+    const engine = await createSearch({ baseUrl: server.baseUrl });
+    const response = await engine.suggest({ q: "artificial int", size: 3 });
+    assert.deepEqual(response.suggestions.map(item => item.text), [
+      "Artificial intelligence",
+      "Artificial Intelligence: A Modern Approach",
+      "Artificial Intelligence Act"
+    ]);
+    assert.equal(response.stats.exact, true);
+    assert.equal(response.stats.suggestLane, "authority-title");
+    assert.ok(response.stats.suggestShardsVisited > 0);
+
+    const folded = await engine.suggest({ q: "cafe", size: 2 });
+    assert.deepEqual(folded.suggestions.map(item => item.text), ["Café Alpha", "Cafe Beta"]);
+  } finally {
+    await server.close();
+  }
+});
+
 test("indexes without suggest fields reject suggest queries clearly", async () => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-nosuggest-"));
   const docsPath = join(root, "docs.jsonl");

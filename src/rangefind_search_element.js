@@ -250,7 +250,10 @@ export class RangefindSearchElement extends HTMLElement {
     if (cfg === false) return false;
     if (cfg === true) return true; // try anyway; degrade silently on failure
     const manifest = this._engine?.manifest;
-    return Boolean(manifest?.features?.suggest ?? manifest?.suggest);
+    const hasAuthorityTitles = manifest?.authority?.fields?.length === 1
+      && manifest.authority.fields[0].path === "title"
+      && manifest.authority.fields[0].exact !== false;
+    return Boolean(manifest?.features?.suggest || manifest?.suggest || hasAuthorityTitles);
   }
 
   // --- Query flow -----------------------------------------------------------

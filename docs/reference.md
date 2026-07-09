@@ -346,6 +346,11 @@ labels win without distorting posting scores.
 - `weight` — base weight; `surfaceWeight` (default `2×exactWeight`),
   `exactWeight` (default `weight`), and `tokenWeight` (default `0.8×weight`)
   tune the diacritic-exact, folded-exact, and token match tiers.
+- If the index has exactly one authority field at path `title` and no
+  `suggest` sidecar, `engine.suggest()` reuses its folded exact-key shards for
+  bounded, exact title-prefix autocomplete. This avoids duplicating millions
+  of titles during a large build. It does not provide custom popularity
+  weighting or mid-label token completion.
 
 ### `geo`
 
@@ -608,8 +613,8 @@ early-stopped totals and sampled facet counts.
   filters/sort/geo/vector). Returns `{ total, totalExact, approximate, stats }`.
 - **`engine.suggest({ q, size = 8 })`** — autocomplete. Returns
   `{ q, prefix, suggestions: [{ text, weight, count }], stats }`. `size`
-  clamped to 50. (Which fields feed suggestions is fixed at build time by the
-  `suggest` config, not chosen per query.)
+  clamped to 50. Sources are fixed at build time: the `suggest` config when
+  present, otherwise a single `title` authority field when available.
 - **`engine.vectorSearch({ vector, field?, k = 10, nprobe = 8, refineFactor = 8,
   refine = true, includeResults })`** — pure vector top-k with real cosine
   scores. `k` clamped to 200, `nprobe` to the cluster count, `refineFactor` to
@@ -629,7 +634,8 @@ Notable fields:
 - Geo: `geoLane` (`browse` | `nearest` | `nearestText` | `textDocSet` |
   `textDocValues`), `geoCandidateLeaves`, `geoLeavesVisited`,
   `geoPointsScanned`, `geoPointsAccepted`.
-- Suggest: `suggestLane` (`hot` | `range`), `suggestPagesVisited`,
+- Suggest: `suggestLane` (`hot` | `range` | `authority-title`),
+  `suggestPagesVisited` or `suggestShardsVisited`, and
   `suggestEntriesScanned`.
 - Facet counts: `facetCountLane` (`dictionary` | `text-match-set` |
   `chunk-scan` | `global-fallback`).
@@ -673,7 +679,7 @@ All optional except `src`.
 | `debounce` | `150` | Debounce in ms before searching (0–5000). |
 | `min-length` | `1` | Minimum query length before searching. |
 | `highlight` | on | `<mark>` matched terms. `highlight="false"` disables. |
-| `suggest` | `auto` | Autocomplete. `auto` = on iff the index has a suggest sidecar; `true`/`false` force it. |
+| `suggest` | `auto` | Autocomplete. `auto` = on iff the index has a suggest sidecar or one reusable `title` authority field; `true`/`false` force it. |
 | `router` | off | Sync `?q=` to the URL (`history.replaceState`) and seed from it on load. |
 | `open-on-focus` | off | Reopen results when the input regains focus. |
 | `hotkey` | off | Press `/` anywhere (outside inputs) to focus the box. |

@@ -73,6 +73,34 @@ postings in 13.4 seconds. The 128-block lane kept the same top result in about
 128 milliseconds (roughly 105 times faster). Callers can pass
 `topKBlockBudget: 0` or request exact search when exhaustive proof matters.
 
+## Full-corpus autocomplete and typo recovery
+
+The full build intentionally omitted the dedicated suggestion sidecar. The
+runtime now reuses the existing 21.1-million-key title authority index for
+prefix completion, avoiding a second multi-million-title map during the scan
+and a duplicate on-disk autocomplete structure. A cold local request reads the
+contiguous authority shard range, stops after eight equal-weight title keys,
+and hydrates only those documents.
+
+| Prefix | Time | Authority shards | First suggestion |
+| --- | ---: | ---: | --- |
+| `m` | 30 ms | 2 | M |
+| `mach` | 17 ms | 4 | Mach 1 |
+| `artificial int` | 20 ms | 3 | Artificial intelligence |
+| `cafe` | 17 ms | 3 | @Cafe |
+
+Each trace visited two small directory pages and scanned exactly eight matching
+entries. The lane is exact for the single configured title authority field;
+the richer suggestion sidecar is still appropriate for custom popularity
+weights or mid-title token completion.
+
+A full-corpus collision case also exposed a typo-planning weakness:
+`artificial inteligence` had zero joint hits even though the rare misspelling
+was itself an indexed term. Correcting tokens in query order spent the bounded
+shard budget on variants of the common word `artificial`. Zero-hit conflict
+recovery now probes tokens in ascending document-frequency order, producing
+`artificial intelligence` in 115 ms while retaining the same 12-shard cap.
+
 ## Scale-only defects found by the run
 
 - Auto-codec sampling could loop forever after seeding both endpoints.
@@ -83,6 +111,10 @@ postings in 13.4 seconds. The 128-block lane kept the same top result in about
   terms. The first full reducer emitted 1,693 duplicate keys; the corrected run
   emitted 77,433 records and 77,433 unique keys.
 - Extraction and JSONL prefix writes ignored stream backpressure.
+- Zero-hit typo recovery could exhaust its shard budget on a common first token
+  before examining a rare, valid-but-conflicting misspelling.
+- Building a second full-title suggestion map was unnecessary: the sorted title
+  authority keys now provide bounded prefix autocomplete directly.
 
 The full external artifact is under
 `/Volumes/RangefindWiki/rangefind/enwiki-full`; the served index is under its

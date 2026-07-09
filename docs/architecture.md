@@ -440,6 +440,15 @@ Query execution is exact top-k:
 Deeper keystrokes narrow the same key range, so they usually hit pages the
 session already cached and cost zero requests.
 
+When an index omits this sidecar but has exactly one `title` authority field,
+the runtime uses the authority index's folded exact keys as a zero-duplication
+fallback. It binary-searches the authority directory for the prefix's
+contiguous leaf-shard range, stops after the first `k` equal-weight title keys,
+and hydrates only those documents. Recursive hot-shard splits are handled by
+the same range walk, so the builder never needs a global in-memory title map
+for full-corpus prefix completion. The dedicated sidecar remains the richer
+lane for weighted ranking and mid-label token prefixes.
+
 ## Vector Index
 
 `vectors` config fields build a range-addressed IVF index for cosine

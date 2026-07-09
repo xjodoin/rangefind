@@ -295,7 +295,10 @@ function hideSuggestions() {
 async function showSuggestions() {
   const q = queryInput.value.trim();
   const token = ++suggestToken;
-  if (!engine?.manifest?.features?.suggest || q.length < 1) {
+  const hasAuthorityTitles = engine?.manifest?.authority?.fields?.length === 1
+    && engine.manifest.authority.fields[0].path === "title"
+    && engine.manifest.authority.fields[0].exact !== false;
+  if ((!engine?.manifest?.features?.suggest && !hasAuthorityTitles) || q.length < 1) {
     hideSuggestions();
     return;
   }

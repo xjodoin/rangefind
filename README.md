@@ -40,7 +40,8 @@ a large thesis corpus.
 - Range-packed result payloads with capped display fields.
 - Range-addressable posting-block sidecar for high-df terms.
 - Optional authority sidecar for exact title/entity/alias rescue without
-  changing the main inverted index.
+  changing the main inverted index; a single title authority also supplies
+  bounded prefix autocomplete without a second large build structure.
 - Range-packed binary facet dictionaries for high-cardinality metadata.
 - File-backed build pipeline with immutable posting segments, selected-term
   spools, raw/compressed document spools, heap-based segment merge, and sampled
@@ -346,7 +347,10 @@ correction.
 titles, entity names, product names, slugs, and aliases. The runtime first tries
 a diacritic-preserving surface-exact key, then falls back to folded exact and
 token keys only when needed, so common title rescue stays precise and cheap
-without forcing all label logic into the BM25 posting lists.
+without forcing all label logic into the BM25 posting lists. If `title` is the
+only authority field and no `suggest` sidecar exists, `engine.suggest()` reuses
+its folded, prefix-partitioned keys. This is useful for multi-million-document
+indexes: autocomplete adds no duplicate build-time title map or on-disk index.
 
 Build:
 
@@ -413,7 +417,8 @@ box filters are exact (bounding-box prune plus Haversine verification), and
 `geoPointsScanned`, ...). See `examples/osm-geo/` for an OpenStreetMap-scale
 example and benchmark.
 
-Search-as-you-type suggestions come from a dedicated static sidecar:
+Weighted and mid-label search-as-you-type suggestions come from a dedicated
+static sidecar:
 
 ```json
 {
@@ -432,6 +437,12 @@ Ranking uses an optional `weightPath` (for example population or importance)
 and falls back to popularity — how many documents share the surface. Each
 keystroke costs at most a few small range requests; repeat keystrokes in a
 session are usually served entirely from cache.
+
+For title-prefix completion only, a single
+`authority: [{ "name": "title", "path": "title" }]` field is also sufficient.
+The runtime walks the first matching authority shards in key order and hydrates
+only the requested titles. Use the dedicated `suggest` sidecar when you need
+custom popularity weights or mid-label completion.
 
 Facet counts for filter UIs come back with the search response:
 

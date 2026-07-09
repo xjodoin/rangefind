@@ -582,6 +582,44 @@ export async function createSearch(options = {}) {
     });
   }
 
+  // Returns the first leaf shards whose key ranges overlap `prefix`. Unlike
+  // exact directory lookup this also handles a hot prefix whose base shard was
+  // recursively split (for example `x|a` -> `x|aa`, `x|ab`, ...). Directory
+  // pages are already key sorted, so autocomplete can stop as soon as it has
+  // enough equal-weight authority rows without materializing the full tree.
+  async function directoryEntriesForPrefix(state, prefix, maxEntries) {
+    const root = await loadDirectoryRoot(state);
+    const upper = prefix + String.fromCharCode(0xffff);
+    let lo = 0;
+    let hi = root.pages.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (root.pages[mid].last < prefix) lo = mid + 1;
+      else hi = mid;
+    }
+    const start = Math.max(0, lo - 1); // an unsplit ancestor can sort before prefix
+    const found = [];
+    let pagesVisited = 0;
+    let truncated = false;
+    for (let index = start; index < root.pages.length; index++) {
+      const page = root.pages[index];
+      if (page.first > upper && !prefix.startsWith(page.first)) break;
+      if (page.last < prefix && index !== start) continue;
+      const entries = await loadDirectoryPage(state, page);
+      pagesVisited++;
+      for (const [shard, entry] of entries) {
+        if (!prefix.startsWith(shard) && !shard.startsWith(prefix)) continue;
+        if (found.length >= maxEntries) {
+          truncated = true;
+          break;
+        }
+        found.push({ shard, entry });
+      }
+      if (truncated) break;
+    }
+    return { entries: found, pagesVisited, truncated };
+  }
+
   async function loadCodes() {
     if (codes) return codes;
     if (!codesPromise) codesPromise = fetchGzipArrayBuffer(new URL("codes.bin.gz", baseUrl)).then(parseCodes);
@@ -5762,12 +5800,23 @@ export async function createSearch(options = {}) {
     const presentTerms = new Map((await termEntries(baseTerms)).map(item => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some(term => !presentTerms.has(term));
     const plans = new Map();
-    const debug = { shards: new Set(), candidates: 0, scanned: 0 };
+    const debug = { shards: new Set(), candidates: 0, scanned: 0, tokens: [] };
 
-    for (let index = 0; index < analyzedTerms.length; index++) {
+    // If every token exists but their intersection is empty, a rare typo can
+    // masquerade as a legitimate term. Probe the lowest-df token first so a
+    // common leading word cannot consume the shared shard budget on obscure
+    // variants before the conflicting token is examined.
+    const candidateIndexes = analyzedTerms
+      .map((_, index) => index)
+      .filter(index => !hasMissingTerms || !presentTerms.has(analyzedTerms[index].term))
+      .sort((left, right) => (
+        (presentTerms.get(analyzedTerms[left].term) ?? -1) - (presentTerms.get(analyzedTerms[right].term) ?? -1)
+        || left - right
+      ));
+    for (const index of candidateIndexes) {
       const item = analyzedTerms[index];
-      if (presentTerms.has(item.term) && hasMissingTerms) continue;
       const candidates = await typoCandidatesForToken(item, debug);
+      if (options.typoDebug) debug.tokens.push({ token: item.term, candidates });
       const strongCandidates = candidates.filter(item => item.score >= 0.5);
       const bestScore = strongCandidates[0]?.score || 0;
       const minScore = bestScore >= 1 ? bestScore * TYPO_CORRECTION_RELATIVE_SCORE : 0.5;
@@ -5806,7 +5855,11 @@ export async function createSearch(options = {}) {
         typoCorrectionBestUpperBound: selectedPlans[0]?.estimatedUpperBound || 0,
         typoShardLookups: debug.shards.size,
         typoCandidateShardLookups: debug.shards.size,
-        typoCandidateTermsScanned: debug.scanned
+        typoCandidateTermsScanned: debug.scanned,
+        ...(options.typoDebug ? {
+          typoDebugTokens: debug.tokens,
+          typoDebugPlans: sortedPlans
+        } : {})
       }
     };
   }
@@ -6529,15 +6582,85 @@ export async function createSearch(options = {}) {
     return summaries.slice(start, end + 1);
   }
 
-  async function executeSuggest(params = {}) {
-    if (!manifest.suggest?.directory?.file) {
-      throw new Error("Rangefind: this index has no suggestion sidecar (configure `suggest` fields at build time).");
+  function authoritySuggestField() {
+    const fields = (manifest.authority?.fields || []).filter(field => field.exact !== false);
+    if (fields.length !== 1) return null;
+    const field = fields[0];
+    // Authority rows intentionally store only doc ids and scores. The title is
+    // guaranteed to be present in every hydrated payload, while arbitrary
+    // authority fields may not be part of `display`; only use the lossless case.
+    return field.path === "title" ? field : null;
+  }
+
+  async function executeAuthoritySuggest(params, q, prefix, size) {
+    const field = authoritySuggestField();
+    if (!authorityDirectory || options.authority === false || !field) return null;
+    const keyPrefix = `x|${prefix}`;
+    const maxShards = Math.max(1, Math.min(64, Math.floor(Number(
+      params.authorityMaxShards ?? options.authoritySuggestMaxShards ?? 16
+    ))));
+    const range = await directoryEntriesForPrefix(authorityDirectory, keyPrefix, maxShards);
+    const candidates = [];
+    let shardsVisited = 0;
+    let entriesScanned = 0;
+    for (const shard of range.entries) {
+      const loaded = await loadAuthorityShards([shard]);
+      const data = loaded.get(shard.shard);
+      if (!data) continue;
+      shardsVisited++;
+      for (const [key, entry] of data.entries) {
+        if (key < keyPrefix) continue;
+        if (!key.startsWith(keyPrefix)) break;
+        entriesScanned++;
+        const row = entry.rows?.[0];
+        if (!row) continue;
+        candidates.push({ key, doc: row[0], weight: row[1], count: entry.total || 1 });
+        // A single title authority field gives every candidate the same
+        // exactWeight. Key order therefore proves the first k suggestions.
+        if (candidates.length >= size) break;
+      }
+      if (candidates.length >= size) break;
     }
+
+    const resultContext = { hasTextTerms: false, preferDocPages: false };
+    const docs = candidates.length
+      ? await rowsToResults(candidates.map(item => [item.doc, item.weight]), resultContext)
+      : [];
+    const suggestions = docs.map((doc, index) => ({
+      text: String(doc.title || ""),
+      weight: candidates[index].weight,
+      count: candidates[index].count
+    })).filter(item => item.text).slice(0, size);
+    const exact = candidates.length >= size || !range.truncated;
+    return {
+      q,
+      prefix,
+      suggestions,
+      stats: {
+        exact,
+        suggestLane: "authority-title",
+        suggestDirectoryPagesVisited: range.pagesVisited,
+        suggestCandidateShards: range.entries.length,
+        suggestShardsVisited: shardsVisited,
+        suggestEntriesScanned: entriesScanned,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
+
+  async function executeSuggest(params = {}) {
     const q = String(params.q || "");
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
     const prefix = suggestKey(q);
     if (!prefix) {
       return { q, prefix, suggestions: [], stats: { exact: true, suggestPagesVisited: 0, suggestEntriesScanned: 0 } };
+    }
+    if (!manifest.suggest?.directory?.file) {
+      const authorityResponse = await executeAuthoritySuggest(params, q, prefix, size);
+      if (authorityResponse) return authorityResponse;
+      throw new Error("Rangefind: this index has no suggestion sidecar or reusable title authority index (configure `suggest` fields at build time).");
     }
     const root = await loadSuggestRoot();
     const upper = prefix + String.fromCharCode(0xffff);

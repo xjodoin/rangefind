@@ -56,6 +56,41 @@ async function resumeStageFile(output, stage) {
   return join(resumeRoot, fingerprints[0], "stages", `${stage}.json`);
 }
 
+test("zero-hit typo recovery prioritizes the rare conflicting token", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-typo-collision-"));
+  const docsPath = join(root, "docs.jsonl");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, [
+    { id: "correct", title: "Artificial intelligence", body: "Artificial intelligence research" },
+    { id: "rare", title: "Intelig Telecom", body: "A telecommunications carrier" },
+    { id: "other", title: "Artificial materials", body: "Synthetic material science" }
+  ].map(JSON.stringify).join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    fields: [
+      { name: "title", path: "title", weight: 4.5, b: 0.55 },
+      { name: "body", path: "body", weight: 1, b: 0.75 }
+    ],
+    display: ["title"],
+    typoMode: "main-index",
+    baseShardDepth: 2,
+    maxShardDepth: 5,
+    targetShardPostings: 2
+  }));
+  await build({ configPath });
+  const server = await serveStatic(join(root, "public"));
+  try {
+    const search = await createSearch({ baseUrl: server.baseUrl });
+    const response = await search.search({ q: "artificial inteligence", size: 3, authority: false });
+    assert.equal(response.correctedQuery, "artificial intelligence");
+    assert.equal(response.results[0].title, "Artificial intelligence");
+    assert.equal(response.stats.typoApplied, true);
+  } finally {
+    await server.close();
+  }
+});
+
 test("builder output is searchable through the range-based runtime", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-build-"));
   const docsPath = join(root, "docs.jsonl");
