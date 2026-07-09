@@ -23,6 +23,11 @@ a large thesis corpus.
 - Adaptive posting segments.
 - Independently compressed posting segments packed into `terms/packs/*.bin`.
 - Single ESM browser runtime bundle at `dist/runtime.browser.js`.
+- Node runtime (`rangefind/node`) for MCP servers, CLIs, and SSR: same query
+  engine over local index directories (positional file reads) or remote
+  HTTP(S) indexes, with browser-equivalent caching — immutable
+  content-addressed objects cached on disk and in a memory LRU, manifests
+  revalidated with ETags.
 - Lazy paged binary range directories at `terms/directory-root.<hash>.bin.gz`
   and `terms/directory-pages/*.bin.gz`.
 - ZFS-inspired object pointers with SHA-256 verification before decompression.

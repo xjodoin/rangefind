@@ -210,16 +210,25 @@ async function inflateGzip(responseOrBuffer) {
   return new Response(stream.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 }
 
+// Injectable transport: the browser uses the platform fetch as-is, while the
+// Node runtime (src/runtime.node.js) installs a scheme-routing fetch that adds
+// file:// support and browser-equivalent HTTP caching.
+let fetchImpl = (url, init) => fetch(url, init);
+
+export function setFetchImplementation(fn) {
+  fetchImpl = typeof fn === "function" ? fn : ((url, init) => fetch(url, init));
+}
+
 async function fetchGzipArrayBuffer(url) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetch(url));
+  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url));
   if (!response.ok) throw new Error(`Unable to fetch ${url}`);
   return traceSpan(`${bucket}.inflate`, () => inflateGzip(response));
 }
 
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetch(url, {
+  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url, {
     headers: { Range: `bytes=${offset}-${offset + length - 1}` }
   }));
   if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
@@ -256,7 +265,7 @@ function facetCodeMatches(words, selected) {
 export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   async function fetchJsonIfOk(path) {
-    const response = await fetch(new URL(path, baseUrl));
+    const response = await fetchImpl(new URL(path, baseUrl));
     return response.ok ? response.json() : null;
   }
 
@@ -264,7 +273,7 @@ export async function createSearch(options = {}) {
     if (!path) return null;
     if (!String(path).endsWith(".gz")) return fetchJsonIfOk(path);
     const url = new URL(path, baseUrl);
-    const response = await fetch(url);
+    const response = await fetchImpl(url);
     if (!response.ok) return null;
     const inflated = await traceSpan("manifest.inflate", () => inflateGzip(response));
     return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder.decode(inflated)));
@@ -1168,7 +1177,7 @@ export async function createSearch(options = {}) {
     if (!segmentTermsCache.has(key)) {
       const path = segment.files?.terms?.path;
       segmentTermsCache.set(key, path
-        ? fetch(new URL(path, baseUrl)).then(response => {
+        ? fetchImpl(new URL(path, baseUrl)).then(response => {
             if (!response.ok) throw new Error(`Unable to fetch ${path}`);
             return response.arrayBuffer();
           }).then(buffer => traceSpanSync("segments.parseTerms", () => parseSegmentTerms(buffer)))

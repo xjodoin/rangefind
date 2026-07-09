@@ -32,6 +32,7 @@
   },
   "exports": {
     ".": "./src/runtime.js",
+    "./node": "./src/runtime.node.js",
     "./browser": "./dist/runtime.browser.js",
     "./element": "./dist/rangefind-search.js",
     "./element.css": "./dist/rangefind-search.css",
