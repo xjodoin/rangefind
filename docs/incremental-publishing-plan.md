@@ -45,11 +45,16 @@ existing codec works unchanged). The root manifest lists generations with
 their doc counts, global scoring statistics (merged term df / field length
 totals), and a tombstone set.
 
-> **Status**: Phase 1 shipped. `rangefind build --update` adds a delta
-> generation over an existing index; the runtime transparently merges text
-> search (with filters, highlights, facet counts), suggestions, and counts
-> across generations, with clear errors for the Phase 3 lanes (geo, vectors,
-> sorted browse). One refinement over the original design below: instead of
+> **Status**: All phases shipped. `rangefind build --update` adds a delta
+> generation over an existing index; the runtime transparently merges every
+> lane across generations — text search (with filters, highlights, facet
+> counts), suggestions, counts, sorted browse (merged by real doc-value
+> keys), geo (browse, nearest-first, radius/boosted text), vector search,
+> and hybrid (RRF fused at the merged level). `rangefind build --compact`
+> folds generations back into one index: a full rebuild from the full corpus
+> that verifies id coverage before deleting the old generation directories;
+> `--update` recommends it at 8 generations or 25% tombstones.
+> One refinement over the original design below: instead of
 > *merging* global statistics, delta builds **replicate the base
 > generations' frozen statistics** (same total, same df for known
 > vocabulary via a local scan of the base's term shards, same field-length

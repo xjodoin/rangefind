@@ -10,6 +10,7 @@ Usage:
   rangefind build <dir> [--output <dir>] [--base-url <url>] [--root <dir>]
   rangefind build --config path/to/rangefind.config.json
   rangefind build --config path/to/delta.config.json --update
+  rangefind build --config path/to/rangefind.config.json --compact
 
 Commands:
   build   Build a static range-packed search index.
@@ -24,6 +25,9 @@ Commands:
           With --config, build from a JSONL corpus described by the config.
             --update    Treat the config's input as a delta (new or replaced
                         documents) added as a new generation over the output.
+            --compact   Fold a generational index back into one index: a full
+                        rebuild (the input must be the FULL corpus) that then
+                        removes the old generation directories.
 `);
 }
 
@@ -40,6 +44,7 @@ function parseArgs(argv) {
     else if (arg === "--root") args.root = argv[++i];
     else if (arg.startsWith("--root=")) args.root = arg.slice("--root=".length);
     else if (arg === "--update") args.update = true;
+    else if (arg === "--compact") args.compact = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
     else if (arg.startsWith("--")) args.unknown = arg;
     else args.positionals.push(arg);
@@ -84,7 +89,7 @@ if (dir) {
     baseUrl: args.baseUrl || "/"
   });
 } else if (args.config) {
-  await build({ configPath: args.config, update: !!args.update });
+  await build({ configPath: args.config, update: !!args.update, compact: !!args.compact });
 } else {
   console.error("Missing directory to crawl or --config");
   usage();

@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Incremental publishing (Phases 3 & 4 — complete)**: every query lane now
+  merges across generations. Sorted browse and text + sort merge by the real
+  doc-value keys (a new `loadDocValues` helper on the engine); geo merges in
+  all three shapes (box browse, nearest-first by exact distance, radius or
+  boosted text search); vector search merges by absolute similarity; and
+  hybrid text + vector fuses reciprocal ranks at the *merged* level, so a
+  small delta generation can never hand its documents inflated per-generation
+  ranks. `rangefind build --compact` folds a generational index back into a
+  single index — a full rebuild that verifies every live document id from the
+  old generations is present in the input before deleting the `gen-NNNN/`
+  directories (and cleans up leftovers from previously failed compactions).
+  `build --update` now recommends compaction once an index crosses 8
+  generations or 25% tombstoned documents.
+
 - **Static site generator adapters**: real, independently installable
   packages for [Astro](packages/rangefind-astro) (`astro:build:done` +
   `<RangefindSearch />`), [Eleventy](packages/eleventy-plugin-rangefind)

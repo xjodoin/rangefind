@@ -79,12 +79,17 @@ const engine = await createSearch({ baseUrl: new URL("./rangefind/", location.hr
 ```bash
 rangefind build --config path/to/rangefind.config.json
 rangefind build --config path/to/delta.config.json --update
+rangefind build --config path/to/rangefind.config.json --compact
 ```
 
 - `--config <path>` — required; the JSON config below.
 - `--update` — treat the config's `input` as a delta (new or replaced
   documents) and add it as a new generation over the existing `output`
   (see [Incremental publishing](#incremental-publishing)).
+- `--compact` — fold a generational index back into a single index: a full
+  rebuild whose `input` must be the **full corpus**, followed by removal of
+  the old `gen-NNNN/` directories. Fails (keeping the generation files) if
+  any live document from the generational index is missing from the input.
 
 ### Programmatic
 
@@ -864,10 +869,21 @@ builds replicate the base generations' frozen statistics, so scores stay
 comparable across generations.
 
 The runtime detects a generational root automatically — no query changes are
-needed. Supported across generations: text search (with filters, highlights,
-facet counts), suggestions, and `count`. **Not yet supported on generational
-indexes** (they throw a clear error): geo, vector, and sorted-browse lanes;
-compact to a single generation for those. See
+needed. Every query lane merges across generations: text search (with
+filters, highlights, facet counts), suggestions, `count`, sorted browse and
+text + sort (merged by real doc-value keys), geo (box browse, nearest-first,
+radius/boosted text), vector search, and hybrid text + vector (fused at the
+merged level, so per-generation ranks never skew the fusion).
+
+Every query pays one fan-out per generation, so fold generations periodically:
+
+```bash
+# full corpus as input; removes gen-NNNN/ after verifying coverage
+rangefind build --config rangefind.config.json --compact
+```
+
+`--update` prints a compaction recommendation once an index reaches 8
+generations or 25% tombstoned documents. See
 [`incremental-publishing-plan.md`](incremental-publishing-plan.md).
 
 ---

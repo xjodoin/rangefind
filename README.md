@@ -73,8 +73,10 @@ a large thesis corpus.
 - Incremental publishing: `rangefind build --update` adds small delta
   generations over an existing index — unchanged pack bytes keep their
   content-addressed names (and CDN cache entries), replaced documents
-  tombstone their old version, and the runtime merges generations with
-  scores that stay exactly comparable.
+  tombstone their old version, and the runtime merges every lane (text,
+  sorted browse, geo, vector, hybrid, suggest, facets) across generations
+  with scores that stay exactly comparable. `rangefind build --compact`
+  folds generations back into a single index when they pile up.
 - Per-query facet counts with exact-or-flagged semantics: dictionary-backed
   global counts, exact counts over budgeted match sets, and bounded
   chunk-sampled estimates for very large result sets.

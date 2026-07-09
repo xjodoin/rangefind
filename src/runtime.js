@@ -6874,6 +6874,15 @@ export async function createSearch(options = {}) {
     return rowsToResults(rows, context);
   }
 
+  // Doc-value lookup for a handful of docs — the generational layer uses it
+  // to merge sorted pages across generations by actual sort keys.
+  async function loadDocValues(fields, indexes) {
+    if (!indexes.length) return [];
+    await ensureDocValuesManifest();
+    const store = await valueStoreForDocs(fields, indexes);
+    return indexes.map(index => Object.fromEntries(fields.map(field => [field, valueForDoc(store, field, index)])));
+  }
+
   return {
     manifest,
     analyzer,
@@ -6882,6 +6891,7 @@ export async function createSearch(options = {}) {
     suggest,
     vectorSearch,
     hydrateRows,
+    loadDocValues,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,
@@ -6910,17 +6920,116 @@ async function createGenerationalSearch(root, options, baseUrl) {
   const tombstones = generations.map(generation => new Set(generation.tombstones || []));
   const tombstoneTotal = tombstones.reduce((sum, set) => sum + set.size, 0);
 
-  function unsupported(feature) {
-    return new Error(`Rangefind: ${feature} is not yet supported on generational indexes (see docs/incremental-publishing-plan.md).`);
+  const primaryManifest = engines[0]?.manifest || {};
+  const sortableFields = new Set([
+    ...(primaryManifest.numbers || []),
+    ...(primaryManifest.booleans || [])
+  ].map(field => field.name));
+
+  // Mirrors the single-engine makeSortPlan: unknown fields fall back to the
+  // unsorted path, exactly like they would inside one generation.
+  function parseSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field || !sortableFields.has(field)) return null;
+    const order = typeof sort === "string" && sort.startsWith("-")
+      ? "desc"
+      : String(sort.order || sort.direction || "asc").toLowerCase();
+    return { field, desc: order === "desc" };
+  }
+
+  function compareMergedTies(a, b) {
+    return (b.score || 0) - (a.score || 0) || a.generation - b.generation || a.index - b.index;
+  }
+
+  // Hydrate merged rows per owning generation, then reassemble in merged
+  // order; row extras (distanceMeters, hybrid lanes) survive onto results.
+  async function hydrateMergedRows(pageRows) {
+    const byGeneration = new Map();
+    for (const row of pageRows) {
+      if (!byGeneration.has(row.generation)) byGeneration.set(row.generation, []);
+      byGeneration.get(row.generation).push(row);
+    }
+    const hydrated = new Map();
+    await Promise.all([...byGeneration.entries()].map(async ([genIndex, rows]) => {
+      const results = await engines[genIndex].hydrateRows(rows.map(row => [row.index, row.score]));
+      rows.forEach((row, i) => {
+        hydrated.set(`${genIndex}:${row.index}`, {
+          ...results[i],
+          generation: genIndex,
+          ...(row.distanceMeters != null ? { distanceMeters: row.distanceMeters } : {}),
+          ...(row.hybrid ? { hybrid: row.hybrid } : {})
+        });
+      });
+    }));
+    return pageRows
+      .map(row => hydrated.get(`${row.generation}:${row.index}`))
+      .filter(Boolean);
+  }
+
+  function mergeFacetResponses(responses) {
+    const facets = {};
+    for (const response of responses) {
+      for (const [field, data] of Object.entries(response.facets || {})) {
+        const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: new Map() });
+        target.exact = target.exact && data.exact !== false;
+        for (const item of data.values) {
+          const existing = target.byValue.get(item.value);
+          if (existing) existing.count += item.count;
+          else target.byValue.set(item.value, { ...item });
+        }
+      }
+    }
+    for (const data of Object.values(facets)) {
+      data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+      delete data.byValue;
+    }
+    return facets;
+  }
+
+  function applyMergedHighlights(params, q, results, correctedQuery) {
+    if (!params.highlight || !results.length || !q) return;
+    const highlightOptions = params.highlight === true ? {} : params.highlight;
+    // Generations are built with one frozen analysis profile, so the
+    // first engine's analyzer speaks for all of them.
+    const genAnalyzer = engines[0]?.analyzer;
+    applyHighlights(results, highlightTermSet(q, correctedQuery, genAnalyzer), { ...highlightOptions, analyzer: genAnalyzer });
+  }
+
+  function mergedResponseShell(responses, results, page, size) {
+    const correctedQuery = responses.map(response => response.correctedQuery).find(Boolean);
+    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0) - tombstoneTotal;
+    const approximate = tombstoneTotal > 0 || responses.some(response => response.approximate);
+    return {
+      total: Math.max(results.length, total),
+      results,
+      page,
+      size,
+      approximate,
+      ...(correctedQuery ? { correctedQuery, corrections: responses.find(r => r.correctedQuery)?.corrections } : {}),
+      stats: {
+        generations: engines.length,
+        generationTotals: responses.map(response => response.total || 0),
+        tombstones: tombstoneTotal
+      }
+    };
   }
 
   async function search(params = {}) {
-    if (params.geo || params.vector) throw unsupported(params.geo ? "geo search" : "vector search");
-    if (params.sort) throw unsupported("sorted browse");
+    if (params.vector) return hybridSearch(params);
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
     const offset = (page - 1) * size;
+    const sortPlan = parseSortPlan(params.sort);
+    const geoDistanceSort = params.geo?.sort === "distance";
+    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+
+    // Ordered lanes (explicit sort, nearest-first geo, geo browse) return
+    // hydrated pages per generation; the merge needs real keys, not scores.
+    if (sortPlan || geoDistanceSort || (params.geo && !q)) {
+      return orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort });
+    }
 
     const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
       ...params,
@@ -6934,72 +7043,216 @@ async function createGenerationalSearch(root, options, baseUrl) {
     for (let genIndex = 0; genIndex < responses.length; genIndex++) {
       for (const row of responses[genIndex].results || []) {
         if (tombstones[genIndex].has(row.index)) continue;
-        merged.push({ generation: genIndex, index: row.index, score: row.score || 0 });
+        merged.push({
+          generation: genIndex,
+          index: row.index,
+          score: row.score || 0,
+          ...(row.distanceMeters != null ? { distanceMeters: row.distanceMeters } : {})
+        });
       }
     }
-    if (q) merged.sort((a, b) => b.score - a.score || a.generation - b.generation || a.index - b.index);
+    if (q) merged.sort(compareMergedTies);
     const pageRows = merged.slice(offset, offset + size);
+    const results = await hydrateMergedRows(pageRows);
 
-    // Hydrate per generation, then reassemble in merged order.
-    const byGeneration = new Map();
-    for (const row of pageRows) {
-      if (!byGeneration.has(row.generation)) byGeneration.set(row.generation, []);
-      byGeneration.get(row.generation).push(row);
+    const response = mergedResponseShell(responses, results, page, size);
+    applyMergedHighlights(params, q, results, response.correctedQuery);
+    if (params.facets) response.facets = mergeFacetResponses(responses);
+    return response;
+  }
+
+  // Sorted browse, text + sort, geo browse, and nearest-first geo: each
+  // generation returns its own correctly ordered hydrated page; the merge
+  // re-orders by the actual key (doc value or meters), never by rank.
+  async function orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort }) {
+    const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
+      ...params,
+      highlight: undefined,
+      facets: params.facets,
+      page: 1,
+      size: Math.min(1000, offset + size + tombstones[genIndex].size)
+    })));
+
+    const merged = [];
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const result of responses[genIndex].results || []) {
+        if (Number.isInteger(result.index) && tombstones[genIndex].has(result.index)) continue;
+        merged.push({ generation: genIndex, index: result.index, score: result.score || 0, result });
+      }
     }
-    const hydrated = new Map();
-    await Promise.all([...byGeneration.entries()].map(async ([genIndex, rows]) => {
-      const results = await engines[genIndex].hydrateRows(rows.map(row => [row.index, row.score]));
-      rows.forEach((row, i) => {
-        hydrated.set(`${genIndex}:${row.index}`, { ...results[i], generation: genIndex });
+
+    if (sortPlan) {
+      await Promise.all(engines.map(async (engine, genIndex) => {
+        const rows = merged.filter(row => row.generation === genIndex);
+        if (!rows.length) return;
+        const values = await engine.loadDocValues([sortPlan.field], rows.map(row => row.index));
+        rows.forEach((row, i) => {
+          row.key = values[i]?.[sortPlan.field];
+        });
+      }));
+      merged.sort((a, b) => {
+        const leftMissing = a.key == null;
+        const rightMissing = b.key == null;
+        if (leftMissing || rightMissing) {
+          if (leftMissing && rightMissing) return compareMergedTies(a, b);
+          return leftMissing ? 1 : -1;
+        }
+        if (a.key !== b.key) return sortPlan.desc ? b.key - a.key : a.key - b.key;
+        return compareMergedTies(a, b);
       });
-    }));
-    const results = pageRows
-      .map(row => hydrated.get(`${row.generation}:${row.index}`))
-      .filter(Boolean);
-
-    const correctedQuery = responses.map(response => response.correctedQuery).find(Boolean);
-    if (params.highlight && results.length && q) {
-      const highlightOptions = params.highlight === true ? {} : params.highlight;
-      // Generations are built with one frozen analysis profile, so the
-      // first engine's analyzer speaks for all of them.
-      const genAnalyzer = engines[0]?.analyzer;
-      applyHighlights(results, highlightTermSet(q, correctedQuery, genAnalyzer), { ...highlightOptions, analyzer: genAnalyzer });
+    } else if (geoDistanceSort) {
+      merged.sort((a, b) => {
+        const left = a.result.distanceMeters;
+        const right = b.result.distanceMeters;
+        const leftMissing = left == null;
+        const rightMissing = right == null;
+        if (leftMissing || rightMissing) {
+          if (leftMissing && rightMissing) return compareMergedTies(a, b);
+          return leftMissing ? 1 : -1;
+        }
+        return left - right || compareMergedTies(a, b);
+      });
     }
+    // Plain geo browse keeps generation order — the single engine makes no
+    // ordering promise there either.
 
-    let facets;
-    if (params.facets) {
-      facets = {};
-      for (const response of responses) {
-        for (const [field, data] of Object.entries(response.facets || {})) {
-          const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: new Map() });
-          target.exact = target.exact && data.exact !== false;
-          for (const item of data.values) {
-            const existing = target.byValue.get(item.value);
-            if (existing) existing.count += item.count;
-            else target.byValue.set(item.value, { ...item });
-          }
+    const results = merged
+      .slice(offset, offset + size)
+      .map(row => ({ ...row.result, generation: row.generation }));
+    const response = mergedResponseShell(responses, results, page, size);
+    applyMergedHighlights(params, q, results, response.correctedQuery);
+    if (params.facets) response.facets = mergeFacetResponses(responses);
+    return response;
+  }
+
+  // Hybrid text + vector: fuse at the MERGED level — per-generation RRF
+  // ranks are not comparable (a small delta hands its docs top ranks), but
+  // merged text scores and merged similarities both are.
+  async function hybridSearch(params) {
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+
+    // Vector lane through engine.search so per-engine doc-value filters
+    // apply; similarities are absolute, so the merge is a plain sort.
+    async function vectorLaneRows(need) {
+      const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
+        q: "",
+        vector: params.vector,
+        vectorField: params.vectorField,
+        hybrid: params.hybrid,
+        filters: params.filters,
+        page: 1,
+        size: Math.min(1000, need + tombstones[genIndex].size)
+      })));
+      const rows = [];
+      for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+        for (const result of responses[genIndex].results || []) {
+          if (tombstones[genIndex].has(result.index)) continue;
+          rows.push({ generation: genIndex, index: result.index, score: result.score || 0, result });
         }
       }
-      for (const data of Object.values(facets)) {
-        data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
-        delete data.byValue;
-      }
+      rows.sort(compareMergedTies);
+      return { rows: rows.slice(0, need), responses };
     }
 
-    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0) - tombstoneTotal;
-    const approximate = tombstoneTotal > 0 || responses.some(response => response.approximate);
+    if (!q) {
+      const { rows, responses } = await vectorLaneRows(offset + size);
+      const results = rows
+        .slice(offset, offset + size)
+        .map(row => ({ ...row.result, generation: row.generation }));
+      const response = mergedResponseShell(responses, results, page, size);
+      response.approximate = true;
+      return response;
+    }
+
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const [textResponses, vectorLane] = await Promise.all([
+      Promise.all(engines.map((engine, genIndex) => engine.search({
+        ...params,
+        vector: undefined,
+        vectorField: undefined,
+        hybrid: undefined,
+        highlight: undefined,
+        includeResults: false,
+        page: 1,
+        size: Math.min(1000, poolSize + tombstones[genIndex].size)
+      }))),
+      vectorLaneRows(poolSize)
+    ]);
+
+    const textRows = [];
+    for (let genIndex = 0; genIndex < textResponses.length; genIndex++) {
+      for (const row of textResponses[genIndex].results || []) {
+        if (tombstones[genIndex].has(row.index)) continue;
+        textRows.push({ generation: genIndex, index: row.index, score: row.score || 0 });
+      }
+    }
+    textRows.sort(compareMergedTies);
+
+    const fused = new Map();
+    const addRanked = (rows, lane) => {
+      rows.forEach((row, rank) => {
+        const key = `${row.generation}:${row.index}`;
+        const entry = fused.get(key) || { generation: row.generation, index: row.index, score: 0, hybrid: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.hybrid[lane] = rank + 1;
+        fused.set(key, entry);
+      });
+    };
+    addRanked(textRows.slice(0, poolSize), "text");
+    addRanked(vectorLane.rows, "vector");
+
+    const ranked = [...fused.values()].sort(compareMergedTies);
+    const pageRows = ranked.slice(offset, offset + size);
+    const results = await hydrateMergedRows(pageRows);
+    applyMergedHighlights(params, q, results, undefined);
     return {
-      total: Math.max(results.length, total),
+      total: ranked.length,
       results,
       page,
       size,
-      approximate,
-      ...(correctedQuery ? { correctedQuery, corrections: responses.find(r => r.correctedQuery)?.corrections } : {}),
-      ...(facets ? { facets } : {}),
+      approximate: true,
       stats: {
         generations: engines.length,
-        generationTotals: responses.map(response => response.total || 0),
-        tombstones: tombstoneTotal
+        tombstones: tombstoneTotal,
+        hybrid: true
+      }
+    };
+  }
+
+  // Standalone ANN queries: per-generation similarities share one metric
+  // (normalized dot products), so cross-generation merge is a heap by score.
+  async function vectorSearch(params = {}) {
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const responses = await Promise.all(engines.map((engine, genIndex) => engine.vectorSearch({
+      ...params,
+      includeResults: false,
+      k: Math.min(200, k + tombstones[genIndex].size)
+    })));
+    const merged = [];
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const row of responses[genIndex].results || []) {
+        if (tombstones[genIndex].has(row.index)) continue;
+        merged.push({ generation: genIndex, index: row.index, score: row.score || 0 });
+      }
+    }
+    merged.sort(compareMergedTies);
+    const pageRows = merged.slice(0, k);
+    const results = params.includeResults === false
+      ? pageRows.map(row => ({ index: row.index, score: row.score, generation: row.generation }))
+      : await hydrateMergedRows(pageRows);
+    return {
+      total: merged.length,
+      results,
+      stats: {
+        generations: engines.length,
+        tombstones: tombstoneTotal,
+        perGeneration: responses.map(response => response.stats || {}),
+        exact: false,
+        approximate: true
       }
     };
   }
@@ -7041,7 +7294,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     search,
     suggest,
     count,
-    vectorSearch: () => Promise.reject(unsupported("vector search")),
+    vectorSearch,
     loadFacetValues: field => engines[0].loadFacetValues(field)
   };
 }

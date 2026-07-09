@@ -2060,7 +2060,72 @@ function writeGenerationalRoot(generational, deltaManifest, config) {
   };
   writeFileSync(resolve(rootDir, "manifest.min.json"), JSON.stringify(root));
   writeFileSync(resolve(rootDir, "manifest.json"), JSON.stringify(root, null, 2));
-  return { replaced, aliveTotal, generations: generations.length };
+  const tombstoneCount = generations.reduce((sum, generation) => sum + (generation.tombstones?.length || 0), 0);
+  return {
+    replaced,
+    aliveTotal,
+    generations: generations.length,
+    tombstoneRatio: tombstoneCount / Math.max(1, aliveTotal + tombstoneCount)
+  };
+}
+
+// Compaction folds every generation back into one full index. The published
+// packs only hold display fields — not the indexed source text — so the fold
+// is a full rebuild from the config's input, which therefore must be the
+// complete corpus; prepare/finalize verify that before deleting anything.
+const COMPACT_MAX_GENERATIONS = 8;
+const COMPACT_MAX_TOMBSTONE_RATIO = 0.25;
+
+function prepareCompaction(config) {
+  const rootDir = config.output;
+  const rootManifestPath = resolve(rootDir, "manifest.json");
+  if (!existsSync(rootManifestPath)) return null;
+  const rootManifest = JSON.parse(readFileSync(rootManifestPath, "utf8"));
+  const liveIds = new Set();
+  const generationDirs = new Set();
+  const generationManifests = new Set();
+  // Sweep unreferenced leftovers too — a previously failed compaction
+  // publishes a plain manifest but keeps the old generation files around.
+  for (const name of readdirSync(rootDir)) {
+    if (/^gen-\d{4}$/u.test(name)) generationDirs.add(name);
+    if (/^manifest\.gen\d{4}(\.min)?\.json$/u.test(name)) generationManifests.add(name);
+  }
+  if (!Array.isArray(rootManifest.generations)) {
+    if (!generationDirs.size && !generationManifests.size) return null;
+    return { rootDir, liveIds, generationDirs, generationManifests };
+  }
+  for (const generation of rootManifest.generations) {
+    if (generation.path) {
+      generationDirs.add(generation.path.replace(/\/+$/u, ""));
+    } else if (generation.manifest) {
+      generationManifests.add(generation.manifest);
+      generationManifests.add(generation.manifest.replace(/\.min\.json$/u, ".json"));
+    }
+    const tombstoned = new Set(generation.tombstones || []);
+    for (const [externalId, localIndex] of readIdMapFile(resolve(rootDir, generation.path || ".", generation.id_map))) {
+      if (!tombstoned.has(localIndex)) liveIds.add(externalId);
+    }
+  }
+  return { rootDir, liveIds, generationDirs, generationManifests };
+}
+
+function finalizeCompaction(compaction, manifest, config) {
+  const newIds = new Set(readIdMapFile(resolve(config.output, manifest.id_map)).map(([externalId]) => externalId));
+  const missing = [...compaction.liveIds].filter(externalId => !newIds.has(externalId));
+  if (missing.length) {
+    throw new Error(
+      `Rangefind compact: ${missing.length} live document(s) from the generational index are missing from the input ` +
+      `(e.g. ${missing.slice(0, 5).join(", ")}). Compaction rebuilds from scratch, so the input must be the FULL corpus. ` +
+      "The rebuilt index was published, but the old generation directories were kept untouched."
+    );
+  }
+  for (const dir of compaction.generationDirs) {
+    rmSync(resolve(compaction.rootDir, dir), { recursive: true, force: true });
+  }
+  for (const file of compaction.generationManifests) {
+    rmSync(resolve(compaction.rootDir, file), { force: true });
+  }
+  return { removedGenerations: compaction.generationDirs.size + (compaction.generationManifests.size ? 1 : 0) };
 }
 
 function sortReplicaKey(field, order) {
@@ -3903,9 +3968,12 @@ function hydrateReducedStage(payload) {
   };
 }
 
-export async function build({ configPath, update = false }) {
+export async function build({ configPath, update = false, compact = false }) {
+  if (update && compact) throw new Error("Rangefind: pass either --update or --compact, not both.");
   const config = await readConfig(configPath);
   const generational = update ? await prepareGenerationalUpdate(config) : null;
+  const compaction = compact ? prepareCompaction(config) : null;
+  if (compact && !compaction) console.log("Rangefind: no generational index at the output; --compact runs as a plain full build.");
   const fingerprint = config.resumeBuild ? buildFingerprint(config) : "scratch";
   config._buildRoot = config.resumeBuild
     ? resolve(config.output, config.resumeDir, fingerprint)
@@ -4539,6 +4607,16 @@ export async function build({ configPath, update = false }) {
     if (generational) {
       const summary = writeGenerationalRoot(generational, manifest, config);
       console.log(`Rangefind: generation ${generational.genDir} added (${measured.total.toLocaleString()} docs, ${summary.replaced.toLocaleString()} replaced, ${summary.generations} generations, ${summary.aliveTotal.toLocaleString()} alive docs)`);
+      if (summary.generations >= COMPACT_MAX_GENERATIONS || summary.tombstoneRatio >= COMPACT_MAX_TOMBSTONE_RATIO) {
+        console.warn(
+          `Rangefind: ${summary.generations} generations, ${(summary.tombstoneRatio * 100).toFixed(1)}% tombstoned — ` +
+          "queries now pay a fan-out per generation. Run `rangefind build --compact` with the full corpus as input to fold them."
+        );
+      }
+    }
+    if (compaction) {
+      const summary = finalizeCompaction(compaction, manifest, config);
+      console.log(`Rangefind: compacted ${summary.removedGenerations} generation(s) into a single index`);
     }
     console.log(`Rangefind: built ${measured.total.toLocaleString()} docs, ${reduced.shards.length.toLocaleString()} posting segments, ${reduced.packs.length.toLocaleString()} packs`);
   } catch (error) {
