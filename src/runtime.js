@@ -484,7 +484,11 @@ export async function createSearch(options = {}) {
     Math.min(4096, Math.floor(Number(options.topKProofCheckIntervalMax || 32)))
   );
   const topKProofCheckScoresPerBlock = Math.max(1, Math.floor(Number(options.topKProofCheckScoresPerBlock || 2048)));
-  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget || 0)));
+  // An unbounded proof can decode millions of postings for broad multi-term
+  // queries. Large indexes default to a bounded approximate top-k lane; callers
+  // can still pass 0 (or request exact search) when exhaustive proof matters.
+  const defaultTopKBlockBudget = Number(manifest.total || 0) >= 1_000_000 ? 128 : 0;
+  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget ?? defaultTopKBlockBudget)));
   const docValueSortPageBatchSize = Math.max(1, Math.min(
     64,
     Math.floor(Number(options.docValueSortPageBatchSize || DOC_VALUE_SORT_PAGE_BATCH_SIZE))

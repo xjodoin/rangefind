@@ -2,8 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { groupRanges, partitionEntries, shardKey } from "../src/shards.js";
 
-test("shardKey pads short terms for stable file names", () => {
-  assert.equal(shardKey("ai", 3), "ai_");
+test("shardKey keeps short and underscore-bearing terms distinct", () => {
+  assert.equal(shardKey("ai", 3), "ai");
+  assert.equal(shardKey("ai_", 3), "ai_");
+});
+
+test("partitionEntries does not emit duplicate names for short-term collisions", () => {
+  const entries = [["ai", [[0, 1]]], ["ai_", [[1, 1]]]];
+  const partitions = partitionEntries(entries, { baseShardDepth: 3, maxShardDepth: 5, targetShardPostings: 1 });
+  assert.deepEqual(partitions.map(item => item.name), ["ai", "ai_"]);
 });
 
 test("partitionEntries recursively splits oversized shards", () => {

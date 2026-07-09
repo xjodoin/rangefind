@@ -1,7 +1,10 @@
 export const RANGE_MERGE_GAP_BYTES = 8 * 1024;
 
 export function shardKey(term, depth) {
-  return String(term || "").slice(0, depth).padEnd(depth, "_");
+  // Do not pad short terms: "ai" padded to "ai_" collides with a real
+  // underscore-bearing expansion term. Variable-length directory keys are
+  // already supported and keep every partition address unique.
+  return String(term || "").slice(0, depth);
 }
 
 export function baseShardFor(term, config) {

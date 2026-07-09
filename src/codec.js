@@ -664,12 +664,11 @@ function encodeRowsWithCodec(rows, codec) {
 function sampleBlockIndexes(count, limit) {
   const max = Math.max(1, Math.min(count, Math.floor(Number(limit || 3))));
   if (count <= max) return Array.from({ length: count }, (_, index) => index);
-  const indexes = new Set([0, count - 1]);
-  while (indexes.size < max) {
-    const fraction = indexes.size / Math.max(1, max - 1);
-    indexes.add(Math.min(count - 1, Math.floor(fraction * (count - 1))));
+  const indexes = new Array(max);
+  for (let i = 0; i < max; i++) {
+    indexes[i] = Math.round((i * (count - 1)) / Math.max(1, max - 1));
   }
-  return [...indexes].sort((a, b) => a - b);
+  return indexes;
 }
 
 function blockCodecSummary(rows) {

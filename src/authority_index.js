@@ -91,7 +91,8 @@ export function addAuthorityRecord(buffer, config, key, doc, score) {
   buffer.byShard.get(shard).push(encodeRunRecord(["string", "number", "number"], [key, doc, score]));
   buffer.baseShards.add(shard);
   buffer.lines++;
-  if (buffer.lines >= config.postingFlushLines) flushAuthorityBuffer(buffer);
+  const flushRecords = Math.max(1, Math.floor(Number(config.authorityRunFlushRecords || 100000)));
+  if (buffer.lines >= flushRecords) flushAuthorityBuffer(buffer);
 }
 
 export function addAuthorityDoc(buffer, config, doc, index) {

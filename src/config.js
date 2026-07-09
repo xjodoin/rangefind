@@ -31,11 +31,13 @@ export const DEFAULTS = {
   externalPostingBlockMinBytes: 1024,
   postingBlockPackBytes: 4 * 1024 * 1024,
   postingSegmentStreamMinBytes: 64 * 1024,
+  postingGzipLevel: 6,
   docPackBytes: 4 * 1024 * 1024,
   docPageSize: 32,
   docPagePackBytes: 4 * 1024 * 1024,
   docPageMaxOverfetchDocs: 16,
   docLocalityTerms: 2,
+  docLayoutStrategy: "locality",
   docValuePackBytes: 4 * 1024 * 1024,
   docValueSortedPageSize: 512,
   docValueSortedPackBytes: 4 * 1024 * 1024,
@@ -62,6 +64,7 @@ export const DEFAULTS = {
   authorityTargetShardRows: 4096,
   authorityMaxShardDepth: 8,
   authorityDirectoryPageBytes: 16 * 1024,
+  authorityRunFlushRecords: 100000,
   facetDictionaryPackBytes: 4 * 1024 * 1024,
   blockFilterMaxFacetWords: 64,
   codeStoreCacheDocs: 16384,
@@ -69,6 +72,12 @@ export const DEFAULTS = {
   codeStoreWorkerCacheChunks: 0,
   codeStoreWorkerMaxAutoCacheChunks: 64,
   docLayoutSortChunkDocs: 100000,
+  // Preloading the compressed document spool speeds small/medium builds, but
+  // a multi-gigabyte preload creates a matching external-memory/RSS spike.
+  // Keep the fast path bounded; larger corpora use positional reads.
+  docPackSpoolPreloadMaxBytes: 256 * 1024 * 1024,
+  docPackSpoolPreloadChunkBytes: 256 * 1024 * 1024,
+  docPackSequentialReadBytes: 64 * 1024 * 1024,
   scanWorkers: 1,
   scanBatchDocs: 128,
   builderWorkerCount: 1,
@@ -147,6 +156,9 @@ function applyIndexProfile(config, raw) {
   config.typoMaxQueryPlans = clampInt(config.typoMaxQueryPlans, DEFAULTS.typoMaxQueryPlans, 1, 32);
   config.typoMaxCorrectedSearches = clampInt(config.typoMaxCorrectedSearches, DEFAULTS.typoMaxCorrectedSearches, 1, 8);
   config.typoMaxShardLookups = clampInt(config.typoMaxShardLookups, DEFAULTS.typoMaxShardLookups, 1, 64);
+  config.postingGzipLevel = clampInt(config.postingGzipLevel, DEFAULTS.postingGzipLevel, 0, 9);
+  config.docLayoutStrategy = String(config.docLayoutStrategy || DEFAULTS.docLayoutStrategy).toLowerCase();
+  if (!["locality", "doc-id"].includes(config.docLayoutStrategy)) config.docLayoutStrategy = DEFAULTS.docLayoutStrategy;
   return config;
 }
 

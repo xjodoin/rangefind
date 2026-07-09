@@ -3742,7 +3742,7 @@ function decodeSegmentRows(buffer, entry, options = {}) {
 // src/shards.js
 var RANGE_MERGE_GAP_BYTES = 8 * 1024;
 function shardKey(term, depth) {
-  return String(term || "").slice(0, depth).padEnd(depth, "_");
+  return String(term || "").slice(0, depth);
 }
 function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
   const mergeGapBytes = typeof options === "number" ? options : options.mergeGapBytes ?? RANGE_MERGE_GAP_BYTES;
@@ -4342,7 +4342,8 @@ async function createSearch(options = {}) {
     Math.min(4096, Math.floor(Number(options.topKProofCheckIntervalMax || 32)))
   );
   const topKProofCheckScoresPerBlock = Math.max(1, Math.floor(Number(options.topKProofCheckScoresPerBlock || 2048)));
-  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget || 0)));
+  const defaultTopKBlockBudget = Number(manifest.total || 0) >= 1e6 ? 128 : 0;
+  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget ?? defaultTopKBlockBudget)));
   const docValueSortPageBatchSize = Math.max(1, Math.min(
     64,
     Math.floor(Number(options.docValueSortPageBatchSize || DOC_VALUE_SORT_PAGE_BATCH_SIZE))

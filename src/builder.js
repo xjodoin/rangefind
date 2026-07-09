@@ -671,6 +671,37 @@ async function createLayoutReader(file) {
   return reader;
 }
 
+function layoutHeapPush(heap, readerIndex, readers) {
+  heap.push(readerIndex);
+  let child = heap.length - 1;
+  while (child > 0) {
+    const parent = Math.floor((child - 1) / 2);
+    if (compareLayoutRecords(readers[heap[parent]].row, readers[heap[child]].row) <= 0) break;
+    [heap[parent], heap[child]] = [heap[child], heap[parent]];
+    child = parent;
+  }
+}
+
+function layoutHeapPop(heap, readers) {
+  const first = heap[0];
+  const last = heap.pop();
+  if (heap.length) {
+    heap[0] = last;
+    let parent = 0;
+    while (true) {
+      const left = parent * 2 + 1;
+      const right = left + 1;
+      if (left >= heap.length) break;
+      let child = left;
+      if (right < heap.length && compareLayoutRecords(readers[heap[right]].row, readers[heap[left]].row) < 0) child = right;
+      if (compareLayoutRecords(readers[heap[parent]].row, readers[heap[child]].row) <= 0) break;
+      [heap[parent], heap[child]] = [heap[child], heap[parent]];
+      parent = child;
+    }
+  }
+  return first;
+}
+
 async function sortedLayoutOrder(spool, total, config) {
   const chunkDocs = Math.max(1, Math.floor(Number(config.docLayoutSortChunkDocs || 100000)));
   const rows = [];
@@ -684,17 +715,20 @@ async function sortedLayoutOrder(spool, total, config) {
   if (rows.length) chunks.push(writeLayoutChunk(rows, buildPath(config, "docs"), chunks.length));
 
   const readers = await Promise.all(chunks.map(createLayoutReader));
-  const order = [];
+  // A binary heap makes the external merge O(totalDocs * log(chunkCount)).
+  // The previous linear reader scan became quadratic as full-corpus builds
+  // produced more sort chunks. Uint32Array also avoids millions of boxed JS
+  // numbers while retaining direct random layout access below.
+  const heap = [];
+  for (let i = 0; i < readers.length; i++) if (readers[i].row) layoutHeapPush(heap, i, readers);
+  const order = new Uint32Array(total);
+  let orderLength = 0;
   const stats = { docsWithoutTerms: 0, primaryTerms: 0 };
   let lastPrimary = null;
-  while (readers.some(reader => reader.row)) {
-    let best = -1;
-    for (let i = 0; i < readers.length; i++) {
-      if (!readers[i].row) continue;
-      if (best < 0 || compareLayoutRecords(readers[i].row, readers[best].row) < 0) best = i;
-    }
+  while (heap.length) {
+    const best = layoutHeapPop(heap, readers);
     const row = readers[best].row;
-    order.push(row.index);
+    order[orderLength++] = row.index;
     if (row.primary) {
       if (row.primary !== lastPrimary) stats.primaryTerms++;
       lastPrimary = row.primary;
@@ -702,12 +736,13 @@ async function sortedLayoutOrder(spool, total, config) {
       stats.docsWithoutTerms++;
     }
     readers[best].row = await nextLayoutRow(readers[best]);
+    if (readers[best].row) layoutHeapPush(heap, best, readers);
   }
   for (const reader of readers) {
     reader.rl.close();
     reader.input.destroy();
   }
-  if (order.length !== total) throw new Error(`Rangefind doc layout expected ${total} docs but sorted ${order.length}.`);
+  if (orderLength !== total) throw new Error(`Rangefind doc layout expected ${total} docs but sorted ${orderLength}.`);
   return { order, summary: layoutSummary(total, config, stats) };
 }
 
@@ -812,28 +847,146 @@ async function mapWorkerBatchesOrdered(pool, batches, handle) {
   while (inFlight.length) await handle(await inFlight.shift());
 }
 
+function preloadFileChunks(path, bytes, chunkBytes) {
+  const fd = openSync(path, "r");
+  const chunks = [];
+  try {
+    for (let offset = 0; offset < bytes;) {
+      const length = Math.min(chunkBytes, bytes - offset);
+      const chunk = Buffer.allocUnsafe(length);
+      let filled = 0;
+      while (filled < length) {
+        const count = readSync(fd, chunk, filled, length - filled, offset + filled);
+        if (!count) throw new Error(`Rangefind preload ended early at ${offset + filled} of ${bytes} bytes.`);
+        filled += count;
+      }
+      chunks.push(chunk);
+      offset += length;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return { chunks, chunkBytes, bytes };
+}
+
+function preloadedFileSlice(file, offset, length) {
+  if (offset < 0 || length < 0 || offset + length > file.bytes) {
+    throw new Error(`Rangefind preload slice ${offset}+${length} exceeds ${file.bytes} bytes.`);
+  }
+  if (!length) return Buffer.alloc(0);
+  const first = Math.floor(offset / file.chunkBytes);
+  const firstOffset = offset % file.chunkBytes;
+  if (firstOffset + length <= file.chunks[first].length) {
+    return file.chunks[first].subarray(firstOffset, firstOffset + length);
+  }
+  const out = Buffer.allocUnsafe(length);
+  let copied = 0;
+  let chunkIndex = first;
+  let chunkOffset = firstOffset;
+  while (copied < length) {
+    const chunk = file.chunks[chunkIndex++];
+    const count = Math.min(length - copied, chunk.length - chunkOffset);
+    chunk.copy(out, copied, chunkOffset, chunkOffset + count);
+    copied += count;
+    chunkOffset = 0;
+  }
+  return out;
+}
+
+function preloadedBigUInt(file, offset) {
+  return readBigUInt(preloadedFileSlice(file, offset, 8), 0);
+}
+
+function createReadWindow(path, bytes, windowBytes) {
+  return {
+    fd: openSync(path, "r"),
+    bytes,
+    windowBytes,
+    start: 0,
+    end: 0,
+    buffer: Buffer.alloc(0)
+  };
+}
+
+function readWindowSlice(reader, offset, length) {
+  if (offset < 0 || length < 0 || offset + length > reader.bytes) {
+    throw new Error(`Rangefind read window ${offset}+${length} exceeds ${reader.bytes} bytes.`);
+  }
+  if (offset < reader.start || offset + length > reader.end) {
+    const bytes = Math.min(reader.bytes - offset, Math.max(reader.windowBytes, length));
+    reader.buffer = Buffer.allocUnsafe(bytes);
+    let filled = 0;
+    while (filled < bytes) {
+      const count = readSync(reader.fd, reader.buffer, filled, bytes - filled, offset + filled);
+      if (!count) throw new Error(`Rangefind sequential read ended early at ${offset + filled} of ${reader.bytes} bytes.`);
+      filled += count;
+    }
+    reader.start = offset;
+    reader.end = offset + bytes;
+  }
+  const start = offset - reader.start;
+  return reader.buffer.subarray(start, start + length);
+}
+
+function closeReadWindow(reader) {
+  if (reader?.fd != null) closeSync(reader.fd);
+}
+
+function docIdLayout(total) {
+  return {
+    order: null,
+    summary: {
+      format: DOC_LAYOUT_FORMAT,
+      strategy: "doc-id",
+      terms: 0,
+      shard_depth: 0,
+      docs: total,
+      docs_without_terms: 0,
+      primary_terms: 0
+    }
+  };
+}
+
 async function finishDocPacks(out, spool, total, config) {
-  const layout = await sortedLayoutOrder(spool, total, config);
+  const sequential = config.docLayoutStrategy === "doc-id";
+  const layout = sequential ? docIdLayout(total) : await sortedLayoutOrder(spool, total, config);
   const packWriter = createAppendOnlyPackWriter(resolve(out, "docs", "packs"), config.docPackBytes);
   const entryPath = buildPath(config, "docs", "doc-pack-entries.bin");
   const entryOutFd = openSync(entryPath, "w");
-  const preloadLimit = Math.max(0, Math.floor(Number(config.docPackSpoolPreloadMaxBytes ?? 2560 * 1024 * 1024)));
-  const preload = spool.bytes > 0 && spool.bytes <= preloadLimit;
-  const payloadBytes = preload ? readFileSync(spool.path) : null;
-  const entryTable = preload ? readFileSync(spool.entryPath) : null;
-  const fd = preload ? null : openSync(spool.path, "r");
-  const spoolEntryFd = preload ? null : openSync(spool.entryPath, "r");
+  const preloadLimit = Math.max(0, Math.floor(Number(config.docPackSpoolPreloadMaxBytes ?? 256 * 1024 * 1024)));
+  const preloadChunkBytes = Math.max(64, Math.floor(Number(config.docPackSpoolPreloadChunkBytes ?? 256 * 1024 * 1024)));
+  const preload = !sequential && spool.bytes > 0 && spool.bytes <= preloadLimit;
+  // Node cannot create a single Buffer larger than 2 GiB. Chunk both files so
+  // the preload fast path remains available to multi-gigabyte corpora while
+  // preserving zero-copy slices for the common within-chunk document.
+  const payloadFile = preload ? preloadFileChunks(spool.path, spool.bytes, preloadChunkBytes) : null;
+  const entryFile = preload ? preloadFileChunks(spool.entryPath, total * DOC_SPOOL_ENTRY_BYTES, preloadChunkBytes) : null;
+  const readWindowBytes = Math.max(64 * 1024, Math.floor(Number(config.docPackSequentialReadBytes ?? 64 * 1024 * 1024)));
+  const payloadWindow = sequential ? createReadWindow(spool.path, spool.bytes, readWindowBytes) : null;
+  const entryWindow = sequential ? createReadWindow(spool.entryPath, total * DOC_SPOOL_ENTRY_BYTES, readWindowBytes) : null;
+  const fd = preload || sequential ? null : openSync(spool.path, "r");
+  const spoolEntryFd = preload || sequential ? null : openSync(spool.entryPath, "r");
   try {
-    for (const index of layout.order) {
+    for (let rank = 0; rank < total; rank++) {
+      const index = layout.order ? layout.order[rank] : rank;
+      const entryOffset = index * DOC_SPOOL_ENTRY_BYTES;
       const entry = preload
         ? {
-            offset: readBigUInt(entryTable, index * DOC_SPOOL_ENTRY_BYTES),
-            length: readBigUInt(entryTable, index * DOC_SPOOL_ENTRY_BYTES + 8),
-            logicalLength: readBigUInt(entryTable, index * DOC_SPOOL_ENTRY_BYTES + 16)
+            offset: preloadedBigUInt(entryFile, entryOffset),
+            length: preloadedBigUInt(entryFile, entryOffset + 8),
+            logicalLength: preloadedBigUInt(entryFile, entryOffset + 16)
           }
+        : sequential
+          ? {
+              offset: readBigUInt(readWindowSlice(entryWindow, entryOffset, DOC_SPOOL_ENTRY_BYTES), 0),
+              length: readBigUInt(readWindowSlice(entryWindow, entryOffset, DOC_SPOOL_ENTRY_BYTES), 8),
+              logicalLength: readBigUInt(readWindowSlice(entryWindow, entryOffset, DOC_SPOOL_ENTRY_BYTES), 16)
+            }
         : readDocSpoolEntry(spoolEntryFd, index);
       const compressed = preload
-        ? payloadBytes.subarray(entry.offset, entry.offset + entry.length)
+        ? preloadedFileSlice(payloadFile, entry.offset, entry.length)
+        : sequential
+          ? readWindowSlice(payloadWindow, entry.offset, entry.length)
         : readSpooledDoc(fd, entry);
       const packed = writePackedShard(packWriter, docIndexKey(index), compressed, {
         kind: "doc",
@@ -845,6 +998,8 @@ async function finishDocPacks(out, spool, total, config) {
   } finally {
     if (fd != null) closeSync(fd);
     if (spoolEntryFd != null) closeSync(spoolEntryFd);
+    closeReadWindow(payloadWindow);
+    closeReadWindow(entryWindow);
     closeSync(entryOutFd);
   }
   finalizePackWriter(packWriter);
@@ -866,7 +1021,10 @@ async function finishDocPacks(out, spool, total, config) {
     compression: "gzip-member",
     layout: {
       ...layout.summary,
-      spool_bytes: spool.bytes
+      spool_bytes: spool.bytes,
+      spool_preloaded: preload,
+      spool_preload_chunks: payloadFile?.chunks.length || 0,
+      sequential_read_bytes: sequential ? readWindowBytes : 0
     },
     pointers: {
       ...pointerTable.meta,
@@ -2465,7 +2623,8 @@ async function reduceSortReplicaSegments(config, measured, dirs, replica, segmen
             kind: "posting-segment",
             codec: encoded.format || POSTING_SEGMENT_FORMAT,
             logicalLength: encoded.logicalLength,
-            streamMinBytes: replicaConfig.postingSegmentStreamMinBytes
+            streamMinBytes: replicaConfig.postingSegmentStreamMinBytes,
+            gzipLevel: replicaConfig.postingGzipLevel
           });
           appendDirectoryEntry(directorySpool, partition.name, entry);
           finalShards.add(partition.name);
@@ -2489,6 +2648,9 @@ async function reduceSortReplicaSegments(config, measured, dirs, replica, segmen
 
   if (blockPackWriter) finalizePackWriter(blockPackWriter);
   if (packWriter) finalizePackWriter(packWriter);
+  if (directorySpool.entries !== finalShards.size) {
+    throw new Error(`Rangefind sort replica produced ${directorySpool.entries - finalShards.size} duplicate term shard keys.`);
+  }
   const termPacks = usePartitionWorkers ? partitionOutput.packs.sort(comparePackFiles) : packWriter.packs;
   const blockPacks = usePartitionWorkers ? partitionOutput.blockPacks.sort(comparePackFiles) : (blockPackWriter?.packs || []);
   const termPackBytes = usePartitionWorkers ? partitionOutput.packBytes : packWriter.bytes;
@@ -2710,7 +2872,7 @@ function addPostingSegmentStats(target, source) {
 function buildFinalPostingSegmentChunks(entries, total, codes, filters, config, blockPackWriter) {
   const writeBlock = !blockPackWriter || config.externalPostingBlocks === false ? null : ({ term, blockIndex, bytes }) => {
     const key = `${term}\u0000${blockIndex}\u0000${blockPackWriter.bytes}`;
-    return writePackedShard(blockPackWriter, key, gzipSync(bytes, { level: 6 }), {
+    return writePackedShard(blockPackWriter, key, gzipSync(bytes, { level: config.postingGzipLevel }), {
       kind: "posting-segment-block",
       codec: "rfsegpost-block-v1",
       logicalLength: bytes.length
@@ -3476,7 +3638,8 @@ async function reduceRuns(config, measured, runData, dirs) {
           kind: "posting-segment",
           codec: encoded.format || POSTING_SEGMENT_FORMAT,
           logicalLength: encoded.logicalLength,
-          streamMinBytes: config.postingSegmentStreamMinBytes
+          streamMinBytes: config.postingSegmentStreamMinBytes,
+          gzipLevel: config.postingGzipLevel
         });
         appendDirectoryEntry(directorySpool, partition.name, entry);
         finalShards.add(partition.name);
@@ -3509,6 +3672,9 @@ async function reduceRuns(config, measured, runData, dirs) {
   }
   if (blockPackWriter) finalizePackWriter(blockPackWriter);
   if (packWriter) finalizePackWriter(packWriter);
+  if (directorySpool.entries !== finalShards.size) {
+    throw new Error(`Rangefind reducer produced ${directorySpool.entries - finalShards.size} duplicate term shard keys.`);
+  }
   const termPacks = usePartitionWorkers ? partitionOutput.packs.sort(comparePackFiles) : packWriter.packs;
   const blockPacks = usePartitionWorkers ? partitionOutput.blockPacks.sort(comparePackFiles) : (blockPackWriter?.packs || []);
   const termPackBytes = usePartitionWorkers ? partitionOutput.packBytes : packWriter.bytes;
@@ -3776,10 +3942,9 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
   });
 }
 
-// v5: segment/directory sort order switched from localeCompare to code-unit
-// comparison; resumed stages sorted under the old collation cannot mix with
-// the new order.
-const BUILD_RESUME_SCHEMA_VERSION = 5;
+// v6: short shard keys no longer use underscore padding. Reduced stages built
+// with the old collision-prone keys cannot mix with the new directory layout.
+const BUILD_RESUME_SCHEMA_VERSION = 6;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -4389,6 +4554,7 @@ export async function build({ configPath, update = false, compact = false }) {
       posting_segment_pack_files: reduced.packs.length,
       posting_segment_pack_bytes: reduced.packBytes,
       posting_segment_stream_min_bytes: config.postingSegmentStreamMinBytes,
+      posting_segment_gzip_level: config.postingGzipLevel,
       posting_segment_block_pack_files: reduced.blockPacks.length,
       posting_segment_block_pack_bytes: reduced.blockPackBytes,
       external_posting_segment_blocks: reduced.blockStats.externalBlocks,

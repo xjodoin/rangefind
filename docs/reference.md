@@ -430,11 +430,17 @@ production `static-large` profile; you rarely need to change these.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `scanWorkers` | `1` | Worker threads that parse/analyze documents. Set near `cores-2` for large builds. |
-| `builderWorkerCount` | `1` | Workers for doc-page and rank-map compression. |
-| `partitionReducerWorkers` | `0` | Reduce-phase workers (0 = main thread). |
+| `builderWorkerCount` | `1` | Workers for doc-page/rank-map compression and the reducer fallback. |
+| `partitionReducerWorkers` | `0` | Reduce-phase workers (`0` = `builderWorkerCount`). |
 | `scanBatchDocs` | `128` | Documents per worker batch. |
 | `partitionReducerInFlightBytes` | `1 GiB` | Backpressure budget for the reducer. |
 | `builderMemoryBudgetBytes` | `0` | Advisory memory budget (0 = unbounded). |
+| `authorityRunFlushRecords` | `100000` | Max buffered authority rows before they are appended to external runs. |
+| `docPackSpoolPreloadMaxBytes` | `256 MiB` | Largest compressed document spool preloaded into RAM during final packing. |
+| `docPackSpoolPreloadChunkBytes` | `256 MiB` | Buffer size used to preload large document spools without Node's 2 GiB single-buffer limit. |
+| `docLayoutStrategy` | `locality` | `locality` clusters related result payloads; `doc-id` uses bounded sequential packing for very large or slow-volume builds. |
+| `docPackSequentialReadBytes` | `64 MiB` | Read-window size used by `doc-id` document packing. |
+| `docLayoutSortChunkDocs` | `100000` | Documents per external locality-sort chunk; chunks are merged with a bounded heap. |
 | `resumeBuild` | `true` (static-large) | Resume interrupted builds from stage files. |
 
 ### Posting index
@@ -447,6 +453,7 @@ production `static-large` profile; you rarely need to change these.
 | `postingSuperblockSize` | `16` | Blocks per superblock. |
 | `externalPostingBlocks` | `true` | Range-address high-df term blocks. |
 | `externalPostingBlockMinBlocks` | `4` | Min blocks before a term goes external. |
+| `postingGzipLevel` | `6` | Gzip level for posting shards and external blocks (0–9). |
 | `packBytes` | `4 MiB` | Target size of each `terms/packs` file. |
 | `baseShardDepth` / `maxShardDepth` | `3` / `5` | Term directory shard depth. |
 | `targetShardPostings` | `30000` | Postings per term shard. |
@@ -502,7 +509,7 @@ loadFacetValues }`.
 | `topKProofCheckInterval` | `1` | 1–4096 | Blocks between proof checks (start). |
 | `topKProofCheckIntervalMax` | `32` | ≥interval, ≤4096 | Proof-check interval ceiling. |
 | `topKProofCheckScoresPerBlock` | `2048` | ≥1 | Amortizes proof checks by volume. |
-| `topKBlockBudget` | `0` | ≥0 | Cap on decoded blocks (0 = unbounded). |
+| `topKBlockBudget` | `128` at ≥1M docs; otherwise `0` | ≥0 | Cap on decoded blocks. Pass `0` for unbounded proof; exact search remains available. |
 | `docValueSortPageBatchSize` | `16` | 1–64 | Sorted-tree pages fetched per batch. |
 | `geoLeafPageBatchSize` | `16` | 1–64 | Geo leaf pages fetched per batch. |
 | `geoTextMaxCandidatePoints` | `100000` | ≥0 | Above this, text+geo verifies via doc-values instead of a tree doc-set. |
@@ -909,7 +916,11 @@ generations or 25% tombstoned documents. See
 
 **Faster builds on big corpora** — raise `scanWorkers` and `builderWorkerCount`
 toward `cores-2`, and set `partitionReducerWorkers` > 0. Keep `resumeBuild` on
-so interruptions don't restart from zero.
+so interruptions don't restart from zero. `docPackSpoolPreloadMaxBytes`
+defaults to 256 MiB; raise it only when the compressed document spool fits
+comfortably in spare RAM. External layout merges use a bounded k-way heap, so
+smaller `docLayoutSortChunkDocs` no longer causes a linear scan across every
+chunk for every document.
 
 **Smaller cold transfer** — lower `targetPostingsPerDoc` and `bodyIndexChars`;
 keep `display` fields short with `maxChars`. Widen `rangePlans.postingBlocks`

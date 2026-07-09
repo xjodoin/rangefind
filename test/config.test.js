@@ -19,6 +19,11 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.builderWorkerCount, 1);
   assert.equal(config.partitionReducerWorkers, 0);
   assert.equal(config.partitionReducerInFlightBytes, 1024 * 1024 * 1024);
+  assert.equal(config.authorityRunFlushRecords, 100000);
+  assert.equal(config.docPackSpoolPreloadMaxBytes, 256 * 1024 * 1024);
+  assert.equal(config.docPackSpoolPreloadChunkBytes, 256 * 1024 * 1024);
+  assert.equal(config.docPackSequentialReadBytes, 64 * 1024 * 1024);
+  assert.equal(config.docLayoutStrategy, "locality");
   assert.equal(config.builderMemoryBudgetBytes, 0);
   assert.equal(config.indexProfile, "static-large");
   assert.equal(config.queryBundles, false);
@@ -38,6 +43,7 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.maxExpansionTermsPerDoc, 0);
   assert.equal(config.postingOrder, "doc-id");
   assert.equal(config.postingSegmentStreamMinBytes, 64 * 1024);
+  assert.equal(config.postingGzipLevel, 6);
   assert.equal(config.postingImpactBucketOrderMinRows, Number.MAX_SAFE_INTEGER);
   assert.equal(config.postingImpactBucketOrderMaxBuckets, 65536);
   assert.equal(config.postingImpactTiers, false);
@@ -69,6 +75,11 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
     alwaysIndexFields: ["title"],
     maxExpansionTermsPerDoc: 3,
     partitionReducerInFlightBytes: 16,
+    authorityRunFlushRecords: 2000,
+    docPackSpoolPreloadMaxBytes: 32 * 1024 * 1024,
+    docPackSpoolPreloadChunkBytes: 128 * 1024,
+    docLayoutStrategy: "doc-id",
+    postingGzipLevel: 3,
     typoMode: "off",
     typoMaxShardLookups: 4,
     codecs: { mode: "auto" }
@@ -89,6 +100,11 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
   assert.equal(config.segmentMergeFanIn, 128);
   assert.equal(config.segmentMergeMaxTempBytes, 512 * 1024 * 1024);
   assert.equal(config.partitionReducerInFlightBytes, 16);
+  assert.equal(config.authorityRunFlushRecords, 2000);
+  assert.equal(config.docPackSpoolPreloadMaxBytes, 32 * 1024 * 1024);
+  assert.equal(config.docPackSpoolPreloadChunkBytes, 128 * 1024);
+  assert.equal(config.docLayoutStrategy, "doc-id");
+  assert.equal(config.postingGzipLevel, 3);
   assert.equal(config.typoMode, "off");
   assert.equal(config.typoMaxShardLookups, 4);
   assert.equal(config.codecs.mode, "auto");

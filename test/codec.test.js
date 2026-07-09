@@ -219,6 +219,27 @@ test("posting segment codec selects compact impact runs when measured smaller", 
   assert.deepEqual([...decodePostings(shard, entry)].filter((_, index) => index % 2 === 0), [0, 100, 200, 300]);
 });
 
+test("auto posting codec samples multi-block terms without repeating endpoints", () => {
+  const config = {
+    facets: [],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 2,
+    postingSuperblockSize: 2,
+    codecs: { mode: "auto" }
+  };
+  const rows = Array.from({ length: 10 }, (_, doc) => [doc, 1000 + (doc % 3)]);
+  const segment = buildPostingSegment(
+    [["multi-block", rows]],
+    rows.length,
+    {},
+    buildBlockFilters(config, {}),
+    config
+  );
+  assert.equal(segment.stats.codecPlannerSampledTerms, 1);
+  assert.equal(segment.stats.codecPlannerSampledBlocks, 3);
+});
+
 test("posting segment codec selects dense impact bitsets when measured smaller", () => {
   const config = {
     facets: [],

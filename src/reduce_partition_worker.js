@@ -48,11 +48,11 @@ function blockWriterFor(config, outDir, targetBytes, indexCounter) {
   return activeBlockWriter;
 }
 
-function writeBlockWith(writer) {
+function writeBlockWith(writer, config) {
   if (!writer) return null;
   return ({ term, blockIndex, bytes }) => {
     const key = `${term}\u0000${blockIndex}\u0000${writer.bytes}`;
-    return writePackedShard(writer, key, gzipSync(bytes, { level: 6 }), {
+    return writePackedShard(writer, key, gzipSync(bytes, { level: config.postingGzipLevel }), {
       kind: "posting-segment-block",
       codec: "rfsegpost-block-v1",
       logicalLength: bytes.length
@@ -82,12 +82,13 @@ function finishActiveWriters(id) {
 async function reduceOnePartition(common, partition) {
   const started = performance.now();
   const { config, filters, id, total, codes, packWriter, blockWriter } = common;
-  const encoded = buildPostingSegmentChunks(partitionTermEntries(partition), total, codes, filters, config, writeBlockWith(blockWriter));
+  const encoded = buildPostingSegmentChunks(partitionTermEntries(partition), total, codes, filters, config, writeBlockWith(blockWriter, config));
   const entry = await writePackedShardChunks(packWriter, partition.name, encoded.chunks, {
     kind: "posting-segment",
     codec: encoded.format || POSTING_SEGMENT_FORMAT,
     logicalLength: encoded.logicalLength,
-    streamMinBytes: config.postingSegmentStreamMinBytes
+    streamMinBytes: config.postingSegmentStreamMinBytes,
+    gzipLevel: config.postingGzipLevel
   });
   return {
     id,

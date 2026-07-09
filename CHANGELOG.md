@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Full-Wikipedia build path**: the wiki fixture can place its complete
+  workspace on another volume with `--root`, discover and concurrently extract
+  Wikimedia's ordered multistream shards, retry throttled downloads, preserve
+  completed shard work across retries, and concatenate the result
+  deterministically. The full English/French npm scripts use multistream
+  extraction and omit the optional suggestion sidecar to keep peak heap
+  bounded across millions of unique titles.
+
 - **Incremental publishing (Phases 3 & 4 — complete)**: every query lane now
   merges across generations. Sorted browse and text + sort merge by the real
   doc-value keys (a new `loadDocValues` helper on the engine); geo merges in
@@ -56,6 +64,33 @@
   phrase/proximity/bundle term helpers moved to `src/terms.js`.
 
 ### Fixed
+
+- Auto posting-codec sampling no longer loops forever when a term spans more
+  blocks than the sample budget. Wikipedia extraction now honors writable
+  stream backpressure, and capped body storage retains the article's true
+  `bodyLength` and length-derived tags.
+- Short shard keys are no longer underscore-padded. Padding made a short term
+  such as `ai` collide with the real expansion term `ai_`, producing duplicate
+  directory keys that could hide one posting segment on large vocabularies.
+- Large document-layout merges now use a k-way heap instead of scanning every
+  sorted chunk for every document. Layout order uses a compact `Uint32Array`,
+  and the document-pack preload fast path is capped at 256 MiB by default to
+  avoid multi-gigabyte RSS spikes. The wiki profile restores linear-time
+  impact-bucket posting order plus auto block/codec selection for substantially
+  earlier broad-query top-k proofs. Posting gzip level is now configurable; the
+  measured Wikipedia profile uses level 3 to reduce compression CPU with a
+  small transfer-size tradeoff while the library default remains level 6.
+  Multi-gigabyte document preloads are chunked to stay below Node's 2 GiB
+  Buffer limit. A new `doc-id` document layout packs through bounded sequential
+  read windows; the full Wikipedia profile uses it to avoid millions of tiny
+  random reads and swap-heavy multi-gigabyte preloads on external volumes.
+- Runtime top-k proof is now adaptively bounded to 128 decoded blocks for
+  indexes with at least one million documents. This turns pathological broad
+  multi-term queries into bounded approximate searches while preserving
+  `topKBlockBudget: 0` and exact search for exhaustive callers.
+- Authority run spooling now has its own `authorityRunFlushRecords` budget
+  (100,000 by default). The old condition referenced a removed posting-run
+  option and therefore retained every authority record in heap on large builds.
 
 - Term order in posting segments, shard payloads, and the range directory
   now uses code-unit comparison instead of `localeCompare`. ICU collation

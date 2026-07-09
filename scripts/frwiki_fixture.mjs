@@ -2,6 +2,7 @@
 
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, copyFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import { availableParallelism } from "node:os";
 import { relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -104,11 +105,11 @@ function categoriesFromWikitext(text) {
   return out;
 }
 
-function articleTags(title, body, categories) {
+function articleTags(title, bodyLength, categories) {
   return [
     categories.length ? "has-categories" : "uncategorized",
     categories.length >= 4 ? "many-categories" : "few-categories",
-    body.length >= 5000 ? "long-body" : "short-body",
+    bodyLength >= 5000 ? "long-body" : "short-body",
     title.length >= 24 ? "long-title" : "short-title"
   ];
 }
@@ -143,6 +144,7 @@ function pageToDoc(page, index, args) {
   const raw = tag(page, "text");
   const timestamp = tag(page, "timestamp");
   let body = stripWikitext(raw);
+  const bodyLength = body.length;
   if (args.bodyChars > 0 && body.length > args.bodyChars) body = body.slice(0, args.bodyChars);
   if (!title || redirect || body.length < 80) return null;
   const categories = categoriesFromWikitext(raw);
@@ -154,10 +156,10 @@ function pageToDoc(page, index, args) {
     titleLength: title.length,
     url: titleToUrl(title),
     body,
-    bodyLength: body.length,
+    bodyLength,
     categories: categories.join(" "),
     categoryList: categories,
-    articleTags: articleTags(title, body, categories),
+    articleTags: articleTags(title, bodyLength, categories),
     category: categories[0] || "",
     categoryCount: categories.length,
     hasCategories: categories.length > 0,
@@ -185,6 +187,10 @@ function waitForChild(child, name, allowSignal = false) {
       else rejectWait(new Error(`${name} exited with code ${code}${signal ? ` signal ${signal}` : ""}`));
     });
   });
+}
+
+async function writeWithBackpressure(stream, chunk) {
+  if (!stream.write(chunk)) await once(stream, "drain");
 }
 
 function expectedMeta(args) {
@@ -301,7 +307,7 @@ async function extractJsonl(args, out) {
       pages++;
       const doc = pageToDoc(page, docs, args);
       if (!doc) continue;
-      output.write(`${JSON.stringify(doc)}\n`);
+      await writeWithBackpressure(output, `${JSON.stringify(doc)}\n`);
       docs++;
       if (docs % 1000 === 0) {
         const seconds = (performance.now() - started) / 1000;
@@ -340,7 +346,7 @@ async function writeJsonlPrefix(sourcePath, out, limit) {
         const line = buffer.slice(0, index);
         buffer = buffer.slice(index + 1);
         if (!line) continue;
-        output.write(`${line}\n`);
+        await writeWithBackpressure(output, `${line}\n`);
         docs++;
         if (docs >= limit) {
           input.destroy();
@@ -351,7 +357,7 @@ async function writeJsonlPrefix(sourcePath, out, limit) {
       }
     }
     if (buffer.trim() && docs < limit) {
-      output.write(`${buffer.trimEnd()}\n`);
+      await writeWithBackpressure(output, `${buffer.trimEnd()}\n`);
       docs++;
     }
     await finishStream(output);

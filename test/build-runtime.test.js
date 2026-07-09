@@ -78,6 +78,10 @@ test("builder output is searchable through the range-based runtime", async (t) =
     docValueChunkSize: 2,
     docValueLookupChunkSize: 1,
     docValueSortedPageSize: 2,
+    // Force multiple external layout chunks so the k-way heap merge is
+    // covered by the end-to-end searchable-output assertions below.
+    docLayoutSortChunkDocs: 2,
+    docPackSpoolPreloadChunkBytes: 128,
     buildTelemetrySampleMs: 5,
     buildTelemetryPath: "build-telemetry.json",
     scanWorkers: 2,
@@ -235,6 +239,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v6");
   assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
   assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
+  assert.equal(manifest.stats.posting_segment_gzip_level, 6);
   assert.ok(manifest.stats.posting_segment_superblocks > 0);
   assert.ok(manifest.stats.posting_segment_superblock_terms > 0);
   assert.ok(manifest.stats.posting_segment_superblock_blocks >= manifest.stats.posting_segment_superblocks);
