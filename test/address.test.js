@@ -12,7 +12,9 @@ import {
   interpolateAddressRangePoint,
   looksLikeAddressQuery,
   normalizeAddressAuthorityKey,
-  normalizeAddressKey
+  normalizeAddressKey,
+  normalizePostalCodePrefixSpacing,
+  normalizePostalCodeSpacing
 } from "../src/address.js";
 import { build } from "../src/builder.js";
 import { authorityAddressRangeKey } from "../src/authority_codec.js";
@@ -36,6 +38,11 @@ test("address keys normalize directions, suffixes, punctuation, and ordinal word
   );
   assert.equal(looksLikeAddressQuery("350 Fifth Avenue New York"), true);
   assert.equal(looksLikeAddressQuery("Pennsylvania Avenue"), false);
+  assert.equal(looksLikeAddressQuery("J7A 1V6"), true);
+  assert.equal(normalizePostalCodeSpacing("H4R1P8"), "H4R 1P8");
+  assert.equal(normalizePostalCodeSpacing("h4r 1p8"), "h4r 1p8");
+  assert.equal(normalizePostalCodePrefixSpacing("J7A1V"), "J7A 1V");
+  assert.equal(normalizePostalCodePrefixSpacing("pharmacy J7A1"), "pharmacy J7A 1");
 });
 
 test("OSM address extraction retains structured and address-only features", () => {
@@ -60,7 +67,16 @@ test("OSM address extraction retains structured and address-only features", () =
   assert.equal(doc.category, "address");
   assert.equal(doc.address_authority, undefined);
 
-  const incomplete = placeDoc("node", 43, 40.7, -73.9, new Map([["addr:street", "5th Avenue"]]));
+  const canadian = placeDoc("node", 43, 45.64, -73.8, new Map([
+    ["addr:housenumber", "12"],
+    ["addr:street", "Rue Exemple"],
+    ["addr:city", "Rosemère"],
+    ["addr:postcode", "J7A1V6"]
+  ]));
+  assert.equal(canadian.postcode, "J7A 1V6");
+  assert.match(canadian.address, /J7A 1V6/u);
+
+  const incomplete = placeDoc("node", 44, 40.7, -73.9, new Map([["addr:street", "5th Avenue"]]));
   assert.equal(incomplete, null);
 });
 
@@ -175,6 +191,26 @@ test("exact, reordered, and component address forms bypass postings", async () =
       category: "amenity",
       type: "cafe"
     },
+    {
+      id: "jean-coutu",
+      name: "Jean Coutu",
+      address: "10 Boulevard des Châteaux, J7B 1Z5",
+      address_search: "10 Boulevard des Châteaux, J7B 1Z5",
+      house_number: "10",
+      street: "Boulevard des Châteaux",
+      postcode: "J7B 1Z5",
+      category: "amenity",
+      type: "pharmacy"
+    },
+    {
+      id: "postal-j7a1v6",
+      name: "J7A 1V6, Rosemère",
+      postal_lookup: "J7A 1V6",
+      postcode: "J7A 1V6",
+      city: "Rosemère",
+      category: "boundary",
+      type: "postal_code"
+    },
     ...interpolation
   ];
   await writeFile(join(root, "docs.jsonl"), docs.map(JSON.stringify).join("\n"));
@@ -207,6 +243,15 @@ test("exact, reordered, and component address forms bypass postings", async () =
         exact: true,
         tokens: false,
         normalizer: "address-range"
+      },
+      {
+        name: "postcode",
+        path: "postal_lookup",
+        weight: 5000000,
+        surface: false,
+        exact: false,
+        tokens: false,
+        normalizer: "address"
       }
     ],
     suggest: [{ path: "name" }],
@@ -215,7 +260,7 @@ test("exact, reordered, and component address forms bypass postings", async () =
       { name: "type", path: "type" }
     ],
     display: [
-      "id", "name", "address", "house_number", "street", "city", "category", "type", "lat", "lon",
+      "id", "name", "address", "house_number", "street", "city", "postcode", "category", "type", "lat", "lon",
       "_address_range_start", "_address_range_end", "_address_range_step",
       "_address_range_geometry", "_address_range_kind", "_address_range_inclusion"
     ]
@@ -280,6 +325,26 @@ test("exact, reordered, and component address forms bypass postings", async () =
 
     const invalidSuggest = await engine.suggest({ q: "213 Rue Lib", size: 5 });
     assert.equal(invalidSuggest.suggestions.length, 0);
+
+    const compactPostcode = await engine.search({ q: "J7B1Z5", size: 5 });
+    assert.equal(compactPostcode.normalizedQuery, "J7B 1Z5");
+    assert.equal(compactPostcode.stats.postalCodeNormalized, true);
+    assert.equal(compactPostcode.results[0].id, "jean-coutu");
+    assert.equal(compactPostcode.results[0].postcode, "J7B 1Z5");
+
+    const compactPostcodeCount = await engine.count({ q: "J7B1Z5" });
+    assert.equal(compactPostcodeCount.total, 1);
+    assert.equal(compactPostcodeCount.totalExact, true);
+
+    const postalArea = await engine.search({ q: "J7A1V6", size: 5 });
+    assert.equal(postalArea.stats.plannerLane, "addressAuthorityExact");
+    assert.equal(postalArea.stats.postingsDecoded, 0);
+    assert.equal(postalArea.results[0].id, "postal-j7a1v6");
+
+    const compactFullAddress = await engine.search({ q: "10 Boulevard des Châteaux J7B1Z5", size: 5 });
+    assert.equal(compactFullAddress.stats.plannerLane, "addressAuthorityExact");
+    assert.equal(compactFullAddress.stats.postingsDecoded, 0);
+    assert.equal(compactFullAddress.results[0].id, "jean-coutu");
   } finally {
     await engine.close();
   }

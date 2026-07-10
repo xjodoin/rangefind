@@ -4,6 +4,33 @@
 
 ### Changed
 
+- **Québec civic and postal coverage**: Québec OSM fixtures now merge the
+  monthly CC BY 4.0 Référentiel québécois des adresses through a resumable,
+  zipped-CSV stream. A disk-indexed canonical pass collapses units and removes
+  only full-address-identical OSM duplicates. Civic records stay out of BM25,
+  geo browse, and autocomplete, while canonical addresses and one compact
+  aggregate per postal-code/municipality pair use the zero-posting authority
+  lane. A measured full run emitted 3.64M civic and 221.7k postal records into
+  a 9.95M-document, 8.39 GiB index in 15m25s; posting segments and geo build
+  time remained effectively unchanged from the OSM-heavy baseline.
+
+- **Map locality intent and autocomplete overlay**: exact settlement queries
+  such as `Laval` resolve the cached `place=city` record globally instead of
+  ranking every address that contains the city name inside a stale viewport.
+  The demo centers the locality and returns it alone. Street-plus-locality
+  queries such as `Rue Hector Rosemère` resolve the town, search only the
+  distinctive street token inside its radius, and collapse OSM road segments
+  to one street result, avoiding common `rue` posting-budget exhaustion.
+  Autocomplete overlays can escape the rounded panel without horizontal
+  overflow, long labels wrap, and pending suggestion work is cancelled on
+  Enter or Escape.
+
+- **Canadian postal-code query normalization**: compact forms such as
+  `J7B1Z5` are canonicalized to the already-indexed `J7B 1Z5` token form
+  before search, count, autocomplete, and exact-address planning. This fixes
+  postal-only, category-plus-postal, and full-address searches without an
+  index rebuild, duplicate postings, or additional range requests.
+
 - **Compact OSM address interpolation**: numeric `addr:interpolation` ways now
   become one range document per compatible anchor segment instead of millions
   of inferred documents. Street-first 16-number authority buckets locate a

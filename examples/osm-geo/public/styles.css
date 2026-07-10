@@ -23,7 +23,7 @@ html, body {
   background: rgba(255, 255, 255, 0.96);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgba(10, 25, 15, 0.25);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .panel-header {
@@ -69,6 +69,7 @@ html, body {
   border-radius: 8px;
   box-shadow: 0 10px 24px rgba(20, 35, 25, 0.18);
   max-height: 280px;
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -82,8 +83,15 @@ html, body {
 }
 
 #suggestList li .count {
+  flex: 0 0 auto;
   color: #7a8a80;
   font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+#suggestList li > span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 #suggestList li:hover, #suggestList li.active {
@@ -107,6 +115,7 @@ html, body {
 }
 
 #resultList {
+  min-height: 0;
   margin: 8px 0 0;
   padding: 0 0 8px;
   list-style: none;
@@ -138,4 +147,17 @@ html, body {
   margin-top: 2px;
   font-size: 0.82rem;
   color: #33413a;
+}
+
+.data-attribution {
+  margin: auto 16px 12px;
+  padding-top: 8px;
+  border-top: 1px solid #edf1ee;
+  color: #66766c;
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.data-attribution a {
+  color: inherit;
 }

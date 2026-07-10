@@ -88,8 +88,8 @@ a large thesis corpus.
   global counts, exact counts over budgeted match sets, and bounded
   chunk-sampled estimates for very large result sets.
 - OpenStreetMap place and address fixture with canonical zero-posting address
-  lookup, compact `addr:interpolation` ranges, structured address results, and
-  exhaustive geo oracles.
+  lookup, compact `addr:interpolation` ranges, structured address results,
+  bounded Québec RQA civic/postal augmentation, and exhaustive geo oracles.
 - Tiny runnable example.
 
 ## Why This Exists

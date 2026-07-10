@@ -7,6 +7,7 @@ const resultList = document.querySelector("#resultList");
 const statusLine = document.querySelector("#statusLine");
 const indexMeta = document.querySelector("#indexMeta");
 const areaToggle = document.querySelector("#areaToggle");
+const rqaAttribution = document.querySelector("#rqaAttribution");
 
 let engine;
 let markers = [];
@@ -14,6 +15,10 @@ let moveTimer = null;
 let suggestTimer = null;
 let suggestToken = 0;
 let searchToken = 0;
+let suggestionsSuppressed = false;
+let suppressedQuery = "";
+
+const CANADIAN_POSTAL_CODE = /\b[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\b/iu;
 
 const map = new maplibregl.Map({
   container: "map",
@@ -49,7 +54,12 @@ function viewportBox() {
 }
 
 function looksLikeAddress(value) {
-  const tokens = String(value || "").trim().split(/[^\p{L}\p{N}-]+/u).filter(Boolean);
+  const text = String(value || "");
+  // Postal-only queries are global identities too. They cannot be inferred
+  // from the house-number heuristic because a suffix such as `1Z5` contains
+  // a second digit after its letter.
+  if (CANADIAN_POSTAL_CODE.test(text)) return true;
+  const tokens = text.trim().split(/[^\p{L}\p{N}-]+/u).filter(Boolean);
   return tokens.length >= 2 && tokens.some(token => /^\d+[\p{L}]?(?:-\d+[\p{L}]?)?$/u.test(token));
 }
 
@@ -78,8 +88,12 @@ function renderResults(results, { fit = false } = {}) {
     name.textContent = item.name || item.title || item.id;
     const meta = document.createElement("div");
     meta.className = "meta";
+    const addressCount = Number(item.address_count);
     meta.textContent = [
       item.type ? String(item.type).replaceAll("_", " ") : item.category,
+      Number.isFinite(addressCount) && addressCount > 0
+        ? `${formatNumber(addressCount)} civic ${addressCount === 1 ? "address" : "addresses"}`
+        : "",
       item.distanceMeters != null ? `${formatNumber(Math.round(item.distanceMeters))} m` : ""
     ].filter(Boolean).join(" · ");
     li.append(name);
@@ -106,7 +120,9 @@ async function runSearch({ fit = false } = {}) {
   // them disables the zero-posting authority lanes and can hide the requested
   // result; ordinary place/browse queries remain map-bounded.
   const addressLookup = looksLikeAddress(q);
+  const areaWasChecked = areaToggle.checked;
   const useArea = areaToggle.checked && !addressLookup;
+  if (addressLookup && areaWasChecked) areaToggle.checked = false;
   const params = { q, size: 30 };
   if (useArea) params.geo = { box: viewportBox() };
   if (!q && !useArea) {
@@ -119,9 +135,11 @@ async function runSearch({ fit = false } = {}) {
   try {
     const response = await searchOsmQuery(engine, params);
     if (token !== searchToken) return;
-    const resolvedLocality = response.stats?.plannerLane === "osmCategoryLocality";
-    if (resolvedLocality) areaToggle.checked = false;
-    renderResults(response.results, { fit: fit || resolvedLocality || (addressLookup && areaToggle.checked) });
+    const resolvedLocation = response.stats?.plannerLane === "osmCategoryLocality"
+      || response.stats?.plannerLane === "osmLocalityExact"
+      || response.stats?.plannerLane === "osmStreetLocality";
+    if (resolvedLocation) areaToggle.checked = false;
+    renderResults(response.results, { fit: fit || resolvedLocation || (addressLookup && areaWasChecked) });
     const ms = Math.round(performance.now() - started);
     statusLine.textContent = `${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${ms} ms`;
   } catch (error) {
@@ -134,16 +152,24 @@ function hideSuggestions() {
   suggestList.replaceChildren();
 }
 
+function cancelSuggestions() {
+  clearTimeout(suggestTimer);
+  suggestToken++;
+  suggestionsSuppressed = true;
+  suppressedQuery = queryInput.value;
+  hideSuggestions();
+}
+
 async function showSuggestions() {
   const q = queryInput.value.trim();
   const token = ++suggestToken;
-  if (!q) {
+  if (!q || suggestionsSuppressed) {
     hideSuggestions();
     return;
   }
   try {
     const response = await engine.suggest({ q, size: 8 });
-    if (token !== suggestToken) return;
+    if (token !== suggestToken || suggestionsSuppressed) return;
     if (!response.suggestions.length) {
       hideSuggestions();
       return;
@@ -175,15 +201,20 @@ async function showSuggestions() {
 }
 
 queryInput.addEventListener("input", () => {
+  if (queryInput.value !== suppressedQuery) {
+    suggestionsSuppressed = false;
+    suppressedQuery = "";
+  }
   clearTimeout(suggestTimer);
+  if (suggestionsSuppressed) return;
   suggestTimer = setTimeout(showSuggestions, 70);
 });
 queryInput.addEventListener("keydown", event => {
   if (event.key === "Enter") {
-    hideSuggestions();
+    cancelSuggestions();
     runSearch({ fit: !areaToggle.checked });
   }
-  if (event.key === "Escape") hideSuggestions();
+  if (event.key === "Escape") cancelSuggestions();
 });
 queryInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
 areaToggle.addEventListener("change", () => runSearch());
@@ -212,6 +243,7 @@ async function boot() {
     const { minLatE7, maxLatE7, minLonE7, maxLonE7 } = geoField.bbox;
     map.jumpTo({ center: [((minLonE7 + maxLonE7) / 2) / 1e7, ((minLatE7 + maxLatE7) / 2) / 1e7], zoom: 11 });
   }
+  rqaAttribution.hidden = !demoView?.rqa;
   await runSearch();
 }
 

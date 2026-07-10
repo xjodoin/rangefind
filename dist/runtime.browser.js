@@ -2703,12 +2703,22 @@ function normalizeAddressAuthorityKey(value) {
   const key = normalizeAddressKey(value);
   return key ? key.split(" ").sort().join(" ") : "";
 }
+var CANADIAN_POSTAL_CODE = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\b/giu;
+var CANADIAN_POSTAL_CODE_QUERY = /^\s*[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\s*$/iu;
+var CANADIAN_POSTAL_CODE_PREFIX = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9](?:[abceghj-nprstvwxyz](?:[0-9])?)?)$/iu;
 function looksLikeAddressQuery(value) {
+  if (CANADIAN_POSTAL_CODE_QUERY.test(String(value || ""))) return true;
   const key = normalizeAddressKey(value);
   if (!key) return false;
   const tokens = key.split(" ");
   if (tokens.length < 2) return false;
   return tokens.some((token) => /^\d+[a-z]?(?:-\d+[a-z]?)?$/u.test(token) || /^\d+(?:st|nd|rd|th)$/u.test(token));
+}
+function normalizePostalCodeSpacing(value) {
+  return String(value || "").replace(CANADIAN_POSTAL_CODE, "$1 $2");
+}
+function normalizePostalCodePrefixSpacing(value) {
+  return String(value || "").replace(CANADIAN_POSTAL_CODE_PREFIX, "$1 $2");
 }
 var ADDRESS_RANGE_BUCKET_SIZE = 16;
 function rangeLookupValue(bucket, parity, tail) {
@@ -10632,24 +10642,35 @@ async function createSearch(options = {}) {
     return runCountSearch({ q, baseTerms });
   }
   async function search(params = {}) {
-    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
     const response = await withRuntimeTrace(trace, () => traceSpan("search.total", async () => {
-      const searchResponse = await executeSearch(params);
-      if (params.facets) await traceSpan("facets.count", () => computeFacetCounts(params, searchResponse));
+      const searchResponse = await executeSearch(activeParams);
+      if (activeParams.facets) await traceSpan("facets.count", () => computeFacetCounts(activeParams, searchResponse));
       return searchResponse;
     }));
-    if (!trace) return response;
-    return {
+    const normalizedResponse = normalizedQuery === surfaceQuery ? response : {
       ...response,
+      normalizedQuery,
+      stats: { ...response.stats || {}, postalCodeNormalized: true }
+    };
+    if (!trace) return normalizedResponse;
+    return {
+      ...normalizedResponse,
       stats: {
-        ...response.stats || {},
+        ...normalizedResponse.stats || {},
         trace: finalizeRuntimeTrace(trace)
       }
     };
   }
   async function count(params = {}) {
-    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
-    const response = await withRuntimeTrace(trace, () => traceSpan("count.total", () => executeCount(params)));
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("count.total", () => executeCount(activeParams)));
     if (!trace) return response;
     const finalizedTrace = finalizeRuntimeTrace(trace);
     return {
@@ -10662,8 +10683,16 @@ async function createSearch(options = {}) {
     };
   }
   async function suggest(params = {}) {
-    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
-    const response = await withRuntimeTrace(trace, () => traceSpan("suggest.total", () => executeSuggest(params)));
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("suggest.total", () => executeSuggest(activeParams)));
+    if (normalizedQuery !== surfaceQuery) {
+      response.q = surfaceQuery;
+      response.normalizedQuery = normalizedQuery;
+      response.stats = { ...response.stats || {}, postalCodeNormalized: true };
+    }
     if (!trace) return response;
     return {
       ...response,
@@ -10802,8 +10831,11 @@ async function createGenerationalSearch(root, options, baseUrl) {
     };
   }
   async function search(params = {}) {
-    if (params.vector) return hybridSearch(params);
-    const q = String(params.q || "").trim();
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    if (activeParams.vector) return hybridSearch(activeParams);
+    const q = String(activeParams.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
     const offset = (page - 1) * size;
@@ -10811,10 +10843,10 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const geoDistanceSort = params.geo?.sort === "distance";
     if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     if (sortPlan || geoDistanceSort || params.geo && !q) {
-      return orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort });
+      return orderedSearch(activeParams, { q, page, size, offset, sortPlan, geoDistanceSort });
     }
     const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
-      ...params,
+      ...activeParams,
       includeResults: false,
       highlight: void 0,
       page: 1,
@@ -10836,8 +10868,12 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const pageRows = merged.slice(offset, offset + size);
     const results = await hydrateMergedRows(pageRows);
     const response = mergedResponseShell(responses, results, page, size);
-    applyMergedHighlights(params, q, results, response.correctedQuery);
-    if (params.facets) response.facets = mergeFacetResponses(responses);
+    applyMergedHighlights(activeParams, q, results, response.correctedQuery);
+    if (activeParams.facets) response.facets = mergeFacetResponses(responses);
+    if (normalizedQuery !== surfaceQuery) {
+      response.normalizedQuery = normalizedQuery;
+      response.stats.postalCodeNormalized = true;
+    }
     return response;
   }
   async function orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort }) {
@@ -11007,8 +11043,11 @@ async function createGenerationalSearch(root, options, baseUrl) {
     };
   }
   async function suggest(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const responses = await Promise.all(engines.map((engine) => engine.suggest(params)));
+    const responses = await Promise.all(engines.map((engine) => engine.suggest(activeParams)));
     const merged = /* @__PURE__ */ new Map();
     for (const response of responses) {
       for (const item of response.suggestions) {
@@ -11022,15 +11061,31 @@ async function createGenerationalSearch(root, options, baseUrl) {
       }
     }
     const suggestions = [...merged.values()].sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1)).slice(0, size);
-    return { q: params.q || "", suggestions, stats: { generations: engines.length } };
+    return {
+      q: surfaceQuery,
+      suggestions,
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        generations: engines.length,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
+    };
   }
   async function count(params = {}) {
-    const responses = await Promise.all(engines.map((engine) => engine.count(params)));
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const responses = await Promise.all(engines.map((engine) => engine.count(activeParams)));
     return {
       total: responses.reduce((sum, response) => sum + (response.total || 0), 0),
       totalExact: tombstoneTotal === 0 && responses.every((response) => response.totalExact),
       approximate: tombstoneTotal > 0 || responses.some((response) => response.approximate),
-      stats: { generations: engines.length, tombstones: tombstoneTotal }
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        generations: engines.length,
+        tombstones: tombstoneTotal,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
     };
   }
   return {

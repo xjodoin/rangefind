@@ -142,12 +142,31 @@ export function normalizeAddressAuthorityKey(value) {
   return key ? key.split(" ").sort().join(" ") : "";
 }
 
+const CANADIAN_POSTAL_CODE = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\b/giu;
+const CANADIAN_POSTAL_CODE_QUERY = /^\s*[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\s*$/iu;
+const CANADIAN_POSTAL_CODE_PREFIX = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9](?:[abceghj-nprstvwxyz](?:[0-9])?)?)$/iu;
+
 export function looksLikeAddressQuery(value) {
+  if (CANADIAN_POSTAL_CODE_QUERY.test(String(value || ""))) return true;
   const key = normalizeAddressKey(value);
   if (!key) return false;
   const tokens = key.split(" ");
   if (tokens.length < 2) return false;
   return tokens.some(token => /^\d+[a-z]?(?:-\d+[a-z]?)?$/u.test(token) || /^\d+(?:st|nd|rd|th)$/u.test(token));
+}
+
+// The analyzer intentionally tokenizes letters and digits together, so a
+// compact Canadian postal code is one term while the customary spaced form is
+// two. Canonicalize queries to the indexed two-part surface without changing
+// case or other address text.
+export function normalizePostalCodeSpacing(value) {
+  return String(value || "").replace(CANADIAN_POSTAL_CODE, "$1 $2");
+}
+
+// Autocomplete needs the same canonical boundary before all six characters
+// have been entered; search itself remains strict to complete postal codes.
+export function normalizePostalCodePrefixSpacing(value) {
+  return String(value || "").replace(CANADIAN_POSTAL_CODE_PREFIX, "$1 $2");
 }
 
 export const ADDRESS_RANGE_BUCKET_SIZE = 16;

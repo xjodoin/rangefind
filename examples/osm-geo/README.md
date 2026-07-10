@@ -12,6 +12,7 @@ text-plus-geo) against exhaustive oracles.
 node scripts/osm_fixture.mjs all --region=luxembourg --root=examples/osm-geo
 
 # Large region (Quebec, millions of places, downloads ~1.2 GB PBF)
+# RQA civic/postal coverage is enabled by default for this region.
 node scripts/osm_fixture.mjs all --region=quebec --root=examples/osm-geo
 
 # National scale (United States, 32.8M places, downloads ~11.2 GB PBF)
@@ -30,6 +31,35 @@ coordinates are stored in an indexed SQLite table while node documents are
 spooled, and the final corpus is materialized sequentially. Each completed
 stage has PBF size/mtime metadata and is reused on restart. The extractor does
 not retain all ways or coordinates in JavaScript heap.
+
+Québec builds also download the monthly, CC BY 4.0
+[Référentiel québécois des adresses (RQA)](https://www.donneesquebec.ca/recherche/dataset/referentiel-quebecois-des-adresses).
+The download is resumable and can be shared across workspaces with
+`RANGEFIND_RQA_ARCHIVE=/path/to/RQA_CSV.zip`; pass `--no-rqa` for an OSM-only
+comparison. Ingestion streams the zipped CSV, collapses apartment/unit rows to
+one civic point, and uses an indexed on-disk canonical set to suppress only
+full addresses already represented identically by OSM. Spatially nearby OSM
+points are retained alongside the RQA authority record when their published
+components differ, ensuring the official full address remains searchable. It
+emits one additional aggregate record per postal-code/municipality pair.
+
+RQA civic records intentionally have no BM25 title/body terms, geo-browse
+point, or autocomplete surface. They contribute only compressed display data
+and canonical authority keys, so a complete address still uses the bounded
+zero-posting exact lane without making ordinary place search, map browse, or
+autocomplete proportional to the residential corpus. Postal aggregates are
+searchable and suggestible; a postal-only query returns the public area
+centroid and civic-address count rather than enumerating private residences.
+
+The July 2026 full Québec run read 5,307,418 RQA rows and emitted 3,635,146
+unique civic records plus 221,677 postal-area aggregates; 12,863 addresses
+already represented identically by OSM were suppressed. The merged corpus has
+9,952,563 documents. RQA merge took 116.5 seconds and the complete resumable
+index build took 925.1 seconds (15m25s). The published index is 8.39 GiB,
+versus 5.52 GiB for the prior OSM-only/interpolation index. Despite adding
+3.86M authority/display records, posting reduction remained 37.9 seconds with
+the same 13,433 posting segments, and geo construction remained 5.4 seconds,
+because residential civic points do not enter either structure.
 
 The fixture converts named places and complete `addr:housenumber` +
 `addr:street`/`addr:place` nodes and ways (anchored at their first node) into
@@ -68,12 +98,26 @@ a distance-sorted geo text query within the town-scale radius. This finds POIs
 such as Uniprix whose OSM node has coordinates and `amenity=pharmacy` but no
 `addr:city`; resolved localities are cached for subsequent searches.
 
+An exact settlement query such as `Laval` uses the same cached place resolver
+before ordinary BM25. It returns the canonical city/town/village record,
+disables a stale map viewport, and centers the map instead of displaying the
+many POIs and addresses that merely contain the locality name.
+
+Street-plus-locality queries use a similarly bounded plan. `Rue Hector
+Rosemère` first resolves the municipality, removes the high-frequency road
+designator from the text plan, and searches the distinctive street name within
+the town radius. Exact OSM road segments are collapsed to one canonical street
+result. This avoids exhausting the posting budget on `rue` and requires no
+per-street sidecar or duplicate street index.
+
 A small hierarchy of canonical address keys per document is stored in the
 packed authority index: full address, house/street/locality,
 house/street/postcode, and house/street. Equivalent forms such as `Fifth
 Avenue`/`5th Ave`, `Northwest`/`NW`, reordered components, and those useful
 partial forms use a zero-posting exact lane. Other incomplete or
 place-plus-address queries fall back to the weighted inverted index.
+Canadian postal codes may be entered with or without their customary space:
+`J7B 1Z5` and `J7B1Z5` share the same query plan and existing index data.
 
 The index also includes a `geo` field:
 

@@ -14,6 +14,7 @@
 //   node scripts/osm_fixture.mjs build
 //   node scripts/osm_fixture.mjs all --region=luxembourg
 //   node scripts/osm_fixture.mjs all --region=quebec
+//   node scripts/osm_fixture.mjs all --region=quebec --no-rqa
 
 import {
   closeSync,
@@ -40,7 +41,8 @@ import {
   addressRangeLookupValues,
   encodeAddressRangeGeometry,
   interpolateAddressRangePoint,
-  normalizeAddressKey
+  normalizeAddressKey,
+  normalizePostalCodeSpacing
 } from "../src/address.js";
 import {
   coordinateStoreExists,
@@ -50,6 +52,7 @@ import {
   sortUniqueAnchorRefs
 } from "./osm_anchor_store.mjs";
 import { build } from "../src/builder.js";
+import { augmentOsmWithRqa, RQA_CSV_URL } from "./rqa_fixture.mjs";
 
 const REGIONS = {
   luxembourg: "https://download.geofabrik.de/europe/luxembourg-latest.osm.pbf",
@@ -68,7 +71,7 @@ const DEMO_VIEWS = {
 // Included in every reusable extraction-stage identity. Bump this whenever
 // document selection or normalized output changes so a large PBF can never
 // silently reuse an older corpus shape.
-const OSM_FIXTURE_SCHEMA_VERSION = 5;
+const OSM_FIXTURE_SCHEMA_VERSION = 8;
 
 // Primary OSM keys that make a feature a searchable place, in ranking order.
 const CATEGORY_KEYS = [
@@ -130,6 +133,8 @@ function parseArgs(argv) {
     root: "examples/osm-geo",
     limit: 0,
     force: false,
+    rqa: null,
+    rqaArchive: "",
     buildProgressLogMs: Number(process.env.OSM_BUILD_PROGRESS_MS || 15000)
   };
   let rootExplicit = false;
@@ -141,12 +146,17 @@ function parseArgs(argv) {
       rootExplicit = true;
     }
     else if (arg.startsWith("--limit=")) args.limit = Number(arg.slice("--limit=".length)) || 0;
+    else if (arg.startsWith("--rqa-archive=")) args.rqaArchive = arg.slice("--rqa-archive=".length);
+    else if (arg === "--rqa") args.rqa = true;
+    else if (arg === "--no-rqa") args.rqa = false;
     else if (arg === "--force") args.force = true;
   }
   if (args.region === "us" && !rootExplicit) {
     args.root = process.env.RANGEFIND_OSM_US_ROOT || ".cache/osm-us";
   }
   if (!args.pbf) args.pbf = `${args.root}/data/${args.region}-latest.osm.pbf`;
+  if (args.rqa == null) args.rqa = args.region === "quebec";
+  if (!args.rqaArchive) args.rqaArchive = process.env.RANGEFIND_RQA_ARCHIVE || `${args.root}/data/RQA_CSV.zip`;
   return args;
 }
 
@@ -159,6 +169,15 @@ function ensurePbf(args) {
   const partial = `${args.pbf}.partial`;
   execFileSync("curl", ["--fail", "--location", "--continue-at", "-", "--output", partial, url], { stdio: "inherit" });
   renameSync(partial, args.pbf);
+}
+
+function ensureRqa(args) {
+  if (!args.rqa || existsSync(args.rqaArchive)) return;
+  mkdirSync(dirname(resolve(args.rqaArchive)), { recursive: true });
+  console.log(`[rqa] downloading ${RQA_CSV_URL}`);
+  const partial = `${args.rqaArchive}.partial`;
+  execFileSync("curl", ["--fail", "--location", "--continue-at", "-", "--retry", "5", "--output", partial, RQA_CSV_URL], { stdio: "inherit" });
+  renameSync(partial, args.rqaArchive);
 }
 
 function firstCategory(tags) {
@@ -344,7 +363,7 @@ export function addressFromTags(tags) {
   const city = cleanText(tags.get("addr:city") || tags.get("addr:town") || tags.get("addr:village") || tags.get("addr:hamlet"));
   const district = cleanText(tags.get("addr:district") || tags.get("addr:county"));
   const state = cleanText(tags.get("addr:state") || tags.get("addr:province"));
-  const postcode = cleanText(tags.get("addr:postcode"));
+  const postcode = normalizePostalCodeSpacing(cleanText(tags.get("addr:postcode")));
   const country = cleanText(tags.get("addr:country"));
   const thoroughfare = street || place;
   const base = uniqueText([houseNumber, thoroughfare]).join(" ");
@@ -395,9 +414,12 @@ export function placeDoc(osmType, osmId, lat, lon, tags) {
     id: `${osmType}/${osmId}`,
     url: `https://www.openstreetmap.org/${osmType}/${osmId}`,
     name: displayName,
+    search_name: displayName,
     body: bodyParts.filter(Boolean).join(" "),
     lat: Number(lat.toFixed(7)),
-    lon: Number(lon.toFixed(7))
+    lon: Number(lon.toFixed(7)),
+    geo_lat: Number(lat.toFixed(7)),
+    geo_lon: Number(lon.toFixed(7))
   };
   if (aliases.length) doc.aliases = aliases;
   if (address) {
@@ -537,12 +559,15 @@ export function interpolationRangeDocs(osmId, refs, points, wayTags) {
       id: `way/${osmId}/address-range/${segment}`,
       url: `https://www.openstreetmap.org/way/${osmId}`,
       name: formatted,
+      search_name: formatted,
       address_search: formatted,
       body: `address interpolation ${kind}`,
       category: "address",
       type: "interpolated_address_range",
       lat: Number(midpoint.lat.toFixed(7)),
       lon: Number(midpoint.lon.toFixed(7)),
+      geo_lat: Number(midpoint.lat.toFixed(7)),
+      geo_lon: Number(midpoint.lon.toFixed(7)),
       interpolation_keys: addressRangeLookupValues(
         left.number,
         right.number,
@@ -560,6 +585,18 @@ export function interpolationRangeDocs(osmId, refs, points, wayTags) {
     docs.push(doc);
   }
   return docs;
+}
+
+async function finishOsmCorpus(args, outPath, meta) {
+  if (!args.rqa) return outPath;
+  ensureRqa(args);
+  return (await augmentOsmWithRqa({
+    root: args.root,
+    osmPath: outPath,
+    archivePath: args.rqaArchive,
+    osmDocs: meta.docs,
+    force: args.force
+  })).path;
 }
 
 async function writeJsonl(args) {
@@ -585,7 +622,7 @@ async function writeJsonl(args) {
     const meta = JSON.parse(readFileSync(metaPath, "utf8"));
     if (matchesPbf(meta, identity) && meta.limit === args.limit) {
       console.log(`[osm] reusing ${outPath} (${meta.docs} docs)`);
-      return outPath;
+      return finishOsmCorpus(args, outPath, meta);
     }
   }
   const t0 = performance.now();
@@ -810,18 +847,18 @@ async function writeJsonl(args) {
   };
   writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   console.log(`[osm] wrote ${docs} docs to ${outPath} in ${meta.seconds}s`);
-  return outPath;
+  return finishOsmCorpus(args, outPath, meta);
 }
 
 function writeSite(args) {
   const configPath = resolve(args.root, "rangefind.config.json");
   const config = {
-    input: "data/osm-places.jsonl",
+    input: args.rqa ? "data/osm-rqa-places.jsonl" : "data/osm-places.jsonl",
     output: "public/rangefind",
     scanWorkers: Math.max(1, availableParallelism() - 2),
     builderWorkerCount: Math.max(1, availableParallelism() - 2),
     fields: [
-      { name: "title", path: "name", weight: 6.0, b: 0.4, phrase: true },
+      { name: "title", path: "search_name", weight: 6.0, b: 0.4, phrase: true },
       { name: "aliases", path: "aliases", weight: 4.0, b: 0.5 },
       { name: "address", path: "address_search", weight: 10.0, b: 0.2 },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
@@ -846,6 +883,15 @@ function writeSite(args) {
         exact: true,
         tokens: false,
         normalizer: "address-range"
+      },
+      {
+        name: "postcode",
+        path: "postal_lookup",
+        weight: 5000000,
+        surface: false,
+        exact: false,
+        tokens: false,
+        normalizer: "address"
       }
     ],
     authorityMaxRowsPerKey: 64,
@@ -857,16 +903,17 @@ function writeSite(args) {
       { name: "population", path: "population", type: "int" }
     ],
     geo: [
-      { name: "location", latPath: "lat", lonPath: "lon" }
+      { name: "location", latPath: "geo_lat", lonPath: "geo_lon" }
     ],
     suggest: [
-      { path: "name", weightPath: "population" },
+      { path: "search_name", weightPath: "population" },
       { path: "aliases" }
     ],
     display: [
       "name", "address", "house_number", "street", "unit", "suburb",
       "city", "district", "state", "postcode", "country",
       "url", "category", "type", "lat", "lon",
+      "address_count",
       "_address_range_start", "_address_range_end", "_address_range_step",
       "_address_range_geometry", "_address_range_kind", "_address_range_inclusion"
     ],
@@ -887,7 +934,7 @@ function writeSite(args) {
   writeFileSync(configPath, JSON.stringify(config, null, 2));
   writeFileSync(
     resolve(args.root, "public", "osm-demo.json"),
-    JSON.stringify({ region: args.region, ...(DEMO_VIEWS[args.region] || {}) }, null, 2)
+    JSON.stringify({ region: args.region, rqa: args.rqa, ...(DEMO_VIEWS[args.region] || {}) }, null, 2)
   );
   const bundle = resolve("dist/runtime.browser.js");
   if (existsSync(bundle)) copyFileSync(bundle, resolve(args.root, "public", "runtime.browser.js"));
