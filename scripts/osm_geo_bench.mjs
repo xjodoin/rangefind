@@ -136,9 +136,10 @@ async function main() {
   const manifest = JSON.parse(readFileSync(resolve(root, "public/rangefind/manifest.min.json"), "utf8"));
   if (!manifest.features?.geo) throw new Error(`Index at ${args.root} has no geo support; run scripts/osm_fixture.mjs first.`);
   const measuredAvgLens = manifest.stats?.field_avg_lengths || null;
-  const measured = args.oracle
-    ? await measureCorpus(sourcePath, config, !measuredAvgLens)
-    : { center: { lat: 49.61, lon: 6.13 }, avgLens: null };
+  // Even without the exhaustive oracle, derive the query center from the
+  // current corpus. The former Luxembourg constant made --skip-oracle issue
+  // valid but meaningless empty geo queries for every other region.
+  const measured = await measureCorpus(sourcePath, config, args.oracle && !measuredAvgLens);
   const center = measured.center;
   const avgLens = measuredAvgLens || measured.avgLens;
   console.log(`[bench] ${manifest.total} docs, ${manifest.geo.fields.location.total} points, ${manifest.geo.fields.location.leaves} leaves`);

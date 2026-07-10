@@ -47,6 +47,11 @@ function viewportBox() {
   };
 }
 
+function looksLikeAddress(value) {
+  const tokens = String(value || "").trim().split(/[^\p{L}\p{N}-]+/u).filter(Boolean);
+  return tokens.length >= 2 && tokens.some(token => /^\d+[\p{L}]?(?:-\d+[\p{L}]?)?$/u.test(token));
+}
+
 function clearMarkers() {
   for (const marker of markers) marker.remove();
   markers = [];
@@ -76,7 +81,14 @@ function renderResults(results, { fit = false } = {}) {
       item.type ? String(item.type).replaceAll("_", " ") : item.category,
       item.distanceMeters != null ? `${formatNumber(Math.round(item.distanceMeters))} m` : ""
     ].filter(Boolean).join(" · ");
-    li.append(name, meta);
+    li.append(name);
+    if (item.address && item.address !== (item.name || item.title)) {
+      const address = document.createElement("div");
+      address.className = "address";
+      address.textContent = item.address;
+      li.append(address);
+    }
+    li.append(meta);
     li.addEventListener("click", () => {
       if (hasPoint) map.flyTo({ center: [item.lon, item.lat], zoom: Math.max(map.getZoom(), 15) });
     });
@@ -89,7 +101,11 @@ async function runSearch({ fit = false } = {}) {
   if (!engine) return;
   const token = ++searchToken;
   const q = queryInput.value.trim();
-  const useArea = areaToggle.checked;
+  // Exact addresses are global identities. Keeping a stale viewport filter on
+  // them disables the zero-posting authority lanes and can hide the requested
+  // result; ordinary place/browse queries remain map-bounded.
+  const addressLookup = looksLikeAddress(q);
+  const useArea = areaToggle.checked && !addressLookup;
   const params = { q, size: 30 };
   if (useArea) params.geo = { box: viewportBox() };
   if (!q && !useArea) {
@@ -102,7 +118,7 @@ async function runSearch({ fit = false } = {}) {
   try {
     const response = await engine.search(params);
     if (token !== searchToken) return;
-    renderResults(response.results, { fit });
+    renderResults(response.results, { fit: fit || (addressLookup && areaToggle.checked) });
     const ms = Math.round(performance.now() - started);
     statusLine.textContent = `${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${ms} ms`;
   } catch (error) {
@@ -135,7 +151,9 @@ async function showSuggestions() {
       text.textContent = item.text;
       const count = document.createElement("span");
       count.className = "count";
-      count.textContent = item.count > 1 ? `×${formatNumber(item.count)}` : "";
+      count.textContent = item.interpolated
+        ? "interpolated"
+        : item.count > 1 ? `×${formatNumber(item.count)}` : "";
       li.append(text, count);
       li.addEventListener("mousedown", event => {
         event.preventDefault();
@@ -178,8 +196,16 @@ async function boot() {
   const total = engine.manifest.total || 0;
   const geoField = engine.manifest.geo?.fields?.location;
   indexMeta.textContent = `${formatNumber(total)} places · ${formatNumber(geoField?.total || 0)} geo points · static index over HTTP ranges`;
-  // Start over the densest spot of whatever extract is deployed.
-  if (geoField?.bbox) {
+  let demoView = null;
+  try {
+    const response = await fetch(new URL("./osm-demo.json", location.href));
+    if (response.ok) demoView = await response.json();
+  } catch {
+    // Custom deployments without fixture metadata retain the bbox fallback.
+  }
+  if (Array.isArray(demoView?.center) && demoView.center.length === 2) {
+    map.jumpTo({ center: demoView.center, zoom: Number(demoView.zoom || 11) });
+  } else if (geoField?.bbox) {
     const { minLatE7, maxLatE7, minLonE7, maxLonE7 } = geoField.bbox;
     map.jumpTo({ center: [((minLonE7 + maxLonE7) / 2) / 1e7, ((minLatE7 + maxLatE7) / 2) / 1e7], zoom: 11 });
   }

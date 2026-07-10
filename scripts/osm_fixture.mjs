@@ -34,7 +34,14 @@ import { availableParallelism } from "node:os";
 import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { scanPbf } from "./osm_pbf.mjs";
+import {
+  addressRangeLookupValues,
+  encodeAddressRangeGeometry,
+  interpolateAddressRangePoint,
+  normalizeAddressKey
+} from "../src/address.js";
 import {
   coordinateStoreExists,
   createAnchorRefWriter,
@@ -50,6 +57,18 @@ const REGIONS = {
   switzerland: "https://download.geofabrik.de/europe/switzerland-latest.osm.pbf",
   us: "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
 };
+
+const DEMO_VIEWS = {
+  luxembourg: { center: [6.13, 49.61], zoom: 11 },
+  quebec: { center: [-73.6, 45.55], zoom: 12 },
+  switzerland: { center: [8.23, 46.82], zoom: 8 },
+  us: { center: [-98.58, 39.83], zoom: 4 }
+};
+
+// Included in every reusable extraction-stage identity. Bump this whenever
+// document selection or normalized output changes so a large PBF can never
+// silently reuse an older corpus shape.
+const OSM_FIXTURE_SCHEMA_VERSION = 5;
 
 // Primary OSM keys that make a feature a searchable place, in ranking order.
 const CATEGORY_KEYS = [
@@ -172,13 +191,33 @@ function cleanText(value) {
   return String(value || "").replaceAll(/[\u0000-\u001f\u0085\u2028\u2029]+/gu, " ").trim();
 }
 
+const ADDRESS_TAG_KEYS = [
+  "addr:street",
+  "addr:housenumber",
+  "addr:city",
+  "addr:town",
+  "addr:village",
+  "addr:hamlet",
+  "addr:place",
+  "addr:full",
+  "addr:unit",
+  "addr:flats",
+  "addr:suburb",
+  "addr:district",
+  "addr:county",
+  "addr:state",
+  "addr:province",
+  "addr:postcode",
+  "addr:country"
+];
+
 const WAY_DOC_KEYS = new Set([
   "name",
   ...CATEGORY_KEYS,
   ...ALIAS_KEYS,
-  "addr:street",
-  "addr:housenumber",
-  "addr:city",
+  ...ADDRESS_TAG_KEYS,
+  "addr:interpolation",
+  "addr:inclusion",
   "cuisine",
   "population"
 ]);
@@ -252,11 +291,17 @@ async function eachRawLine(path, handler) {
 function pbfIdentity(path) {
   const absolute = resolve(path);
   const stat = statSync(absolute);
-  return { pbf: absolute, pbfBytes: stat.size, pbfMtimeMs: Math.floor(stat.mtimeMs) };
+  return {
+    schemaVersion: OSM_FIXTURE_SCHEMA_VERSION,
+    pbf: absolute,
+    pbfBytes: stat.size,
+    pbfMtimeMs: Math.floor(stat.mtimeMs)
+  };
 }
 
 function matchesPbf(meta, identity) {
-  return meta?.pbf === identity.pbf
+  return meta?.schemaVersion === identity.schemaVersion
+    && meta?.pbf === identity.pbf
     && meta?.pbfBytes === identity.pbfBytes
     && meta?.pbfMtimeMs === identity.pbfMtimeMs;
 }
@@ -275,36 +320,246 @@ function elapsedSeconds(start) {
   return Math.round((performance.now() - start) / 100) / 10;
 }
 
-function placeDoc(osmType, osmId, lat, lon, tags) {
+function uniqueText(parts) {
+  const seen = new Set();
+  const out = [];
+  for (const part of parts) {
+    const value = cleanText(part);
+    const key = value.toLocaleLowerCase("en-US");
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+export function addressFromTags(tags) {
+  if (!ADDRESS_TAG_KEYS.some(key => tags.has(key))) return null;
+  const full = cleanText(tags.get("addr:full"));
+  const houseNumber = cleanText(tags.get("addr:housenumber"));
+  const street = cleanText(tags.get("addr:street"));
+  const place = cleanText(tags.get("addr:place"));
+  const unit = cleanText(tags.get("addr:unit") || tags.get("addr:flats"));
+  const suburb = cleanText(tags.get("addr:suburb"));
+  const city = cleanText(tags.get("addr:city") || tags.get("addr:town") || tags.get("addr:village") || tags.get("addr:hamlet"));
+  const district = cleanText(tags.get("addr:district") || tags.get("addr:county"));
+  const state = cleanText(tags.get("addr:state") || tags.get("addr:province"));
+  const postcode = cleanText(tags.get("addr:postcode"));
+  const country = cleanText(tags.get("addr:country"));
+  const thoroughfare = street || place;
+  const base = uniqueText([houseNumber, thoroughfare]).join(" ");
+  const locality = uniqueText([suburb, city, district, state, postcode, country]);
+  const complete = Boolean(full || (houseNumber && thoroughfare));
+  if (!full && !base && !locality.length) return null;
+
+  const premises = unit && base ? `${base}, Unit ${unit}` : base;
+  const formatted = full || uniqueText([premises, ...locality]).join(", ");
+  if (!formatted) return null;
+  return {
+    formatted,
+    search: formatted,
+    complete,
+    houseNumber,
+    street: thoroughfare,
+    unit,
+    suburb,
+    city,
+    district,
+    state,
+    postcode,
+    country
+  };
+}
+
+function searchablePlaceTags(tags) {
+  return Boolean(
+    tags.get("name")
+    || firstCategory(tags)
+    || tags.get("addr:full")
+    || (tags.get("addr:housenumber") && (tags.get("addr:street") || tags.get("addr:place")))
+    || tags.get("addr:interpolation")
+  );
+}
+
+export function placeDoc(osmType, osmId, lat, lon, tags) {
   const name = cleanText(tags.get("name"));
   const category = firstCategory(tags);
-  if (!name && !category) return null;
-  const label = typeLabel(category?.type);
+  const address = addressFromTags(tags);
+  if (!name && !category && !address?.complete) return null;
+  const label = typeLabel(category?.type || (address ? "address" : ""));
+  const displayName = name || address?.formatted || label;
   const aliases = name ? collectAliases(tags, name) : [];
-  const street = tags.get("addr:street") || "";
-  const housenumber = tags.get("addr:housenumber") || "";
-  const city = tags.get("addr:city") || "";
-  const addressParts = [housenumber && street ? `${housenumber} ${street}` : street, city].filter(Boolean);
   const cuisine = typeLabel(tags.get("cuisine"));
-  const bodyParts = [label, category ? category.category : "", cuisine, ...addressParts];
+  const bodyParts = [label, category ? category.category : address ? "address" : "", cuisine];
   const doc = {
     id: `${osmType}/${osmId}`,
     url: `https://www.openstreetmap.org/${osmType}/${osmId}`,
-    name: name || label,
+    name: displayName,
     body: bodyParts.filter(Boolean).join(" "),
     lat: Number(lat.toFixed(7)),
     lon: Number(lon.toFixed(7))
   };
   if (aliases.length) doc.aliases = aliases;
+  if (address) {
+    doc.address = address.formatted;
+    doc.address_search = address.search;
+    if (address.houseNumber) doc.house_number = address.houseNumber;
+    if (address.street) doc.street = address.street;
+    if (address.unit) doc.unit = address.unit;
+    if (address.suburb) doc.suburb = address.suburb;
+    if (address.city) doc.city = address.city;
+    if (address.district) doc.district = address.district;
+    if (address.state) doc.state = address.state;
+    if (address.postcode) doc.postcode = address.postcode;
+    if (address.country) doc.country = address.country;
+  }
   if (category) {
     doc.category = category.category;
     doc.type = category.type;
+  } else if (address) {
+    doc.category = "address";
+    doc.type = "address";
   }
   if (tags.get("place")) {
     const population = Number(tags.get("population"));
     if (Number.isFinite(population) && population > 0) doc.population = population;
   }
   return doc;
+}
+
+function interpolationStep(value) {
+  const normalized = cleanText(value).toLowerCase();
+  if (normalized === "all") return 1;
+  if (normalized === "odd" || normalized === "even") return 2;
+  const numeric = Number(normalized);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function numericHouseNumber(value) {
+  const normalized = cleanText(value);
+  return /^\d+$/u.test(normalized) ? Number(normalized) : null;
+}
+
+function retainedAddressTagEntries(tags) {
+  if (!tags) return [];
+  return ADDRESS_TAG_KEYS
+    .filter(key => tags.has(key))
+    .map(key => [key, cleanText(tags.get(key))])
+    .filter(([, value]) => value);
+}
+
+function compatibleAddressTags(left, right, wayTags) {
+  const merged = new Map();
+  for (const key of ADDRESS_TAG_KEYS) {
+    if (key === "addr:housenumber" || key === "addr:full" || key === "addr:unit" || key === "addr:flats") continue;
+    const wayValue = cleanText(wayTags.get(key));
+    const leftValue = cleanText(left.get(key));
+    const rightValue = cleanText(right.get(key));
+    if (leftValue && rightValue && normalizeAddressKey(leftValue) !== normalizeAddressKey(rightValue)) return null;
+    const value = wayValue || leftValue || rightValue;
+    if (value) merged.set(key, value);
+  }
+  if (!merged.get("addr:street") && !merged.get("addr:place")) return null;
+  return merged;
+}
+
+function addressRangeTails(address) {
+  const street = address.street;
+  const locality = uniqueText([address.suburb, address.city, address.district, address.state, address.country]);
+  const tails = [street];
+  for (let length = 1; length <= locality.length; length++) {
+    tails.push(uniqueText([street, ...locality.slice(0, length)]).join(" "));
+  }
+  if (address.postcode) {
+    tails.push(uniqueText([street, address.postcode]).join(" "));
+    tails.push(uniqueText([street, ...locality, address.postcode]).join(" "));
+  }
+  return uniqueText(tails);
+}
+
+function applyAddressFields(doc, address) {
+  if (address.street) doc.street = address.street;
+  if (address.suburb) doc.suburb = address.suburb;
+  if (address.city) doc.city = address.city;
+  if (address.district) doc.district = address.district;
+  if (address.state) doc.state = address.state;
+  if (address.postcode) doc.postcode = address.postcode;
+  if (address.country) doc.country = address.country;
+}
+
+// Materialize one compact range document per pair of numeric address anchors.
+// Individual inferred houses remain virtual and are resolved by the runtime's
+// bucketed authority lane, avoiding millions of full posting/doc payloads.
+export function interpolationRangeDocs(osmId, refs, points, wayTags) {
+  const kind = cleanText(wayTags.get("addr:interpolation")).toLowerCase();
+  const step = interpolationStep(kind);
+  if (!step || refs.length < 2 || points.length !== refs.length) return [];
+  const anchors = [];
+  for (let index = 0; index < points.length; index++) {
+    const point = points[index];
+    if (!point) continue;
+    const tags = point.tags || new Map();
+    const number = numericHouseNumber(tags.get("addr:housenumber"));
+    if (number != null) anchors.push({ index, number, tags });
+  }
+  if (anchors.length < 2 || anchors[0].index !== 0 || anchors.at(-1).index !== points.length - 1) return [];
+
+  const docs = [];
+  for (let anchorIndex = 0; anchorIndex + 1 < anchors.length; anchorIndex++) {
+    const left = anchors[anchorIndex];
+    const right = anchors[anchorIndex + 1];
+    const difference = right.number - left.number;
+    if (!difference || Math.abs(difference) <= step || Math.abs(difference) % step) continue;
+    if (kind === "even" && (left.number % 2 || right.number % 2)) continue;
+    if (kind === "odd" && (!(left.number % 2) || !(right.number % 2))) continue;
+    const addressTags = compatibleAddressTags(left.tags, right.tags, wayTags);
+    if (!addressTags) continue;
+    addressTags.set("addr:housenumber", String(left.number));
+    const startAddress = addressFromTags(addressTags);
+    if (!startAddress?.complete) continue;
+    const geometryPoints = points.slice(left.index, right.index + 1);
+    if (geometryPoints.some(point => !point)) continue;
+    const geometry = encodeAddressRangeGeometry(geometryPoints);
+    const midpoint = interpolateAddressRangePoint(geometry, left.number, right.number, (left.number + right.number) / 2);
+    if (!midpoint) continue;
+    const rangeLabel = `${left.number}\u2013${right.number} ${startAddress.street}`;
+    const locality = uniqueText([
+      startAddress.suburb,
+      startAddress.city,
+      startAddress.district,
+      startAddress.state,
+      startAddress.postcode,
+      startAddress.country
+    ]);
+    const formatted = uniqueText([rangeLabel, ...locality]).join(", ");
+    const segment = docs.length;
+    const doc = {
+      id: `way/${osmId}/address-range/${segment}`,
+      url: `https://www.openstreetmap.org/way/${osmId}`,
+      name: formatted,
+      address_search: formatted,
+      body: `address interpolation ${kind}`,
+      category: "address",
+      type: "interpolated_address_range",
+      lat: Number(midpoint.lat.toFixed(7)),
+      lon: Number(midpoint.lon.toFixed(7)),
+      interpolation_keys: addressRangeLookupValues(
+        left.number,
+        right.number,
+        step,
+        addressRangeTails(startAddress)
+      ),
+      _address_range_start: left.number,
+      _address_range_end: right.number,
+      _address_range_step: step,
+      _address_range_geometry: geometry,
+      _address_range_kind: kind,
+      _address_range_inclusion: cleanText(wayTags.get("addr:inclusion")) || "actual"
+    };
+    applyAddressFields(doc, startAddress);
+    docs.push(doc);
+  }
+  return docs;
 }
 
 async function writeJsonl(args) {
@@ -336,12 +591,14 @@ async function writeJsonl(args) {
   const t0 = performance.now();
   const stageSeconds = {};
   let ways = 0;
+  let interpolationWays = 0;
   let reusableWays = false;
   if (!args.force && existsSync(wayPath) && existsSync(wayMetaPath)) {
     const meta = JSON.parse(readFileSync(wayMetaPath, "utf8"));
     if (matchesPbf(meta, identity)) {
       console.log(`[osm] reusing disk-backed candidate-way spool (${meta.ways} ways, ${meta.bytes} bytes)`);
       ways = meta.ways;
+      interpolationWays = meta.interpolationWays || 0;
       reusableWays = true;
     }
   }
@@ -355,10 +612,16 @@ async function writeJsonl(args) {
       scanPbf(args.pbf, {
         onWay(id, refs, tags) {
           if (!refs.length) return;
-          if (!tags.get("name") && !firstCategory(tags)) return;
-          const ref = refs[0];
-          writer.write([id, ref, wayDocTagEntries(tags)]);
-          anchorWriter.write(ref);
+          if (!searchablePlaceTags(tags)) return;
+          const interpolation = Boolean(tags.get("addr:interpolation"));
+          const anchorRefs = interpolation ? refs : refs[0];
+          writer.write([id, anchorRefs, wayDocTagEntries(tags)]);
+          if (interpolation) {
+            interpolationWays++;
+            for (const ref of refs) anchorWriter.write(ref);
+          } else {
+            anchorWriter.write(refs[0]);
+          }
           ways++;
           progress(() => `${ways.toLocaleString()} ways, ${(writer.bytes / 2 ** 30).toFixed(2)} GiB spooled`);
         }
@@ -368,7 +631,7 @@ async function writeJsonl(args) {
       anchorWriter.close();
     }
     renameSync(wayPartialPath, wayPath);
-    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, bytes: statSync(wayPath).size }, null, 2));
+    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, interpolationWays, bytes: statSync(wayPath).size }, null, 2));
     stageSeconds.candidateWays = elapsedSeconds(stageStart);
   }
 
@@ -385,7 +648,11 @@ async function writeJsonl(args) {
       const progress = progressLogger("anchor references");
       try {
         await eachJsonLine(wayPath, ([, ref]) => {
-          anchorWriter.write(ref);
+          if (Array.isArray(ref)) {
+            for (const item of ref) anchorWriter.write(item);
+          } else {
+            anchorWriter.write(ref);
+          }
           read++;
           progress(() => `${read.toLocaleString()}/${ways.toLocaleString()} references`);
         });
@@ -435,7 +702,8 @@ async function writeJsonl(args) {
           lastNodeId = id;
           while (anchors.current != null && anchors.current < id) anchors.advance();
           if (anchors.current === id) {
-            coords.put(id, lat, lon);
+            const entries = retainedAddressTagEntries(tags);
+            coords.put(id, lat, lon, entries.length ? JSON.stringify(entries) : null);
             anchorsResolved++;
             anchors.advance();
           }
@@ -472,6 +740,7 @@ async function writeJsonl(args) {
   let nodeDocs = 0;
   let waysRead = 0;
   let wayDocs = 0;
+  let interpolationRangeDocsWritten = 0;
   const outputProgress = progressLogger("output documents");
   try {
     await eachRawLine(nodePath, line => {
@@ -486,13 +755,32 @@ async function writeJsonl(args) {
       await eachJsonLine(wayPath, ([id, ref, entries]) => {
         waysRead++;
         if (!args.limit || docs < args.limit) {
-          const point = coords.get(ref);
+          const refs = Array.isArray(ref) ? ref : [ref];
+          const points = refs.map(item => {
+            const point = coords.get(item);
+            if (!point) return null;
+            return {
+              lat: point.lat,
+              lon: point.lon,
+              tags: point.data ? new Map(JSON.parse(point.data)) : new Map()
+            };
+          });
+          const point = points[0];
+          const tags = new Map(entries);
           if (point) {
-            const doc = placeDoc("way", id, point.lat, point.lon, new Map(entries));
+            const doc = placeDoc("way", id, point.lat, point.lon, tags);
             if (doc) {
               writer.write(doc);
               docs++;
               wayDocs++;
+            }
+          }
+          if ((!args.limit || docs < args.limit) && Array.isArray(ref)) {
+            for (const doc of interpolationRangeDocs(id, refs, points, tags)) {
+              if (args.limit && docs >= args.limit) break;
+              writer.write(doc);
+              docs++;
+              interpolationRangeDocsWritten++;
             }
           }
         }
@@ -512,6 +800,8 @@ async function writeJsonl(args) {
     docs,
     nodeDocs,
     wayDocs,
+    interpolationWays,
+    interpolationRangeDocs: interpolationRangeDocsWritten,
     ways,
     anchors: uniqueAnchors,
     bytes: statSync(outPath).size,
@@ -533,8 +823,32 @@ function writeSite(args) {
     fields: [
       { name: "title", path: "name", weight: 6.0, b: 0.4, phrase: true },
       { name: "aliases", path: "aliases", weight: 4.0, b: 0.5 },
+      { name: "address", path: "address_search", weight: 10.0, b: 0.2 },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
+    alwaysIndexFields: ["title", "aliases", "address"],
+    authority: [
+      {
+        name: "address",
+        path: "address",
+        weight: 4000000,
+        surface: false,
+        exact: false,
+        tokens: false,
+        normalizer: "address",
+        addressComponents: true
+      },
+      {
+        name: "address_interpolation",
+        path: "interpolation_keys",
+        weight: 3000000,
+        surface: false,
+        exact: true,
+        tokens: false,
+        normalizer: "address-range"
+      }
+    ],
+    authorityMaxRowsPerKey: 64,
     facets: [
       { name: "category", path: "category" },
       { name: "type", path: "type" }
@@ -549,7 +863,13 @@ function writeSite(args) {
       { path: "name", weightPath: "population" },
       { path: "aliases" }
     ],
-    display: ["name", "url", "category", "type", "lat", "lon"],
+    display: [
+      "name", "address", "house_number", "street", "unit", "suburb",
+      "city", "district", "state", "postcode", "country",
+      "url", "category", "type", "lat", "lon",
+      "_address_range_start", "_address_range_end", "_address_range_step",
+      "_address_range_geometry", "_address_range_kind", "_address_range_inclusion"
+    ],
     buildProgressLogMs: args.buildProgressLogMs
   };
   if (args.region === "us") {
@@ -565,6 +885,10 @@ function writeSite(args) {
   }
   mkdirSync(resolve(args.root, "public"), { recursive: true });
   writeFileSync(configPath, JSON.stringify(config, null, 2));
+  writeFileSync(
+    resolve(args.root, "public", "osm-demo.json"),
+    JSON.stringify({ region: args.region, ...(DEMO_VIEWS[args.region] || {}) }, null, 2)
+  );
   const bundle = resolve("dist/runtime.browser.js");
   if (existsSync(bundle)) copyFileSync(bundle, resolve(args.root, "public", "runtime.browser.js"));
   return configPath;
@@ -584,7 +908,9 @@ async function run() {
   }
 }
 
-run().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}

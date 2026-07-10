@@ -133,3 +133,9 @@ html, body {
   font-size: 0.78rem;
   color: #66766c;
 }
+
+#resultList .address {
+  margin-top: 2px;
+  font-size: 0.82rem;
+  color: #33413a;
+}

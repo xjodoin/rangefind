@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { authorityKeysForValue, buildAuthorityShard, parseAuthorityShard } from "../src/authority_codec.js";
+import { authorityKeysForQuery, authorityKeysForValue, buildAuthorityShard, parseAuthorityShard } from "../src/authority_codec.js";
 import {
   buildBlockFilters,
   buildCodesFile,
@@ -504,6 +504,22 @@ test("authority keys keep surface-exact accents separate from folded exact looku
     authorityKeysForValue("Pâris").map(item => item.key),
     ["r|pâris", "x|paris", "t|paris"]
   );
+});
+
+test("authority address keys use one normalized namespace for equivalent forms", () => {
+  assert.deepEqual(
+    authorityKeysForValue("350 Fifth Avenue, New York", {
+      surface: false,
+      exact: false,
+      tokens: false,
+      normalizer: "address"
+    }),
+    [{ key: "a|350 5th ave new york", kind: "address" }]
+  );
+  assert.ok(authorityKeysForQuery("350 5th Ave. New York", [], { address: true })
+    .some(item => item.key === "a|350 5th ave new york" && item.kind === "address"));
+  assert.ok(authorityKeysForQuery("New York 350 Fifth Avenue", [], { address: true })
+    .some(item => item.key === "a|350 5th ave new york" && item.kind === "address"));
 });
 
 test("paged directory can encode checksummed block pointers", () => {

@@ -37,6 +37,37 @@ const POSTING_BLOCK_CODEC_CODES = {
 };
 const POSTING_BLOCK_CODECS = Object.fromEntries(Object.entries(POSTING_BLOCK_CODEC_CODES).map(([name, code]) => [code, name]));
 
+class ChunkedByteWriter {
+  constructor(chunkBytes = 64 * 1024) {
+    this.chunkBytes = Math.max(1024, Math.floor(Number(chunkBytes || 0)));
+    this.chunks = [];
+    this.current = new Uint8Array(this.chunkBytes);
+    this.offset = 0;
+    this.length = 0;
+  }
+
+  push(value) {
+    if (this.offset >= this.current.length) {
+      this.chunks.push(this.current);
+      this.current = new Uint8Array(this.chunkBytes);
+      this.offset = 0;
+    }
+    this.current[this.offset++] = value;
+    this.length++;
+  }
+
+  finish() {
+    if (this.offset) this.chunks.push(this.current.subarray(0, this.offset));
+    const out = Buffer.allocUnsafe(this.length);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+}
+
 function postingBlockCodecCode(codec) {
   return POSTING_BLOCK_CODEC_CODES[codec] ?? POSTING_BLOCK_CODEC_CODES[POSTING_BLOCK_CODEC_PAIR_VARINT];
 }
@@ -310,6 +341,39 @@ export function summarizeBlockFilters(filters, codes, docs) {
   return Object.fromEntries((filters || []).map((filter, index) => [filter.name, summary[index]]));
 }
 
+const POSTING_BLOCK_ROWS = Symbol("posting-block-rows");
+
+// Final reduction already materializes each term into compact typed doc and
+// impact columns. Keep blocks as zero-copy views over those columns instead of
+// allocating one `[doc, impact]` JavaScript array per posting. At national
+// scale that removes hundreds of millions of short-lived objects from the
+// reducer's hottest loop while retaining array support for focused codec tests.
+function postingBlockRows(docs, impacts, order, start, end) {
+  return {
+    [POSTING_BLOCK_ROWS]: true,
+    docs,
+    impacts,
+    order,
+    start,
+    length: end - start
+  };
+}
+
+function postingRowsSourceIndex(rows, index) {
+  const orderedIndex = rows.start + index;
+  return rows.order ? rows.order[orderedIndex] : orderedIndex;
+}
+
+function postingRowsDoc(rows, index) {
+  if (!rows?.[POSTING_BLOCK_ROWS]) return rows[index][0];
+  return rows.docs[postingRowsSourceIndex(rows, index)];
+}
+
+function postingRowsImpact(rows, index) {
+  if (!rows?.[POSTING_BLOCK_ROWS]) return rows[index][1];
+  return rows.impacts[postingRowsSourceIndex(rows, index)];
+}
+
 function encodePostings(rows, total, codes, filters, config, term = "") {
   const df = postingRowCount(rows);
   // Generational delta builds replicate the base generations' frozen corpus
@@ -338,23 +402,22 @@ function encodePostings(rows, total, codes, filters, config, term = "") {
   const docRanges = buildPostingDocRanges(docs, impacts, total, config);
   const orderPlan = postingImpactOrder(docs, impacts, maxImpact, docsSorted, config);
   const order = orderPlan.order;
+  const orderLength = order?.length ?? docs.length;
   const chunks = [];
   const blocks = [];
   const pendingBlocks = [];
   let offset = 0;
-  for (let start = 0; start < order.length; start += config.postingBlockSize) {
-    const end = Math.min(order.length, start + config.postingBlockSize);
-    const blockRows = new Array(end - start);
-    for (let i = start; i < end; i++) {
-      const row = order[i];
-      blockRows[i - start] = [docs[row], impacts[row]];
-    }
+  for (let start = 0; start < orderLength; start += config.postingBlockSize) {
+    const end = Math.min(orderLength, start + config.postingBlockSize);
+    const blockRows = postingBlockRows(docs, impacts, order, start, end);
     if (!blockRows.length) continue;
-    let maxImpactDoc = blockRows[0][0];
-    let maxImpact = blockRows[0][1];
-    let docMin = blockRows[0][0];
-    let docMax = blockRows[0][0];
-    for (const [doc, impact] of blockRows) {
+    let maxImpactDoc = postingRowsDoc(blockRows, 0);
+    let maxImpact = postingRowsImpact(blockRows, 0);
+    let docMin = maxImpactDoc;
+    let docMax = maxImpactDoc;
+    for (let i = 0; i < blockRows.length; i++) {
+      const doc = postingRowsDoc(blockRows, i);
+      const impact = postingRowsImpact(blockRows, i);
       docMin = Math.min(docMin, doc);
       docMax = Math.max(docMax, doc);
       if (impact > maxImpact || (impact === maxImpact && doc < maxImpactDoc)) {
@@ -380,7 +443,9 @@ function encodePostings(rows, total, codes, filters, config, term = "") {
   for (const item of pendingBlocks) {
     const block = item.block;
     block.offset = offset;
-    for (const [doc] of item.rows) updateSummary(block.filters, filters, codes, doc);
+    for (let i = 0; i < item.rows.length; i++) {
+      updateSummary(block.filters, filters, codes, postingRowsDoc(item.rows, i));
+    }
     const encodedBlock = encodePostingBlockRows(item.rows, config, codecPlan);
     block.codec = encodedBlock.codec;
     block.bytes = encodedBlock.bytes;
@@ -394,7 +459,7 @@ function encodePostings(rows, total, codes, filters, config, term = "") {
     chunks.push(encodedBlock.bytes);
     offset += encodedBlock.bytes.length;
   }
-  return { df, count: order.length, byteLength: offset, chunks, blocks, docRanges, orderCodec: orderPlan.codec, codecPlan };
+  return { df, count: orderLength, byteLength: offset, chunks, blocks, docRanges, orderCodec: orderPlan.codec, codecPlan };
 }
 
 function buildPostingDocRanges(docs, impacts, total, config) {
@@ -428,7 +493,9 @@ function buildPostingDocRanges(docs, impacts, total, config) {
 function buildPostingBlockDocRanges(blockRows, docRanges) {
   if (!docRanges?.rangeSize || !docRanges.scale || !blockRows?.length) return null;
   const maxes = new Map();
-  for (const [doc, impact] of blockRows) {
+  for (let i = 0; i < blockRows.length; i++) {
+    const doc = postingRowsDoc(blockRows, i);
+    const impact = postingRowsImpact(blockRows, i);
     if (doc < 0 || impact <= 0) continue;
     const range = Math.floor(doc / docRanges.rangeSize);
     if (impact <= (maxes.get(range) || 0)) continue;
@@ -449,9 +516,7 @@ function postingImpactOrder(docs, impacts, maxImpact, docsSorted, config) {
   const count = docs.length;
   const requestedOrder = String(config.postingOrder || "").toLowerCase();
   if (requestedOrder === "doc" || requestedOrder === "doc-id" || requestedOrder === "docid" || requestedOrder === "sort-rank") {
-    const order = new Int32Array(count);
-    for (let i = 0; i < count; i++) order[i] = i;
-    return { order, codec: "doc-id" };
+    return { order: null, codec: "doc-id" };
   }
   const minRows = Math.max(0, Math.floor(Number(config.postingImpactBucketOrderMinRows ?? 2048)));
   const maxBuckets = Math.max(1, Math.floor(Number(config.postingImpactBucketOrderMaxBuckets ?? 65536)));
@@ -487,9 +552,9 @@ function concatUint8(chunks, total) {
 
 function encodePairVarintRows(rows) {
   const bytes = [];
-  for (const [doc, impact] of rows) {
-    pushVarint(bytes, doc);
-    pushVarint(bytes, impact);
+  for (let i = 0; i < rows.length; i++) {
+    pushVarint(bytes, postingRowsDoc(rows, i));
+    pushVarint(bytes, postingRowsImpact(rows, i));
   }
   return Uint8Array.from(bytes);
 }
@@ -499,10 +564,10 @@ function encodeImpactRunRows(rows) {
   let groupCount = 0;
   const groups = [];
   for (let i = 0; i < rows.length;) {
-    const impact = rows[i][1];
+    const impact = postingRowsImpact(rows, i);
     const docs = [];
-    while (i < rows.length && rows[i][1] === impact) {
-      docs.push(rows[i][0]);
+    while (i < rows.length && postingRowsImpact(rows, i) === impact) {
+      docs.push(postingRowsDoc(rows, i));
       i++;
     }
     groups.push({ impact, docs });
@@ -524,10 +589,10 @@ function encodeImpactRunRows(rows) {
 function impactGroups(rows) {
   const groups = [];
   for (let i = 0; i < rows.length;) {
-    const impact = rows[i][1];
+    const impact = postingRowsImpact(rows, i);
     const docs = [];
-    while (i < rows.length && rows[i][1] === impact) {
-      docs.push(rows[i][0]);
+    while (i < rows.length && postingRowsImpact(rows, i) === impact) {
+      docs.push(postingRowsDoc(rows, i));
       i++;
     }
     groups.push({ impact, docs });
@@ -676,7 +741,9 @@ function blockCodecSummary(rows) {
   let maxDelta = 0;
   let impactRuns = 0;
   let previousImpact = null;
-  for (const [doc, impact] of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const doc = postingRowsDoc(rows, i);
+    const impact = postingRowsImpact(rows, i);
     if (previousDoc >= 0) maxDelta = Math.max(maxDelta, doc - previousDoc);
     previousDoc = doc;
     if (impact !== previousImpact) {
@@ -684,8 +751,8 @@ function blockCodecSummary(rows) {
       previousImpact = impact;
     }
   }
-  const firstDoc = rows[0]?.[0] || 0;
-  const lastDoc = rows[rows.length - 1]?.[0] || firstDoc;
+  const firstDoc = rows.length ? postingRowsDoc(rows, 0) : 0;
+  const lastDoc = rows.length ? postingRowsDoc(rows, rows.length - 1) : firstDoc;
   return {
     rows: rows.length,
     span: Math.max(1, lastDoc - firstDoc + 1),
@@ -786,7 +853,8 @@ function addPostingBlockCodecStats(stats, block) {
 export function buildPostingSegmentChunks(entries, total, codes, filters, config, writeBlock) {
   const minBlocks = Math.max(1, Number(config.externalPostingBlockMinBlocks || 0));
   const minBytes = Math.max(0, Number(config.externalPostingBlockMinBytes || 0));
-  const header = [...POSTING_SEGMENT_MAGIC];
+  const header = new ChunkedByteWriter();
+  for (const byte of POSTING_SEGMENT_MAGIC) header.push(byte);
   const chunks = [];
   let chunkBytes = 0;
   const directory = [];
@@ -997,7 +1065,7 @@ export function buildPostingSegmentChunks(entries, total, codes, filters, config
     }
   }
 
-  const headerBuffer = Buffer.from(Uint8Array.from(header));
+  const headerBuffer = header.finish();
   return {
     format: POSTING_SEGMENT_FORMAT,
     chunks: [headerBuffer, ...chunks],

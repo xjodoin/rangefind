@@ -3788,7 +3788,12 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
 
 // v7: autocomplete records moved into authority runs. Reusing a v6 scan stage
 // would silently omit the unified lexicon even when `suggest` is configured.
-const BUILD_RESUME_SCHEMA_VERSION = 7;
+// v8: authority fields can emit canonical address keys. Reusing v7 authority
+// runs would publish an index whose manifest advertises keys it does not have.
+// v9: address interpolation range keys use their own namespace.
+// v10: range keys put street/locality before their bucket so prefix sharding
+// distributes national corpora; v9 runs could retain oversized partitions.
+const BUILD_RESUME_SCHEMA_VERSION = 10;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;

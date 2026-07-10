@@ -8,6 +8,7 @@ import {
   createSegmentBuilder,
   finishSegmentBuilder,
   flushSegment,
+  openSegmentDirectoryCursor,
   readSegmentRows,
   readSegmentTerms,
   shouldFlushSegment
@@ -59,6 +60,30 @@ test("segment builder streams large term metadata files with readable checksums"
   assert.equal(data.terms.length, 5000);
   assert.equal(data.terms[0].term, "term-00000");
   assert.equal(data.terms.at(-1).term, "term-04999");
+});
+
+test("segment directory cursor streams entries across buffer boundaries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-segment-cursor-"));
+  const builder = createSegmentBuilder(root, { segmentMaxPostings: 100 });
+  const terms = [
+    `alpha-${"a".repeat(1400)}`,
+    `beta-${"b".repeat(1400)}`,
+    `gamma-${"c".repeat(1400)}`
+  ];
+  terms.forEach((term, index) => addSegmentPosting(builder, term, index + 1, index + 2));
+  const [segment] = finishSegmentBuilder(builder);
+  const cursor = openSegmentDirectoryCursor(segment, { bufferBytes: 1024 });
+
+  try {
+    assert.equal(cursor.count, terms.length);
+    const entries = [];
+    for (let entry = cursor.next(); entry; entry = cursor.next()) entries.push(entry);
+    assert.deepEqual(entries.map(entry => entry.term), terms);
+    assert.deepEqual(entries.map(entry => entry.df), [1, 1, 1]);
+    assert.equal(cursor.next(), null);
+  } finally {
+    cursor.close();
+  }
 });
 
 test("segment builder flushes by explicit doc and byte budgets", async () => {

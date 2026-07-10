@@ -4,6 +4,33 @@
 
 ### Changed
 
+- **Compact OSM address interpolation**: numeric `addr:interpolation` ways now
+  become one range document per compatible anchor segment instead of millions
+  of inferred documents. Street-first 16-number authority buckets locate a
+  candidate with zero posting decodes; the runtime verifies range/parity and
+  computes the inferred point by distance along a compact 1e-6-degree polyline.
+  Explicit address objects always take precedence. On Quebec, 442,979 ways
+  produced 339,169 range docs covering about 9.15M possible addresses, growing
+  the corpus only 5.9%. The authority shard encoder now uses bounded byte chunks
+  rather than a giant JavaScript array, and address-like demo searches bypass a
+  stale map viewport so exact addresses cannot be hidden. Address autocomplete
+  now resolves a typed house number against lexicon-completed street/locality
+  tails after three street-token characters, reusing the compact range lane
+  instead of publishing millions of inferred suggestion strings.
+
+- **National-scale address search and posting reduction**: the OSM fixture now
+  retains complete address-only nodes and ways, publishes structured address
+  fields, and builds canonical full, locality, postcode, and street authority
+  keys. Normalized, reordered, and useful partial address forms use a bounded
+  zero-posting exact lane before BM25. A 66.8M-document / 700.8M-posting US
+  build also exposed two reducer limits: final segment directories now merge
+  through 64 KiB streaming cursors instead of decoding roughly 2 GiB into V8,
+  and posting blocks are zero-copy typed-array views instead of allocating one
+  JavaScript pair per posting. Large posting headers now grow through bounded
+  64 KiB byte chunks instead of one giant JavaScript number array. The
+  zero-copy change produced byte-identical output 2.17x faster with 62% lower
+  RSS on a 1M-posting encoder benchmark.
+
 - **National-scale OSM builds**: the geo fixture now supports the full United
   States Geofabrik extract and uses resumable downloads, disk-spooled candidate
   ways, externally sorted/deduplicated anchors, and an indexed on-disk

@@ -242,9 +242,11 @@ export function createCoordinateStore(path, options = {}) {
   mkdirSync(dirname(resolve(path)), { recursive: true });
   const database = new DatabaseSync(path);
   database.exec("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA locking_mode=EXCLUSIVE;");
-  database.exec("CREATE TABLE IF NOT EXISTS coords (ref INTEGER PRIMARY KEY, lat REAL NOT NULL, lon REAL NOT NULL) WITHOUT ROWID");
-  const insert = database.prepare("INSERT OR REPLACE INTO coords (ref, lat, lon) VALUES (?, ?, ?)");
-  const lookup = database.prepare("SELECT lat, lon FROM coords WHERE ref = ?");
+  database.exec("CREATE TABLE IF NOT EXISTS coords (ref INTEGER PRIMARY KEY, lat REAL NOT NULL, lon REAL NOT NULL, data TEXT) WITHOUT ROWID");
+  const columns = database.prepare("PRAGMA table_info(coords)").all();
+  if (!columns.some(column => column.name === "data")) database.exec("ALTER TABLE coords ADD COLUMN data TEXT");
+  const insert = database.prepare("INSERT OR REPLACE INTO coords (ref, lat, lon, data) VALUES (?, ?, ?, ?)");
+  const lookup = database.prepare("SELECT lat, lon, data FROM coords WHERE ref = ?");
   let transactionRows = 0;
   let transactionOpen = false;
 
@@ -262,15 +264,18 @@ export function createCoordinateStore(path, options = {}) {
   }
 
   return {
-    put(ref, lat, lon) {
+    put(ref, lat, lon, data = null) {
       begin();
-      insert.run(ref, lat, lon);
+      insert.run(ref, lat, lon, data);
       transactionRows++;
       if (transactionRows >= 100000) commit();
     },
     get(ref) {
       const row = lookup.get(ref);
-      return row ? { lat: row.lat, lon: row.lon } : null;
+      if (!row) return null;
+      return row.data == null
+        ? { lat: row.lat, lon: row.lon }
+        : { lat: row.lat, lon: row.lon, data: row.data };
     },
     count() {
       commit();

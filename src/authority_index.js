@@ -34,6 +34,48 @@ function valueList(value) {
   return [value];
 }
 
+function addressComponentOptions(field) {
+  if (field.normalizer !== "address" || !field.addressComponents) return null;
+  const raw = typeof field.addressComponents === "object" ? field.addressComponents : {};
+  return {
+    houseNumberPath: String(raw.houseNumberPath || "house_number"),
+    streetPath: String(raw.streetPath || "street"),
+    unitPath: String(raw.unitPath || "unit"),
+    localityPaths: (Array.isArray(raw.localityPaths) ? raw.localityPaths : ["city", "suburb", "district", "state"]).map(String),
+    postcodePath: String(raw.postcodePath || "postcode")
+  };
+}
+
+function uniqueValues(values) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values) {
+    const value = String(raw || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function authorityValuesForField(field, doc) {
+  const values = valueList(rawPath(doc, field.path));
+  const components = field.addressComponents;
+  if (!components) return values;
+  const houseNumber = String(rawPath(doc, components.houseNumberPath) || "").trim();
+  const street = String(rawPath(doc, components.streetPath) || "").trim();
+  if (!houseNumber || !street) return values;
+  const base = `${houseNumber} ${street}`;
+  const locality = components.localityPaths.map(path => String(rawPath(doc, path) || "").trim()).find(Boolean) || "";
+  const postcode = String(rawPath(doc, components.postcodePath) || "").trim();
+  return uniqueValues([
+    ...values,
+    locality ? `${base}, ${locality}` : "",
+    postcode ? `${base}, ${postcode}` : "",
+    base
+  ]);
+}
+
 export function authorityFields(config) {
   return (config.authority || [])
     .map(field => typeof field === "string" ? { name: field, path: field } : field)
@@ -46,7 +88,9 @@ export function authorityFields(config) {
       tokenWeight: Math.max(1, Math.floor(Number(field.tokenWeight ?? Math.floor(Number(field.weight ?? 1000000) * 0.8)))),
       surface: field.surface !== false,
       exact: field.exact !== false,
-      tokens: field.tokens !== false
+      tokens: field.tokens !== false,
+      normalizer: field.normalizer === "address" || field.normalizer === "address-range" ? field.normalizer : "",
+      addressComponents: addressComponentOptions(field)
     }))
     .filter(field => field.path);
 }
@@ -100,7 +144,7 @@ function flushAuthorityBuffer(buffer) {
 export function authorityRecordsForDoc(fields, doc, analyzer = null, suggestionFields = []) {
   const records = new Map();
   for (const field of fields || []) {
-    for (const value of valueList(rawPath(doc, field.path))) {
+    for (const value of authorityValuesForField(field, doc)) {
       for (const { key, kind } of authorityKeysForValue(value, analyzer ? { ...field, analyzer } : field)) {
         const score = kind === "surface" ? field.surfaceWeight : kind === "exact" ? field.exactWeight : field.tokenWeight;
         records.set(key, Math.max(records.get(key) || 0, score));
@@ -297,7 +341,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
     storage: "range-pack-v1",
     compression: "gzip-member",
     format: AUTHORITY_FORMAT,
-    fields: authorityFields(config).map(({ name, path, weight, surfaceWeight, exactWeight, tokenWeight, surface, exact, tokens }) => ({ name, path, weight, surfaceWeight, exactWeight, tokenWeight, surface, exact, tokens })),
+    fields: authorityFields(config).map(({ name, path, weight, surfaceWeight, exactWeight, tokenWeight, surface, exact, tokens, normalizer }) => ({ name, path, weight, surfaceWeight, exactWeight, tokenWeight, surface, exact, tokens, normalizer })),
     max_rows_per_key: Math.max(1, Math.floor(Number(config.authorityMaxRowsPerKey || 16))),
     base_shard_depth: shardConfig.baseShardDepth,
     max_shard_depth: shardConfig.maxShardDepth,

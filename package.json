@@ -87,6 +87,7 @@
     "bench:directories": "node scripts/bench_directory_layouts.mjs",
     "bench:frwiki": "node scripts/frwiki_fixture.mjs all",
     "bench:osm-geo": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
+    "bench:osm-address": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_address_bench.mjs --root=examples/osm-geo",
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",
     "bench:osm-geo:quebec": "node scripts/osm_fixture.mjs all --region=quebec && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",

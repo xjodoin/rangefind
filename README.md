@@ -87,7 +87,9 @@ a large thesis corpus.
 - Per-query facet counts with exact-or-flagged semantics: dictionary-backed
   global counts, exact counts over budgeted match sets, and bounded
   chunk-sampled estimates for very large result sets.
-- OpenStreetMap example and benchmark fixture with exhaustive geo oracles.
+- OpenStreetMap place and address fixture with canonical zero-posting address
+  lookup, compact `addr:interpolation` ranges, structured address results, and
+  exhaustive geo oracles.
 - Tiny runnable example.
 
 ## Why This Exists

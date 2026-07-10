@@ -13,3 +13,4 @@ const run = (script, args) => execFileSync(process.execPath, [script, ...args], 
 
 run(resolve(scripts, "osm_fixture.mjs"), ["all", "--region=us", `--root=${root}`]);
 run(resolve(scripts, "osm_geo_bench.mjs"), [`--root=${root}`]);
+run(resolve(scripts, "osm_address_bench.mjs"), [`--root=${root}`, "--samples=250"]);

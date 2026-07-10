@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, readSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendPostingRow, isPostingRowBuffer, postingRowCount, postingRowDoc, postingRowScore } from "./posting_rows.js";
 import { tryReadVarint, varintLength, writeVarint } from "./runs.js";
@@ -361,6 +361,103 @@ export function readSegmentDirectory(segment) {
     };
   }
   return { meta, terms, postingsPath };
+}
+
+// Sequential cursor for national-scale merges. `readSegmentDirectory` is
+// convenient for small/random-access callers, but decoding dozens of 50+ MB
+// term directories into JS strings and objects at once can exhaust V8 even
+// though the encoded files themselves are bounded. This cursor retains one
+// small byte buffer and one current term per segment.
+export function openSegmentDirectoryCursor(segment, options = {}) {
+  const dir = segment.dir || segment.path || segment;
+  const meta = typeof segment === "string"
+    ? JSON.parse(readFileSync(resolve(segment, "segment.json"), "utf8"))
+    : segment;
+  const termsPath = resolve(dir, meta.terms || "terms.bin");
+  const postingsPath = resolve(dir, meta.postings || "postings.bin");
+  const fd = openSync(termsPath, "r");
+  const buffer = Buffer.allocUnsafe(Math.max(1024, Math.floor(Number(options.bufferBytes || 64 * 1024))));
+  let bufferPos = 0;
+  let bufferEnd = 0;
+  let fileOffset = 0;
+  let index = 0;
+  let count = 0;
+  let closed = false;
+
+  function fill() {
+    bufferEnd = readSync(fd, buffer, 0, buffer.length, fileOffset);
+    fileOffset += bufferEnd;
+    bufferPos = 0;
+    return bufferEnd > 0;
+  }
+
+  function byte() {
+    if (bufferPos >= bufferEnd && !fill()) throw new Error("Truncated Rangefind segment terms file.");
+    return buffer[bufferPos++];
+  }
+
+  function cursorVarint() {
+    let result = 0;
+    let multiplier = 1;
+    for (;;) {
+      const value = byte();
+      result += (value & 0x7f) * multiplier;
+      if ((value & 0x80) === 0) return result;
+      multiplier *= 0x80;
+      if (!Number.isSafeInteger(result) || multiplier > Number.MAX_SAFE_INTEGER) {
+        throw new Error("Rangefind segment varint exceeds the safe integer range.");
+      }
+    }
+  }
+
+  function cursorUtf8() {
+    const length = cursorVarint();
+    if (!length) return "";
+    if (bufferEnd - bufferPos >= length) {
+      const value = textDecoder.decode(buffer.subarray(bufferPos, bufferPos + length));
+      bufferPos += length;
+      return value;
+    }
+    const bytes = Buffer.allocUnsafe(length);
+    for (let offset = 0; offset < length; offset++) bytes[offset] = byte();
+    return textDecoder.decode(bytes);
+  }
+
+  try {
+    for (const expected of TERMS_MAGIC) {
+      if (byte() !== expected) throw new Error("Unsupported Rangefind segment terms file.");
+    }
+    count = cursorVarint();
+  } catch (error) {
+    closeSync(fd);
+    closed = true;
+    throw error;
+  }
+
+  return {
+    meta,
+    postingsPath,
+    termsPath,
+    get count() {
+      return count;
+    },
+    next() {
+      if (closed || index >= count) return null;
+      index++;
+      return {
+        term: cursorUtf8(),
+        offset: cursorVarint(),
+        bytes: cursorVarint(),
+        df: cursorVarint(),
+        count: cursorVarint()
+      };
+    },
+    close() {
+      if (closed) return;
+      closeSync(fd);
+      closed = true;
+    }
+  };
 }
 
 export function readSegmentRows(segmentData, entry) {

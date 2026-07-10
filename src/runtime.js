@@ -1,6 +1,6 @@
 import { expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms } from "./terms.js";
 import { analyzerFromManifest } from "./analysis.js";
-import { authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
+import { authorityAddressRangeKey, authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns, decodeDocPagePointerRecord } from "./doc_pages.js";
@@ -41,6 +41,12 @@ import {
 import { filterBitmapHas, parseFilterBitmap } from "./filter_bitmaps.js";
 import { verifyBlockPointer } from "./object_store.js";
 import { parseQueryBundle } from "./query_bundle_codec.js";
+import {
+  addressRangeContains,
+  addressRangeQueryCandidates,
+  interpolateAddressRangePoint,
+  looksLikeAddressQuery
+} from "./address.js";
 import { decodeSegmentRows, parseSegmentTerms } from "./segment_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
 import {
@@ -6005,6 +6011,216 @@ export async function createSearch(options = {}) {
     return !!title && !!surface && title === surface;
   }
 
+  const addressAuthorityEnabled = Boolean(
+    manifest.authority?.fields?.some(field => field.normalizer === "address")
+  );
+  const addressInterpolationEnabled = Boolean(
+    manifest.authority?.fields?.some(field => field.normalizer === "address-range")
+  );
+
+  function interpolatedAddressLabel(result, houseNumber) {
+    const base = [String(houseNumber), result.street].filter(Boolean).join(" ");
+    const parts = [
+      base,
+      result.suburb,
+      result.city,
+      result.district,
+      result.state,
+      result.postcode,
+      result.country
+    ].map(value => String(value || "").trim()).filter(Boolean);
+    return [...new Set(parts)].join(", ");
+  }
+
+  function synthesizeInterpolatedAddress(result, houseNumber) {
+    if (!addressRangeContains(
+      result._address_range_start,
+      result._address_range_end,
+      result._address_range_step,
+      houseNumber
+    )) return null;
+    const point = interpolateAddressRangePoint(
+      result._address_range_geometry,
+      result._address_range_start,
+      result._address_range_end,
+      houseNumber
+    );
+    if (!point) return null;
+    const address = interpolatedAddressLabel(result, houseNumber);
+    const synthesized = {
+      ...result,
+      id: `${result.id}/${houseNumber}`,
+      title: address,
+      name: address,
+      address,
+      house_number: String(houseNumber),
+      type: "interpolated_address",
+      lat: Number(point.lat.toFixed(7)),
+      lon: Number(point.lon.toFixed(7)),
+      interpolated: true,
+      address_accuracy: result._address_range_inclusion || "actual",
+      interpolation: result._address_range_kind || ""
+    };
+    delete synthesized._address_range_start;
+    delete synthesized._address_range_end;
+    delete synthesized._address_range_step;
+    delete synthesized._address_range_geometry;
+    delete synthesized._address_range_kind;
+    delete synthesized._address_range_inclusion;
+    return synthesized;
+  }
+
+  async function tryAddressInterpolationFastPath({ q, page, size, includeResults }) {
+    if (!addressInterpolationEnabled) return null;
+    const candidates = addressRangeQueryCandidates(q);
+    if (!candidates.length) return null;
+    const housesByKey = new Map();
+    for (const candidate of candidates) {
+      const key = authorityAddressRangeKey(candidate.lookupValue);
+      if (!key) continue;
+      if (!housesByKey.has(key)) housesByKey.set(key, new Set());
+      housesByKey.get(key).add(candidate.houseNumber);
+    }
+    const entries = await authorityEntries([...housesByKey.keys()]);
+    const rowsByDoc = new Map();
+    let complete = true;
+    for (const { key, entry } of entries) {
+      complete = complete && entry.complete !== false;
+      for (const [doc, score] of entry.rows || []) {
+        if (!rowsByDoc.has(doc)) rowsByDoc.set(doc, { doc, score, houses: new Set() });
+        const row = rowsByDoc.get(doc);
+        row.score = Math.max(row.score, score);
+        for (const house of housesByKey.get(key) || []) row.houses.add(house);
+      }
+    }
+    if (!rowsByDoc.size) return null;
+    const ranked = [...rowsByDoc.values()].sort((left, right) => right.score - left.score || left.doc - right.doc);
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+    const hydrated = includeResults === false
+      ? []
+      : await rowsToResults(ranked.map(row => [row.doc, row.score]), resultContext);
+    const matches = [];
+    if (includeResults !== false) {
+      for (let index = 0; index < ranked.length; index++) {
+        for (const houseNumber of ranked[index].houses) {
+          const result = synthesizeInterpolatedAddress(hydrated[index], houseNumber);
+          if (result) matches.push(result);
+        }
+      }
+    } else {
+      // Count-only callers still need the compact range payloads to prove
+      // containment, so defer to the regular planner instead of guessing.
+      return null;
+    }
+    if (!matches.length) {
+      if (!complete) return null;
+      return {
+        total: 0,
+        page,
+        size,
+        approximate: false,
+        results: [],
+        stats: {
+          exact: true,
+          plannerLane: "addressInterpolationExact",
+          topKProven: true,
+          totalExact: true,
+          tailExhausted: true,
+          addressInterpolationKeys: housesByKey.size,
+          addressInterpolationRows: ranked.length,
+          addressInterpolationMatches: 0,
+          addressInterpolationComplete: true,
+          blocksDecoded: 0,
+          postingsDecoded: 0,
+          docPayloadLane: resultContext.docPayloadLane,
+          docPayloadPages: resultContext.docPayloadPages,
+          docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+          docPayloadAdaptive: resultContext.docPayloadAdaptive,
+          docPayloadForced: resultContext.docPayloadForced
+        }
+      };
+    }
+    matches.sort((left, right) => right.score - left.score || left.index - right.index || left.house_number.localeCompare(right.house_number));
+    return {
+      total: matches.length,
+      page,
+      size,
+      approximate: !complete,
+      results: matches.slice(0, size),
+      stats: {
+        exact: true,
+        plannerLane: "addressInterpolationExact",
+        topKProven: complete,
+        totalExact: complete,
+        tailExhausted: complete,
+        addressInterpolationKeys: housesByKey.size,
+        addressInterpolationRows: ranked.length,
+        addressInterpolationMatches: matches.length,
+        addressInterpolationComplete: complete,
+        blocksDecoded: 0,
+        postingsDecoded: 0,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced
+      }
+    };
+  }
+
+  async function tryAddressAuthorityFastPath({ q, page, size, hasFilters, sortPlan, geoPlan, includeResults, authority }) {
+    if (!addressAuthorityEnabled || options.authority === false || authority === false) return null;
+    if (page !== 1 || hasFilters || sortPlan || geoPlan || !looksLikeAddressQuery(q)) return null;
+    const keyPlans = authorityKeysForQuery(q, [], { analyzer, address: true });
+    const addressKeys = [...new Set(keyPlans.filter(item => item.kind === "address").map(item => item.key))];
+    if (!addressKeys.length) return null;
+    const entries = await authorityEntries(addressKeys);
+    const rowsByDoc = new Map();
+    let total = 0;
+    let complete = true;
+    for (const { entry } of entries) {
+      total = Math.max(total, entry.total || 0);
+      complete = complete && entry.complete !== false;
+      for (const [doc, score] of entry.rows || []) {
+        rowsByDoc.set(doc, Math.max(rowsByDoc.get(doc) || 0, score));
+      }
+    }
+    if (!rowsByDoc.size) {
+      return tryAddressInterpolationFastPath({ q, page, size, includeResults });
+    }
+    const ranked = [...rowsByDoc].sort((left, right) => right[1] - left[1] || left[0] - right[0]);
+    // Authority shards retain a bounded top list. Fall back to postings if a
+    // caller requests more rows than the exact key retained.
+    if (ranked.length < Math.min(size, total)) return null;
+    const pageRows = ranked.slice(0, size);
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+    const results = includeResults === false ? [] : await rowsToResults(pageRows, resultContext);
+    return {
+      total,
+      page,
+      size,
+      approximate: false,
+      results,
+      stats: {
+        exact: true,
+        plannerLane: "addressAuthorityExact",
+        topKProven: true,
+        totalExact: true,
+        tailExhausted: complete,
+        addressAuthorityKeys: addressKeys.length,
+        addressAuthorityRows: ranked.length,
+        addressAuthorityComplete: complete,
+        blocksDecoded: 0,
+        postingsDecoded: 0,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced
+      }
+    };
+  }
+
   async function maybeAuthorityRerank(params, response) {
     return traceSpan("authority.rerank", () => maybeAuthorityRerankInner(params, response));
   }
@@ -6021,14 +6237,22 @@ export async function createSearch(options = {}) {
     if (!authorityQuery || resultTitleMatchesQuery(response.results?.[0], authorityQuery)) return response;
 
     const authorityTerms = analyzer.queryPlan(authorityQuery).baseTerms;
-    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms, { analyzer }).filter(item => item.key);
+    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms, {
+      analyzer,
+      address: addressAuthorityEnabled && looksLikeAddressQuery(authorityQuery)
+    }).filter(item => item.key);
+    const addressKeys = [...new Set(keyPlans.filter(item => item.kind === "address").map(item => item.key))];
     const surfaceKeys = [...new Set(keyPlans.filter(item => item.kind === "surface").map(item => item.key))];
     const exactKeys = [...new Set(keyPlans.filter(item => item.kind === "exact").map(item => item.key))];
     const tokenKeys = [...new Set(keyPlans.filter(item => item.kind === "tokens").map(item => item.key))];
     if (!surfaceKeys.length && !exactKeys.length && !tokenKeys.length) return response;
 
-    let loadedKeys = surfaceKeys;
-    let entries = await authorityEntries(surfaceKeys);
+    let loadedKeys = addressKeys.length ? addressKeys : surfaceKeys;
+    let entries = await authorityEntries(loadedKeys);
+    if (!authorityEntryRows(entries) && surfaceKeys.length && loadedKeys !== surfaceKeys) {
+      loadedKeys = surfaceKeys;
+      entries = await authorityEntries(surfaceKeys);
+    }
     if (!authorityEntryRows(entries) && exactKeys.length) {
       loadedKeys = exactKeys;
       entries = await authorityEntries(exactKeys);
@@ -6199,6 +6423,24 @@ export async function createSearch(options = {}) {
           docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
         }
       };
+    }
+
+    const addressResponse = await tryAddressAuthorityFastPath({
+      q,
+      page,
+      size,
+      hasFilters,
+      sortPlan,
+      geoPlan,
+      includeResults: params.includeResults !== false,
+      authority: params.authority
+    });
+    if (addressResponse) {
+      if (params.highlight && addressResponse.results.length) {
+        const highlightOptions = params.highlight === true ? {} : params.highlight;
+        applyHighlights(addressResponse.results, highlightTermSet(q, "", analyzer), { ...highlightOptions, analyzer });
+      }
+      return addressResponse;
     }
 
     const queryAnalysis = await resolveQueryPlan(q);
@@ -6708,6 +6950,92 @@ export async function createSearch(options = {}) {
     };
   }
 
+  function addressSuggestionParts(q) {
+    const match = String(q || "").trim().match(/^(\d+)\s+(.+)$/u);
+    if (!match) return null;
+    const houseNumber = Number(match[1]);
+    if (!Number.isSafeInteger(houseNumber) || houseNumber < 0) return null;
+    return { houseNumber, tail: match[2].trim() };
+  }
+
+  function replaceSuggestionHouseNumber(value, houseNumber) {
+    const tail = String(value || "")
+      .trim()
+      .replace(/^\d+[\p{L}]?(?:\s*[\u2013-]\s*\d+[\p{L}]?)?\s+/u, "");
+    return tail ? `${houseNumber} ${tail}` : "";
+  }
+
+  async function executeAddressSuggest(q, prefix, size, root) {
+    if (!addressInterpolationEnabled || !root) return null;
+    const parts = addressSuggestionParts(q);
+    if (!parts?.tail) return null;
+    const activeTailToken = authorityNormalizeSurface(parts.tail).split(" ").filter(Boolean).at(-1) || "";
+    if (activeTailToken.length < 3) return null;
+    const tailPrefix = suggestKey(parts.tail);
+    if (!tailPrefix) return null;
+    const tailSize = Math.min(32, Math.max(12, size * 3));
+    const tailResponse = await executeLexiconSuggest(parts.tail, tailPrefix, tailSize, root);
+    const suggestions = [];
+    const seenQueries = new Set();
+    const seenAddresses = new Set();
+    const candidates = [];
+    for (const candidate of tailResponse.suggestions) {
+      const candidateQuery = replaceSuggestionHouseNumber(candidate.text, parts.houseNumber);
+      const normalizedQuery = authorityNormalizeSurface(candidateQuery);
+      if (!candidateQuery || seenQueries.has(normalizedQuery)) continue;
+      seenQueries.add(normalizedQuery);
+      candidates.push({ candidate, candidateQuery });
+      if (candidates.length >= Math.min(16, Math.max(12, size * 2))) break;
+    }
+    // Directory and shard promises are cached, so concurrent probes coalesce
+    // shared reads while broad street prefixes avoid serial range latency.
+    const responses = await Promise.all(candidates.map(({ candidateQuery }) => tryAddressAuthorityFastPath({
+        q: candidateQuery,
+        page: 1,
+        size: 1,
+        hasFilters: false,
+        sortPlan: null,
+        geoPlan: null,
+        includeResults: true,
+        authority: true
+      })));
+    for (let index = 0; index < candidates.length; index++) {
+      const candidate = candidates[index].candidate;
+      const response = responses[index];
+      const result = response?.results?.[0];
+      const text = String(result?.address || result?.name || result?.title || "").trim();
+      const normalizedAddress = authorityNormalizeSurface(text);
+      if (!text || seenAddresses.has(normalizedAddress)) continue;
+      seenAddresses.add(normalizedAddress);
+      suggestions.push({
+        text,
+        weight: Math.max(1, Number(candidate.weight || 0)),
+        count: 1,
+        interpolated: Boolean(result.interpolated)
+      });
+      if (suggestions.length >= size) break;
+    }
+    if (!suggestions.length) return null;
+    return {
+      q,
+      prefix,
+      suggestions,
+      stats: {
+        exact: true,
+        suggestLane: "address-authority",
+        addressSuggestionTail: parts.tail,
+        addressSuggestionCandidates: tailResponse.suggestions.length,
+        addressSuggestionLookups: candidates.length,
+        addressSuggestionMatches: suggestions.length,
+        addressSuggestionTailLane: tailResponse.stats?.suggestLane || "",
+        suggestCandidateShards: tailResponse.stats?.suggestCandidateShards || 0,
+        suggestShardsVisited: tailResponse.stats?.suggestShardsVisited || 0,
+        suggestDirectoryPagesVisited: tailResponse.stats?.suggestDirectoryPagesVisited || 0,
+        suggestEntriesScanned: tailResponse.stats?.suggestEntriesScanned || 0
+      }
+    };
+  }
+
   async function executeSuggest(params = {}) {
     const q = String(params.q || "");
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
@@ -6716,7 +7044,11 @@ export async function createSearch(options = {}) {
       return { q, prefix, suggestions: [], stats: { exact: true, suggestShardsVisited: 0, suggestEntriesScanned: 0 } };
     }
     const root = await loadAuthorityLexiconRoot();
-    if (root) return executeLexiconSuggest(q, prefix, size, root);
+    if (root) {
+      const address = await executeAddressSuggest(q, prefix, size, root);
+      if (address) return address;
+      return executeLexiconSuggest(q, prefix, size, root);
+    }
     const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
     if (legacy) return legacy;
     throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");

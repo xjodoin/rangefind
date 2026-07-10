@@ -2,7 +2,7 @@ import { closeSync, mkdirSync, openSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createPostingRowBuffer, appendPostingRow, copyPostingRows, postingRowCount, resetPostingRows } from "./posting_rows.js";
-import { readSegmentDirectory, readSegmentRowsFromFdInto, writeSegmentFromTermRows } from "./segment_builder.js";
+import { openSegmentDirectoryCursor, readSegmentRowsFromFdInto, writeSegmentFromTermRows } from "./segment_builder.js";
 import { shardKey } from "./shards.js";
 
 // Code-unit term order, matching segment_builder's write order and the
@@ -59,17 +59,14 @@ class MinHeap {
 
 function segmentReaders(segments) {
   return segments.map((segment, index) => {
-    const data = readSegmentDirectory(segment);
+    const cursor = openSegmentDirectoryCursor(segment);
     return {
       index,
-      data,
-      fd: openSync(data.postingsPath, "r"),
+      cursor,
+      fd: openSync(cursor.postingsPath, "r"),
       readBuffer: Buffer.alloc(0),
       rows: createPostingRowBuffer(0),
-      position: 0,
-      get current() {
-        return data.terms[this.position] || null;
-      }
+      current: cursor.next()
     };
   });
 }
@@ -97,14 +94,17 @@ async function* mergedSegmentTermRows(segments, onTerm) {
       mergeSortedReaderRows(readers, matches, mergedRows);
       for (const readerIndex of matches) {
         const reader = readers[readerIndex];
-        reader.position++;
+        reader.current = reader.cursor.next();
         if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
       }
       onTerm?.(term, mergedRows.length);
       yield { term, rows: mergedRows };
     }
   } finally {
-    for (const reader of readers) closeSync(reader.fd);
+    for (const reader of readers) {
+      closeSync(reader.fd);
+      reader.cursor.close();
+    }
   }
 }
 
@@ -112,35 +112,32 @@ function* mergedSegmentTermStats(segments) {
   // Builder segments are disjoint doc slices, so directory df values are enough
   // for prefix planning; the posting rows are decoded only during final reduce.
   const readers = segments.map((segment, index) => {
-    const data = readSegmentDirectory(segment);
-    return {
-      index,
-      terms: data.terms,
-      position: 0,
-      get current() {
-        return this.terms[this.position] || null;
-      }
-    };
+    const cursor = openSegmentDirectoryCursor(segment);
+    return { index, cursor, current: cursor.next() };
   });
   const heap = new MinHeap((left, right) => compareTermCodeUnits(left.term, right.term) || left.reader - right.reader);
   for (const reader of readers) {
     if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
   }
 
-  while (heap.size) {
-    const first = heap.pop();
-    const term = first.term;
-    const matches = [first.reader];
-    while (heap.size && heap.items[0].term === term) matches.push(heap.pop().reader);
-    let df = 0;
-    for (const readerIndex of matches) {
-      const reader = readers[readerIndex];
-      const entry = reader.current;
-      df += Math.max(0, Math.floor(Number(entry?.df ?? entry?.count ?? 0)));
-      reader.position++;
-      if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
+  try {
+    while (heap.size) {
+      const first = heap.pop();
+      const term = first.term;
+      const matches = [first.reader];
+      while (heap.size && heap.items[0].term === term) matches.push(heap.pop().reader);
+      let df = 0;
+      for (const readerIndex of matches) {
+        const reader = readers[readerIndex];
+        const entry = reader.current;
+        df += Math.max(0, Math.floor(Number(entry?.df ?? entry?.count ?? 0)));
+        reader.current = reader.cursor.next();
+        if (reader.current) heap.push({ reader: reader.index, term: reader.current.term });
+      }
+      yield { term, df };
     }
-    yield { term, df };
+  } finally {
+    for (const reader of readers) reader.cursor.close();
   }
 }
 
