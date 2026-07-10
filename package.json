@@ -90,6 +90,7 @@
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",
     "bench:osm-geo:quebec": "node scripts/osm_fixture.mjs all --region=quebec && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
+    "bench:osm-geo:us": "node scripts/osm_us_bench.mjs",
     "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
     "bench:frwiki:lucene-quality": "node scripts/frwiki_lucene_quality.mjs",
     "bench:frwiki:search-game": "node scripts/search_benchmark_game.mjs",

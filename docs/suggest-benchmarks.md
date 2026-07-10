@@ -62,9 +62,30 @@ HTTP deployments benefit more directly from the reduced byte totals.
   matches; indexes with `weightPath` retain the configured weight as the
   primary signal. Both modes use the same exact shard-max proof.
 - Single-character prefixes fetch a compact immutable hot list from
-  `authority/hot/`; other queries do not pay for hot-list contents.
+  `authority/hot/`. Two- and three-letter Latin prefixes also get a hot list
+  only after crossing 256 candidates; the bounded 18,252-prefix keyspace keeps
+  aggregation independent of corpus size, while adaptive publication avoids
+  inflating the root for rare prefixes.
 - `rfauth-v2` autocomplete entries store only normalized/display text, maximum
   weight, and count—no unnecessary document row list or payload hydration.
 
 The former `suggest/` directory, page/branch codecs, pack table, manifest
 branch, scan aggregation map, and runtime page lane have been removed.
+
+## Full-US result
+
+Recorded 2026-07-09 on the 32,809,763-place US corpus: 16,718,287 autocomplete
+keys, 98,528 authority shards, and 4,196 adaptively published hot prefixes.
+The unified lexicon root is 424 KB and hot payloads total 2.55 MB.
+
+| Metric across 75 keystrokes | One-character hot lists | Adaptive 1–3 characters | Change |
+| --- | ---: | ---: | ---: |
+| Mean latency | 34.5 ms | 10.6 ms | -69% |
+| Mean transfer | 80.2 KB | 62.3 KB | -22% |
+| Mean requests | 1.72 | 0.75 | -56% |
+| Root | 370 KB | 424 KB | +54 KB one time |
+
+The worst second-keystroke example, `mo`, dropped from 398 ms / 749 KB /
+61,547 decoded entries to about 1 ms / 1 KB / 64 entries. Longer selective
+prefixes remain on the exact shard-max lane; the hot lists only bypass work
+where the ordinary prefix is demonstrably broad.

@@ -15,18 +15,40 @@
 //   node scripts/osm_fixture.mjs all --region=luxembourg
 //   node scripts/osm_fixture.mjs all --region=quebec
 
-import { copyFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  copyFileSync,
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { availableParallelism } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { createInterface } from "node:readline";
 import { scanPbf } from "./osm_pbf.mjs";
+import {
+  coordinateStoreExists,
+  createAnchorRefWriter,
+  createCoordinateStore,
+  openSortedAnchorRefs,
+  sortUniqueAnchorRefs
+} from "./osm_anchor_store.mjs";
 import { build } from "../src/builder.js";
 
 const REGIONS = {
   luxembourg: "https://download.geofabrik.de/europe/luxembourg-latest.osm.pbf",
   quebec: "https://download.geofabrik.de/north-america/canada/quebec-latest.osm.pbf",
-  switzerland: "https://download.geofabrik.de/europe/switzerland-latest.osm.pbf"
+  switzerland: "https://download.geofabrik.de/europe/switzerland-latest.osm.pbf",
+  us: "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
 };
 
 // Primary OSM keys that make a feature a searchable place, in ranking order.
@@ -91,12 +113,19 @@ function parseArgs(argv) {
     force: false,
     buildProgressLogMs: Number(process.env.OSM_BUILD_PROGRESS_MS || 15000)
   };
+  let rootExplicit = false;
   for (const arg of argv.slice(1)) {
     if (arg.startsWith("--region=")) args.region = arg.slice("--region=".length);
     else if (arg.startsWith("--pbf=")) args.pbf = arg.slice("--pbf=".length);
-    else if (arg.startsWith("--root=")) args.root = arg.slice("--root=".length);
+    else if (arg.startsWith("--root=")) {
+      args.root = arg.slice("--root=".length);
+      rootExplicit = true;
+    }
     else if (arg.startsWith("--limit=")) args.limit = Number(arg.slice("--limit=".length)) || 0;
     else if (arg === "--force") args.force = true;
+  }
+  if (args.region === "us" && !rootExplicit) {
+    args.root = process.env.RANGEFIND_OSM_US_ROOT || ".cache/osm-us";
   }
   if (!args.pbf) args.pbf = `${args.root}/data/${args.region}-latest.osm.pbf`;
   return args;
@@ -106,9 +135,11 @@ function ensurePbf(args) {
   if (existsSync(args.pbf)) return;
   const url = REGIONS[args.region];
   if (!url) throw new Error(`No PBF at ${args.pbf} and unknown region "${args.region}".`);
-  mkdirSync(resolve(args.root, "data"), { recursive: true });
+  mkdirSync(dirname(resolve(args.pbf)), { recursive: true });
   console.log(`[osm] downloading ${url}`);
-  execFileSync("curl", ["-sSL", "-o", args.pbf, url], { stdio: "inherit" });
+  const partial = `${args.pbf}.partial`;
+  execFileSync("curl", ["--fail", "--location", "--continue-at", "-", "--output", partial, url], { stdio: "inherit" });
+  renameSync(partial, args.pbf);
 }
 
 function firstCategory(tags) {
@@ -139,6 +170,109 @@ function typeLabel(type) {
 // which JSON.stringify leaves unescaped and line-based JSONL readers split on.
 function cleanText(value) {
   return String(value || "").replaceAll(/[\u0000-\u001f\u0085\u2028\u2029]+/gu, " ").trim();
+}
+
+const WAY_DOC_KEYS = new Set([
+  "name",
+  ...CATEGORY_KEYS,
+  ...ALIAS_KEYS,
+  "addr:street",
+  "addr:housenumber",
+  "addr:city",
+  "cuisine",
+  "population"
+]);
+
+function wayDocTagEntries(tags) {
+  const entries = [];
+  for (const [key, value] of tags) {
+    if (WAY_DOC_KEYS.has(key) || key.startsWith("name:")) entries.push([key, value]);
+  }
+  return entries;
+}
+
+const JSONL_WRITE_BUFFER_BYTES = 8 * 1024 * 1024;
+
+function createBufferedJsonlWriter(path) {
+  const fd = openSync(path, "w");
+  let pending = [];
+  let pendingBytes = 0;
+  let bytes = 0;
+  let closed = false;
+
+  function flush() {
+    if (!pending.length) return;
+    const buffer = Buffer.from(pending.join(""));
+    let offset = 0;
+    while (offset < buffer.length) offset += writeSync(fd, buffer, offset, buffer.length - offset);
+    bytes += buffer.length;
+    pending = [];
+    pendingBytes = 0;
+  }
+
+  return {
+    write(value) {
+      const line = `${JSON.stringify(value)}\n`;
+      pending.push(line);
+      pendingBytes += Buffer.byteLength(line);
+      if (pendingBytes >= JSONL_WRITE_BUFFER_BYTES) flush();
+    },
+    writeLine(value) {
+      const line = `${value}\n`;
+      pending.push(line);
+      pendingBytes += Buffer.byteLength(line);
+      if (pendingBytes >= JSONL_WRITE_BUFFER_BYTES) flush();
+    },
+    close() {
+      if (closed) return;
+      flush();
+      closeSync(fd);
+      closed = true;
+    },
+    get bytes() {
+      return bytes + pendingBytes;
+    }
+  };
+}
+
+async function eachJsonLine(path, handler) {
+  const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (line && await handler(JSON.parse(line))) break;
+  }
+}
+
+async function eachRawLine(path, handler) {
+  const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (line && await handler(line)) break;
+  }
+}
+
+function pbfIdentity(path) {
+  const absolute = resolve(path);
+  const stat = statSync(absolute);
+  return { pbf: absolute, pbfBytes: stat.size, pbfMtimeMs: Math.floor(stat.mtimeMs) };
+}
+
+function matchesPbf(meta, identity) {
+  return meta?.pbf === identity.pbf
+    && meta?.pbfBytes === identity.pbfBytes
+    && meta?.pbfMtimeMs === identity.pbfMtimeMs;
+}
+
+function progressLogger(label) {
+  let last = performance.now();
+  return (detail) => {
+    const now = performance.now();
+    if (now - last < 30000) return;
+    last = now;
+    console.log(`[osm] ${label}: ${detail()}`);
+  };
+}
+
+function elapsedSeconds(start) {
+  return Math.round((performance.now() - start) / 100) / 10;
 }
 
 function placeDoc(osmType, osmId, lat, lon, tags) {
@@ -175,69 +309,213 @@ function placeDoc(osmType, osmId, lat, lon, tags) {
 
 async function writeJsonl(args) {
   const outPath = resolve(args.root, "data", "osm-places.jsonl");
+  const outPartialPath = `${outPath}.partial`;
   const metaPath = resolve(args.root, "data", "osm-places.meta.json");
+  const wayPath = resolve(args.root, "data", "osm-way-candidates.jsonl");
+  const wayPartialPath = `${wayPath}.partial`;
+  const wayMetaPath = resolve(args.root, "data", "osm-way-candidates.meta.json");
+  const anchorRawPath = resolve(args.root, "data", "osm-way-anchors.bin");
+  const anchorSortedPath = resolve(args.root, "data", "osm-way-anchors.sorted.bin");
+  const anchorMetaPath = resolve(args.root, "data", "osm-way-anchors.meta.json");
+  const anchorScratchPath = resolve(args.root, "data", "osm-way-anchor-sort");
+  const nodePath = resolve(args.root, "data", "osm-node-docs.jsonl");
+  const nodePartialPath = `${nodePath}.partial`;
+  const nodeMetaPath = resolve(args.root, "data", "osm-node-docs.meta.json");
+  const coordPath = resolve(args.root, "data", "osm-way-anchor-coords.sqlite");
+  const coordMetaPath = resolve(args.root, "data", "osm-way-anchor-coords.meta.json");
+  mkdirSync(dirname(outPath), { recursive: true });
+  ensurePbf(args);
+  const identity = pbfIdentity(args.pbf);
   if (!args.force && existsSync(outPath) && existsSync(metaPath)) {
     const meta = JSON.parse(readFileSync(metaPath, "utf8"));
-    if (meta.pbf === args.pbf && meta.limit === args.limit) {
+    if (matchesPbf(meta, identity) && meta.limit === args.limit) {
       console.log(`[osm] reusing ${outPath} (${meta.docs} docs)`);
       return outPath;
     }
   }
-  ensurePbf(args);
   const t0 = performance.now();
-  console.log(`[osm] pass 1/2: scanning ways in ${args.pbf}`);
-  // Tagged ways keep only their first node ref; pass 2 resolves it to coords.
-  const wayAnchors = new Map();
-  const ways = [];
-  scanPbf(args.pbf, {
-    onWay(id, refs, tags) {
-      if (!refs.length) return;
-      if (!tags.get("name") && !firstCategory(tags)) return;
-      ways.push({ id, ref: refs[0], tags });
-      wayAnchors.set(refs[0], -1);
+  const stageSeconds = {};
+  let ways = 0;
+  let reusableWays = false;
+  if (!args.force && existsSync(wayPath) && existsSync(wayMetaPath)) {
+    const meta = JSON.parse(readFileSync(wayMetaPath, "utf8"));
+    if (matchesPbf(meta, identity)) {
+      console.log(`[osm] reusing disk-backed candidate-way spool (${meta.ways} ways, ${meta.bytes} bytes)`);
+      ways = meta.ways;
+      reusableWays = true;
     }
-  });
-  console.log(`[osm] pass 2/2: scanning nodes (${ways.length} candidate ways)`);
-  const stream = createWriteStream(outPath);
-  let docs = 0;
-  let truncated = false;
-  const writeDoc = doc => {
-    if (!doc) return false;
-    if (args.limit && docs >= args.limit) {
-      truncated = true;
-      return true;
-    }
-    stream.write(`${JSON.stringify(doc)}\n`);
-    docs += 1;
-    return false;
-  };
-  const anchorLat = new Map();
-  const anchorLon = new Map();
-  scanPbf(args.pbf, {
-    onNode(id, lat, lon, tags) {
-      if (wayAnchors.has(id)) {
-        anchorLat.set(id, lat);
-        anchorLon.set(id, lon);
-      }
-      if (!tags || truncated) return;
-      writeDoc(placeDoc("node", id, lat, lon, tags));
-    }
-  });
-  for (const way of ways) {
-    if (truncated) break;
-    const lat = anchorLat.get(way.ref);
-    const lon = anchorLon.get(way.ref);
-    if (lat === undefined || lon === undefined) continue;
-    writeDoc(placeDoc("way", way.id, lat, lon, way.tags));
   }
-  await new Promise((resolvePromise, reject) => {
-    stream.end(err => (err ? reject(err) : resolvePromise()));
-  });
+  if (!reusableWays) {
+    const stageStart = performance.now();
+    console.log(`[osm] stage 1/4: spooling candidate ways and anchor references from ${args.pbf}`);
+    const writer = createBufferedJsonlWriter(wayPartialPath);
+    const anchorWriter = createAnchorRefWriter(anchorRawPath);
+    const progress = progressLogger("candidate ways");
+    try {
+      scanPbf(args.pbf, {
+        onWay(id, refs, tags) {
+          if (!refs.length) return;
+          if (!tags.get("name") && !firstCategory(tags)) return;
+          const ref = refs[0];
+          writer.write([id, ref, wayDocTagEntries(tags)]);
+          anchorWriter.write(ref);
+          ways++;
+          progress(() => `${ways.toLocaleString()} ways, ${(writer.bytes / 2 ** 30).toFixed(2)} GiB spooled`);
+        }
+      });
+    } finally {
+      writer.close();
+      anchorWriter.close();
+    }
+    renameSync(wayPartialPath, wayPath);
+    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, bytes: statSync(wayPath).size }, null, 2));
+    stageSeconds.candidateWays = elapsedSeconds(stageStart);
+  }
+
+  let anchorMeta = null;
+  if (!args.force && existsSync(anchorSortedPath) && existsSync(anchorMetaPath)) {
+    const meta = JSON.parse(readFileSync(anchorMetaPath, "utf8"));
+    if (matchesPbf(meta, identity) && meta.ways === ways) anchorMeta = meta;
+  }
+  if (!anchorMeta) {
+    if (!existsSync(anchorRawPath) || reusableWays) {
+      console.log(`[osm] reconstructing anchor references from ${ways.toLocaleString()} spooled ways`);
+      const anchorWriter = createAnchorRefWriter(anchorRawPath);
+      let read = 0;
+      const progress = progressLogger("anchor references");
+      try {
+        await eachJsonLine(wayPath, ([, ref]) => {
+          anchorWriter.write(ref);
+          read++;
+          progress(() => `${read.toLocaleString()}/${ways.toLocaleString()} references`);
+        });
+      } finally {
+        anchorWriter.close();
+      }
+    }
+    console.log("[osm] stage 2/4: externally sorting and deduplicating way anchors");
+    const stageStart = performance.now();
+    rmSync(anchorScratchPath, { recursive: true, force: true });
+    const sorted = sortUniqueAnchorRefs(anchorRawPath, anchorSortedPath, anchorScratchPath);
+    rmSync(anchorRawPath, { force: true });
+    rmSync(anchorScratchPath, { recursive: true, force: true });
+    anchorMeta = { ...identity, ways, anchors: sorted.count, bytes: sorted.bytes, runs: sorted.runs };
+    writeFileSync(anchorMetaPath, JSON.stringify(anchorMeta, null, 2));
+    stageSeconds.anchorSort = elapsedSeconds(stageStart);
+  } else {
+    console.log(`[osm] reusing ${anchorMeta.anchors.toLocaleString()} sorted way anchors`);
+  }
+  const uniqueAnchors = anchorMeta.anchors;
+
+  let nodeMeta = null;
+  if (!args.force && existsSync(nodePath) && existsSync(nodeMetaPath)
+      && coordinateStoreExists(coordPath) && existsSync(coordMetaPath)) {
+    const candidateNodeMeta = JSON.parse(readFileSync(nodeMetaPath, "utf8"));
+    const candidateCoordMeta = JSON.parse(readFileSync(coordMetaPath, "utf8"));
+    if (matchesPbf(candidateNodeMeta, identity) && candidateNodeMeta.anchors === uniqueAnchors
+        && matchesPbf(candidateCoordMeta, identity) && candidateCoordMeta.anchors === uniqueAnchors) {
+      nodeMeta = candidateNodeMeta;
+    }
+  }
+  if (!nodeMeta) {
+    const stageStart = performance.now();
+    console.log(`[osm] stage 3/4: scanning nodes (${ways.toLocaleString()} candidate ways, ${uniqueAnchors.toLocaleString()} unique anchors)`);
+    const nodeWriter = createBufferedJsonlWriter(nodePartialPath);
+    const anchors = openSortedAnchorRefs(anchorSortedPath);
+    const coords = createCoordinateStore(coordPath, { reset: true });
+    let nodeDocs = 0;
+    let anchorsResolved = 0;
+    let lastNodeId = -1;
+    let storedCoords = 0;
+    const nodeProgress = progressLogger("nodes");
+    try {
+      scanPbf(args.pbf, {
+        onNode(id, lat, lon, tags) {
+          if (id < lastNodeId) throw new Error("OSM node IDs are not ordered; bounded anchor resolution requires a sorted Geofabrik PBF.");
+          lastNodeId = id;
+          while (anchors.current != null && anchors.current < id) anchors.advance();
+          if (anchors.current === id) {
+            coords.put(id, lat, lon);
+            anchorsResolved++;
+            anchors.advance();
+          }
+          if (tags) {
+            const doc = placeDoc("node", id, lat, lon, tags);
+            if (doc) {
+              nodeWriter.write(doc);
+              nodeDocs++;
+            }
+          }
+          nodeProgress(() => `${nodeDocs.toLocaleString()} node documents, ${anchorsResolved.toLocaleString()}/${uniqueAnchors.toLocaleString()} anchors resolved`);
+        }
+      });
+      storedCoords = coords.count();
+    } finally {
+      nodeWriter.close();
+      coords.close();
+      anchors.close();
+    }
+    renameSync(nodePartialPath, nodePath);
+    nodeMeta = { ...identity, nodeDocs, anchors: uniqueAnchors, anchorsResolved: storedCoords, bytes: statSync(nodePath).size };
+    writeFileSync(nodeMetaPath, JSON.stringify(nodeMeta, null, 2));
+    writeFileSync(coordMetaPath, JSON.stringify({ ...identity, anchors: uniqueAnchors, anchorsResolved: storedCoords, bytes: statSync(coordPath).size }, null, 2));
+    stageSeconds.nodes = elapsedSeconds(stageStart);
+  } else {
+    console.log(`[osm] reusing ${nodeMeta.nodeDocs.toLocaleString()} node documents and ${nodeMeta.anchorsResolved.toLocaleString()} anchor coordinates`);
+  }
+
+  console.log("[osm] stage 4/4: materializing searchable node and way documents");
+  const outputStart = performance.now();
+  const writer = createBufferedJsonlWriter(outPartialPath);
+  const coords = createCoordinateStore(coordPath);
+  let docs = 0;
+  let nodeDocs = 0;
+  let waysRead = 0;
+  let wayDocs = 0;
+  const outputProgress = progressLogger("output documents");
+  try {
+    await eachRawLine(nodePath, line => {
+      if (args.limit && docs >= args.limit) return true;
+      writer.writeLine(line);
+      docs++;
+      nodeDocs++;
+      outputProgress(() => `${docs.toLocaleString()} documents`);
+      return Boolean(args.limit && docs >= args.limit);
+    });
+    if (!args.limit || docs < args.limit) {
+      await eachJsonLine(wayPath, ([id, ref, entries]) => {
+        waysRead++;
+        if (!args.limit || docs < args.limit) {
+          const point = coords.get(ref);
+          if (point) {
+            const doc = placeDoc("way", id, point.lat, point.lon, new Map(entries));
+            if (doc) {
+              writer.write(doc);
+              docs++;
+              wayDocs++;
+            }
+          }
+        }
+        outputProgress(() => `${waysRead.toLocaleString()}/${ways.toLocaleString()} ways, ${docs.toLocaleString()} total documents`);
+        return Boolean(args.limit && docs >= args.limit);
+      });
+    }
+  } finally {
+    writer.close();
+    coords.close();
+  }
+  renameSync(outPartialPath, outPath);
+  stageSeconds.output = elapsedSeconds(outputStart);
   const meta = {
-    pbf: args.pbf,
+    ...identity,
     limit: args.limit,
     docs,
-    ways: ways.length,
+    nodeDocs,
+    wayDocs,
+    ways,
+    anchors: uniqueAnchors,
+    bytes: statSync(outPath).size,
+    stageSeconds,
     seconds: Math.round((performance.now() - t0) / 100) / 10
   };
   writeFileSync(metaPath, JSON.stringify(meta, null, 2));
@@ -274,6 +552,17 @@ function writeSite(args) {
     display: ["name", "url", "category", "type", "lat", "lon"],
     buildProgressLogMs: args.buildProgressLogMs
   };
+  if (args.region === "us") {
+    // National builds run from large external workspaces. Sequential doc-id
+    // packing avoids millions of random spool reads, level-3 posting gzip
+    // preserves query layout while reducing reducer CPU, and the high merge
+    // fan-in is now safely bounded by decoded directory bytes.
+    config.docLayoutStrategy = "doc-id";
+    config.postingGzipLevel = 3;
+    config.segmentMergeFanIn = 512;
+    config.codeStorePreloadMaxBytes = 2304 * 1024 * 1024;
+    config.buildTelemetryPath = "osm-us-build-telemetry.json";
+  }
   mkdirSync(resolve(args.root, "public"), { recursive: true });
   writeFileSync(configPath, JSON.stringify(config, null, 2));
   const bundle = resolve("dist/runtime.browser.js");

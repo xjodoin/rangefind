@@ -271,6 +271,8 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.doc_gzip_spool_bytes > 0);
   assert.ok(manifest.stats.doc_page_spool_bytes > 0);
   assert.ok(manifest.stats.doc_page_spool_pages > 0);
+  assert.ok(manifest.stats.field_avg_lengths.title > 0);
+  assert.ok(manifest.stats.field_avg_lengths.body > 0);
   assert.equal(manifest.stats.posting_segment_format, "rfsegpost-v6");
   assert.equal(manifest.stats.posting_segment_storage, "range-pack-v1");
   assert.equal(manifest.stats.posting_segment_block_storage, "range-pack-v1");
@@ -637,10 +639,10 @@ test("builder can reduce posting partitions in worker-owned packs", async (t) =>
   const output = join(root, "public", "rangefind");
   const configPath = join(root, "rangefind.config.json");
   await writeFile(docsPath, [
-    JSON.stringify({ id: "a", title: "alpha beta", url: "/a" }),
-    JSON.stringify({ id: "b", title: "alpha gamma", url: "/b" }),
-    JSON.stringify({ id: "c", title: "delta epsilon", url: "/c" }),
-    JSON.stringify({ id: "d", title: "zeta eta", url: "/d" })
+    JSON.stringify({ id: "a", title: "alpha beta", rank: 4, url: "/a" }),
+    JSON.stringify({ id: "b", title: "alpha gamma", rank: 3, url: "/b" }),
+    JSON.stringify({ id: "c", title: "delta epsilon", rank: 2, url: "/c" }),
+    JSON.stringify({ id: "d", title: "zeta eta", rank: 1, url: "/d" })
   ].join("\n"));
   await writeFile(configPath, JSON.stringify({
     input: "docs.jsonl",
@@ -655,7 +657,8 @@ test("builder can reduce posting partitions in worker-owned packs", async (t) =>
     baseShardDepth: 1,
     maxShardDepth: 2,
     targetShardPostings: 1,
-    fields: [{ name: "title", path: "title", weight: 1 }]
+    fields: [{ name: "title", path: "title", weight: 1 }],
+    numbers: [{ name: "rank", path: "rank", type: "int" }]
   }));
 
   await build({ configPath });
@@ -678,6 +681,7 @@ test("builder can reduce posting partitions in worker-owned packs", async (t) =>
   assert.ok(manifest.stats.partition_reducer_max_active_input_bytes > 0);
   assert.equal(manifest.stats.partition_reducer_finish_mode, "staggered");
   assert.ok(manifest.stats.code_store_worker_cache_chunks > 0);
+  assert.ok(manifest.stats.code_store_worker_preloaded_bytes > 0);
 
   const server = await serveStatic(join(root, "public"));
   t.after(() => server.close());
@@ -858,6 +862,21 @@ test("resumable builds reuse scan and reduce stages and keep old manifest on fai
   await writeFile(reduceConfigPath, JSON.stringify(reduceConfig));
   await build({ configPath: reduceConfigPath });
   assert.equal(await readFile(reduceStage, "utf8"), reduceBefore);
+
+  const sidecarRoot = await mkdtemp(join(tmpdir(), "rangefind-resume-sidecar-"));
+  const sidecarConfigPath = join(sidecarRoot, "rangefind.config.json");
+  const sidecarOutput = join(sidecarRoot, "public", "rangefind");
+  await writeFile(join(sidecarRoot, "docs.jsonl"), await readFile(reduceDocsPath, "utf8"));
+  await writeFile(sidecarConfigPath, JSON.stringify({
+    ...baseConfig,
+    debugFailAfterStage: "sidecar-doc-packs"
+  }));
+  await assert.rejects(() => build({ configPath: sidecarConfigPath }), /debug failure after sidecar-doc-packs/u);
+  const docPackStage = await resumeStageFile(sidecarOutput, "sidecar-doc-packs");
+  const docPackBefore = await readFile(docPackStage, "utf8");
+  await writeFile(sidecarConfigPath, JSON.stringify(baseConfig));
+  await build({ configPath: sidecarConfigPath });
+  assert.equal(await readFile(docPackStage, "utf8"), docPackBefore);
 
   await writeFile(docsPath, [
     JSON.stringify({ id: "a", title: "Changed", url: "/a" }),

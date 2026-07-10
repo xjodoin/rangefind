@@ -173,18 +173,33 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
   const autocompleteWeighted = autocompleteFields(config).some(field => field.weightPath);
   const hotLimit = Math.max(8, Math.floor(Number(config.suggestHotListSize || 64)));
   const hot = new Map();
+  const hotSeen = new Map();
 
   function mergeHotCandidate(item) {
-    const prefix = Array.from(item.normalized)[0] || "";
-    if (!prefix) return;
-    if (!hot.has(prefix)) hot.set(prefix, new Map());
-    const bucket = hot.get(prefix);
-    const previous = bucket.get(item.display);
-    if (!previous || compareAutocomplete(item, previous) < 0) bucket.set(item.display, item);
-    if (bucket.size > hotLimit * 2) {
-      const kept = [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit);
-      bucket.clear();
-      for (const entry of kept) bucket.set(entry.display, entry);
+    const codepoints = Array.from(item.normalized);
+    const prefixes = [codepoints[0] || ""];
+    // Two- and three-letter Latin prefixes are the expensive national-scale
+    // cases ("sa", "par", "bou", ...). Their combined keyspace is fixed at
+    // 18,252 buckets, so precomputing them remains corpus-independent while
+    // avoiding tens of thousands of decoded entries on early keystrokes. Keep
+    // universal one-codepoint lists for every script, but do not create an
+    // unbounded cross-script n-gram map.
+    for (let length = 2; length <= 3; length++) {
+      const latinPrefix = codepoints.slice(0, length).join("");
+      if (latinPrefix.length === length && /^[a-z]+$/u.test(latinPrefix)) prefixes.push(latinPrefix);
+    }
+    for (const prefix of prefixes) {
+      if (!prefix) continue;
+      hotSeen.set(prefix, (hotSeen.get(prefix) || 0) + 1);
+      if (!hot.has(prefix)) hot.set(prefix, new Map());
+      const bucket = hot.get(prefix);
+      const previous = bucket.get(item.display);
+      if (!previous || compareAutocomplete(item, previous) < 0) bucket.set(item.display, item);
+      if (bucket.size > hotLimit * 2) {
+        const kept = [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit);
+        bucket.clear();
+        for (const entry of kept) bucket.set(entry.display, entry);
+      }
     }
   }
   mkdirSync(resolve(dirs.out, "authority"), { recursive: true });
@@ -242,6 +257,11 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
   if (autocompleteShards.length) {
     const hotLists = new Map();
     for (const [prefix, bucket] of hot) {
+      // Universal one-character lists make the first keystroke constant-cost.
+      // Multi-character lists only pay for themselves when the normal lane
+      // would scan a genuinely broad prefix; rare prefixes already resolve in
+      // one small shard and should not inflate the lexicon boot root.
+      if (Array.from(prefix).length > 1 && (hotSeen.get(prefix) || 0) <= hotLimit * 4) continue;
       hotLists.set(prefix, [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit));
     }
     const hotObjects = new Map();

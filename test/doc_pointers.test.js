@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildDocPointerTable,
+  buildDocPointerTableFromReader,
   decodeDocPointerRecord,
   DOC_POINTER_FORMAT,
   parseDocPointerHeader,
@@ -42,6 +43,33 @@ test("dense doc pointer table can still be parsed as a whole for diagnostics", (
   assert.equal(parsed.entries.length, 1);
   assert.equal(parsed.entries[0].pack, "0000.hash.bin");
   assert.equal(parsed.entries[0].logicalLength, null);
+});
+
+test("dense doc pointer table batches large sequential readers", () => {
+  const entries = [
+    { pack: "0000.hash.bin", offset: 10, length: 20, logicalLength: 100, checksum: checksumA },
+    { pack: "0001.hash.bin", offset: 30, length: 40, logicalLength: 200, checksum: checksumB },
+    { pack: "0000.hash.bin", offset: 70, length: 80, logicalLength: 300, checksum: checksumA }
+  ];
+  const calls = [];
+  const packIndexes = new Map([["0000.hash.bin", 0], ["0001.hash.bin", 1]]);
+  const { buffer } = buildDocPointerTableFromReader(entries.length, packIndexes, () => {
+    throw new Error("single-row reader should not be used");
+  }, {
+    batchSize: 2,
+    readBatch(start, count, pass) {
+      calls.push([start, count, pass]);
+      return entries.slice(start, start + count).map(entry => pass === "write"
+        ? { ...entry, checksum: { value: Buffer.from(entry.checksum.value, "hex") } }
+        : { ...entry, checksum: undefined });
+    }
+  });
+  const parsed = parseDocPointerPage(buffer, { packTable: ["0000.hash.bin", "0001.hash.bin"] });
+  assert.deepEqual(parsed.entries, entries.map(entry => ({ ...entry, physicalLength: entry.length })));
+  assert.deepEqual(calls, [
+    [0, 2, "measure"], [2, 1, "measure"],
+    [0, 2, "write"], [2, 1, "write"]
+  ]);
 });
 
 test("dense doc pointer table rejects malformed object pointers", () => {

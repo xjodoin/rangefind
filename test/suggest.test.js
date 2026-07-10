@@ -118,6 +118,17 @@ function suggestFixtureDocs() {
       population: 0
     });
   }
+  // Cross the adaptive multi-letter hot-list threshold so "mo" exercises
+  // the national-scale constant-cost lane rather than the normal small-shard
+  // fallback used by rare prefixes.
+  for (let i = 0; i < 300; i++) {
+    docs.push({
+      id: `mountain-${i}`,
+      title: `Mountain Feature ${String(i).padStart(3, "0")}`,
+      body: "broad prefix filler",
+      population: 0
+    });
+  }
   // Many distinct displays sharing one token key ("centre"), so the shared
   // key spans several pages and consecutive page minKeys are equal —
   // regression coverage for the candidate-run lower bound.
@@ -224,6 +235,9 @@ async function runSuggestOracleSuite(configOverrides, assertManifest) {
     // Weighted places outrank fillers; popularity ranks the chains.
     const mont = await engine.suggest({ q: "mont", size: 3 });
     assert.equal(mont.suggestions[0].text, "Montréal");
+    const mo = await engine.suggest({ q: "mo", size: 3 });
+    assert.equal(mo.stats.suggestLane, "authority-hot");
+    assert.equal(mo.stats.suggestShardsVisited, 0);
     const chains = await engine.suggest({ q: "t", size: 2 });
     assert.ok(chains.suggestions.some(item => item.text === "Tim Hortons"));
     const tim = await engine.suggest({ q: "tim", size: 2 });

@@ -18,8 +18,11 @@ import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createFetchMeter, kb, mean, quantile, serveStatic } from "./bench_support.mjs";
 import { DEFAULT_ANALYZER } from "../src/analysis.js";
+import { foldMulti } from "../src/analysis_fold.js";
+import { readConfig } from "../src/config.js";
 import { createSearch } from "../src/runtime.js";
 import { haversineMetersE7, latToE7, lonToE7, boxContainsPointE7 } from "../src/geo_tree.js";
+import { analyzeDocumentTerms, analyzeFieldText } from "../src/scoring.js";
 
 function parseArgs(argv) {
   const args = { root: "examples/osm-geo", runs: 5, size: 10, oracle: true, out: "" };
@@ -34,8 +37,10 @@ function parseArgs(argv) {
   return args;
 }
 
-async function loadPoints(path) {
-  const points = [];
+async function measureCorpus(path, config, needAvgLens) {
+  const cells = new Map();
+  const fieldTotals = Object.fromEntries(config.fields.map(field => [field.name, 0]));
+  let docs = 0;
   const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
   for await (const line of lines) {
     if (!line) continue;
@@ -43,26 +48,12 @@ async function loadPoints(path) {
     const latE7 = latToE7(doc.lat);
     const lonE7 = lonToE7(doc.lon);
     if (latE7 == null || lonE7 == null) continue;
-    points.push({
-      id: doc.id,
-      name: doc.name,
-      category: doc.category || "",
-      tokens: `${doc.name} ${doc.body || ""}`.toLowerCase(),
-      tokenSet: new Set(DEFAULT_ANALYZER.tokenize(`${doc.name} ${doc.body || ""} ${(doc.aliases || []).join(" ")}`)),
-      latE7,
-      lonE7
-    });
-  }
-  return points;
-}
-
-// Queries run from the densest 0.05-degree cell (the busiest urban core), not
-// the geographic centroid, which for large sparse regions lands in wilderness.
-function urbanCenterOf(points) {
-  const cells = new Map();
-  for (const point of points) {
-    const key = `${Math.round(point.latE7 / 500000)},${Math.round(point.lonE7 / 500000)}`;
+    docs++;
+    const key = `${Math.round(latE7 / 500000)},${Math.round(lonE7 / 500000)}`;
     cells.set(key, (cells.get(key) || 0) + 1);
+    if (needAvgLens) {
+      for (const field of config.fields) fieldTotals[field.name] += analyzeFieldText(doc, field, config).length;
+    }
   }
   let bestKey = "";
   let bestCount = -1;
@@ -73,41 +64,83 @@ function urbanCenterOf(points) {
     }
   }
   const [latCell, lonCell] = bestKey.split(",").map(Number);
-  return { lat: latCell / 20, lon: lonCell / 20 };
+  return {
+    center: { lat: latCell / 20, lon: lonCell / 20 },
+    avgLens: needAvgLens
+      ? Object.fromEntries(config.fields.map(field => [field.name, Math.max(1, fieldTotals[field.name] / Math.max(1, docs))]))
+      : null
+  };
 }
 
-function oracleRadius(points, center, radius, predicate = null) {
-  const latE7 = latToE7(center.lat);
-  const lonE7 = lonToE7(center.lon);
-  const matches = [];
-  for (const point of points) {
-    if (predicate && !predicate(point)) continue;
-    const dist = haversineMetersE7(latE7, lonE7, point.latE7, point.lonE7);
-    if (dist <= radius) matches.push({ id: point.id, dist });
+function boundedNearest(rows, item, size) {
+  const compare = (a, b) => a.dist - b.dist || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  if (rows.length < size) {
+    rows.push(item);
+    rows.sort(compare);
+    return;
   }
-  matches.sort((a, b) => a.dist - b.dist || (a.id < b.id ? -1 : 1));
-  return matches;
+  if (compare(item, rows[rows.length - 1]) >= 0) return;
+  rows[rows.length - 1] = item;
+  for (let index = rows.length - 1; index > 0 && compare(rows[index], rows[index - 1]) < 0; index--) {
+    [rows[index], rows[index - 1]] = [rows[index - 1], rows[index]];
+  }
 }
 
-function oracleBox(points, box, predicate = null) {
+async function streamOracle(path, center, box, radius, nearestSize, textGuard, textTerm, config, avgLens) {
   const boxE7 = {
     minLatE7: latToE7(box.minLat),
     maxLatE7: latToE7(box.maxLat),
     minLonE7: lonToE7(box.minLon),
     maxLonE7: lonToE7(box.maxLon)
   };
-  return points.filter(point => (
-    (!predicate || predicate(point)) && boxContainsPointE7(boxE7, point.latE7, point.lonE7)
-  ));
+  const centerLatE7 = latToE7(center.lat);
+  const centerLonE7 = lonToE7(center.lon);
+  const result = {
+    points: 0,
+    boxCount: 0,
+    radiusCount: 0,
+    textRadiusCount: 0,
+    nearest: [],
+    textNearest: []
+  };
+  const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line) continue;
+    const doc = JSON.parse(line);
+    const latE7 = latToE7(doc.lat);
+    const lonE7 = lonToE7(doc.lon);
+    if (latE7 == null || lonE7 == null) continue;
+    result.points++;
+    if (boxContainsPointE7(boxE7, latE7, lonE7)) result.boxCount++;
+    const dist = haversineMetersE7(centerLatE7, centerLonE7, latE7, lonE7);
+    if (dist <= radius) result.radiusCount++;
+    boundedNearest(result.nearest, { id: doc.id, dist }, nearestSize);
+
+    // The exact analyzer pass is relatively expensive over tens of millions
+    // of documents. A folded substring guard retains diacritic, plural, and
+    // compound forms while skipping the analyzer for almost every OSM row.
+    if (!foldMulti(line).includes(textGuard)) continue;
+    const selectedTerms = new Set(analyzeDocumentTerms(doc, config, avgLens).map(([term]) => term));
+    if (!selectedTerms.has(textTerm)) continue;
+    boundedNearest(result.textNearest, { id: doc.id, dist }, nearestSize);
+    if (dist <= radius) result.textRadiusCount++;
+  }
+  return result;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const root = resolve(args.root);
+  const sourcePath = resolve(root, "data/osm-places.jsonl");
+  const config = await readConfig(resolve(root, "rangefind.config.json"));
   const manifest = JSON.parse(readFileSync(resolve(root, "public/rangefind/manifest.min.json"), "utf8"));
   if (!manifest.features?.geo) throw new Error(`Index at ${args.root} has no geo support; run scripts/osm_fixture.mjs first.`);
-  const points = args.oracle ? await loadPoints(resolve(root, "data/osm-places.jsonl")) : [];
-  const center = points.length ? urbanCenterOf(points) : { lat: 49.61, lon: 6.13 };
+  const measuredAvgLens = manifest.stats?.field_avg_lengths || null;
+  const measured = args.oracle
+    ? await measureCorpus(sourcePath, config, !measuredAvgLens)
+    : { center: { lat: 49.61, lon: 6.13 }, avgLens: null };
+  const center = measured.center;
+  const avgLens = measuredAvgLens || measured.avgLens;
   console.log(`[bench] ${manifest.total} docs, ${manifest.geo.fields.location.total} points, ${manifest.geo.fields.location.leaves} leaves`);
   console.log(`[bench] query center ${center.lat.toFixed(4)}, ${center.lon.toFixed(4)}`);
 
@@ -125,6 +158,12 @@ async function main() {
   };
   const near1km = { lat: center.lat, lon: center.lon, radiusMeters: 1000 };
   const near5km = { lat: center.lat, lon: center.lon, radiusMeters: 5000 };
+  // "restaurant" is intentionally broad enough to exceed the runtime's
+  // exact distance-sort posting guard on a national corpus. Use a common but
+  // selective place term there so the lane measures exact text-nearest work
+  // rather than merely re-testing the safety error.
+  const textQuery = manifest.total >= 10_000_000 ? "bakery" : "restaurant";
+  const textGuard = textQuery === "bakery" ? "baker" : foldMulti(textQuery);
 
   const lanes = [
     { name: "viewport-browse", params: { q: "", geo: { box: viewport } } },
@@ -141,21 +180,21 @@ async function main() {
         geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" }
       }
     },
-    { name: "text-radius-5km", params: { q: "restaurant", geo: { near: near5km } } },
+    { name: "text-radius-5km", params: { q: textQuery, geo: { near: near5km } } },
     {
       name: "text-nearest",
-      params: { q: "restaurant", geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" } }
+      params: { q: textQuery, geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" } }
     },
     { name: "text-viewport", params: { q: "pharmacie", geo: { box: wideViewport } } },
     {
       name: "text-radius-boost",
-      params: { q: "restaurant", geo: { near: near5km, boost: { weight: 2, pivotMeters: 500 } } }
+      params: { q: textQuery, geo: { near: near5km, boost: { weight: 2, pivotMeters: 500 } } }
     },
-    { name: "text-only-baseline", params: { q: "restaurant" } }
+    { name: "text-only-baseline", params: { q: textQuery } }
   ];
 
   const meter = createFetchMeter(/\/rangefind\//u);
-  const report = { generated_for: args.root, runs: args.runs, size: args.size, lanes: {} };
+  const report = { generated_for: args.root, runs: args.runs, size: args.size, text_query: textQuery, lanes: {} };
 
   for (const lane of lanes) {
     const server = await serveStatic(resolve(root, "public"));
@@ -212,63 +251,59 @@ async function main() {
   }
 
   if (args.oracle) {
-    console.log("[oracle] verifying lane correctness against exhaustive scans");
+    console.log("[oracle] streaming exhaustive verification without retaining the corpus");
+    const textTerm = DEFAULT_ANALYZER.analyzeTerms(textQuery)[0].term;
+    const oracle = await streamOracle(sourcePath, center, viewport, near5km.radiusMeters, 20, textGuard, textTerm, config, avgLens);
     const server = await serveStatic(resolve(root, "public"));
     try {
       const engine = await createSearch({ baseUrl: `${server.url}rangefind/` });
       const failures = [];
 
       const boxResponse = await engine.search({ q: "", geo: { box: viewport }, size: 100 });
-      const boxExpected = oracleBox(points, viewport);
       const boxOk = boxResponse.approximate
-        ? boxResponse.results.length === Math.min(100, boxExpected.length)
-        : boxResponse.total === boxExpected.length;
-      if (!boxOk) failures.push(`viewport-browse: got total ${boxResponse.total}, expected ${boxExpected.length}`);
+        ? boxResponse.results.length === Math.min(100, oracle.boxCount)
+        : boxResponse.total === oracle.boxCount;
+      if (!boxOk) failures.push(`viewport-browse: got total ${boxResponse.total}, expected ${oracle.boxCount}`);
 
       const radiusResponse = await engine.search({ q: "", geo: { near: near5km }, size: 100 });
-      const radiusExpected = oracleRadius(points, near5km, near5km.radiusMeters);
       const radiusOk = radiusResponse.approximate
-        ? radiusResponse.results.length === Math.min(100, radiusExpected.length)
-        : radiusResponse.total === radiusExpected.length;
-      if (!radiusOk) failures.push(`radius-5km: got total ${radiusResponse.total}, expected ${radiusExpected.length}`);
+        ? radiusResponse.results.length === Math.min(100, oracle.radiusCount)
+        : radiusResponse.total === oracle.radiusCount;
+      if (!radiusOk) failures.push(`radius-5km: got total ${radiusResponse.total}, expected ${oracle.radiusCount}`);
 
       const nearestResponse = await engine.search({
         q: "",
         geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" },
         size: 20
       });
-      const nearestExpected = oracleRadius(points, center, Infinity).slice(0, 20);
       const nearestDistances = nearestResponse.results.map(result => result.distanceMeters);
-      const expectedDistances = nearestExpected.map(item => Math.round(item.dist * 10) / 10);
+      const expectedDistances = oracle.nearest.map(item => Math.round(item.dist * 10) / 10);
       if (JSON.stringify(nearestDistances) !== JSON.stringify(expectedDistances)) {
         failures.push(`nearest: distances ${JSON.stringify(nearestDistances.slice(0, 5))} != ${JSON.stringify(expectedDistances.slice(0, 5))}`);
       }
 
       const textNearest = await engine.search({
-        q: "restaurant",
+        q: textQuery,
         geo: { near: { lat: center.lat, lon: center.lon }, sort: "distance" },
         size: 20
       });
-      const restaurantTerm = DEFAULT_ANALYZER.analyzeTerms("restaurant")[0].term;
-      const textNearestExpected = oracleRadius(points, center, Infinity, point => point.tokenSet.has(restaurantTerm)).slice(0, 20);
       const textNearestDistances = textNearest.results.map(result => result.distanceMeters);
-      const textNearestExpectedDistances = textNearestExpected.map(item => Math.round(item.dist * 10) / 10);
+      const textNearestExpectedDistances = oracle.textNearest.map(item => Math.round(item.dist * 10) / 10);
       if (JSON.stringify(textNearestDistances) !== JSON.stringify(textNearestExpectedDistances)) {
         failures.push(`text-nearest: distances ${JSON.stringify(textNearestDistances.slice(0, 5))} != ${JSON.stringify(textNearestExpectedDistances.slice(0, 5))}`);
       }
 
-      const textRadius = await engine.search({ q: "restaurant", geo: { near: near5km }, size: 100 });
-      const textExpected = oracleRadius(points, near5km, near5km.radiusMeters, point => point.tokens.includes("restaurant"));
+      const textRadius = await engine.search({ q: textQuery, geo: { near: near5km }, size: 100 });
       for (const result of textRadius.results) {
         if (result.distanceMeters > near5km.radiusMeters) {
           failures.push(`text-radius: ${result.name} outside radius at ${result.distanceMeters}m`);
         }
       }
-      if (!textRadius.approximate && textRadius.total > textExpected.length) {
-        failures.push(`text-radius: got total ${textRadius.total}, oracle upper bound ${textExpected.length}`);
+      if (!textRadius.approximate && textRadius.total > oracle.textRadiusCount) {
+        failures.push(`text-radius: got total ${textRadius.total}, oracle upper bound ${oracle.textRadiusCount}`);
       }
 
-      report.oracle = { failures, checks: 4 };
+      report.oracle = { failures, checks: 4, points: oracle.points, mode: "streaming-bounded" };
       if (failures.length) {
         console.error(`[oracle] FAILURES:\n  ${failures.join("\n  ")}`);
         process.exitCode = 1;

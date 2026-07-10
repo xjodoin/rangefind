@@ -13,8 +13,20 @@ Reproduce with:
 
 ```bash
 npm run bench:osm-geo          # Luxembourg
-npm run bench:osm-geo:quebec   # Quebec (needs ~16 GB RAM for the build)
+npm run bench:osm-geo:quebec   # Quebec
+RANGEFIND_OSM_US_ROOT=/Volumes/large-disk/osm-us npm run bench:osm-geo:us
 ```
+
+The oracle is a two-pass bounded stream: the first pass locates the densest
+0.05° cell and the second keeps only exact counters and the nearest 20 rows.
+It never loads the corpus or per-document token sets into memory.
+
+National builds selectively share category/type/population code columns
+across posting-reducer workers; unrelated geo columns no longer push the
+all-or-nothing preload over budget. On the 32.8M-place US corpus, reduction
+completed in 2m41s versus an aborted baseline that had produced no pack bytes
+after 29m35s. Batched dense-pointer assembly reduced document packing from
+4m33s to 2m44s.
 
 ## Luxembourg (175,276 places, single-level tree, 512 leaves)
 
@@ -38,8 +50,9 @@ Index: 172 MB total, geo sidecar 1.5 MB. Build: 5 s end to end.
 ## Quebec (4,269,316 places, two-level tree, 16,384 leaves / 64 branches, 9.9 KB root)
 
 Index: 3.4 GB total, geo sidecar 37 MB. Build: 139 s end to end (geo tree
-phase with per-leaf filter summaries: ~4 s). PBF→JSONL conversion (1.16 GB
-extract, pure Node): 105 s.
+phase with per-leaf filter summaries: ~4 s). The bounded PBF→JSONL pipeline
+converts the 1.16 GB extract in 77.5 s at 462 MiB peak RSS; the former
+in-memory anchor maps needed 113.7 s and 2.71 GB.
 
 | lane                 | cold req | cold KB | cold ms | warm ms | leaves visited |
 | -------------------- | -------- | ------- | ------- | ------- | -------------- |
@@ -58,6 +71,32 @@ extract, pure Node): 105 s.
 `text nearest` is exact "closest matches first": the runtime resolves the
 full text match set from postings (bounded by `geoTextSortMaxDf`), then the
 tree orders it with the nearest early-stop proof.
+
+## United States (32,809,763 places, 65,536 leaves / 256 branches, 29 KB root)
+
+Recorded 2026-07-09 from the checksum-verified 11.2 GB Geofabrik US extract.
+The published index is approximately 11 GB excluding resumable `_build`
+scratch; the geo family is 285 MB. The measured optimized phase sum is about
+27m25s (measurement 40s, scan 11m56s, reduction 2m41s, authority 6m48s,
+document packing 2m49s, geo 27s, and the remaining phases about 2m04s).
+Extraction produced 32,809,763 JSONL rows in 14m14s at 503 MiB peak RSS;
+entity-selective PBF decoding added afterward removes unused node/way parsing
+from future runs.
+
+| lane | cold req | cold KB | cold ms | warm ms | leaves / points scanned |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| viewport browse | 9 | 140 | 26.4 | 0.10 | 1 / 501 |
+| radius 5 km | 18 | 81 | 14.1 | 0.14 | 1 / 501 |
+| nearest (exact) | 23 | 154 | 16.3 | 0.23 | 1 / 500 |
+| nearest + facet | 30 | 6,724 | 155.6 | 0.34 | 3 / 1,501 |
+| text nearest (`bakery`) | 35 | 763 | 70.4 | 71.05 | 39 / 19,525 |
+| text + radius 5 km | 64 | 6,255 | 189.4 | 3.62 | 95 / 47,562 |
+| text-only baseline | 28 | 518 | 53.3 | 23.84 | — |
+
+All four streaming-oracle checks passed over all 32,809,763 source points.
+The common facet and broad text+geo lanes pay for whole-corpus bitmap or
+doc-value verification; unfiltered exact nearest remains effectively
+constant-cost and settles after one 500-point leaf.
 
 ## What the two-level root bought
 

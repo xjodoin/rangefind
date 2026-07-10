@@ -13,7 +13,23 @@ node scripts/osm_fixture.mjs all --region=luxembourg --root=examples/osm-geo
 
 # Large region (Quebec, millions of places, downloads ~1.2 GB PBF)
 node scripts/osm_fixture.mjs all --region=quebec --root=examples/osm-geo
+
+# National scale (United States, 32.8M places, downloads ~11.2 GB PBF)
+RANGEFIND_OSM_US_ROOT=/Volumes/large-disk/rangefind-osm-us \
+  npm run bench:osm-geo:us
 ```
+
+The US driver defaults to `.cache/osm-us`; set `RANGEFIND_OSM_US_ROOT` to a
+volume with at least 100 GB free for the source PBF, resumable extraction
+artifacts, build scratch space, and final index. Downloads use `curl -C -`
+and publish atomically after completion.
+
+Large extraction is a four-stage bounded pipeline: candidate ways are spooled
+to JSONL, their node anchors are externally sorted/deduplicated, matching node
+coordinates are stored in an indexed SQLite table while node documents are
+spooled, and the final corpus is materialized sequentially. Each completed
+stage has PBF size/mtime metadata and is reused on restart. The extractor does
+not retain all ways or coordinates in JavaScript heap.
 
 The fixture converts tagged OSM nodes and ways (anchored at their first node)
 into place documents with `name`, `aliases`, `category`, `type`, and `lat`/`lon`
@@ -33,7 +49,9 @@ node scripts/osm_geo_bench.mjs --root=examples/osm-geo
 
 Reports cold HTTP request counts, transfer KB, warm latency, and geo tree
 traversal stats per query lane, then verifies bounding box, radius, nearest,
-and text-plus-radius results against exhaustive Haversine scans of the corpus.
+and text-plus-radius results against streaming exhaustive Haversine scans of
+the corpus. The oracle retains only the densest-cell counters and bounded
+top-20 nearest sets, so validation is safe at national scale.
 
 ## Query API
 

@@ -1,5 +1,6 @@
 import {
   copyFileSync,
+  createWriteStream,
   createReadStream,
   existsSync,
   mkdirSync,
@@ -16,8 +17,10 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { performance } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 import { expandedTermsFromBaseTerms, queryBundleKeyFromBaseTerms } from "./terms.js";
@@ -776,6 +779,30 @@ function readPackedDocEntry(fd, doc, packFiles) {
   };
 }
 
+function readPackedDocEntryBatch(fd, start, count, packFiles, includeChecksum) {
+  const buffer = Buffer.allocUnsafe(count * PACKED_DOC_ENTRY_BYTES);
+  let filled = 0;
+  const fileOffset = start * PACKED_DOC_ENTRY_BYTES;
+  while (filled < buffer.length) {
+    const bytesRead = readSync(fd, buffer, filled, buffer.length - filled, fileOffset + filled);
+    if (!bytesRead) throw new Error(`Rangefind packed doc entries ended at document ${start + Math.floor(filled / PACKED_DOC_ENTRY_BYTES)}.`);
+    filled += bytesRead;
+  }
+  const entries = new Array(count);
+  for (let row = 0; row < count; row++) {
+    const offset = row * PACKED_DOC_ENTRY_BYTES;
+    const packIndex = buffer.readUInt32LE(offset);
+    entries[row] = {
+      pack: packFiles[packIndex],
+      offset: readBigUInt(buffer, offset + 4),
+      length: readBigUInt(buffer, offset + 12),
+      logicalLength: readBigUInt(buffer, offset + 20),
+      ...(includeChecksum ? { checksum: { algorithm: "sha256", value: buffer.subarray(offset + 28, offset + 60) } } : {})
+    };
+  }
+  return entries;
+}
+
 function docPageWorkerCount(config) {
   const explicit = Math.max(0, Math.floor(Number(config.docPageWorkers || 0)));
   return Math.max(1, explicit || Math.floor(Number(config.builderWorkerCount || 1)));
@@ -996,7 +1023,15 @@ async function finishDocPacks(out, spool, total, config) {
   const entryInFd = openSync(entryPath, "r");
   let pointerTable;
   try {
-    pointerTable = buildDocPointerTableFromReader(total, packIndexes, doc => readPackedDocEntry(entryInFd, doc, packFiles));
+    pointerTable = buildDocPointerTableFromReader(
+      total,
+      packIndexes,
+      doc => readPackedDocEntry(entryInFd, doc, packFiles),
+      {
+        batchSize: Math.max(1, Math.floor(Number(config.docPointerReadBatchDocs || 65536))),
+        readBatch: (start, count, pass) => readPackedDocEntryBatch(entryInFd, start, count, packFiles, pass === "write")
+      }
+    );
   } finally {
     closeSync(entryInFd);
   }
@@ -1524,6 +1559,22 @@ function packTable(packs) {
   return (packs || []).map(pack => pack.file);
 }
 
+function geoEntriesBbox(entries) {
+  if (!entries.length) return { minLatE7: 0, maxLatE7: 0, minLonE7: 0, maxLonE7: 0 };
+  let minLatE7 = entries[0].minLatE7;
+  let maxLatE7 = entries[0].maxLatE7;
+  let minLonE7 = entries[0].minLonE7;
+  let maxLonE7 = entries[0].maxLonE7;
+  for (let index = 1; index < entries.length; index++) {
+    const entry = entries[index];
+    if (entry.minLatE7 < minLatE7) minLatE7 = entry.minLatE7;
+    if (entry.maxLatE7 > maxLatE7) maxLatE7 = entry.maxLatE7;
+    if (entry.minLonE7 < minLonE7) minLonE7 = entry.minLonE7;
+    if (entry.maxLonE7 > maxLonE7) maxLonE7 = entry.maxLonE7;
+  }
+  return { minLatE7, maxLatE7, minLonE7, maxLonE7 };
+}
+
 function writeGeoTrees(out, config, total, codes, blockFilters) {
   if (!config.geo?.length) return null;
   const summaryFilters = Array.isArray(blockFilters) && blockFilters.length ? blockFilters : null;
@@ -1571,14 +1622,7 @@ function writeGeoTrees(out, config, total, codes, blockFilters) {
         leaf.summary = summarizeBlockFilters(summaryFilters, codes, points.docs.subarray(leaf.start, leaf.end));
       }
     }
-    const bbox = leaves.length
-      ? {
-          minLatE7: Math.min(...leaves.map(leaf => leaf.minLatE7)),
-          maxLatE7: Math.max(...leaves.map(leaf => leaf.maxLatE7)),
-          minLonE7: Math.min(...leaves.map(leaf => leaf.minLonE7)),
-          maxLonE7: Math.max(...leaves.map(leaf => leaf.maxLonE7))
-        }
-      : { minLatE7: 0, maxLatE7: 0, minLonE7: 0, maxLonE7: 0 };
+    const bbox = geoEntriesBbox(leaves);
     rootsByField.set(geoField.name, { geoField, total: count, bbox, leaves });
   }
 
@@ -1594,11 +1638,9 @@ function writeGeoTrees(out, config, total, codes, blockFilters) {
     state.branches = [];
     for (let start = 0; start < state.leaves.length; start += branchLeaves) {
       const slice = state.leaves.slice(start, start + branchLeaves);
+      const bbox = geoEntriesBbox(slice);
       const branch = {
-        minLatE7: Math.min(...slice.map(leaf => leaf.minLatE7)),
-        maxLatE7: Math.max(...slice.map(leaf => leaf.maxLatE7)),
-        minLonE7: Math.min(...slice.map(leaf => leaf.minLonE7)),
-        maxLonE7: Math.max(...slice.map(leaf => leaf.maxLonE7)),
+        ...bbox,
         count: slice.reduce((sum, leaf) => sum + leaf.count, 0),
         firstLeafIndex: start,
         leafCount: slice.length
@@ -1888,34 +1930,43 @@ async function writeVectorIndexes(out, config, vectorSpools) {
 // External-id → local doc index map, written with every build so future
 // `--update` runs can tombstone replaced documents. Loaded only by the
 // builder, never by the runtime.
-function writeIdMap(out, config, total, docSpool) {
+async function writeIdMap(out, config, total, docSpool) {
   const reader = openDocPageSpoolReader(docSpool, config, 64);
-  const lines = [];
-  const chunks = [];
-  try {
-    for (let index = 0; index < total; index++) {
-      lines.push(JSON.stringify([String(reader.doc(index)?.id ?? index), index]));
-      if (lines.length >= 20000) {
-        chunks.push(`${lines.join("\n")}\n`);
-        lines.length = 0;
+  async function* chunks() {
+    const lines = [];
+    try {
+      for (let index = 0; index < total; index++) {
+        lines.push(JSON.stringify([String(reader.doc(index)?.id ?? index), index]));
+        if (lines.length >= 20000) {
+          yield `${lines.join("\n")}\n`;
+          lines.length = 0;
+        }
       }
+      if (lines.length) yield `${lines.join("\n")}\n`;
+    } finally {
+      reader.close();
     }
-  } finally {
-    reader.close();
   }
-  if (lines.length) chunks.push(`${lines.join("\n")}\n`);
   const file = "docs/id-map.jsonl.gz";
-  writeFileSync(resolve(out, file), gzipSync(chunks.join(""), { level: 6 }));
+  const path = resolve(out, file);
+  const partial = `${path}.partial`;
+  rmSync(partial, { force: true });
+  await pipeline(Readable.from(chunks()), createGzip({ level: 6 }), createWriteStream(partial));
+  renameSync(partial, path);
   return { file, docs: total };
 }
 
-function readIdMapFile(path) {
-  const entries = [];
-  const source = gunzipSync(readFileSync(path)).toString("utf8");
-  for (const line of source.split("\n")) {
-    if (line) entries.push(JSON.parse(line));
+async function* readIdMapEntries(path) {
+  const source = createReadStream(path).pipe(createGunzip());
+  const lines = createInterface({ input: source, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (line) yield JSON.parse(line);
+    }
+  } finally {
+    lines.close();
+    source.destroy();
   }
-  return entries;
 }
 
 // Streams a previous generation's published term shards from local disk and
@@ -2009,7 +2060,7 @@ async function prepareGenerationalUpdate(config) {
       );
     }
     const tombstoned = new Set(generation.tombstones || []);
-    for (const [externalId, localIndex] of readIdMapFile(resolve(genRoot, generation.id_map))) {
+    for await (const [externalId, localIndex] of readIdMapEntries(resolve(genRoot, generation.id_map))) {
       if (!tombstoned.has(localIndex)) idMap.set(externalId, [g, localIndex]);
     }
     collectGenerationDf(genRoot, genManifest, dfBase);
@@ -2025,11 +2076,10 @@ async function prepareGenerationalUpdate(config) {
   return { rootDir, rootManifest, generations, genIndex, genDir, prevTotal, prevFieldTotals, idMap, dfBase };
 }
 
-function writeGenerationalRoot(generational, deltaManifest, config) {
+async function writeGenerationalRoot(generational, deltaManifest, config) {
   const { rootDir, generations, genDir, idMap } = generational;
-  const deltaIdMap = readIdMapFile(resolve(config.output, deltaManifest.id_map));
   let replaced = 0;
-  for (const [externalId] of deltaIdMap) {
+  for await (const [externalId] of readIdMapEntries(resolve(config.output, deltaManifest.id_map))) {
     const previous = idMap.get(externalId);
     if (!previous) continue;
     const [genIndexPrev, localIndex] = previous;
@@ -2075,7 +2125,7 @@ function writeGenerationalRoot(generational, deltaManifest, config) {
 const COMPACT_MAX_GENERATIONS = 8;
 const COMPACT_MAX_TOMBSTONE_RATIO = 0.25;
 
-function prepareCompaction(config) {
+async function prepareCompaction(config) {
   const rootDir = config.output;
   const rootManifestPath = resolve(rootDir, "manifest.json");
   if (!existsSync(rootManifestPath)) return null;
@@ -2101,20 +2151,21 @@ function prepareCompaction(config) {
       generationManifests.add(generation.manifest.replace(/\.min\.json$/u, ".json"));
     }
     const tombstoned = new Set(generation.tombstones || []);
-    for (const [externalId, localIndex] of readIdMapFile(resolve(rootDir, generation.path || ".", generation.id_map))) {
+    for await (const [externalId, localIndex] of readIdMapEntries(resolve(rootDir, generation.path || ".", generation.id_map))) {
       if (!tombstoned.has(localIndex)) liveIds.add(externalId);
     }
   }
   return { rootDir, liveIds, generationDirs, generationManifests };
 }
 
-function finalizeCompaction(compaction, manifest, config) {
-  const newIds = new Set(readIdMapFile(resolve(config.output, manifest.id_map)).map(([externalId]) => externalId));
-  const missing = [...compaction.liveIds].filter(externalId => !newIds.has(externalId));
-  if (missing.length) {
+async function finalizeCompaction(compaction, manifest, config) {
+  const missing = new Set(compaction.liveIds);
+  for await (const [externalId] of readIdMapEntries(resolve(config.output, manifest.id_map))) missing.delete(externalId);
+  if (missing.size) {
+    const examples = [...missing].slice(0, 5);
     throw new Error(
-      `Rangefind compact: ${missing.length} live document(s) from the generational index are missing from the input ` +
-      `(e.g. ${missing.slice(0, 5).join(", ")}). Compaction rebuilds from scratch, so the input must be the FULL corpus. ` +
+      `Rangefind compact: ${missing.size} live document(s) from the generational index are missing from the input ` +
+      `(e.g. ${examples.join(", ")}). Compaction rebuilds from scratch, so the input must be the FULL corpus. ` +
       "The rebuilt index was published, but the old generation directories were kept untouched."
     );
   }
@@ -2732,8 +2783,14 @@ function partitionReducerWorkerCount(config) {
   return Math.max(1, explicit || fallback);
 }
 
-function codeStoreDescriptorForPartitionWorkers(codes, config) {
+function codeStoreDescriptorForPartitionWorkers(codes, config, filters = []) {
   const descriptor = codes.descriptor();
+  // Posting reduction reads code values only to build the configured block
+  // filter summaries. Geo and other doc-value columns can be hundreds of MiB
+  // at national scale; including them made the all-or-nothing shared preload
+  // exceed its budget and forced every worker into random chunk-cache reads.
+  const filterNames = new Set(filters.map(filter => filter.name));
+  const fields = (descriptor.fields || []).filter(field => filterNames.has(field.name));
   const explicit = Math.max(0, Math.floor(Number(config.codeStoreWorkerCacheChunks || 0)));
   const cacheDocs = Math.max(1, Math.floor(Number(descriptor.cacheDocs || config.codeStoreCacheDocs || 1)));
   const totalChunks = Math.max(1, Math.ceil(Math.max(0, Number(descriptor.total || 0)) / cacheDocs));
@@ -2742,6 +2799,7 @@ function codeStoreDescriptorForPartitionWorkers(codes, config) {
   const preloadMaxBytes = Math.max(0, Math.floor(Number(config.codeStoreWorkerPreloadMaxBytes ?? 1536 * 1024 * 1024)));
   return preloadCodeStoreDescriptor({
     ...descriptor,
+    fields,
     cacheChunks
   }, preloadMaxBytes);
 }
@@ -3387,7 +3445,7 @@ async function reduceRuns(config, measured, runData, dirs) {
   const bundleDfs = new Map();
   const bundleTermSet = new Set(runData.queryBundleTerms || []);
   let partitionOutput = { packs: [], packBytes: 0, blockPacks: [], blockPackBytes: 0 };
-  const workerCodesDescriptor = usePartitionWorkers ? codeStoreDescriptorForPartitionWorkers(runData.codes, config) : null;
+  const workerCodesDescriptor = usePartitionWorkers ? codeStoreDescriptorForPartitionWorkers(runData.codes, config, filters) : null;
   let stats;
   try {
     stats = await mergeSegmentsToPartitions({
@@ -3486,6 +3544,7 @@ async function reduceRuns(config, measured, runData, dirs) {
     postingCount: stats.postings,
     bundleDfs,
     workerCodeStoreCacheChunks: workerCodesDescriptor?.cacheChunks || 0,
+    workerCodeStorePreloadedBytes: workerCodesDescriptor?.preloadedBytes || 0,
     workerStats: usePartitionWorkers ? partitionPool.stats() : [{
       worker: 0,
       tasks: runData.segments.length,
@@ -3525,6 +3584,7 @@ async function reduceRuns(config, measured, runData, dirs) {
     mergeTiers: stats.mergeTiers || [],
     mergePolicy: stats.mergePolicy || null,
     workerCodeStoreCacheChunks: reduced.workerCodeStoreCacheChunks || 0,
+    workerCodeStorePreloadedBytes: reduced.workerCodeStorePreloadedBytes || 0,
     workerStats: reduced.workerStats || [],
     reduceTimings: {
       ...(reduced.reduceTimings || {}),
@@ -3799,8 +3859,15 @@ function maybeFailAfterStage(config, stage) {
 }
 
 async function runResumableStage(config, telemetry, stage, phase, run, hydrate = value => value) {
-  const cached = readStage(config, stage);
-  if (cached) return hydrate(cached);
+  if (config.resumeBuild) {
+    const path = stagePath(config, stage);
+    if (existsSync(path)) {
+      const cached = JSON.parse(readFileSync(path, "utf8"));
+      if (cached?.status === "complete" && cached.schema === BUILD_RESUME_SCHEMA_VERSION) {
+        return hydrate(cached.payload);
+      }
+    }
+  }
   const value = await timeBuildPhase(telemetry, phase, run);
   writeStage(config, stage, value);
   maybeFailAfterStage(config, stage);
@@ -3923,7 +3990,7 @@ export async function build({ configPath, update = false, compact = false }) {
   if (update && compact) throw new Error("Rangefind: pass either --update or --compact, not both.");
   const config = await readConfig(configPath);
   const generational = update ? await prepareGenerationalUpdate(config) : null;
-  const compaction = compact ? prepareCompaction(config) : null;
+  const compaction = compact ? await prepareCompaction(config) : null;
   if (compact && !compaction) console.log("Rangefind: no generational index at the output; --compact runs as a plain full build.");
   const fingerprint = config.resumeBuild ? buildFingerprint(config) : "scratch";
   config._buildRoot = config.resumeBuild
@@ -4036,7 +4103,8 @@ export async function build({ configPath, update = false, compact = false }) {
       partition_reducer_credit_wait_ms: reduced.reduceTimings.partitionScheduler?.creditWaitMs || 0,
       partition_reducer_credit_waits: reduced.reduceTimings.partitionScheduler?.creditWaits || 0,
       partition_reducer_oversized_partitions: reduced.reduceTimings.partitionScheduler?.oversizedPartitions || 0,
-      partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || ""
+      partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
+      code_store_worker_preloaded_bytes: reduced.workerCodeStorePreloadedBytes || 0
     });
     const segmentManifest = await runResumableStage(config, telemetry, "segment-manifest", "segment-manifest", () => writeSegmentManifest(dirs.out, {
       config,
@@ -4047,7 +4115,10 @@ export async function build({ configPath, update = false, compact = false }) {
       mergePolicy: reduced.mergePolicy,
       publishSegments: true
     }));
-    runData.codes.preload?.(Math.max(0, Math.floor(Number(config.codeStorePreloadMaxBytes ?? 1536 * 1024 * 1024))));
+    const defaultCodeStorePreloadBytes = measured.total >= 10_000_000
+      ? 2304 * 1024 * 1024
+      : 1536 * 1024 * 1024;
+    runData.codes.preload?.(Math.max(0, Math.floor(Number(config.codeStorePreloadMaxBytes ?? defaultCodeStorePreloadBytes))));
     const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
     addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
     addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);
@@ -4068,18 +4139,22 @@ export async function build({ configPath, update = false, compact = false }) {
     if (sidecarStage) {
       ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, vectors } = sidecarStage);
     } else {
-      sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
-      queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
-      authority = await timeBuildPhase(telemetry, "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
-      docs = await timeBuildPhase(telemetry, "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
-      docs.pages = await timeBuildPhase(telemetry, "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
-      docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
-      docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
-      geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows, reduced.filters));
-      vectors = await timeBuildPhase(telemetry, "vectors", () => writeVectorIndexes(dirs.out, config, runData.vectorSpools));
-      docs.id_map = await timeBuildPhase(telemetry, "id-map", () => writeIdMap(dirs.out, config, measured.total, runData.docSpool));
-      filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
-      facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
+      // Checkpoint every independently publishable sidecar. A national geo
+      // build can spend minutes in each phase; the former monolithic
+      // "sidecars" checkpoint repeated authority and all document packs when
+      // a later geo/vector phase was interrupted.
+      sortReplicas = await runResumableStage(config, telemetry, "sidecar-sort-replicas", "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
+      queryBundles = await runResumableStage(config, telemetry, "sidecar-query-bundles", "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
+      authority = await runResumableStage(config, telemetry, "sidecar-authority", "authority", () => reduceAuthorityRuns(config, dirs, runData.authorityBaseShards));
+      docs = await runResumableStage(config, telemetry, "sidecar-doc-packs", "doc-packs", () => finishDocPacks(dirs.out, runData.docSpool, measured.total, config));
+      docs.pages = await runResumableStage(config, telemetry, "sidecar-doc-pages", "doc-pages", () => finishDocPages(dirs.out, runData.docSpool, measured.total, config));
+      docValues = await runResumableStage(config, telemetry, "sidecar-doc-values", "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
+      docValueSorted = await runResumableStage(config, telemetry, "sidecar-doc-value-sorted", "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
+      geoTrees = await runResumableStage(config, telemetry, "sidecar-geo-trees", "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows, reduced.filters));
+      vectors = await runResumableStage(config, telemetry, "sidecar-vectors", "vectors", () => writeVectorIndexes(dirs.out, config, runData.vectorSpools));
+      docs.id_map = await runResumableStage(config, telemetry, "sidecar-id-map", "id-map", () => writeIdMap(dirs.out, config, measured.total, runData.docSpool));
+      filterBitmaps = await runResumableStage(config, telemetry, "sidecar-filter-bitmaps", "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
+      facetDictionaries = await runResumableStage(config, telemetry, "sidecar-facet-dictionaries", "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
       writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, vectors });
       maybeFailAfterStage(config, "sidecars");
     }
@@ -4477,6 +4552,7 @@ export async function build({ configPath, update = false, compact = false }) {
       partition_reducer_oversized_partitions: reduced.reduceTimings.partitionScheduler?.oversizedPartitions || 0,
       partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
       code_store_worker_cache_chunks: reduced.workerCodeStoreCacheChunks || 0,
+      code_store_worker_preloaded_bytes: reduced.workerCodeStorePreloadedBytes || 0,
       segment_merge_fan_in: config.segmentMergeFanIn,
       segment_merge_tiers: reduced.mergeTiers.length,
       segment_partition_spool_bytes: reduced.partitionSpoolBytes || 0,
@@ -4516,6 +4592,7 @@ export async function build({ configPath, update = false, compact = false }) {
       max_shard_depth: config.maxShardDepth,
       target_shard_postings: config.targetShardPostings,
       target_postings_per_doc: config.targetPostingsPerDoc,
+      field_avg_lengths: measured.avgLens,
       body_index_chars: config.bodyIndexChars,
       always_index_fields: config.alwaysIndexFields,
       max_expansion_terms_per_doc: config.maxExpansionTermsPerDoc,
@@ -4546,7 +4623,7 @@ export async function build({ configPath, update = false, compact = false }) {
       writeFileSync(config.buildTelemetryPath, JSON.stringify(buildTelemetry, null, 2));
     }
     if (generational) {
-      const summary = writeGenerationalRoot(generational, manifest, config);
+      const summary = await writeGenerationalRoot(generational, manifest, config);
       console.log(`Rangefind: generation ${generational.genDir} added (${measured.total.toLocaleString()} docs, ${summary.replaced.toLocaleString()} replaced, ${summary.generations} generations, ${summary.aliveTotal.toLocaleString()} alive docs)`);
       if (summary.generations >= COMPACT_MAX_GENERATIONS || summary.tombstoneRatio >= COMPACT_MAX_TOMBSTONE_RATIO) {
         console.warn(
@@ -4556,7 +4633,7 @@ export async function build({ configPath, update = false, compact = false }) {
       }
     }
     if (compaction) {
-      const summary = finalizeCompaction(compaction, manifest, config);
+      const summary = await finalizeCompaction(compaction, manifest, config);
       console.log(`Rangefind: compacted ${summary.removedGenerations} generation(s) into a single index`);
     }
     console.log(`Rangefind: built ${measured.total.toLocaleString()} docs, ${reduced.shards.length.toLocaleString()} posting segments, ${reduced.packs.length.toLocaleString()} packs`);

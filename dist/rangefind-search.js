@@ -9837,10 +9837,11 @@ async function createSearch(options = {}) {
   }
   async function executeLexiconSuggest(q, prefix, size, root) {
     const codepoints = Array.from(prefix);
-    if (codepoints.length === 1 && root.hot?.size) {
-      const hotEntry = root.hot.get(codepoints[0]);
-      if (!hotEntry || size <= hotEntry.count) {
-        const hot = hotEntry ? await loadAuthorityHotList(codepoints[0], hotEntry) : [];
+    if (root.hot?.size) {
+      const hotEntry = root.hot.get(prefix);
+      const completeMissingSingle = codepoints.length === 1 && !hotEntry;
+      if (completeMissingSingle || hotEntry && size <= hotEntry.count) {
+        const hot = hotEntry ? await loadAuthorityHotList(prefix, hotEntry) : [];
         return {
           q,
           prefix,

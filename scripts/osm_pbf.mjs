@@ -167,18 +167,18 @@ function parseWay(bytes) {
   return way;
 }
 
-function parsePrimitiveGroup(bytes) {
+function parsePrimitiveGroup(bytes, selected) {
   const group = { dense: null, nodes: [], ways: [] };
   for (const { field, wireType, state } of fields(bytes)) {
-    if (field === 1 && wireType === WIRE_BYTES) group.nodes.push(parseNode(readBytes(bytes, state)));
-    else if (field === 2 && wireType === WIRE_BYTES) group.dense = parseDenseNodes(readBytes(bytes, state));
-    else if (field === 3 && wireType === WIRE_BYTES) group.ways.push(parseWay(readBytes(bytes, state)));
+    if (field === 1 && wireType === WIRE_BYTES && selected.nodes) group.nodes.push(parseNode(readBytes(bytes, state)));
+    else if (field === 2 && wireType === WIRE_BYTES && selected.nodes) group.dense = parseDenseNodes(readBytes(bytes, state));
+    else if (field === 3 && wireType === WIRE_BYTES && selected.ways) group.ways.push(parseWay(readBytes(bytes, state)));
     else skipField(bytes, state, wireType);
   }
   return group;
 }
 
-function parsePrimitiveBlock(bytes) {
+function parsePrimitiveBlock(bytes, selected) {
   const block = {
     strings: [],
     groups: [],
@@ -188,7 +188,7 @@ function parsePrimitiveBlock(bytes) {
   };
   for (const { field, wireType, state } of fields(bytes)) {
     if (field === 1 && wireType === WIRE_BYTES) block.strings = parseStringTable(readBytes(bytes, state));
-    else if (field === 2 && wireType === WIRE_BYTES) block.groups.push(parsePrimitiveGroup(readBytes(bytes, state)));
+    else if (field === 2 && wireType === WIRE_BYTES) block.groups.push(parsePrimitiveGroup(readBytes(bytes, state), selected));
     else if (field === 17) block.granularity = readVarint53(bytes, state);
     else if (field === 19) block.latOffset = readVarint53(bytes, state);
     else if (field === 20) block.lonOffset = readVarint53(bytes, state);
@@ -248,9 +248,10 @@ function elementTags(keys, vals, strings) {
 // tags as null when a node has none, so dense untagged nodes stay cheap.
 export function scanPbf(path, { onNode = null, onWay = null } = {}) {
   const counts = { nodes: 0, ways: 0, blocks: 0 };
+  const selected = { nodes: Boolean(onNode), ways: Boolean(onWay) };
   for (const blob of rawBlobs(path)) {
     if (blob.type !== "OSMData") continue;
-    const block = parsePrimitiveBlock(parseBlob(blob.bytes));
+    const block = parsePrimitiveBlock(parseBlob(blob.bytes), selected);
     counts.blocks += 1;
     const { strings, granularity, latOffset, lonOffset } = block;
     const latScale = granularity * 1e-9;

@@ -8,6 +8,9 @@ const SHA256_HEX = /^[0-9a-f]{64}$/iu;
 
 function checksumToBytes(checksum) {
   const value = checksum?.value || "";
+  if (ArrayBuffer.isView(value) && value.byteLength === SHA256_BYTES) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
   if (!SHA256_HEX.test(value)) throw new Error("Rangefind doc pointer requires a SHA-256 checksum.");
   const out = new Uint8Array(SHA256_BYTES);
   for (let i = 0; i < SHA256_BYTES; i++) {
@@ -79,19 +82,33 @@ export function buildDocPointerTable(entries, packIndexes, options = {}) {
 }
 
 export function buildDocPointerTableFromReader(count, packIndexes, readEntry, options = {}) {
+  const batchSize = Math.max(1, Math.floor(Number(options.batchSize || 65536)));
+  const visitEntries = (pass, visitor) => {
+    if (typeof options.readBatch !== "function") {
+      for (let i = 0; i < count; i++) visitor(readEntry(i), i);
+      return;
+    }
+    for (let start = 0; start < count; start += batchSize) {
+      const expected = Math.min(batchSize, count - start);
+      const entries = options.readBatch(start, expected, pass);
+      if (!Array.isArray(entries) || entries.length !== expected) {
+        throw new Error(`Rangefind doc pointer batch at ${start} returned ${entries?.length ?? 0} of ${expected} entries.`);
+      }
+      for (let row = 0; row < entries.length; row++) visitor(entries[row], start + row);
+    }
+  };
   let maxPack = 0;
   let maxOffset = 0;
   let maxLength = 0;
   let maxLogicalLength = 0;
-  for (let i = 0; i < count; i++) {
-    const entry = readEntry(i);
+  visitEntries("measure", (entry) => {
     const packIndex = packIndexes.get(entry.pack);
     if (!Number.isFinite(packIndex)) throw new Error(`Rangefind doc pointer references unknown pack ${entry.pack}.`);
     maxPack = Math.max(maxPack, packIndex);
     maxOffset = Math.max(maxOffset, entry.offset || 0);
     maxLength = Math.max(maxLength, entry.length || 0);
     maxLogicalLength = Math.max(maxLogicalLength, entry.logicalLength || 0);
-  }
+  });
   const widths = {
     pack: fixedWidth([maxPack]),
     offset: fixedWidth([maxOffset]),
@@ -111,8 +128,7 @@ export function buildDocPointerTableFromReader(count, packIndexes, readEntry, op
   meta.dataOffset = header.length;
   const buffer = Buffer.alloc(meta.dataOffset + count * recordBytes);
   buffer.set(header, 0);
-  for (let i = 0; i < count; i++) {
-    const entry = readEntry(i);
+  visitEntries("write", (entry, i) => {
     let offset = meta.dataOffset + i * recordBytes;
     writeFixedInt(buffer, offset, widths.pack, packIndexes.get(entry.pack));
     offset += widths.pack;
@@ -123,7 +139,7 @@ export function buildDocPointerTableFromReader(count, packIndexes, readEntry, op
     writeFixedInt(buffer, offset, widths.logicalLength, entry.logicalLength || 0);
     offset += widths.logicalLength;
     buffer.set(checksumToBytes(entry.checksum), offset);
-  }
+  });
   return { buffer, meta };
 }
 

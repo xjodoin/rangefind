@@ -4,6 +4,27 @@
 
 ### Changed
 
+- **National-scale OSM builds**: the geo fixture now supports the full United
+  States Geofabrik extract and uses resumable downloads, disk-spooled candidate
+  ways, externally sorted/deduplicated anchors, and an indexed on-disk
+  coordinate store. Entity-selective PBF decoding skips unused node or way
+  payloads. Quebec extraction dropped from 113.7 s / 2.71 GB peak RSS to
+  77.5 s / 462 MiB with byte-identical JSONL. The exhaustive benchmark oracle
+  is now a bounded two-pass stream instead of retaining every point and token
+  set, and geo root bounding boxes no longer use argument-spread operations
+  that can overflow at national leaf counts. Posting reducers share only the
+  block-filter code columns they read; on the 32.8M-place US corpus this
+  changed reduction from more than 29m35s with no output to 2m41s. Dense
+  document pointers use 65,536-row sequential reads instead of two reads per
+  document (4m33s to 2m44s for US document packing), and 10M+ builds may
+  preload a 2.25 GiB code store so geo summaries and doc-value writers avoid
+  random chunk reads. Large sidecars checkpoint independently, so an
+  interrupted geo/vector phase no longer repeats authority, document, and
+  doc-value work. Unified autocomplete now publishes bounded, adaptive hot
+  lists for broad two- and three-letter Latin prefixes in addition to every
+  one-character prefix; on the full-US index this reduced mean keystroke
+  latency 69% and transfer 22% while adding 54 KiB to the one-time root.
+
 - **Unified authority autocomplete**: `suggest` fields now stream into bounded
   authority runs and are encoded directly in `rfauth-v2` packs with exact
   weights, counts, display strings, token suffixes, per-shard max-rank

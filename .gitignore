@@ -33,4 +33,5 @@ examples/wiki-search/wiki-search-build-telemetry.json
 target/
 .claude/
 .playwright-mcp/
+.cache/
 examples/vector-bench/
