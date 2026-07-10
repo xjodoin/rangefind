@@ -65,6 +65,7 @@
     "examples/osm-geo/README.md",
     "examples/osm-geo/public/index.html",
     "examples/osm-geo/public/app.js",
+    "examples/osm-geo/public/osm-query.js",
     "examples/osm-geo/public/styles.css",
     "examples/wiki-search/scripts/embed.mjs",
     "CHANGELOG.md",

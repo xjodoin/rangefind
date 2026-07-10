@@ -61,6 +61,13 @@ range lane, and returns only addresses whose interpolation step actually
 contains the requested number. No inferred address surfaces are added to the
 lexicon.
 
+The demo also recognizes category-plus-locality intents in either order. For
+example, `Pharmacie Rosemère` resolves the exact `place=town` document for
+Rosemère, maps the French category to the indexed `pharmacy` type, and performs
+a distance-sorted geo text query within the town-scale radius. This finds POIs
+such as Uniprix whose OSM node has coordinates and `amenity=pharmacy` but no
+`addr:city`; resolved localities are cached for subsequent searches.
+
 A small hierarchy of canonical address keys per document is stored in the
 packed authority index: full address, house/street/locality,
 house/street/postcode, and house/street. Equivalent forms such as `Fifth

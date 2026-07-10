@@ -1,4 +1,5 @@
 import { createSearch } from "./runtime.browser.js";
+import { searchOsmQuery } from "./osm-query.js";
 
 const queryInput = document.querySelector("#queryInput");
 const suggestList = document.querySelector("#suggestList");
@@ -116,9 +117,11 @@ async function runSearch({ fit = false } = {}) {
   }
   const started = performance.now();
   try {
-    const response = await engine.search(params);
+    const response = await searchOsmQuery(engine, params);
     if (token !== searchToken) return;
-    renderResults(response.results, { fit: fit || (addressLookup && areaToggle.checked) });
+    const resolvedLocality = response.stats?.plannerLane === "osmCategoryLocality";
+    if (resolvedLocality) areaToggle.checked = false;
+    renderResults(response.results, { fit: fit || resolvedLocality || (addressLookup && areaToggle.checked) });
     const ms = Math.round(performance.now() - started);
     statusLine.textContent = `${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${ms} ms`;
   } catch (error) {

@@ -18,6 +18,13 @@
   tails after three street-token characters, reusing the compact range lane
   instead of publishing millions of inferred suggestion strings.
 
+- **OSM category-locality search**: the map demo recognizes pharmacy queries
+  such as `Pharmacie Rosemère`, `Rosemère pharmacie`, and `pharmacy rosemere`.
+  It resolves the exact settlement through the place facet, maps the localized
+  category to the indexed OSM term, and runs a distance-sorted geo query. This
+  finds POIs whose OSM records omit `addr:city` without fabricating locality
+  tags or rebuilding the index; locality resolutions are cached.
+
 - **National-scale address search and posting reduction**: the OSM fixture now
   retains complete address-only nodes and ways, publishes structured address
   fields, and builds canonical full, locality, postcode, and street authority
