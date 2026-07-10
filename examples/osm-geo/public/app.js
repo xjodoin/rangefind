@@ -1,5 +1,5 @@
 import { createSearch } from "./runtime.browser.js";
-import { searchOsmQuery } from "./osm-query.js";
+import { searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
 
 const queryInput = document.querySelector("#queryInput");
 const suggestList = document.querySelector("#suggestList");
@@ -168,7 +168,7 @@ async function showSuggestions() {
     return;
   }
   try {
-    const response = await engine.suggest({ q, size: 8 });
+    const response = await suggestOsmQuery(engine, { q, size: 8 });
     if (token !== suggestToken || suggestionsSuppressed) return;
     if (!response.suggestions.length) {
       hideSuggestions();
@@ -180,7 +180,9 @@ async function showSuggestions() {
       text.textContent = item.text;
       const count = document.createElement("span");
       count.className = "count";
-      count.textContent = item.interpolated
+      count.textContent = item.type === "street"
+        ? "street"
+        : item.interpolated
         ? "interpolated"
         : item.count > 1 ? `×${formatNumber(item.count)}` : "";
       li.append(text, count);

@@ -62,6 +62,86 @@ function possibleLocalityQuery(value) {
     && !CATEGORY_INTENTS.has(normalized);
 }
 
+function hasHouseNumber(value) {
+  return String(value || "")
+    .trim()
+    .split(/[^\p{L}\p{N}-]+/u)
+    .some(token => /^\d+[\p{L}]?(?:-\d+[\p{L}]?)?$/u.test(token));
+}
+
+function streetLocalitySurface(value) {
+  const withoutNumber = String(value || "").replace(
+    /^\s*\d+[\p{L}]?(?:\s*[-–—]\s*\d+[\p{L}]?)?\s+/u,
+    ""
+  );
+  const comma = withoutNumber.indexOf(",");
+  if (comma <= 0 || comma === withoutNumber.length - 1) return null;
+  const street = withoutNumber.slice(0, comma).trim();
+  const locality = withoutNumber.slice(comma + 1).trim();
+  const streetTokens = fold(street).split(" ").filter(Boolean);
+  if (!streetTokens.some(token => STREET_DESIGNATORS.has(token))) return null;
+  return { text: `${street}, ${locality}`, key: fold(`${street}, ${locality}`) };
+}
+
+export function collapseStreetSuggestions(response, params = {}) {
+  const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+  if (hasHouseNumber(params.q)) {
+    return { ...response, suggestions: (response.suggestions || []).slice(0, size) };
+  }
+  const grouped = new Map();
+  const passthrough = [];
+  for (const item of response.suggestions || []) {
+    const surface = streetLocalitySurface(item.text);
+    if (!surface) {
+      passthrough.push(item);
+      continue;
+    }
+    const current = grouped.get(surface.key) || {
+      text: surface.text,
+      weight: 0,
+      count: 0,
+      matches: 0,
+      type: "street"
+    };
+    current.weight += Number(item.weight || 0);
+    current.count += Number(item.count || 1);
+    current.matches++;
+    grouped.set(surface.key, current);
+  }
+  const streets = [...grouped.values()]
+    .filter(item => item.matches >= 2)
+    .map(({ matches, ...item }) => item);
+  const collapsedKeys = new Set(streets.map(item => fold(item.text)));
+  const remaining = passthrough.concat((response.suggestions || []).filter(item => {
+    const surface = streetLocalitySurface(item.text);
+    return surface && !collapsedKeys.has(surface.key);
+  }));
+  const suggestions = streets.concat(remaining)
+    .sort((left, right) => (
+      (right.type === "street") - (left.type === "street")
+      || Number(right.weight || 0) - Number(left.weight || 0)
+      || String(left.text).localeCompare(String(right.text))
+    ))
+    .slice(0, size);
+  return {
+    ...response,
+    suggestions,
+    stats: {
+      ...(response.stats || {}),
+      osmStreetSuggestionsCollapsed: streets.length
+    }
+  };
+}
+
+export async function suggestOsmQuery(engine, params = {}) {
+  const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+  const response = await engine.suggest({
+    ...params,
+    size: hasHouseNumber(params.q) ? requestedSize : Math.max(32, requestedSize)
+  });
+  return collapseStreetSuggestions(response, { ...params, size: requestedSize });
+}
+
 function collapseCivicDuplicates(response) {
   const results = response.results || [];
   const named = results.filter(result => result.type !== "civic_address");
@@ -121,7 +201,11 @@ async function resolveLocality(engine, surface) {
 }
 
 async function resolveStreetLocality(engine, surface, params) {
-  const tokens = String(surface || "").trim().split(/\s+/u).filter(Boolean);
+  const tokens = String(surface || "")
+    .trim()
+    .replaceAll(/\s*,\s*/gu, " ")
+    .split(/\s+/u)
+    .filter(Boolean);
   if (tokens.length < 3) return null;
   const designatorIndexes = tokens
     .map((token, index) => STREET_DESIGNATORS.has(fold(token)) ? index : -1)

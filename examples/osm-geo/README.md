@@ -5,6 +5,27 @@ regional extract. It benchmarks canonical address lookup plus Lucene-style geo
 queries (bounding box, radius, nearest-neighbor distance sort, and
 text-plus-geo) against exhaustive oracles.
 
+## Integration API
+
+OSM behavior is a reusable integration rather than demo-only code. Browser-safe
+document conversion, schema generation, search intents, and autocomplete are
+exported from `rangefind/osm`; bounded PBF/RQA build helpers are exported from
+`rangefind/osm/node`:
+
+```js
+import {
+  createOsmIndexConfig,
+  searchOsmQuery,
+  suggestOsmQuery
+} from "rangefind/osm";
+import { buildOsmIndex, augmentOsmWithRqa } from "rangefind/osm/node";
+```
+
+Both APIs produce and query the normal Rangefind pack format. There is no OSM
+sidecar or parallel runtime. `scripts/osm_fixture.mjs` remains a resumable CLI
+for PBF extraction and delegates document shaping, RQA ingestion, schema
+generation, and index publication to these modules.
+
 ## Build
 
 ```bash
@@ -109,6 +130,13 @@ designator from the text plan, and searches the distinctive street name within
 the town radius. Exact OSM road segments are collapsed to one canonical street
 result. This avoids exhausting the posting budget on `rue` and requires no
 per-street sidecar or duplicate street index.
+
+Autocomplete applies the same street-level presentation without changing the
+index. When no house number is present, a bounded candidate window groups
+civic and interpolation titles by street and municipality, so `Rue Libersan
+Saint` offers `Rue Libersan, Sainte-Thérèse` instead of spending every visible
+slot on individual house numbers. Numeric prefixes keep the address-level and
+interpolated suggestions unchanged.
 
 A small hierarchy of canonical address keys per document is stored in the
 packed authority index: full address, house/street/locality,

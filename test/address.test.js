@@ -19,7 +19,11 @@ import {
 import { build } from "../src/builder.js";
 import { authorityAddressRangeKey } from "../src/authority_codec.js";
 import { createNodeSearch } from "../src/runtime.node.js";
-import { addressFromTags, interpolationRangeDocs, placeDoc } from "../scripts/osm_fixture.mjs";
+import {
+  addressFromTags,
+  interpolationRangeDocs,
+  placeDoc
+} from "../src/integrations/osm/documents.js";
 
 test("address keys normalize directions, suffixes, punctuation, and ordinal words", () => {
   assert.equal(

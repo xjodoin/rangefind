@@ -8,7 +8,7 @@ import {
   augmentOsmWithRqa,
   parseCsvRows,
   rqaAddressDoc
-} from "../scripts/rqa_fixture.mjs";
+} from "../src/integrations/osm/node/rqa.js";
 
 const HEADER = [
   "identifiant_unique_adresse",

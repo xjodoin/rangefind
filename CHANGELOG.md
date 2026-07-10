@@ -4,6 +4,13 @@
 
 ### Changed
 
+- **Reusable OSM integration**: OSM document normalization, compact address
+  interpolation, index schema generation, map query intents, and autocomplete
+  now live under the browser-safe `rangefind/osm` export. Node-only RQA
+  ingestion and index publication are exposed through `rangefind/osm/node`.
+  Fixture scripts and the map demo are thin consumers of those APIs, while the
+  underlying Rangefind pack format stays unchanged and no OSM sidecar is added.
+
 - **Québec civic and postal coverage**: Québec OSM fixtures now merge the
   monthly CC BY 4.0 Référentiel québécois des adresses through a resumable,
   zipped-CSV stream. A disk-indexed canonical pass collapses units and removes
@@ -23,7 +30,9 @@
   to one street result, avoiding common `rue` posting-budget exhaustion.
   Autocomplete overlays can escape the rounded panel without horizontal
   overflow, long labels wrap, and pending suggestion work is cancelled on
-  Enter or Escape.
+  Enter or Escape. Non-numeric street prefixes now group civic candidates by
+  street and municipality, promoting canonical street suggestions without a
+  new sidecar; numeric address autocomplete remains unchanged.
 
 - **Canadian postal-code query normalization**: compact forms such as
   `J7B1Z5` are canonicalized to the already-indexed `J7B 1Z5` token form

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseOsmQueryIntent, searchOsmQuery } from "../examples/osm-geo/public/osm-query.js";
+import {
+  parseOsmQueryIntent,
+  searchOsmQuery,
+  suggestOsmQuery
+} from "../src/integrations/osm/query.js";
 
 test("OSM query intents recognize pharmacy and locality in either order", () => {
   assert.deepEqual(parseOsmQueryIntent("Pharmacie Rosemère"), {
@@ -15,6 +19,37 @@ test("OSM query intents recognize pharmacy and locality in either order", () => 
   });
   assert.equal(parseOsmQueryIntent("Pharmacie"), null);
   assert.equal(parseOsmQueryIntent("Café Rosemère"), null);
+});
+
+test("OSM autocomplete collapses civic matches into street-locality suggestions", async () => {
+  const calls = [];
+  const engine = {
+    async suggest(params) {
+      calls.push(params);
+      return {
+        suggestions: [
+          { text: "200 Rue Libersan, Sainte-Thérèse", weight: 2, count: 2 },
+          { text: "202 Rue Libersan, Sainte-Thérèse", weight: 1, count: 1 },
+          { text: "202–218 Rue Libersan, Sainte-Thérèse", weight: 1, count: 1 },
+          { text: "3024 Rue Libersan, Sainte-Marthe-sur-le-Lac", weight: 1, count: 1 },
+          { text: "3028 Rue Libersan, Sainte-Marthe-sur-le-Lac", weight: 1, count: 1 }
+        ],
+        stats: { suggestLane: "authority-lexicon" }
+      };
+    }
+  };
+  const response = await suggestOsmQuery(engine, { q: "Rue Libersan Saint", size: 8 });
+  assert.equal(calls[0].size, 32);
+  assert.deepEqual(response.suggestions.map(item => item.text), [
+    "Rue Libersan, Sainte-Thérèse",
+    "Rue Libersan, Sainte-Marthe-sur-le-Lac"
+  ]);
+  assert.equal(response.suggestions[0].type, "street");
+  assert.equal(response.suggestions[0].count, 4);
+  assert.equal(response.stats.osmStreetSuggestionsCollapsed, 2);
+
+  await suggestOsmQuery(engine, { q: "214 Rue Libersan Saint", size: 8 });
+  assert.equal(calls[1].size, 8);
 });
 
 test("OSM category-locality search resolves a place then searches nearby", async () => {
@@ -95,7 +130,7 @@ test("OSM street-locality search avoids common road-designator posting exhaustio
       return { total: 0, results: [] };
     }
   };
-  const response = await searchOsmQuery(engine, { q: "Rue Hector Rosemère", geo: { box: {} }, size: 10 });
+  const response = await searchOsmQuery(engine, { q: "Rue Hector, Rosemère", geo: { box: {} }, size: 10 });
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0].filters, { facets: { category: ["place"] } });
   assert.equal(calls[0].q, "Rosemère");
