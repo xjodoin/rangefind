@@ -34,8 +34,6 @@ import {
   numericValue,
   queryBundlesEnabled,
   rawPath,
-  suggestEnabled,
-  suggestRowsForDoc,
   valueList,
   vectorsEnabled
 } from "./scan_doc.js";
@@ -52,16 +50,6 @@ import {
   VECTOR_ROOT_FORMAT,
   vectorFromValue
 } from "./vector_index.js";
-import {
-  addSuggestionRow,
-  encodeSuggestBranchPage,
-  encodeSuggestPage,
-  encodeSuggestRoot,
-  finalizeSuggestionRows,
-  SUGGEST_BRANCH_PAGE_FORMAT,
-  SUGGEST_PAGE_FORMAT,
-  SUGGEST_ROOT_FORMAT
-} from "./suggest_index.js";
 import { addBuildCounter, createBuildTelemetry, finishBuildTelemetry, recordBuildWorkers, timeBuildPhase } from "./build_telemetry.js";
 import { createCodeStore, openCodeStore, preloadCodeStoreDescriptor } from "./build_store.js";
 import {
@@ -1696,153 +1684,6 @@ function writeGeoTrees(out, config, total, codes, blockFilters) {
   };
 }
 
-async function writeSuggestIndex(out, config, suggestRows) {
-  if (!suggestEnabled(config) || !suggestRows?.rows) return null;
-  const pageSize = Math.max(16, Math.floor(Number(config.suggestPageSize || 256)));
-  const branchPages = Math.max(2, Math.floor(Number(config.suggestBranchPages || 256)));
-  const minKeyLength = Math.max(1, Math.floor(Number(config.suggestMinKeyLength || 1)));
-  const packWriter = createPackWriter(resolve(out, "suggest", "packs"), config.suggestPackBytes || config.docValuePackBytes);
-  const rows = new Map();
-  const tokenOptions = { maxTokenKeys: config.suggestMaxTokenKeys };
-  await eachJsonLine(suggestRows.file, async (row) => {
-    addSuggestionRow(rows, row[0], row[2], {
-      count: row[1],
-      tokenPrefixes: row[3] === 1,
-      maxTokenKeys: tokenOptions.maxTokenKeys
-    });
-  });
-  const entries = finalizeSuggestionRows(rows).filter(entry => entry.key.length >= minKeyLength);
-  rows.clear();
-
-  const pages = [];
-  for (let start = 0; start < entries.length; start += pageSize) {
-    const slice = entries.slice(start, start + pageSize);
-    const encoded = encodeSuggestPage(slice);
-    const entry = writePackedShard(packWriter, `suggest ${pages.length}`, gzipSync(encoded, { level: 6 }), {
-      kind: "suggest-page",
-      codec: SUGGEST_PAGE_FORMAT,
-      logicalLength: encoded.length
-    });
-    let maxWeight = 0;
-    for (const item of slice) if (item.weight > maxWeight) maxWeight = item.weight;
-    pages.push({ minKey: slice[0].key, maxWeight, count: slice.length, entry });
-  }
-
-  // Branch pages keep the cold root small for large suggestion sets; pack
-  // indexes stay stable across finalizePackWriter renames.
-  let branches = null;
-  if (pages.length > branchPages * 2) {
-    const packIndexesNow = new Map(packTable(packWriter.packs).map((file, index) => [file, index]));
-    branches = [];
-    for (let start = 0; start < pages.length; start += branchPages) {
-      const slice = pages.slice(start, start + branchPages);
-      const encoded = encodeSuggestBranchPage({
-        branchIndex: branches.length,
-        firstPageIndex: start,
-        pages: slice,
-        packIndexes: packIndexesNow
-      });
-      const entry = writePackedShard(packWriter, `suggest branch ${start}`, gzipSync(encoded, { level: 6 }), {
-        kind: "suggest-branch-page",
-        codec: SUGGEST_BRANCH_PAGE_FORMAT,
-        logicalLength: encoded.length
-      });
-      let maxWeight = 0;
-      let count = 0;
-      for (const page of slice) {
-        if (page.maxWeight > maxWeight) maxWeight = page.maxWeight;
-        count += page.count;
-      }
-      branches.push({
-        minKey: slice[0].minKey,
-        maxWeight,
-        count,
-        firstPageIndex: start,
-        pageCount: slice.length,
-        entry
-      });
-    }
-  }
-
-  // Precomputed top lists per first character: the first keystroke of a
-  // session costs one small page instead of a best-first walk over the
-  // widest possible key range.
-  const hotListSize = Math.max(8, Math.floor(Number(config.suggestHotListSize || 64)));
-  const hot = [];
-  for (let start = 0; start < entries.length;) {
-    const firstChar = entries[start].key[0];
-    let end = start;
-    while (end < entries.length && entries[end].key[0] === firstChar) end++;
-    const best = new Map();
-    for (let i = start; i < end; i++) {
-      const entry = entries[i];
-      const existing = best.get(entry.display);
-      if (!existing
-        || entry.weight > existing.weight
-        || (entry.weight === existing.weight && entry.key < existing.key)) {
-        best.set(entry.display, entry);
-      }
-    }
-    const top = [...best.values()]
-      .sort((a, b) => b.weight - a.weight
-        || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
-        || (a.display < b.display ? -1 : a.display > b.display ? 1 : 0))
-      .slice(0, hotListSize);
-    const encoded = encodeSuggestPage(top);
-    const entry = writePackedShard(packWriter, `suggest hot ${firstChar}`, gzipSync(encoded, { level: 6 }), {
-      kind: "suggest-hot-page",
-      codec: SUGGEST_PAGE_FORMAT,
-      logicalLength: encoded.length
-    });
-    hot.push({ prefix: firstChar, count: top.length, entry });
-    start = end;
-  }
-
-  finalizePackWriter(packWriter);
-  const packFiles = packTable(packWriter.packs);
-  const packIndexes = new Map(packFiles.map((file, index) => [file, index]));
-  const root = encodeSuggestRoot({
-    total: entries.length,
-    pageSize,
-    pages: branches ? null : pages,
-    branches,
-    hot,
-    packTable: packFiles,
-    packIndexes
-  });
-  const compressed = gzipSync(root.buffer, { level: 6 });
-  const hash = sha256Hex(compressed);
-  mkdirSync(resolve(out, "suggest"), { recursive: true });
-  const file = `suggest/${hashedFile("root", hash, ".bin.gz")}`;
-  writeFileSync(resolve(out, file), compressed);
-
-  return {
-    storage: "range-pack-v1",
-    compression: "gzip-member",
-    directory_format: SUGGEST_ROOT_FORMAT,
-    page_format: SUGGEST_PAGE_FORMAT,
-    total: entries.length,
-    surfaces: suggestRows.rows,
-    page_size: pageSize,
-    pages: pages.length,
-    levels: branches ? 2 : 1,
-    branches: branches ? branches.length : 0,
-    hot_prefixes: hot.length,
-    directory: {
-      format: SUGGEST_ROOT_FORMAT,
-      compression: "gzip-member",
-      file,
-      content_hash: hash,
-      immutable: true,
-      bytes: compressed.length,
-      logical_bytes: root.buffer.length
-    },
-    packs: packWriter.packs,
-    pack_table: packFiles,
-    pack_bytes: packWriter.packs.reduce((sum, pack) => sum + pack.bytes, 0)
-  };
-}
-
 function forEachSpooledVector(spool, dims, handler) {
   const fd = openSync(spool.file, "r");
   const rowBytes = dims * 4;
@@ -3082,25 +2923,7 @@ function consumeScanBatch(state, response) {
     for (let i = 0; i < n; i++) mergeQueryBundleSeedCandidates(queryBundleSeedBuffer, response.bundleCandidates[i]);
   }
 
-  if (state.suggestBuffer && response.suggest) {
-    const { surfaces, rows } = response.suggest;
-    for (let r = 0; r < surfaces.length; r++) {
-      mergeSuggestSurface(state.suggestBuffer, surfaces[r], rows[r][0], rows[r][1], rows[r][2] === 1);
-    }
-  }
-
   appendVectorBatch(state.vectorSpools, response, n);
-}
-
-function mergeSuggestSurface(buffer, surface, count, weight, tokenPrefixes) {
-  const existing = buffer.get(surface);
-  if (existing) {
-    existing[0] += count;
-    if (weight > existing[1]) existing[1] = weight;
-    if (tokenPrefixes) existing[2] = 1;
-  } else {
-    buffer.set(surface, [count, weight, tokenPrefixes ? 1 : 0]);
-  }
 }
 
 // Vectors spool straight to disk as fixed-width Float32 rows (NaN in the
@@ -3150,36 +2973,6 @@ function finishVectorSpools(spools) {
   });
 }
 
-// Spools the aggregated (surface, count, weight, tokenPrefixes) rows so the
-// scan stage stays resumable without serializing a multi-million-entry map
-// into the stage JSON.
-function finishSuggestRows(buffer, dirs) {
-  if (!buffer) return null;
-  const file = resolve(dirs.build, "suggest-rows.jsonl");
-  const lines = [];
-  let bytes = 0;
-  const fd = openSync(file, "w");
-  try {
-    for (const [surface, row] of buffer) {
-      lines.push(JSON.stringify([surface, row[0], row[1], row[2]]));
-      if (lines.length >= 20000) {
-        const chunk = Buffer.from(`${lines.join("\n")}\n`);
-        writeSync(fd, chunk, 0, chunk.length);
-        bytes += chunk.length;
-        lines.length = 0;
-      }
-    }
-    if (lines.length) {
-      const chunk = Buffer.from(`${lines.join("\n")}\n`);
-      writeSync(fd, chunk, 0, chunk.length);
-      bytes += chunk.length;
-    }
-  } finally {
-    closeSync(fd);
-  }
-  return { file, rows: buffer.size, bytes };
-}
-
 function consumeScanDoc(state, doc, index, analysis) {
   const {
     config,
@@ -3198,12 +2991,7 @@ function consumeScanDoc(state, doc, index, analysis) {
     addSegmentPosting(segmentBuilder, term, index, Math.max(1, Math.round(score * 1000)));
   }
   addQueryBundleSeeds(queryBundleSeedBuffer, selectedTerms, config, doc, analysis.fieldTerms);
-  addAuthorityDoc(authorityBuffer, config, doc, index);
-  if (state.suggestBuffer) {
-    for (const [surface, weight, tokenPrefixes] of suggestRowsForDoc(config, doc)) {
-      mergeSuggestSurface(state.suggestBuffer, surface, 1, weight, tokenPrefixes);
-    }
-  }
+  addAuthorityDoc(authorityBuffer, config, doc, index, analyzerForConfig(config));
   appendVectorDoc(state.vectorSpools, config, doc);
 
   if (shouldFlushSegment(segmentBuilder)) {
@@ -3545,7 +3333,6 @@ async function writePostingRuns(config, measured, dirs) {
     segmentBuilder,
     queryBundleSeedBuffer,
     authorityBuffer,
-    suggestBuffer: suggestEnabled(config) ? new Map() : null,
     vectorSpools: createVectorSpools(config, dirs),
     docSpool,
     selectedTermSpool
@@ -3568,7 +3355,6 @@ async function writePostingRuns(config, measured, dirs) {
   const segments = workerSegments ?? finishSegmentBuilder(segmentBuilder);
   const authorityBaseShards = finishAuthorityRuns(authorityBuffer);
   const queryBundleSeeds = finalizeQueryBundleSeeds(queryBundleSeedBuffer, config);
-  const suggestRows = finishSuggestRows(state.suggestBuffer, dirs);
   const vectorSpools = finishVectorSpools(state.vectorSpools);
   return {
     codes,
@@ -3580,7 +3366,6 @@ async function writePostingRuns(config, measured, dirs) {
     queryBundleSeeds,
     queryBundleTerms: queryBundleTerms(queryBundleSeeds),
     authorityBaseShards,
-    suggestRows,
     vectorSpools,
     scanWorkerStats
   };
@@ -3882,7 +3667,6 @@ function minimalManifest(manifest) {
     booleans: manifest.booleans,
     sorts: manifest.sorts,
     geo: manifest.geo,
-    suggest: manifest.suggest,
     vectors: manifest.vectors,
     block_filters: manifest.block_filters,
     directory: manifest.directory,
@@ -3942,9 +3726,9 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
   });
 }
 
-// v6: short shard keys no longer use underscore padding. Reduced stages built
-// with the old collision-prone keys cannot mix with the new directory layout.
-const BUILD_RESUME_SCHEMA_VERSION = 6;
+// v7: autocomplete records moved into authority runs. Reusing a v6 scan stage
+// would silently omit the unified lexicon even when `suggest` is configured.
+const BUILD_RESUME_SCHEMA_VERSION = 7;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -4083,10 +3867,14 @@ function serializeSelectedTermSpool(spool) {
   };
 }
 
-function serializeScanStage(runData, measured) {
+function serializeScanStage(runData) {
   const codeDescriptor = runData.codes.descriptor();
   return {
-    codeDescriptor: { ...codeDescriptor, dicts: serializeDicts(measured.dicts) },
+    // Dictionaries already live in the measure checkpoint and hydrateScanStage
+    // deliberately reattaches that canonical copy. Repeating them here made a
+    // full-Wikipedia scan checkpoint 67+ MiB larger and doubled parse-time
+    // object retention on resume.
+    codeDescriptor: { ...codeDescriptor, dicts: undefined },
     initialResults: runData.initialResults,
     segments: runData.segments,
     segmentSummary: runData.segmentSummary,
@@ -4095,7 +3883,6 @@ function serializeScanStage(runData, measured) {
     queryBundleSeeds: runData.queryBundleSeeds,
     queryBundleTerms: runData.queryBundleTerms,
     authorityBaseShards: runData.authorityBaseShards,
-    suggestRows: runData.suggestRows,
     vectorSpools: runData.vectorSpools,
     scanWorkerStats: runData.scanWorkerStats
   };
@@ -4112,7 +3899,6 @@ function hydrateScanStage(payload, measured) {
     queryBundleSeeds: payload.queryBundleSeeds || [],
     queryBundleTerms: payload.queryBundleTerms || [],
     authorityBaseShards: payload.authorityBaseShards || [],
-    suggestRows: payload.suggestRows || null,
     vectorSpools: payload.vectorSpools || null,
     scanWorkerStats: payload.scanWorkerStats || []
   };
@@ -4159,6 +3945,7 @@ export async function build({ configPath, update = false, compact = false }) {
   mkdirSync(resolve(dirs.build, "stages"), { recursive: true });
   mkdirSync(dirs.authorityRunsOut, { recursive: true });
   rmSync(resolve(dirs.out, "typo"), { recursive: true, force: true });
+  rmSync(resolve(dirs.out, "suggest"), { recursive: true, force: true });
   rmSync(resolve(dirs.out, "docs", "ordinals"), { recursive: true, force: true });
 
   let runData = null;
@@ -4190,7 +3977,7 @@ export async function build({ configPath, update = false, compact = false }) {
       runData = hydrateScanStage(scanStage, measured);
     } else {
       runData = await timeBuildPhase(telemetry, "scan-and-spool", () => writePostingRuns(config, measured, dirs));
-      writeStage(config, "scan", serializeScanStage(runData, measured));
+      writeStage(config, "scan", serializeScanStage(runData));
       maybeFailAfterStage(config, "scan");
     }
     recordBuildWorkers(telemetry, "scan-and-spool", runData.scanWorkerStats, {
@@ -4237,6 +4024,8 @@ export async function build({ configPath, update = false, compact = false }) {
       segment_merge_intermediate_bytes: reduced.mergePolicy?.intermediateBytes || 0,
       segment_merge_skipped_segments: reduced.mergePolicy?.skippedSegments || 0,
       segment_merge_blocked_by_temp_budget: Boolean(reduced.mergePolicy?.blockedByTempBudget),
+      segment_merge_blocked_by_directory_budget: Boolean(reduced.mergePolicy?.blockedByDirectoryBudget),
+      segment_merge_max_directory_bytes: reduced.mergePolicy?.maxDirectoryBytes || 0,
       segment_merge_fan_in: config.segmentMergeFanIn,
       segment_merge_tiers: reduced.mergeTiers.length,
       segment_merge_tier_outputs: reduced.mergeTiers.map(tier => tier.output_segments),
@@ -4274,11 +4063,10 @@ export async function build({ configPath, update = false, compact = false }) {
     let filterBitmaps;
     let facetDictionaries;
     let geoTrees;
-    let suggest;
     let vectors;
     const sidecarStage = readStage(config, "sidecars");
     if (sidecarStage) {
-      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest, vectors } = sidecarStage);
+      ({ sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, vectors } = sidecarStage);
     } else {
       sortReplicas = await timeBuildPhase(telemetry, "sort-replicas", () => buildSortReplicas(config, measured, dirs, runData.selectedTermSpool, runData.docSpool, fieldRows));
       queryBundles = await timeBuildPhase(telemetry, "query-bundles", () => buildQueryBundleIndex(config, measured, dirs, runData.queryBundleSeeds, reduced.bundleDfs, runData.selectedTermSpool, reduced.filters, fieldRows));
@@ -4288,12 +4076,11 @@ export async function build({ configPath, update = false, compact = false }) {
       docValues = await timeBuildPhase(telemetry, "doc-values", () => writeDocValuePacks(dirs.out, config, measured.total, fieldRows));
       docValueSorted = await timeBuildPhase(telemetry, "doc-value-sorted", () => writeDocValueSortedIndexes(dirs.out, config, measured.total, fieldRows));
       geoTrees = await timeBuildPhase(telemetry, "geo-trees", () => writeGeoTrees(dirs.out, config, measured.total, fieldRows, reduced.filters));
-      suggest = await timeBuildPhase(telemetry, "suggest", () => writeSuggestIndex(dirs.out, config, runData.suggestRows));
       vectors = await timeBuildPhase(telemetry, "vectors", () => writeVectorIndexes(dirs.out, config, runData.vectorSpools));
       docs.id_map = await timeBuildPhase(telemetry, "id-map", () => writeIdMap(dirs.out, config, measured.total, runData.docSpool));
       filterBitmaps = await timeBuildPhase(telemetry, "filter-bitmaps", () => writeFilterBitmapIndex(dirs.out, config, measured.total, fieldRows, measured.dicts));
       facetDictionaries = await timeBuildPhase(telemetry, "facet-dictionaries", () => writeFacetDictionaries(dirs.out, measured.dicts, config));
-      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, suggest, vectors });
+      writeStage(config, "sidecars", { sortReplicas, queryBundles, authority, docs, docValues, docValueSorted, filterBitmaps, facetDictionaries, geoTrees, vectors });
       maybeFailAfterStage(config, "sidecars");
     }
     addBuildCounter(telemetry, "sort_replica_count", sortReplicas.count);
@@ -4326,7 +4113,7 @@ export async function build({ configPath, update = false, compact = false }) {
         sortReplicas: sortReplicas.count > 0,
         mainIndexTypo: config.typoMode !== "off",
         geo: !!geoTrees && Object.keys(geoTrees.fields).length > 0,
-        suggest: !!suggest && suggest.total > 0,
+        suggest: !!authority?.autocomplete?.keys,
         vectors: !!vectors && Object.keys(vectors.fields).length > 0
       },
     object_store: {
@@ -4350,8 +4137,7 @@ export async function build({ configPath, update = false, compact = false }) {
         facets: packTable(facetDictionaries.pack_objects),
         queryBundles: packTable(queryBundles?.packs),
         authority: packTable(authority?.packs),
-        geo: packTable(geoTrees?.packs),
-        suggest: packTable(suggest?.packs)
+        geo: packTable(geoTrees?.packs)
       },
       dedupe: summarizeDedup(
         reduced.packs,
@@ -4364,8 +4150,7 @@ export async function build({ configPath, update = false, compact = false }) {
         facetDictionaries.pack_objects,
         queryBundles?.packs || [],
         authority?.packs || [],
-        geoTrees?.packs || [],
-        suggest?.packs || []
+        geoTrees?.packs || []
       ),
       directories: {
         terms: reduced.directory,
@@ -4438,24 +4223,6 @@ export async function build({ configPath, update = false, compact = false }) {
           fields: vectors.fields
         }
       : null,
-    suggest: suggest
-      ? {
-          storage: suggest.storage,
-          compression: suggest.compression,
-          directory_format: suggest.directory_format,
-          page_format: suggest.page_format,
-          total: suggest.total,
-          surfaces: suggest.surfaces,
-          page_size: suggest.page_size,
-          pages: suggest.pages,
-          levels: suggest.levels,
-          branches: suggest.branches,
-          hot_prefixes: suggest.hot_prefixes,
-          directory: suggest.directory,
-          packs: suggest.packs.length,
-          pack_table: suggest.pack_table
-        }
-      : null,
     sort_replicas: sortReplicas,
     filter_bitmaps: {
       storage: filterBitmaps.storage,
@@ -4511,6 +4278,7 @@ export async function build({ configPath, update = false, compact = false }) {
       keys: authority.keys,
       rows: authority.rows,
       shards: authority.shards,
+      autocomplete: authority.autocomplete,
       directory: authority.directory,
       packs: authority.packs.length,
       stats: {
@@ -4692,6 +4460,11 @@ export async function build({ configPath, update = false, compact = false }) {
       authority_directory_bytes: authority?.directory_bytes || 0,
       authority_pack_files: authority?.packs.length || 0,
       authority_pack_bytes: authority?.pack_bytes || 0,
+      autocomplete_keys: authority?.autocomplete?.keys || 0,
+      autocomplete_rows: authority?.autocomplete?.rows || 0,
+      autocomplete_shards: authority?.autocomplete?.shards || 0,
+      autocomplete_hot_prefixes: authority?.autocomplete?.hot_prefixes || 0,
+      autocomplete_directory_bytes: authority?.autocomplete?.directory?.bytes || 0,
       scan_workers: scanWorkerCount(config),
       scan_batch_docs: scanBatchDocs(config),
       segment_merge_workers: 1,
@@ -4716,6 +4489,8 @@ export async function build({ configPath, update = false, compact = false }) {
       segment_merge_intermediate_bytes: reduced.mergePolicy?.intermediateBytes || 0,
       segment_merge_skipped_segments: reduced.mergePolicy?.skippedSegments || 0,
       segment_merge_blocked_by_temp_budget: Boolean(reduced.mergePolicy?.blockedByTempBudget),
+      segment_merge_blocked_by_directory_budget: Boolean(reduced.mergePolicy?.blockedByDirectoryBudget),
+      segment_merge_max_directory_bytes: reduced.mergePolicy?.maxDirectoryBytes || 0,
       segment_tier_merge_ms: Math.round(reduced.reduceTimings.segmentTierMergeMs || 0),
       segment_prefix_count_ms: Math.round(reduced.reduceTimings.segmentPrefixCountMs || 0),
       segment_partition_assembly_ms: Math.round(reduced.reduceTimings.segmentPartitionAssemblyMs || 0),

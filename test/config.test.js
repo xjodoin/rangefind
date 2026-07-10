@@ -19,7 +19,7 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.builderWorkerCount, 1);
   assert.equal(config.partitionReducerWorkers, 0);
   assert.equal(config.partitionReducerInFlightBytes, 1024 * 1024 * 1024);
-  assert.equal(config.authorityRunFlushRecords, 100000);
+  assert.equal(config.authorityRunFlushRecords, 5000);
   assert.equal(config.docPackSpoolPreloadMaxBytes, 256 * 1024 * 1024);
   assert.equal(config.docPackSpoolPreloadChunkBytes, 256 * 1024 * 1024);
   assert.equal(config.docPackSequentialReadBytes, 64 * 1024 * 1024);

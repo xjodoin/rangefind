@@ -2,9 +2,11 @@ import { AUTHORITY_SHARD_MAGIC, pushVarint, readVarint } from "./binary.js";
 import { foldMulti } from "./analysis_fold.js";
 import { DEFAULT_ANALYZER } from "./analysis.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
+import { autocompleteEntrySummary, isAutocompleteKey } from "./authority_lexicon.js";
 
-export const AUTHORITY_FORMAT = "rfauth-v1";
-const AUTHORITY_VERSION = 1;
+export const AUTHORITY_FORMAT = "rfauth-v2";
+const AUTHORITY_VERSION = 2;
+const AUTHORITY_LEGACY_VERSION = 1;
 const SURFACE_PREFIX = "r|";
 const EXACT_PREFIX = "x|";
 const TOKEN_PREFIX = "t|";
@@ -77,12 +79,18 @@ export function buildAuthorityShard(entries, options = {}) {
   pushVarint(out, entries.length);
   let previous = "";
   for (const [key, rows] of entries) {
+    const autocomplete = autocompleteEntrySummary(key, rows);
     const sorted = rows.slice().sort(compareRows);
     const kept = sorted.slice(0, maxRows);
     const prefix = commonPrefixLength(previous, key);
     pushVarint(out, prefix);
     pushUtf8(out, key.slice(prefix));
     pushVarint(out, rows.length);
+    if (autocomplete) {
+      pushVarint(out, autocomplete.weight);
+      previous = key;
+      continue;
+    }
     pushVarint(out, kept.length);
     for (const [doc, score] of kept) {
       pushVarint(out, doc);
@@ -98,7 +106,9 @@ export function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION) throw new Error(`Unsupported Rangefind authority shard version ${version}`);
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION) {
+    throw new Error(`Unsupported Rangefind authority shard version ${version}`);
+  }
   const count = readVarint(bytes, state);
   const entries = new Map();
   let previous = "";
@@ -107,11 +117,16 @@ export function parseAuthorityShard(buffer) {
     const suffix = readUtf8(bytes, state);
     const key = previous.slice(0, prefix) + suffix;
     const total = readVarint(bytes, state);
+    if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
+      entries.set(key, { total, complete: true, rows: [], autocompleteWeight: readVarint(bytes, state) });
+      previous = key;
+      continue;
+    }
     const rowCount = readVarint(bytes, state);
     const rows = new Array(rowCount);
     for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
     entries.set(key, { total, complete: total === rowCount, rows });
     previous = key;
   }
-  return { format: AUTHORITY_FORMAT, entries };
+  return { format: version === AUTHORITY_LEGACY_VERSION ? "rfauth-v1" : AUTHORITY_FORMAT, entries };
 }

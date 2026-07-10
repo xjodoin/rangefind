@@ -253,7 +253,7 @@ export class RangefindSearchElement extends HTMLElement {
     const hasAuthorityTitles = manifest?.authority?.fields?.length === 1
       && manifest.authority.fields[0].path === "title"
       && manifest.authority.fields[0].exact !== false;
-    return Boolean(manifest?.features?.suggest || manifest?.suggest || hasAuthorityTitles);
+    return Boolean(manifest?.features?.suggest || hasAuthorityTitles);
   }
 
   // --- Query flow -----------------------------------------------------------

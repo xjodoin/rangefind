@@ -97,7 +97,8 @@ export function parseIntAttr(value, fallback, { min = -Infinity, max = Infinity 
 }
 
 // The `suggest` attribute is tri-state: "auto" (default) enables autocomplete
-// only when the index actually ships a suggest sidecar; explicit true/false
+// only when the index actually ships an authority autocomplete lexicon;
+// explicit true/false
 // force it on/off.
 export function parseSuggestAttr(value) {
   if (value == null) return "auto";

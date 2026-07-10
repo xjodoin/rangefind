@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- **Unified authority autocomplete**: `suggest` fields now stream into bounded
+  authority runs and are encoded directly in `rfauth-v2` packs with exact
+  weights, counts, display strings, token suffixes, per-shard max-rank
+  proofs, and lazy one-character hot lists. This removes the scan-wide surface
+  map, the second writer-wide map, the `suggest/` pack family, suggestion
+  page/branch codecs, `manifest.suggest`, and the old runtime page lane. The
+  public `engine.suggest()` and build configuration remain unchanged; legacy
+  title-only `rfauth-v1` indexes retain a bounded compatibility path.
+
 ### Added
 
 - **Full-Wikipedia build path**: the wiki fixture can place its complete
@@ -9,8 +20,7 @@
   Wikimedia's ordered multistream shards, retry throttled downloads, preserve
   completed shard work across retries, and concatenate the result
   deterministically. The full English/French npm scripts use multistream
-  extraction and omit the optional suggestion sidecar to keep peak heap
-  bounded across millions of unique titles.
+  extraction and the bounded unified authority autocomplete path.
 
 - **Incremental publishing (Phases 3 & 4 — complete)**: every query lane now
   merges across generations. Sorted browse and text + sort merge by the real

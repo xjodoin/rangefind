@@ -173,7 +173,7 @@ The `output` directory is what you deploy. Key files:
 - `manifest.min.json` — the small manifest the runtime loads cold. (`manifest.json`
   is the full diagnostic manifest; `manifest.full.json` is a lazy sidecar.)
 - `terms/`, `docs/`, `doc-values/`, `facets/` — the core index.
-- `authority/`, `geo/`, `suggest/`, `vectors/`, `filter-bitmaps/` — sidecars,
+- `authority/`, `geo/`, `vectors/`, `filter-bitmaps/` — sidecars,
   present only when the corresponding config section is set.
 - `debug/build-telemetry.json` — phase timings and counters.
 
@@ -335,7 +335,7 @@ Accepts `true`/`false`/`1`/`0`/`"true"`/`"false"`.
 
 ### `authority`
 
-An exact title/entity/alias rescue sidecar, layered over BM25 so canonical
+An exact title/entity/alias rescue index, layered over BM25 so canonical
 labels win without distorting posting scores.
 
 ```json
@@ -346,11 +346,11 @@ labels win without distorting posting scores.
 - `weight` — base weight; `surfaceWeight` (default `2×exactWeight`),
   `exactWeight` (default `weight`), and `tokenWeight` (default `0.8×weight`)
   tune the diacritic-exact, folded-exact, and token match tiers.
-- If the index has exactly one authority field at path `title` and no
-  `suggest` sidecar, `engine.suggest()` reuses its folded exact-key shards for
-  bounded, exact title-prefix autocomplete. This avoids duplicating millions
-  of titles during a large build. It does not provide custom popularity
-  weighting or mid-label token completion.
+- `suggest` fields share the authority run/reduce pipeline and packs. The
+  emitted `rfauth-v2` autocomplete namespace carries display text, counts, and
+  weights without duplicating a scan-wide title map or separate pack family.
+- Older title-only `rfauth-v1` indexes remain available through a bounded
+  lexicographic fallback.
 
 ### `geo`
 
@@ -369,7 +369,7 @@ Tuning: `geoLeafSize` (default `512` points/leaf), `geoPackBytes`.
 
 ### `suggest`
 
-Search-as-you-type autocomplete sidecar. See
+Search-as-you-type configuration for the unified authority lexicon. See
 [`suggest-benchmarks.md`](suggest-benchmarks.md).
 
 ```json
@@ -377,14 +377,15 @@ Search-as-you-type autocomplete sidecar. See
 ```
 
 - `path` — dotted path to the surface text (arrays produce multiple surfaces).
-- `weightPath` — optional numeric ranking weight; falls back to popularity
-  (number of documents sharing the surface).
+- `weightPath` — optional numeric ranking weight. Without it, direct surface
+  prefixes rank before token-suffix matches, followed by popularity (number of
+  documents sharing the surface) and concise-label tie breaks.
 - `tokenPrefixes` — default `true`; emit mid-label token keys so "eiffel"
   completes "Tour Eiffel".
 
-Tuning: `suggestPageSize` (`256`), `suggestBranchPages` (`256`),
-`suggestMaxTokenKeys` (`4`), `suggestHotListSize` (`64`),
-`suggestMinKeyLength` (`1`), `suggestPackBytes`.
+Tuning: `suggestMaxTokenKeys` (`4`), `suggestHotListSize` (`64`), and
+`suggestMinKeyLength` (`1`). Authority pack, shard, directory, and run-buffer
+settings control the shared physical layout.
 
 ### `vectors`
 
@@ -440,7 +441,7 @@ production `static-large` profile; you rarely need to change these.
 | `scanBatchDocs` | `128` | Documents per worker batch. |
 | `partitionReducerInFlightBytes` | `1 GiB` | Backpressure budget for the reducer. |
 | `builderMemoryBudgetBytes` | `0` | Advisory memory budget (0 = unbounded). |
-| `authorityRunFlushRecords` | `100000` | Max buffered authority rows before they are appended to external runs. |
+| `authorityRunFlushRecords` | `5000` | Max buffered authority and autocomplete rows before they are appended to external runs. |
 | `docPackSpoolPreloadMaxBytes` | `256 MiB` | Largest compressed document spool preloaded into RAM during final packing. |
 | `docPackSpoolPreloadChunkBytes` | `256 MiB` | Buffer size used to preload large document spools without Node's 2 GiB single-buffer limit. |
 | `docLayoutStrategy` | `locality` | `locality` clusters related result payloads; `doc-id` uses bounded sequential packing for very large or slow-volume builds. |
@@ -467,7 +468,9 @@ production `static-large` profile; you rarely need to change these.
 
 `segmentMaxPostings` (`250000`), `segmentMaxBytes` (`64 MiB`),
 `segmentMergePolicy` (`tiered-log`), `segmentMergeFanIn` (`128`),
-`segmentMergeMaxTempBytes` (`512 MiB`), `finalSegmentTargetCount` (`0` = auto).
+`segmentMergeMaxTempBytes` (`512 MiB`), `segmentMergeMaxDirectoryBytes`
+(`64 MiB`), `finalSegmentTargetCount` (`0` = auto). The directory-byte
+budget bounds decoded term metadata even when a very high fan-in is selected.
 
 ### Documents and doc-values
 
@@ -537,7 +540,6 @@ the overfetch limits. Keys and defaults:
 | `postingBlocks` | 256 KB | 512 KB (maxMerged 1 MB) |
 | `postingBlockFrontier` / `postingDocRanges` | 512 KB | 1 MB (maxMerged 2 MB) |
 | `geoLeafPages` | 64 KB | 64 KB |
-| `suggestPages` | 32 KB | 32 KB |
 | `vectorClusterPages` | 64 KB | 64 KB |
 | `vectorRefine` | 16 KB | 32 KB (ratio 8) |
 
@@ -634,8 +636,8 @@ Notable fields:
 - Geo: `geoLane` (`browse` | `nearest` | `nearestText` | `textDocSet` |
   `textDocValues`), `geoCandidateLeaves`, `geoLeavesVisited`,
   `geoPointsScanned`, `geoPointsAccepted`.
-- Suggest: `suggestLane` (`hot` | `range` | `authority-title`),
-  `suggestPagesVisited` or `suggestShardsVisited`, and
+- Suggest: `suggestLane` (`authority-hot` | `authority-lexicon` |
+  `authority-title` for old indexes), `suggestShardsVisited`, and
   `suggestEntriesScanned`.
 - Facet counts: `facetCountLane` (`dictionary` | `text-match-set` |
   `chunk-scan` | `global-fallback`).
@@ -679,7 +681,7 @@ All optional except `src`.
 | `debounce` | `150` | Debounce in ms before searching (0–5000). |
 | `min-length` | `1` | Minimum query length before searching. |
 | `highlight` | on | `<mark>` matched terms. `highlight="false"` disables. |
-| `suggest` | `auto` | Autocomplete. `auto` = on iff the index has a suggest sidecar or one reusable `title` authority field; `true`/`false` force it. |
+| `suggest` | `auto` | Autocomplete. `auto` = on iff the authority index has an autocomplete lexicon or one reusable legacy `title` field; `true`/`false` force it. |
 | `router` | off | Sync `?q=` to the URL (`history.replaceState`) and seed from it on load. |
 | `open-on-focus` | off | Reopen results when the input regains focus. |
 | `hotkey` | off | Press `/` anywhere (outside inputs) to focus the box. |

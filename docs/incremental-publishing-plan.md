@@ -101,7 +101,7 @@ totals), and a tombstone set.
   until compaction. Acceptable and self-healing.
 - Facet dictionaries assign codes per generation; cross-generation count
   merging must go through values, not codes.
-- The suggest sidecar's popularity weights and the vector index's centroids
+- The authority lexicon's autocomplete weights and the vector index's centroids
   are trained per generation; quality degrades gracefully and compaction
   restores it.
 

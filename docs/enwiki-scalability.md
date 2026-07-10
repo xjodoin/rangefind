@@ -30,20 +30,32 @@ changes could be measured without redownloading or rescanning the corpus.
 
 | Phase | Time | Peak RSS / note |
 | --- | ---: | --- |
-| Measure | 6m12s | 2.83 GiB |
-| Scan and spool | 12m21s | 6.21 GiB before the authority-buffer fix |
-| Reduce postings, gzip level 3 | 30m33s | 6.25 GiB |
-| Segment manifest | 25s | — |
-| Authority | 2m01s | about 3 GiB |
-| Document packs, sequential doc-id | 1m34s | bounded 64 MiB read windows |
-| Document pages | 41s | — |
-| Doc values + sorted doc values | 37s | — |
+| Measure | 5m24s | 2.82 GiB |
+| Scan and spool with unified autocomplete | 14m35s | 4.20 GiB |
+| Reduce postings, gzip level 3 | 30m42s | 6.10 GiB RSS, about 2.1–2.5 GiB V8 heap |
+| Segment manifest | 15–24s | — |
+| Authority + autocomplete | 4m17s–4m55s | 2.86 GiB first pass; 1.47 GiB resumed pass |
+| Document packs, sequential doc-id | 1m44s–1m47s | bounded 64 MiB read windows |
+| Document pages | 33s–47s | — |
+| Doc values + sorted doc values | 36s–38s | — |
 | ID map + filters + facet dictionaries | 21s | — |
 
 The initial level-6 reducer took 43m08s. Level 3 reduced that to 30m33s
 (29% faster) while term-pack bytes increased 6.2%; external block bytes were
 effectively unchanged. Auto block codecs saved 544 MiB relative to the
 pair-varint baseline.
+
+The unified scan emits 18.95 million autocomplete rows in the same pass, so it
+takes 2m14s longer than the former authority-only scan. Its peak RSS is 4.20
+GiB, 32% below the former 6.21 GiB peak, because autocomplete records flush to
+external runs every 5,000 rows instead of accumulating a corpus-sized map.
+
+A fresh reducer run exposed a second scale boundary: opening 512 compact term
+directories together inflated 457 MiB of binary metadata into roughly 4 GiB
+of V8 objects. Merge admission is now bounded independently by encoded
+directory bytes (64 MiB by default). The resumed reducer completed in 30m42s,
+within nine seconds of the previous baseline, with identical 758.5 MiB term
+packs and 292.4 MiB external blocks and without increasing Node's heap limit.
 
 Locality-ordered document packing was unsuitable for this slow external-volume
 path: millions of small random reads produced less than 1 MiB/s and projected
@@ -75,24 +87,38 @@ postings in 13.4 seconds. The 128-block lane kept the same top result in about
 
 ## Full-corpus autocomplete and typo recovery
 
-The full build intentionally omitted the dedicated suggestion sidecar. The
-runtime now reuses the existing 21.1-million-key title authority index for
-prefix completion, avoiding a second multi-million-title map during the scan
-and a duplicate on-disk autocomplete structure. A cold local request reads the
-contiguous authority shard range, stops after eight equal-weight title keys,
-and hydrates only those documents.
+The published build uses `rfauth-v2` and has no `suggest/` directory,
+`manifest.suggest` branch, suggestion pack table, or suggestion page codecs.
+Autocomplete lives in the authority packs as compact terminal summaries:
 
-| Prefix | Time | Authority shards | First suggestion |
-| --- | ---: | ---: | --- |
-| `m` | 30 ms | 2 | M |
-| `mach` | 17 ms | 4 | Mach 1 |
-| `artificial int` | 20 ms | 3 | Artificial intelligence |
-| `cafe` | 17 ms | 3 | @Cafe |
+| Metric | Result |
+| --- | ---: |
+| Autocomplete keys | 18,717,147 |
+| Source rows | 18,948,931 |
+| Autocomplete authority shards | 56,066 |
+| Referenced authority pack bytes (all authority lanes) | 424.1 MiB |
+| Lexicon root | 177 KiB compressed |
+| One-character hot lists | 479 prefixes, 50 KiB total |
 
-Each trace visited two small directory pages and scanned exactly eight matching
-entries. The lane is exact for the single configured title authority field;
-the richer suggestion sidecar is still appropriate for custom popularity
-weights or mid-title token completion.
+Cold local traces reset Rangefind's caches before each request. Bytes exclude
+the manifest opened while creating the engine but include the lexicon root,
+authority directory data, and exact shard ranges.
+
+| Prefix | Time | Bytes | Shards | First suggestion |
+| --- | ---: | ---: | ---: | --- |
+| `m` | 20 ms | 177 KiB | hot list | Ma' |
+| `mach` | 49 ms | 417 KiB | 7 / 24 candidates | Macham |
+| `artificial int` | 16 ms | 371 KiB | 1 | Artificial intimacy |
+| `cafe` | 20 ms | 383 KiB | 1 | Café Frascati |
+| `modern app` | 25 ms | 392 KiB | 1 | Artificial Intelligence: A Modern Approach |
+| `mechanical scattering` | 18 ms | 399 KiB | 1 | Quantum mechanical scattering of photon and nucleus |
+
+Unweighted indexes rank direct surface prefixes ahead of token-suffix matches;
+within each class they keep duplicate-count popularity and prefer concise
+labels. Weighted indexes keep the configured weight as the primary signal.
+The root stores the same composite rank per shard, so best-first traversal still
+has an exact stop proof. The last two traces prove mid-title recall without a
+second suggestion index.
 
 A full-corpus collision case also exposed a typo-planning weakness:
 `artificial inteligence` had zero joint hits even though the rare misspelling
@@ -105,6 +131,10 @@ recovery now probes tokens in ascending document-frequency order, producing
 
 - Auto-codec sampling could loop forever after seeding both endpoints.
 - Authority rows referenced a removed flush option and accumulated in heap.
+- A 512-way tier merge decoded 457 MiB of compact term directories into enough
+  JavaScript objects to exhaust V8; directory-byte admission now bounds it.
+- Scan checkpoints duplicated 67.7 MiB of facet dictionaries already stored in
+  the measure checkpoint; resumed builds now reattach only the canonical copy.
 - External document-layout merge scanned every reader for every document.
 - Single-buffer document preload failed above Node's 2 GiB Buffer limit.
 - Short shard keys padded with `_` collided with real underscore expansion
@@ -113,8 +143,9 @@ recovery now probes tokens in ascending document-frequency order, producing
 - Extraction and JSONL prefix writes ignored stream backpressure.
 - Zero-hit typo recovery could exhaust its shard budget on a common first token
   before examining a rare, valid-but-conflicting misspelling.
-- Building a second full-title suggestion map was unnecessary: the sorted title
-  authority keys now provide bounded prefix autocomplete directly.
+- Building a second full-title suggestion map was unnecessary: autocomplete
+  terminals, shard maxima, and hot lists now share the authority reducer and
+  packs while preserving weighted and token-suffix completion.
 
 The full external artifact is under
 `/Volumes/RangefindWiki/rangefind/enwiki-full`; the served index is under its

@@ -51,6 +51,9 @@ rangefind/
       0000.<hash>.bin
       0001.<hash>.bin
   authority/
+    lexicon-root.<hash>.bin.gz
+    hot/
+      <hash>.bin.gz
     directory-root.<hash>.bin.gz
     directory-pages/
       0000.<hash>.bin.gz
@@ -59,10 +62,6 @@ rangefind/
   geo/
     location.<hash>.bin.gz
     point-packs/
-      0000.<hash>.bin
-  suggest/
-    root.<hash>.bin.gz
-    packs/
       0000.<hash>.bin
 ```
 
@@ -211,10 +210,12 @@ Segment merging uses an explicit `tiered-log` policy. Segments are ordered by
 size, similarly sized batches are merged up to `segmentMergeFanIn`, and
 `finalSegmentTargetCount` can request an optional force merge down to a target
 count such as `1`. `segmentMergeMaxTempBytes` can block oversized merge batches;
-blocked tiers are recorded instead of silently exceeding the temp budget. The
-build telemetry and segment manifest record the merge target, skipped segment
-count, intermediate bytes, write amplification, and whether a temp budget
-prevented the requested target from being reached.
+`segmentMergeMaxDirectoryBytes` independently caps the compact term-directory
+bytes admitted to a batch because those rows expand into strings and objects
+while merging. Blocked tiers are recorded instead of silently exceeding either
+budget. The build telemetry and segment manifest record the merge target,
+skipped segment count, intermediate bytes, write amplification, and whether a
+budget prevented the requested target from being reached.
 
 Term pack assembly uses the same append-only direction. As posting partitions
 are compressed into `terms/packs/*.bin`, the builder writes compact binary
@@ -296,7 +297,7 @@ observable before the final telemetry file exists.
 Authority fields use the same file-backed run/reduce pattern as postings. Each
 configured title, entity-name, slug, or alias value emits surface-exact,
 folded-exact, and token authority keys into temporary run files. The reducer
-writes `rfauth-v1` shards into immutable `authority/packs/*.bin` objects and a
+writes `rfauth-v2` shards into immutable `authority/packs/*.bin` objects and a
 paged range directory. Authority has its own shard budget
 (`authorityTargetShardRows`) and deeper max shard depth
 (`authorityMaxShardDepth`) and smaller directory pages
@@ -409,45 +410,37 @@ Point-to-box minimum and maximum spherical distances are exact (including
 antimeridian wrap, facing-away meridians, and antipodal interiors), so radius
 pruning and containment proofs never drop a matching document.
 
-## Suggestion Sidecar
+## Unified Authority Autocomplete
 
-`suggest` config fields build a search-as-you-type sidecar keyed by
-diacritic-folded, punctuation-collapsed surfaces (every script preserved).
-Each surface also emits token-suffix keys so "eiffel" completes to "Tour
-Eiffel". Duplicate surfaces aggregate during the scan — inside each scan
-worker per batch, then once on the main thread — so builder cost stays a
-single pass and the spooled row count is the number of unique surfaces, not
-documents.
+`suggest` config fields feed an autocomplete namespace inside the authority
+run/reduce pipeline. Diacritic-folded, punctuation-collapsed full surfaces and
+token suffixes are written directly to bounded external runs; no scan-wide map
+of unique surfaces exists. The authority reducer aggregates document counts
+and maximum explicit weights while writing the same `authority/packs/*.bin`
+objects used for canonical-label rescue.
 
-The on-disk layout mirrors the other sidecars: suggestion entries sorted by
-key are packed into gzip-member pages (front-coded keys, display text,
-weight, count) with a root directory of per-page `minKey` + `maxWeight`
-summaries, branch-paged above a size threshold like the geo tree.
+Autocomplete entries in `rfauth-v2` store display text, count, and final weight
+without document rows. A compact `rflexicon-v1` root records only each relevant
+authority shard's maximum composite rank and entry count. Per-character hot lists are
+small immutable objects under `authority/hot/`, fetched only for a
+single-character query; they do not inflate every cold prefix request.
 
-Query execution is exact top-k:
+Query execution remains exact top-k:
 
-- The prefix maps to one contiguous run of candidate pages (two binary
-  searches over `minKey`s).
-- Candidates are visited best-first by `maxWeight`; traversal stops when the
-  current k-th suggestion outweighs every unvisited page's maximum — the
-  same block-max proof the posting scheduler uses.
-- Results are deduplicated by display text; ranking is weight (explicit
-  `weightPath` or document popularity), then key, then text.
-- Single-character prefixes — the widest ranges and the first keystroke of
-  every session — are answered from precomputed per-character hot pages: one
-  small fetch, already ranked and deduplicated.
+- A prefix selects authority leaf shards by their trie prefixes, including
+  recursively split hot shards.
+- Shards are visited best-first by `maxRank`; traversal stops only when the
+  current k-th result strictly outranks every unvisited shard maximum.
+- Results are deduplicated by display text. Weighted indexes rank by
+  `weightPath`, while unweighted indexes prefer direct surface prefixes before
+  token suffixes; popularity, concise display text, and normalized key provide
+  deterministic lower-order signals.
+- Single-character prefixes use their precomputed authority hot list, avoiding
+  the widest shard traversal.
 
-Deeper keystrokes narrow the same key range, so they usually hit pages the
-session already cached and cost zero requests.
-
-When an index omits this sidecar but has exactly one `title` authority field,
-the runtime uses the authority index's folded exact keys as a zero-duplication
-fallback. It binary-searches the authority directory for the prefix's
-contiguous leaf-shard range, stops after the first `k` equal-weight title keys,
-and hydrates only those documents. Recursive hot-shard splits are handled by
-the same range walk, so the builder never needs a global in-memory title map
-for full-corpus prefix completion. The dedicated sidecar remains the richer
-lane for weighted ranking and mid-label token prefixes.
+Old `rfauth-v1` title-only indexes remain readable through the bounded
+lexicographic fallback, but new builders never emit `suggest/` artifacts or a
+`manifest.suggest` branch.
 
 ## Vector Index
 

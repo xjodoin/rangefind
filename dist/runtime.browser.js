@@ -1879,12 +1879,11 @@ var DOC_VALUE_SORT_DIRECTORY_MAGIC = [82, 70, 68, 84];
 var DOC_VALUE_SORT_PAGE_MAGIC = [82, 70, 68, 86];
 var QUERY_BUNDLE_MAGIC = [82, 70, 81, 66];
 var AUTHORITY_SHARD_MAGIC = [82, 70, 65, 85];
+var AUTHORITY_LEXICON_MAGIC = [82, 70, 76, 88];
+var AUTHORITY_HOT_MAGIC = [82, 70, 76, 72];
 var GEO_TREE_ROOT_MAGIC = [82, 70, 71, 82];
 var GEO_BRANCH_PAGE_MAGIC = [82, 70, 71, 66];
 var GEO_LEAF_PAGE_MAGIC = [82, 70, 71, 76];
-var SUGGEST_ROOT_MAGIC = [82, 70, 83, 82];
-var SUGGEST_BRANCH_PAGE_MAGIC = [82, 70, 83, 66];
-var SUGGEST_PAGE_MAGIC = [82, 70, 83, 71];
 var VECTOR_ROOT_MAGIC = [82, 70, 86, 82];
 var VECTOR_CLUSTER_PAGE_MAGIC = [82, 70, 86, 67];
 function readVarint(bytes, state) {
@@ -2499,9 +2498,95 @@ function parseFacetDictionary(buffer) {
   return values;
 }
 
+// src/authority_lexicon.js
+var AUTHORITY_LEXICON_FORMAT = "rflexicon-v1";
+var AUTOCOMPLETE_PREFIX = "s|";
+var AUTOCOMPLETE_SEPARATOR = "\0";
+var AUTHORITY_LEXICON_VERSION = 1;
+var UNWEIGHTED_SURFACE_BONUS = 2 ** 32;
+function suggestKey(value) {
+  return foldMulti(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
+}
+function isAutocompleteKey(key) {
+  return String(key || "").startsWith(AUTOCOMPLETE_PREFIX);
+}
+function parseAutocompleteKey(key) {
+  if (!isAutocompleteKey(key)) return null;
+  const separator = key.indexOf(AUTOCOMPLETE_SEPARATOR, AUTOCOMPLETE_PREFIX.length);
+  if (separator < 0) return null;
+  return {
+    normalized: key.slice(AUTOCOMPLETE_PREFIX.length, separator),
+    display: key.slice(separator + AUTOCOMPLETE_SEPARATOR.length)
+  };
+}
+function autocompleteRank(item, weighted = false) {
+  const weight = Math.max(0, Math.floor(Number(item.weight) || 0));
+  const full = item.full ?? suggestKey(item.display) === item.normalized;
+  return weighted ? Math.min(Number.MAX_SAFE_INTEGER, weight * 2 + (full ? 1 : 0)) : (full ? UNWEIGHTED_SURFACE_BONUS : 0) + Math.min(UNWEIGHTED_SURFACE_BONUS - 1, weight);
+}
+function compareAutocomplete(left, right) {
+  return (right.rank ?? right.weight) - (left.rank ?? left.weight) || Array.from(left.display).length - Array.from(right.display).length || (left.normalized < right.normalized ? -1 : left.normalized > right.normalized ? 1 : 0) || (left.display < right.display ? -1 : left.display > right.display ? 1 : 0);
+}
+function readFrontCoded(bytes, state, previous) {
+  const prefix = readVarint(bytes, state);
+  return previous.slice(0, prefix) + readUtf8(bytes, state);
+}
+function parseAuthorityLexiconRoot(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, AUTHORITY_LEXICON_MAGIC, "Unsupported Rangefind authority lexicon root");
+  const state = { pos: AUTHORITY_LEXICON_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority lexicon root version ${version}`);
+  const weighted = readVarint(bytes, state) === 1;
+  const shardCount = readVarint(bytes, state);
+  const shards = new Array(shardCount);
+  let previousShard = "";
+  for (let index = 0; index < shardCount; index++) {
+    const shard = readFrontCoded(bytes, state, previousShard);
+    shards[index] = {
+      shard,
+      maxRank: readVarint(bytes, state),
+      count: readVarint(bytes, state)
+    };
+    previousShard = shard;
+  }
+  const hotCount = readVarint(bytes, state);
+  const hot = /* @__PURE__ */ new Map();
+  for (let index = 0; index < hotCount; index++) {
+    const prefix = readUtf8(bytes, state);
+    hot.set(prefix, {
+      file: readUtf8(bytes, state),
+      bytes: readVarint(bytes, state),
+      count: readVarint(bytes, state)
+    });
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind authority lexicon root has trailing bytes.");
+  return { format: AUTHORITY_LEXICON_FORMAT, weighted, shards, hot };
+}
+function parseAuthorityHotList(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
+  const state = { pos: AUTHORITY_HOT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  const count = readVarint(bytes, state);
+  const entries = new Array(count);
+  for (let index = 0; index < count; index++) {
+    entries[index] = {
+      normalized: readUtf8(bytes, state),
+      display: readUtf8(bytes, state),
+      weight: readVarint(bytes, state),
+      count: readVarint(bytes, state)
+    };
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind authority hot list has trailing bytes.");
+  return entries;
+}
+
 // src/authority_codec.js
-var AUTHORITY_FORMAT = "rfauth-v1";
-var AUTHORITY_VERSION = 1;
+var AUTHORITY_FORMAT = "rfauth-v2";
+var AUTHORITY_VERSION = 2;
+var AUTHORITY_LEGACY_VERSION = 1;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
@@ -2543,7 +2628,9 @@ function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION) throw new Error(`Unsupported Rangefind authority shard version ${version}`);
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION) {
+    throw new Error(`Unsupported Rangefind authority shard version ${version}`);
+  }
   const count = readVarint(bytes, state);
   const entries = /* @__PURE__ */ new Map();
   let previous = "";
@@ -2552,13 +2639,18 @@ function parseAuthorityShard(buffer) {
     const suffix = readUtf8(bytes, state);
     const key = previous.slice(0, prefix) + suffix;
     const total = readVarint(bytes, state);
+    if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
+      entries.set(key, { total, complete: true, rows: [], autocompleteWeight: readVarint(bytes, state) });
+      previous = key;
+      continue;
+    }
     const rowCount = readVarint(bytes, state);
     const rows = new Array(rowCount);
     for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
     entries.set(key, { total, complete: total === rowCount, rows });
     previous = key;
   }
-  return { format: AUTHORITY_FORMAT, entries };
+  return { format: version === AUTHORITY_LEGACY_VERSION ? "rfauth-v1" : AUTHORITY_FORMAT, entries };
 }
 
 // src/directory.js
@@ -3402,147 +3494,6 @@ function parseVectorRoot(buffer) {
   };
 }
 
-// src/suggest_index.js
-var SUGGEST_ROOT_FORMAT = "rfsuggestroot-v1";
-var SUGGEST_PAGE_FORMAT = "rfsuggestpage-v1";
-var FORMAT_VERSION4 = 1;
-var FLAG_DISPLAY_EQUALS_KEY = 1;
-function suggestKey(value) {
-  return foldMulti(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
-}
-function decodeSuggestPage(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, SUGGEST_PAGE_MAGIC, "Unsupported Rangefind suggest page");
-  const state = { pos: SUGGEST_PAGE_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest page version ${version}`);
-  const count = readVarint(bytes, state);
-  const entries = new Array(count);
-  let previousKey = "";
-  for (let i = 0; i < count; i++) {
-    const lcp = readVarint(bytes, state);
-    const key = previousKey.slice(0, lcp) + readUtf8(bytes, state);
-    const flags = bytes[state.pos++];
-    const display = flags & FLAG_DISPLAY_EQUALS_KEY ? key : readUtf8(bytes, state);
-    const weight = readVarint(bytes, state);
-    const entryCount = readVarint(bytes, state);
-    entries[i] = { key, display, weight, count: entryCount };
-    previousKey = key;
-  }
-  if (state.pos !== bytes.length) throw new Error("Rangefind suggest page has trailing bytes.");
-  return { count, entries };
-}
-function readObjectPointer3(bytes, state, packTable, target) {
-  const packIndex = readVarint(bytes, state);
-  target.pack = packTable[packIndex];
-  target.offset = readVarint(bytes, state);
-  target.length = readVarint(bytes, state);
-  target.physicalLength = readVarint(bytes, state);
-  target.logicalLength = readVarint(bytes, state) || null;
-  const algorithm = readUtf8(bytes, state);
-  const value = readUtf8(bytes, state);
-  target.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
-  return target;
-}
-function readPageSummary(bytes, state, packTable, previousMinKey, index) {
-  const lcp = readVarint(bytes, state);
-  const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
-  const maxWeight = readVarint(bytes, state);
-  const count = readVarint(bytes, state);
-  return readObjectPointer3(bytes, state, packTable, { index, minKey, maxWeight, count });
-}
-function parseSuggestRoot(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, SUGGEST_ROOT_MAGIC, "Unsupported Rangefind suggest root");
-  const state = { pos: SUGGEST_ROOT_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest root version ${version}`);
-  const total = readVarint(bytes, state);
-  const pageSize = readVarint(bytes, state);
-  const pageCount = readVarint(bytes, state);
-  const packCount = readVarint(bytes, state);
-  const packTable = new Array(packCount);
-  for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
-  const levels = bytes[state.pos++];
-  const root = {
-    format: SUGGEST_ROOT_FORMAT,
-    pageFormat: SUGGEST_PAGE_FORMAT,
-    total,
-    pageSize,
-    pageCount,
-    levels,
-    packTable,
-    pages: null,
-    branches: null
-  };
-  if (levels === 1) {
-    const count = readVarint(bytes, state);
-    const pages = new Array(count);
-    let previousMinKey = "";
-    for (let i = 0; i < count; i++) {
-      pages[i] = readPageSummary(bytes, state, packTable, previousMinKey, i);
-      previousMinKey = pages[i].minKey;
-    }
-    root.pages = pages;
-  } else if (levels === 2) {
-    const count = readVarint(bytes, state);
-    const branches = new Array(count);
-    let previousMinKey = "";
-    for (let i = 0; i < count; i++) {
-      const lcp = readVarint(bytes, state);
-      const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
-      const maxWeight = readVarint(bytes, state);
-      const branchCount = readVarint(bytes, state);
-      const firstPageIndex = readVarint(bytes, state);
-      const branchPageCount = readVarint(bytes, state);
-      branches[i] = readObjectPointer3(bytes, state, packTable, {
-        index: i,
-        minKey,
-        maxWeight,
-        count: branchCount,
-        firstPageIndex,
-        pageCount: branchPageCount
-      });
-      previousMinKey = minKey;
-    }
-    root.branches = branches;
-  } else {
-    throw new Error(`Unsupported Rangefind suggest root levels ${levels}`);
-  }
-  const hotCount = readVarint(bytes, state);
-  const hot = /* @__PURE__ */ new Map();
-  for (let i = 0; i < hotCount; i++) {
-    const prefix = readUtf8(bytes, state);
-    const count = readVarint(bytes, state);
-    hot.set(prefix, readObjectPointer3(bytes, state, packTable, {
-      index: pageCount + i,
-      prefix,
-      count
-    }));
-  }
-  root.hot = hot;
-  if (state.pos !== bytes.length) throw new Error("Rangefind suggest root has trailing bytes.");
-  return root;
-}
-function decodeSuggestBranchPage(buffer, packTable) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, SUGGEST_BRANCH_PAGE_MAGIC, "Unsupported Rangefind suggest branch page");
-  const state = { pos: SUGGEST_BRANCH_PAGE_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest branch page version ${version}`);
-  const branchIndex = readVarint(bytes, state);
-  const firstPageIndex = readVarint(bytes, state);
-  const count = readVarint(bytes, state);
-  const pages = new Array(count);
-  let previousMinKey = "";
-  for (let i = 0; i < count; i++) {
-    pages[i] = readPageSummary(bytes, state, packTable, previousMinKey, firstPageIndex + i);
-    previousMinKey = pages[i].minKey;
-  }
-  if (state.pos !== bytes.length) throw new Error("Rangefind suggest branch page has trailing bytes.");
-  return { branchIndex, firstPageIndex, pages };
-}
-
 // src/filter_bitmaps.js
 var FILTER_BITMAP_MAGIC = [82, 70, 66, 77];
 var FILTER_BITMAP_FORMAT = "rffilterbitmap-v1";
@@ -3995,6 +3946,8 @@ function traceBucketFromPath(path) {
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/authority/packs/")) return "authority";
+  if (path.includes("/authority/lexicon-root.")) return "authorityLexicon";
+  if (path.includes("/authority/hot/")) return "authorityHot";
   if (path.includes("/sort-replicas/")) return "sortReplicas";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
@@ -4180,9 +4133,8 @@ async function createSearch(options = {}) {
   const geoTreeRootCache = /* @__PURE__ */ new Map();
   const geoBranchPageCache = /* @__PURE__ */ new Map();
   const geoLeafPageCache = /* @__PURE__ */ new Map();
-  let suggestRootPromise = null;
-  const suggestPageCache = /* @__PURE__ */ new Map();
-  const suggestBranchPageCache = /* @__PURE__ */ new Map();
+  let authorityLexiconRootPromise = null;
+  const authorityHotCache = /* @__PURE__ */ new Map();
   const vectorRootCache = /* @__PURE__ */ new Map();
   const vectorClusterPageCache = /* @__PURE__ */ new Map();
   const sortReplicaDirectoryCache = /* @__PURE__ */ new Map();
@@ -4233,7 +4185,6 @@ async function createSearch(options = {}) {
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     geoLeafPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
-    suggestPages: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     vectorClusterPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     vectorRefine: { mergeGapBytes: 16 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: 8 },
     ...options.rangePlans || {}
@@ -4702,42 +4653,25 @@ async function createSearch(options = {}) {
       stats
     });
   }
-  async function loadSuggestRoot() {
-    const meta = manifest.suggest;
+  async function loadAuthorityLexiconRoot() {
+    const meta = manifest.authority?.autocomplete;
     if (!meta?.directory?.file) return null;
-    if (!suggestRootPromise) {
-      suggestRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseSuggestRoot);
-      suggestRootPromise.catch(() => {
-        suggestRootPromise = null;
+    if (!authorityLexiconRootPromise) {
+      authorityLexiconRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseAuthorityLexiconRoot);
+      authorityLexiconRootPromise.catch(() => {
+        authorityLexiconRootPromise = null;
       });
     }
-    return suggestRootPromise;
+    return authorityLexiconRootPromise;
   }
-  async function loadSuggestPages(root, pages, stats = null) {
-    return loadPackedPages({
-      field: "suggest",
-      entries: pages,
-      cache: suggestPageCache,
-      cacheKey: (field, index) => `${field} ${index}`,
-      decode: decodeSuggestPage,
-      label: "suggest page",
-      packDir: "suggest/packs",
-      rangePlan: "suggestPages",
-      stats
-    });
-  }
-  async function loadSuggestBranchPages(root, branches, stats = null) {
-    return loadPackedPages({
-      field: "suggest",
-      entries: branches,
-      cache: suggestBranchPageCache,
-      cacheKey: (field, index) => `${field} branch ${index}`,
-      decode: (inflated) => decodeSuggestBranchPage(inflated, root.packTable),
-      label: "suggest branch page",
-      packDir: "suggest/packs",
-      rangePlan: "suggestPages",
-      stats
-    });
+  async function loadAuthorityHotList(prefix, entry) {
+    if (!entry?.file) return [];
+    if (!authorityHotCache.has(prefix)) {
+      const promise = fetchGzipArrayBuffer(new URL(entry.file, baseUrl)).then(parseAuthorityHotList);
+      promise.catch(() => authorityHotCache.delete(prefix));
+      authorityHotCache.set(prefix, promise);
+    }
+    return authorityHotCache.get(prefix);
   }
   async function loadGeoLeafPages(field, leaves, stats = null) {
     return loadGeoPages(
@@ -9838,34 +9772,13 @@ async function createSearch(options = {}) {
       }
     };
   }
-  function suggestCandidateRun(summaries, prefix, upper) {
-    if (!summaries?.length) return [];
-    let lo = 0;
-    let hi = summaries.length;
-    while (lo < hi) {
-      const mid = lo + hi >> 1;
-      if (summaries[mid].minKey < prefix) lo = mid + 1;
-      else hi = mid;
-    }
-    const start = Math.max(0, lo - 1);
-    let lo2 = start;
-    let hi2 = summaries.length;
-    while (lo2 < hi2) {
-      const mid = lo2 + hi2 >> 1;
-      if (summaries[mid].minKey <= upper) lo2 = mid + 1;
-      else hi2 = mid;
-    }
-    const end = lo2 - 1;
-    if (end < start) return [];
-    return summaries.slice(start, end + 1);
-  }
   function authoritySuggestField() {
     const fields = (manifest.authority?.fields || []).filter((field2) => field2.exact !== false);
     if (fields.length !== 1) return null;
     const field = fields[0];
     return field.path === "title" ? field : null;
   }
-  async function executeAuthoritySuggest(params, q, prefix, size) {
+  async function executeLegacyAuthoritySuggest(params, q, prefix, size) {
     const field = authoritySuggestField();
     if (!authorityDirectory || options.authority === false || !field) return null;
     const keyPrefix = `x|${prefix}`;
@@ -9917,108 +9830,109 @@ async function createSearch(options = {}) {
       }
     };
   }
+  function lexiconCandidateShards(shards, prefix) {
+    return (shards || []).filter((item) => prefix.startsWith(item.shard) || item.shard.startsWith(prefix));
+  }
+  function mergeAutocompleteCandidate(best, item) {
+    const previous = best.get(item.display);
+    if (!previous || compareAutocomplete(item, previous) < 0) best.set(item.display, item);
+  }
+  async function executeLexiconSuggest(q, prefix, size, root) {
+    const codepoints = Array.from(prefix);
+    if (codepoints.length === 1 && root.hot?.size) {
+      const hotEntry = root.hot.get(codepoints[0]);
+      if (!hotEntry || size <= hotEntry.count) {
+        const hot = hotEntry ? await loadAuthorityHotList(codepoints[0], hotEntry) : [];
+        return {
+          q,
+          prefix,
+          suggestions: hot.slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
+          stats: {
+            exact: true,
+            suggestLane: "authority-hot",
+            suggestCandidateShards: 0,
+            suggestShardsVisited: 0,
+            suggestEntriesScanned: hot.length
+          }
+        };
+      }
+    }
+    const keyPrefix = `${AUTOCOMPLETE_PREFIX}${prefix}`;
+    const candidates = lexiconCandidateShards(root.shards, keyPrefix);
+    const ordered = candidates.slice().sort((left, right) => right.maxRank - left.maxRank || (left.shard < right.shard ? -1 : left.shard > right.shard ? 1 : 0));
+    const best = /* @__PURE__ */ new Map();
+    let entriesScanned = 0;
+    let shardsVisited = 0;
+    let directoryPagesVisited = 0;
+    const directoryPages = /* @__PURE__ */ new Set();
+    const kthRank = () => {
+      if (best.size < size) return -1;
+      return [...best.values()].sort(compareAutocomplete)[size - 1].rank;
+    };
+    const directoryRoot = await loadDirectoryRoot(authorityDirectory);
+    let batch = 1;
+    for (let position = 0; position < ordered.length; ) {
+      const boundary = kthRank();
+      if (boundary >= 0 && ordered[position].maxRank < boundary) break;
+      const slice = ordered.slice(position, position + batch);
+      batch = Math.min(8, batch * 2);
+      const resolved = [];
+      for (const summary of slice) {
+        const page = findDirectoryPage(directoryRoot, summary.shard);
+        if (page) directoryPages.add(page.file);
+        const item = await directoryEntryFromRoot(authorityDirectory, directoryRoot, summary.shard);
+        if (item) resolved.push(item);
+      }
+      directoryPagesVisited = directoryPages.size;
+      const loaded = await loadAuthorityShards(resolved);
+      for (const item of resolved) {
+        const shard = loaded.get(item.shard);
+        if (!shard) continue;
+        shardsVisited++;
+        for (const [key, entry] of shard.entries) {
+          if (key < keyPrefix) continue;
+          if (!key.startsWith(keyPrefix)) break;
+          const parsed = parseAutocompleteKey(key);
+          if (!parsed) continue;
+          entriesScanned++;
+          const candidate = {
+            ...parsed,
+            weight: entry.autocompleteWeight || entry.total || 0,
+            count: entry.total || 1
+          };
+          candidate.rank = autocompleteRank(candidate, root.weighted);
+          mergeAutocompleteCandidate(best, candidate);
+        }
+      }
+      position += slice.length;
+    }
+    const ranked = [...best.values()].sort(compareAutocomplete).slice(0, size);
+    return {
+      q,
+      prefix,
+      suggestions: ranked.map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
+      stats: {
+        exact: true,
+        suggestLane: "authority-lexicon",
+        suggestCandidateShards: candidates.length,
+        suggestShardsVisited: shardsVisited,
+        suggestDirectoryPagesVisited: directoryPagesVisited,
+        suggestEntriesScanned: entriesScanned
+      }
+    };
+  }
   async function executeSuggest(params = {}) {
     const q = String(params.q || "");
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
     const prefix = suggestKey(q);
     if (!prefix) {
-      return { q, prefix, suggestions: [], stats: { exact: true, suggestPagesVisited: 0, suggestEntriesScanned: 0 } };
+      return { q, prefix, suggestions: [], stats: { exact: true, suggestShardsVisited: 0, suggestEntriesScanned: 0 } };
     }
-    if (!manifest.suggest?.directory?.file) {
-      const authorityResponse = await executeAuthoritySuggest(params, q, prefix, size);
-      if (authorityResponse) return authorityResponse;
-      throw new Error("Rangefind: this index has no suggestion sidecar or reusable title authority index (configure `suggest` fields at build time).");
-    }
-    const root = await loadSuggestRoot();
-    const upper = prefix + String.fromCharCode(65535);
-    const pageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
-    const branchFetchStats = { wanted: 0, fetched: 0, groups: 0 };
-    if (prefix.length === 1 && root.hot?.size) {
-      const hotEntry = root.hot.get(prefix);
-      if (!hotEntry || size <= hotEntry.count) {
-        const hotPage = hotEntry ? (await loadSuggestPages(root, [hotEntry], pageFetchStats))[0] : null;
-        const suggestions = (hotPage?.entries || []).slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 }));
-        return {
-          q,
-          prefix,
-          suggestions,
-          stats: {
-            exact: true,
-            suggestLane: "hot",
-            suggestPagesVisited: hotPage ? 1 : 0,
-            suggestPagesFetched: pageFetchStats.fetched,
-            suggestEntriesScanned: hotPage?.entries.length || 0
-          }
-        };
-      }
-    }
-    let summaries;
-    if (root.levels === 1) {
-      summaries = suggestCandidateRun(root.pages, prefix, upper);
-    } else {
-      const branchRun = suggestCandidateRun(root.branches, prefix, upper);
-      const branchPages = await loadSuggestBranchPages(root, branchRun, branchFetchStats);
-      summaries = [];
-      for (const branchPage of branchPages) {
-        summaries.push(...suggestCandidateRun(branchPage.pages, prefix, upper));
-      }
-    }
-    const ordered = summaries.slice().sort((a, b) => b.maxWeight - a.maxWeight || a.index - b.index);
-    const best = /* @__PURE__ */ new Map();
-    let entriesScanned = 0;
-    let pagesVisited = 0;
-    const kthWeight = () => {
-      if (best.size < size) return -1;
-      const weights = [...best.values()].map((item) => item.weight).sort((a, b) => b - a);
-      return weights[size - 1];
-    };
-    let batch = 2;
-    for (let position = 0; position < ordered.length; ) {
-      const boundary = kthWeight();
-      if (boundary >= 0 && ordered[position].maxWeight < boundary) break;
-      const slice = ordered.slice(position, position + batch);
-      batch = Math.min(batch * 2, 8);
-      const pages = await loadSuggestPages(root, slice, pageFetchStats);
-      for (const page of pages) {
-        pagesVisited++;
-        const entries = page.entries;
-        let lo = 0;
-        let hi = entries.length;
-        while (lo < hi) {
-          const mid = lo + hi >> 1;
-          if (entries[mid].key < prefix) lo = mid + 1;
-          else hi = mid;
-        }
-        for (let i = lo; i < entries.length; i++) {
-          const entry = entries[i];
-          if (!entry.key.startsWith(prefix)) break;
-          entriesScanned++;
-          const existing = best.get(entry.display);
-          if (!existing || entry.weight > existing.weight || entry.weight === existing.weight && entry.key < existing.key) {
-            best.set(entry.display, { text: entry.display, key: entry.key, weight: entry.weight, count: entry.count });
-          }
-        }
-      }
-      position += slice.length;
-    }
-    const ranked = [...best.values()].sort((a, b) => b.weight - a.weight || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0) || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0)).slice(0, size);
-    return {
-      q,
-      prefix,
-      suggestions: ranked.map(({ text, weight, count: count2 }) => ({ text, weight, count: count2 })),
-      stats: {
-        exact: true,
-        suggestLane: "range",
-        suggestLevels: root.levels,
-        suggestCandidatePages: summaries.length,
-        suggestPagesVisited: pagesVisited,
-        suggestPagesPrefetched: pageFetchStats.wanted,
-        suggestPagesFetched: pageFetchStats.fetched,
-        suggestPageFetchGroups: pageFetchStats.groups,
-        suggestBranchPagesFetched: branchFetchStats.fetched,
-        suggestEntriesScanned: entriesScanned
-      }
-    };
+    const root = await loadAuthorityLexiconRoot();
+    if (root) return executeLexiconSuggest(q, prefix, size, root);
+    const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
+    if (legacy) return legacy;
+    throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");
   }
   function normalizeFacetsParam(param) {
     if (!param) return null;

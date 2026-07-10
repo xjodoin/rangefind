@@ -96,10 +96,12 @@ export function buildSegmentManifest({ config = {}, total = 0, segments = [], su
       targetSegments: mergePolicy?.targetSegments || config.finalSegmentTargetCount || config.segmentMergeFanIn || 0,
       forceMerge: Boolean(mergePolicy?.forceMerge),
       maxTempBytes: mergePolicy?.maxTempBytes || config.segmentMergeMaxTempBytes || 0,
+      maxDirectoryBytes: mergePolicy?.maxDirectoryBytes || 0,
       writeAmplification: mergePolicy?.writeAmplification || 0,
       intermediateBytes: mergePolicy?.intermediateBytes || 0,
       skippedSegments: mergePolicy?.skippedSegments || 0,
       blockedByTempBudget: Boolean(mergePolicy?.blockedByTempBudget),
+      blockedByDirectoryBudget: Boolean(mergePolicy?.blockedByDirectoryBudget),
       tiers: mergeTiers
     },
     segments: rows

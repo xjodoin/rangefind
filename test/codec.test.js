@@ -475,12 +475,16 @@ test("query bundle codec round-trips row filter values", () => {
   assert.equal(bundle.filterValues.featured[9405], false);
 });
 
-test("authority shard codec round-trips exact and token rows", () => {
+test("authority shard codec round-trips rescue rows and compact autocomplete summaries", () => {
   const shard = parseAuthorityShard(buildAuthorityShard([
+    ["s|par\0Paris", [[3, 0], [1, 0]]],
     ["t|paris", [[3, 800000], [1, 400000]]],
     ["x|paris", [[1, 1000000]]]
   ], { maxRows: 1 }));
-  assert.equal(shard.format, "rfauth-v1");
+  assert.equal(shard.format, "rfauth-v2");
+  assert.equal(shard.entries.get("s|par\0Paris").total, 2);
+  assert.equal(shard.entries.get("s|par\0Paris").autocompleteWeight, 2);
+  assert.deepEqual(shard.entries.get("s|par\0Paris").rows, []);
   assert.equal(shard.entries.get("t|paris").total, 2);
   assert.equal(shard.entries.get("t|paris").complete, false);
   assert.deepEqual(shard.entries.get("t|paris").rows, [[3, 800000]]);

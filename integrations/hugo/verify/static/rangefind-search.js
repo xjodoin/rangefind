@@ -1880,12 +1880,11 @@ var DOC_VALUE_SORT_DIRECTORY_MAGIC = [82, 70, 68, 84];
 var DOC_VALUE_SORT_PAGE_MAGIC = [82, 70, 68, 86];
 var QUERY_BUNDLE_MAGIC = [82, 70, 81, 66];
 var AUTHORITY_SHARD_MAGIC = [82, 70, 65, 85];
+var AUTHORITY_LEXICON_MAGIC = [82, 70, 76, 88];
+var AUTHORITY_HOT_MAGIC = [82, 70, 76, 72];
 var GEO_TREE_ROOT_MAGIC = [82, 70, 71, 82];
 var GEO_BRANCH_PAGE_MAGIC = [82, 70, 71, 66];
 var GEO_LEAF_PAGE_MAGIC = [82, 70, 71, 76];
-var SUGGEST_ROOT_MAGIC = [82, 70, 83, 82];
-var SUGGEST_BRANCH_PAGE_MAGIC = [82, 70, 83, 66];
-var SUGGEST_PAGE_MAGIC = [82, 70, 83, 71];
 var VECTOR_ROOT_MAGIC = [82, 70, 86, 82];
 var VECTOR_CLUSTER_PAGE_MAGIC = [82, 70, 86, 67];
 function readVarint(bytes, state) {
@@ -2500,9 +2499,95 @@ function parseFacetDictionary(buffer) {
   return values;
 }
 
+// src/authority_lexicon.js
+var AUTHORITY_LEXICON_FORMAT = "rflexicon-v1";
+var AUTOCOMPLETE_PREFIX = "s|";
+var AUTOCOMPLETE_SEPARATOR = "\0";
+var AUTHORITY_LEXICON_VERSION = 1;
+var UNWEIGHTED_SURFACE_BONUS = 2 ** 32;
+function suggestKey(value) {
+  return foldMulti(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
+}
+function isAutocompleteKey(key) {
+  return String(key || "").startsWith(AUTOCOMPLETE_PREFIX);
+}
+function parseAutocompleteKey(key) {
+  if (!isAutocompleteKey(key)) return null;
+  const separator = key.indexOf(AUTOCOMPLETE_SEPARATOR, AUTOCOMPLETE_PREFIX.length);
+  if (separator < 0) return null;
+  return {
+    normalized: key.slice(AUTOCOMPLETE_PREFIX.length, separator),
+    display: key.slice(separator + AUTOCOMPLETE_SEPARATOR.length)
+  };
+}
+function autocompleteRank(item, weighted = false) {
+  const weight = Math.max(0, Math.floor(Number(item.weight) || 0));
+  const full = item.full ?? suggestKey(item.display) === item.normalized;
+  return weighted ? Math.min(Number.MAX_SAFE_INTEGER, weight * 2 + (full ? 1 : 0)) : (full ? UNWEIGHTED_SURFACE_BONUS : 0) + Math.min(UNWEIGHTED_SURFACE_BONUS - 1, weight);
+}
+function compareAutocomplete(left, right) {
+  return (right.rank ?? right.weight) - (left.rank ?? left.weight) || Array.from(left.display).length - Array.from(right.display).length || (left.normalized < right.normalized ? -1 : left.normalized > right.normalized ? 1 : 0) || (left.display < right.display ? -1 : left.display > right.display ? 1 : 0);
+}
+function readFrontCoded(bytes, state, previous) {
+  const prefix = readVarint(bytes, state);
+  return previous.slice(0, prefix) + readUtf8(bytes, state);
+}
+function parseAuthorityLexiconRoot(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, AUTHORITY_LEXICON_MAGIC, "Unsupported Rangefind authority lexicon root");
+  const state = { pos: AUTHORITY_LEXICON_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority lexicon root version ${version}`);
+  const weighted = readVarint(bytes, state) === 1;
+  const shardCount = readVarint(bytes, state);
+  const shards = new Array(shardCount);
+  let previousShard = "";
+  for (let index = 0; index < shardCount; index++) {
+    const shard = readFrontCoded(bytes, state, previousShard);
+    shards[index] = {
+      shard,
+      maxRank: readVarint(bytes, state),
+      count: readVarint(bytes, state)
+    };
+    previousShard = shard;
+  }
+  const hotCount = readVarint(bytes, state);
+  const hot = /* @__PURE__ */ new Map();
+  for (let index = 0; index < hotCount; index++) {
+    const prefix = readUtf8(bytes, state);
+    hot.set(prefix, {
+      file: readUtf8(bytes, state),
+      bytes: readVarint(bytes, state),
+      count: readVarint(bytes, state)
+    });
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind authority lexicon root has trailing bytes.");
+  return { format: AUTHORITY_LEXICON_FORMAT, weighted, shards, hot };
+}
+function parseAuthorityHotList(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
+  const state = { pos: AUTHORITY_HOT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  const count = readVarint(bytes, state);
+  const entries = new Array(count);
+  for (let index = 0; index < count; index++) {
+    entries[index] = {
+      normalized: readUtf8(bytes, state),
+      display: readUtf8(bytes, state),
+      weight: readVarint(bytes, state),
+      count: readVarint(bytes, state)
+    };
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind authority hot list has trailing bytes.");
+  return entries;
+}
+
 // src/authority_codec.js
-var AUTHORITY_FORMAT = "rfauth-v1";
-var AUTHORITY_VERSION = 1;
+var AUTHORITY_FORMAT = "rfauth-v2";
+var AUTHORITY_VERSION = 2;
+var AUTHORITY_LEGACY_VERSION = 1;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
@@ -2544,7 +2629,9 @@ function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION) throw new Error(`Unsupported Rangefind authority shard version ${version}`);
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION) {
+    throw new Error(`Unsupported Rangefind authority shard version ${version}`);
+  }
   const count = readVarint(bytes, state);
   const entries = /* @__PURE__ */ new Map();
   let previous = "";
@@ -2553,13 +2640,18 @@ function parseAuthorityShard(buffer) {
     const suffix = readUtf8(bytes, state);
     const key = previous.slice(0, prefix) + suffix;
     const total = readVarint(bytes, state);
+    if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
+      entries.set(key, { total, complete: true, rows: [], autocompleteWeight: readVarint(bytes, state) });
+      previous = key;
+      continue;
+    }
     const rowCount = readVarint(bytes, state);
     const rows = new Array(rowCount);
     for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
     entries.set(key, { total, complete: total === rowCount, rows });
     previous = key;
   }
-  return { format: AUTHORITY_FORMAT, entries };
+  return { format: version === AUTHORITY_LEGACY_VERSION ? "rfauth-v1" : AUTHORITY_FORMAT, entries };
 }
 
 // src/directory.js
@@ -3403,147 +3495,6 @@ function parseVectorRoot(buffer) {
   };
 }
 
-// src/suggest_index.js
-var SUGGEST_ROOT_FORMAT = "rfsuggestroot-v1";
-var SUGGEST_PAGE_FORMAT = "rfsuggestpage-v1";
-var FORMAT_VERSION4 = 1;
-var FLAG_DISPLAY_EQUALS_KEY = 1;
-function suggestKey(value) {
-  return foldMulti(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
-}
-function decodeSuggestPage(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, SUGGEST_PAGE_MAGIC, "Unsupported Rangefind suggest page");
-  const state = { pos: SUGGEST_PAGE_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest page version ${version}`);
-  const count = readVarint(bytes, state);
-  const entries = new Array(count);
-  let previousKey = "";
-  for (let i = 0; i < count; i++) {
-    const lcp = readVarint(bytes, state);
-    const key = previousKey.slice(0, lcp) + readUtf8(bytes, state);
-    const flags = bytes[state.pos++];
-    const display = flags & FLAG_DISPLAY_EQUALS_KEY ? key : readUtf8(bytes, state);
-    const weight = readVarint(bytes, state);
-    const entryCount = readVarint(bytes, state);
-    entries[i] = { key, display, weight, count: entryCount };
-    previousKey = key;
-  }
-  if (state.pos !== bytes.length) throw new Error("Rangefind suggest page has trailing bytes.");
-  return { count, entries };
-}
-function readObjectPointer3(bytes, state, packTable, target) {
-  const packIndex = readVarint(bytes, state);
-  target.pack = packTable[packIndex];
-  target.offset = readVarint(bytes, state);
-  target.length = readVarint(bytes, state);
-  target.physicalLength = readVarint(bytes, state);
-  target.logicalLength = readVarint(bytes, state) || null;
-  const algorithm = readUtf8(bytes, state);
-  const value = readUtf8(bytes, state);
-  target.checksum = value ? { algorithm: algorithm || "sha256", value } : null;
-  return target;
-}
-function readPageSummary(bytes, state, packTable, previousMinKey, index) {
-  const lcp = readVarint(bytes, state);
-  const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
-  const maxWeight = readVarint(bytes, state);
-  const count = readVarint(bytes, state);
-  return readObjectPointer3(bytes, state, packTable, { index, minKey, maxWeight, count });
-}
-function parseSuggestRoot(buffer) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, SUGGEST_ROOT_MAGIC, "Unsupported Rangefind suggest root");
-  const state = { pos: SUGGEST_ROOT_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest root version ${version}`);
-  const total = readVarint(bytes, state);
-  const pageSize = readVarint(bytes, state);
-  const pageCount = readVarint(bytes, state);
-  const packCount = readVarint(bytes, state);
-  const packTable = new Array(packCount);
-  for (let i = 0; i < packCount; i++) packTable[i] = readUtf8(bytes, state);
-  const levels = bytes[state.pos++];
-  const root = {
-    format: SUGGEST_ROOT_FORMAT,
-    pageFormat: SUGGEST_PAGE_FORMAT,
-    total,
-    pageSize,
-    pageCount,
-    levels,
-    packTable,
-    pages: null,
-    branches: null
-  };
-  if (levels === 1) {
-    const count = readVarint(bytes, state);
-    const pages = new Array(count);
-    let previousMinKey = "";
-    for (let i = 0; i < count; i++) {
-      pages[i] = readPageSummary(bytes, state, packTable, previousMinKey, i);
-      previousMinKey = pages[i].minKey;
-    }
-    root.pages = pages;
-  } else if (levels === 2) {
-    const count = readVarint(bytes, state);
-    const branches = new Array(count);
-    let previousMinKey = "";
-    for (let i = 0; i < count; i++) {
-      const lcp = readVarint(bytes, state);
-      const minKey = previousMinKey.slice(0, lcp) + readUtf8(bytes, state);
-      const maxWeight = readVarint(bytes, state);
-      const branchCount = readVarint(bytes, state);
-      const firstPageIndex = readVarint(bytes, state);
-      const branchPageCount = readVarint(bytes, state);
-      branches[i] = readObjectPointer3(bytes, state, packTable, {
-        index: i,
-        minKey,
-        maxWeight,
-        count: branchCount,
-        firstPageIndex,
-        pageCount: branchPageCount
-      });
-      previousMinKey = minKey;
-    }
-    root.branches = branches;
-  } else {
-    throw new Error(`Unsupported Rangefind suggest root levels ${levels}`);
-  }
-  const hotCount = readVarint(bytes, state);
-  const hot = /* @__PURE__ */ new Map();
-  for (let i = 0; i < hotCount; i++) {
-    const prefix = readUtf8(bytes, state);
-    const count = readVarint(bytes, state);
-    hot.set(prefix, readObjectPointer3(bytes, state, packTable, {
-      index: pageCount + i,
-      prefix,
-      count
-    }));
-  }
-  root.hot = hot;
-  if (state.pos !== bytes.length) throw new Error("Rangefind suggest root has trailing bytes.");
-  return root;
-}
-function decodeSuggestBranchPage(buffer, packTable) {
-  const bytes = new Uint8Array(buffer);
-  assertMagic(bytes, SUGGEST_BRANCH_PAGE_MAGIC, "Unsupported Rangefind suggest branch page");
-  const state = { pos: SUGGEST_BRANCH_PAGE_MAGIC.length };
-  const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind suggest branch page version ${version}`);
-  const branchIndex = readVarint(bytes, state);
-  const firstPageIndex = readVarint(bytes, state);
-  const count = readVarint(bytes, state);
-  const pages = new Array(count);
-  let previousMinKey = "";
-  for (let i = 0; i < count; i++) {
-    pages[i] = readPageSummary(bytes, state, packTable, previousMinKey, firstPageIndex + i);
-    previousMinKey = pages[i].minKey;
-  }
-  if (state.pos !== bytes.length) throw new Error("Rangefind suggest branch page has trailing bytes.");
-  return { branchIndex, firstPageIndex, pages };
-}
-
 // src/filter_bitmaps.js
 var FILTER_BITMAP_MAGIC = [82, 70, 66, 77];
 var FILTER_BITMAP_FORMAT = "rffilterbitmap-v1";
@@ -3743,7 +3694,7 @@ function decodeSegmentRows(buffer, entry, options = {}) {
 // src/shards.js
 var RANGE_MERGE_GAP_BYTES = 8 * 1024;
 function shardKey(term, depth) {
-  return String(term || "").slice(0, depth).padEnd(depth, "_");
+  return String(term || "").slice(0, depth);
 }
 function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
   const mergeGapBytes = typeof options === "number" ? options : options.mergeGapBytes ?? RANGE_MERGE_GAP_BYTES;
@@ -3996,6 +3947,8 @@ function traceBucketFromPath(path) {
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/bundles/packs/")) return "queryBundles";
   if (path.includes("/authority/packs/")) return "authority";
+  if (path.includes("/authority/lexicon-root.")) return "authorityLexicon";
+  if (path.includes("/authority/hot/")) return "authorityHot";
   if (path.includes("/sort-replicas/")) return "sortReplicas";
   if (path.includes("/doc-values/sorted")) return "docValueSorted";
   if (path.includes("/doc-values/")) return "docValues";
@@ -4093,15 +4046,16 @@ async function inflateGzip(responseOrBuffer) {
   if (!stream) throw new Error("Response body is not streamable.");
   return new Response(stream.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 }
+var fetchImpl = (url, init) => fetch(url, init);
 async function fetchGzipArrayBuffer(url) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetch(url));
+  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url));
   if (!response.ok) throw new Error(`Unable to fetch ${url}`);
   return traceSpan(`${bucket}.inflate`, () => inflateGzip(response));
 }
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetch(url, {
+  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url, {
     headers: { Range: `bytes=${offset}-${offset + length - 1}` }
   }));
   if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
@@ -4135,14 +4089,14 @@ function facetCodeMatches(words, selected) {
 async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   async function fetchJsonIfOk(path) {
-    const response = await fetch(new URL(path, baseUrl));
+    const response = await fetchImpl(new URL(path, baseUrl));
     return response.ok ? response.json() : null;
   }
   async function fetchManifestJsonIfOk(path) {
     if (!path) return null;
     if (!String(path).endsWith(".gz")) return fetchJsonIfOk(path);
     const url = new URL(path, baseUrl);
-    const response = await fetch(url);
+    const response = await fetchImpl(url);
     if (!response.ok) return null;
     const inflated = await traceSpan("manifest.inflate", () => inflateGzip(response));
     return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder4.decode(inflated)));
@@ -4177,9 +4131,8 @@ async function createSearch(options = {}) {
   const geoTreeRootCache = /* @__PURE__ */ new Map();
   const geoBranchPageCache = /* @__PURE__ */ new Map();
   const geoLeafPageCache = /* @__PURE__ */ new Map();
-  let suggestRootPromise = null;
-  const suggestPageCache = /* @__PURE__ */ new Map();
-  const suggestBranchPageCache = /* @__PURE__ */ new Map();
+  let authorityLexiconRootPromise = null;
+  const authorityHotCache = /* @__PURE__ */ new Map();
   const vectorRootCache = /* @__PURE__ */ new Map();
   const vectorClusterPageCache = /* @__PURE__ */ new Map();
   const sortReplicaDirectoryCache = /* @__PURE__ */ new Map();
@@ -4230,7 +4183,6 @@ async function createSearch(options = {}) {
     postingBlockFrontier: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     postingDocRanges: { mergeGapBytes: 512 * 1024, maxMergedBytes: 2 * 1024 * 1024, maxOverfetchBytes: 1024 * 1024, maxOverfetchRatio: Infinity },
     geoLeafPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
-    suggestPages: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
     vectorClusterPages: { mergeGapBytes: 64 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: Infinity },
     vectorRefine: { mergeGapBytes: 16 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: 8 },
     ...options.rangePlans || {}
@@ -4339,7 +4291,8 @@ async function createSearch(options = {}) {
     Math.min(4096, Math.floor(Number(options.topKProofCheckIntervalMax || 32)))
   );
   const topKProofCheckScoresPerBlock = Math.max(1, Math.floor(Number(options.topKProofCheckScoresPerBlock || 2048)));
-  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget || 0)));
+  const defaultTopKBlockBudget = Number(manifest.total || 0) >= 1e6 ? 128 : 0;
+  const topKBlockBudget = Math.max(0, Math.floor(Number(options.topKBlockBudget ?? defaultTopKBlockBudget)));
   const docValueSortPageBatchSize = Math.max(1, Math.min(
     64,
     Math.floor(Number(options.docValueSortPageBatchSize || DOC_VALUE_SORT_PAGE_BATCH_SIZE))
@@ -4422,6 +4375,38 @@ async function createSearch(options = {}) {
       }
       return null;
     });
+  }
+  async function directoryEntriesForPrefix(state, prefix, maxEntries) {
+    const root = await loadDirectoryRoot(state);
+    const upper = prefix + String.fromCharCode(65535);
+    let lo = 0;
+    let hi = root.pages.length;
+    while (lo < hi) {
+      const mid = lo + hi >> 1;
+      if (root.pages[mid].last < prefix) lo = mid + 1;
+      else hi = mid;
+    }
+    const start = Math.max(0, lo - 1);
+    const found = [];
+    let pagesVisited = 0;
+    let truncated = false;
+    for (let index = start; index < root.pages.length; index++) {
+      const page = root.pages[index];
+      if (page.first > upper && !prefix.startsWith(page.first)) break;
+      if (page.last < prefix && index !== start) continue;
+      const entries = await loadDirectoryPage(state, page);
+      pagesVisited++;
+      for (const [shard, entry] of entries) {
+        if (!prefix.startsWith(shard) && !shard.startsWith(prefix)) continue;
+        if (found.length >= maxEntries) {
+          truncated = true;
+          break;
+        }
+        found.push({ shard, entry });
+      }
+      if (truncated) break;
+    }
+    return { entries: found, pagesVisited, truncated };
   }
   async function loadCodes() {
     if (codes) return codes;
@@ -4666,42 +4651,25 @@ async function createSearch(options = {}) {
       stats
     });
   }
-  async function loadSuggestRoot() {
-    const meta = manifest.suggest;
+  async function loadAuthorityLexiconRoot() {
+    const meta = manifest.authority?.autocomplete;
     if (!meta?.directory?.file) return null;
-    if (!suggestRootPromise) {
-      suggestRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseSuggestRoot);
-      suggestRootPromise.catch(() => {
-        suggestRootPromise = null;
+    if (!authorityLexiconRootPromise) {
+      authorityLexiconRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseAuthorityLexiconRoot);
+      authorityLexiconRootPromise.catch(() => {
+        authorityLexiconRootPromise = null;
       });
     }
-    return suggestRootPromise;
+    return authorityLexiconRootPromise;
   }
-  async function loadSuggestPages(root, pages, stats = null) {
-    return loadPackedPages({
-      field: "suggest",
-      entries: pages,
-      cache: suggestPageCache,
-      cacheKey: (field, index) => `${field} ${index}`,
-      decode: decodeSuggestPage,
-      label: "suggest page",
-      packDir: "suggest/packs",
-      rangePlan: "suggestPages",
-      stats
-    });
-  }
-  async function loadSuggestBranchPages(root, branches, stats = null) {
-    return loadPackedPages({
-      field: "suggest",
-      entries: branches,
-      cache: suggestBranchPageCache,
-      cacheKey: (field, index) => `${field} branch ${index}`,
-      decode: (inflated) => decodeSuggestBranchPage(inflated, root.packTable),
-      label: "suggest branch page",
-      packDir: "suggest/packs",
-      rangePlan: "suggestPages",
-      stats
-    });
+  async function loadAuthorityHotList(prefix, entry) {
+    if (!entry?.file) return [];
+    if (!authorityHotCache.has(prefix)) {
+      const promise = fetchGzipArrayBuffer(new URL(entry.file, baseUrl)).then(parseAuthorityHotList);
+      promise.catch(() => authorityHotCache.delete(prefix));
+      authorityHotCache.set(prefix, promise);
+    }
+    return authorityHotCache.get(prefix);
   }
   async function loadGeoLeafPages(field, leaves, stats = null) {
     return loadGeoPages(
@@ -4966,7 +4934,7 @@ async function createSearch(options = {}) {
     const key = segment.id || String(segment.ordinal);
     if (!segmentTermsCache.has(key)) {
       const path = segment.files?.terms?.path;
-      segmentTermsCache.set(key, path ? fetch(new URL(path, baseUrl)).then((response) => {
+      segmentTermsCache.set(key, path ? fetchImpl(new URL(path, baseUrl)).then((response) => {
         if (!response.ok) throw new Error(`Unable to fetch ${path}`);
         return response.arrayBuffer();
       }).then((buffer) => traceSpanSync("segments.parseTerms", () => parseSegmentTerms(buffer))) : Promise.resolve(null));
@@ -9135,11 +9103,12 @@ async function createSearch(options = {}) {
     const presentTerms = new Map((await termEntries(baseTerms)).map((item) => [item.term, item.entry.df || 0]));
     const hasMissingTerms = baseTerms.some((term) => !presentTerms.has(term));
     const plans = /* @__PURE__ */ new Map();
-    const debug = { shards: /* @__PURE__ */ new Set(), candidates: 0, scanned: 0 };
-    for (let index = 0; index < analyzedTerms.length; index++) {
+    const debug = { shards: /* @__PURE__ */ new Set(), candidates: 0, scanned: 0, tokens: [] };
+    const candidateIndexes = analyzedTerms.map((_, index) => index).filter((index) => !hasMissingTerms || !presentTerms.has(analyzedTerms[index].term)).sort((left, right) => (presentTerms.get(analyzedTerms[left].term) ?? -1) - (presentTerms.get(analyzedTerms[right].term) ?? -1) || left - right);
+    for (const index of candidateIndexes) {
       const item = analyzedTerms[index];
-      if (presentTerms.has(item.term) && hasMissingTerms) continue;
       const candidates = await typoCandidatesForToken(item, debug);
+      if (options.typoDebug) debug.tokens.push({ token: item.term, candidates });
       const strongCandidates = candidates.filter((item2) => item2.score >= 0.5);
       const bestScore = strongCandidates[0]?.score || 0;
       const minScore = bestScore >= 1 ? bestScore * TYPO_CORRECTION_RELATIVE_SCORE : 0.5;
@@ -9177,7 +9146,11 @@ async function createSearch(options = {}) {
         typoCorrectionBestUpperBound: selectedPlans[0]?.estimatedUpperBound || 0,
         typoShardLookups: debug.shards.size,
         typoCandidateShardLookups: debug.shards.size,
-        typoCandidateTermsScanned: debug.scanned
+        typoCandidateTermsScanned: debug.scanned,
+        ...options.typoDebug ? {
+          typoDebugTokens: debug.tokens,
+          typoDebugPlans: sortedPlans
+        } : {}
       }
     };
   }
@@ -9797,127 +9770,167 @@ async function createSearch(options = {}) {
       }
     };
   }
-  function suggestCandidateRun(summaries, prefix, upper) {
-    if (!summaries?.length) return [];
-    let lo = 0;
-    let hi = summaries.length;
-    while (lo < hi) {
-      const mid = lo + hi >> 1;
-      if (summaries[mid].minKey < prefix) lo = mid + 1;
-      else hi = mid;
-    }
-    const start = Math.max(0, lo - 1);
-    let lo2 = start;
-    let hi2 = summaries.length;
-    while (lo2 < hi2) {
-      const mid = lo2 + hi2 >> 1;
-      if (summaries[mid].minKey <= upper) lo2 = mid + 1;
-      else hi2 = mid;
-    }
-    const end = lo2 - 1;
-    if (end < start) return [];
-    return summaries.slice(start, end + 1);
+  function authoritySuggestField() {
+    const fields = (manifest.authority?.fields || []).filter((field2) => field2.exact !== false);
+    if (fields.length !== 1) return null;
+    const field = fields[0];
+    return field.path === "title" ? field : null;
   }
-  async function executeSuggest(params = {}) {
-    if (!manifest.suggest?.directory?.file) {
-      throw new Error("Rangefind: this index has no suggestion sidecar (configure `suggest` fields at build time).");
+  async function executeLegacyAuthoritySuggest(params, q, prefix, size) {
+    const field = authoritySuggestField();
+    if (!authorityDirectory || options.authority === false || !field) return null;
+    const keyPrefix = `x|${prefix}`;
+    const maxShards = Math.max(1, Math.min(64, Math.floor(Number(
+      params.authorityMaxShards ?? options.authoritySuggestMaxShards ?? 16
+    ))));
+    const range = await directoryEntriesForPrefix(authorityDirectory, keyPrefix, maxShards);
+    const candidates = [];
+    let shardsVisited = 0;
+    let entriesScanned = 0;
+    for (const shard of range.entries) {
+      const loaded = await loadAuthorityShards([shard]);
+      const data = loaded.get(shard.shard);
+      if (!data) continue;
+      shardsVisited++;
+      for (const [key, entry] of data.entries) {
+        if (key < keyPrefix) continue;
+        if (!key.startsWith(keyPrefix)) break;
+        entriesScanned++;
+        const row = entry.rows?.[0];
+        if (!row) continue;
+        candidates.push({ key, doc: row[0], weight: row[1], count: entry.total || 1 });
+        if (candidates.length >= size) break;
+      }
+      if (candidates.length >= size) break;
     }
-    const q = String(params.q || "");
-    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const prefix = suggestKey(q);
-    if (!prefix) {
-      return { q, prefix, suggestions: [], stats: { exact: true, suggestPagesVisited: 0, suggestEntriesScanned: 0 } };
-    }
-    const root = await loadSuggestRoot();
-    const upper = prefix + String.fromCharCode(65535);
-    const pageFetchStats = { wanted: 0, fetched: 0, groups: 0 };
-    const branchFetchStats = { wanted: 0, fetched: 0, groups: 0 };
-    if (prefix.length === 1 && root.hot?.size) {
-      const hotEntry = root.hot.get(prefix);
+    const resultContext = { hasTextTerms: false, preferDocPages: false };
+    const docs = candidates.length ? await rowsToResults(candidates.map((item) => [item.doc, item.weight]), resultContext) : [];
+    const suggestions = docs.map((doc, index) => ({
+      text: String(doc.title || ""),
+      weight: candidates[index].weight,
+      count: candidates[index].count
+    })).filter((item) => item.text).slice(0, size);
+    const exact = candidates.length >= size || !range.truncated;
+    return {
+      q,
+      prefix,
+      suggestions,
+      stats: {
+        exact,
+        suggestLane: "authority-title",
+        suggestDirectoryPagesVisited: range.pagesVisited,
+        suggestCandidateShards: range.entries.length,
+        suggestShardsVisited: shardsVisited,
+        suggestEntriesScanned: entriesScanned,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
+  function lexiconCandidateShards(shards, prefix) {
+    return (shards || []).filter((item) => prefix.startsWith(item.shard) || item.shard.startsWith(prefix));
+  }
+  function mergeAutocompleteCandidate(best, item) {
+    const previous = best.get(item.display);
+    if (!previous || compareAutocomplete(item, previous) < 0) best.set(item.display, item);
+  }
+  async function executeLexiconSuggest(q, prefix, size, root) {
+    const codepoints = Array.from(prefix);
+    if (codepoints.length === 1 && root.hot?.size) {
+      const hotEntry = root.hot.get(codepoints[0]);
       if (!hotEntry || size <= hotEntry.count) {
-        const hotPage = hotEntry ? (await loadSuggestPages(root, [hotEntry], pageFetchStats))[0] : null;
-        const suggestions = (hotPage?.entries || []).slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 }));
+        const hot = hotEntry ? await loadAuthorityHotList(codepoints[0], hotEntry) : [];
         return {
           q,
           prefix,
-          suggestions,
+          suggestions: hot.slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
           stats: {
             exact: true,
-            suggestLane: "hot",
-            suggestPagesVisited: hotPage ? 1 : 0,
-            suggestPagesFetched: pageFetchStats.fetched,
-            suggestEntriesScanned: hotPage?.entries.length || 0
+            suggestLane: "authority-hot",
+            suggestCandidateShards: 0,
+            suggestShardsVisited: 0,
+            suggestEntriesScanned: hot.length
           }
         };
       }
     }
-    let summaries;
-    if (root.levels === 1) {
-      summaries = suggestCandidateRun(root.pages, prefix, upper);
-    } else {
-      const branchRun = suggestCandidateRun(root.branches, prefix, upper);
-      const branchPages = await loadSuggestBranchPages(root, branchRun, branchFetchStats);
-      summaries = [];
-      for (const branchPage of branchPages) {
-        summaries.push(...suggestCandidateRun(branchPage.pages, prefix, upper));
-      }
-    }
-    const ordered = summaries.slice().sort((a, b) => b.maxWeight - a.maxWeight || a.index - b.index);
+    const keyPrefix = `${AUTOCOMPLETE_PREFIX}${prefix}`;
+    const candidates = lexiconCandidateShards(root.shards, keyPrefix);
+    const ordered = candidates.slice().sort((left, right) => right.maxRank - left.maxRank || (left.shard < right.shard ? -1 : left.shard > right.shard ? 1 : 0));
     const best = /* @__PURE__ */ new Map();
     let entriesScanned = 0;
-    let pagesVisited = 0;
-    const kthWeight = () => {
+    let shardsVisited = 0;
+    let directoryPagesVisited = 0;
+    const directoryPages = /* @__PURE__ */ new Set();
+    const kthRank = () => {
       if (best.size < size) return -1;
-      const weights = [...best.values()].map((item) => item.weight).sort((a, b) => b - a);
-      return weights[size - 1];
+      return [...best.values()].sort(compareAutocomplete)[size - 1].rank;
     };
-    let batch = 2;
+    const directoryRoot = await loadDirectoryRoot(authorityDirectory);
+    let batch = 1;
     for (let position = 0; position < ordered.length; ) {
-      const boundary = kthWeight();
-      if (boundary >= 0 && ordered[position].maxWeight < boundary) break;
+      const boundary = kthRank();
+      if (boundary >= 0 && ordered[position].maxRank < boundary) break;
       const slice = ordered.slice(position, position + batch);
-      batch = Math.min(batch * 2, 8);
-      const pages = await loadSuggestPages(root, slice, pageFetchStats);
-      for (const page of pages) {
-        pagesVisited++;
-        const entries = page.entries;
-        let lo = 0;
-        let hi = entries.length;
-        while (lo < hi) {
-          const mid = lo + hi >> 1;
-          if (entries[mid].key < prefix) lo = mid + 1;
-          else hi = mid;
-        }
-        for (let i = lo; i < entries.length; i++) {
-          const entry = entries[i];
-          if (!entry.key.startsWith(prefix)) break;
+      batch = Math.min(8, batch * 2);
+      const resolved = [];
+      for (const summary of slice) {
+        const page = findDirectoryPage(directoryRoot, summary.shard);
+        if (page) directoryPages.add(page.file);
+        const item = await directoryEntryFromRoot(authorityDirectory, directoryRoot, summary.shard);
+        if (item) resolved.push(item);
+      }
+      directoryPagesVisited = directoryPages.size;
+      const loaded = await loadAuthorityShards(resolved);
+      for (const item of resolved) {
+        const shard = loaded.get(item.shard);
+        if (!shard) continue;
+        shardsVisited++;
+        for (const [key, entry] of shard.entries) {
+          if (key < keyPrefix) continue;
+          if (!key.startsWith(keyPrefix)) break;
+          const parsed = parseAutocompleteKey(key);
+          if (!parsed) continue;
           entriesScanned++;
-          const existing = best.get(entry.display);
-          if (!existing || entry.weight > existing.weight || entry.weight === existing.weight && entry.key < existing.key) {
-            best.set(entry.display, { text: entry.display, key: entry.key, weight: entry.weight, count: entry.count });
-          }
+          const candidate = {
+            ...parsed,
+            weight: entry.autocompleteWeight || entry.total || 0,
+            count: entry.total || 1
+          };
+          candidate.rank = autocompleteRank(candidate, root.weighted);
+          mergeAutocompleteCandidate(best, candidate);
         }
       }
       position += slice.length;
     }
-    const ranked = [...best.values()].sort((a, b) => b.weight - a.weight || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0) || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0)).slice(0, size);
+    const ranked = [...best.values()].sort(compareAutocomplete).slice(0, size);
     return {
       q,
       prefix,
-      suggestions: ranked.map(({ text, weight, count: count2 }) => ({ text, weight, count: count2 })),
+      suggestions: ranked.map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
       stats: {
         exact: true,
-        suggestLane: "range",
-        suggestLevels: root.levels,
-        suggestCandidatePages: summaries.length,
-        suggestPagesVisited: pagesVisited,
-        suggestPagesPrefetched: pageFetchStats.wanted,
-        suggestPagesFetched: pageFetchStats.fetched,
-        suggestPageFetchGroups: pageFetchStats.groups,
-        suggestBranchPagesFetched: branchFetchStats.fetched,
+        suggestLane: "authority-lexicon",
+        suggestCandidateShards: candidates.length,
+        suggestShardsVisited: shardsVisited,
+        suggestDirectoryPagesVisited: directoryPagesVisited,
         suggestEntriesScanned: entriesScanned
       }
     };
+  }
+  async function executeSuggest(params = {}) {
+    const q = String(params.q || "");
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const prefix = suggestKey(q);
+    if (!prefix) {
+      return { q, prefix, suggestions: [], stats: { exact: true, suggestShardsVisited: 0, suggestEntriesScanned: 0 } };
+    }
+    const root = await loadAuthorityLexiconRoot();
+    if (root) return executeLexiconSuggest(q, prefix, size, root);
+    const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
+    if (legacy) return legacy;
+    throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");
   }
   function normalizeFacetsParam(param) {
     if (!param) return null;
@@ -10120,6 +10133,12 @@ async function createSearch(options = {}) {
   async function hydrateRows(rows, context = {}) {
     return rowsToResults(rows, context);
   }
+  async function loadDocValues(fields, indexes) {
+    if (!indexes.length) return [];
+    await ensureDocValuesManifest();
+    const store = await valueStoreForDocs(fields, indexes);
+    return indexes.map((index) => Object.fromEntries(fields.map((field) => [field, valueForDoc(store, field, index)])));
+  }
   return {
     manifest,
     analyzer,
@@ -10128,6 +10147,7 @@ async function createSearch(options = {}) {
     suggest,
     vectorSearch,
     hydrateRows,
+    loadDocValues,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,
@@ -10148,16 +10168,96 @@ async function createGenerationalSearch(root, options, baseUrl) {
   }));
   const tombstones = generations.map((generation) => new Set(generation.tombstones || []));
   const tombstoneTotal = tombstones.reduce((sum, set) => sum + set.size, 0);
-  function unsupported(feature) {
-    return new Error(`Rangefind: ${feature} is not yet supported on generational indexes (see docs/incremental-publishing-plan.md).`);
+  const primaryManifest = engines[0]?.manifest || {};
+  const sortableFields = new Set([
+    ...primaryManifest.numbers || [],
+    ...primaryManifest.booleans || []
+  ].map((field) => field.name));
+  function parseSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field || !sortableFields.has(field)) return null;
+    const order = typeof sort === "string" && sort.startsWith("-") ? "desc" : String(sort.order || sort.direction || "asc").toLowerCase();
+    return { field, desc: order === "desc" };
+  }
+  function compareMergedTies(a, b) {
+    return (b.score || 0) - (a.score || 0) || a.generation - b.generation || a.index - b.index;
+  }
+  async function hydrateMergedRows(pageRows) {
+    const byGeneration = /* @__PURE__ */ new Map();
+    for (const row of pageRows) {
+      if (!byGeneration.has(row.generation)) byGeneration.set(row.generation, []);
+      byGeneration.get(row.generation).push(row);
+    }
+    const hydrated = /* @__PURE__ */ new Map();
+    await Promise.all([...byGeneration.entries()].map(async ([genIndex, rows]) => {
+      const results = await engines[genIndex].hydrateRows(rows.map((row) => [row.index, row.score]));
+      rows.forEach((row, i) => {
+        hydrated.set(`${genIndex}:${row.index}`, {
+          ...results[i],
+          generation: genIndex,
+          ...row.distanceMeters != null ? { distanceMeters: row.distanceMeters } : {},
+          ...row.hybrid ? { hybrid: row.hybrid } : {}
+        });
+      });
+    }));
+    return pageRows.map((row) => hydrated.get(`${row.generation}:${row.index}`)).filter(Boolean);
+  }
+  function mergeFacetResponses(responses) {
+    const facets = {};
+    for (const response of responses) {
+      for (const [field, data] of Object.entries(response.facets || {})) {
+        const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: /* @__PURE__ */ new Map() });
+        target.exact = target.exact && data.exact !== false;
+        for (const item of data.values) {
+          const existing = target.byValue.get(item.value);
+          if (existing) existing.count += item.count;
+          else target.byValue.set(item.value, { ...item });
+        }
+      }
+    }
+    for (const data of Object.values(facets)) {
+      data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+      delete data.byValue;
+    }
+    return facets;
+  }
+  function applyMergedHighlights(params, q, results, correctedQuery) {
+    if (!params.highlight || !results.length || !q) return;
+    const highlightOptions = params.highlight === true ? {} : params.highlight;
+    const genAnalyzer = engines[0]?.analyzer;
+    applyHighlights(results, highlightTermSet(q, correctedQuery, genAnalyzer), { ...highlightOptions, analyzer: genAnalyzer });
+  }
+  function mergedResponseShell(responses, results, page, size) {
+    const correctedQuery = responses.map((response) => response.correctedQuery).find(Boolean);
+    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0) - tombstoneTotal;
+    const approximate = tombstoneTotal > 0 || responses.some((response) => response.approximate);
+    return {
+      total: Math.max(results.length, total),
+      results,
+      page,
+      size,
+      approximate,
+      ...correctedQuery ? { correctedQuery, corrections: responses.find((r) => r.correctedQuery)?.corrections } : {},
+      stats: {
+        generations: engines.length,
+        generationTotals: responses.map((response) => response.total || 0),
+        tombstones: tombstoneTotal
+      }
+    };
   }
   async function search(params = {}) {
-    if (params.geo || params.vector) throw unsupported(params.geo ? "geo search" : "vector search");
-    if (params.sort) throw unsupported("sorted browse");
+    if (params.vector) return hybridSearch(params);
     const q = String(params.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
     const offset = (page - 1) * size;
+    const sortPlan = parseSortPlan(params.sort);
+    const geoDistanceSort = params.geo?.sort === "distance";
+    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    if (sortPlan || geoDistanceSort || params.geo && !q) {
+      return orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort });
+    }
     const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
       ...params,
       includeResults: false,
@@ -10169,63 +10269,185 @@ async function createGenerationalSearch(root, options, baseUrl) {
     for (let genIndex = 0; genIndex < responses.length; genIndex++) {
       for (const row of responses[genIndex].results || []) {
         if (tombstones[genIndex].has(row.index)) continue;
-        merged.push({ generation: genIndex, index: row.index, score: row.score || 0 });
+        merged.push({
+          generation: genIndex,
+          index: row.index,
+          score: row.score || 0,
+          ...row.distanceMeters != null ? { distanceMeters: row.distanceMeters } : {}
+        });
       }
     }
-    if (q) merged.sort((a, b) => b.score - a.score || a.generation - b.generation || a.index - b.index);
+    if (q) merged.sort(compareMergedTies);
     const pageRows = merged.slice(offset, offset + size);
-    const byGeneration = /* @__PURE__ */ new Map();
-    for (const row of pageRows) {
-      if (!byGeneration.has(row.generation)) byGeneration.set(row.generation, []);
-      byGeneration.get(row.generation).push(row);
+    const results = await hydrateMergedRows(pageRows);
+    const response = mergedResponseShell(responses, results, page, size);
+    applyMergedHighlights(params, q, results, response.correctedQuery);
+    if (params.facets) response.facets = mergeFacetResponses(responses);
+    return response;
+  }
+  async function orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort }) {
+    const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
+      ...params,
+      highlight: void 0,
+      facets: params.facets,
+      page: 1,
+      size: Math.min(1e3, offset + size + tombstones[genIndex].size)
+    })));
+    const merged = [];
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const result of responses[genIndex].results || []) {
+        if (Number.isInteger(result.index) && tombstones[genIndex].has(result.index)) continue;
+        merged.push({ generation: genIndex, index: result.index, score: result.score || 0, result });
+      }
     }
-    const hydrated = /* @__PURE__ */ new Map();
-    await Promise.all([...byGeneration.entries()].map(async ([genIndex, rows]) => {
-      const results2 = await engines[genIndex].hydrateRows(rows.map((row) => [row.index, row.score]));
-      rows.forEach((row, i) => {
-        hydrated.set(`${genIndex}:${row.index}`, { ...results2[i], generation: genIndex });
+    if (sortPlan) {
+      await Promise.all(engines.map(async (engine, genIndex) => {
+        const rows = merged.filter((row) => row.generation === genIndex);
+        if (!rows.length) return;
+        const values = await engine.loadDocValues([sortPlan.field], rows.map((row) => row.index));
+        rows.forEach((row, i) => {
+          row.key = values[i]?.[sortPlan.field];
+        });
+      }));
+      merged.sort((a, b) => {
+        const leftMissing = a.key == null;
+        const rightMissing = b.key == null;
+        if (leftMissing || rightMissing) {
+          if (leftMissing && rightMissing) return compareMergedTies(a, b);
+          return leftMissing ? 1 : -1;
+        }
+        if (a.key !== b.key) return sortPlan.desc ? b.key - a.key : a.key - b.key;
+        return compareMergedTies(a, b);
       });
-    }));
-    const results = pageRows.map((row) => hydrated.get(`${row.generation}:${row.index}`)).filter(Boolean);
-    const correctedQuery = responses.map((response) => response.correctedQuery).find(Boolean);
-    if (params.highlight && results.length && q) {
-      const highlightOptions = params.highlight === true ? {} : params.highlight;
-      const genAnalyzer = engines[0]?.analyzer;
-      applyHighlights(results, highlightTermSet(q, correctedQuery, genAnalyzer), { ...highlightOptions, analyzer: genAnalyzer });
+    } else if (geoDistanceSort) {
+      merged.sort((a, b) => {
+        const left = a.result.distanceMeters;
+        const right = b.result.distanceMeters;
+        const leftMissing = left == null;
+        const rightMissing = right == null;
+        if (leftMissing || rightMissing) {
+          if (leftMissing && rightMissing) return compareMergedTies(a, b);
+          return leftMissing ? 1 : -1;
+        }
+        return left - right || compareMergedTies(a, b);
+      });
     }
-    let facets;
-    if (params.facets) {
-      facets = {};
-      for (const response of responses) {
-        for (const [field, data] of Object.entries(response.facets || {})) {
-          const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: /* @__PURE__ */ new Map() });
-          target.exact = target.exact && data.exact !== false;
-          for (const item of data.values) {
-            const existing = target.byValue.get(item.value);
-            if (existing) existing.count += item.count;
-            else target.byValue.set(item.value, { ...item });
-          }
+    const results = merged.slice(offset, offset + size).map((row) => ({ ...row.result, generation: row.generation }));
+    const response = mergedResponseShell(responses, results, page, size);
+    applyMergedHighlights(params, q, results, response.correctedQuery);
+    if (params.facets) response.facets = mergeFacetResponses(responses);
+    return response;
+  }
+  async function hybridSearch(params) {
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    async function vectorLaneRows(need) {
+      const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
+        q: "",
+        vector: params.vector,
+        vectorField: params.vectorField,
+        hybrid: params.hybrid,
+        filters: params.filters,
+        page: 1,
+        size: Math.min(1e3, need + tombstones[genIndex].size)
+      })));
+      const rows = [];
+      for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+        for (const result of responses[genIndex].results || []) {
+          if (tombstones[genIndex].has(result.index)) continue;
+          rows.push({ generation: genIndex, index: result.index, score: result.score || 0, result });
         }
       }
-      for (const data of Object.values(facets)) {
-        data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
-        delete data.byValue;
+      rows.sort(compareMergedTies);
+      return { rows: rows.slice(0, need), responses };
+    }
+    if (!q) {
+      const { rows, responses } = await vectorLaneRows(offset + size);
+      const results2 = rows.slice(offset, offset + size).map((row) => ({ ...row.result, generation: row.generation }));
+      const response = mergedResponseShell(responses, results2, page, size);
+      response.approximate = true;
+      return response;
+    }
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const [textResponses, vectorLane] = await Promise.all([
+      Promise.all(engines.map((engine, genIndex) => engine.search({
+        ...params,
+        vector: void 0,
+        vectorField: void 0,
+        hybrid: void 0,
+        highlight: void 0,
+        includeResults: false,
+        page: 1,
+        size: Math.min(1e3, poolSize + tombstones[genIndex].size)
+      }))),
+      vectorLaneRows(poolSize)
+    ]);
+    const textRows = [];
+    for (let genIndex = 0; genIndex < textResponses.length; genIndex++) {
+      for (const row of textResponses[genIndex].results || []) {
+        if (tombstones[genIndex].has(row.index)) continue;
+        textRows.push({ generation: genIndex, index: row.index, score: row.score || 0 });
       }
     }
-    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0) - tombstoneTotal;
-    const approximate = tombstoneTotal > 0 || responses.some((response) => response.approximate);
+    textRows.sort(compareMergedTies);
+    const fused = /* @__PURE__ */ new Map();
+    const addRanked = (rows, lane) => {
+      rows.forEach((row, rank) => {
+        const key = `${row.generation}:${row.index}`;
+        const entry = fused.get(key) || { generation: row.generation, index: row.index, score: 0, hybrid: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.hybrid[lane] = rank + 1;
+        fused.set(key, entry);
+      });
+    };
+    addRanked(textRows.slice(0, poolSize), "text");
+    addRanked(vectorLane.rows, "vector");
+    const ranked = [...fused.values()].sort(compareMergedTies);
+    const pageRows = ranked.slice(offset, offset + size);
+    const results = await hydrateMergedRows(pageRows);
+    applyMergedHighlights(params, q, results, void 0);
     return {
-      total: Math.max(results.length, total),
+      total: ranked.length,
       results,
       page,
       size,
-      approximate,
-      ...correctedQuery ? { correctedQuery, corrections: responses.find((r) => r.correctedQuery)?.corrections } : {},
-      ...facets ? { facets } : {},
+      approximate: true,
       stats: {
         generations: engines.length,
-        generationTotals: responses.map((response) => response.total || 0),
-        tombstones: tombstoneTotal
+        tombstones: tombstoneTotal,
+        hybrid: true
+      }
+    };
+  }
+  async function vectorSearch(params = {}) {
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const responses = await Promise.all(engines.map((engine, genIndex) => engine.vectorSearch({
+      ...params,
+      includeResults: false,
+      k: Math.min(200, k + tombstones[genIndex].size)
+    })));
+    const merged = [];
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const row of responses[genIndex].results || []) {
+        if (tombstones[genIndex].has(row.index)) continue;
+        merged.push({ generation: genIndex, index: row.index, score: row.score || 0 });
+      }
+    }
+    merged.sort(compareMergedTies);
+    const pageRows = merged.slice(0, k);
+    const results = params.includeResults === false ? pageRows.map((row) => ({ index: row.index, score: row.score, generation: row.generation })) : await hydrateMergedRows(pageRows);
+    return {
+      total: merged.length,
+      results,
+      stats: {
+        generations: engines.length,
+        tombstones: tombstoneTotal,
+        perGeneration: responses.map((response) => response.stats || {}),
+        exact: false,
+        approximate: true
       }
     };
   }
@@ -10262,7 +10484,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     search,
     suggest,
     count,
-    vectorSearch: () => Promise.reject(unsupported("vector search")),
+    vectorSearch,
     loadFacetValues: (field) => engines[0].loadFacetValues(field)
   };
 }
@@ -10645,7 +10867,8 @@ var RangefindSearchElement = class extends HTMLElement {
     if (cfg === false) return false;
     if (cfg === true) return true;
     const manifest = this._engine?.manifest;
-    return Boolean(manifest?.features?.suggest ?? manifest?.suggest);
+    const hasAuthorityTitles = manifest?.authority?.fields?.length === 1 && manifest.authority.fields[0].path === "title" && manifest.authority.fields[0].exact !== false;
+    return Boolean(manifest?.features?.suggest || hasAuthorityTitles);
   }
   // --- Query flow -----------------------------------------------------------
   _onInput() {

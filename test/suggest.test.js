@@ -7,17 +7,13 @@ import test from "node:test";
 import { build } from "../src/builder.js";
 import { createSearch } from "../src/runtime.js";
 import {
-  addSuggestionRow,
-  compareSuggestions,
-  decodeSuggestBranchPage,
-  decodeSuggestPage,
-  encodeSuggestBranchPage,
-  encodeSuggestPage,
-  encodeSuggestRoot,
-  finalizeSuggestionRows,
-  parseSuggestRoot,
+  autocompleteKeysForValue,
+  encodeAuthorityHotList,
+  encodeAuthorityLexiconRoot,
+  parseAuthorityHotList,
+  parseAuthorityLexiconRoot,
   suggestKey
-} from "../src/suggest_index.js";
+} from "../src/authority_lexicon.js";
 
 test("suggest keys fold diacritics and punctuation but keep every script", () => {
   assert.equal(suggestKey("Montréal"), "montreal");
@@ -27,97 +23,31 @@ test("suggest keys fold diacritics and punctuation but keep every script", () =>
   assert.equal(suggestKey("---"), "");
 });
 
-test("suggestion rows aggregate counts, weights, and token prefixes", () => {
-  const rows = new Map();
-  addSuggestionRow(rows, "Café de la Gare", 0, {});
-  addSuggestionRow(rows, "Café de la Gare", 0, {});
-  addSuggestionRow(rows, "Café de la Gare", 7, { count: 3 });
-  addSuggestionRow(rows, "Gare Centrale", 0, { tokenPrefixes: false });
-  const entries = finalizeSuggestionRows(rows);
-  const byKey = Object.fromEntries(entries.map(entry => [`${entry.key}|${entry.display}`, entry]));
-  const full = byKey["cafe de la gare|Café de la Gare"];
-  assert.equal(full.count, 5);
-  assert.equal(full.weight, 7);
-  // Token-prefix keys make mid-label tokens completable.
-  assert.ok(byKey["gare|Café de la Gare"]);
-  assert.ok(byKey["de la gare|Café de la Gare"]);
-  // tokenPrefixes: false emits only the full key.
-  assert.ok(byKey["gare centrale|Gare Centrale"]);
-  assert.equal(byKey["centrale|Gare Centrale"], undefined);
+test("authority autocomplete keys preserve display and add token suffixes", () => {
+  const keys = autocompleteKeysForValue("Café de la Gare");
+  assert.deepEqual(keys.map(item => item.normalized), ["cafe de la gare", "de la gare", "la gare", "gare"]);
+  assert.ok(keys.every(item => item.display === "Café de la Gare"));
+  assert.deepEqual(
+    autocompleteKeysForValue("Gare Centrale", { tokenPrefixes: false }).map(item => item.normalized),
+    ["gare centrale"]
+  );
 });
 
-test("suggest pages, branch pages, and roots round trip", () => {
-  const rows = new Map();
-  for (let i = 0; i < 300; i++) {
-    addSuggestionRow(rows, `Place ${String(i).padStart(3, "0")} unique`, i % 7, {});
-  }
-  const entries = finalizeSuggestionRows(rows);
-  assert.deepEqual(entries, entries.slice().sort(compareSuggestions));
-  const encoded = encodeSuggestPage(entries);
-  const decoded = decodeSuggestPage(encoded);
-  assert.equal(decoded.count, entries.length);
-  assert.deepEqual(
-    decoded.entries,
-    entries.map(({ key, display, weight, count }) => ({ key, display, weight, count }))
-  );
-
-  const packTable = ["0000.abc.bin"];
-  const packIndexes = new Map([["0000.abc.bin", 0]]);
-  const entry = {
-    pack: "0000.abc.bin",
-    offset: 100,
-    length: 50,
-    physicalLength: 50,
-    logicalLength: 90,
-    checksum: { algorithm: "sha256", value: "ab".repeat(32) }
-  };
-  const pages = Array.from({ length: 10 }, (_, i) => ({
-    minKey: `key ${String(i).padStart(2, "0")}`,
-    maxWeight: 10 - i,
-    count: 30,
-    entry
-  }));
-  const flatRoot = parseSuggestRoot(encodeSuggestRoot({
-    total: 300,
-    pageSize: 30,
-    pages,
-    branches: null,
-    packTable,
-    packIndexes
-  }).buffer);
-  assert.equal(flatRoot.levels, 1);
-  assert.equal(flatRoot.pages.length, 10);
-  assert.equal(flatRoot.pages[3].minKey, "key 03");
-  assert.equal(flatRoot.pages[3].maxWeight, 7);
-  assert.equal(flatRoot.pages[3].offset, 100);
-
-  const branchPageBuffer = encodeSuggestBranchPage({
-    branchIndex: 1,
-    firstPageIndex: 5,
-    pages: pages.slice(5),
-    packIndexes
-  });
-  const branchPage = decodeSuggestBranchPage(branchPageBuffer, packTable);
-  assert.equal(branchPage.firstPageIndex, 5);
-  assert.equal(branchPage.pages[0].index, 5);
-  assert.equal(branchPage.pages[0].minKey, "key 05");
-
-  const branches = [
-    { minKey: "key 00", maxWeight: 10, count: 150, firstPageIndex: 0, pageCount: 5, entry },
-    { minKey: "key 05", maxWeight: 5, count: 150, firstPageIndex: 5, pageCount: 5, entry }
+test("authority lexicon shard summaries and hot lists round trip", () => {
+  const shards = [
+    { shard: "s|a", maxRank: 9, count: 20 },
+    { shard: "s|b", maxRank: 7, count: 12 }
   ];
-  const branchRoot = parseSuggestRoot(encodeSuggestRoot({
-    total: 300,
-    pageSize: 30,
-    pages: null,
-    branches,
-    packTable,
-    packIndexes
-  }).buffer);
-  assert.equal(branchRoot.levels, 2);
-  assert.equal(branchRoot.branches.length, 2);
-  assert.equal(branchRoot.branches[1].firstPageIndex, 5);
-  assert.equal(branchRoot.branches[1].maxWeight, 5);
+  const hotItems = [
+    { normalized: "alpha", display: "Alpha", weight: 9, count: 2 },
+    { normalized: "azure", display: "Azure", weight: 5, count: 1 }
+  ];
+  const hot = new Map([["a", { file: "authority/hot/abc.bin.gz", bytes: 42, count: 2 }]]);
+  const decoded = parseAuthorityLexiconRoot(encodeAuthorityLexiconRoot({ shards, hot, weighted: true }));
+  assert.equal(decoded.weighted, true);
+  assert.deepEqual(decoded.shards, shards);
+  assert.deepEqual(decoded.hot.get("a"), hot.get("a"));
+  assert.deepEqual(parseAuthorityHotList(encodeAuthorityHotList(hotItems)), hotItems);
 });
 
 async function serveStatic(root) {
@@ -207,22 +137,43 @@ function suggestFixtureDocs() {
 function oracleSuggest(docs, q, size) {
   const rows = new Map();
   for (const doc of docs) {
-    addSuggestionRow(rows, doc.title, Number(doc.population) || 0, {});
+    const display = String(doc.title || "").trim().replace(/\s+/gu, " ");
+    const normalized = suggestKey(display);
+    const keys = [normalized];
+    let start = normalized.indexOf(" ");
+    while (start !== -1 && keys.length < 4) {
+      const key = normalized.slice(start + 1);
+      if (key.length > 1 && !keys.includes(key)) keys.push(key);
+      start = normalized.indexOf(" ", start + 1);
+    }
+    for (const key of keys) {
+      const mapKey = `${key}\0${display}`;
+      const previous = rows.get(mapKey) || { key, display, weight: 0, count: 0, full: key === normalized };
+      previous.count++;
+      previous.weight = Math.max(previous.weight, Number(doc.population) || 0);
+      rows.set(mapKey, previous);
+    }
   }
-  const entries = finalizeSuggestionRows(rows);
+  const entries = [...rows.values()];
+  for (const entry of entries) {
+    if (!entry.weight) entry.weight = entry.count;
+    entry.rank = entry.weight * 2 + (entry.full ? 1 : 0);
+  }
   const prefix = suggestKey(q);
   const best = new Map();
   for (const entry of entries) {
     if (!entry.key.startsWith(prefix)) continue;
     const existing = best.get(entry.display);
     if (!existing
-      || entry.weight > existing.weight
-      || (entry.weight === existing.weight && entry.key < existing.key)) {
+      || entry.rank > existing.rank
+      || (entry.rank === existing.rank && entry.display.length < existing.display.length)
+      || (entry.rank === existing.rank && entry.display.length === existing.display.length && entry.key < existing.key)) {
       best.set(entry.display, entry);
     }
   }
   return [...best.values()]
-    .sort((a, b) => b.weight - a.weight
+    .sort((a, b) => b.rank - a.rank
+      || a.display.length - b.display.length
       || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
       || (a.display < b.display ? -1 : a.display > b.display ? 1 : 0))
     .slice(0, size)
@@ -250,7 +201,9 @@ async function runSuggestOracleSuite(configOverrides, assertManifest) {
   await build({ configPath });
   const manifest = JSON.parse(await readFile(join(output, "manifest.min.json"), "utf8"));
   assert.equal(manifest.features.suggest, true);
-  assert.ok(manifest.suggest.directory.file.startsWith("suggest/"));
+  assert.equal(manifest.suggest, undefined);
+  assert.ok(manifest.authority.autocomplete.directory.file.startsWith("authority/"));
+  assert.equal(manifest.object_store.pack_table.suggest, undefined);
   if (assertManifest) assertManifest(manifest);
 
   const server = await serveStatic(join(root, "public"));
@@ -288,20 +241,19 @@ async function runSuggestOracleSuite(configOverrides, assertManifest) {
   }
 }
 
-test("suggestions agree with an exhaustive oracle (single-level root)", async () => {
-  await runSuggestOracleSuite({ suggestPageSize: 32 }, manifest => {
-    assert.equal(manifest.suggest.levels, 1);
+test("unified authority autocomplete agrees with an exhaustive oracle", async () => {
+  await runSuggestOracleSuite({}, manifest => {
+    assert.ok(manifest.authority.autocomplete.shards > 0);
   });
 });
 
-test("suggestions agree with an exhaustive oracle (branch-paged root)", async () => {
-  await runSuggestOracleSuite({ suggestPageSize: 16, suggestBranchPages: 4 }, manifest => {
-    assert.equal(manifest.suggest.levels, 2);
-    assert.ok(manifest.suggest.branches >= 2);
+test("unified autocomplete remains exact across recursively split authority shards", async () => {
+  await runSuggestOracleSuite({ authorityTargetShardRows: 8 }, manifest => {
+    assert.ok(manifest.authority.autocomplete.shards > 20);
   });
 });
 
-test("title authority provides bounded autocomplete without a suggestion sidecar", async () => {
+test("legacy title authority provides bounded autocomplete without explicit suggest fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-authority-suggest-"));
   const docsPath = join(root, "docs.jsonl");
   const output = join(root, "public", "rangefind");
@@ -366,7 +318,7 @@ test("indexes without suggest fields reject suggest queries clearly", async () =
   const server = await serveStatic(join(root, "public"));
   try {
     const engine = await createSearch({ baseUrl: server.baseUrl });
-    await assert.rejects(engine.suggest({ q: "pla" }), /no suggestion sidecar/);
+    await assert.rejects(engine.suggest({ q: "pla" }), /no authority autocomplete lexicon/);
   } finally {
     await server.close();
   }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Search-as-you-type benchmark for the Rangefind suggestion sidecar.
+// Search-as-you-type benchmark for the unified authority autocomplete lexicon.
 //
 // Replays realistic keystroke sequences against a built index, measuring
 // requests, transfer, and latency per keystroke — both for a cold session
@@ -45,10 +45,11 @@ async function main() {
   const root = resolve(args.root);
   const manifest = JSON.parse(readFileSync(resolve(root, "public/rangefind/manifest.min.json"), "utf8"));
   if (!manifest.features?.suggest) {
-    throw new Error(`Index at ${args.root} has no suggestion sidecar; rebuild with suggest fields.`);
+    throw new Error(`Index at ${args.root} has no authority autocomplete lexicon; rebuild with suggest fields.`);
   }
-  const meta = manifest.suggest;
-  console.log(`[bench] ${meta.total} suggestion keys from ${meta.surfaces} surfaces, ${meta.pages} pages, levels ${meta.levels}, root ${kb(meta.directory.bytes)} KB`);
+  const meta = manifest.authority?.autocomplete;
+  if (!meta) throw new Error(`Index at ${args.root} predates unified authority autocomplete; rebuild it.`);
+  console.log(`[bench] ${meta.keys} autocomplete keys, ${meta.shards} authority shards, ${meta.hot_prefixes} hot prefixes, root ${kb(meta.directory.bytes)} KB`);
 
   const meter = createFetchMeter(/\/rangefind\//u);
   const report = { root: args.root, size: args.size, total_keys: meta.total, queries: {} };
@@ -74,7 +75,7 @@ async function main() {
           kb: kb(snapshot.bytes),
           suggestions: response.suggestions.length,
           top: response.suggestions[0]?.text || "",
-          pages_visited: response.stats.suggestPagesVisited,
+          shards_visited: response.stats.suggestShardsVisited,
           entries_scanned: response.stats.suggestEntriesScanned
         });
       }

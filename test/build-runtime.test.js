@@ -349,7 +349,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(await readFile(join(output, manifest.query_bundles.directory.root)));
   assert.ok(await readFile(join(output, "bundles", "packs", manifest.object_store.pack_table.queryBundles[0])));
   assert.ok(manifest.authority);
-  assert.equal(manifest.authority.format, "rfauth-v1");
+  assert.equal(manifest.authority.format, "rfauth-v2");
   assert.equal(manifest.authority.fields.length, 2);
   assert.ok(manifest.authority.keys > 0);
   assert.ok(await readFile(join(output, manifest.authority.directory.root)));
@@ -835,6 +835,7 @@ test("resumable builds reuse scan and reduce stages and keep old manifest on fai
   await assert.rejects(() => build({ configPath }), /debug failure after scan/u);
   const scanStage = await resumeStageFile(output, "scan");
   const scanBefore = await readFile(scanStage, "utf8");
+  assert.equal(JSON.parse(scanBefore).payload.codeDescriptor.dicts, undefined);
   await writeFile(configPath, JSON.stringify(baseConfig));
   await build({ configPath });
   assert.equal(await readFile(scanStage, "utf8"), scanBefore);

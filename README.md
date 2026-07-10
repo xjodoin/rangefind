@@ -60,10 +60,11 @@ a large thesis corpus.
   bounding-box and radius filters, exact nearest-neighbor distance sort with
   early-stop proofs (with or without a text query), text-plus-geo filtering,
   per-cell filter summaries, and distance boosts.
-- Search-as-you-type autocomplete from a range-addressed suggestion sidecar:
+- Search-as-you-type autocomplete inside the range-addressed authority index:
   diacritic-folded prefix and mid-label token matching, popularity or custom
-  weights, exact best-first top-k with per-page weight proofs, and
-  precomputed hot pages so a first keystroke costs one small fetch.
+  weights, exact best-first top-k with per-shard weight proofs, and
+  precomputed hot lists so a first keystroke costs one small fetch—without a
+  second suggestion pack family or a corpus-sized heap map.
 - Hybrid semantic search from a range-addressed IVF vector index: int8
   quantized embeddings, coarse-dimension candidate pages plus a fixed-width
   full-dimension refine store, cosine top-k, and reciprocal-rank fusion with
@@ -343,14 +344,14 @@ payload size stays controlled by `display` entries. Terms from
 instead of building a separate typo sidecar. Use `typoMode: "off"` to disable
 correction.
 
-`authority` fields build a separate packed sidecar for canonical labels such as
+`authority` fields build a packed lexicon for canonical labels such as
 titles, entity names, product names, slugs, and aliases. The runtime first tries
 a diacritic-preserving surface-exact key, then falls back to folded exact and
 token keys only when needed, so common title rescue stays precise and cheap
-without forcing all label logic into the BM25 posting lists. If `title` is the
-only authority field and no `suggest` sidecar exists, `engine.suggest()` reuses
-its folded, prefix-partitioned keys. This is useful for multi-million-document
-indexes: autocomplete adds no duplicate build-time title map or on-disk index.
+without forcing all label logic into the BM25 posting lists. `suggest` fields
+stream into the same external-run reducer under an autocomplete namespace, so
+multi-million-document builds never create a duplicate in-memory title map or
+a separate `suggest/` pack family.
 
 Build:
 
@@ -417,8 +418,8 @@ box filters are exact (bounding-box prune plus Haversine verification), and
 `geoPointsScanned`, ...). See `examples/osm-geo/` for an OpenStreetMap-scale
 example and benchmark.
 
-Weighted and mid-label search-as-you-type suggestions come from a dedicated
-static sidecar:
+Weighted and mid-label search-as-you-type suggestions use the authority
+lexicon:
 
 ```json
 {
@@ -434,15 +435,16 @@ const { suggestions } = await engine.suggest({ q: "boul", size: 8 });
 Matching is prefix-based over diacritic-folded keys ("montre" finds
 "Montréal") and covers mid-label tokens ("eiffel" finds "Tour Eiffel").
 Ranking uses an optional `weightPath` (for example population or importance)
-and falls back to popularity — how many documents share the surface. Each
-keystroke costs at most a few small range requests; repeat keystrokes in a
-session are usually served entirely from cache.
+and falls back to direct-prefix priority plus popularity — how many documents
+share the surface. Each keystroke costs at most a few small range requests;
+repeat keystrokes in a session are usually served entirely from cache.
 
-For title-prefix completion only, a single
+For title-prefix completion on an older index, a single
 `authority: [{ "name": "title", "path": "title" }]` field is also sufficient.
 The runtime walks the first matching authority shards in key order and hydrates
-only the requested titles. Use the dedicated `suggest` sidecar when you need
-custom popularity weights or mid-label completion.
+only the requested titles. New builds should configure `suggest` to get custom
+weights, popularity fallback, mid-label completion, and hot-prefix lists in the
+same authority packs.
 
 Facet counts for filter UIs come back with the search response:
 

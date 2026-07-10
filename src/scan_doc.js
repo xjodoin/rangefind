@@ -46,27 +46,8 @@ export function booleanValue(doc, field) {
   return null;
 }
 
-export function suggestEnabled(config) {
-  return Array.isArray(config.suggest) && config.suggest.length > 0;
-}
-
 export function vectorsEnabled(config) {
   return Array.isArray(config.vectors) && config.vectors.length > 0;
-}
-
-// Rows are [surface, weight, tokenPrefixes]; the caller aggregates duplicate
-// surfaces before anything crosses a worker boundary.
-export function suggestRowsForDoc(config, doc) {
-  const rows = [];
-  for (const field of config.suggest) {
-    const weightValue = field.weightPath ? Number(rawPath(doc, field.weightPath)) : 0;
-    const weight = Number.isFinite(weightValue) && weightValue > 0 ? Math.floor(weightValue) : 0;
-    for (const value of valueList(rawPath(doc, field.path))) {
-      const surface = String(value ?? "").trim();
-      if (surface) rows.push([surface, weight, field.tokenPrefixes !== false]);
-    }
-  }
-  return rows;
 }
 
 export function facetValues(doc, facet) {

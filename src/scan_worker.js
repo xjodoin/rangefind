@@ -1,7 +1,7 @@
 import { parentPort } from "node:worker_threads";
 import { gzipSync } from "node:zlib";
 import { analyzerForConfig } from "./analysis.js";
-import { authorityEnabled, authorityFields, authorityRecordsForDoc } from "./authority_index.js";
+import { autocompleteFields, authorityEnabled, authorityFields, authorityRecordsForDoc } from "./authority_index.js";
 import { docLayoutRecord } from "./doc_layout.js";
 import { encodeDocPageColumns } from "./doc_pages.js";
 import {
@@ -14,8 +14,6 @@ import {
   queryBundlesEnabled,
   queryBundleSeedCandidatesForDoc,
   rawPath,
-  suggestEnabled,
-  suggestRowsForDoc,
   vectorsEnabled
 } from "./scan_doc.js";
 import { normalizeVector, vectorFromValue } from "./vector_index.js";
@@ -34,7 +32,7 @@ function initState(message) {
     pageSize: Math.max(1, Math.floor(Number(config.docPageSize || 32))),
     pageFields: docPayloadFieldNames(config),
     authorityFields: authorityEnabled(config) ? authorityFields(config) : [],
-    suggestEnabled: suggestEnabled(config),
+    autocompleteFields: authorityEnabled(config) ? autocompleteFields(config) : [],
     vectorsEnabled: vectorsEnabled(config),
     initialResultLimit: Math.max(0, Math.floor(Number(config.initialResultLimit || 0)))
   };
@@ -58,9 +56,6 @@ function processBatch({ id, baseIndex, lines }) {
   const booleansOut = (config.booleans || []).map(() => new Int8Array(n));
   const authority = { keys: [], docs: [], scores: [] };
   const bundleCandidates = state.includeFieldTerms ? new Array(n) : null;
-  // Aggregated per batch so duplicate surfaces (chains, repeated street
-  // names) collapse before crossing the worker boundary.
-  const suggest = state.suggestEnabled ? new Map() : null;
   // One dense Float32 block per vector field per batch; a NaN in the first
   // component marks a missing vector.
   const vectorsOut = state.vectorsEnabled
@@ -113,7 +108,12 @@ function processBatch({ id, baseIndex, lines }) {
       const value = booleanValue(doc, (config.booleans || [])[f]);
       booleansOut[f][i] = value == null ? -1 : value ? 1 : 0;
     }
-    for (const record of authorityRecordsForDoc(state.authorityFields, doc, analyzerForConfig(config))) {
+    for (const record of authorityRecordsForDoc(
+      state.authorityFields,
+      doc,
+      analyzerForConfig(config),
+      state.autocompleteFields
+    )) {
       authority.keys.push(record.key);
       authority.docs.push(index);
       authority.scores.push(record.score);
@@ -127,18 +127,6 @@ function processBatch({ id, baseIndex, lines }) {
         const vector = vectorFromValue(rawPath(doc, field.path, null), field.dims);
         const normalized = vector ? normalizeVector(vector) : null;
         if (normalized) vectorsOut[f].set(normalized, i * field.dims);
-      }
-    }
-    if (suggest) {
-      for (const [surface, weight, tokenPrefixes] of suggestRowsForDoc(config, doc)) {
-        const existing = suggest.get(surface);
-        if (existing) {
-          existing[0] += 1;
-          if (weight > existing[1]) existing[1] = weight;
-          if (tokenPrefixes) existing[2] = 1;
-        } else {
-          suggest.set(surface, [1, weight, tokenPrefixes ? 1 : 0]);
-        }
       }
     }
   }
@@ -165,12 +153,6 @@ function processBatch({ id, baseIndex, lines }) {
     booleans: booleansOut,
     authority,
     bundleCandidates,
-    suggest: suggest
-      ? {
-          surfaces: [...suggest.keys()],
-          rows: [...suggest.values()]
-        }
-      : null,
     vectors: vectorsOut,
     analysisMs: performance.now() - started
   };

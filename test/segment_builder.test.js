@@ -260,7 +260,7 @@ test("segment merge writes intermediate tiers before final partitioning", async 
   assert.equal(stats.mergePolicy.outputSegments, 2);
   assert.ok(stats.mergePolicy.writeAmplification > 0);
   assert.ok(stats.mergeTiers.every(tier => tier.input_bytes > 0));
-  assert.ok(stats.mergeTiers.every(tier => tier.batches.every(batch => batch.input_bytes > 0 && batch.output_bytes > 0)));
+  assert.ok(stats.mergeTiers.every(tier => tier.batches.every(batch => batch.input_bytes > 0 && batch.input_directory_bytes > 0 && batch.output_bytes > 0)));
   assert.equal(stats.terms, 3);
   assert.equal(stats.postings, 5);
   assert.deepEqual(partitionPairs, [
@@ -268,6 +268,39 @@ test("segment merge writes intermediate tiers before final partitioning", async 
     ["beta", [[2, 3], [5, 11]]],
     ["gamma", [[4, 7]]]
   ]);
+});
+
+test("segment merge bounds decoded directory bytes independently of fan-in", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-segment-directory-budget-"));
+  const builder = createSegmentBuilder(join(root, "segments"), { segmentMaxPostings: 1 });
+  for (const [term, doc] of [["alpha", 1], ["beta", 2], ["gamma", 3], ["delta", 4], ["epsilon", 5]]) {
+    addSegmentPosting(builder, term, doc, 1);
+    flushSegment(builder);
+  }
+  const segments = finishSegmentBuilder(builder);
+  // Model large compact directories without constructing megabytes of test
+  // strings. The merge planner consumes this metadata; readers still verify
+  // the real segment files end to end.
+  for (const segment of segments) segment.termsBytes = 400 * 1024;
+
+  const stats = await mergeSegmentsToPartitions({
+    segments,
+    scratchDir: join(root, "merge"),
+    config: {
+      baseShardDepth: 1,
+      maxShardDepth: 2,
+      targetShardPostings: 10,
+      segmentMergeFanIn: 5,
+      segmentMergeMaxDirectoryBytes: 1024 * 1024,
+      finalSegmentTargetCount: 1
+    },
+    onPartition: partition => partition.name
+  });
+
+  assert.equal(stats.mergePolicy.maxDirectoryBytes, 1024 * 1024);
+  assert.ok(stats.mergeTiers[0].batches.every(batch => batch.input_segments <= 2));
+  assert.ok(stats.mergeTiers[0].batches.every(batch => batch.input_directory_bytes <= 1024 * 1024));
+  assert.equal(stats.mergePolicy.outputSegments, 1);
 });
 
 test("segment merge can force merge to a target segment count", async () => {

@@ -233,6 +233,16 @@ function maxTempBytes(config) {
   return Math.max(0, Math.floor(Number(config.segmentMergeMaxTempBytes || 0)));
 }
 
+// Segment term directories are compact on disk but expand into strings and
+// objects while a merge cursor is open. Bound batches by encoded directory
+// bytes as well as segment count so a high fan-in cannot exhaust V8's heap on
+// large corpora. The cap is intentionally independent of the temporary-disk
+// budget: it controls live decoded metadata, not write amplification.
+function maxDirectoryBytes(config) {
+  const configured = Number(config.segmentMergeMaxDirectoryBytes ?? 64 * 1024 * 1024);
+  return Number.isFinite(configured) && configured > 0 ? Math.max(1024 * 1024, Math.floor(configured)) : 0;
+}
+
 function mergePolicyName(config) {
   const policy = String(config.segmentMergePolicy || "tiered-log");
   if (policy === "none") return "none";
@@ -249,17 +259,28 @@ function orderedMergeCandidates(segments) {
 function mergeBatches(segments, config) {
   const fanIn = mergeFanIn(config);
   const cap = maxTempBytes(config);
+  const directoryCap = maxDirectoryBytes(config);
   const ordered = orderedMergeCandidates(segments);
   const batches = [];
   for (let start = 0; start < ordered.length;) {
     const batch = [ordered[start++]];
     let bytes = segmentBytes(batch[0]);
+    let directoryBytes = batch[0].termsBytes || 0;
     while (start < ordered.length && batch.length < fanIn) {
       const next = ordered[start];
       const nextBytes = segmentBytes(next);
-      if (cap && bytes + nextBytes > cap) break;
+      if (cap && bytes + nextBytes > cap) {
+        batch.tempLimited = true;
+        break;
+      }
+      const nextDirectoryBytes = next.termsBytes || 0;
+      if (directoryCap && directoryBytes + nextDirectoryBytes > directoryCap) {
+        batch.directoryLimited = true;
+        break;
+      }
       batch.push(next);
       bytes += nextBytes;
+      directoryBytes += nextDirectoryBytes;
       start++;
     }
     batches.push(batch);
@@ -279,6 +300,7 @@ function mergePolicySummary({ config, inputSegments, outputSegments, tiers }) {
     targetSegments,
     forceMerge: targetSegments === 1,
     maxTempBytes: maxTempBytes(config),
+    maxDirectoryBytes: maxDirectoryBytes(config),
     inputSegments: inputSegments.length,
     outputSegments: outputSegments.length,
     inputBytes,
@@ -286,6 +308,7 @@ function mergePolicySummary({ config, inputSegments, outputSegments, tiers }) {
     intermediateBytes,
     skippedSegments: tiers.reduce((sum, tier) => sum + (tier.skipped_segments || 0), 0),
     blockedByTempBudget: tiers.some(tier => tier.blocked_by_temp_budget),
+    blockedByDirectoryBudget: tiers.some(tier => tier.blocked_by_directory_budget),
     writeAmplification: inputBytes > 0 ? intermediateBytes / inputBytes : 0
   };
 }
@@ -313,17 +336,22 @@ async function tierMergeSegments(segments, scratchDir, config) {
     let inputBytes = 0;
     let outputBytes = 0;
     let mergedBatches = 0;
+    let tempLimited = false;
+    let directoryLimited = false;
     for (const batch of mergeBatches(current, config)) {
       inputBytes += batch.reduce((sum, segment) => sum + segmentBytes(segment), 0);
       if (batch.length === 1) {
         next.push(batch[0]);
         skippedSegments++;
+        if (batch.tempLimited) tempLimited = true;
+        if (batch.directoryLimited) directoryLimited = true;
         continue;
       }
       const segment = await mergeSegmentBatchToSegment(batch, tierDir, `merged-${String(tier).padStart(2, "0")}-${String(batches.length).padStart(6, "0")}`, tier);
       next.push(segment);
       mergedBatches++;
       const batchInputBytes = batch.reduce((sum, item) => sum + segmentBytes(item), 0);
+      const batchDirectoryBytes = batch.reduce((sum, item) => sum + (item.termsBytes || 0), 0);
       const batchOutputBytes = segmentBytes(segment);
       outputBytes += batchOutputBytes;
       batches.push({
@@ -334,6 +362,7 @@ async function tierMergeSegments(segments, scratchDir, config) {
         input_terms: batch.reduce((sum, item) => sum + (item.termCount || 0), 0),
         input_postings: batch.reduce((sum, item) => sum + (item.postingCount || 0), 0),
         input_bytes: batchInputBytes,
+        input_directory_bytes: batchDirectoryBytes,
         output_terms: segment.termCount,
         output_postings: segment.postingCount,
         output_bytes: batchOutputBytes,
@@ -351,7 +380,8 @@ async function tierMergeSegments(segments, scratchDir, config) {
       input_bytes: inputBytes,
       output_bytes: outputBytes,
       estimated_write_amplification: inputBytes > 0 ? outputBytes / inputBytes : 0,
-      blocked_by_temp_budget: mergedBatches === 0 && next.length > targetSegments,
+      blocked_by_temp_budget: tempLimited && mergedBatches === 0 && next.length > targetSegments,
+      blocked_by_directory_budget: directoryLimited && mergedBatches === 0 && next.length > targetSegments,
       batches
     });
     if (mergedBatches === 0) {

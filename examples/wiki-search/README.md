@@ -21,10 +21,9 @@ To build the full English Wikipedia dump with the bounded body cap, use:
 npm run build:wiki-site:full
 ```
 
-The full-dump scripts omit the optional suggestion sidecar to keep peak heap
-bounded across millions of unique titles. Remove `--no-suggest` from the
-command when the build machine has enough additional memory and autocomplete
-is required.
+The full-dump scripts include autocomplete. Suggestion records stream through
+the bounded authority reducer, so millions of unique titles no longer require
+a corpus-sized heap map or a separate suggestion index.
 
 For the full French Wikipedia dump, use:
 
@@ -57,9 +56,8 @@ Useful options:
 - `--body-chars=N`: extraction cap for article body text before the JSONL is
   written. The Rangefind `bodyIndexChars` config then applies a separate
   indexing-only cap, and result snippets remain controlled by `display`.
-- `--no-suggest`: omit the autocomplete sidecar. This is useful for a
-  memory-constrained full-dump validation because millions of unique title
-  surfaces otherwise need additional suggestion-build memory.
+- `--no-suggest`: omit autocomplete records entirely. It is no longer needed
+  for memory safety; use it only when the product does not expose completion.
 - `--multistream[=N]`: discover Wikimedia's ordered pages-articles shards and
   extract `N` concurrently (default `3` when the flag is present). The full
   English npm script enables this because it avoids one slow multi-hour HTTP

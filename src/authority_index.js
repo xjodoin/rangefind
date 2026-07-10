@@ -1,7 +1,17 @@
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { authorityKeysForValue, AUTHORITY_FORMAT, buildAuthorityShard } from "./authority_codec.js";
+import {
+  autocompleteEntrySummary,
+  autocompleteKeysForValue,
+  compareAutocomplete,
+  encodeAuthorityHotList,
+  encodeAuthorityLexiconRoot,
+  isAutocompleteKey,
+  AUTHORITY_LEXICON_FORMAT
+} from "./authority_lexicon.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { reduceRunToPartitions } from "./reduce_stream.js";
@@ -41,8 +51,18 @@ export function authorityFields(config) {
     .filter(field => field.path);
 }
 
+export function autocompleteFields(config) {
+  return (config.suggest || []).map(field => ({
+    path: field.path,
+    weightPath: field.weightPath || "",
+    tokenPrefixes: field.tokenPrefixes !== false,
+    maxTokenKeys: config.suggestMaxTokenKeys,
+    minKeyLength: config.suggestMinKeyLength
+  })).filter(field => field.path);
+}
+
 export function authorityEnabled(config) {
-  return config.authority !== false && authorityFields(config).length > 0;
+  return (config.authority !== false && authorityFields(config).length > 0) || autocompleteFields(config).length > 0;
 }
 
 function authorityShardConfig(config) {
@@ -54,8 +74,17 @@ function authorityShardConfig(config) {
 
 export function createAuthorityRunBuffer(config, outDir) {
   return authorityEnabled(config)
-    ? { byShard: new Map(), lines: 0, runsOut: outDir, baseShards: new Set(), fields: authorityFields(config), shardConfig: authorityShardConfig(config), enabled: true }
-    : { enabled: false, baseShards: new Set(), fields: [] };
+    ? {
+        byShard: new Map(),
+        lines: 0,
+        runsOut: outDir,
+        baseShards: new Set(),
+        fields: authorityFields(config),
+        autocompleteFields: autocompleteFields(config),
+        shardConfig: authorityShardConfig(config),
+        enabled: true
+      }
+    : { enabled: false, baseShards: new Set(), fields: [], autocompleteFields: [] };
 }
 
 function flushAuthorityBuffer(buffer) {
@@ -68,46 +97,43 @@ function flushAuthorityBuffer(buffer) {
   buffer.lines = 0;
 }
 
-export function authorityRecordsForDoc(fields, doc, analyzer = null) {
-  const records = [];
-  const seen = new Set();
+export function authorityRecordsForDoc(fields, doc, analyzer = null, suggestionFields = []) {
+  const records = new Map();
   for (const field of fields || []) {
     for (const value of valueList(rawPath(doc, field.path))) {
       for (const { key, kind } of authorityKeysForValue(value, analyzer ? { ...field, analyzer } : field)) {
-        if (seen.has(key)) continue;
-        seen.add(key);
         const score = kind === "surface" ? field.surfaceWeight : kind === "exact" ? field.exactWeight : field.tokenWeight;
-        records.push({ key, score });
+        records.set(key, Math.max(records.get(key) || 0, score));
       }
     }
   }
-  return records;
+  for (const field of suggestionFields || []) {
+    const rawWeight = field.weightPath ? Number(rawPath(doc, field.weightPath, 0)) : 0;
+    const score = Number.isFinite(rawWeight) && rawWeight > 0 ? Math.floor(rawWeight) : 0;
+    for (const value of valueList(rawPath(doc, field.path))) {
+      for (const { key } of autocompleteKeysForValue(value, field)) {
+        records.set(key, Math.max(records.get(key) || 0, score));
+      }
+    }
+  }
+  return [...records].map(([key, score]) => ({ key, score }));
 }
 
 export function addAuthorityRecord(buffer, config, key, doc, score) {
-  if (!key || score <= 0) return;
+  if (!key || (score <= 0 && !isAutocompleteKey(key))) return;
   const shard = baseShardFor(key, buffer.shardConfig || authorityShardConfig(config));
   if (!buffer.byShard.has(shard)) buffer.byShard.set(shard, []);
   buffer.byShard.get(shard).push(encodeRunRecord(["string", "number", "number"], [key, doc, score]));
   buffer.baseShards.add(shard);
   buffer.lines++;
-  const flushRecords = Math.max(1, Math.floor(Number(config.authorityRunFlushRecords || 100000)));
+  const flushRecords = Math.max(1, Math.floor(Number(config.authorityRunFlushRecords || 5000)));
   if (buffer.lines >= flushRecords) flushAuthorityBuffer(buffer);
 }
 
-export function addAuthorityDoc(buffer, config, doc, index) {
+export function addAuthorityDoc(buffer, config, doc, index, analyzer = null) {
   if (!buffer.enabled) return;
-  const seen = new Set();
-  for (const field of buffer.fields) {
-    for (const value of valueList(rawPath(doc, field.path))) {
-      for (const { key, kind } of authorityKeysForValue(value, field)) {
-        const dedupeKey = `${key}\u0000${index}`;
-        if (seen.has(dedupeKey)) continue;
-        seen.add(dedupeKey);
-        const score = kind === "surface" ? field.surfaceWeight : kind === "exact" ? field.exactWeight : field.tokenWeight;
-        addAuthorityRecord(buffer, config, key, index, score);
-      }
-    }
+  for (const { key, score } of authorityRecordsForDoc(buffer.fields, doc, analyzer, buffer.autocompleteFields)) {
+    addAuthorityRecord(buffer, config, key, index, score);
   }
 }
 
@@ -141,6 +167,26 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
   const entries = [];
   let keyCount = 0;
   let rowCount = 0;
+  let autocompleteKeyCount = 0;
+  let autocompleteRowCount = 0;
+  const autocompleteShards = [];
+  const autocompleteWeighted = autocompleteFields(config).some(field => field.weightPath);
+  const hotLimit = Math.max(8, Math.floor(Number(config.suggestHotListSize || 64)));
+  const hot = new Map();
+
+  function mergeHotCandidate(item) {
+    const prefix = Array.from(item.normalized)[0] || "";
+    if (!prefix) return;
+    if (!hot.has(prefix)) hot.set(prefix, new Map());
+    const bucket = hot.get(prefix);
+    const previous = bucket.get(item.display);
+    if (!previous || compareAutocomplete(item, previous) < 0) bucket.set(item.display, item);
+    if (bucket.size > hotLimit * 2) {
+      const kept = [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit);
+      bucket.clear();
+      for (const entry of kept) bucket.set(entry.display, entry);
+    }
+  }
   mkdirSync(resolve(dirs.out, "authority"), { recursive: true });
   const processedRuns = new Set();
   for (const baseShard of baseShards) {
@@ -155,6 +201,25 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
       scratchDir: resolve(dirs.build || resolve(dirs.out, "_build"), "authority-reduce-sort", safeShardDirName(baseShard)),
       config: shardConfig,
       onPartition: (partition) => {
+        const autocomplete = partition.entries
+          .filter(([key]) => isAutocompleteKey(key))
+          .map(([key, rows]) => autocompleteEntrySummary(key, rows, { weighted: autocompleteWeighted }));
+        if (autocomplete.length) {
+          let maxRank = 0;
+          let rows = 0;
+          for (const item of autocomplete) {
+            maxRank = Math.max(maxRank, item.rank);
+            rows += item.count;
+            mergeHotCandidate(item);
+          }
+          autocompleteShards.push({
+            shard: partition.name,
+            maxRank,
+            count: autocomplete.length
+          });
+          autocompleteKeyCount += autocomplete.length;
+          autocompleteRowCount += rows;
+        }
         const buffer = buildAuthorityShard(partition.entries, { maxRows: config.authorityMaxRowsPerKey });
         const entry = writePackedShard(packWriter, partition.name, gzipSync(buffer, { level: 6 }), {
           kind: "authority-shard",
@@ -173,6 +238,41 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const directoryEntries = entries.map(entry => ({ ...entry, packIndex: packIndexes.get(entry.pack) }));
   const directory = writeDirectoryFiles(resolve(dirs.out, "authority"), directoryEntries, config.authorityDirectoryPageBytes || config.directoryPageBytes, "authority", { packTable: packWriter.packs });
+  let autocomplete = null;
+  if (autocompleteShards.length) {
+    const hotLists = new Map();
+    for (const [prefix, bucket] of hot) {
+      hotLists.set(prefix, [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit));
+    }
+    const hotObjects = new Map();
+    let hotBytes = 0;
+    mkdirSync(resolve(dirs.out, "authority", "hot"), { recursive: true });
+    for (const [prefix, items] of hotLists) {
+      const source = encodeAuthorityHotList(items);
+      const compressed = gzipSync(source, { level: 6 });
+      const hash = createHash("sha256").update(compressed).digest("hex");
+      const file = `authority/hot/${hash.slice(0, 24)}.bin.gz`;
+      writeFileSync(resolve(dirs.out, file), compressed);
+      hotBytes += compressed.length;
+      hotObjects.set(prefix, { file, bytes: compressed.length, count: items.length });
+    }
+    const root = encodeAuthorityLexiconRoot({ shards: autocompleteShards, hot: hotObjects, weighted: autocompleteWeighted });
+    const compressed = gzipSync(root, { level: 6 });
+    const hash = createHash("sha256").update(compressed).digest("hex");
+    const file = `authority/lexicon-root.${hash.slice(0, 24)}.bin.gz`;
+    writeFileSync(resolve(dirs.out, file), compressed);
+    autocomplete = {
+      format: AUTHORITY_LEXICON_FORMAT,
+      fields: autocompleteFields(config),
+      keys: autocompleteKeyCount,
+      rows: autocompleteRowCount,
+      shards: autocompleteShards.length,
+      hot_prefixes: hotLists.size,
+      hot_list_size: hotLimit,
+      hot_bytes: hotBytes,
+      directory: { file, bytes: compressed.length, logical_bytes: root.length, immutable: true }
+    };
+  }
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
@@ -185,6 +285,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
     keys: keyCount,
     rows: rowCount,
     shards: finalShards.length,
+    autocomplete,
     directory,
     packs: packWriter.packs,
     pack_bytes: packWriter.bytes,
