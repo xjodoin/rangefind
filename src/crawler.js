@@ -172,6 +172,10 @@ function inferConfig({ usedFields, filterKeys, sortValues, langs, anyDescription
   if (anyDescription) display.push("description");
   display.push({ name: "excerpt", path: "body", maxChars: 300 });
 
+  // Page titles power search-as-you-type out of the box (the component's
+  // `suggest` attribute and `rangefind suggest`).
+  const suggest = usedFields.has("title") ? [{ path: "title" }] : [];
+
   const languages = langs.size ? [...langs].sort() : DEFAULT_ANALYSIS_LANGUAGES.slice();
 
   return {
@@ -187,6 +191,7 @@ function inferConfig({ usedFields, filterKeys, sortValues, langs, anyDescription
     facets,
     numbers,
     sorts,
+    suggest,
     display
   };
 }

@@ -68,7 +68,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || 'XXXXX-XXXXX-XXXXX-XXXXX' }}
         run: |
           set -e
-          for dir in . packages/docusaurus-plugin-rangefind packages/eleventy-plugin-rangefind packages/rangefind-astro; do
+          for dir in . packages/docusaurus-plugin-rangefind packages/eleventy-plugin-rangefind packages/rangefind-astro packages/rangefind-mcp; do
             NAME="$(node -p "require('./$dir/package.json').name")"
             VERSION="$(node -p "require('./$dir/package.json').version")"
             if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then

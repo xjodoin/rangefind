@@ -23,7 +23,10 @@ const res = await rf.search({
   page: 1,
   size: 10,
   facets: ["topic"],
-  filters: { topic: ["ports"], year: { gte: 1990 } },
+  filters: {
+    facets: { topic: ["ports"] },
+    numbers: { year: { min: 1990 } }
+  },
   sort: "-year",
   highlight: true
 });
@@ -34,7 +37,7 @@ const res = await rf.search({
 | `q` | query text; analyzed with the index's frozen profile |
 | `page`, `size` | pagination (size ≤ 100) |
 | `facets` | facet names to count for this query |
-| `filters` | facet values, numeric/date ranges (`gte`/`lte`), booleans |
+| `filters` | `{ facets: {field: [values]}, numbers: {field: {min, max}}, booleans: {field: bool} }` |
 | `sort` | `"field"` / `"-field"` over a number or boolean field |
 | `geo` | see [geo queries](#geo-queries) |
 | `shards` | sharded indexes: scope to shard ids or group labels |

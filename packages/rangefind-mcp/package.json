@@ -1,0 +1,26 @@
+{
+  "name": "rangefind-mcp",
+  "version": "0.3.1",
+  "description": "MCP server exposing rangefind static search indexes (local or remote; single, generational, or sharded) as tools: search, autocomplete, counts, and index metadata.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Xavier Jodoin <xavier@jodoin.me>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xjodoin/rangefind.git",
+    "directory": "packages/rangefind-mcp"
+  },
+  "homepage": "https://github.com/xjodoin/rangefind/tree/main/packages/rangefind-mcp#readme",
+  "bugs": { "url": "https://github.com/xjodoin/rangefind/issues" },
+  "keywords": ["mcp", "model-context-protocol", "search", "static-search", "rangefind", "agent-tools"],
+  "engines": { "node": ">=22" },
+  "bin": { "rangefind-mcp": "./bin.js" },
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "bin.js", "README.md"],
+  "scripts": { "test": "node --test test/*.test.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "rangefind": "^0.3.0",
+    "zod": "^3.24.0"
+  }
+}

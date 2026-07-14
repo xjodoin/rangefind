@@ -20,8 +20,28 @@
   all expose the same capability. The Eleventy plugin also no longer warns
   on Nunjucks' internal `__keywords` shortcode marker.
 
+- **Query CLI**: the `rangefind` binary now queries indexes as well as
+  building them — `search` (facets, `--filter` facet/range/boolean filters,
+  `--sort`, `--near`/`--box` geo, `--shards` scoping, `--json`), `suggest`,
+  `count`, and `info` (totals, provenance, features, shard tree) against any
+  local directory or http(s) index URL. Query-command failures print
+  one-line messages with a failing exit code.
+- **MCP server** (`rangefind-mcp`, new package): exposes any rangefind
+  index as Model Context Protocol tools — `rangefind_search` (text + geo +
+  facets + shard scoping), `rangefind_suggest`, `rangefind_count`,
+  `rangefind_info`, and `rangefind_list_indexes` — over stdio via the
+  official SDK, with structured content, read-only annotations, cached
+  engines, and configured/open index access modes. Lives in its own package
+  so the core keeps zero runtime dependencies.
+- Crawled sites now build a title autocomplete lexicon by default, powering
+  the component's `suggest` attribute and `rangefind suggest` on every
+  plugin-indexed site.
+
 ### Changed
 
+- Search params `filters` documentation and TypeScript types now describe
+  the engine's actual shape (`{ facets, numbers: {field: {min, max}},
+  booleans }`).
 - Site crawls now index deep body vocabulary: the crawler's generated config
   sets `targetPostingsPerDoc: 128` (the corpus-scale default of 12 dropped
   most body terms on long pages, breaking multi-word site search).

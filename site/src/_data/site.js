@@ -29,7 +29,8 @@ export default {
       items: [
         { title: "Query API", url: "/docs/query-api/" },
         { title: "Search component", url: "/docs/search-component/" },
-        { title: "Node runtime", url: "/docs/node-runtime/" }
+        { title: "Node runtime", url: "/docs/node-runtime/" },
+        { title: "CLI & MCP server", url: "/docs/cli-mcp/" }
       ]
     },
     {

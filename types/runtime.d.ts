@@ -32,7 +32,11 @@ export interface SearchParams {
   /** "field" | "-field" | { field, order } over a number/boolean field. */
   sort?: string | { field: string; order?: "asc" | "desc"; direction?: "asc" | "desc" };
   facets?: string[];
-  filters?: Record<string, unknown>;
+  filters?: {
+    facets?: Record<string, string[]>;
+    numbers?: Record<string, { min?: number; max?: number }>;
+    booleans?: Record<string, boolean>;
+  };
   geo?: GeoParams;
   /**
    * Sharded indexes only: restrict to shard ids or group labels
