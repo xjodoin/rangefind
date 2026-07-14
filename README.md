@@ -113,7 +113,7 @@ they optimize for smaller sites. Rangefind is for the case where you want:
 
 ## Quick Start
 
-Demos: https://xjodoin.github.io/rangefind/ — an OpenStreetMap map search
+Demos: https://rangefind.dev/ — an OpenStreetMap map search
 (175k places with autocomplete, viewport geo queries, and nearest-neighbor)
 and the minimal example, both served as pure static files.
 
