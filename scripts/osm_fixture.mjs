@@ -478,6 +478,28 @@ async function writeJsonl(args) {
 }
 
 
+// Programmatic extraction API, published as `rangefind/osm/extract`: PBF →
+// normalized places JSONL under `${root}/data/`, reusing the fingerprinted
+// skip logic (a second call with an unchanged PBF returns immediately).
+// Returns the corpus meta ({ docs, bytes, seconds, … }).
+export async function extractOsmPlaces(options = {}) {
+  const root = String(options.root || "examples/osm-geo");
+  const region = String(options.region || "custom");
+  const args = {
+    command: "jsonl",
+    region,
+    pbf: options.pbf ? String(options.pbf) : `${root}/data/${region}-latest.osm.pbf`,
+    root,
+    limit: Math.max(0, Math.floor(Number(options.limit || 0))),
+    force: Boolean(options.force),
+    rqa: Boolean(options.rqa),
+    rqaArchive: options.rqaArchive ? String(options.rqaArchive) : `${root}/data/RQA_CSV.zip`,
+    buildProgressLogMs: Number(options.buildProgressLogMs ?? 15000)
+  };
+  await writeJsonl(args);
+  return JSON.parse(readFileSync(resolve(root, "data", "osm-places.meta.json"), "utf8"));
+}
+
 async function run() {
   const args = parseArgs(process.argv.slice(2));
   if (!["jsonl", "build", "all"].includes(args.command)) {

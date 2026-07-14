@@ -1,8 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-07-14
 
 ### Added
+
+- **Release structure**: conditional package exports — node-only entries
+  (`./node`, `./builder`, `./crawler`, `./config`, `./shards`,
+  `./scoring-stats`, `./osm/node`, `./osm/extract`) resolve to a clear
+  import-time error under browser bundler conditions instead of failing on
+  `node:` built-ins. TypeScript declarations for the public surface
+  (search params/responses including `shards` scoping and geo, builder,
+  config, sharded roots, scoring stats, OSM integration). New
+  `rangefind/osm/extract` entry exposes PBF → places JSONL extraction as a
+  stable API (`extractOsmPlaces`) instead of a script path inside
+  `node_modules`. `prepublishOnly` runs the full bundle + test + smoke
+  pipeline.
 
 - **Geographic index sharding** (`docs/sharded-osm.md`): a corpus can now be
   built as independently updated per-region shards that federate into one

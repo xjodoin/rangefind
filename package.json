@@ -1,6 +1,6 @@
 {
   "name": "rangefind",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",
@@ -30,25 +30,68 @@
   "bin": {
     "rangefind": "./bin/rangefind.js"
   },
+  "types": "./types/runtime.d.ts",
   "exports": {
-    ".": "./src/runtime.js",
-    "./node": "./src/runtime.node.js",
-    "./browser": "./dist/runtime.browser.js",
+    ".": {
+      "types": "./types/runtime.d.ts",
+      "default": "./src/runtime.js"
+    },
+    "./node": {
+      "types": "./types/node.d.ts",
+      "node": "./src/runtime.node.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./browser": {
+      "types": "./types/runtime.d.ts",
+      "default": "./dist/runtime.browser.js"
+    },
     "./element": "./dist/rangefind-search.js",
     "./element.css": "./dist/rangefind-search.css",
-    "./builder": "./src/builder.js",
-    "./crawler": "./src/crawler.js",
-    "./osm": "./src/integrations/osm/index.js",
-    "./osm/node": "./src/integrations/osm/node/builder.js",
-    "./shards": "./src/index_shards.js",
-    "./scoring-stats": "./src/scoring_stats.js",
-    "./config": "./src/config.js",
+    "./builder": {
+      "types": "./types/builder.d.ts",
+      "node": "./src/builder.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./crawler": {
+      "node": "./src/crawler.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./osm": {
+      "types": "./types/osm.d.ts",
+      "default": "./src/integrations/osm/index.js"
+    },
+    "./osm/node": {
+      "types": "./types/osm-node.d.ts",
+      "node": "./src/integrations/osm/node/builder.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./osm/extract": {
+      "types": "./types/osm-node.d.ts",
+      "node": "./src/integrations/osm/node/extract.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./shards": {
+      "types": "./types/shards.d.ts",
+      "node": "./src/index_shards.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./scoring-stats": {
+      "types": "./types/scoring-stats.d.ts",
+      "node": "./src/scoring_stats.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./config": {
+      "types": "./types/config.d.ts",
+      "node": "./src/config.js",
+      "default": "./src/node_only_entry.js"
+    },
     "./analysis": "./src/analysis.js",
     "./terms": "./src/terms.js"
   },
   "files": [
     "bin/",
     "dist/",
+    "types/",
     "src/",
     "docs/",
     "scripts/",
@@ -105,7 +148,8 @@
     "check": "for f in bin/rangefind.js src/*.js src/integrations/osm/*.js src/integrations/osm/node/*.js scripts/*.mjs test/*.js dist/*.js examples/wiki-search/scripts/*.mjs examples/wiki-search/public/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
     "test": "node --test test/*.test.js",
     "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",
-    "test:all": "npm run build:browser && npm run build:element && npm run check && npm test && npm run test:smoke"
+    "test:all": "npm run build:browser && npm run build:element && npm run check && npm test && npm run test:smoke",
+    "prepublishOnly": "npm run test:all"
   },
   "devDependencies": {
     "esbuild": "^0.25.12"
