@@ -1,6 +1,6 @@
 {
   "name": "rangefind-mcp",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "MCP server exposing rangefind static search indexes (local or remote; single, generational, or sharded) as tools: search, autocomplete, counts, and index metadata.",
   "type": "module",
   "license": "MIT",
@@ -43,5 +43,6 @@
     "@modelcontextprotocol/sdk": "^1.12.0",
     "rangefind": "^0.3.0",
     "zod": "^3.24.0"
-  }
+  },
+  "mcpName": "io.github.xjodoin/rangefind"
 }
