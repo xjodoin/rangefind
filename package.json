@@ -86,7 +86,8 @@
       "default": "./src/node_only_entry.js"
     },
     "./analysis": "./src/analysis.js",
-    "./terms": "./src/terms.js"
+    "./terms": "./src/terms.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "bin/",
@@ -152,6 +153,10 @@
     "prepublishOnly": "npm run test:all"
   },
   "devDependencies": {
-    "esbuild": "^0.25.12"
-  }
+    "esbuild": "^0.25.12",
+    "rangefind": "file:."
+  },
+  "workspaces": [
+    "packages/*"
+  ]
 }

@@ -39,6 +39,7 @@ jobs:
 
       - run: npm ci
       - run: npm run test:all
+      - run: npm test --workspaces
 
       # Guard: the tag must match the package version so a release can't
       # publish a mismatched version.
@@ -52,5 +53,19 @@ jobs:
             exit 1
           fi
 
-      - name: Publish
-        run: npm publish --provenance --access public
+      # Publishes the core package and every workspace plugin, skipping
+      # versions already on the registry — re-runs are idempotent, and
+      # plugins version independently of the core.
+      - name: Publish packages
+        run: |
+          set -e
+          for dir in . packages/docusaurus-plugin-rangefind packages/eleventy-plugin-rangefind packages/rangefind-astro; do
+            NAME="$(node -p "require('./$dir/package.json').name")"
+            VERSION="$(node -p "require('./$dir/package.json').version")"
+            if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+              echo "$NAME@$VERSION already on the registry — skipping"
+              continue
+            fi
+            echo "Publishing $NAME@$VERSION"
+            (cd "$dir" && npm publish --provenance --access public)
+          done

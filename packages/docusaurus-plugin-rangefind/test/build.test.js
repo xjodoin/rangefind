@@ -16,7 +16,20 @@ const { readFile, readdir, stat } = require("node:fs/promises");
 const PKG_DIR = path.resolve(__dirname, "..");
 const FIXTURE_DIR = path.join(PKG_DIR, "test", "fixture");
 const BUILD_DIR = path.join(FIXTURE_DIR, "build");
-const DOCUSAURUS_BIN = path.join(PKG_DIR, "node_modules", ".bin", "docusaurus");
+
+// npm workspaces hoist binaries to the repo root's node_modules/.bin; walk
+// up from the package so the test works standalone and in the workspace.
+function findBin(name) {
+  let dir = PKG_DIR;
+  for (;;) {
+    const candidate = path.join(dir, "node_modules", ".bin", name);
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) throw new Error(`${name} binary not found above ${PKG_DIR}`);
+    dir = parent;
+  }
+}
+const DOCUSAURUS_BIN = findBin("docusaurus");
 
 // Static file server with HTTP Range support (mirrors test/build-runtime.test.js
 // serveStatic in the repo root). Serves `root`; the Rangefind runtime is pointed

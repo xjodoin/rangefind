@@ -1,6 +1,6 @@
 {
   "name": "rangefind-astro",
-  "version": "0.0.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Astro integration for Rangefind — builds a static search index at `astro build` time and ships a drop-in search component.",
   "type": "module",
@@ -30,7 +30,7 @@
     "test": "node --test test/build.test.js"
   },
   "dependencies": {
-    "rangefind": "file:../.."
+    "rangefind": "^0.3.0"
   },
   "peerDependencies": {
     "astro": ">=4.0.0"
@@ -42,5 +42,14 @@
   },
   "devDependencies": {
     "astro": "^5.13.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xjodoin/rangefind.git",
+    "directory": "packages/rangefind-astro"
+  },
+  "homepage": "https://github.com/xjodoin/rangefind/tree/main/packages/rangefind-astro#readme",
+  "bugs": {
+    "url": "https://github.com/xjodoin/rangefind/issues"
   }
 }

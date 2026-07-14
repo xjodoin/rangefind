@@ -1,6 +1,6 @@
 {
   "name": "docusaurus-plugin-rangefind",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Docusaurus plugin that indexes your built site with Rangefind (static search over HTTP Range requests, no server) and injects the drop-in <rangefind-search> web component.",
   "license": "MIT",
@@ -25,12 +25,21 @@
     "@docusaurus/core": ">=3.0.0"
   },
   "dependencies": {
-    "rangefind": "file:../.."
+    "rangefind": "^0.3.0"
   },
   "devDependencies": {
     "@docusaurus/core": "^3",
     "@docusaurus/preset-classic": "^3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xjodoin/rangefind.git",
+    "directory": "packages/docusaurus-plugin-rangefind"
+  },
+  "homepage": "https://github.com/xjodoin/rangefind/tree/main/packages/docusaurus-plugin-rangefind#readme",
+  "bugs": {
+    "url": "https://github.com/xjodoin/rangefind/issues"
   }
 }

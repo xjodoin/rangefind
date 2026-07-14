@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 import { readFile, rm, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -16,7 +17,18 @@ const testDir = dirname(fileURLToPath(import.meta.url));
 const pkgDir = resolve(testDir, "..");
 const fixtureDir = join(testDir, "fixture");
 const distDir = join(fixtureDir, "dist");
-const astroBin = join(pkgDir, "node_modules", ".bin", "astro");
+// npm workspaces hoist binaries to the repo root's node_modules/.bin; walk
+// up from the package so the test works standalone and in the workspace.
+const astroBin = (() => {
+  let dir = pkgDir;
+  for (;;) {
+    const candidate = join(dir, "node_modules", ".bin", "astro");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) throw new Error(`astro binary not found above ${pkgDir}`);
+    dir = parent;
+  }
+})();
 
 // Range-capable static file server (mirrors test/build-runtime.test.js).
 async function serveStatic(root) {
