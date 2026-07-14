@@ -67,7 +67,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || 'XXXXX-XXXXX-XXXXX-XXXXX' }}
         run: |
-          set -e
+          FAILED=""
           for dir in . packages/docusaurus-plugin-rangefind packages/eleventy-plugin-rangefind packages/rangefind-astro packages/rangefind-mcp; do
             NAME="$(node -p "require('./$dir/package.json').name")"
             VERSION="$(node -p "require('./$dir/package.json').version")"
@@ -76,16 +76,30 @@ jobs:
               continue
             fi
             echo "Publishing $NAME@$VERSION"
-            (cd "$dir" && npm publish --provenance --access public)
+            # Attempt every package even when one fails (a new package's
+            # first publish needs a token bootstrap) — collect failures.
+            if ! (cd "$dir" && npm publish --provenance --access public); then
+              echo "::error::$NAME@$VERSION publish command failed"
+              FAILED="$FAILED $NAME@$VERSION"
+              continue
+            fi
             # npm exits 0 on warnings (e.g. a private flag silently skips
             # the publish) — trust only the registry.
+            CONFIRMED=""
             for attempt in 1 2 3 4 5; do
               if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
                 echo "$NAME@$VERSION confirmed on the registry"
-                continue 2
+                CONFIRMED=1
+                break
               fi
               sleep 10
             done
-            echo "::error::$NAME@$VERSION did not appear on the registry after publish"
-            exit 1
+            if [ -z "$CONFIRMED" ]; then
+              echo "::error::$NAME@$VERSION did not appear on the registry after publish"
+              FAILED="$FAILED $NAME@$VERSION"
+            fi
           done
+          if [ -n "$FAILED" ]; then
+            echo "::error::Failed packages:$FAILED"
+            exit 1
+          fi

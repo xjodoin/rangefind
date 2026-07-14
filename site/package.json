@@ -12,6 +12,7 @@
     "@11ty/eleventy": "^3.0.0",
     "@11ty/eleventy-plugin-syntaxhighlight": "^5.0.0",
     "@huggingface/transformers": "^4.2.0",
-    "eleventy-plugin-rangefind": "^0.3.0"
+    "eleventy-plugin-rangefind": "^0.3.0",
+    "markdown-it": "^14.1.0"
   }
 }

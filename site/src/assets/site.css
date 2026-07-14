@@ -366,6 +366,7 @@ main .button--ghost:hover { border-color: var(--link); color: var(--link); }
   border-radius: 3px;
 }
 
+.docs--single { grid-template-columns: 1fr; }
 .docs-main { padding: 1.9rem 0 4rem; min-width: 0; }
 .docs-main > * { max-width: var(--w-text); }
 .docs-main pre { max-width: none; }

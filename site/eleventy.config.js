@@ -1,5 +1,11 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import markdownIt from "markdown-it";
 import syntaxHighlight from "@11ty/eleventy-plugin-syntaxhighlight";
 import rangefindPlugin from "eleventy-plugin-rangefind";
+
+const siteDir = dirname(fileURLToPath(import.meta.url));
 
 // GitHub Pages serves the site under /rangefind/; local dev serves at /.
 // Every internal URL goes through Eleventy's `url` filter, and the search
@@ -37,6 +43,15 @@ export default function (eleventyConfig) {
   });
 
   eleventyConfig.addPassthroughCopy({ "src/assets": "assets" });
+
+  // The changelog page renders the repository's CHANGELOG.md verbatim, so
+  // the site can never drift from the source of truth.
+  eleventyConfig.addGlobalData("changelogHtml", () => {
+    const md = markdownIt({ html: false, linkify: true });
+    const source = readFileSync(resolve(siteDir, "../CHANGELOG.md"), "utf8")
+      .replace(/^# Changelog\s*/u, ""); // the page supplies its own H1
+    return md.render(source);
+  });
 
   eleventyConfig.addCollection("docs", collection =>
     collection

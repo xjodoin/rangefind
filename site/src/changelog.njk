@@ -1,0 +1,16 @@
+---
+layout: base.njk
+title: Changelog
+description: Release history for rangefind — every feature, fix, and measured improvement, straight from the repository's CHANGELOG.
+permalink: /changelog/
+---
+<div class="docs docs--single">
+  <main id="main" class="docs-main" data-rangefind-body>
+    <h1>Changelog</h1>
+    <p class="docs-lede">
+      Straight from the repository's <code>CHANGELOG.md</code> — rendered at
+      build time, so this page and the source can't disagree.
+    </p>
+    {{ changelogHtml | safe }}
+  </main>
+</div>
