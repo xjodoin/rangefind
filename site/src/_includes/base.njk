@@ -13,7 +13,12 @@
   <meta property="og:description" content="{{ description or site.description }}">
   <meta property="og:url" content="{{ site.origin }}{{ page.url | url }}">
   <meta property="og:image" content="{{ site.origin }}{{ '/assets/og.png' | url }}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Rangefind — Search, without the server. A static search index read with HTTP range requests.">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#14161d">
+  <script type="application/ld+json">{{ jsonLd | safe }}</script>
   <link rel="preload" href="{{ '/assets/fonts/bricolage-grotesque-400-800-latin.woff2' | url }}" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="{{ '/assets/fonts/martian-mono-400-latin.woff2' | url }}" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="{{ '/assets/site.css' | url }}">

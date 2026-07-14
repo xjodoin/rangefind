@@ -1,0 +1,26 @@
+---
+permalink: /llms.txt
+eleventyExcludeFromCollections: true
+---
+# Rangefind
+
+> Rangefind is a static search engine: it packs a corpus into an index of plain immutable files, and the browser (or Node, or an MCP agent) answers queries by reading only the byte ranges it needs over HTTP. Full-text BM25F relevance, typo correction, facets, autocomplete, geo search, and vector/hybrid semantic search — with no search server, no SaaS, and no per-query cost.
+
+Key facts: MIT licensed; zero runtime dependencies in the core npm package (`rangefind`); indexes proven at 7.2M-page (English Wikipedia) and 33M-place (OpenStreetMap) scale; geographic sharding federates planet-scale corpora with rankings identical to a monolithic build; every claim on this site is backed by committed, rerunnable benchmarks.
+
+Install: `npm install rangefind`. Index a built site: `npx rangefind build ./dist`. Query from a browser via `createSearch({ baseUrl })`, from Node via `rangefind/node`, from a shell via `rangefind search`, or from an agent via the `rangefind-mcp` MCP server.
+
+## Documentation
+
+{% for group in site.docsNav %}{% for item in group.items %}{% for doc in collections.docs %}{% if doc.url == item.url %}- [{{ item.title | safe }}]({{ site.origin }}{{ item.url | url }}): {{ doc.data.description | safe }}
+{% endif %}{% endfor %}{% endfor %}{% endfor %}
+## Reference
+
+- [Changelog]({{ site.origin }}{{ '/changelog/' | url }}): Release history, rendered from the repository's CHANGELOG.md.
+- [GitHub repository]({{ site.repo }}): Source, benchmarks, tests, and the sharded planet-OSM architecture document (docs/sharded-osm.md).
+- [npm package]({{ site.npm }}): Core package; plugins ship as eleventy-plugin-rangefind, rangefind-astro, docusaurus-plugin-rangefind, mkdocs-rangefind (PyPI), and rangefind-mcp.
+
+## Optional
+
+- [Full documentation as one file]({{ site.origin }}{{ '/llms-full.txt' | url }}): Every documentation page concatenated as raw Markdown.
+- [Live map demo]({{ site.origin }}{{ '/map/' | url }}): 175k OpenStreetMap places searched from static files.

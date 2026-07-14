@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import markdownIt from "markdown-it";
@@ -51,6 +51,24 @@ export default function (eleventyConfig) {
     const source = readFileSync(resolve(siteDir, "../CHANGELOG.md"), "utf8")
       .replace(/^# Changelog\s*/u, ""); // the page supplies its own H1
     return md.render(source);
+  });
+
+  // llms-full.txt: every docs page as raw Markdown (front matter stripped,
+  // title/lede promoted to a heading), in nav order.
+  eleventyConfig.addGlobalData("llmsFullDocs", () => {
+    const dir = resolve(siteDir, "src/docs");
+    const pages = [];
+    for (const file of readdirSync(dir).filter(name => name.endsWith(".md")).sort()) {
+      const raw = readFileSync(resolve(dir, file), "utf8");
+      const match = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/u);
+      if (!match) continue;
+      const front = match[1];
+      const title = front.match(/^title:\s*(.*)$/mu)?.[1] || file;
+      const lede = front.match(/^lede:\s*(.*)$/mu)?.[1] || "";
+      const order = Number(front.match(/^order:\s*(\d+)$/mu)?.[1] || 999);
+      pages.push({ order, text: `## ${title}\n\n${lede ? `> ${lede}\n\n` : ""}${match[2].trim()}` });
+    }
+    return pages.sort((a, b) => a.order - b.order).map(page => page.text).join("\n\n---\n\n");
   });
 
   eleventyConfig.addCollection("docs", collection =>
