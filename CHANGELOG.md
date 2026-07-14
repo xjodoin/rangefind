@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Per-query hook on `<rangefind-search>`**: `element.searchOptions.transform`
+  — an async function receiving the params about to be sent and returning the
+  params to use. Built for hybrid semantic search (embed the query, set
+  `params.vector`); stale transforms are dropped when a newer keystroke wins.
+- **Crawler enrichment**: `buildFromCrawl({ enrich })` runs an async hook on
+  the crawled documents before indexing (embeddings, external metadata), and
+  `buildFromCrawl({ config })` merges overrides into the generated config
+  (e.g. a `vectors` declaration for enriched embeddings).
+- The Eleventy plugin passes both through (`config`, `enrich` options) and no
+  longer warns on Nunjucks' internal `__keywords` shortcode marker.
+
+### Changed
+
+- Site crawls now index deep body vocabulary: the crawler's generated config
+  sets `targetPostingsPerDoc: 128` (the corpus-scale default of 12 dropped
+  most body terms on long pages, breaking multi-word site search).
+
 ## 0.3.0 — 2026-07-14
 
 ### Added

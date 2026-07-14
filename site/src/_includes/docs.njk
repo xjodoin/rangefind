@@ -1,0 +1,18 @@
+---
+layout: base.njk
+---
+<div class="docs">
+  <nav class="docs-nav" aria-label="Documentation">
+    {% for group in site.docsNav %}
+      <p class="docs-nav__section">{{ group.section }}</p>
+      {% for item in group.items %}
+        <a href="{{ item.url | url }}"{% if page.url == item.url %} aria-current="page"{% endif %}>{{ item.title }}</a>
+      {% endfor %}
+    {% endfor %}
+  </nav>
+  <main id="main" class="docs-main" data-rangefind-body>
+    <h1>{{ title }}</h1>
+    {% if lede %}<p class="docs-lede">{{ lede }}</p>{% endif %}
+    {{ content | safe }}
+  </main>
+</div>

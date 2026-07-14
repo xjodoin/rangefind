@@ -25,7 +25,7 @@ export const PART_CLASS_ATTRS = [
 export const KNOWN_ATTRS = new Set([...CONFIG_ATTRS, ...PART_CLASS_ATTRS]);
 
 // Keys that control markup structure rather than element attributes.
-const CONTROL_KEYS = new Set(["src", "assetsBase", "theme"]);
+const CONTROL_KEYS = new Set(["src", "assetsBase", "theme", "__keywords"]); // __keywords: Nunjucks kwargs marker
 
 // camelCase / snake_case -> kebab-case, so `pageSize`, `page_size`, and
 // `page-size` all resolve to the `page-size` attribute the element observes.

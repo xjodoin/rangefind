@@ -1974,6 +1974,7 @@ function readBlockFilterSummary(bytes, state, manifest) {
   }
   return filters;
 }
+var POSTING_BLOCK_ROWS = Symbol("posting-block-rows");
 function readPackedUnsigned(source, state, count, width, byteLength) {
   const start = state.pos;
   state.pos += byteLength;
@@ -2584,6 +2585,238 @@ function parseAuthorityHotList(buffer) {
   return entries;
 }
 
+// src/address.js
+var DIRECTION_PHRASES = [
+  [/\bnorth[\s-]*east\b/gu, "ne"],
+  [/\bnorth[\s-]*west\b/gu, "nw"],
+  [/\bsouth[\s-]*east\b/gu, "se"],
+  [/\bsouth[\s-]*west\b/gu, "sw"]
+];
+var TOKEN_ALIASES = new Map(Object.entries({
+  north: "n",
+  south: "s",
+  east: "e",
+  west: "w",
+  northeast: "ne",
+  northwest: "nw",
+  southeast: "se",
+  southwest: "sw",
+  street: "st",
+  str: "st",
+  avenue: "ave",
+  av: "ave",
+  boulevard: "blvd",
+  road: "rd",
+  drive: "dr",
+  lane: "ln",
+  court: "ct",
+  circle: "cir",
+  highway: "hwy",
+  parkway: "pkwy",
+  place: "pl",
+  plaza: "plz",
+  square: "sq",
+  terrace: "ter",
+  trail: "trl",
+  route: "rte",
+  apartment: "apt",
+  suite: "ste",
+  unit: "unit"
+}));
+var SIMPLE_ORDINALS = new Map(Object.entries({
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  ninth: 9,
+  tenth: 10,
+  eleventh: 11,
+  twelfth: 12,
+  thirteenth: 13,
+  fourteenth: 14,
+  fifteenth: 15,
+  sixteenth: 16,
+  seventeenth: 17,
+  eighteenth: 18,
+  nineteenth: 19
+}));
+var ORDINAL_TENS = new Map(Object.entries({
+  twentieth: 20,
+  thirtieth: 30,
+  fortieth: 40,
+  fiftieth: 50,
+  sixtieth: 60,
+  seventieth: 70,
+  eightieth: 80,
+  ninetieth: 90
+}));
+var CARDINAL_TENS = new Map(Object.entries({
+  twenty: 20,
+  thirty: 30,
+  forty: 40,
+  fifty: 50,
+  sixty: 60,
+  seventy: 70,
+  eighty: 80,
+  ninety: 90
+}));
+function ordinal(value) {
+  const mod100 = value % 100;
+  const suffix = mod100 >= 11 && mod100 <= 13 ? "th" : value % 10 === 1 ? "st" : value % 10 === 2 ? "nd" : value % 10 === 3 ? "rd" : "th";
+  return `${value}${suffix}`;
+}
+function normalizeOrdinalTokens(tokens) {
+  const out = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    const simple = SIMPLE_ORDINALS.get(token);
+    if (simple != null) {
+      out.push(ordinal(simple));
+      continue;
+    }
+    const tensOrdinal = ORDINAL_TENS.get(token);
+    if (tensOrdinal != null) {
+      out.push(ordinal(tensOrdinal));
+      continue;
+    }
+    const tens = CARDINAL_TENS.get(token);
+    const nextOrdinal = SIMPLE_ORDINALS.get(tokens[index + 1]);
+    if (tens != null && nextOrdinal != null && nextOrdinal < 10) {
+      out.push(ordinal(tens + nextOrdinal));
+      index++;
+      continue;
+    }
+    out.push(token);
+  }
+  return out;
+}
+function normalizeAddressKey(value) {
+  let normalized = foldMulti(String(value || "")).toLowerCase();
+  for (const [pattern, replacement] of DIRECTION_PHRASES) normalized = normalized.replace(pattern, replacement);
+  const tokens = normalizeOrdinalTokens(normalized.match(/[a-z0-9]+/gu) || []);
+  return tokens.map((token) => TOKEN_ALIASES.get(token) || token).join(" ");
+}
+function normalizeAddressAuthorityKey(value) {
+  const key = normalizeAddressKey(value);
+  return key ? key.split(" ").sort().join(" ") : "";
+}
+var CANADIAN_POSTAL_CODE = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\b/giu;
+var CANADIAN_POSTAL_CODE_QUERY = /^\s*[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\s*$/iu;
+var CANADIAN_POSTAL_CODE_PREFIX = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9](?:[abceghj-nprstvwxyz](?:[0-9])?)?)$/iu;
+function looksLikeAddressQuery(value) {
+  if (CANADIAN_POSTAL_CODE_QUERY.test(String(value || ""))) return true;
+  const key = normalizeAddressKey(value);
+  if (!key) return false;
+  const tokens = key.split(" ");
+  if (tokens.length < 2) return false;
+  return tokens.some((token) => /^\d+[a-z]?(?:-\d+[a-z]?)?$/u.test(token) || /^\d+(?:st|nd|rd|th)$/u.test(token));
+}
+function normalizePostalCodeSpacing(value) {
+  return String(value || "").replace(CANADIAN_POSTAL_CODE, "$1 $2");
+}
+function normalizePostalCodePrefixSpacing(value) {
+  return String(value || "").replace(CANADIAN_POSTAL_CODE_PREFIX, "$1 $2");
+}
+var ADDRESS_RANGE_BUCKET_SIZE = 16;
+function rangeLookupValue(bucket, parity, tail) {
+  return `${tail} ${bucket.toString(36)} ${parity}`;
+}
+function addressRangeQueryCandidates(value, bucketSize = ADDRESS_RANGE_BUCKET_SIZE) {
+  const tokens = normalizeAddressKey(value).split(" ").filter(Boolean);
+  const candidates = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (let index = 0; index < tokens.length; index++) {
+    if (!/^\d+$/u.test(tokens[index])) continue;
+    const houseNumber = Number(tokens[index]);
+    if (!Number.isSafeInteger(houseNumber) || houseNumber < 0) continue;
+    const tail = tokens.filter((_, tokenIndex) => tokenIndex !== index).sort().join(" ");
+    if (!tail) continue;
+    const parity = Math.abs(houseNumber % 2);
+    for (const candidateParity of [parity, 1 - parity]) {
+      const lookupValue = rangeLookupValue(
+        Math.floor(houseNumber / bucketSize),
+        candidateParity,
+        tail
+      );
+      if (seen.has(lookupValue)) continue;
+      seen.add(lookupValue);
+      candidates.push({ houseNumber, lookupValue });
+    }
+  }
+  return candidates;
+}
+function addressRangeContains(start, end, step, houseNumber) {
+  const first = Number(start);
+  const last = Number(end);
+  const increment = Math.max(1, Math.floor(Number(step)));
+  const target = Number(houseNumber);
+  if (![first, last, target].every(Number.isInteger) || first === last) return false;
+  if (target < Math.min(first, last) || target > Math.max(first, last)) return false;
+  return Math.abs(target - first) % increment === 0;
+}
+function decodeAddressRangeGeometry(encoded) {
+  const source = String(encoded || "");
+  const points = [];
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+  function nextDelta() {
+    let result = 0;
+    let shift = 0;
+    for (; ; ) {
+      if (index >= source.length) throw new Error("Truncated address interpolation geometry.");
+      const value = source.charCodeAt(index++) - 63;
+      result |= (value & 31) << shift;
+      if (value < 32) break;
+      shift += 5;
+    }
+    return result & 1 ? ~(result >>> 1) : result >>> 1;
+  }
+  while (index < source.length) {
+    lat += nextDelta();
+    lon += nextDelta();
+    points.push({ lat: lat / 1e6, lon: lon / 1e6 });
+  }
+  return points;
+}
+function segmentLength(left, right) {
+  const meanLat = (left.lat + right.lat) * Math.PI / 360;
+  const dx = (right.lon - left.lon) * Math.cos(meanLat);
+  const dy = right.lat - left.lat;
+  return Math.hypot(dx, dy);
+}
+function interpolateAddressRangePoint(encodedGeometry, start, end, houseNumber) {
+  const points = decodeAddressRangeGeometry(encodedGeometry);
+  if (!points.length) return null;
+  if (points.length === 1) return points[0];
+  const denominator = Number(end) - Number(start);
+  const fraction = denominator ? Math.max(0, Math.min(1, (Number(houseNumber) - Number(start)) / denominator)) : 0;
+  const lengths = new Array(points.length - 1);
+  let total = 0;
+  for (let index = 0; index < lengths.length; index++) {
+    lengths[index] = segmentLength(points[index], points[index + 1]);
+    total += lengths[index];
+  }
+  if (!total) return points[0];
+  let remaining = total * fraction;
+  for (let index = 0; index < lengths.length; index++) {
+    if (remaining > lengths[index] && index + 1 < lengths.length) {
+      remaining -= lengths[index];
+      continue;
+    }
+    const local = lengths[index] ? remaining / lengths[index] : 0;
+    return {
+      lat: points[index].lat + (points[index + 1].lat - points[index].lat) * local,
+      lon: points[index].lon + (points[index + 1].lon - points[index].lon) * local
+    };
+  }
+  return points.at(-1);
+}
+
 // src/authority_codec.js
 var AUTHORITY_FORMAT = "rfauth-v2";
 var AUTHORITY_VERSION = 2;
@@ -2591,6 +2824,12 @@ var AUTHORITY_LEGACY_VERSION = 1;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
+var ADDRESS_PREFIX = "a|";
+var ADDRESS_RANGE_PREFIX = "i|";
+function authorityAddressRangeKey(value) {
+  const normalized = authorityNormalizeSurface(value);
+  return normalized ? `${ADDRESS_RANGE_PREFIX}${normalized}` : "";
+}
 function authorityNormalizeRawSurface(value) {
   return String(value || "").normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
 }
@@ -2607,6 +2846,10 @@ function authorityTokens(value, analyzer) {
 }
 function authorityKeysForValue(value, options = {}) {
   const analyzer = options.analyzer || DEFAULT_ANALYZER;
+  if (options.normalizer === "address-range") {
+    const key = authorityAddressRangeKey(value);
+    return key ? [{ key, kind: "address-range" }] : [];
+  }
   const out = [];
   const surface = options.surface !== false ? authorityNormalizeRawSurface(value) : "";
   if (surface) out.push({ key: `${SURFACE_PREFIX}${surface}`, kind: "surface" });
@@ -2616,12 +2859,24 @@ function authorityKeysForValue(value, options = {}) {
     const tokenKey = authorityTokenKeyFromTerms(authorityTokens(value, analyzer));
     if (tokenKey && !out.some((item) => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
   }
+  if (options.normalizer === "address") {
+    const address = normalizeAddressAuthorityKey(value);
+    if (address && !out.some((item) => item.key === `${ADDRESS_PREFIX}${address}`)) {
+      out.push({ key: `${ADDRESS_PREFIX}${address}`, kind: "address" });
+    }
+  }
   return out;
 }
 function authorityKeysForQuery(query, baseTerms, options = {}) {
   const out = authorityKeysForValue(query, { analyzer: options.analyzer });
   const tokenKey = authorityTokenKeyFromTerms(baseTerms);
   if (tokenKey && !out.some((item) => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
+  if (options.address) {
+    const address = normalizeAddressAuthorityKey(query);
+    if (address && !out.some((item) => item.key === `${ADDRESS_PREFIX}${address}`)) {
+      out.push({ key: `${ADDRESS_PREFIX}${address}`, kind: "address" });
+    }
+  }
   return out;
 }
 function parseAuthorityShard(buffer) {
@@ -4103,6 +4358,9 @@ async function createSearch(options = {}) {
   }
   const manifest = options.manifestName ? await fetchJsonIfOk(options.manifestName) : await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
+  if (Array.isArray(manifest.shards)) {
+    return createShardedSearch(manifest, options, baseUrl);
+  }
   if (Array.isArray(manifest.generations)) {
     return createGenerationalSearch(manifest, options, baseUrl);
   }
@@ -4948,11 +5206,11 @@ async function createSearch(options = {}) {
     const entries = [];
     const dfs = /* @__PURE__ */ new Map();
     for (const term of terms) {
-      for (let ordinal = 0; ordinal < meta.segments.length; ordinal++) {
-        const segment = meta.segments[ordinal];
-        const entry = dictionaries[ordinal]?.terms?.get(term);
+      for (let ordinal2 = 0; ordinal2 < meta.segments.length; ordinal2++) {
+        const segment = meta.segments[ordinal2];
+        const entry = dictionaries[ordinal2]?.terms?.get(term);
         if (!entry) continue;
-        entries.push({ term, segment, segmentOrdinal: ordinal, entry });
+        entries.push({ term, segment, segmentOrdinal: ordinal2, entry });
         dfs.set(term, (dfs.get(term) || 0) + (entry.df || entry.count || 0));
       }
     }
@@ -8453,9 +8711,9 @@ async function createSearch(options = {}) {
         Math.ceil(candidateK / 16) * docRangeBlockPruneInitialBatchSize
       )
     );
-    const rangeStates = plan.candidates.map((range, ordinal) => ({
+    const rangeStates = plan.candidates.map((range, ordinal2) => ({
       range,
-      ordinal,
+      ordinal: ordinal2,
       rangeSize: plan.rangeSize,
       initialized: false,
       exhausted: false,
@@ -9295,6 +9553,205 @@ async function createSearch(options = {}) {
     const surface = authorityNormalizeSurface(query);
     return !!title && !!surface && title === surface;
   }
+  const addressAuthorityEnabled = Boolean(
+    manifest.authority?.fields?.some((field) => field.normalizer === "address")
+  );
+  const addressInterpolationEnabled = Boolean(
+    manifest.authority?.fields?.some((field) => field.normalizer === "address-range")
+  );
+  function interpolatedAddressLabel(result, houseNumber) {
+    const base = [String(houseNumber), result.street].filter(Boolean).join(" ");
+    const parts = [
+      base,
+      result.suburb,
+      result.city,
+      result.district,
+      result.state,
+      result.postcode,
+      result.country
+    ].map((value) => String(value || "").trim()).filter(Boolean);
+    return [...new Set(parts)].join(", ");
+  }
+  function synthesizeInterpolatedAddress(result, houseNumber) {
+    if (!addressRangeContains(
+      result._address_range_start,
+      result._address_range_end,
+      result._address_range_step,
+      houseNumber
+    )) return null;
+    const point = interpolateAddressRangePoint(
+      result._address_range_geometry,
+      result._address_range_start,
+      result._address_range_end,
+      houseNumber
+    );
+    if (!point) return null;
+    const address = interpolatedAddressLabel(result, houseNumber);
+    const synthesized = {
+      ...result,
+      id: `${result.id}/${houseNumber}`,
+      title: address,
+      name: address,
+      address,
+      house_number: String(houseNumber),
+      type: "interpolated_address",
+      lat: Number(point.lat.toFixed(7)),
+      lon: Number(point.lon.toFixed(7)),
+      interpolated: true,
+      address_accuracy: result._address_range_inclusion || "actual",
+      interpolation: result._address_range_kind || ""
+    };
+    delete synthesized._address_range_start;
+    delete synthesized._address_range_end;
+    delete synthesized._address_range_step;
+    delete synthesized._address_range_geometry;
+    delete synthesized._address_range_kind;
+    delete synthesized._address_range_inclusion;
+    return synthesized;
+  }
+  async function tryAddressInterpolationFastPath({ q, page, size, includeResults }) {
+    if (!addressInterpolationEnabled) return null;
+    const candidates = addressRangeQueryCandidates(q);
+    if (!candidates.length) return null;
+    const housesByKey = /* @__PURE__ */ new Map();
+    for (const candidate of candidates) {
+      const key = authorityAddressRangeKey(candidate.lookupValue);
+      if (!key) continue;
+      if (!housesByKey.has(key)) housesByKey.set(key, /* @__PURE__ */ new Set());
+      housesByKey.get(key).add(candidate.houseNumber);
+    }
+    const entries = await authorityEntries([...housesByKey.keys()]);
+    const rowsByDoc = /* @__PURE__ */ new Map();
+    let complete = true;
+    for (const { key, entry } of entries) {
+      complete = complete && entry.complete !== false;
+      for (const [doc, score] of entry.rows || []) {
+        if (!rowsByDoc.has(doc)) rowsByDoc.set(doc, { doc, score, houses: /* @__PURE__ */ new Set() });
+        const row = rowsByDoc.get(doc);
+        row.score = Math.max(row.score, score);
+        for (const house of housesByKey.get(key) || []) row.houses.add(house);
+      }
+    }
+    if (!rowsByDoc.size) return null;
+    const ranked = [...rowsByDoc.values()].sort((left, right) => right.score - left.score || left.doc - right.doc);
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+    const hydrated = includeResults === false ? [] : await rowsToResults(ranked.map((row) => [row.doc, row.score]), resultContext);
+    const matches = [];
+    if (includeResults !== false) {
+      for (let index = 0; index < ranked.length; index++) {
+        for (const houseNumber of ranked[index].houses) {
+          const result = synthesizeInterpolatedAddress(hydrated[index], houseNumber);
+          if (result) matches.push(result);
+        }
+      }
+    } else {
+      return null;
+    }
+    if (!matches.length) {
+      if (!complete) return null;
+      return {
+        total: 0,
+        page,
+        size,
+        approximate: false,
+        results: [],
+        stats: {
+          exact: true,
+          plannerLane: "addressInterpolationExact",
+          topKProven: true,
+          totalExact: true,
+          tailExhausted: true,
+          addressInterpolationKeys: housesByKey.size,
+          addressInterpolationRows: ranked.length,
+          addressInterpolationMatches: 0,
+          addressInterpolationComplete: true,
+          blocksDecoded: 0,
+          postingsDecoded: 0,
+          docPayloadLane: resultContext.docPayloadLane,
+          docPayloadPages: resultContext.docPayloadPages,
+          docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+          docPayloadAdaptive: resultContext.docPayloadAdaptive,
+          docPayloadForced: resultContext.docPayloadForced
+        }
+      };
+    }
+    matches.sort((left, right) => right.score - left.score || left.index - right.index || left.house_number.localeCompare(right.house_number));
+    return {
+      total: matches.length,
+      page,
+      size,
+      approximate: !complete,
+      results: matches.slice(0, size),
+      stats: {
+        exact: true,
+        plannerLane: "addressInterpolationExact",
+        topKProven: complete,
+        totalExact: complete,
+        tailExhausted: complete,
+        addressInterpolationKeys: housesByKey.size,
+        addressInterpolationRows: ranked.length,
+        addressInterpolationMatches: matches.length,
+        addressInterpolationComplete: complete,
+        blocksDecoded: 0,
+        postingsDecoded: 0,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced
+      }
+    };
+  }
+  async function tryAddressAuthorityFastPath({ q, page, size, hasFilters, sortPlan, geoPlan, includeResults, authority }) {
+    if (!addressAuthorityEnabled || options.authority === false || authority === false) return null;
+    if (page !== 1 || hasFilters || sortPlan || geoPlan || !looksLikeAddressQuery(q)) return null;
+    const keyPlans = authorityKeysForQuery(q, [], { analyzer, address: true });
+    const addressKeys = [...new Set(keyPlans.filter((item) => item.kind === "address").map((item) => item.key))];
+    if (!addressKeys.length) return null;
+    const entries = await authorityEntries(addressKeys);
+    const rowsByDoc = /* @__PURE__ */ new Map();
+    let total = 0;
+    let complete = true;
+    for (const { entry } of entries) {
+      total = Math.max(total, entry.total || 0);
+      complete = complete && entry.complete !== false;
+      for (const [doc, score] of entry.rows || []) {
+        rowsByDoc.set(doc, Math.max(rowsByDoc.get(doc) || 0, score));
+      }
+    }
+    if (!rowsByDoc.size) {
+      return tryAddressInterpolationFastPath({ q, page, size, includeResults });
+    }
+    const ranked = [...rowsByDoc].sort((left, right) => right[1] - left[1] || left[0] - right[0]);
+    if (ranked.length < Math.min(size, total)) return null;
+    const pageRows = ranked.slice(0, size);
+    const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
+    const results = includeResults === false ? [] : await rowsToResults(pageRows, resultContext);
+    return {
+      total,
+      page,
+      size,
+      approximate: false,
+      results,
+      stats: {
+        exact: true,
+        plannerLane: "addressAuthorityExact",
+        topKProven: true,
+        totalExact: true,
+        tailExhausted: complete,
+        addressAuthorityKeys: addressKeys.length,
+        addressAuthorityRows: ranked.length,
+        addressAuthorityComplete: complete,
+        blocksDecoded: 0,
+        postingsDecoded: 0,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs,
+        docPayloadAdaptive: resultContext.docPayloadAdaptive,
+        docPayloadForced: resultContext.docPayloadForced
+      }
+    };
+  }
   async function maybeAuthorityRerank(params, response) {
     return traceSpan("authority.rerank", () => maybeAuthorityRerankInner(params, response));
   }
@@ -9309,13 +9766,21 @@ async function createSearch(options = {}) {
     const authorityQuery = String(response.correctedQuery || response.surfaceFallbackQuery || params.q || "").trim();
     if (!authorityQuery || resultTitleMatchesQuery(response.results?.[0], authorityQuery)) return response;
     const authorityTerms = analyzer.queryPlan(authorityQuery).baseTerms;
-    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms, { analyzer }).filter((item) => item.key);
+    const keyPlans = authorityKeysForQuery(authorityQuery, authorityTerms, {
+      analyzer,
+      address: addressAuthorityEnabled && looksLikeAddressQuery(authorityQuery)
+    }).filter((item) => item.key);
+    const addressKeys = [...new Set(keyPlans.filter((item) => item.kind === "address").map((item) => item.key))];
     const surfaceKeys = [...new Set(keyPlans.filter((item) => item.kind === "surface").map((item) => item.key))];
     const exactKeys = [...new Set(keyPlans.filter((item) => item.kind === "exact").map((item) => item.key))];
     const tokenKeys = [...new Set(keyPlans.filter((item) => item.kind === "tokens").map((item) => item.key))];
     if (!surfaceKeys.length && !exactKeys.length && !tokenKeys.length) return response;
-    let loadedKeys = surfaceKeys;
-    let entries = await authorityEntries(surfaceKeys);
+    let loadedKeys = addressKeys.length ? addressKeys : surfaceKeys;
+    let entries = await authorityEntries(loadedKeys);
+    if (!authorityEntryRows(entries) && surfaceKeys.length && loadedKeys !== surfaceKeys) {
+      loadedKeys = surfaceKeys;
+      entries = await authorityEntries(surfaceKeys);
+    }
     if (!authorityEntryRows(entries) && exactKeys.length) {
       loadedKeys = exactKeys;
       entries = await authorityEntries(exactKeys);
@@ -9471,6 +9936,23 @@ async function createSearch(options = {}) {
           docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
         }
       };
+    }
+    const addressResponse = await tryAddressAuthorityFastPath({
+      q,
+      page,
+      size,
+      hasFilters,
+      sortPlan,
+      geoPlan,
+      includeResults: params.includeResults !== false,
+      authority: params.authority
+    });
+    if (addressResponse) {
+      if (params.highlight && addressResponse.results.length) {
+        const highlightOptions = params.highlight === true ? {} : params.highlight;
+        applyHighlights(addressResponse.results, highlightTermSet(q, "", analyzer), { ...highlightOptions, analyzer });
+      }
+      return addressResponse;
     }
     const queryAnalysis = await resolveQueryPlan(q);
     const analyzedTerms = queryAnalysis.analyzedTerms;
@@ -9650,12 +10132,12 @@ async function createSearch(options = {}) {
     if (params.refine === false || !shortlist.length) {
       rows = shortlist.slice(0, k).map(([doc, , score]) => [doc, score]);
     } else {
-      const items = shortlist.map(([doc, ordinal, coarseScore]) => ({
+      const items = shortlist.map(([doc, ordinal2, coarseScore]) => ({
         doc,
         coarseScore,
         entry: {
-          pack: root.refine.packs[Math.floor(ordinal / root.refine.rowsPerPack)],
-          offset: ordinal % root.refine.rowsPerPack * root.refine.rowBytes,
+          pack: root.refine.packs[Math.floor(ordinal2 / root.refine.rowsPerPack)],
+          offset: ordinal2 % root.refine.rowsPerPack * root.refine.rowBytes,
           length: root.refine.rowBytes
         }
       }));
@@ -9920,6 +10402,85 @@ async function createSearch(options = {}) {
       }
     };
   }
+  function addressSuggestionParts(q) {
+    const match = String(q || "").trim().match(/^(\d+)\s+(.+)$/u);
+    if (!match) return null;
+    const houseNumber = Number(match[1]);
+    if (!Number.isSafeInteger(houseNumber) || houseNumber < 0) return null;
+    return { houseNumber, tail: match[2].trim() };
+  }
+  function replaceSuggestionHouseNumber(value, houseNumber) {
+    const tail = String(value || "").trim().replace(/^\d+[\p{L}]?(?:\s*[\u2013-]\s*\d+[\p{L}]?)?\s+/u, "");
+    return tail ? `${houseNumber} ${tail}` : "";
+  }
+  async function executeAddressSuggest(q, prefix, size, root) {
+    if (!addressInterpolationEnabled || !root) return null;
+    const parts = addressSuggestionParts(q);
+    if (!parts?.tail) return null;
+    const activeTailToken = authorityNormalizeSurface(parts.tail).split(" ").filter(Boolean).at(-1) || "";
+    if (activeTailToken.length < 3) return null;
+    const tailPrefix = suggestKey(parts.tail);
+    if (!tailPrefix) return null;
+    const tailSize = Math.min(32, Math.max(12, size * 3));
+    const tailResponse = await executeLexiconSuggest(parts.tail, tailPrefix, tailSize, root);
+    const suggestions = [];
+    const seenQueries = /* @__PURE__ */ new Set();
+    const seenAddresses = /* @__PURE__ */ new Set();
+    const candidates = [];
+    for (const candidate of tailResponse.suggestions) {
+      const candidateQuery = replaceSuggestionHouseNumber(candidate.text, parts.houseNumber);
+      const normalizedQuery = authorityNormalizeSurface(candidateQuery);
+      if (!candidateQuery || seenQueries.has(normalizedQuery)) continue;
+      seenQueries.add(normalizedQuery);
+      candidates.push({ candidate, candidateQuery });
+      if (candidates.length >= Math.min(16, Math.max(12, size * 2))) break;
+    }
+    const responses = await Promise.all(candidates.map(({ candidateQuery }) => tryAddressAuthorityFastPath({
+      q: candidateQuery,
+      page: 1,
+      size: 1,
+      hasFilters: false,
+      sortPlan: null,
+      geoPlan: null,
+      includeResults: true,
+      authority: true
+    })));
+    for (let index = 0; index < candidates.length; index++) {
+      const candidate = candidates[index].candidate;
+      const response = responses[index];
+      const result = response?.results?.[0];
+      const text = String(result?.address || result?.name || result?.title || "").trim();
+      const normalizedAddress = authorityNormalizeSurface(text);
+      if (!text || seenAddresses.has(normalizedAddress)) continue;
+      seenAddresses.add(normalizedAddress);
+      suggestions.push({
+        text,
+        weight: Math.max(1, Number(candidate.weight || 0)),
+        count: 1,
+        interpolated: Boolean(result.interpolated)
+      });
+      if (suggestions.length >= size) break;
+    }
+    if (!suggestions.length) return null;
+    return {
+      q,
+      prefix,
+      suggestions,
+      stats: {
+        exact: true,
+        suggestLane: "address-authority",
+        addressSuggestionTail: parts.tail,
+        addressSuggestionCandidates: tailResponse.suggestions.length,
+        addressSuggestionLookups: candidates.length,
+        addressSuggestionMatches: suggestions.length,
+        addressSuggestionTailLane: tailResponse.stats?.suggestLane || "",
+        suggestCandidateShards: tailResponse.stats?.suggestCandidateShards || 0,
+        suggestShardsVisited: tailResponse.stats?.suggestShardsVisited || 0,
+        suggestDirectoryPagesVisited: tailResponse.stats?.suggestDirectoryPagesVisited || 0,
+        suggestEntriesScanned: tailResponse.stats?.suggestEntriesScanned || 0
+      }
+    };
+  }
   async function executeSuggest(params = {}) {
     const q = String(params.q || "");
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
@@ -9928,7 +10489,11 @@ async function createSearch(options = {}) {
       return { q, prefix, suggestions: [], stats: { exact: true, suggestShardsVisited: 0, suggestEntriesScanned: 0 } };
     }
     const root = await loadAuthorityLexiconRoot();
-    if (root) return executeLexiconSuggest(q, prefix, size, root);
+    if (root) {
+      const address = await executeAddressSuggest(q, prefix, size, root);
+      if (address) return address;
+      return executeLexiconSuggest(q, prefix, size, root);
+    }
     const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
     if (legacy) return legacy;
     throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");
@@ -10078,24 +10643,35 @@ async function createSearch(options = {}) {
     return runCountSearch({ q, baseTerms });
   }
   async function search(params = {}) {
-    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
     const response = await withRuntimeTrace(trace, () => traceSpan("search.total", async () => {
-      const searchResponse = await executeSearch(params);
-      if (params.facets) await traceSpan("facets.count", () => computeFacetCounts(params, searchResponse));
+      const searchResponse = await executeSearch(activeParams);
+      if (activeParams.facets) await traceSpan("facets.count", () => computeFacetCounts(activeParams, searchResponse));
       return searchResponse;
     }));
-    if (!trace) return response;
-    return {
+    const normalizedResponse = normalizedQuery === surfaceQuery ? response : {
       ...response,
+      normalizedQuery,
+      stats: { ...response.stats || {}, postalCodeNormalized: true }
+    };
+    if (!trace) return normalizedResponse;
+    return {
+      ...normalizedResponse,
       stats: {
-        ...response.stats || {},
+        ...normalizedResponse.stats || {},
         trace: finalizeRuntimeTrace(trace)
       }
     };
   }
   async function count(params = {}) {
-    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
-    const response = await withRuntimeTrace(trace, () => traceSpan("count.total", () => executeCount(params)));
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("count.total", () => executeCount(activeParams)));
     if (!trace) return response;
     const finalizedTrace = finalizeRuntimeTrace(trace);
     return {
@@ -10108,8 +10684,16 @@ async function createSearch(options = {}) {
     };
   }
   async function suggest(params = {}) {
-    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
-    const response = await withRuntimeTrace(trace, () => traceSpan("suggest.total", () => executeSuggest(params)));
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
+    const response = await withRuntimeTrace(trace, () => traceSpan("suggest.total", () => executeSuggest(activeParams)));
+    if (normalizedQuery !== surfaceQuery) {
+      response.q = surfaceQuery;
+      response.normalizedQuery = normalizedQuery;
+      response.stats = { ...response.stats || {}, postalCodeNormalized: true };
+    }
     if (!trace) return response;
     return {
       ...response,
@@ -10204,25 +10788,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     }));
     return pageRows.map((row) => hydrated.get(`${row.generation}:${row.index}`)).filter(Boolean);
   }
-  function mergeFacetResponses(responses) {
-    const facets = {};
-    for (const response of responses) {
-      for (const [field, data] of Object.entries(response.facets || {})) {
-        const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: /* @__PURE__ */ new Map() });
-        target.exact = target.exact && data.exact !== false;
-        for (const item of data.values) {
-          const existing = target.byValue.get(item.value);
-          if (existing) existing.count += item.count;
-          else target.byValue.set(item.value, { ...item });
-        }
-      }
-    }
-    for (const data of Object.values(facets)) {
-      data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
-      delete data.byValue;
-    }
-    return facets;
-  }
+  const mergeFacetResponses = mergeFederatedFacets;
   function applyMergedHighlights(params, q, results, correctedQuery) {
     if (!params.highlight || !results.length || !q) return;
     const highlightOptions = params.highlight === true ? {} : params.highlight;
@@ -10248,8 +10814,11 @@ async function createGenerationalSearch(root, options, baseUrl) {
     };
   }
   async function search(params = {}) {
-    if (params.vector) return hybridSearch(params);
-    const q = String(params.q || "").trim();
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    if (activeParams.vector) return hybridSearch(activeParams);
+    const q = String(activeParams.q || "").trim();
     const page = Math.max(1, Number(params.page || 1));
     const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
     const offset = (page - 1) * size;
@@ -10257,10 +10826,10 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const geoDistanceSort = params.geo?.sort === "distance";
     if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     if (sortPlan || geoDistanceSort || params.geo && !q) {
-      return orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort });
+      return orderedSearch(activeParams, { q, page, size, offset, sortPlan, geoDistanceSort });
     }
     const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
-      ...params,
+      ...activeParams,
       includeResults: false,
       highlight: void 0,
       page: 1,
@@ -10282,8 +10851,12 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const pageRows = merged.slice(offset, offset + size);
     const results = await hydrateMergedRows(pageRows);
     const response = mergedResponseShell(responses, results, page, size);
-    applyMergedHighlights(params, q, results, response.correctedQuery);
-    if (params.facets) response.facets = mergeFacetResponses(responses);
+    applyMergedHighlights(activeParams, q, results, response.correctedQuery);
+    if (activeParams.facets) response.facets = mergeFacetResponses(responses);
+    if (normalizedQuery !== surfaceQuery) {
+      response.normalizedQuery = normalizedQuery;
+      response.stats.postalCodeNormalized = true;
+    }
     return response;
   }
   async function orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort }) {
@@ -10453,8 +11026,11 @@ async function createGenerationalSearch(root, options, baseUrl) {
     };
   }
   async function suggest(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const responses = await Promise.all(engines.map((engine) => engine.suggest(params)));
+    const responses = await Promise.all(engines.map((engine) => engine.suggest(activeParams)));
     const merged = /* @__PURE__ */ new Map();
     for (const response of responses) {
       for (const item of response.suggestions) {
@@ -10468,15 +11044,31 @@ async function createGenerationalSearch(root, options, baseUrl) {
       }
     }
     const suggestions = [...merged.values()].sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1)).slice(0, size);
-    return { q: params.q || "", suggestions, stats: { generations: engines.length } };
+    return {
+      q: surfaceQuery,
+      suggestions,
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        generations: engines.length,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
+    };
   }
   async function count(params = {}) {
-    const responses = await Promise.all(engines.map((engine) => engine.count(params)));
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const responses = await Promise.all(engines.map((engine) => engine.count(activeParams)));
     return {
       total: responses.reduce((sum, response) => sum + (response.total || 0), 0),
       totalExact: tombstoneTotal === 0 && responses.every((response) => response.totalExact),
       approximate: tombstoneTotal > 0 || responses.some((response) => response.approximate),
-      stats: { generations: engines.length, tombstones: tombstoneTotal }
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        generations: engines.length,
+        tombstones: tombstoneTotal,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
     };
   }
   return {
@@ -10487,6 +11079,436 @@ async function createGenerationalSearch(root, options, baseUrl) {
     count,
     vectorSearch,
     loadFacetValues: (field) => engines[0].loadFacetValues(field)
+  };
+}
+function mergeFederatedFacets(responses) {
+  const facets = {};
+  for (const response of responses) {
+    for (const [field, data] of Object.entries(response.facets || {})) {
+      const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: /* @__PURE__ */ new Map() });
+      target.exact = target.exact && data.exact !== false;
+      for (const item of data.values) {
+        const existing = target.byValue.get(item.value);
+        if (existing) existing.count += item.count;
+        else target.byValue.set(item.value, { ...item });
+      }
+    }
+  }
+  for (const data of Object.values(facets)) {
+    data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+    delete data.byValue;
+  }
+  return facets;
+}
+var SHARD_ROUTING_SLACK_RATIO = 1.05;
+var SHARD_ROUTING_SLACK_METERS = 1e4;
+function shardRoutingBudget(meters) {
+  return meters * SHARD_ROUTING_SLACK_RATIO + SHARD_ROUTING_SLACK_METERS;
+}
+function wrapLonDelta(a, b) {
+  return (a - b + 540) % 360 - 180;
+}
+function shardBboxDistanceMeters(bbox, lat, lon) {
+  const clampedLat = Math.min(Math.max(lat, bbox[0]), bbox[2]);
+  let clampedLon = lon;
+  if (!(lon >= bbox[1] && lon <= bbox[3])) {
+    clampedLon = Math.abs(wrapLonDelta(lon, bbox[1])) <= Math.abs(wrapLonDelta(lon, bbox[3])) ? bbox[1] : bbox[3];
+  }
+  return haversineMetersE7(latToE7(lat), lonToE7(lon), latToE7(clampedLat), lonToE7(clampedLon));
+}
+function shardBoxIntersects(bbox, box) {
+  const minLat = Math.min(Number(box.minLat), Number(box.maxLat));
+  const maxLat = Math.max(Number(box.minLat), Number(box.maxLat));
+  if (bbox[2] < minLat || bbox[0] > maxLat) return false;
+  const minLon = Number(box.minLon);
+  const maxLon = Number(box.maxLon);
+  if (minLon <= maxLon) return bbox[3] >= minLon && bbox[1] <= maxLon;
+  return bbox[3] >= minLon || bbox[1] <= maxLon;
+}
+async function createShardedSearch(root, options, baseUrl) {
+  const shards = (root.shards || []).map((shard, index) => ({
+    id: String(shard.id || `shard-${index}`),
+    index,
+    path: shard.path || "",
+    manifestName: shard.manifest || "manifest.min.json",
+    total: shard.total || 0,
+    bbox: Array.isArray(shard.bbox) && shard.bbox.length === 4 ? shard.bbox.map(Number) : null,
+    groups: Array.isArray(shard.groups) ? shard.groups.map(String) : []
+  }));
+  if (!shards.length) throw new Error("Rangefind: sharded manifest has no shards.");
+  const engines = new Array(shards.length).fill(null);
+  function engineAt(index) {
+    if (!engines[index]) {
+      const shard = shards[index];
+      const manifestName = shard.manifestName.startsWith(shard.path) && shard.path ? shard.manifestName.slice(shard.path.length) : shard.manifestName;
+      engines[index] = createSearch({
+        ...options,
+        baseUrl: new URL(shard.path || "./", baseUrl).href,
+        manifestName,
+        maxPageSize: 1e3
+      });
+    }
+    return engines[index];
+  }
+  const sortableFields = new Set([
+    ...root.numbers || [],
+    ...root.booleans || []
+  ].map((field) => field.name));
+  function parseSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field || !sortableFields.has(field)) return null;
+    const order = typeof sort === "string" && sort.startsWith("-") ? "desc" : String(sort.order || sort.direction || "asc").toLowerCase();
+    return { field, desc: order === "desc" };
+  }
+  const shardIdIndex = new Map(shards.map((shard) => [shard.id, shard.index]));
+  const shardGroupIndex = /* @__PURE__ */ new Map();
+  for (const shard of shards) {
+    for (const group of shard.groups) {
+      if (!shardGroupIndex.has(group)) shardGroupIndex.set(group, []);
+      shardGroupIndex.get(group).push(shard.index);
+    }
+  }
+  function candidateShards(params) {
+    if (params?.shards == null) return shards;
+    const names = Array.isArray(params.shards) ? params.shards : [params.shards];
+    const picked = /* @__PURE__ */ new Set();
+    for (const name of names) {
+      const id = String(name);
+      const index = shardIdIndex.get(id);
+      if (index !== void 0) {
+        picked.add(index);
+        continue;
+      }
+      const members = shardGroupIndex.get(id);
+      if (!members) {
+        throw new Error(`Rangefind: unknown shard or group "${id}" (shards: ${shards.map((shard) => shard.id).join(", ")}${shardGroupIndex.size ? `; groups: ${[...shardGroupIndex.keys()].join(", ")}` : ""}).`);
+      }
+      for (const member of members) picked.add(member);
+    }
+    return [...picked].sort((a, b) => a - b).map((index) => shards[index]);
+  }
+  function routeShards(geo, params) {
+    const candidates = candidateShards(params);
+    const all = candidates.map((shard) => shard.index);
+    if (!geo || !candidates.some((shard) => shard.bbox)) return { selected: all, expanding: null };
+    if (geo.near) {
+      const lat = Number(geo.near.lat);
+      const lon = Number(geo.near.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return { selected: all, expanding: null };
+      const distances = candidates.map((shard) => ({
+        index: shard.index,
+        meters: shard.bbox ? shardBboxDistanceMeters(shard.bbox, lat, lon) : 0
+      }));
+      const radius = Number(geo.near.radiusMeters);
+      if (Number.isFinite(radius) && radius > 0) {
+        return {
+          selected: distances.filter((item) => item.meters <= shardRoutingBudget(radius)).map((item) => item.index),
+          expanding: null
+        };
+      }
+      return { selected: null, expanding: distances.sort((a, b) => a.meters - b.meters) };
+    }
+    if (geo.box) {
+      return {
+        selected: candidates.filter((shard) => !shard.bbox || shardBoxIntersects(shard.bbox, geo.box)).map((shard) => shard.index),
+        expanding: null
+      };
+    }
+    return { selected: all, expanding: null };
+  }
+  function stampShard(result, shardIndex) {
+    const id = shards[shardIndex].id;
+    return { ...result, shard: result.shard != null ? `${id}/${result.shard}` : id };
+  }
+  async function searchShard(index, params) {
+    const engine = await engineAt(index);
+    return { index, response: await engine.search(params) };
+  }
+  async function expandingNearestQuery(front, params, need) {
+    const queried = [];
+    const distances = [];
+    let cursor = 0;
+    while (cursor < front.length) {
+      if (distances.length >= need) {
+        distances.sort((a, b) => a - b);
+        if (front[cursor].meters > shardRoutingBudget(distances[need - 1])) break;
+      }
+      const batch = front.slice(cursor, cursor + 2);
+      cursor += batch.length;
+      const batchResults = await Promise.all(batch.map((item) => searchShard(item.index, params)));
+      for (const item of batchResults) {
+        queried.push(item);
+        for (const result of item.response.results || []) {
+          if (result.distanceMeters != null) distances.push(result.distanceMeters);
+        }
+      }
+    }
+    return { queried, partial: cursor < front.length };
+  }
+  function compareByScore(a, b) {
+    return (b.result.score || 0) - (a.result.score || 0) || a.shardIndex - b.shardIndex || (a.result.index || 0) - (b.result.index || 0);
+  }
+  function sortKeyNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  function shardResponseShell(responses, results, page, size, meta = {}) {
+    const correctedQuery = responses.map((response) => response.correctedQuery).find(Boolean);
+    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0);
+    return {
+      total: Math.max(results.length, total),
+      results,
+      page,
+      size,
+      approximate: Boolean(meta.partial) || responses.some((response) => response.approximate),
+      ...correctedQuery ? { correctedQuery, corrections: responses.find((r) => r.correctedQuery)?.corrections } : {},
+      stats: {
+        shards: shards.length,
+        shardsQueried: responses.length,
+        shardTotals: responses.map((response) => response.total || 0),
+        ...meta.stats || {}
+      }
+    };
+  }
+  async function search(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    if (activeParams.vector) return hybridSearch(activeParams);
+    const q = String(activeParams.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    const need = offset + size;
+    const sortPlan = parseSortPlan(params.sort);
+    const geoDistanceSort = activeParams.geo?.sort === "distance";
+    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    const route = routeShards(activeParams.geo, activeParams);
+    const perShardParams = { ...activeParams, shards: void 0, page: 1, size: Math.min(1e3, need) };
+    let queried;
+    let partial = need > 1e3;
+    if (route.expanding) {
+      const expanded = await expandingNearestQuery(route.expanding, perShardParams, need);
+      queried = expanded.queried;
+      partial = partial || expanded.partial;
+    } else {
+      queried = await Promise.all(route.selected.map((index) => searchShard(index, perShardParams)));
+    }
+    const rows = [];
+    for (const { index, response: response2 } of queried) {
+      for (const result of response2.results || []) {
+        rows.push({ shardIndex: index, result });
+      }
+    }
+    if (sortPlan) {
+      rows.sort((a, b) => {
+        const left = sortKeyNumber(a.result[sortPlan.field]);
+        const right = sortKeyNumber(b.result[sortPlan.field]);
+        if (left == null || right == null) {
+          if (left == null && right == null) return compareByScore(a, b);
+          return left == null ? 1 : -1;
+        }
+        if (left !== right) return sortPlan.desc ? right - left : left - right;
+        return compareByScore(a, b);
+      });
+    } else if (geoDistanceSort) {
+      rows.sort((a, b) => {
+        const left = a.result.distanceMeters;
+        const right = b.result.distanceMeters;
+        if (left == null || right == null) {
+          if (left == null && right == null) return compareByScore(a, b);
+          return left == null ? 1 : -1;
+        }
+        return left - right || compareByScore(a, b);
+      });
+    } else if (q) {
+      rows.sort(compareByScore);
+    }
+    const results = rows.slice(offset, need).map((row) => stampShard(row.result, row.shardIndex));
+    const responses = queried.map((item) => item.response);
+    const response = shardResponseShell(responses, results, page, size, { partial });
+    if (activeParams.facets) {
+      response.facets = mergeFederatedFacets(responses);
+      if (partial) {
+        for (const facet of Object.values(response.facets)) facet.exact = false;
+      }
+    }
+    if (normalizedQuery !== surfaceQuery) {
+      response.normalizedQuery = normalizedQuery;
+      response.stats.postalCodeNormalized = true;
+    }
+    return response;
+  }
+  async function hybridSearch(params) {
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    const route = routeShards(params.geo, params);
+    const selected = route.expanding ? route.expanding.map((item) => item.index) : route.selected;
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+    async function lane(laneParams) {
+      const queried = await Promise.all(selected.map((index) => searchShard(index, { ...laneParams, shards: void 0, page: 1, size: Math.min(1e3, poolSize) })));
+      const rows = [];
+      for (const { index, response } of queried) {
+        for (const result of response.results || []) {
+          rows.push({ shardIndex: index, result });
+        }
+      }
+      rows.sort(compareByScore);
+      return { rows: rows.slice(0, poolSize), responses: queried.map((item) => item.response) };
+    }
+    const vectorLaneParams = {
+      q: "",
+      vector: params.vector,
+      vectorField: params.vectorField,
+      hybrid: params.hybrid,
+      filters: params.filters,
+      geo: params.geo
+    };
+    if (!q) {
+      const { rows, responses } = await lane(vectorLaneParams);
+      const results2 = rows.slice(offset, offset + size).map((row) => stampShard(row.result, row.shardIndex));
+      const response = shardResponseShell(responses, results2, page, size);
+      response.approximate = true;
+      return response;
+    }
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const [textLane, vectorLane] = await Promise.all([
+      lane({ ...params, vector: void 0, vectorField: void 0, hybrid: void 0 }),
+      lane(vectorLaneParams)
+    ]);
+    const fused = /* @__PURE__ */ new Map();
+    const addRanked = (rows, laneName) => {
+      rows.forEach((row, rank) => {
+        const key = `${row.shardIndex}:${row.result.generation ?? ""}:${row.result.index}`;
+        const entry = fused.get(key) || { shardIndex: row.shardIndex, result: row.result, score: 0, hybrid: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.hybrid[laneName] = rank + 1;
+        fused.set(key, entry);
+      });
+    };
+    addRanked(textLane.rows, "text");
+    addRanked(vectorLane.rows, "vector");
+    const ranked = [...fused.values()].sort((a, b) => b.score - a.score || a.shardIndex - b.shardIndex || (a.result.index || 0) - (b.result.index || 0));
+    const results = ranked.slice(offset, offset + size).map((entry) => ({
+      ...stampShard(entry.result, entry.shardIndex),
+      score: entry.score,
+      hybrid: entry.hybrid
+    }));
+    return {
+      total: ranked.length,
+      results,
+      page,
+      size,
+      approximate: true,
+      stats: { shards: shards.length, shardsQueried: selected.length, hybrid: true }
+    };
+  }
+  async function vectorSearch(params = {}) {
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const queried = await Promise.all(candidateShards(params).map(async (shard) => {
+      const engine = await engineAt(shard.index);
+      return { index: shard.index, response: await engine.vectorSearch({ ...params, shards: void 0, k }) };
+    }));
+    const rows = [];
+    for (const { index, response } of queried) {
+      for (const result of response.results || []) {
+        rows.push({ shardIndex: index, result });
+      }
+    }
+    rows.sort(compareByScore);
+    const results = rows.slice(0, k).map((row) => stampShard(row.result, row.shardIndex));
+    return {
+      total: rows.length,
+      results,
+      stats: {
+        shards: shards.length,
+        perShard: queried.map((item) => item.response.stats || {}),
+        exact: false,
+        approximate: true
+      }
+    };
+  }
+  async function suggest(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const responses = await Promise.all(candidateShards(activeParams).map(async (shard) => {
+      const engine = await engineAt(shard.index);
+      return engine.suggest({ ...activeParams, shards: void 0 });
+    }));
+    const merged = /* @__PURE__ */ new Map();
+    for (const response of responses) {
+      for (const item of response.suggestions) {
+        const existing = merged.get(item.text);
+        if (existing) {
+          existing.count += item.count;
+          existing.weight = Math.max(existing.weight, item.weight);
+        } else {
+          merged.set(item.text, { ...item });
+        }
+      }
+    }
+    const suggestions = [...merged.values()].sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1)).slice(0, size);
+    return {
+      q: surfaceQuery,
+      suggestions,
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        shards: shards.length,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
+    };
+  }
+  async function count(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const route = routeShards(activeParams.geo, activeParams);
+    const selected = route.expanding ? route.expanding.map((item) => item.index) : route.selected;
+    const responses = await Promise.all(selected.map(async (index) => {
+      const engine = await engineAt(index);
+      return engine.count({ ...activeParams, shards: void 0 });
+    }));
+    return {
+      total: responses.reduce((sum, response) => sum + (response.total || 0), 0),
+      totalExact: responses.every((response) => response.totalExact),
+      approximate: responses.some((response) => response.approximate),
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        shards: shards.length,
+        shardsQueried: selected.length,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
+    };
+  }
+  async function loadFacetValues(field) {
+    const dictionaries = await Promise.all(shards.map(async (shard) => {
+      const engine = await engineAt(shard.index);
+      return engine.loadFacetValues(field);
+    }));
+    const merged = /* @__PURE__ */ new Map();
+    for (const values of dictionaries) {
+      for (const item of values || []) {
+        if (!item?.value) continue;
+        const existing = merged.get(item.value);
+        if (existing) existing.n += item.n || 0;
+        else merged.set(item.value, { ...item });
+      }
+    }
+    return [...merged.values()].sort((a, b) => (b.n || 0) - (a.n || 0) || (a.value < b.value ? -1 : 1));
+  }
+  return {
+    manifest: root,
+    shards: shards.map((shard) => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
+    search,
+    suggest,
+    count,
+    vectorSearch,
+    loadFacetValues
   };
 }
 
@@ -10904,13 +11926,18 @@ var RangefindSearchElement = class extends HTMLElement {
     if (token !== this._token) return;
     if (!engine) return;
     try {
-      const response = await engine.search({
+      let params = {
         q: query,
         page: 1,
         size: this._config.pageSize,
         highlight: this._config.highlight,
         ...this._searchOptions.search || {}
-      });
+      };
+      if (typeof this._searchOptions.transform === "function") {
+        params = await this._searchOptions.transform(params) || params;
+        if (token !== this._token) return;
+      }
+      const response = await engine.search(params);
       if (token !== this._token) return;
       this._renderResults(query, response);
       this._emit("rangefind:search", { query, response });

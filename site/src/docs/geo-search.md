@@ -1,0 +1,70 @@
+---
+title: Geo search
+lede: Radius filters, viewport queries, and exact nearest-neighbor over millions of points — from a static file, in single-digit milliseconds.
+description: Rangefind geo search — static KD trees, near/box/distance-sort/boost queries, text-plus-geo, and the OpenStreetMap integration for building place and address search.
+order: 11
+---
+
+Declare a geo field and every document with coordinates joins a static KD
+tree:
+
+```json
+"geo": [{ "name": "location", "latPath": "lat", "lonPath": "lon" }]
+```
+
+## Query shapes
+
+```js
+// nearest-first within a radius
+await rf.search({ q: "", geo: { near: { lat: 46.81, lon: -71.21, radiusMeters: 2000 }, sort: "distance" } });
+
+// map viewport
+await rf.search({ q: "museum", geo: { box: { minLat, maxLat, minLon, maxLon } } });
+
+// text relevance with a distance boost instead of a hard sort
+await rf.search({ q: "pizza", geo: { near: { lat, lon, radiusMeters: 20000 }, boost: { weight: 2, pivotMeters: 2000 } } });
+```
+
+Nearest-neighbor sort is **exact** — the tree search carries early-stop
+proofs, so it visits only the leaves that could contain a closer point.
+Measured on OpenStreetMap corpora: cold nearest queries touch 1–3 leaves and
+run in 7–16 ms whether the index holds 4 million points or 33 million;
+warm queries run in well under a millisecond. Text+geo queries verify the
+geo filter per document through hidden coordinate doc-values, so the two
+lanes always agree exactly.
+
+The tree's branch-paged root keeps the cold footprint tiny: a viewport query
+against a 3.4 GB Québec index transfers a few hundred kilobytes, not the
+tree.
+
+## The OpenStreetMap integration
+
+`rangefind/osm` turns OSM extracts into production place-and-address search:
+
+```js
+import { extractOsmPlaces } from "rangefind/osm/extract"; // PBF → places JSONL
+import { buildOsmIndex } from "rangefind/osm/node";        // one region, one index
+
+await extractOsmPlaces({ pbf: "quebec-latest.osm.pbf", root: "./work" });
+await buildOsmIndex({ input: "./work/data/osm-places.jsonl", output: "public/rangefind" });
+```
+
+What the schema gives you out of the box:
+
+- **Names, aliases, and categories** with tuned field weights and facets.
+- **Address search** through a zero-posting authority lane: exact
+  house-number lookups and compact `addr:interpolation` ranges that resolve
+  numbers *between* mapped addresses.
+- **Search-as-you-type** place autocomplete weighted by population.
+- **Locality intent** — "Laval" resolves the city record globally instead of
+  ranking every street that mentions it; "Rue Hector Rosemère" resolves the
+  town, then searches the street inside its radius.
+- **ODbL provenance** stamped into the manifest (`© OpenStreetMap
+  contributors`), plus upstream data version for freshness display.
+
+The [map demo](../../map/) is exactly this: Luxembourg's 175k places (a
+172 MB index) with autocomplete, viewport search, and nearest-neighbor —
+served entirely from static files on GitHub Pages.
+
+Planet-scale OSM — every country, updated nightly — is the sharded setup:
+see [Sharded indexes](../sharded-indexes/).

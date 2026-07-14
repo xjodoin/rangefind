@@ -39,3 +39,4 @@ target/
 .cache/
 examples/vector-bench/
 examples/osm-geo/shard-bench/
+site/_site/

@@ -178,6 +178,10 @@ function inferConfig({ usedFields, filterKeys, sortValues, langs, anyDescription
     urlPath: "url",
     resumeBuild: false,
     analysis: { languages, languageField: "lang" },
+    // Site search wants deep body recall: crawled pages are few and small
+    // compared to corpus-scale builds, so keep far more terms per page than
+    // the corpus-scale default (12) would.
+    targetPostingsPerDoc: 128,
     fields,
     facets,
     numbers,
@@ -190,21 +194,29 @@ function inferConfig({ usedFields, filterKeys, sortValues, langs, anyDescription
 // unchanged builder against them. The work dir uses absolute input/output
 // paths so config.js's relative resolution is a no-op. On success the work dir
 // is removed; on failure it is preserved and its path reported for debugging.
-export async function buildFromCrawl({ root, output, baseUrl = "/", scanDir }) {
+export async function buildFromCrawl({ root, output, baseUrl = "/", scanDir, config: overrides, enrich }) {
   const outputAbs = resolve(output);
-  const { docs, config, files, languages } = await crawlSite({
+  let { docs, config, files, languages } = await crawlSite({
     root,
     scanDir,
     baseUrl,
     skipPath: outputAbs
   });
   if (!docs.length) throw new Error(`Rangefind found no indexable HTML under ${resolve(scanDir || root)}.`);
+  // Optional enrichment between crawl and build: add computed fields to the
+  // documents (embeddings for semantic search, external metadata, …) and
+  // declare them via `config` overrides (e.g. a `vectors` entry).
+  if (typeof enrich === "function") {
+    docs = (await enrich(docs)) || docs;
+  }
 
   const workDir = await mkdtemp(join(tmpdir(), "rangefind-crawl-"));
   const inputPath = join(workDir, "docs.jsonl");
   const configPath = join(workDir, "rangefind.config.json");
   await writeFile(inputPath, docs.map(doc => JSON.stringify(doc)).join("\n") + "\n");
-  await writeFile(configPath, JSON.stringify({ ...config, input: inputPath, output: outputAbs }, null, 2));
+  // Caller overrides win over the generated config (tuning knobs, meta,
+  // analysis…); input/output stay authoritative.
+  await writeFile(configPath, JSON.stringify({ ...config, ...(overrides || {}), input: inputPath, output: outputAbs }, null, 2));
 
   try {
     await build({ configPath });

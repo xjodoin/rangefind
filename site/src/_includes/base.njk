@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}</title>
+  <meta name="description" content="{{ description or site.description }}">
+  <link rel="canonical" href="{{ site.origin }}{{ page.url | url }}">
+  <link rel="icon" href="{{ '/assets/favicon.svg' | url }}" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ site.name }}">
+  <meta property="og:title" content="{% if title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}">
+  <meta property="og:description" content="{{ description or site.description }}">
+  <meta property="og:url" content="{{ site.origin }}{{ page.url | url }}">
+  <meta property="og:image" content="{{ site.origin }}{{ '/assets/og.png' | url }}">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preload" href="{{ '/assets/fonts/bricolage-grotesque-400-800-latin.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ '/assets/fonts/martian-mono-400-latin.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="{{ '/assets/site.css' | url }}">
+  <link rel="stylesheet" href="{{ '/_rangefind/rangefind-search.css' | url }}">
+  <link rel="sitemap" href="{{ '/sitemap.xml' | url }}">
+  <script type="module" src="{{ '/assets/semantic.js' | url }}"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <a class="brand" href="{{ '/' | url }}" aria-label="Rangefind home">
+        <svg class="brand__mark" width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><rect x="1" y="11" width="24" height="4" rx="2" fill="currentColor" opacity=".25"/><rect x="6" y="11" width="9" height="4" rx="2" fill="var(--marker)"/></svg>
+        <span class="brand__name">rangefind</span>
+      </a>
+      <nav class="site-nav" aria-label="Site">
+        <a href="{{ '/docs/' | url }}">Docs</a>
+        <a href="{{ '/docs/benchmarks/' | url }}">Benchmarks</a>
+        <a href="{{ '/map/' | url }}">Map demo</a>
+        <a href="{{ site.repo }}" rel="external">GitHub</a>
+      </nav>
+      <div class="site-header__search">
+        {% rangefindSearch placeholder="Search the site…", hotkey=true, pageSize=8 %}
+      </div>
+    </div>
+  </header>
+
+  {{ content | safe }}
+
+  <footer class="site-footer">
+    <div class="site-footer__inner">
+      <div class="range-track range-track--static" aria-hidden="true">
+        <span class="range-track__span" style="left:12%;width:14%"></span>
+        <span class="range-track__span" style="left:44%;width:8%"></span>
+        <span class="range-track__span" style="left:71%;width:19%"></span>
+      </div>
+      <p>
+        This page ships two fonts, one stylesheet, and its own search index —
+        no framework, no analytics. The search box above queries this site
+        through HTTP range requests, exactly the way your site would.
+      </p>
+      <nav aria-label="Footer">
+        <a href="{{ '/docs/' | url }}">Documentation</a>
+        <a href="{{ site.repo }}" rel="external">GitHub</a>
+        <a href="{{ site.npm }}" rel="external">npm</a>
+        <a href="{{ '/basic/' | url }}">Minimal demo</a>
+        <a href="{{ '/map/' | url }}">Map demo</a>
+      </nav>
+      <p class="site-footer__legal">MIT licensed · © Xavier Jodoin · Fonts: Bricolage Grotesque &amp; Martian Mono (OFL)</p>
+    </div>
+  </footer>
+</body>
+</html>

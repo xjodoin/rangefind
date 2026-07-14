@@ -36,6 +36,12 @@ export default function rangefindPlugin(eleventyConfig, options = {}) {
     assetsDir = "_rangefind",
     // URL prefix/origin baked into indexed result URLs.
     baseUrl = "/",
+    // Rangefind config overrides merged into the crawler's generated config
+    // (e.g. { targetPostingsPerDoc, analysis, meta, vectors }).
+    config = null,
+    // Optional async hook run between crawl and build: enrich the crawled
+    // documents with computed fields (e.g. embeddings for semantic search).
+    enrich = null,
     // Shortcode defaults (overridable per call site).
     src = "/rangefind/",
     assetsBase = "/_rangefind",
@@ -68,7 +74,9 @@ export default function rangefindPlugin(eleventyConfig, options = {}) {
       root: outputRoot,
       scanDir: outputRoot,
       output: join(outputRoot, outputDir),
-      baseUrl
+      baseUrl,
+      config,
+      enrich
     });
 
     // 2. Copy the client assets next to the site.

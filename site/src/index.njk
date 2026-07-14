@@ -1,0 +1,217 @@
+---
+layout: base.njk
+description: "Rangefind is a static search engine: BM25F relevance, typo correction, facets, autocomplete, geo, and vectors served straight from plain files with HTTP range requests. No search server, no SaaS, no per-query bill."
+---
+<div class="hero">
+  <div class="hero__inner">
+    <div>
+      <span class="eyebrow">GET terms/packs/0007.bin · Range: bytes=52880–118512 → 206</span>
+      <h1>Search, without the server.</h1>
+      <p class="hero__lede">
+        Rangefind packs your content into a <strong>static index</strong> —
+        plain files on any host or CDN — and the browser reads
+        <strong>only the byte ranges it needs</strong> to answer a query.
+        Full-text relevance, typo correction, facets, autocomplete, geo, and
+        vectors. Nothing to run, nothing metered.
+      </p>
+      <div class="hero__actions">
+        <a class="button button--marker" href="{{ '/docs/' | url }}">Get started</a>
+        <a class="button button--ghost" href="{{ '/map/' | url }}">Search a live map</a>
+      </div>
+    </div>
+    <div class="hero__demo">
+      {% rangefindSearch placeholder="Try “sharded geo index”…", pageSize=8 %}
+      <p class="hero__demo-caption">
+        This box searches <strong>this site's own index</strong> — static
+        files, range requests, <strong>hybrid semantic ranking</strong>: on
+        first focus it loads a small embedding model in your browser and
+        fuses meaning with keywords. Try describing what you want.
+      </p>
+      <div class="hero__trace">
+        <div class="range-track" aria-hidden="true">
+          <span class="range-track__span" style="left:2%;width:5%"></span>
+          <span class="range-track__span" style="left:31%;width:11%"></span>
+          <span class="range-track__span" style="left:68%;width:17%"></span>
+        </div>
+        <div class="range-legend" aria-hidden="true">
+          <span>manifest</span><span>term directory</span><span>postings + top docs</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="hero__stats">
+    <div class="stat"><div class="stat__value">7.2M</div><div class="stat__label">Wikipedia pages in one index</div></div>
+    <div class="stat"><div class="stat__value">128 ms</div><div class="stat__label">cold two-word query, top-10</div></div>
+    <div class="stat"><div class="stat__value">2.3 MiB</div><div class="stat__label">fetched for it — not 26 GB</div></div>
+    <div class="stat"><div class="stat__value">$0/mo</div><div class="stat__label">servers, licenses, per-query fees</div></div>
+  </div>
+</div>
+
+<main id="main" data-rangefind-body>
+  <section class="section">
+    <span class="eyebrow">manifest.min.json → terms/ → docs/</span>
+    <h2>How it works</h2>
+    <p>
+      A search index is mostly reads. Rangefind does all the writing at build
+      time — postings, documents, facets, and geo trees packed into
+      content-addressed files — so query time is nothing but a few small,
+      cacheable HTTP range requests against your own static hosting.
+    </p>
+    <div class="steps">
+      <div class="step">
+        <span class="step__n">01 · build</span>
+        <h3>Index your content</h3>
+        <p>Point the crawler at any built static site, or feed JSONL through a schema with weighted fields, facets, numbers, geo points, and vectors.</p>
+        <pre><code>npx rangefind build ./dist</code></pre>
+      </div>
+      <div class="step">
+        <span class="step__n">02 · publish</span>
+        <h3>Deploy plain files</h3>
+        <p>The index is a directory of immutable packs plus one small manifest. Any static host or CDN that supports range requests will do — most do.</p>
+        <pre><code>rsync -r dist/ your-host:
+# or: netlify / pages / s3 / r2…</code></pre>
+      </div>
+      <div class="step">
+        <span class="step__n">03 · query</span>
+        <h3>Search from the browser</h3>
+        <p>The runtime fetches the manifest, then range-reads exactly the term postings and documents a query touches. Warm queries are often a single request — or zero.</p>
+        <pre><code>const rf = await createSearch({ baseUrl: "/rangefind/" });
+await rf.search({ q: "byte ranges" });</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <span class="eyebrow">features/</span>
+    <h2>A complete engine, not a toy</h2>
+    <p>
+      Everything below ships in the same static index and the same
+      zero-dependency runtime — no plugins to bolt relevance on later.
+    </p>
+    <div class="features">
+      <div class="feature">
+        <span class="eyebrow">terms/packs/</span>
+        <h3>Real relevance</h3>
+        <p>BM25F field weighting with phrase and proximity signals, impact-ordered postings, and early termination for fast top-k.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">typo/</span>
+        <h3>Typo correction</h3>
+        <p>Bounded vocabulary probes rescue misspelled queries only when first-page results are empty or weak — no fuzzy tax on good queries.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">facets/ · filter-bitmaps/</span>
+        <h3>Facets &amp; filters</h3>
+        <p>Keyword facets with exact-or-flagged counts, plus typed numeric, date, and boolean doc-values for filtering and sorting.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">authority/</span>
+        <h3>Search-as-you-type</h3>
+        <p>Diacritic-folded prefix autocomplete with popularity weights; the first keystroke costs one small fetch from a precomputed hot list.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">geo/tree/</span>
+        <h3>Geo search</h3>
+        <p>Static KD trees with bounding-box and radius filters, exact nearest-neighbor sort, and distance boosts — proven on 33M OSM places.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">vectors/</span>
+        <h3>Semantic &amp; hybrid</h3>
+        <p>An int8 IVF vector index with cosine top-k and reciprocal-rank fusion against the text lane. No vector database.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">analysis</span>
+        <h3>20+ languages</h3>
+        <p>Per-document language detection, light stemmers and stopwords, script-aware folding, and deterministic CJK bigrams — frozen into the manifest.</p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">gen-0001/</span>
+        <h3>Incremental updates</h3>
+        <p>Publish small delta generations over an existing index; unchanged packs keep their names and their CDN cache entries.</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="band">
+    <div class="band__inner">
+      <span class="eyebrow">debug/build-telemetry.json</span>
+      <h2>Measured, not promised</h2>
+      <div class="band__cols">
+        <div>
+          <table class="bench-table">
+            <thead><tr><th>corpus</th><th>docs</th><th>index</th><th>cold query</th></tr></thead>
+            <tbody>
+              <tr><td>French Wikipedia</td><td class="num">2.75M</td><td>5.3 GB</td><td>7–66 ms</td></tr>
+              <tr><td>English Wikipedia</td><td class="num">7.19M</td><td>9.1 GB</td><td>128 ms · 2.3 MiB</td></tr>
+              <tr><td>OSM Québec (geo)</td><td class="num">6.1M</td><td>9.5 GB</td><td>5–13 ms nearest</td></tr>
+              <tr><td>OSM United States</td><td class="num">32.8M</td><td>11 GB</td><td>7–16 ms nearest</td></tr>
+            </tbody>
+          </table>
+          <p style="margin-top:0.9rem">
+            Every number comes from committed benchmark scripts you can rerun,
+            with quality checked against Lucene and Tantivy oracles.
+            <a href="{{ '/docs/benchmarks/' | url }}">See the methodology →</a>
+          </p>
+        </div>
+        <div>
+          <h3 style="color:#fffdf3">Planet-scale, still static</h3>
+          <p>
+            Geographic sharding splits a corpus into independently built and
+            updated region indexes that merge into one engine at query time —
+            with rankings proven identical to a single monolithic build.
+            All of OpenStreetMap fits in ~310 shards, updates nightly as
+            kilobyte-sized deltas, and serves from object storage for the
+            price of a coffee.
+          </p>
+          <p>
+            <a href="{{ '/docs/sharded-indexes/' | url }}">How sharding works →</a><br>
+            <a href="{{ '/map/' | url }}">Try the live map demo →</a>
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <section class="section">
+    <span class="eyebrow">integrations/</span>
+    <h2>Drops into your stack</h2>
+    <div class="features">
+      <div class="feature"><h3>Eleventy</h3><p><code>eleventy-plugin-rangefind</code> indexes the built site and registers a search shortcode. This site uses it.</p></div>
+      <div class="feature"><h3>Astro</h3><p><code>rangefind-astro</code> hooks <code>astro:build:done</code> and ships a <code>&lt;RangefindSearch /&gt;</code> component.</p></div>
+      <div class="feature"><h3>Docusaurus</h3><p><code>docusaurus-plugin-rangefind</code> replaces hosted search on docs sites with your own static index.</p></div>
+      <div class="feature"><h3>MkDocs</h3><p><code>mkdocs-rangefind</code> on PyPI builds the index after <code>mkdocs build</code> and injects the widget.</p></div>
+      <div class="feature"><h3>Hugo &amp; anything else</h3><p>Copy-in layouts for Hugo — or run <code>npx rangefind build ./public</code> after any generator. If it makes HTML, it's indexable.</p></div>
+      <div class="feature"><h3>Node / MCP / SSR</h3><p><code>rangefind/node</code> runs the same engine server-side over local directories or remote indexes, with disk caching.</p></div>
+    </div>
+  </section>
+
+  <section class="section section--last">
+    <span class="eyebrow">$ npm install rangefind</span>
+    <h2>Two ways to start</h2>
+    <div class="quickstart">
+      <div>
+        <h3>Have a built site?</h3>
+        <p>Index the HTML you already generate, then mount the web component. Titles, headings, and body text are extracted automatically; <code>data-rangefind-*</code> attributes refine scoping, facets, and metadata.</p>
+        <pre><code class="language-bash">npx rangefind build ./dist</code></pre>
+        <pre><code class="language-html">&lt;script type="module" src="/_rangefind/rangefind-search.js"&gt;&lt;/script&gt;
+&lt;rangefind-search src="/rangefind/" hotkey&gt;&lt;/rangefind-search&gt;</code></pre>
+      </div>
+      <div>
+        <h3>Have structured data?</h3>
+        <p>Describe fields, weights, facets, and geo points in a config; feed JSONL; query with the full API — filters, sorting, geo, vectors, and pagination included.</p>
+        <pre><code class="language-bash">npx rangefind build --config rangefind.config.json</code></pre>
+        <pre><code class="language-js">import { createSearch } from "rangefind";
+const rf = await createSearch({ baseUrl: "/rangefind/" });
+const hits = await rf.search({
+  q: "harbor",
+  facets: ["topic"],
+  geo: { near: { lat: 46.8, lon: -71.2, radiusMeters: 5000 } }
+});</code></pre>
+      </div>
+    </div>
+    <p style="margin-top:2rem">
+      <a class="button button--marker" href="{{ '/docs/' | url }}">Read the documentation</a>
+      <a class="button button--ghost" href="{{ site.repo }}">Star on GitHub</a>
+    </p>
+  </section>
+</main>

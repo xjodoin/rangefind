@@ -157,6 +157,7 @@
     "rangefind": "file:."
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "site"
   ]
 }

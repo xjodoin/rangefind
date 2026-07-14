@@ -1,0 +1,17 @@
+{
+  "name": "rangefind-site",
+  "version": "0.0.0",
+  "private": true,
+  "description": "rangefind.dev marketing and documentation site — built with Eleventy, searched by rangefind itself.",
+  "type": "module",
+  "scripts": {
+    "build": "eleventy",
+    "serve": "eleventy --serve"
+  },
+  "devDependencies": {
+    "@11ty/eleventy": "^3.0.0",
+    "@11ty/eleventy-plugin-syntaxhighlight": "^5.0.0",
+    "@huggingface/transformers": "^4.2.0",
+    "eleventy-plugin-rangefind": "^0.3.0"
+  }
+}

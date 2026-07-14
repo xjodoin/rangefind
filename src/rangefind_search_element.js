@@ -295,13 +295,20 @@ export class RangefindSearchElement extends HTMLElement {
     if (token !== this._token) return;
     if (!engine) return; // error state already shown by _ensureEngine
     try {
-      const response = await engine.search({
+      let params = {
         q: query,
         page: 1,
         size: this._config.pageSize,
         highlight: this._config.highlight,
         ...(this._searchOptions.search || {})
-      });
+      };
+      // Async per-query hook: compute params from the query text — e.g.
+      // embed it for hybrid semantic search and set `params.vector`.
+      if (typeof this._searchOptions.transform === "function") {
+        params = (await this._searchOptions.transform(params)) || params;
+        if (token !== this._token) return; // superseded while transforming
+      }
+      const response = await engine.search(params);
       if (token !== this._token) return;
       this._renderResults(query, response);
       this._emit("rangefind:search", { query, response });

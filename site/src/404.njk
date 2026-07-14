@@ -1,0 +1,16 @@
+---
+layout: base.njk
+title: Page not found
+permalink: 404.html
+eleventyExcludeFromCollections: true
+---
+<main id="main" class="section section--last" data-rangefind-ignore>
+  <span class="eyebrow">GET {{ page.url }} → 404 Not Found</span>
+  <h1>That range came back empty.</h1>
+  <p>
+    The page you asked for isn't in this site's manifest. Try the search box
+    above — it covers every page here — or start from the
+    <a href="{{ '/docs/' | url }}">documentation</a> or the
+    <a href="{{ '/' | url }}">home page</a>.
+  </p>
+</main>
