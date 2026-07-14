@@ -57,6 +57,11 @@ class RangefindPlugin(BasePlugin):
         # Command used to run the Rangefind CLI. "npx" resolves the local
         # `rangefind` install; can be pointed at a specific binary in CI.
         ("node_command", config_options.Type(str, default="npx")),
+        # Path to an ES module whose default export is an async
+        # function(docs) run on the crawled documents before indexing
+        # (embeddings, metadata, ...); may also export `config` overrides.
+        # Relative paths resolve from the project directory.
+        ("enrich", config_options.Type(str, default="")),
         # Where to place the <rangefind-search> element:
         #   "body_end" (default) - injected right before </body> on every page.
         #   "manual"             - not injected; you hand-place it in a theme
@@ -103,6 +108,9 @@ class RangefindPlugin(BasePlugin):
             "--base-url",
             base_url,
         ]
+        if self.config["enrich"]:
+            enrich_abs = os.path.join(project_dir, self.config["enrich"])
+            command.extend(["--enrich", enrich_abs])
         log.info("Building Rangefind index: %s", " ".join(command))
         try:
             result = subprocess.run(

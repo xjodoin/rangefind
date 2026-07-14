@@ -1,6 +1,6 @@
 {
   "name": "docusaurus-plugin-rangefind",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Docusaurus plugin that indexes your built site with Rangefind (static search over HTTP Range requests, no server) and injects the drop-in <rangefind-search> web component.",
   "license": "MIT",
   "author": "Xavier Jodoin <xavier@jodoin.me>",

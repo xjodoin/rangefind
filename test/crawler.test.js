@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -129,4 +129,41 @@ test("buildFromCrawl honors a base URL prefix and skips a nested output dir", as
   const search = await createSearch({ baseUrl: server.baseUrl });
   const result = await search.search({ q: "alpha beta gamma", size: 5 });
   assert.equal(result.results[0].url, "https://example.com/blog/");
+});
+
+test("buildFromCrawl enrich hook: function form, and module path with config export", async (t) => {
+  const site = await mkdtemp(join(tmpdir(), "rangefind-enrich-"));
+  await writeFile(join(site, "index.html"),
+    `<html lang="en"><body><main><h1>Beacon</h1><p>harbor beacon over the wharf</p></main></body></html>`);
+
+  // Function form + config overrides.
+  const fnOutput = join(site, "rangefind");
+  await buildFromCrawl({
+    root: site,
+    output: fnOutput,
+    config: { facets: [{ name: "kind", path: "kind" }] },
+    enrich: async docs => {
+      for (const doc of docs) doc.kind = "fn-enriched";
+      return docs;
+    }
+  });
+  const server = await serveStatic(site);
+  t.after(() => server.close());
+  const viaFn = await createSearch({ baseUrl: server.baseUrl });
+  const fnHit = await viaFn.search({ q: "harbor beacon", facets: ["kind"], size: 2 });
+  assert.equal(fnHit.facets.kind.values[0].value, "fn-enriched");
+
+  // Module-path form: default export enriches, `config` export declares the
+  // facet — the shape every integration (CLI --enrich, plugin options,
+  // mkdocs setting) forwards.
+  const modulePath = join(site, "enrich.mjs");
+  await writeFile(modulePath, [
+    `export const config = { facets: [{ name: "kind", path: "kind" }] };`,
+    `export default async docs => docs.map(doc => ({ ...doc, kind: "module-enriched" }));`
+  ].join("\n"));
+  await rm(fnOutput, { recursive: true, force: true });
+  await buildFromCrawl({ root: site, output: fnOutput, enrich: modulePath });
+  const viaModule = await createSearch({ baseUrl: server.baseUrl });
+  const moduleHit = await viaModule.search({ q: "harbor beacon", facets: ["kind"], size: 2 });
+  assert.equal(moduleHit.facets.kind.values[0].value, "module-enriched");
 });

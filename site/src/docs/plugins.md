@@ -11,6 +11,24 @@ crawl the generated HTML into a static index, copy the
 idiomatic way to mount the search box. No build pipeline forks, no separate
 indexing service.
 
+All of them also share two hooks:
+
+- **`config`** — rangefind config overrides merged into the crawler's
+  generated config (tuning knobs, provenance `meta`, a `vectors`
+  declaration…).
+- **`enrich`** — an async `function(docs)` (or, everywhere a function can't
+  be expressed — the CLI, MkDocs — a path to an ES module default-exporting
+  one, optionally exporting `config` overrides too) that runs on the
+  crawled documents before indexing. This is how the search on this site
+  adds MiniLM embeddings for semantic ranking; it works equally for
+  external metadata, tags, or computed weights.
+
+```js
+// enrich.mjs — usable via any plugin option or `--enrich`
+export const config = { vectors: [{ name: "embedding", path: "embedding", dims: 384 }] };
+export default async docs => { /* add doc.embedding to each */ return docs; };
+```
+
 ## Eleventy
 
 ```bash
@@ -105,7 +123,7 @@ script.
 If your tool produces HTML, the plain CLI is the integration:
 
 ```bash
-npx rangefind build ./out
+npx rangefind build ./out --enrich ./enrich.mjs   # --enrich is optional
 ```
 
 Add [`data-rangefind-*` attributes](../) to your templates for body scoping,

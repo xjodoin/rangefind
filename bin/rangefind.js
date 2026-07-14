@@ -21,6 +21,11 @@ Commands:
             --base-url  URL prefix or origin for result URLs (default: "/").
             --root      Directory whose relative paths define ids/URLs
                         (default: <dir>).
+            --enrich    Path to an ES module whose default export is an
+                        async function(docs) run on the crawled documents
+                        before indexing (add embeddings, metadata, …).
+                        The module may also export "config": overrides
+                        merged into the generated build config.
 
           With --config, build from a JSONL corpus described by the config.
             --update    Treat the config's input as a delta (new or replaced
@@ -43,6 +48,8 @@ function parseArgs(argv) {
     else if (arg.startsWith("--base-url=")) args.baseUrl = arg.slice("--base-url=".length);
     else if (arg === "--root") args.root = argv[++i];
     else if (arg.startsWith("--root=")) args.root = arg.slice("--root=".length);
+    else if (arg === "--enrich") args.enrich = argv[++i];
+    else if (arg.startsWith("--enrich=")) args.enrich = arg.slice("--enrich=".length);
     else if (arg === "--update") args.update = true;
     else if (arg === "--compact") args.compact = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
@@ -86,7 +93,8 @@ if (dir) {
     root: args.root || dir,
     scanDir: dir,
     output,
-    baseUrl: args.baseUrl || "/"
+    baseUrl: args.baseUrl || "/",
+    enrich: args.enrich
   });
 } else if (args.config) {
   await build({ configPath: args.config, update: !!args.update, compact: !!args.compact });

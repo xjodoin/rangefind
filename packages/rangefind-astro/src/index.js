@@ -31,6 +31,9 @@ function resolveUnderOut(outDir, subPath) {
  * @param {string} [options.baseUrl="/"] URL prefix/origin for result URLs.
  * @param {string} [options.outputDir="rangefind"] Index output dir, relative to the build output (or absolute).
  * @param {string} [options.assetsDir="_rangefind"] Client-asset dir, relative to the build output (or absolute).
+ * @param {object} [options.config] Rangefind config overrides merged into the crawler's generated config.
+ * @param {Function|string} [options.enrich] Async function(docs) — or a path to an ES module default-exporting one —
+ *   run on the crawled documents before indexing (embeddings, metadata, …).
  * @returns {import("astro").AstroIntegration}
  */
 export default function rangefindAstro(options = {}) {
@@ -38,7 +41,9 @@ export default function rangefindAstro(options = {}) {
     enabled = true,
     baseUrl = "/",
     outputDir = "rangefind",
-    assetsDir = "_rangefind"
+    assetsDir = "_rangefind",
+    config = null,
+    enrich = null
   } = options;
 
   return {
@@ -67,7 +72,9 @@ export default function rangefindAstro(options = {}) {
             root: outDir,
             scanDir: outDir,
             output: indexOut,
-            baseUrl
+            baseUrl,
+            config,
+            enrich
           });
           logger.info(
             `indexed ${result.docs} doc(s) from ${result.files} file(s) -> ${indexOut}`

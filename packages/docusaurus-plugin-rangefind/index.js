@@ -32,6 +32,11 @@ module.exports = function rangefindPlugin(context = {}, options = {}) {
   const theme = options.theme !== false;
   const assetsDir = options.assetsDir || DEFAULT_ASSETS_DIR;
   const outputDir = options.outputDir || DEFAULT_OUTPUT_DIR;
+  // Rangefind config overrides merged into the crawler's generated config,
+  // and an optional enrich hook — an async function(docs) or a path to an
+  // ES module default-exporting one — run before indexing (embeddings, …).
+  const crawlConfig = options.config || null;
+  const enrich = options.enrich || null;
 
   // Base URL for the injected asset tags. Prefer an explicit override, then the
   // site's own configured baseUrl so the tag src matches the deployed prefix.
@@ -70,7 +75,9 @@ module.exports = function rangefindPlugin(context = {}, options = {}) {
         root: outDir,
         scanDir: outDir,
         output,
-        baseUrl: crawlBaseUrl
+        baseUrl: crawlBaseUrl,
+        config: crawlConfig,
+        enrich
       });
 
       // Copy the two client assets next to the site. Paths resolve through the

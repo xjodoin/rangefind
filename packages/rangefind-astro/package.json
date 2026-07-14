@@ -1,6 +1,6 @@
 {
   "name": "rangefind-astro",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Astro integration for Rangefind — builds a static search index at `astro build` time and ships a drop-in search component.",
   "type": "module",
   "license": "MIT",

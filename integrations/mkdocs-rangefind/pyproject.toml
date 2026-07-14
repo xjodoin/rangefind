@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mkdocs-rangefind"
-version = "0.1.0"
+version = "0.2.0"
 description = "MkDocs plugin that builds a Rangefind static search index and injects the search widget after every build."
 readme = "README.md"
 requires-python = ">=3.8"

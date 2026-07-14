@@ -9,6 +9,7 @@
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { build } from "./builder.js";
 import { DEFAULT_ANALYSIS_LANGUAGES } from "./analysis.js";
 import { extractHtml } from "./html_extract.js";
@@ -194,8 +195,25 @@ function inferConfig({ usedFields, filterKeys, sortValues, langs, anyDescription
 // unchanged builder against them. The work dir uses absolute input/output
 // paths so config.js's relative resolution is a no-op. On success the work dir
 // is removed; on failure it is preserved and its path reported for debugging.
-export async function buildFromCrawl({ root, output, baseUrl = "/", scanDir, config: overrides, enrich }) {
+// `enrich` is either an async function over the crawled docs, or a path to
+// an ES module whose default export is that function — the form every
+// integration (CLI flag, plugin option, MkDocs setting) can express. A
+// module may also export `config`: overrides merged under the caller's
+// (e.g. the `vectors` declaration matching the embeddings it adds).
+async function resolveEnrich(enrich) {
+  if (enrich == null) return { fn: null, config: null };
+  if (typeof enrich === "function") return { fn: enrich, config: null };
+  const module = await import(pathToFileURL(resolve(String(enrich))).href);
+  if (typeof module.default !== "function") {
+    throw new Error(`Rangefind enrich module ${enrich} must default-export an async function(docs).`);
+  }
+  return { fn: module.default, config: module.config && typeof module.config === "object" ? module.config : null };
+}
+
+export async function buildFromCrawl({ root, output, baseUrl = "/", scanDir, config: callerOverrides, enrich }) {
   const outputAbs = resolve(output);
+  const enricher = await resolveEnrich(enrich);
+  const overrides = { ...(enricher.config || {}), ...(callerOverrides || {}) };
   let { docs, config, files, languages } = await crawlSite({
     root,
     scanDir,
@@ -206,8 +224,8 @@ export async function buildFromCrawl({ root, output, baseUrl = "/", scanDir, con
   // Optional enrichment between crawl and build: add computed fields to the
   // documents (embeddings for semantic search, external metadata, …) and
   // declare them via `config` overrides (e.g. a `vectors` entry).
-  if (typeof enrich === "function") {
-    docs = (await enrich(docs)) || docs;
+  if (enricher.fn) {
+    docs = (await enricher.fn(docs)) || docs;
   }
 
   const workDir = await mkdtemp(join(tmpdir(), "rangefind-crawl-"));
@@ -216,7 +234,7 @@ export async function buildFromCrawl({ root, output, baseUrl = "/", scanDir, con
   await writeFile(inputPath, docs.map(doc => JSON.stringify(doc)).join("\n") + "\n");
   // Caller overrides win over the generated config (tuning knobs, meta,
   // analysis…); input/output stay authoritative.
-  await writeFile(configPath, JSON.stringify({ ...config, ...(overrides || {}), input: inputPath, output: outputAbs }, null, 2));
+  await writeFile(configPath, JSON.stringify({ ...config, ...overrides, input: inputPath, output: outputAbs }, null, 2));
 
   try {
     await build({ configPath });

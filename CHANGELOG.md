@@ -12,8 +12,13 @@
   the crawled documents before indexing (embeddings, external metadata), and
   `buildFromCrawl({ config })` merges overrides into the generated config
   (e.g. a `vectors` declaration for enriched embeddings).
-- The Eleventy plugin passes both through (`config`, `enrich` options) and no
-  longer warns on Nunjucks' internal `__keywords` shortcode marker.
+- **Uniform enrichment across every integration**: `enrich` accepts a
+  function or a path to an ES module (default export = the hook, optional
+  `config` export = overrides), so the CLI (`rangefind build <dir>
+  --enrich ./enrich.mjs`), the Eleventy, Astro, and Docusaurus plugins
+  (`config` + `enrich` options), and mkdocs-rangefind (`enrich:` setting)
+  all expose the same capability. The Eleventy plugin also no longer warns
+  on Nunjucks' internal `__keywords` shortcode marker.
 
 ### Changed
 

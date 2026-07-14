@@ -154,3 +154,13 @@ node --test test.mjs
 
 The test serves `public/` with a Range-capable server and asserts that
 searching for `xylophone` returns the second post.
+
+## Enriching the index
+
+Add computed fields (embeddings for semantic search, external metadata) with
+an enrich module — its default export runs on the crawled documents, and an
+optional `config` export merges overrides into the generated build config:
+
+```bash
+hugo && npx rangefind build ./public --enrich ./enrich.mjs
+```
