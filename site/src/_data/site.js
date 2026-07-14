@@ -2,6 +2,9 @@ export default {
   name: "Rangefind",
   // Origin only — page URLs already carry the path prefix via the url filter.
   origin: process.env.SITE_ORIGIN || "https://rangefind.dev",
+  // GA4 measurement id; the tag is only rendered when set (production
+  // deploys set it in pages.yml — local/dev builds stay analytics-free).
+  analyticsId: process.env.GA_MEASUREMENT_ID || "",
   tagline: "Search, without the server.",
   description:
     "Rangefind packs your site into a static search index and lets the browser read only the byte ranges it needs. BM25F relevance, typo correction, facets, autocomplete, geo, and vectors — from plain files on any static host.",

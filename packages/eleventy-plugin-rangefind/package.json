@@ -40,7 +40,7 @@
     "url": "git+https://github.com/xjodoin/rangefind.git",
     "directory": "packages/eleventy-plugin-rangefind"
   },
-  "homepage": "https://github.com/xjodoin/rangefind/tree/main/packages/eleventy-plugin-rangefind#readme",
+  "homepage": "https://rangefind.dev/docs/plugins/",
   "bugs": {
     "url": "https://github.com/xjodoin/rangefind/issues"
   }

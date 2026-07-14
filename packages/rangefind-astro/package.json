@@ -47,7 +47,7 @@
     "url": "git+https://github.com/xjodoin/rangefind.git",
     "directory": "packages/rangefind-astro"
   },
-  "homepage": "https://github.com/xjodoin/rangefind/tree/main/packages/rangefind-astro#readme",
+  "homepage": "https://rangefind.dev/docs/plugins/",
   "bugs": {
     "url": "https://github.com/xjodoin/rangefind/issues"
   }
