@@ -14,6 +14,23 @@ export const OSM_DISPLAY_FIELDS = Object.freeze([
 export function createOsmIndexConfig(options = {}) {
   const workerCount = Math.max(1, Math.floor(Number(options.workerCount || 1)));
   const config = {
+    // Provenance published in the manifest. OSM's ODbL requires attribution
+    // wherever the data is used; options.meta merges extra fields (generator,
+    // data version, …) on top without losing the license block.
+    meta: {
+      source: "OpenStreetMap",
+      attribution: "© OpenStreetMap contributors",
+      license: "ODbL-1.0",
+      license_url: "https://www.openstreetmap.org/copyright",
+      ...(options.rqa ? {
+        additional_sources: [{
+          source: "Référentiel québécois des adresses (RQA)",
+          attribution: "Gouvernement du Québec",
+          license: "CC-BY-4.0"
+        }]
+      } : {}),
+      ...(options.meta || {})
+    },
     input: options.input || (options.rqa ? "data/osm-rqa-places.jsonl" : "data/osm-places.jsonl"),
     output: options.output || "public/rangefind",
     scanWorkers: workerCount,

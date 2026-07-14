@@ -6,6 +6,12 @@ import { openCodeStore } from "./build_store.js";
 import { buildPostingSegmentChunks, POSTING_SEGMENT_FORMAT } from "./codec.js";
 import { createAppendOnlyPackWriter, finalizePackWriter, resolvePackEntry, writePackedShard, writePackedShardChunks } from "./packs.js";
 import { partitionInputBytes, partitionRowCount, partitionTermCount, partitionTermEntries } from "./reduced_terms.js";
+import { installScoringDfProvider } from "./scoring_stats.js";
+
+// Sharded builds freeze per-term df in a sorted on-disk table; the config
+// carries only its path, so each worker resolves terms lazily through this
+// provider instead of receiving a cloned df map.
+installScoringDfProvider();
 
 let activeCodes = null;
 let activeCodesKey = "";

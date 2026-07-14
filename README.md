@@ -91,6 +91,12 @@ a large thesis corpus.
   lookup, compact `addr:interpolation` ranges, structured address results,
   bounded Québec RQA civic/postal augmentation, reusable `rangefind/osm` and
   `rangefind/osm/node` integration APIs, and exhaustive geo oracles.
+- Geographic index sharding for planet-scale corpora: independently built and
+  updated per-region shards sharing one frozen scoring-stats artifact
+  (`scoringStats` config + `rangefind/scoring-stats`), a tiny sharded root
+  manifest (`rangefind/shards`), lazy shard engines with bbox geo routing and
+  expanding nearest-first search, and merged lanes whose rankings match a
+  monolithic build of the same corpus exactly — see `docs/sharded-osm.md`.
 - Tiny runnable example.
 
 ## Why This Exists

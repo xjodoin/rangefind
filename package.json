@@ -40,6 +40,9 @@
     "./crawler": "./src/crawler.js",
     "./osm": "./src/integrations/osm/index.js",
     "./osm/node": "./src/integrations/osm/node/builder.js",
+    "./shards": "./src/index_shards.js",
+    "./scoring-stats": "./src/scoring_stats.js",
+    "./config": "./src/config.js",
     "./analysis": "./src/analysis.js",
     "./terms": "./src/terms.js"
   },
@@ -93,6 +96,7 @@
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",
     "bench:osm-geo:quebec": "node scripts/osm_fixture.mjs all --region=quebec && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
+    "bench:osm-shards": "node scripts/osm_fixture.mjs jsonl --region=quebec --no-rqa && node scripts/osm_shard_bench.mjs --root=examples/osm-geo --shards=4",
     "bench:osm-geo:us": "node scripts/osm_us_bench.mjs",
     "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
     "bench:frwiki:lucene-quality": "node scripts/frwiki_lucene_quality.mjs",

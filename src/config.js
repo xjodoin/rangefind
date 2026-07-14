@@ -4,6 +4,8 @@ import { normalizeAnalysisConfig } from "./analysis.js";
 
 export const DEFAULTS = {
   analysis: null,
+  scoringStats: "",
+  meta: null,
   geoLeafSize: 512,
   geoPackBytes: 4 * 1024 * 1024,
   suggestMaxTokenKeys: 4,
@@ -251,6 +253,10 @@ export async function readConfig(configPath) {
     codecs: { ...DEFAULTS.codecs, ...(raw.codecs || {}) },
     input: resolveFrom(base, raw.input),
     output: resolveFrom(base, raw.output || "public/rangefind"),
+    scoringStats: raw.scoringStats ? resolveFrom(base, raw.scoringStats) : "",
+    // Free-form provenance carried verbatim into the manifest (`meta`):
+    // data attribution/license, generator identity, source versions, …
+    meta: raw.meta && typeof raw.meta === "object" ? { ...raw.meta } : null,
     buildTelemetryPath: raw.buildTelemetryPath ? resolveFrom(base, raw.buildTelemetryPath) : "",
     fields: raw.fields || [
       { name: "title", path: "title", weight: 4.5, b: 0.55, phrase: true },

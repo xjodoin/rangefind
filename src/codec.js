@@ -374,16 +374,29 @@ function postingRowsImpact(rows, index) {
   return rows.impacts[postingRowsSourceIndex(rows, index)];
 }
 
+// Sharded builds freeze per-term document frequencies in a sorted on-disk
+// table too large to clone into every reduce worker. The node-side reader is
+// injected here so this module stays platform-neutral for the browser bundle.
+let scoringDfProvider = null;
+
+export function setScoringDfProvider(provider) {
+  scoringDfProvider = provider;
+}
+
 function encodePostings(rows, total, codes, filters, config, term = "") {
   const df = postingRowCount(rows);
   // Generational delta builds replicate the base generations' frozen corpus
   // statistics (same total, same df for vocabulary the base knows), so a
   // document added by a delta scores identically to the same document in the
-  // base build — exact cross-generation comparability. Terms new to the
-  // corpus fall back to delta-local df. Only the idf input is overridden;
-  // `df` keeps meaning "rows in this posting list" everywhere else.
+  // base build — exact cross-generation comparability. Sharded builds do the
+  // same through a df file shared by every shard. Terms new to the corpus
+  // fall back to local df. Only the idf input is overridden; `df` keeps
+  // meaning "rows in this posting list" everywhere else.
   const overrides = config._scoringOverrides || null;
-  const frozenDf = overrides?.dfBase?.get(term);
+  let frozenDf = overrides?.dfBase?.get(term);
+  if (frozenDf === undefined && overrides?.dfFile && scoringDfProvider) {
+    frozenDf = scoringDfProvider(overrides.dfFile, term);
+  }
   const statisticalDf = frozenDf !== undefined ? frozenDf : df;
   const effectiveTotal = overrides?.total || total;
   const idf = Math.log(1 + (effectiveTotal - statisticalDf + 0.5) / (statisticalDf + 0.5));

@@ -8,6 +8,7 @@ import { createOsmIndexConfig } from "../schema.js";
 export * from "../documents.js";
 export * from "../schema.js";
 export * from "./rqa.js";
+export * from "./shards.js";
 
 export const OSM_DEMO_VIEWS = Object.freeze({
   luxembourg: { center: [6.13, 49.61], zoom: 11 },

@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Added
+
+- **Geographic index sharding** (`docs/sharded-osm.md`): a corpus can now be
+  built as independently updated per-region shards that federate into one
+  engine at query time. A frozen scoring-stats artifact
+  (`rangefind/scoring-stats`, new `scoringStats` build config) collects
+  corpus-wide document totals, average field lengths, and per-term document
+  frequencies (sorted on-disk `rfdf-v1` table with spill-and-merge
+  collection, resolved lazily inside parallel reduce workers), so every
+  shard bakes exactly comparable BM25 impacts — a sharded index reproduces
+  the monolithic build's rankings exactly. A tiny sharded root manifest
+  (`rangefind/shards`) lists shard paths and coverage bboxes; the runtime
+  opens shard engines lazily, routes radius/box queries to intersecting
+  shards, answers nearest-first queries through an expanding shard front
+  with an early-stop proof, and merges every lane (text, distance and sorted
+  browse, facets, suggest, vector, hybrid). Shards compose with generational
+  updates. OSM corpora get a one-call orchestrator
+  (`buildOsmShardedIndex` in `rangefind/osm/node`) and a Québec-scale
+  benchmark (`npm run bench:osm-shards`). Stats-frozen shards accept
+  generational deltas (`build --update` with the same `scoringStats`
+  artifact): impacts bake from the shared df table — no per-generation
+  term-directory scan, parallel reducers retained — and a delta-updated
+  shard is proven identical to a full rebuild of the final corpus, so
+  region refreshes publish one small generation instead of re-shipping the
+  shard. Queries scope to named shards with `shards: ["quebec"]`
+  (search/count/suggest/vectorSearch; unknown names throw), resolve
+  multi-level group labels from the shard entries' `groups` hierarchy
+  (`shards: ["canada"]` expands to every province shard), or bypass
+  federation entirely by opening a shard directory as a standalone index.
+  Hierarchical roots compose: a shard entry may itself point at a sharded
+  root — routing recurses, merges nest, results carry hierarchical shard
+  paths, and rankings match the flat topology.
+
+- **Manifest provenance** (`meta` config option): a free-form provenance
+  block carried verbatim into every manifest (full, minimal, generational
+  root, sharded root — the root defaults to the first shard's meta) next to
+  the existing `built_at`. The OSM integration ships ODbL-compliant defaults
+  (`© OpenStreetMap contributors`, `ODbL-1.0`, license URL, plus the RQA
+  CC-BY-4.0 source when enabled) and merges caller fields — generator
+  identity, source URL, upstream data version — on top via
+  `createOsmIndexConfig({ meta })`.
+
 ### Changed
 
 - **Reusable OSM integration**: OSM document normalization, compact address

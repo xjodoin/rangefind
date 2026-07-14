@@ -23,6 +23,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -489,7 +490,16 @@ async function run() {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// realpath both sides: when invoked through a symlinked node_modules (the
+// script ships in the npm package), argv[1] is the symlink while
+// import.meta.url is already resolved.
+if (process.argv[1] && (() => {
+  try {
+    return realpathSync(resolve(process.argv[1])) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})()) {
   run().catch(err => {
     console.error(err);
     process.exit(1);

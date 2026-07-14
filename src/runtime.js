@@ -296,6 +296,9 @@ export async function createSearch(options = {}) {
     ? await fetchJsonIfOk(options.manifestName)
     : await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
+  if (Array.isArray(manifest.shards)) {
+    return createShardedSearch(manifest, options, baseUrl);
+  }
   if (Array.isArray(manifest.generations)) {
     return createGenerationalSearch(manifest, options, baseUrl);
   }
@@ -7404,25 +7407,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
       .filter(Boolean);
   }
 
-  function mergeFacetResponses(responses) {
-    const facets = {};
-    for (const response of responses) {
-      for (const [field, data] of Object.entries(response.facets || {})) {
-        const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: new Map() });
-        target.exact = target.exact && data.exact !== false;
-        for (const item of data.values) {
-          const existing = target.byValue.get(item.value);
-          if (existing) existing.count += item.count;
-          else target.byValue.set(item.value, { ...item });
-        }
-      }
-    }
-    for (const data of Object.values(facets)) {
-      data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
-      delete data.byValue;
-    }
-    return facets;
-  }
+  const mergeFacetResponses = mergeFederatedFacets;
 
   function applyMergedHighlights(params, q, results, correctedQuery) {
     if (!params.highlight || !results.length || !q) return;
@@ -7759,6 +7744,534 @@ async function createGenerationalSearch(root, options, baseUrl) {
     count,
     vectorSearch,
     loadFacetValues: field => engines[0].loadFacetValues(field)
+  };
+}
+
+// Facet merging shared by the generational and sharded federation layers:
+// counts add across sub-indexes, exactness survives only if every side was
+// exact.
+function mergeFederatedFacets(responses) {
+  const facets = {};
+  for (const response of responses) {
+    for (const [field, data] of Object.entries(response.facets || {})) {
+      const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: new Map() });
+      target.exact = target.exact && data.exact !== false;
+      for (const item of data.values) {
+        const existing = target.byValue.get(item.value);
+        if (existing) existing.count += item.count;
+        else target.byValue.set(item.value, { ...item });
+      }
+    }
+  }
+  for (const data of Object.values(facets)) {
+    data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+    delete data.byValue;
+  }
+  return facets;
+}
+
+// Shard routing must never exclude a shard that could hold a matching
+// document, so distance estimates are haversine to the coordinate-clamped
+// bbox point (antimeridian-aware) and every exclusion decision applies
+// SHARD_ROUTING_SLACK: the clamped point is not always the exact great-circle
+// argmin (high latitudes + wide longitude gaps), but the deviation is far
+// inside 5% + 10km. Per-shard geo lanes verify exact distances, so slack only
+// costs an occasional extra shard query.
+const SHARD_ROUTING_SLACK_RATIO = 1.05;
+const SHARD_ROUTING_SLACK_METERS = 10000;
+
+function shardRoutingBudget(meters) {
+  return meters * SHARD_ROUTING_SLACK_RATIO + SHARD_ROUTING_SLACK_METERS;
+}
+
+function wrapLonDelta(a, b) {
+  return ((a - b + 540) % 360) - 180;
+}
+
+function shardBboxDistanceMeters(bbox, lat, lon) {
+  const clampedLat = Math.min(Math.max(lat, bbox[0]), bbox[2]);
+  let clampedLon = lon;
+  if (!(lon >= bbox[1] && lon <= bbox[3])) {
+    // Outside the range: snap to whichever edge is nearer around the globe.
+    clampedLon = Math.abs(wrapLonDelta(lon, bbox[1])) <= Math.abs(wrapLonDelta(lon, bbox[3])) ? bbox[1] : bbox[3];
+  }
+  return haversineMetersE7(latToE7(lat), lonToE7(lon), latToE7(clampedLat), lonToE7(clampedLon));
+}
+
+function shardBoxIntersects(bbox, box) {
+  const minLat = Math.min(Number(box.minLat), Number(box.maxLat));
+  const maxLat = Math.max(Number(box.minLat), Number(box.maxLat));
+  if (bbox[2] < minLat || bbox[0] > maxLat) return false;
+  const minLon = Number(box.minLon);
+  const maxLon = Number(box.maxLon);
+  if (minLon <= maxLon) return bbox[3] >= minLon && bbox[1] <= maxLon;
+  // Query box crossing the antimeridian: two longitude ranges.
+  return bbox[3] >= minLon || bbox[1] <= maxLon;
+}
+
+// Sharded indexes: the root manifest lists independently built shard indexes
+// (typically geographic regions) with coverage bboxes. Shard engines open
+// lazily; geo queries route to the shards whose coverage can match, text
+// queries fan out; merged scores are exactly comparable because every shard
+// bakes impacts from one frozen scoring-stats artifact (see
+// src/scoring_stats.js). A shard may itself be generational — createSearch
+// dispatches per shard manifest, so the layers compose.
+async function createShardedSearch(root, options, baseUrl) {
+  const shards = (root.shards || []).map((shard, index) => ({
+    id: String(shard.id || `shard-${index}`),
+    index,
+    path: shard.path || "",
+    manifestName: shard.manifest || "manifest.min.json",
+    total: shard.total || 0,
+    bbox: Array.isArray(shard.bbox) && shard.bbox.length === 4 ? shard.bbox.map(Number) : null,
+    groups: Array.isArray(shard.groups) ? shard.groups.map(String) : []
+  }));
+  if (!shards.length) throw new Error("Rangefind: sharded manifest has no shards.");
+
+  const engines = new Array(shards.length).fill(null);
+  function engineAt(index) {
+    if (!engines[index]) {
+      const shard = shards[index];
+      const manifestName = shard.manifestName.startsWith(shard.path) && shard.path
+        ? shard.manifestName.slice(shard.path.length)
+        : shard.manifestName;
+      engines[index] = createSearch({
+        ...options,
+        baseUrl: new URL(shard.path || "./", baseUrl).href,
+        manifestName,
+        maxPageSize: 1000
+      });
+    }
+    return engines[index];
+  }
+
+  const sortableFields = new Set([
+    ...(root.numbers || []),
+    ...(root.booleans || [])
+  ].map(field => field.name));
+
+  function parseSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field || !sortableFields.has(field)) return null;
+    const order = typeof sort === "string" && sort.startsWith("-")
+      ? "desc"
+      : String(sort.order || sort.direction || "asc").toLowerCase();
+    return { field, desc: order === "desc" };
+  }
+
+  const shardIdIndex = new Map(shards.map(shard => [shard.id, shard.index]));
+  const shardGroupIndex = new Map();
+  for (const shard of shards) {
+    for (const group of shard.groups) {
+      if (!shardGroupIndex.has(group)) shardGroupIndex.set(group, []);
+      shardGroupIndex.get(group).push(shard.index);
+    }
+  }
+
+  // Explicit shard scoping: `params.shards: ["quebec"]` restricts a query
+  // to the named shards before geo routing applies. Names resolve
+  // multi-level: a shard id or a group label ("canada" expands to every
+  // member shard). Unknown names throw — a typo silently searching the
+  // wrong region is worse than an error.
+  function candidateShards(params) {
+    if (params?.shards == null) return shards;
+    const names = Array.isArray(params.shards) ? params.shards : [params.shards];
+    const picked = new Set();
+    for (const name of names) {
+      const id = String(name);
+      const index = shardIdIndex.get(id);
+      if (index !== undefined) {
+        picked.add(index);
+        continue;
+      }
+      const members = shardGroupIndex.get(id);
+      if (!members) {
+        throw new Error(`Rangefind: unknown shard or group "${id}" (shards: ${shards.map(shard => shard.id).join(", ")}${shardGroupIndex.size ? `; groups: ${[...shardGroupIndex.keys()].join(", ")}` : ""}).`);
+      }
+      for (const member of members) picked.add(member);
+    }
+    return [...picked].sort((a, b) => a - b).map(index => shards[index]);
+  }
+
+  // Routing: which shards can contain a match for this geo context, within
+  // the explicitly scoped candidates. Returns either a fixed selection or
+  // an expanding front (nearest-first queries with no radius: shards
+  // ordered by bbox distance, visited until the next shard cannot beat the
+  // page's worst kept distance).
+  function routeShards(geo, params) {
+    const candidates = candidateShards(params);
+    const all = candidates.map(shard => shard.index);
+    if (!geo || !candidates.some(shard => shard.bbox)) return { selected: all, expanding: null };
+    if (geo.near) {
+      const lat = Number(geo.near.lat);
+      const lon = Number(geo.near.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return { selected: all, expanding: null };
+      const distances = candidates.map(shard => ({
+        index: shard.index,
+        meters: shard.bbox ? shardBboxDistanceMeters(shard.bbox, lat, lon) : 0
+      }));
+      const radius = Number(geo.near.radiusMeters);
+      if (Number.isFinite(radius) && radius > 0) {
+        return {
+          selected: distances.filter(item => item.meters <= shardRoutingBudget(radius)).map(item => item.index),
+          expanding: null
+        };
+      }
+      return { selected: null, expanding: distances.sort((a, b) => a.meters - b.meters) };
+    }
+    if (geo.box) {
+      return {
+        selected: candidates
+          .filter(shard => !shard.bbox || shardBoxIntersects(shard.bbox, geo.box))
+          .map(shard => shard.index),
+        expanding: null
+      };
+    }
+    return { selected: all, expanding: null };
+  }
+
+  // Results carry their shard id; when a shard is itself a sharded index
+  // (hierarchical roots compose through createSearch dispatch), the inner
+  // id is preserved as a path: "north-america/canada/quebec".
+  function stampShard(result, shardIndex) {
+    const id = shards[shardIndex].id;
+    return { ...result, shard: result.shard != null ? `${id}/${result.shard}` : id };
+  }
+
+  async function searchShard(index, params) {
+    const engine = await engineAt(index);
+    return { index, response: await engine.search(params) };
+  }
+
+  // Expanding nearest-first: query shards in bbox-distance order and stop
+  // once the merged page cannot improve — the next shard's minimum possible
+  // distance already exceeds the page's worst kept result.
+  async function expandingNearestQuery(front, params, need) {
+    const queried = [];
+    const distances = [];
+    let cursor = 0;
+    while (cursor < front.length) {
+      if (distances.length >= need) {
+        distances.sort((a, b) => a - b);
+        // Same slack as routing: only stop when the next shard's minimum
+        // possible distance clearly exceeds the page's worst kept result.
+        if (front[cursor].meters > shardRoutingBudget(distances[need - 1])) break;
+      }
+      const batch = front.slice(cursor, cursor + 2);
+      cursor += batch.length;
+      const batchResults = await Promise.all(batch.map(item => searchShard(item.index, params)));
+      for (const item of batchResults) {
+        queried.push(item);
+        for (const result of item.response.results || []) {
+          if (result.distanceMeters != null) distances.push(result.distanceMeters);
+        }
+      }
+    }
+    return { queried, partial: cursor < front.length };
+  }
+
+  function compareByScore(a, b) {
+    return (b.result.score || 0) - (a.result.score || 0)
+      || a.shardIndex - b.shardIndex
+      || (a.result.index || 0) - (b.result.index || 0);
+  }
+
+  function sortKeyNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function shardResponseShell(responses, results, page, size, meta = {}) {
+    const correctedQuery = responses.map(response => response.correctedQuery).find(Boolean);
+    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0);
+    return {
+      total: Math.max(results.length, total),
+      results,
+      page,
+      size,
+      approximate: Boolean(meta.partial) || responses.some(response => response.approximate),
+      ...(correctedQuery ? { correctedQuery, corrections: responses.find(r => r.correctedQuery)?.corrections } : {}),
+      stats: {
+        shards: shards.length,
+        shardsQueried: responses.length,
+        shardTotals: responses.map(response => response.total || 0),
+        ...(meta.stats || {})
+      }
+    };
+  }
+
+  async function search(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    if (activeParams.vector) return hybridSearch(activeParams);
+    const q = String(activeParams.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    const need = offset + size;
+    const sortPlan = parseSortPlan(params.sort);
+    const geoDistanceSort = activeParams.geo?.sort === "distance";
+    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+
+    const route = routeShards(activeParams.geo, activeParams);
+    const perShardParams = { ...activeParams, shards: undefined, page: 1, size: Math.min(1000, need) };
+
+    let queried;
+    // Beyond each shard's 1000-row page cap the merge can no longer prove
+    // completeness; the response is flagged approximate instead of silently
+    // dropping rows.
+    let partial = need > 1000;
+    if (route.expanding) {
+      const expanded = await expandingNearestQuery(route.expanding, perShardParams, need);
+      queried = expanded.queried;
+      partial = partial || expanded.partial;
+    } else {
+      queried = await Promise.all(route.selected.map(index => searchShard(index, perShardParams)));
+    }
+
+    const rows = [];
+    for (const { index, response } of queried) {
+      for (const result of response.results || []) {
+        rows.push({ shardIndex: index, result });
+      }
+    }
+
+    if (sortPlan) {
+      // Merge by the real key. Shards return their pages already ordered;
+      // the key rides on the hydrated payload (sort fields belong in
+      // `display` for sharded browses).
+      rows.sort((a, b) => {
+        const left = sortKeyNumber(a.result[sortPlan.field]);
+        const right = sortKeyNumber(b.result[sortPlan.field]);
+        if (left == null || right == null) {
+          if (left == null && right == null) return compareByScore(a, b);
+          return left == null ? 1 : -1;
+        }
+        if (left !== right) return sortPlan.desc ? right - left : left - right;
+        return compareByScore(a, b);
+      });
+    } else if (geoDistanceSort) {
+      rows.sort((a, b) => {
+        const left = a.result.distanceMeters;
+        const right = b.result.distanceMeters;
+        if (left == null || right == null) {
+          if (left == null && right == null) return compareByScore(a, b);
+          return left == null ? 1 : -1;
+        }
+        return left - right || compareByScore(a, b);
+      });
+    } else if (q) {
+      rows.sort(compareByScore);
+    }
+    // Plain geo browse keeps shard order — the single engine makes no
+    // ordering promise there either.
+
+    const results = rows.slice(offset, need).map(row => stampShard(row.result, row.shardIndex));
+    const responses = queried.map(item => item.response);
+    const response = shardResponseShell(responses, results, page, size, { partial });
+    if (activeParams.facets) {
+      response.facets = mergeFederatedFacets(responses);
+      if (partial) {
+        // An early-stopped expanding front merged only the shards it
+        // visited — counts cover a subset of the corpus.
+        for (const facet of Object.values(response.facets)) facet.exact = false;
+      }
+    }
+    if (normalizedQuery !== surfaceQuery) {
+      response.normalizedQuery = normalizedQuery;
+      response.stats.postalCodeNormalized = true;
+    }
+    return response;
+  }
+
+  // Hybrid text + vector across shards: fuse at the merged level, like the
+  // generational layer — per-shard RRF ranks are not comparable, but merged
+  // text scores and merged similarities both are.
+  async function hybridSearch(params) {
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    const route = routeShards(params.geo, params);
+    const selected = route.expanding ? route.expanding.map(item => item.index) : route.selected;
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+
+    async function lane(laneParams) {
+      const queried = await Promise.all(selected.map(index => searchShard(index, { ...laneParams, shards: undefined, page: 1, size: Math.min(1000, poolSize) })));
+      const rows = [];
+      for (const { index, response } of queried) {
+        for (const result of response.results || []) {
+          rows.push({ shardIndex: index, result });
+        }
+      }
+      rows.sort(compareByScore);
+      return { rows: rows.slice(0, poolSize), responses: queried.map(item => item.response) };
+    }
+
+    const vectorLaneParams = {
+      q: "",
+      vector: params.vector,
+      vectorField: params.vectorField,
+      hybrid: params.hybrid,
+      filters: params.filters,
+      geo: params.geo
+    };
+    if (!q) {
+      const { rows, responses } = await lane(vectorLaneParams);
+      const results = rows.slice(offset, offset + size).map(row => stampShard(row.result, row.shardIndex));
+      const response = shardResponseShell(responses, results, page, size);
+      response.approximate = true;
+      return response;
+    }
+
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const [textLane, vectorLane] = await Promise.all([
+      lane({ ...params, vector: undefined, vectorField: undefined, hybrid: undefined }),
+      lane(vectorLaneParams)
+    ]);
+
+    const fused = new Map();
+    const addRanked = (rows, laneName) => {
+      rows.forEach((row, rank) => {
+        // Generational shards reuse `index` per generation, so the key
+        // includes the generation to keep fused docs distinct.
+        const key = `${row.shardIndex}:${row.result.generation ?? ""}:${row.result.index}`;
+        const entry = fused.get(key) || { shardIndex: row.shardIndex, result: row.result, score: 0, hybrid: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.hybrid[laneName] = rank + 1;
+        fused.set(key, entry);
+      });
+    };
+    addRanked(textLane.rows, "text");
+    addRanked(vectorLane.rows, "vector");
+
+    const ranked = [...fused.values()].sort((a, b) => b.score - a.score || a.shardIndex - b.shardIndex || (a.result.index || 0) - (b.result.index || 0));
+    const results = ranked.slice(offset, offset + size).map(entry => ({
+      ...stampShard(entry.result, entry.shardIndex),
+      score: entry.score,
+      hybrid: entry.hybrid
+    }));
+    return {
+      total: ranked.length,
+      results,
+      page,
+      size,
+      approximate: true,
+      stats: { shards: shards.length, shardsQueried: selected.length, hybrid: true }
+    };
+  }
+
+  async function vectorSearch(params = {}) {
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const queried = await Promise.all(candidateShards(params).map(async shard => {
+      const engine = await engineAt(shard.index);
+      return { index: shard.index, response: await engine.vectorSearch({ ...params, shards: undefined, k }) };
+    }));
+    const rows = [];
+    for (const { index, response } of queried) {
+      for (const result of response.results || []) {
+        rows.push({ shardIndex: index, result });
+      }
+    }
+    rows.sort(compareByScore);
+    const results = rows.slice(0, k).map(row => stampShard(row.result, row.shardIndex));
+    return {
+      total: rows.length,
+      results,
+      stats: {
+        shards: shards.length,
+        perShard: queried.map(item => item.response.stats || {}),
+        exact: false,
+        approximate: true
+      }
+    };
+  }
+
+  async function suggest(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const responses = await Promise.all(candidateShards(activeParams).map(async shard => {
+      const engine = await engineAt(shard.index);
+      return engine.suggest({ ...activeParams, shards: undefined });
+    }));
+    const merged = new Map();
+    for (const response of responses) {
+      for (const item of response.suggestions) {
+        const existing = merged.get(item.text);
+        if (existing) {
+          existing.count += item.count;
+          existing.weight = Math.max(existing.weight, item.weight);
+        } else {
+          merged.set(item.text, { ...item });
+        }
+      }
+    }
+    const suggestions = [...merged.values()]
+      .sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1))
+      .slice(0, size);
+    return {
+      q: surfaceQuery,
+      suggestions,
+      ...(normalizedQuery !== surfaceQuery ? { normalizedQuery } : {}),
+      stats: {
+        shards: shards.length,
+        ...(normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {})
+      }
+    };
+  }
+
+  async function count(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const route = routeShards(activeParams.geo, activeParams);
+    const selected = route.expanding ? route.expanding.map(item => item.index) : route.selected;
+    const responses = await Promise.all(selected.map(async index => {
+      const engine = await engineAt(index);
+      return engine.count({ ...activeParams, shards: undefined });
+    }));
+    return {
+      total: responses.reduce((sum, response) => sum + (response.total || 0), 0),
+      totalExact: responses.every(response => response.totalExact),
+      approximate: responses.some(response => response.approximate),
+      ...(normalizedQuery !== surfaceQuery ? { normalizedQuery } : {}),
+      stats: {
+        shards: shards.length,
+        shardsQueried: selected.length,
+        ...(normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {})
+      }
+    };
+  }
+
+  async function loadFacetValues(field) {
+    const dictionaries = await Promise.all(shards.map(async shard => {
+      const engine = await engineAt(shard.index);
+      return engine.loadFacetValues(field);
+    }));
+    const merged = new Map();
+    for (const values of dictionaries) {
+      for (const item of values || []) {
+        if (!item?.value) continue;
+        const existing = merged.get(item.value);
+        if (existing) existing.n += item.n || 0;
+        else merged.set(item.value, { ...item });
+      }
+    }
+    return [...merged.values()].sort((a, b) => (b.n || 0) - (a.n || 0) || (a.value < b.value ? -1 : 1));
+  }
+
+  return {
+    manifest: root,
+    shards: shards.map(shard => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
+    search,
+    suggest,
+    count,
+    vectorSearch,
+    loadFacetValues
   };
 }
 

@@ -66,6 +66,7 @@ import {
   summarizeBlockFilters
 } from "./codec.js";
 import { geoComponentFieldNames, getPath, readConfig } from "./config.js";
+import { closeScoringDfReaders, installScoringDfProvider, loadScoringStats } from "./scoring_stats.js";
 import {
   buildGeoTreeLeaves,
   encodeGeoBranchPage,
@@ -109,6 +110,10 @@ const textDecoder = new TextDecoder();
 const SORT_REPLICA_FORMAT = "rfsortreplicas-v1";
 const SORT_REPLICA_RANK_MAP_FORMAT = "rfsortrankmap-v1";
 const SORT_REPLICA_RANK_RECORD_BYTES = 12;
+
+// Main-thread reduce and final pack assembly resolve frozen shard df
+// through the same provider the reduce workers install.
+installScoringDfProvider();
 
 function addDict(dict, value, label = value) {
   const key = String(value || "");
@@ -2003,7 +2008,7 @@ function generationDirName(index) {
   return `gen-${String(index).padStart(4, "0")}`;
 }
 
-async function prepareGenerationalUpdate(config) {
+async function prepareGenerationalUpdate(config, { frozenStats = false } = {}) {
   const rootDir = config.output;
   const rootManifestPath = resolve(rootDir, "manifest.json");
   if (!existsSync(rootManifestPath)) {
@@ -2063,13 +2068,21 @@ async function prepareGenerationalUpdate(config) {
     for await (const [externalId, localIndex] of readIdMapEntries(resolve(genRoot, generation.id_map))) {
       if (!tombstoned.has(localIndex)) idMap.set(externalId, [g, localIndex]);
     }
-    collectGenerationDf(genRoot, genManifest, dfBase);
+    // Stats-frozen shards take idf from the shared scoring-stats artifact
+    // instead — the same table the base generation baked from, so the delta
+    // stays exactly comparable across generations AND across shards. It also
+    // spares deltas the term-directory scan over every prior generation.
+    if (!frozenStats) collectGenerationDf(genRoot, genManifest, dfBase);
   }
 
-  // Delta builds run the reducer on the main thread so the df map is shared,
-  // not cloned per worker; deltas are small by definition.
   config.output = resolve(rootDir, genDir);
-  config.partitionReducerWorkers = 0;
+  if (!frozenStats) {
+    // Delta builds run the reducer on the main thread so the df map is
+    // shared, not cloned per worker; deltas are small by definition. The
+    // frozen-stats path keeps parallel reducers — workers resolve df through
+    // the on-disk table.
+    config.partitionReducerWorkers = 0;
+  }
   config.resumeBuild = false;
   config._buildRoot = resolve(config.output, "_build");
   mkdirSync(resolve(config.output), { recursive: true });
@@ -2102,6 +2115,7 @@ async function writeGenerationalRoot(generational, deltaManifest, config) {
   const root = {
     version: 1,
     engine: "rangefind",
+    ...(config.meta ? { meta: config.meta } : {}),
     features: { generations: true },
     generations,
     total: aliveTotal,
@@ -3682,6 +3696,7 @@ function minimalManifest(manifest) {
   return {
     version: manifest.version,
     engine: manifest.engine,
+    ...(manifest.meta ? { meta: manifest.meta } : {}),
     features: manifest.features,
     object_store: {
       format: manifest.object_store.format,
@@ -3816,6 +3831,16 @@ function buildFingerprint(config) {
       mtimeMs: Math.floor(inputStat.mtimeMs)
     }
   };
+  if (config.scoringStats) {
+    // Regenerated stats at the same path must invalidate resume stages:
+    // frozen averages and df feed both the scan and reduce outputs.
+    const statsStat = statSync(config.scoringStats);
+    payload.scoringStats = {
+      path: config.scoringStats,
+      size: statsStat.size,
+      mtimeMs: Math.floor(statsStat.mtimeMs)
+    };
+  }
   return createHash("sha256").update(stableJson(payload)).digest("hex").slice(0, 24);
 }
 
@@ -3994,7 +4019,27 @@ function hydrateReducedStage(payload) {
 export async function build({ configPath, update = false, compact = false }) {
   if (update && compact) throw new Error("Rangefind: pass either --update or --compact, not both.");
   const config = await readConfig(configPath);
-  const generational = update ? await prepareGenerationalUpdate(config) : null;
+  const scoringStats = config.scoringStats ? loadScoringStats(config.scoringStats) : null;
+  // Compaction of a stats-frozen shard is just a fresh full build with the
+  // same artifact into a clean directory; the generational --compact path
+  // would re-freeze at shard-local statistics and break comparability.
+  if (scoringStats && compact) {
+    throw new Error("Rangefind: --compact does not apply to scoringStats shards; rebuild the shard fully instead.");
+  }
+  // Shards share one term space, exactly like generations: a shard built
+  // with a different analysis profile would emit incomparable terms.
+  if (scoringStats && stableJson(scoringStats.analysis || null) !== stableJson(analyzerForConfig(config).profile)) {
+    throw new Error(
+      "Rangefind: the analysis profile differs from the scoring stats; " +
+      "regenerate the stats or keep the same `analysis` config across shards."
+    );
+  }
+  // Query-bundle impacts bake idf outside encodePostings and would use
+  // shard-local statistics, breaking cross-shard comparability.
+  if (scoringStats && queryBundlesEnabled(config)) {
+    throw new Error("Rangefind: scoringStats shard builds do not support queryBundles yet; disable queryBundles.");
+  }
+  const generational = update ? await prepareGenerationalUpdate(config, { frozenStats: Boolean(scoringStats) }) : null;
   const compaction = compact ? await prepareCompaction(config) : null;
   if (compact && !compaction) console.log("Rangefind: no generational index at the output; --compact runs as a plain full build.");
   const fingerprint = config.resumeBuild ? buildFingerprint(config) : "scratch";
@@ -4044,6 +4089,14 @@ export async function build({ configPath, update = false, compact = false }) {
         Math.max(1, (generational.prevFieldTotals[field.name] || 0) / Math.max(1, generational.prevTotal))
       ]));
     }
+    if (scoringStats) {
+      // Freeze field-length normalization at the corpus-wide averages so a
+      // document scores identically no matter which shard indexes it.
+      measured.avgLens = Object.fromEntries(config.fields.map(field => [
+        field.name,
+        Math.max(1, (scoringStats.field_totals?.[field.name] || 0) / Math.max(1, scoringStats.total))
+      ]));
+    }
     const scanStage = readStage(config, "scan");
     if (scanStage) {
       runData = hydrateScanStage(scanStage, measured);
@@ -4062,6 +4115,15 @@ export async function build({ configPath, update = false, compact = false }) {
       config._scoringOverrides = {
         total: generational.prevTotal,
         dfBase: generational.dfBase
+      };
+    }
+    if (scoringStats) {
+      // Clone-safe by design: reduce workers get a file path and resolve
+      // terms through the sorted df table lazily, so parallel reducers stay
+      // enabled for shard builds (unlike generational deltas).
+      config._scoringOverrides = {
+        total: scoringStats.total,
+        dfFile: scoringStats.dfPath
       };
     }
     addBuildCounter(telemetry, "selected_term_spool_bytes", runData.selectedTermSpool.bytes);
@@ -4172,6 +4234,7 @@ export async function build({ configPath, update = false, compact = false }) {
     const manifest = {
       version: 1,
       engine: "rangefind",
+      ...(config.meta ? { meta: config.meta } : {}),
       features: {
         objectPointers: true,
         checksummedObjects: true,
@@ -4598,6 +4661,8 @@ export async function build({ configPath, update = false, compact = false }) {
       target_shard_postings: config.targetShardPostings,
       target_postings_per_doc: config.targetPostingsPerDoc,
       field_avg_lengths: measured.avgLens,
+      frozen_scoring_stats: Boolean(scoringStats),
+      frozen_scoring_total: scoringStats ? scoringStats.total : 0,
       body_index_chars: config.bodyIndexChars,
       always_index_fields: config.alwaysIndexFields,
       max_expansion_terms_per_doc: config.maxExpansionTermsPerDoc,
@@ -4647,5 +4712,8 @@ export async function build({ configPath, update = false, compact = false }) {
     throw error;
   } finally {
     runData?.codes?.close?.();
+    // Main-thread df readers must not outlive the build: a later build in
+    // the same process may regenerate the stats file at the same path.
+    closeScoringDfReaders();
   }
 }

@@ -38,3 +38,4 @@ target/
 .playwright-mcp/
 .cache/
 examples/vector-bench/
+examples/osm-geo/shard-bench/
