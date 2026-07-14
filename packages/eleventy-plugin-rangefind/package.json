@@ -3,7 +3,6 @@
   "version": "0.3.0",
   "description": "Eleventy plugin that indexes your built site with Rangefind (static index + HTTP Range requests, no search server) and drops in the search Web Component.",
   "type": "module",
-  "private": true,
   "license": "MIT",
   "author": "Xavier Jodoin <xavier@jodoin.me>",
   "keywords": [

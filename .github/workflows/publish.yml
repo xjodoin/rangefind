@@ -68,4 +68,15 @@ jobs:
             fi
             echo "Publishing $NAME@$VERSION"
             (cd "$dir" && npm publish --provenance --access public)
+            # npm exits 0 on warnings (e.g. a private flag silently skips
+            # the publish) — trust only the registry.
+            for attempt in 1 2 3 4 5; do
+              if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+                echo "$NAME@$VERSION confirmed on the registry"
+                continue 2
+              fi
+              sleep 10
+            done
+            echo "::error::$NAME@$VERSION did not appear on the registry after publish"
+            exit 1
           done
