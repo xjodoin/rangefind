@@ -58,7 +58,7 @@ jobs:
           key: hf-minilm-q8-v1
 
       - name: Build site
-        run: PATH_PREFIX=/ SITE_ORIGIN=https://rangefind.dev npm run build --workspace rangefind-site
+        run: PATH_PREFIX=/ SITE_ORIGIN=https://rangefind.dev GA_MEASUREMENT_ID=G-YXQZVK0FK0 npm run build --workspace rangefind-site
 
       - name: Assemble site
         run: |
