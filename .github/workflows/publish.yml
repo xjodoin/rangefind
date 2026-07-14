@@ -56,7 +56,16 @@ jobs:
       # Publishes the core package and every workspace plugin, skipping
       # versions already on the registry — re-runs are idempotent, and
       # plugins version independently of the core.
+      #
+      # First publish of a NEW package cannot use OIDC (npm returns 404 —
+      # trusted publishers only exist on existing packages): add an npm
+      # granular token with package-create permission as the NPM_TOKEN
+      # secret for that run, then configure the package's trusted publisher
+      # and delete the token. When the secret is absent, the placeholder
+      # keeps setup-node's default so OIDC handles existing packages.
       - name: Publish packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || 'XXXXX-XXXXX-XXXXX-XXXXX' }}
         run: |
           set -e
           for dir in . packages/docusaurus-plugin-rangefind packages/eleventy-plugin-rangefind packages/rangefind-astro; do
