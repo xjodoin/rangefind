@@ -150,6 +150,25 @@ the graph by title mentions over the link-stripped fixtures — useful for a qui
 scaling check, but noisier than real wikilinks (it can conflate a common word
 with an article of the same name).
 
+## Choosing the boost
+
+The default `boost` of `0.5` is chosen from a sweep, not a guess
+(`npm run bench:link-rank-quality`). Across a labeled synthetic corpus:
+
+```
+  boost   tieWin   nearTieToHub   relevancePreserved
+  0         0%       0%              100%
+  0.25    100%     100%              100%
+  0.5     100%     100%              100%   <- default
+  1       100%     100%                0%
+```
+
+`0.5` is the strongest setting that still keeps a clear relevance winner at #1
+(`relevancePreserved` = 100%) while letting authority decide exact ties and
+near-ties. At `1.0` the prior starts overriding clear relevance. Raise the boost
+if you want authority to weigh more heavily; lower it toward `0` to make it a
+pure tie-breaker.
+
 ## Scope and limits
 
 - The boost reranks a **bounded** pool (`min(100, size·page·overfetch)`), so
@@ -157,9 +176,12 @@ with an article of the same name).
   from arbitrarily deep in the ranking — by design, authority sways near-ties,
   it does not resurrect weak matches. Raise `size` or `linkRankOverfetch` to
   widen the reach.
-- Automatic `linkRank` is computed by the **crawler** over a full crawl, and the
-  boost is wired on the monolithic query path. Generational (`--update`) and
-  sharded indexes still carry and sort the doc-value, but do not yet apply the
-  query-time prior automatically.
+- The prior applies on all three index topologies — monolithic, generational
+  (`--update`), and sharded. In the federated layers each generation/shard
+  applies it to its own candidates before the merge, so `linkRank` is normalized
+  per partition: "top authority in a delta/shard" is relative to that partition,
+  not the whole corpus. For geographic shards that is usually what you want
+  (local authority); for generations, `--compact` re-normalizes globally when
+  deltas pile up. The merged response reports `stats.linkRankBoost` either way.
 - This is graph-*aware ranking*, not a graph query engine: no multi-hop
   traversal, path queries, or edge lookups at query time — by design.

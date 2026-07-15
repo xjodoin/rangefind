@@ -7563,6 +7563,13 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const results = await hydrateMergedRows(pageRows);
 
     const response = mergedResponseShell(responses, results, page, size);
+    // Each generation applies the authority prior to its own candidates before
+    // the merge (linkRank is normalized per generation); surface that in the
+    // merged stats so the federation lane is as observable as the monolithic one.
+    if (responses.some(r => r?.stats?.linkRankBoost)) {
+      response.stats.linkRankBoost = true;
+      response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);
+    }
     applyMergedHighlights(activeParams, q, results, response.correctedQuery);
     if (activeParams.facets) response.facets = mergeFacetResponses(responses);
     if (normalizedQuery !== surfaceQuery) {
@@ -8153,6 +8160,12 @@ async function createShardedSearch(root, options, baseUrl) {
     const results = rows.slice(offset, need).map(row => stampShard(row.result, row.shardIndex));
     const responses = queried.map(item => item.response);
     const response = shardResponseShell(responses, results, page, size, { partial });
+    // Each shard applies the authority prior to its own (disjoint) candidates
+    // before the merge; reflect that in the merged stats.
+    if (responses.some(r => r?.stats?.linkRankBoost)) {
+      response.stats.linkRankBoost = true;
+      response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);
+    }
     if (activeParams.facets) {
       response.facets = mergeFederatedFacets(responses);
       if (partial) {
