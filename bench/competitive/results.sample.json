@@ -1,0 +1,37 @@
+{
+  "corpus": "frwiki",
+  "docs": 10000,
+  "queries": 300,
+  "engines": {
+    "rangefind": {
+      "model": "static index, HTTP range",
+      "buildMs": 11350,
+      "indexMB": 13.82,
+      "recall10": 1,
+      "mrr": 0.989,
+      "coldQueryKB": 90.5,
+      "coldQueryKBp95": 173.8,
+      "latencyMsP50": 3.29
+    },
+    "orama": {
+      "model": "in-memory (full index downloaded first)",
+      "buildMs": 8761,
+      "indexMB": 166.16,
+      "recall10": 0.977,
+      "mrr": 0.805,
+      "coldQueryKB": 166157.8,
+      "coldQueryKBp95": 166157.8,
+      "latencyMsP50": 3.118
+    },
+    "pagefind": {
+      "model": "static index, fragment fetch (WASM)",
+      "buildMs": 17509,
+      "indexMB": 44.39,
+      "recall10": 1,
+      "mrr": 0.978,
+      "coldQueryKB": 224.9,
+      "coldQueryKBp95": 875.4,
+      "latencyMsP50": null
+    }
+  }
+}

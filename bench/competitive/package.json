@@ -1,0 +1,13 @@
+{
+  "name": "rangefind-competitive-bench",
+  "private": true,
+  "type": "module",
+  "description": "Head-to-head static-search benchmark: rangefind vs Pagefind vs Orama on frwiki.",
+  "dependencies": {
+    "@orama/orama": "^3.1.18",
+    "@orama/plugin-data-persistence": "^3.1.18",
+    "@orama/stemmers": "^3.1.18",
+    "pagefind": "^1.5.2",
+    "playwright": "^1.61.1"
+  }
+}
