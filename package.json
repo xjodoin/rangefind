@@ -141,6 +141,8 @@
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",
     "bench:link-rank": "node scripts/link_rank_bench.mjs",
+    "bench:link-rank-query": "node scripts/link_rank_query_bench.mjs",
+    "bench:wiki-link-rank": "node scripts/wiki_linkrank_real.mjs",
     "bench:osm-geo:quebec": "node scripts/osm_fixture.mjs all --region=quebec && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
     "bench:osm-shards": "node scripts/osm_fixture.mjs jsonl --region=quebec --no-rqa && node scripts/osm_shard_bench.mjs --root=examples/osm-geo --shards=4",
     "bench:osm-geo:us": "node scripts/osm_us_bench.mjs",

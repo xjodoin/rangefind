@@ -118,6 +118,29 @@ The same benchmark tracks a related builder speedup: `html_extract` now
 precompiles its raw-text-stripping regexes once at module load instead of per
 document, making that stage ~2.8x faster on repeated pages.
 
+## Wikipedia
+
+The Wikipedia example build (`examples/wiki-search/build.mjs`) turns linkRank on
+by default: it extracts real `[[wikilink]]` targets from the article wikitext,
+runs PageRank over the article graph, and ships `linkRank` as a sortable
+doc-value plus the `linkGraph` boost. Disable with `--no-link-rank`.
+
+Two benchmarks exercise this at scale:
+
+- `npm run bench:wiki-link-rank` (`scripts/wiki_linkrank_real.mjs`) streams a
+  bounded prefix of a real Wikimedia dump, extracts actual wikilinks, and reports
+  the most authoritative articles. On frwiki this yields a textbook ranking —
+  France, Europe, the World Wars, countries, languages — and PageRank over
+  ~500k edges runs in ~20ms.
+- `npm run bench:link-rank-query` (`scripts/link_rank_query_bench.mjs`) builds a
+  large synthetic linked site and measures search latency with the boost off vs.
+  on; the bounded overfetch adds no measurable cost (range-coalesced payloads).
+
+`scripts/wiki_linkrank_bench.mjs` is a download-free variant that approximates
+the graph by title mentions over the link-stripped fixtures — useful for a quick
+scaling check, but noisier than real wikilinks (it can conflate a common word
+with an article of the same name).
+
 ## Scope and limits
 
 - The boost reranks a **bounded** pool (`min(100, size·page·overfetch)`), so
