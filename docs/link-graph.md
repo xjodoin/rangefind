@@ -135,6 +135,15 @@ Two benchmarks exercise this at scale:
 - `npm run bench:link-rank-query` (`scripts/link_rank_query_bench.mjs`) builds a
   large synthetic linked site and measures search latency with the boost off vs.
   on; the bounded overfetch adds no measurable cost (range-coalesced payloads).
+- `npm run bench:link-rank-geo` (`scripts/link_rank_geo_bench.mjs`) synthesizes a
+  corpus with both coordinates and a link graph to confirm the prior composes
+  with geo bbox/radius filters (it reranks the geo-filtered relevance results,
+  and the overfetch pool auto-shrinks to the filtered set) and is skipped under
+  distance sort.
+
+The prior fires under a geo **filter** (bbox/radius), where results are still
+relevance-ranked, but never under `geo.sort: "distance"`, where the ordering is
+geometric — see the `link_rank_geo` test.
 
 `scripts/wiki_linkrank_bench.mjs` is a download-free variant that approximates
 the graph by title mentions over the link-stripped fixtures — useful for a quick
