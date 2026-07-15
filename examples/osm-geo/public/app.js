@@ -7,7 +7,24 @@ const resultList = document.querySelector("#resultList");
 const statusLine = document.querySelector("#statusLine");
 const indexMeta = document.querySelector("#indexMeta");
 const areaToggle = document.querySelector("#areaToggle");
-const rqaAttribution = document.querySelector("#rqaAttribution");
+const clearButton = document.querySelector("#clearButton");
+const emptyState = document.querySelector("#emptyState");
+const emptyTitle = document.querySelector("#emptyTitle");
+const emptyCopy = document.querySelector("#emptyCopy");
+const placeMetric = document.querySelector("#placeMetric");
+const regionMetric = document.querySelector("#regionMetric");
+const coverageMetric = document.querySelector("#coverageMetric");
+const livePill = document.querySelector("#livePill");
+const liveState = document.querySelector("#liveState");
+const mapHudText = document.querySelector("#mapHudText");
+const searchPanel = document.querySelector("#searchPanel");
+const panelToggle = document.querySelector("#panelToggle");
+const collapsedSelection = document.querySelector("#collapsedSelection");
+
+// The client ships with Rangefind; ../osm-rangefind-index independently
+// publishes the rolling regional shards. Every root-manifest update is picked
+// up by the demo without copying index artifacts into the Pages deployment.
+const OSM_INDEX_BASE_URL = "https://osm.rangefind.dev/";
 
 let engine;
 let markers = [];
@@ -15,6 +32,7 @@ let moveTimer = null;
 let suggestTimer = null;
 let suggestToken = 0;
 let searchToken = 0;
+let activeSuggestion = -1;
 let suggestionsSuppressed = false;
 let suppressedQuery = "";
 
@@ -32,15 +50,51 @@ const map = new maplibregl.Map({
         attribution: "© OpenStreetMap contributors"
       }
     },
-    layers: [{ id: "osm", type: "raster", source: "osm" }]
+    layers: [{
+      id: "osm",
+      type: "raster",
+      source: "osm",
+      paint: {
+        "raster-saturation": -0.62,
+        "raster-contrast": 0.12,
+        "raster-brightness-min": 0.22,
+        "raster-brightness-max": 0.9
+      }
+    }]
   },
   center: [-73.6, 45.53],
   zoom: 12
 });
-map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
+map.addControl(new maplibregl.GeolocateControl({
+  positionOptions: { enableHighAccuracy: true },
+  trackUserLocation: false,
+  showUserHeading: true
+}), "top-right");
 
 function formatNumber(value) {
   return new Intl.NumberFormat().format(Number(value || 0));
+}
+
+function formatCompact(value) {
+  return new Intl.NumberFormat(undefined, {
+    notation: "compact",
+    maximumFractionDigits: 1
+  }).format(Number(value || 0));
+}
+
+function formatDistance(meters) {
+  const value = Number(meters);
+  if (!Number.isFinite(value)) return "";
+  if (value >= 1000) return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value / 1000)} km`;
+  return `${formatNumber(Math.round(value))} m`;
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" }).format(date);
 }
 
 function viewportBox() {
@@ -55,82 +109,179 @@ function viewportBox() {
 
 function looksLikeAddress(value) {
   const text = String(value || "");
-  // Postal-only queries are global identities too. They cannot be inferred
-  // from the house-number heuristic because a suffix such as `1Z5` contains
-  // a second digit after its letter.
   if (CANADIAN_POSTAL_CODE.test(text)) return true;
   const tokens = text.trim().split(/[^\p{L}\p{N}-]+/u).filter(Boolean);
   return tokens.length >= 2 && tokens.some(token => /^\d+[\p{L}]?(?:-\d+[\p{L}]?)?$/u.test(token));
 }
 
+function setStatus(text, state = "ready") {
+  statusLine.textContent = text;
+  statusLine.dataset.state = state;
+}
+
+function showEmpty(title, copy) {
+  emptyTitle.textContent = title;
+  emptyCopy.textContent = copy;
+  emptyState.hidden = false;
+  resultList.hidden = true;
+}
+
+function setPanelCollapsed(collapsed, selection = "") {
+  searchPanel.classList.toggle("is-collapsed", collapsed);
+  panelToggle.setAttribute("aria-expanded", String(!collapsed));
+  panelToggle.setAttribute("aria-label", collapsed ? "Expand search panel" : "Collapse search panel");
+  panelToggle.title = collapsed ? "Expand search panel" : "Collapse search panel";
+  if (selection) collapsedSelection.textContent = `${selection} selected`;
+  if (collapsed) {
+    hideSuggestions();
+    queryInput.blur();
+  }
+  requestAnimationFrame(() => map.resize());
+}
+
 function clearMarkers() {
-  for (const marker of markers) marker.remove();
+  for (const { marker } of markers) marker.remove();
   markers = [];
 }
 
-function renderResults(results, { fit = false } = {}) {
+function markerFor(item, index) {
+  const element = document.createElement("button");
+  element.className = "result-marker";
+  element.type = "button";
+  element.setAttribute("aria-label", item.name || item.title || item.id);
+  const label = document.createElement("span");
+  label.textContent = index + 1;
+  element.append(label);
+  element.addEventListener(
+    "click",
+    () => setPanelCollapsed(true, item.name || item.title || item.id),
+    { capture: true }
+  );
+  const marker = new maplibregl.Marker({ element, anchor: "bottom" })
+    .setLngLat([item.lon, item.lat])
+    .setPopup(new maplibregl.Popup({ closeButton: false, offset: 18 }).setText(item.name || item.title || item.id))
+    .addTo(map);
+  // MapLibre supplies a generic marker label during construction; restore the
+  // real place name once the marker is mounted.
+  element.setAttribute("aria-label", item.name || item.title || item.id);
+  return { marker, element };
+}
+
+function renderResults(results, { fit = false, query = "" } = {}) {
   clearMarkers();
   resultList.replaceChildren();
   const bounds = new maplibregl.LngLatBounds();
-  for (const item of results) {
+
+  for (const [index, item] of results.entries()) {
     const hasPoint = Number.isFinite(item.lat) && Number.isFinite(item.lon);
-    if (hasPoint) {
-      const marker = new maplibregl.Marker({ color: "#2a7a4b" })
-        .setLngLat([item.lon, item.lat])
-        .setPopup(new maplibregl.Popup({ closeButton: false }).setText(item.name || item.title || item.id));
-      marker.addTo(map);
-      markers.push(marker);
+    const markerEntry = hasPoint ? markerFor(item, index) : null;
+    if (markerEntry) {
+      markers.push(markerEntry);
       bounds.extend([item.lon, item.lat]);
     }
-    const li = document.createElement("li");
-    const name = document.createElement("div");
+
+    const listItem = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "result-card";
+    button.setAttribute("aria-label", `${item.name || item.title || item.id}${item.address ? `, ${item.address}` : ""}`);
+
+    const number = document.createElement("span");
+    number.className = "result-card__number";
+    number.textContent = index + 1;
+
+    const body = document.createElement("span");
+    body.className = "result-card__body";
+    const name = document.createElement("span");
     name.className = "name";
     name.textContent = item.name || item.title || item.id;
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const addressCount = Number(item.address_count);
-    meta.textContent = [
-      item.type ? String(item.type).replaceAll("_", " ") : item.category,
-      Number.isFinite(addressCount) && addressCount > 0
-        ? `${formatNumber(addressCount)} civic ${addressCount === 1 ? "address" : "addresses"}`
-        : "",
-      item.distanceMeters != null ? `${formatNumber(Math.round(item.distanceMeters))} m` : ""
-    ].filter(Boolean).join(" · ");
-    li.append(name);
+    body.append(name);
+
     if (item.address && item.address !== (item.name || item.title)) {
-      const address = document.createElement("div");
+      const address = document.createElement("span");
       address.className = "address";
       address.textContent = item.address;
-      li.append(address);
+      body.append(address);
     }
-    li.append(meta);
-    li.addEventListener("click", () => {
-      if (hasPoint) map.flyTo({ center: [item.lon, item.lat], zoom: Math.max(map.getZoom(), 15) });
-    });
-    resultList.append(li);
+
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const addressCount = Number(item.address_count);
+    const parts = [
+      item.type ? String(item.type).replaceAll("_", " ") : item.category,
+      Number.isFinite(addressCount) && addressCount > 0
+        ? `${formatCompact(addressCount)} civic ${addressCount === 1 ? "address" : "addresses"}`
+        : "",
+      formatDistance(item.distanceMeters),
+      item.shard ? String(item.shard).replaceAll("-", " ") : ""
+    ].filter(Boolean);
+    for (const part of parts) {
+      const span = document.createElement("span");
+      span.textContent = part;
+      meta.append(span);
+    }
+    body.append(meta);
+
+    const arrow = document.createElement("span");
+    arrow.className = "result-card__arrow";
+    arrow.textContent = "→";
+    arrow.setAttribute("aria-hidden", "true");
+    button.append(number, body, arrow);
+
+    const flyToResult = () => {
+      if (hasPoint) {
+        map.flyTo({ center: [item.lon, item.lat], zoom: Math.max(map.getZoom(), 15), essential: true });
+        markerEntry.marker.togglePopup();
+      }
+      setPanelCollapsed(true, item.name || item.title || item.id);
+    };
+    button.addEventListener("click", flyToResult);
+    button.addEventListener("mouseenter", () => markerEntry?.element.classList.add("active"));
+    button.addEventListener("mouseleave", () => markerEntry?.element.classList.remove("active"));
+    button.addEventListener("focus", () => markerEntry?.element.classList.add("active"));
+    button.addEventListener("blur", () => markerEntry?.element.classList.remove("active"));
+    listItem.append(button);
+    resultList.append(listItem);
   }
-  if (fit && !bounds.isEmpty()) map.fitBounds(bounds, { padding: 80, maxZoom: 15 });
+
+  if (!results.length) {
+    showEmpty(
+      query ? "No signal found" : "This view is quiet",
+      query
+        ? `No indexed place matched “${query}”. Try a broader name or move the map.`
+        : "Move or zoom the map to scan another published region."
+    );
+    return;
+  }
+
+  emptyState.hidden = true;
+  resultList.hidden = false;
+  if (fit && !bounds.isEmpty()) map.fitBounds(bounds, { padding: 90, maxZoom: 15, duration: 700 });
 }
 
 async function runSearch({ fit = false } = {}) {
   if (!engine) return;
   const token = ++searchToken;
   const q = queryInput.value.trim();
-  // Exact addresses are global identities. Keeping a stale viewport filter on
-  // them disables the zero-posting authority lanes and can hide the requested
-  // result; ordinary place/browse queries remain map-bounded.
   const addressLookup = looksLikeAddress(q);
   const areaWasChecked = areaToggle.checked;
   const useArea = areaToggle.checked && !addressLookup;
   if (addressLookup && areaWasChecked) areaToggle.checked = false;
+  clearButton.hidden = !q;
+
   const params = { q, size: 30 };
   if (useArea) params.geo = { box: viewportBox() };
   if (!q && !useArea) {
     resultList.replaceChildren();
     clearMarkers();
-    statusLine.textContent = "";
+    setStatus("Viewport search paused", "ready");
+    mapHudText.textContent = "Search this view is off";
+    showEmpty("Where should we look?", "Search for a place or turn on Search this view to browse the map.");
     return;
   }
+
+  setStatus("Scanning static byte ranges…", "loading");
+  mapHudText.textContent = q ? `Searching “${q}”` : "Scanning this viewport";
   const started = performance.now();
   try {
     const response = await searchOsmQuery(engine, params);
@@ -139,17 +290,58 @@ async function runSearch({ fit = false } = {}) {
       || response.stats?.plannerLane === "osmLocalityExact"
       || response.stats?.plannerLane === "osmStreetLocality";
     if (resolvedLocation) areaToggle.checked = false;
-    renderResults(response.results, { fit: fit || resolvedLocation || (addressLookup && areaWasChecked) });
+    renderResults(response.results, {
+      fit: fit || resolvedLocation || (addressLookup && areaWasChecked),
+      query: q
+    });
     const ms = Math.round(performance.now() - started);
-    statusLine.textContent = `${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${ms} ms`;
+    const queried = response.stats?.shardsQueried;
+    const available = response.stats?.shards || engine.shards?.length;
+    const shardText = queried != null
+      ? ` // ${formatNumber(queried)} OF ${formatNumber(available)} SHARDS`
+      : "";
+    setStatus(`${formatNumber(response.total)}${response.approximate ? "+" : ""} MATCHES // ${ms} MS${shardText}`);
+    mapHudText.textContent = queried != null
+      ? `${formatNumber(queried)} ${queried === 1 ? "shard" : "shards"} touched · ${formatNumber(response.results.length)} shown`
+      : `${formatNumber(response.results.length)} results plotted`;
   } catch (error) {
-    if (token === searchToken) statusLine.textContent = error?.message || "Search failed";
+    if (token !== searchToken) return;
+    const message = error?.message || "Search failed";
+    setStatus(message, "error");
+    mapHudText.textContent = "Search interrupted";
+    showEmpty("The atlas lost the trail", "The public index could not answer this query. Try again in a moment.");
   }
 }
 
 function hideSuggestions() {
   suggestList.hidden = true;
   suggestList.replaceChildren();
+  activeSuggestion = -1;
+  queryInput.setAttribute("aria-expanded", "false");
+  queryInput.removeAttribute("aria-activedescendant");
+}
+
+function setActiveSuggestion(index) {
+  const options = [...suggestList.querySelectorAll('[role="option"]')];
+  if (!options.length) return;
+  activeSuggestion = (index + options.length) % options.length;
+  for (const [optionIndex, option] of options.entries()) {
+    const active = optionIndex === activeSuggestion;
+    option.classList.toggle("active", active);
+    option.setAttribute("aria-selected", String(active));
+    if (active) {
+      queryInput.setAttribute("aria-activedescendant", option.id);
+      option.scrollIntoView({ block: "nearest" });
+    }
+  }
+}
+
+function chooseSuggestion(value) {
+  queryInput.value = value;
+  clearButton.hidden = false;
+  hideSuggestions();
+  areaToggle.checked = false;
+  runSearch({ fit: true });
 }
 
 function cancelSuggestions() {
@@ -163,7 +355,7 @@ function cancelSuggestions() {
 async function showSuggestions() {
   const q = queryInput.value.trim();
   const token = ++suggestToken;
-  if (!q || suggestionsSuppressed) {
+  if (!engine || !q || suggestionsSuppressed) {
     hideSuggestions();
     return;
   }
@@ -174,8 +366,11 @@ async function showSuggestions() {
       hideSuggestions();
       return;
     }
-    suggestList.replaceChildren(...response.suggestions.map(item => {
-      const li = document.createElement("li");
+    suggestList.replaceChildren(...response.suggestions.map((item, index) => {
+      const option = document.createElement("li");
+      option.id = `suggestion-${index}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", "false");
       const text = document.createElement("span");
       text.textContent = item.text;
       const count = document.createElement("span");
@@ -183,72 +378,153 @@ async function showSuggestions() {
       count.textContent = item.type === "street"
         ? "street"
         : item.interpolated
-        ? "interpolated"
-        : item.count > 1 ? `×${formatNumber(item.count)}` : "";
-      li.append(text, count);
-      li.addEventListener("mousedown", event => {
+          ? "interpolated"
+          : item.count > 1 ? `×${formatNumber(item.count)}` : "place";
+      option.append(text, count);
+      option.addEventListener("pointerdown", event => {
         event.preventDefault();
-        queryInput.value = item.text;
-        hideSuggestions();
-        // A picked suggestion searches the whole index and flies to the hits.
-        areaToggle.checked = false;
-        runSearch({ fit: true });
+        chooseSuggestion(item.text);
       });
-      return li;
+      return option;
     }));
     suggestList.hidden = false;
+    queryInput.setAttribute("aria-expanded", "true");
   } catch {
     hideSuggestions();
   }
 }
 
+async function loadIndexStatus() {
+  try {
+    const response = await fetch(new URL("status.json", OSM_INDEX_BASE_URL));
+    if (!response.ok) throw new Error(`Status ${response.status}`);
+    const status = await response.json();
+    const index = status.index || {};
+    const running = status.run?.state === "running";
+    const expanding = Number(index.publishedShards || 0) < Number(index.totalRegions || 0);
+    livePill.dataset.state = running ? "running" : "ready";
+    liveState.textContent = running ? "Indexing" : expanding ? "Expanding" : "Live";
+    livePill.title = `${formatNumber(index.publishedShards)} of ${formatNumber(index.totalRegions)} regional shards published`;
+    coverageMetric.textContent = Number.isFinite(Number(index.publicationPercent))
+      ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(Number(index.publicationPercent))}%`
+      : "Live";
+  } catch {
+    livePill.dataset.state = "ready";
+    liveState.textContent = "Live";
+    coverageMetric.textContent = "Live";
+  }
+}
+
 queryInput.addEventListener("input", () => {
+  clearButton.hidden = !queryInput.value;
   if (queryInput.value !== suppressedQuery) {
     suggestionsSuppressed = false;
     suppressedQuery = "";
   }
   clearTimeout(suggestTimer);
   if (suggestionsSuppressed) return;
-  suggestTimer = setTimeout(showSuggestions, 70);
+  suggestTimer = setTimeout(showSuggestions, 90);
 });
+
 queryInput.addEventListener("keydown", event => {
+  const options = suggestList.querySelectorAll('[role="option"]');
+  if (event.key === "ArrowDown" && !suggestList.hidden && options.length) {
+    event.preventDefault();
+    setActiveSuggestion(activeSuggestion + 1);
+    return;
+  }
+  if (event.key === "ArrowUp" && !suggestList.hidden && options.length) {
+    event.preventDefault();
+    setActiveSuggestion(activeSuggestion - 1);
+    return;
+  }
   if (event.key === "Enter") {
-    cancelSuggestions();
-    runSearch({ fit: !areaToggle.checked });
+    event.preventDefault();
+    if (activeSuggestion >= 0 && options[activeSuggestion]) {
+      chooseSuggestion(options[activeSuggestion].querySelector("span")?.textContent || "");
+    } else {
+      cancelSuggestions();
+      runSearch({ fit: !areaToggle.checked });
+    }
   }
   if (event.key === "Escape") cancelSuggestions();
 });
+
 queryInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
+
+clearButton.addEventListener("click", () => {
+  queryInput.value = "";
+  clearButton.hidden = true;
+  areaToggle.checked = true;
+  cancelSuggestions();
+  queryInput.focus();
+  runSearch();
+});
+
+panelToggle.addEventListener("click", () => {
+  setPanelCollapsed(!searchPanel.classList.contains("is-collapsed"));
+});
+
+for (const example of document.querySelectorAll("[data-query]")) {
+  example.addEventListener("click", () => {
+    queryInput.value = example.dataset.query;
+    clearButton.hidden = false;
+    areaToggle.checked = false;
+    cancelSuggestions();
+    runSearch({ fit: true });
+  });
+}
+
 areaToggle.addEventListener("change", () => runSearch());
 
+document.addEventListener("keydown", event => {
+  const shortcut = event.key === "/" && document.activeElement !== queryInput;
+  const command = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k";
+  if (!shortcut && !command) return;
+  event.preventDefault();
+  setPanelCollapsed(false);
+  queryInput.focus();
+  queryInput.select();
+});
+
+map.on("movestart", () => {
+  if (areaToggle.checked && engine) mapHudText.textContent = "New viewport detected";
+});
+
 map.on("moveend", () => {
-  if (!areaToggle.checked) return;
+  if (!areaToggle.checked || !engine) return;
   clearTimeout(moveTimer);
   moveTimer = setTimeout(() => runSearch(), 250);
 });
 
 async function boot() {
-  engine = await createSearch({ baseUrl: new URL("./rangefind/", location.href).href });
+  loadIndexStatus();
+  engine = await createSearch({ baseUrl: OSM_INDEX_BASE_URL });
   const total = engine.manifest.total || 0;
   const geoField = engine.manifest.geo?.fields?.location;
-  indexMeta.textContent = `${formatNumber(total)} places · ${formatNumber(geoField?.total || 0)} geo points · static index over HTTP ranges`;
-  let demoView = null;
-  try {
-    const response = await fetch(new URL("./osm-demo.json", location.href));
-    if (response.ok) demoView = await response.json();
-  } catch {
-    // Custom deployments without fixture metadata retain the bbox fallback.
-  }
-  if (Array.isArray(demoView?.center) && demoView.center.length === 2) {
-    map.jumpTo({ center: demoView.center, zoom: Number(demoView.zoom || 11) });
-  } else if (geoField?.bbox) {
+  const shardCount = engine.shards?.length || 1;
+  const builtAt = formatDate(engine.manifest.built_at);
+  placeMetric.textContent = formatCompact(total);
+  placeMetric.title = `${formatNumber(total)} indexed places`;
+  regionMetric.textContent = formatNumber(shardCount);
+  indexMeta.textContent = `${builtAt ? `Manifest ${builtAt}. ` : ""}Queries run entirely in this browser over immutable HTTP byte ranges.`;
+
+  if (geoField?.bbox) {
     const { minLatE7, maxLatE7, minLonE7, maxLonE7 } = geoField.bbox;
-    map.jumpTo({ center: [((minLonE7 + maxLonE7) / 2) / 1e7, ((minLatE7 + maxLatE7) / 2) / 1e7], zoom: 11 });
+    map.fitBounds(
+      [[minLonE7 / 1e7, minLatE7 / 1e7], [maxLonE7 / 1e7, maxLatE7 / 1e7]],
+      { padding: 70, maxZoom: 11, duration: 0 }
+    );
   }
-  rqaAttribution.hidden = !demoView?.rqa;
   await runSearch();
 }
 
 boot().catch(error => {
-  indexMeta.textContent = error?.message || "Index failed to load";
+  const message = error?.message || "Index failed to load";
+  indexMeta.textContent = message;
+  livePill.dataset.state = "error";
+  liveState.textContent = "Offline";
+  setStatus(message, "error");
+  mapHudText.textContent = "Index unavailable";
+  showEmpty("The atlas is offline", "The public manifest could not be loaded. Try refreshing in a moment.");
 });

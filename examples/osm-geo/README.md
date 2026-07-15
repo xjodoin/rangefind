@@ -26,6 +26,12 @@ sidecar or parallel runtime. `scripts/osm_fixture.mjs` remains a resumable CLI
 for PBF extraction and delegates document shaping, RQA ingestion, schema
 generation, and index publication to these modules.
 
+The hosted map client queries the rolling sharded index published by the
+sibling [`osm-rangefind-index`](https://github.com/xjodoin/osm-rangefind-index)
+project at `https://osm.rangefind.dev/`. The fixture commands below remain
+available for local builds, benchmarks, and development against one regional
+extract.
+
 ## Build
 
 ```bash

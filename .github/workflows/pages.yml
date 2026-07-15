@@ -40,14 +40,8 @@ jobs:
       - name: Build minimal example
         run: npm run build:example
 
-      - name: Cache OSM extract
-        uses: actions/cache@v4
-        with:
-          path: examples/osm-geo/data/luxembourg-latest.osm.pbf
-          key: osm-pbf-luxembourg-v1
-
-      - name: Build OSM map demo (Luxembourg)
-        run: node scripts/osm_fixture.mjs all --region=luxembourg --root=examples/osm-geo
+      - name: Build OSM map demo client
+        run: npm run build:osm-demo
 
       - name: Cache embedding model
         uses: actions/cache@v4

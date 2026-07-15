@@ -3,32 +3,127 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Rangefind OSM Place Search</title>
+  <meta name="description" content="Search a live, browser-native OpenStreetMap index with Rangefind. No API key, search server, or database required.">
+  <meta name="theme-color" content="#14161d">
+  <title>Rangefind Atlas — Live OpenStreetMap Search</title>
+  <link rel="icon" href="https://rangefind.dev/assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://tile.openstreetmap.org">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div id="map"></div>
-  <aside class="panel">
-    <header class="panel-header">
-      <h1>Rangefind OSM Search</h1>
-      <p id="indexMeta">Loading index…</p>
-    </header>
-    <div class="search-box">
-      <input id="queryInput" type="search" placeholder="Search a place or address…" autocomplete="off" autofocus>
-      <ul id="suggestList" hidden></ul>
+  <a class="skip-link" href="#queryInput">Skip to search</a>
+  <main class="atlas">
+    <div id="map" aria-label="Interactive OpenStreetMap"></div>
+    <div class="map-wash" aria-hidden="true"></div>
+    <div class="map-hud" aria-live="polite">
+      <span class="map-hud__signal" aria-hidden="true"></span>
+      <span id="mapHudText">Connecting to the atlas</span>
     </div>
-    <label class="area-toggle">
-      <input id="areaToggle" type="checkbox" checked>
-      Search visible map area
-    </label>
-    <p id="statusLine"></p>
-    <ul id="resultList"></ul>
-    <p id="rqaAttribution" class="data-attribution" hidden>
-      Québec civic addresses: <a href="https://www.donneesquebec.ca/recherche/dataset/referentiel-quebecois-des-adresses">MRNF — RQA</a>,
-      <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
-    </p>
-  </aside>
+
+    <aside id="searchPanel" class="panel" aria-label="OpenStreetMap search">
+      <header class="panel-header">
+        <div class="brand-row">
+          <a class="brand" href="https://rangefind.dev/" aria-label="Rangefind home">
+            <span class="brand-mark" aria-hidden="true"><i></i></span>
+            <span>rangefind</span>
+          </a>
+          <span id="collapsedSelection" class="collapsed-selection">Map result selected</span>
+          <span class="brand-actions">
+            <a class="live-pill" id="livePill" href="https://osm.rangefind.dev/" target="_blank" rel="noreferrer">
+              <span aria-hidden="true"></span>
+              <b id="liveState">Connecting</b>
+            </a>
+            <button
+              id="panelToggle"
+              class="panel-toggle"
+              type="button"
+              aria-controls="searchPanel"
+              aria-expanded="true"
+              aria-label="Collapse search panel"
+              title="Collapse search panel">
+              <span aria-hidden="true"></span>
+            </button>
+          </span>
+        </div>
+        <p class="eyebrow">OSM / SHARDED PLANET INDEX</p>
+        <h1>Search the planet.<br><em>No search server.</em></h1>
+        <p id="indexMeta" class="index-meta">Opening the public index directly from static files…</p>
+
+        <div class="index-metrics" aria-label="Index statistics">
+          <div class="metric">
+            <strong id="placeMetric">—</strong>
+            <span>places</span>
+          </div>
+          <div class="metric">
+            <strong id="regionMetric">—</strong>
+            <span>regions live</span>
+          </div>
+          <div class="metric metric--range">
+            <strong id="coverageMetric">—</strong>
+            <span>planet indexed</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="search-area" aria-label="Search controls">
+        <label class="visually-hidden" for="queryInput">Search a place or address</label>
+        <div class="search-box">
+          <span class="search-icon" aria-hidden="true"></span>
+          <input
+            id="queryInput"
+            type="search"
+            placeholder="Try “Monaco” or an address"
+            autocomplete="off"
+            spellcheck="false"
+            aria-autocomplete="list"
+            aria-controls="suggestList"
+            aria-expanded="false"
+            autofocus>
+          <kbd aria-hidden="true">/</kbd>
+          <ul id="suggestList" role="listbox" hidden></ul>
+        </div>
+
+        <div class="query-examples" aria-label="Example searches">
+          <span>Try</span>
+          <button type="button" data-query="Monaco">Monaco</button>
+          <button type="button" data-query="Monte Carlo">Monte Carlo</button>
+          <button type="button" data-query="pharmacy">pharmacy</button>
+        </div>
+
+        <div class="search-toolbar">
+          <label class="area-toggle">
+            <input id="areaToggle" type="checkbox" checked>
+            <span class="switch" aria-hidden="true"><i></i></span>
+            <span>
+              <b>Search this view</b>
+              <small>Updates when the map moves</small>
+            </span>
+          </label>
+          <button id="clearButton" class="clear-button" type="button" hidden>Clear</button>
+        </div>
+      </section>
+
+      <section class="results" aria-label="Search results">
+        <p id="statusLine" class="status-line" data-state="loading" aria-live="polite">Loading manifest…</p>
+        <div id="emptyState" class="empty-state">
+          <span class="empty-state__graphic" aria-hidden="true"><i></i><i></i><i></i></span>
+          <strong id="emptyTitle">Warming up the atlas</strong>
+          <p id="emptyCopy">Rangefind is reading a tiny manifest, then only the byte ranges this map needs.</p>
+        </div>
+        <ol id="resultList" hidden></ol>
+      </section>
+
+      <footer class="panel-footer">
+        <p>OpenStreetMap data, searched in your browser from Cloudflare R2.</p>
+        <nav aria-label="Demo resources">
+          <a href="https://osm.rangefind.dev/" target="_blank" rel="noreferrer">Index status</a>
+          <a href="https://rangefind.dev/docs/geo-search/">How it works</a>
+          <a href="https://www.openstreetmap.org/copyright">ODbL</a>
+        </nav>
+      </footer>
+    </aside>
+  </main>
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <script type="module" src="app.js"></script>
 </body>
