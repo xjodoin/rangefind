@@ -97,6 +97,15 @@ a large thesis corpus.
   manifest (`rangefind/shards`), lazy shard engines with bbox geo routing and
   expanding nearest-first search, and merged lanes whose rankings match a
   monolithic build of the same corpus exactly — see `docs/sharded-osm.md`.
+- Link-graph authority (`linkRank`): the static-site crawler resolves internal
+  `<a href>` links into a document graph and folds a build-time PageRank prior
+  into a sortable numeric doc-value. Well-linked pages win near-ties in ranking
+  (an opt-out multiplicative boost, `score *= 1 + boost*linkRank`, applied as a
+  bounded window rerank with no change to the scoring hot loop), you can sort by
+  authority, and there is zero query-time graph traversal. Any corpus that knows
+  its own edges can opt in with the turnkey `examples/link-graph-enrich.mjs`
+  enricher (or the exported `rangefind/link-graph` helper); see
+  `docs/link-graph.md`.
 - Tiny runnable example.
 
 ## Why This Exists

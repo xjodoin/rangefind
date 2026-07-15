@@ -162,3 +162,28 @@ test("strips HTML comments before extraction", () => {
   const result = extractHtml(`<html><body><main><p>Visible</p><!-- <p>Commented</p> --></main></body></html>`);
   assert.equal(result.body, "Visible");
 });
+
+test("collects hrefs of links inside the indexed region", () => {
+  const result = extractHtml(`<html><body><main>
+    <p>See the <a href="/guide/">guide</a> and the <a href="intro.html">intro</a>.</p>
+    <a href="https://example.com">external</a>
+  </main></body></html>`);
+  assert.deepEqual(result.links, ["/guide/", "intro.html", "https://example.com"]);
+});
+
+test("excludes links in nav/aside/footer chrome from the link set", () => {
+  const result = extractHtml(`<html><body>
+    <nav><a href="/menu/">menu</a></nav>
+    <main><p>Body <a href="/real/">real</a>.</p></main>
+    <footer><a href="/legal/">legal</a></footer>
+  </body></html>`);
+  assert.deepEqual(result.links, ["/real/"]);
+});
+
+test("ignores links marked with data-rangefind-ignore", () => {
+  const result = extractHtml(`<html><body><main>
+    <a href="/kept/">kept</a>
+    <a href="/skip/" data-rangefind-ignore>skip</a>
+  </main></body></html>`);
+  assert.deepEqual(result.links, ["/kept/"]);
+});

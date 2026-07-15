@@ -6,6 +6,10 @@ export const DEFAULTS = {
   analysis: null,
   scoringStats: "",
   meta: null,
+  // Optional link-graph authority prior. When set (the static-site crawler
+  // populates it automatically), `field` names a numeric doc-value in [0, 1]
+  // and `boost` is the default query-time multiplier: score *= 1 + boost*rank.
+  linkGraph: null,
   geoLeafSize: 512,
   geoPackBytes: 4 * 1024 * 1024,
   suggestMaxTokenKeys: 4,

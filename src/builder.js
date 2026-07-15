@@ -3742,6 +3742,7 @@ function minimalManifest(manifest) {
     booleans: manifest.booleans,
     sorts: manifest.sorts,
     geo: manifest.geo,
+    linkGraph: manifest.linkGraph,
     vectors: manifest.vectors,
     block_filters: manifest.block_filters,
     directory: manifest.directory,
@@ -4358,6 +4359,7 @@ export async function build({ configPath, update = false, compact = false }) {
           pack_table: geoTrees.pack_table
         }
       : null,
+    linkGraph: config.linkGraph || null,
     vectors: vectors
       ? {
           storage: vectors.storage,

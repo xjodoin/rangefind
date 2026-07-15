@@ -13,8 +13,53 @@ import { pathToFileURL } from "node:url";
 import { build } from "./builder.js";
 import { DEFAULT_ANALYSIS_LANGUAGES } from "./analysis.js";
 import { extractHtml } from "./html_extract.js";
+import { computeLinkRank, DEFAULT_DAMPING, DEFAULT_ITERATIONS } from "./link_graph.js";
+import { createLinkResolver, urlKey } from "./link_resolve.js";
 
 const HTML_RE = /\.html?$/i;
+
+// Default strength of the query-time linkRank prior for crawled sites. The
+// runtime applies it multiplicatively: score *= 1 + boost * linkRank, with
+// linkRank in [0, 1]. 0.5 lets a maximally authoritative page win a near-tie
+// without letting authority override a clearly stronger textual match.
+const DEFAULT_LINK_BOOST = 0.5;
+
+// Turn per-page resolved paths and raw hrefs into normalized linkRank scores
+// (PageRank over the internal link graph, most-authoritative page = 1). Returns
+// per-ordinal scores aligned with `paths`, the total internal edge count so the
+// caller can skip the signal when a site has no cross-links, and the number of
+// raw hrefs seen so the caller can warn when links exist but none resolve
+// (usually a baseUrl mismatch against absolute internal links).
+function computeLinkRanks(paths, linksPerPage, baseUrl) {
+  const n = paths.length;
+  const resolve = createLinkResolver(baseUrl);
+  const keyToOrdinal = new Map();
+  for (let i = 0; i < n; i++) {
+    const key = urlKey(paths[i]);
+    // First page wins a key collision, matching the crawler's id assignment.
+    if (!keyToOrdinal.has(key)) keyToOrdinal.set(key, i);
+  }
+  const adjacency = new Array(n);
+  let edges = 0;
+  let hrefs = 0;
+  for (let i = 0; i < n; i++) {
+    const seen = new Set();
+    const row = [];
+    for (const href of linksPerPage[i] || []) {
+      hrefs++;
+      const key = resolve(href, paths[i]);
+      if (key == null) continue;
+      const target = keyToOrdinal.get(key);
+      if (target === undefined || target === i || seen.has(target)) continue;
+      seen.add(target);
+      row.push(target);
+    }
+    edges += row.length;
+    adjacency[i] = row;
+  }
+  const ranks = edges > 0 ? computeLinkRank(adjacency, { damping: DEFAULT_DAMPING, iterations: DEFAULT_ITERATIONS }) : null;
+  return { ranks, edges, hrefs };
+}
 
 // Recursively list crawlable HTML files under `dir`. Dotfiles/dot-dirs,
 // node_modules, and an optional `skipPath` (e.g. a nested output dir) are
@@ -92,6 +137,8 @@ export async function crawlSite({ root, scanDir, baseUrl = "/", skipPath = "" })
   const files = await listHtmlFiles(scanAbs, skipPath ? resolve(skipPath) : "");
 
   const docs = [];
+  const pagePaths = [];
+  const pageLinks = [];
   const ids = new Set();
   const usedFields = new Set();
   const filterKeys = new Set();
@@ -135,9 +182,40 @@ export async function crawlSite({ root, scanDir, baseUrl = "/", skipPath = "" })
     }
 
     docs.push(doc);
+    pagePaths.push(path);
+    pageLinks.push(extracted.links || []);
   }
 
   const config = inferConfig({ usedFields, filterKeys, sortValues, langs, anyDescription });
+
+  // Link-graph authority: a build-time PageRank prior materialized as a sortable
+  // numeric doc-value. It sharpens ranking (well-linked pages win near-ties) and
+  // lets callers sort by authority, with zero query-time graph traversal.
+  const { ranks, edges, hrefs } = computeLinkRanks(pagePaths, pageLinks, baseUrl);
+  if (!ranks && hrefs > 0) {
+    console.warn(
+      `Rangefind: found ${hrefs} in-content link(s) but none resolved to internal pages, `
+      + `so no linkRank authority signal was built. If this site uses absolute internal URLs, `
+      + `pass a matching baseUrl (currently "${baseUrl}").`
+    );
+  }
+  if (ranks) {
+    for (let i = 0; i < docs.length; i++) {
+      // Round to keep the JSONL compact and the build deterministic.
+      docs[i].linkRank = Math.round(ranks[i] * 1e6) / 1e6;
+    }
+    config.numbers.push({ name: "linkRank", path: "linkRank", type: "double", sortable: true });
+    config.sorts.push({ field: "linkRank", order: "desc" });
+    config.linkGraph = {
+      field: "linkRank",
+      boost: DEFAULT_LINK_BOOST,
+      damping: DEFAULT_DAMPING,
+      iterations: DEFAULT_ITERATIONS,
+      nodes: docs.length,
+      edges
+    };
+  }
+
   return { docs, config, files: files.length, languages: [...langs] };
 }
 

@@ -7233,12 +7233,94 @@ export async function createSearch(options = {}) {
     return runCountSearch({ q, baseTerms });
   }
 
+  // Link-graph authority prior. A build-time PageRank score (manifest.linkGraph,
+  // field values in [0, 1]) applied as a multiplicative document boost over the
+  // returned result window: score *= 1 + weight * linkRank. This mirrors the
+  // geo-boost window rerank — it reorders the current page rather than pulling
+  // in new candidates, so it stays a bounded, cheap post-pass with no change to
+  // the block-max scoring loop. Skipped entirely (no doc-value fetch) unless the
+  // index carries a linkGraph block and the boost weight is positive.
+  // Resolve the active link-graph boost weight for a query, or 0 when the prior
+  // must not apply. The prior is a *relevance* prior: it only makes sense on a
+  // text query ranked by score. A browse (no query) or an explicit sort has
+  // zero/degenerate scores that multiplying-then-resorting would destroy, so
+  // those are excluded outright.
+  function linkRankBoostWeight(params) {
+    const cfg = manifest.linkGraph;
+    if (!cfg || !cfg.field) return 0;
+    if (!params.q || params.sort || params.geo?.sort) return 0;
+    if (params.linkRank === false || params.linkRankBoost === 0) return 0;
+    const weight = Number(params.linkRankBoost ?? cfg.boost ?? 0);
+    return weight > 0 ? weight : 0;
+  }
+
+  // Multiply each result's score by its authority prior (1 + weight*linkRank)
+  // and resort. Mutates `results` in place; returns whether any score changed.
+  async function applyLinkRankBoostToResults(results, weight) {
+    const field = manifest.linkGraph?.field;
+    if (!field || !results?.length) return false;
+    const indexes = results.map(result => result.index).filter(Number.isInteger);
+    if (!indexes.length) return false;
+    await ensureDocValuesManifest();
+    const store = await valueStoreForDocs([field], indexes);
+    let touched = false;
+    for (const result of results) {
+      if (!Number.isInteger(result.index)) continue;
+      const rank = valueForDoc(store, field, result.index);
+      if (typeof rank === "number" && Number.isFinite(rank) && rank > 0) {
+        result.score *= 1 + weight * rank;
+        touched = true;
+      }
+    }
+    if (touched) results.sort((a, b) => b.score - a.score || a.index - b.index);
+    return touched;
+  }
+
+  // Relevance search with the authority prior. To let a well-linked page win a
+  // near-tie that sits just outside the requested page, we rank a bounded wider
+  // window through the normal (fully hydrated) path, apply the prior, then
+  // return the requested slice. Over-materialization is capped by
+  // LINKRANK_MAX_POOL and only happens on boosted relevance queries; facet
+  // counts are unaffected (they are computed over the full match set, not this
+  // window).
+  const LINKRANK_OVERFETCH = 4;
+  const LINKRANK_MAX_POOL = 100;
+  async function executeBoostedSearch(params, weight) {
+    const cfg = manifest.linkGraph;
+    const size = Math.max(1, Math.floor(Number(params.size ?? 10)));
+    const page = Math.max(1, Math.floor(Number(params.page ?? 1)));
+    const factor = Math.max(1, Number(params.linkRankOverfetch ?? cfg.overfetch ?? LINKRANK_OVERFETCH));
+    const windowSize = Math.min(LINKRANK_MAX_POOL, Math.max(size * page, Math.ceil(size * page * factor)));
+    const wide = await executeSearch({ ...params, size: windowSize, page: 1 });
+    const boosted = await applyLinkRankBoostToResults(wide.results, weight);
+    const offset = (page - 1) * size;
+    const results = (wide.results || []).slice(offset, offset + size);
+    const response = {
+      ...wide,
+      results,
+      page,
+      size,
+      stats: {
+        ...(wide.stats || {}),
+        linkRankBoost: boosted,
+        linkRankBoostPool: wide.results?.length || 0,
+        linkRankBoostWindow: results.length
+      }
+    };
+    if (params.facets) await traceSpan("facets.count", () => computeFacetCounts(params, response));
+    return response;
+  }
+
   async function search(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
     const response = await withRuntimeTrace(trace, () => traceSpan("search.total", async () => {
+      const boostWeight = linkRankBoostWeight(activeParams);
+      if (boostWeight > 0) {
+        return traceSpan("linkRank.boost", () => executeBoostedSearch(activeParams, boostWeight));
+      }
       const searchResponse = await executeSearch(activeParams);
       if (activeParams.facets) await traceSpan("facets.count", () => computeFacetCounts(activeParams, searchResponse));
       return searchResponse;

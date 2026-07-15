@@ -25,6 +25,16 @@ const CHROME_EXCLUDE_TAGS = new Set(["nav", "aside", "header", "footer"]);
 // tokenizing so a `<` inside a script or stylesheet never looks like a tag.
 const RAWTEXT_TAGS = ["script", "style", "template", "noscript"];
 
+// Precompiled once at module load rather than per document. `stripNonContent`
+// runs on every crawled page, so hoisting these 8 patterns out of the hot loop
+// removes a `new RegExp` compile per raw-text tag per document — a measurable
+// win on large crawls. `paired` removes a well-formed `<tag>…</tag>`; `dangling`
+// mops up a truncated raw-text element that never closes.
+const RAWTEXT_PATTERNS = RAWTEXT_TAGS.map(tag => ({
+  paired: new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, "gi"),
+  dangling: new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*$`, "i")
+}));
+
 // Void elements never have a closing tag; treat them as self-closing so the
 // tolerant stack does not wait for a `</meta>` that will never come.
 const VOID_TAGS = new Set([
@@ -87,9 +97,9 @@ function parseAttrs(source) {
 function stripNonContent(html) {
   let out = html.replace(/<!--[\s\S]*?-->/g, " ");
   out = out.replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, " ");
-  for (const tag of RAWTEXT_TAGS) {
-    out = out.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, "gi"), " ");
-    out = out.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*$`, "i"), " ");
+  for (const pattern of RAWTEXT_PATTERNS) {
+    out = out.replace(pattern.paired, " ");
+    out = out.replace(pattern.dangling, " ");
   }
   return out;
 }
@@ -169,6 +179,11 @@ export function extractHtml(html) {
   const sorts = {};
   const headingParts = [];
   const bodyParts = [];
+  // Raw hrefs of `<a>` links found inside the indexed content region. The
+  // crawler resolves these to internal document ids to build the link graph
+  // (src/link_graph.js); chrome links in nav/aside/header/footer are excluded
+  // by the same region logic that keeps them out of the body text.
+  const links = [];
   let titleTag = "";
   let firstH1 = "";
   let lang = "";
@@ -209,6 +224,10 @@ export function extractHtml(html) {
       if (name === "html" && attrs.lang) lang = primaryLang(attrs.lang);
       if (name === "meta" && attrs.name && attrs.name.toLowerCase() === "description" && attrs.content) {
         description = collapse(attrs.content);
+      }
+      if (name === "a" && attrs.href && !isIgnored(attrs) && inBody()) {
+        const href = attrs.href.trim();
+        if (href) links.push(href);
       }
 
       // Resolve attribute-form captures now (they need no element text).
@@ -298,6 +317,7 @@ export function extractHtml(html) {
     description,
     meta,
     filters,
-    sorts
+    sorts,
+    links
   };
 }
