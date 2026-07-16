@@ -8,6 +8,7 @@ import { build } from "../src/builder.js";
 import { readConfig } from "../src/config.js";
 import { collectScoringStats, loadScoringStats } from "../src/scoring_stats.js";
 import { writeShardedRootManifest } from "../src/index_shards.js";
+import { writeTextRoutingIndex } from "../src/text_routing.js";
 import { createSearch } from "../src/runtime.js";
 
 async function serveStatic(root) {
@@ -56,7 +57,9 @@ function makeDoc(i, band) {
   return {
     id: `doc-${band}-${i}`,
     title: `Entry ${i} about ${topic} in band ${band}`,
-    body: `${topic} ${topic} study number ${i}. ${filler}`,
+    // bandmarkN is unique to its band: text routing should resolve queries
+    // containing it to exactly one shard.
+    body: `${topic} ${topic} study number ${i} bandmark${band}. ${filler}`,
     topic,
     population: 100 + ((i * 37) % 5000),
     lat: band * 10 + (i % 100) / 100,
@@ -118,6 +121,10 @@ async function buildSharded(root, docsByBand) {
     }));
     await build({ configPath });
   }
+  const textRouting = await writeTextRoutingIndex({
+    outDir: join(root, "public/rangefind"),
+    shards: BANDS.map(band => ({ id: `band-${band}`, dir: join(root, `public/rangefind/shards/band-${band}`) }))
+  });
   return writeShardedRootManifest({
     outDir: join(root, "public/rangefind"),
     shards: BANDS.map(band => ({
@@ -128,7 +135,8 @@ async function buildSharded(root, docsByBand) {
       // sit in "world".
       groups: band <= 2 ? ["south", "world"] : ["world"]
     })),
-    scoringStats: stats.stats
+    scoringStats: stats.stats,
+    textRouting
   });
 }
 
@@ -205,6 +213,39 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
       assert.ok(populations[i - 1] >= populations[i], "population sort not monotone");
     }
     assert.ok(new Set(shardSorted.results.map(item => item.shard)).size > 1, "sorted browse should span shards");
+
+    // Text routing: a band-unique term opens exactly one shard, with the
+    // same scores the monolithic index produces.
+    const routedResponse = await sharded.search({ q: "glacier bandmark2", size: 20 });
+    assert.equal(routedResponse.stats.shardsQueried, 1, "bandmark2 should route to a single shard");
+    assert.equal(routedResponse.stats.textRouting?.selected, 1);
+    assert.ok(routedResponse.results.length > 0);
+    assert.ok(routedResponse.results.every(item => item.shard === "band-2"));
+    const monoRouted = await mono.search({ q: "glacier bandmark2", size: 20 });
+    assert.deepEqual(
+      routedResponse.results.map(item => [item.id, item.score]),
+      monoRouted.results.map(item => [item.id, item.score]),
+      "routed results diverged from monolithic"
+    );
+    const routedCount = await sharded.count({ q: "glacier bandmark2" });
+    const monoRoutedCount = await mono.count({ q: "glacier bandmark2" });
+    assert.equal(routedCount.total, monoRoutedCount.total);
+    assert.equal(routedCount.stats.shardsQueried, 1);
+
+    // A term no shard contains cannot be routed: the query falls back to
+    // the full fan-out so per-shard typo correction still applies.
+    const fallbackResponse = await sharded.search({ q: "glacier bandmarq2", size: 5 });
+    assert.equal(fallbackResponse.stats.textRouting?.fallback, "no-shard-support");
+    assert.equal(fallbackResponse.stats.shardsQueried, 3);
+    // Every shard still runs its own typo correction (band-N corrects to its
+    // local bandmarkN); the merge surfaces one of them.
+    assert.match(fallbackResponse.correctedQuery || "", /bandmark\d/u, "typo path should still correct");
+    assert.ok(fallbackResponse.results.length > 0);
+
+    // Broad vocabulary routes everywhere: no narrowing, no fallback.
+    const broadResponse = await sharded.search({ q: "glacier study", size: 5 });
+    assert.equal(broadResponse.stats.shardsQueried, 3);
+    assert.equal(broadResponse.stats.textRouting?.selected, 3);
   } finally {
     await monoServer.close();
     await shardServer.close();
@@ -471,4 +512,63 @@ test("geo queries route to intersecting shards only", { timeout: 120000 }, async
     await shardServer.close();
     await monoServer.close();
   }
+});
+
+test("text routing fails open for shards it does not know", { timeout: 120000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-shard-routefo-"));
+  const docsByBand = BANDS.map(band => bandDocs(band, 60));
+  const rootManifest = await buildSharded(root, docsByBand);
+
+  // Rewrite the root as if band-3 were added after the routing build: its
+  // id is unknown to the routing table, so every query must include it.
+  const manifestPath = join(root, "public/rangefind/manifest.min.json");
+  const patched = {
+    ...rootManifest,
+    text_routing: {
+      ...rootManifest.text_routing,
+      shard_ids: [rootManifest.text_routing.shard_ids[0], rootManifest.text_routing.shard_ids[1], "band-3-stale"]
+    }
+  };
+  await writeFile(manifestPath, JSON.stringify(patched));
+  await writeFile(join(root, "public/rangefind/manifest.json"), JSON.stringify(patched));
+
+  const server = await serveStatic(join(root, "public"));
+  try {
+    const sharded = await createSearch({ baseUrl: server.baseUrl });
+    // band-3's marker resolves through the fail-open path: no routed shard
+    // has it, but the unrouted shard is always searched.
+    const unrouted = await sharded.search({ q: "bandmark3", size: 5 });
+    assert.equal(unrouted.stats.shardsQueried, 1);
+    assert.ok(unrouted.results.length > 0);
+    assert.ok(unrouted.results.every(item => item.shard === "band-3"));
+    // A routed band keeps narrowing, but the unknown shard rides along.
+    const routed = await sharded.search({ q: "bandmark1", size: 5 });
+    assert.equal(routed.stats.shardsQueried, 2);
+    assert.ok(routed.results.every(item => item.shard === "band-1"));
+  } finally {
+    await server.close();
+  }
+});
+
+test("term-set sidecars rebuild identical text routing", { timeout: 120000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-shard-termset-"));
+  const docsByBand = BANDS.map(band => bandDocs(band, 60));
+  const rootManifest = await buildSharded(root, docsByBand);
+
+  const { writeShardTermSet, writeTextRoutingIndex } = await import("../src/text_routing.js");
+  const sidecarShards = [];
+  for (const band of BANDS) {
+    const outFile = join(root, `term-sets/band-${band}.terms.gz`);
+    const written = writeShardTermSet({ dir: join(root, `public/rangefind/shards/band-${band}`), outFile });
+    assert.ok(written.terms > 0);
+    sidecarShards.push({ id: `band-${band}`, termSet: outFile });
+  }
+  const fromSidecars = await writeTextRoutingIndex({
+    outDir: join(root, "routing-from-sidecars"),
+    shards: sidecarShards
+  });
+  assert.equal(fromSidecars.term_count, rootManifest.text_routing.term_count);
+  assert.deepEqual(fromSidecars.shard_ids, rootManifest.text_routing.shard_ids);
+  // Same inputs must produce the same content-addressed artifact.
+  assert.equal(fromSidecars.directory.root_hash, rootManifest.text_routing.directory.root_hash);
 });

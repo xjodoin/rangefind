@@ -14,6 +14,8 @@ import { resolve } from "node:path";
 
 export const SHARDED_INDEX_FORMAT = "rangefind-sharded-v1";
 
+export { TEXT_ROUTING_FORMAT, writeShardTermSet, writeTextRoutingIndex } from "./text_routing.js";
+
 function normalizedShardPath(path) {
   const trimmed = String(path || "").replace(/^\.?\//u, "");
   return trimmed.endsWith("/") || trimmed === "" ? trimmed : `${trimmed}/`;
@@ -27,7 +29,9 @@ function normalizedBbox(bbox) {
 // Writes manifest.json/manifest.min.json for a sharded root.
 // shards: [{ id, path, bbox? }] with paths relative to outDir; each must
 // already contain a built index (single or generational).
-export function writeShardedRootManifest({ outDir, shards, scoringStats = null, extra = {} }) {
+// textRouting: the block returned by writeTextRoutingIndex (text_routing.js);
+// when present, text queries route to the shards that contain their terms.
+export function writeShardedRootManifest({ outDir, shards, scoringStats = null, textRouting = null, extra = {} }) {
   const root = resolve(outDir);
   mkdirSync(root, { recursive: true });
   const entries = (shards || []).map((shard, index) => {
@@ -72,6 +76,7 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
         df_terms: scoringStats.df_terms || 0
       }
     } : {}),
+    ...(textRouting ? { text_routing: textRouting } : {}),
     shards: entries.map(item => item.entry),
     ...extra
   };

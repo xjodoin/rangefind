@@ -6,6 +6,7 @@ import { build } from "../../../builder.js";
 import { readConfig } from "../../../config.js";
 import { collectScoringStats } from "../../../scoring_stats.js";
 import { writeShardedRootManifest } from "../../../index_shards.js";
+import { writeTextRoutingIndex } from "../../../text_routing.js";
 import { createOsmIndexConfig } from "../schema.js";
 
 // Sharded OSM build: one Rangefind index per region, every shard consuming
@@ -78,10 +79,23 @@ export async function buildOsmShardedIndex(options = {}) {
     });
   }
 
+  // Text routing directory: term → shard-set lookups let federated text
+  // queries open only the shards that can satisfy them (fan-out killer).
+  let textRouting = null;
+  if (options.textRouting !== false) {
+    console.log("Rangefind: building text routing directory");
+    textRouting = await writeTextRoutingIndex({
+      outDir: output,
+      shards: shardEntries.map(entry => ({ id: entry.id, dir: resolve(output, entry.path) }))
+    });
+    console.log(`Rangefind: text routing ready — ${textRouting.term_count.toLocaleString()} terms`);
+  }
+
   const rootManifest = writeShardedRootManifest({
     outDir: output,
     shards: shardEntries,
-    scoringStats: stats.stats
+    scoringStats: stats.stats,
+    textRouting
   });
   const seconds = Math.round((performance.now() - started) / 100) / 10;
   console.log(`Rangefind: sharded index ready — ${rootManifest.shards.length} shards, ${rootManifest.total.toLocaleString()} docs, ${seconds}s`);

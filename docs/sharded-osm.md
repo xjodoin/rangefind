@@ -145,12 +145,28 @@ federated engine. Nothing changes for callers.
   leaf shards or independently administered/hosted subtrees (a country
   subtree on its own bucket, mounted into a world index).
 
-Current limitations (v1): text-only queries fan out to every shard (a small
-global locality/authority routing index is the planned fix); `count()` stays
-text-only, like the single engine; cross-shard `sort` browse reads the sort
-key from the hydrated payload, so sharded sort fields belong in `display`;
-shard coverage bboxes do not model antimeridian-crossing regions (split such
-regions into two shards).
+- **Text routing** — when the root carries a `text_routing` block (built by
+  `writeTextRoutingIndex` from `rangefind/shards`, automatic in
+  `buildOsmShardedIndex`), text queries stop fanning out to every shard.
+  The block is a root-level term → shard-set directory (`text-routing/`):
+  the federated engine analyzes the query with the shards' own profile,
+  looks up each base term (a couple of small cached range reads), and opens
+  only shards that hold enough of the terms to satisfy `minShouldMatch`
+  for some query plan (primary or alternate language). Routing is exact for
+  well-spelled queries and *fail-open* everywhere else: shards whose ids the
+  routing table does not know are always searched, a query no shard supports
+  falls back to the full fan-out (so per-shard typo correction still runs),
+  and any routing fetch/parse error disables routing for that query. Rebuild
+  the artifact whenever shard contents change — terms added by delta
+  generations are invisible to a stale table until then. Responses report
+  `stats.textRouting` (`terms`, `selected` or `fallback`).
+
+Current limitations (v1): `count()` stays text-only, like the single engine;
+suggest, vector, and hybrid lanes fan out to every shard (suggestions and
+vector neighbors can come from anywhere); cross-shard `sort` browse reads the
+sort key from the hydrated payload, so sharded sort fields belong in
+`display`; shard coverage bboxes do not model antimeridian-crossing regions
+(split such regions into two shards).
 
 ### Incremental shard updates
 

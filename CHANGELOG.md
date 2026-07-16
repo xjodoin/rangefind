@@ -4,6 +4,30 @@
 
 ### Added
 
+- **Federated text routing for sharded roots**: `writeTextRoutingIndex`
+  (`rangefind/shards`) builds a root-level term → shard-set directory
+  (`text-routing/`, format `rftextroute-v1`) by enumerating every shard's
+  term directory; `writeShardedRootManifest({ textRouting })` embeds it and
+  `buildOsmShardedIndex` builds it automatically. The federated engine then
+  opens only the shards that can satisfy `minShouldMatch` of a query plan's
+  terms instead of fanning text queries out to every shard — on a 67-shard
+  planet index this turns a ~1 200-request, 12–18 MB cold text query into a
+  handful of shard opens. Fail-open by design: unknown shard ids are always
+  searched, unroutable queries fall back to the full fan-out (per-shard typo
+  correction keeps working), and routing errors never break a query.
+  Responses report `stats.textRouting`.
+
+### Changed
+
+- **Suggest CPU**: autocomplete candidates are parsed once per authority
+  shard and binary-searched per call (previously every suggest call re-walked
+  and re-normalized every entry), comparisons no longer allocate, and the
+  top-k pool is pruned as it grows. Warm federated suggest on a 67-shard OSM
+  index dropped from ~2.5 s to ~0.1 s per call.
+- **Text top-k selection**: early-terminated search lanes and the repeated
+  top-k stability proofs now select the best k rows with a bounded heap
+  instead of materializing and fully sorting every scored document.
+
 - **Mobile runtime** (`rangefind/mobile`): the full query engine on embedded
   JS hosts — React Native/Hermes, QuickJS, JavaScriptCore. Local indexes
   (bundled with the app or downloaded to device storage) are searched fully

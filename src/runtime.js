@@ -3,6 +3,7 @@ import { analyzerFromManifest } from "./analysis.js";
 import { authorityAddressRangeKey, authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
+import { floorDirectoryPageIndex, floorSortedKeyIndex, parseTextRoutingSegment, TEXT_ROUTING_FORMAT } from "./text_routing_codec.js";
 import { DOC_PAGE_ENCODING, decodeDocPageColumns, decodeDocPagePointerRecord } from "./doc_pages.js";
 import { decodeDocValueSortPage, parseDocValueSortDirectory } from "./doc_value_tree.js";
 import {
@@ -97,6 +98,12 @@ function createRuntimeTrace() {
   };
 }
 
+// Shared by the single engine and the sharded routing layer: queries up to
+// four terms require every term, longer ones tolerate a single miss.
+function minShouldMatchFor(baseTerms) {
+  return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+}
+
 function traceBucketFromPath(path) {
   if (path.endsWith("/manifest.min.json")) return "manifest";
   if (/\/manifest(?:\.[0-9a-f]+)?\.json(?:\.gz)?$/u.test(path)) return "manifest";
@@ -122,6 +129,7 @@ function traceBucketFromPath(path) {
   if (path.includes("/docs/")) return "docs";
   if (path.includes("/facets/")) return "facetDictionaries";
   if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
+  if (path.includes("/text-routing/")) return "textRouting";
   if (path.includes("/directory-")) return "directory";
   if (path.endsWith("/codes.bin.gz")) return "codes";
   return "other";
@@ -2605,10 +2613,6 @@ export async function createSearch(options = {}) {
     return true;
   }
 
-  function minShouldMatchFor(baseTerms) {
-    return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
-  }
-
   // Multilingual base-plan selection: the detected query language may not
   // match the language the relevant documents were indexed in, and the base
   // terms drive minShouldMatch, phrase bundles, proximity, and typo
@@ -2642,6 +2646,55 @@ export async function createSearch(options = {}) {
     return [...scores.entries()]
       .filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch))
       .sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  }
+
+  // Bounded selection over the score map: the same ordering as
+  // collectEligibleScores but keeping only the best k rows via a min-heap
+  // (root = weakest kept row), so the repeated top-k proofs and the
+  // early-terminated lanes never materialize or sort the full match set.
+  // Returns { count, top } — count is the number of eligible rows seen.
+  function topEligibleScores(scores, hits, minShouldMatch, k) {
+    const need = Math.max(1, minShouldMatch);
+    const limit = Math.max(1, Math.floor(k));
+    const docs = [];
+    const vals = [];
+    let count = 0;
+    // a "worse" than b under (score desc, doc asc): lower score, or same
+    // score with a higher doc id.
+    const worse = (aScore, aDoc, bScore, bDoc) => aScore < bScore || (aScore === bScore && aDoc > bDoc);
+    for (const [doc, score] of scores) {
+      if ((hits.get(doc) || 0) < need) continue;
+      count++;
+      if (docs.length < limit) {
+        let i = docs.length;
+        docs.push(doc);
+        vals.push(score);
+        while (i > 0) {
+          const parent = (i - 1) >> 1;
+          if (!worse(vals[i], docs[i], vals[parent], docs[parent])) break;
+          [docs[i], docs[parent]] = [docs[parent], docs[i]];
+          [vals[i], vals[parent]] = [vals[parent], vals[i]];
+          i = parent;
+        }
+      } else if (worse(vals[0], docs[0], score, doc)) {
+        docs[0] = doc;
+        vals[0] = score;
+        let i = 0;
+        while (true) {
+          const left = 2 * i + 1;
+          const right = left + 1;
+          let weakest = i;
+          if (left < docs.length && worse(vals[left], docs[left], vals[weakest], docs[weakest])) weakest = left;
+          if (right < docs.length && worse(vals[right], docs[right], vals[weakest], docs[weakest])) weakest = right;
+          if (weakest === i) break;
+          [docs[i], docs[weakest]] = [docs[weakest], docs[i]];
+          [vals[i], vals[weakest]] = [vals[weakest], vals[i]];
+          i = weakest;
+        }
+      }
+    }
+    const top = docs.map((doc, i) => [doc, vals[i]]).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    return { count, top };
   }
 
   function emptyTextSearchResponse({ page, size, terms, entries = [], missingBaseTerms = 0 }) {
@@ -4564,13 +4617,11 @@ export async function createSearch(options = {}) {
 
   function stableTopK(scores, hits, masks, cursors, minShouldMatch, k, filterPlan, proofStats = null) {
     if (proofStats) proofStats.attempts++;
-    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
-    if (eligible.length < k) {
+    const { count: eligibleCount, top } = topEligibleScores(scores, hits, minShouldMatch, k);
+    if (eligibleCount < k) {
       recordTopKProofFailure(proofStats, "candidate_count");
       return null;
     }
-
-    const top = eligible.slice(0, k);
     const topDocs = new Set(top.map(([doc]) => doc));
     const threshold = top[top.length - 1][1];
     const boundaryDoc = top[top.length - 1][0];
@@ -5279,7 +5330,7 @@ export async function createSearch(options = {}) {
 
     let ranked = exhausted
       ? collectEligibleScores(scores, hits, minShouldMatch)
-      : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, candidateK);
+      : stable || topEligibleScores(scores, hits, minShouldMatch, candidateK).top;
     const reranked = rerank === false
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, candidateK);
@@ -5510,7 +5561,7 @@ export async function createSearch(options = {}) {
 
     let ranked = exhausted
       ? collectEligibleScores(scores, hits, minShouldMatch)
-      : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, k);
+      : stable || topEligibleScores(scores, hits, minShouldMatch, k).top;
     const reranked = rerank === false
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, candidateK);
@@ -6885,6 +6936,41 @@ export async function createSearch(options = {}) {
     if (!previous || compareAutocomplete(item, previous) < 0) best.set(item.display, item);
   }
 
+  // Autocomplete candidates parsed once per authority shard and cached on the
+  // (immutable, engine-cached) parsed shard: repeat suggest calls binary-search
+  // the sorted candidate list instead of re-walking and re-normalizing every
+  // entry in the shard.
+  function autocompleteCandidatesForShard(shard, weighted) {
+    if (shard.autocompleteCandidates) return shard.autocompleteCandidates;
+    const list = [];
+    for (const [key, entry] of shard.entries) {
+      const parsed = parseAutocompleteKey(key);
+      if (!parsed) continue;
+      const candidate = {
+        key,
+        ...parsed,
+        weight: entry.autocompleteWeight || entry.total || 0,
+        count: entry.total || 1,
+        full: suggestKey(parsed.display) === parsed.normalized
+      };
+      candidate.rank = autocompleteRank(candidate, weighted);
+      list.push(candidate);
+    }
+    shard.autocompleteCandidates = list;
+    return list;
+  }
+
+  function autocompleteLowerBound(candidates, keyPrefix) {
+    let lo = 0;
+    let hi = candidates.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (candidates[mid].key < keyPrefix) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
   async function executeLexiconSuggest(q, prefix, size, root) {
     const codepoints = Array.from(prefix);
     if (root.hot?.size) {
@@ -6920,7 +7006,15 @@ export async function createSearch(options = {}) {
     const directoryPages = new Set();
     const kthRank = () => {
       if (best.size < size) return -1;
-      return [...best.values()].sort(compareAutocomplete)[size - 1].rank;
+      const sorted = [...best.values()].sort(compareAutocomplete);
+      // Candidates below the boundary can never re-enter the top `size`
+      // (duplicates merge to the max rank), so cap the pool to keep the
+      // per-batch sort from growing with broad prefixes.
+      if (sorted.length > size * 4) {
+        best.clear();
+        for (const item of sorted.slice(0, size * 2)) best.set(item.display, item);
+      }
+      return sorted[size - 1].rank;
     };
     const directoryRoot = await loadDirectoryRoot(authorityDirectory);
     let batch = 1;
@@ -6942,18 +7036,11 @@ export async function createSearch(options = {}) {
         const shard = loaded.get(item.shard);
         if (!shard) continue;
         shardsVisited++;
-        for (const [key, entry] of shard.entries) {
-          if (key < keyPrefix) continue;
-          if (!key.startsWith(keyPrefix)) break;
-          const parsed = parseAutocompleteKey(key);
-          if (!parsed) continue;
+        const shardCandidates = autocompleteCandidatesForShard(shard, root.weighted);
+        for (let index = autocompleteLowerBound(shardCandidates, keyPrefix); index < shardCandidates.length; index++) {
+          const candidate = shardCandidates[index];
+          if (!candidate.key.startsWith(keyPrefix)) break;
           entriesScanned++;
-          const candidate = {
-            ...parsed,
-            weight: entry.autocompleteWeight || entry.total || 0,
-            count: entry.total || 1
-          };
-          candidate.rank = autocompleteRank(candidate, root.weighted);
           mergeAutocompleteCandidate(best, candidate);
         }
       }
@@ -8004,6 +8091,127 @@ async function createShardedSearch(root, options, baseUrl) {
     return [...picked].sort((a, b) => a - b).map(index => shards[index]);
   }
 
+  // Text routing: the root-level term directory (text_routing.js) maps every
+  // analyzed term to the shards containing it. A shard can only satisfy a
+  // text query when it holds at least minShouldMatch of some query plan's
+  // base terms, so shards below that support are skipped without opening
+  // them. Fail-open everywhere: shards unknown to the routing table are
+  // always searched, and a query no shard supports falls back to the full
+  // fan-out so per-shard typo correction keeps working.
+  const textRouting = root.text_routing?.format === TEXT_ROUTING_FORMAT && root.text_routing.directory?.root
+    ? createTextRoutingState(root.text_routing)
+    : null;
+
+  function createTextRoutingState(block) {
+    const routedIds = new Set((block.shard_ids || []).map(String));
+    const shardIndexByOrdinal = (block.shard_ids || []).map(id => shardIdIndex.get(String(id)) ?? -1);
+    const alwaysSelected = shards.filter(shard => !routedIds.has(shard.id)).map(shard => shard.index);
+    let analyzer = null;
+    let rootPromise = null;
+    const pageCache = new Map();
+    const segmentCache = new Map();
+
+    function routingAnalyzer() {
+      if (!analyzer) analyzer = analyzerFromManifest({ analysis: block.analysis || null });
+      return analyzer;
+    }
+
+    function loadRoot() {
+      if (!rootPromise) {
+        rootPromise = fetchGzipArrayBuffer(new URL(block.directory.root, baseUrl)).then(parseDirectoryRoot);
+      }
+      return rootPromise;
+    }
+
+    function loadPage(page) {
+      if (!pageCache.has(page.file)) {
+        const path = `${String(block.directory.pages || "text-routing/directory-pages/").replace(/\/?$/u, "/")}${page.file}`;
+        pageCache.set(page.file, fetchGzipArrayBuffer(new URL(path, baseUrl)).then(buffer => {
+          const entries = parseDirectoryPage(buffer, { packTable: block.directory.pack_table || [] });
+          return { entries, keys: [...entries.keys()] };
+        }));
+      }
+      return pageCache.get(page.file);
+    }
+
+    function loadSegment(entry) {
+      const key = `${entry.pack}:${entry.offset}`;
+      if (!segmentCache.has(key)) {
+        segmentCache.set(key, fetchRange(new URL(`text-routing/packs/${entry.pack}`, baseUrl), entry.offset, entry.length)
+          .then(buffer => inflateGzip(buffer))
+          .then(parseTextRoutingSegment));
+      }
+      return segmentCache.get(key);
+    }
+
+    // Root shard indexes containing `term` ([] when the term is unindexed).
+    async function shardIndexesForTerm(term) {
+      const directoryRoot = await loadRoot();
+      const pageIndex = floorDirectoryPageIndex(directoryRoot, term);
+      if (pageIndex < 0) return [];
+      const page = await loadPage(directoryRoot.pages[pageIndex]);
+      const keyIndex = floorSortedKeyIndex(page.keys, term);
+      if (keyIndex < 0) return [];
+      const segment = await loadSegment(page.entries.get(page.keys[keyIndex]));
+      const ordinals = segment.get(term);
+      if (!ordinals) return [];
+      const indexes = [];
+      for (const ordinal of ordinals) {
+        const index = shardIndexByOrdinal[ordinal];
+        if (index >= 0) indexes.push(index);
+      }
+      return indexes;
+    }
+
+    // Selection across every query plan (primary + alternate languages):
+    // a shard qualifies when it supports minShouldMatch of any plan.
+    async function selectShards(q) {
+      const plan = routingAnalyzer().queryPlan(q);
+      const plans = [plan, ...(plan.altPlans || [])];
+      const uniqueTerms = new Set();
+      for (const item of plans) for (const term of item.baseTerms) uniqueTerms.add(term);
+      if (!uniqueTerms.size) return null;
+      const byTerm = new Map(await Promise.all([...uniqueTerms].map(async term => [term, await shardIndexesForTerm(term)])));
+      const selected = new Set(alwaysSelected);
+      for (const item of plans) {
+        const planTerms = [...new Set(item.baseTerms)];
+        if (!planTerms.length) continue;
+        const need = Math.min(planTerms.length, Math.max(1, minShouldMatchFor(item.baseTerms)));
+        const support = new Map();
+        for (const term of planTerms) {
+          for (const index of byTerm.get(term) || []) support.set(index, (support.get(index) || 0) + 1);
+        }
+        for (const [index, count] of support) {
+          if (count >= need) selected.add(index);
+        }
+      }
+      return { selected, terms: uniqueTerms.size };
+    }
+
+    return { selectShards };
+  }
+
+  // Applies text routing to an already geo/scope-routed selection. Returns
+  // the narrowed route plus stats, or the original route when routing does
+  // not apply or no shard survives (typo fallback).
+  async function withTextRoute(route, q) {
+    if (!textRouting || !q) return { route, stats: null };
+    let selection;
+    try {
+      selection = await textRouting.selectShards(q);
+    } catch {
+      // A broken or missing routing artifact must never break search.
+      return { route, stats: { fallback: "error" } };
+    }
+    if (!selection) return { route, stats: null };
+    const narrowed = route.expanding
+      ? { selected: null, expanding: route.expanding.filter(item => selection.selected.has(item.index)) }
+      : { selected: route.selected.filter(index => selection.selected.has(index)), expanding: null };
+    const kept = route.expanding ? narrowed.expanding.length : narrowed.selected.length;
+    if (!kept) return { route, stats: { terms: selection.terms, fallback: "no-shard-support" } };
+    return { route: narrowed, stats: { terms: selection.terms, selected: kept } };
+  }
+
   // Routing: which shards can contain a match for this geo context, within
   // the explicitly scoped candidates. Returns either a fixed selection or
   // an expanding front (nearest-first queries with no radius: shards
@@ -8125,7 +8333,8 @@ async function createShardedSearch(root, options, baseUrl) {
     const geoDistanceSort = activeParams.geo?.sort === "distance";
     if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
 
-    const route = routeShards(activeParams.geo, activeParams);
+    const routed = await withTextRoute(routeShards(activeParams.geo, activeParams), q);
+    const route = routed.route;
     const perShardParams = { ...activeParams, shards: undefined, page: 1, size: Math.min(1000, need) };
 
     let queried;
@@ -8180,7 +8389,10 @@ async function createShardedSearch(root, options, baseUrl) {
 
     const results = rows.slice(offset, need).map(row => stampShard(row.result, row.shardIndex));
     const responses = queried.map(item => item.response);
-    const response = shardResponseShell(responses, results, page, size, { partial });
+    const response = shardResponseShell(responses, results, page, size, {
+      partial,
+      ...(routed.stats ? { stats: { textRouting: routed.stats } } : {})
+    });
     // Each shard applies the authority prior to its own (disjoint) candidates
     // before the merge; reflect that in the merged stats.
     if (responses.some(r => r?.stats?.linkRankBoost)) {
@@ -8344,7 +8556,8 @@ async function createShardedSearch(root, options, baseUrl) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
-    const route = routeShards(activeParams.geo, activeParams);
+    const routed = await withTextRoute(routeShards(activeParams.geo, activeParams), String(activeParams.q || "").trim());
+    const route = routed.route;
     const selected = route.expanding ? route.expanding.map(item => item.index) : route.selected;
     const responses = await Promise.all(selected.map(async index => {
       const engine = await engineAt(index);
@@ -8358,6 +8571,7 @@ async function createShardedSearch(root, options, baseUrl) {
       stats: {
         shards: shards.length,
         shardsQueried: selected.length,
+        ...(routed.stats ? { textRouting: routed.stats } : {}),
         ...(normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {})
       }
     };

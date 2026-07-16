@@ -82,9 +82,21 @@ export function autocompleteEntrySummary(key, rows, options = {}) {
   return item;
 }
 
+// Memoized code-point length: compareAutocomplete runs inside hot sort loops,
+// so the per-comparison Array.from allocation is replaced by a counted pass
+// cached on the candidate itself.
+function displayLengthOf(item) {
+  if (item.displayLength == null) {
+    let length = 0;
+    for (const _ of item.display) length++;
+    item.displayLength = length;
+  }
+  return item.displayLength;
+}
+
 export function compareAutocomplete(left, right) {
   return (right.rank ?? right.weight) - (left.rank ?? left.weight)
-    || Array.from(left.display).length - Array.from(right.display).length
+    || displayLengthOf(left) - displayLengthOf(right)
     || (left.normalized < right.normalized ? -1 : left.normalized > right.normalized ? 1 : 0)
     || (left.display < right.display ? -1 : left.display > right.display ? 1 : 0);
 }

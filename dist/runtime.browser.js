@@ -2525,8 +2525,16 @@ function autocompleteRank(item, weighted = false) {
   const full = item.full ?? suggestKey(item.display) === item.normalized;
   return weighted ? Math.min(Number.MAX_SAFE_INTEGER, weight * 2 + (full ? 1 : 0)) : (full ? UNWEIGHTED_SURFACE_BONUS : 0) + Math.min(UNWEIGHTED_SURFACE_BONUS - 1, weight);
 }
+function displayLengthOf(item) {
+  if (item.displayLength == null) {
+    let length = 0;
+    for (const _ of item.display) length++;
+    item.displayLength = length;
+  }
+  return item.displayLength;
+}
 function compareAutocomplete(left, right) {
-  return (right.rank ?? right.weight) - (left.rank ?? left.weight) || Array.from(left.display).length - Array.from(right.display).length || (left.normalized < right.normalized ? -1 : left.normalized > right.normalized ? 1 : 0) || (left.display < right.display ? -1 : left.display > right.display ? 1 : 0);
+  return (right.rank ?? right.weight) - (left.rank ?? left.weight) || displayLengthOf(left) - displayLengthOf(right) || (left.normalized < right.normalized ? -1 : left.normalized > right.normalized ? 1 : 0) || (left.display < right.display ? -1 : left.display > right.display ? 1 : 0);
 }
 function readFrontCoded(bytes, state, previous) {
   const prefix = readVarint(bytes, state);
@@ -3011,6 +3019,58 @@ function findDirectoryPage(root, shard) {
     else return page;
   }
   return null;
+}
+
+// src/text_routing_codec.js
+var TEXT_ROUTING_FORMAT = "rftextroute-v1";
+var TEXT_ROUTING_VERSION = 1;
+var TEXT_ROUTING_SEGMENT_MAGIC = [82, 70, 84, 82];
+function parseTextRoutingSegment(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, TEXT_ROUTING_SEGMENT_MAGIC, "Unsupported Rangefind text routing segment");
+  const state = { pos: TEXT_ROUTING_SEGMENT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== TEXT_ROUTING_VERSION) throw new Error(`Unsupported Rangefind text routing segment version ${version}`);
+  const count = readVarint(bytes, state);
+  const terms = /* @__PURE__ */ new Map();
+  let previous = "";
+  for (let index = 0; index < count; index++) {
+    const prefix = readVarint(bytes, state);
+    const term = previous.slice(0, prefix) + readUtf8(bytes, state);
+    const shardCount = readVarint(bytes, state);
+    const shards = new Array(shardCount);
+    let last = -1;
+    for (let i = 0; i < shardCount; i++) {
+      last += readVarint(bytes, state) + 1;
+      shards[i] = last;
+    }
+    terms.set(term, shards);
+    previous = term;
+  }
+  return terms;
+}
+function floorDirectoryPageIndex(root, term) {
+  const pages = root?.pages || [];
+  if (!pages.length || term < pages[0].first) return -1;
+  let lo = 0;
+  let hi = pages.length - 1;
+  while (lo < hi) {
+    const mid = lo + hi + 1 >> 1;
+    if (pages[mid].first <= term) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+function floorSortedKeyIndex(keys, term) {
+  if (!keys.length || term < keys[0]) return -1;
+  let lo = 0;
+  let hi = keys.length - 1;
+  while (lo < hi) {
+    const mid = lo + hi + 1 >> 1;
+    if (keys[mid] <= term) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 // src/doc_pointers.js
@@ -4187,6 +4247,9 @@ function createRuntimeTrace() {
     spans: /* @__PURE__ */ new Map()
   };
 }
+function minShouldMatchFor(baseTerms) {
+  return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+}
 function traceBucketFromPath(path) {
   if (path.endsWith("/manifest.min.json")) return "manifest";
   if (/\/manifest(?:\.[0-9a-f]+)?\.json(?:\.gz)?$/u.test(path)) return "manifest";
@@ -4212,6 +4275,7 @@ function traceBucketFromPath(path) {
   if (path.includes("/docs/")) return "docs";
   if (path.includes("/facets/")) return "facetDictionaries";
   if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
+  if (path.includes("/text-routing/")) return "textRouting";
   if (path.includes("/directory-")) return "directory";
   if (path.endsWith("/codes.bin.gz")) return "codes";
   return "other";
@@ -4292,9 +4356,22 @@ function finalizeRuntimeTrace(trace) {
     })).sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name))
   };
 }
+var inflateImpl = null;
+function setInflateImplementation(fn) {
+  inflateImpl = typeof fn === "function" ? fn : null;
+}
+function viewToArrayBuffer(bytes) {
+  if (bytes instanceof ArrayBuffer) return bytes;
+  if (ArrayBuffer.isView(bytes)) return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  throw new Error("Inflate implementation must return an ArrayBuffer or a typed array.");
+}
 async function inflateGzip(responseOrBuffer) {
+  if (inflateImpl) {
+    const compressed = responseOrBuffer instanceof ArrayBuffer ? responseOrBuffer : await responseOrBuffer.arrayBuffer();
+    return viewToArrayBuffer(await inflateImpl(compressed));
+  }
   if (!("DecompressionStream" in globalThis)) {
-    throw new Error("Rangefind requires DecompressionStream for compressed static index files.");
+    throw new Error("Rangefind requires DecompressionStream for compressed static index files. On hosts without it, provide one with setInflateImplementation().");
   }
   const stream = responseOrBuffer instanceof ArrayBuffer ? new Blob([responseOrBuffer]).stream() : responseOrBuffer.body;
   if (!stream) throw new Error("Response body is not streamable.");
@@ -4360,6 +4437,9 @@ async function createSearch(options = {}) {
   }
   const manifest = options.manifestName ? await fetchJsonIfOk(options.manifestName) : await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
+  if (Array.isArray(manifest.shards)) {
+    return createShardedSearch(manifest, options, baseUrl);
+  }
   if (Array.isArray(manifest.generations)) {
     return createGenerationalSearch(manifest, options, baseUrl);
   }
@@ -6421,9 +6501,6 @@ async function createSearch(options = {}) {
     }
     return true;
   }
-  function minShouldMatchFor(baseTerms) {
-    return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
-  }
   async function resolveQueryPlan(q) {
     const plan = analyzer.queryPlan(q);
     if (!plan.altPlans?.length || !plan.baseTerms.length) return plan;
@@ -6447,6 +6524,47 @@ async function createSearch(options = {}) {
   }
   function collectEligibleScores(scores, hits, minShouldMatch) {
     return [...scores.entries()].filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch)).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  }
+  function topEligibleScores(scores, hits, minShouldMatch, k) {
+    const need = Math.max(1, minShouldMatch);
+    const limit = Math.max(1, Math.floor(k));
+    const docs = [];
+    const vals = [];
+    let count2 = 0;
+    const worse = (aScore, aDoc, bScore, bDoc) => aScore < bScore || aScore === bScore && aDoc > bDoc;
+    for (const [doc, score] of scores) {
+      if ((hits.get(doc) || 0) < need) continue;
+      count2++;
+      if (docs.length < limit) {
+        let i = docs.length;
+        docs.push(doc);
+        vals.push(score);
+        while (i > 0) {
+          const parent = i - 1 >> 1;
+          if (!worse(vals[i], docs[i], vals[parent], docs[parent])) break;
+          [docs[i], docs[parent]] = [docs[parent], docs[i]];
+          [vals[i], vals[parent]] = [vals[parent], vals[i]];
+          i = parent;
+        }
+      } else if (worse(vals[0], docs[0], score, doc)) {
+        docs[0] = doc;
+        vals[0] = score;
+        let i = 0;
+        while (true) {
+          const left = 2 * i + 1;
+          const right = left + 1;
+          let weakest = i;
+          if (left < docs.length && worse(vals[left], docs[left], vals[weakest], docs[weakest])) weakest = left;
+          if (right < docs.length && worse(vals[right], docs[right], vals[weakest], docs[weakest])) weakest = right;
+          if (weakest === i) break;
+          [docs[i], docs[weakest]] = [docs[weakest], docs[i]];
+          [vals[i], vals[weakest]] = [vals[weakest], vals[i]];
+          i = weakest;
+        }
+      }
+    }
+    const top = docs.map((doc, i) => [doc, vals[i]]).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    return { count: count2, top };
   }
   function emptyTextSearchResponse({ page, size, terms, entries = [], missingBaseTerms = 0 }) {
     return {
@@ -8221,12 +8339,11 @@ async function createSearch(options = {}) {
   }
   function stableTopK(scores, hits, masks, cursors, minShouldMatch, k, filterPlan, proofStats = null) {
     if (proofStats) proofStats.attempts++;
-    const eligible = collectEligibleScores(scores, hits, minShouldMatch);
-    if (eligible.length < k) {
+    const { count: eligibleCount, top } = topEligibleScores(scores, hits, minShouldMatch, k);
+    if (eligibleCount < k) {
       recordTopKProofFailure(proofStats, "candidate_count");
       return null;
     }
-    const top = eligible.slice(0, k);
     const topDocs = new Set(top.map(([doc]) => doc));
     const threshold = top[top.length - 1][1];
     const boundaryDoc = top[top.length - 1][0];
@@ -8863,7 +8980,7 @@ async function createSearch(options = {}) {
       state.batchLimit = Math.min(docRangeBlockPruneBatchSize, Math.max(1, state.batchLimit * 2));
     }
     exhausted = !stable && maxDocRangeOutsidePotential(rangeStates).potential <= 0;
-    let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, candidateK);
+    let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || topEligibleScores(scores, hits, minShouldMatch, candidateK).top;
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
@@ -9074,7 +9191,7 @@ async function createSearch(options = {}) {
       }
       if (stable || budgetExhausted) break;
     }
-    let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || collectEligibleScores(scores, hits, minShouldMatch).slice(0, k);
+    let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || topEligibleScores(scores, hits, minShouldMatch, k).top;
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
@@ -10316,6 +10433,35 @@ async function createSearch(options = {}) {
     const previous = best.get(item.display);
     if (!previous || compareAutocomplete(item, previous) < 0) best.set(item.display, item);
   }
+  function autocompleteCandidatesForShard(shard, weighted) {
+    if (shard.autocompleteCandidates) return shard.autocompleteCandidates;
+    const list = [];
+    for (const [key, entry] of shard.entries) {
+      const parsed = parseAutocompleteKey(key);
+      if (!parsed) continue;
+      const candidate = {
+        key,
+        ...parsed,
+        weight: entry.autocompleteWeight || entry.total || 0,
+        count: entry.total || 1,
+        full: suggestKey(parsed.display) === parsed.normalized
+      };
+      candidate.rank = autocompleteRank(candidate, weighted);
+      list.push(candidate);
+    }
+    shard.autocompleteCandidates = list;
+    return list;
+  }
+  function autocompleteLowerBound(candidates, keyPrefix) {
+    let lo = 0;
+    let hi = candidates.length;
+    while (lo < hi) {
+      const mid = lo + hi >> 1;
+      if (candidates[mid].key < keyPrefix) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
   async function executeLexiconSuggest(q, prefix, size, root) {
     const codepoints = Array.from(prefix);
     if (root.hot?.size) {
@@ -10347,7 +10493,12 @@ async function createSearch(options = {}) {
     const directoryPages = /* @__PURE__ */ new Set();
     const kthRank = () => {
       if (best.size < size) return -1;
-      return [...best.values()].sort(compareAutocomplete)[size - 1].rank;
+      const sorted = [...best.values()].sort(compareAutocomplete);
+      if (sorted.length > size * 4) {
+        best.clear();
+        for (const item of sorted.slice(0, size * 2)) best.set(item.display, item);
+      }
+      return sorted[size - 1].rank;
     };
     const directoryRoot = await loadDirectoryRoot(authorityDirectory);
     let batch = 1;
@@ -10369,18 +10520,11 @@ async function createSearch(options = {}) {
         const shard = loaded.get(item.shard);
         if (!shard) continue;
         shardsVisited++;
-        for (const [key, entry] of shard.entries) {
-          if (key < keyPrefix) continue;
-          if (!key.startsWith(keyPrefix)) break;
-          const parsed = parseAutocompleteKey(key);
-          if (!parsed) continue;
+        const shardCandidates = autocompleteCandidatesForShard(shard, root.weighted);
+        for (let index = autocompleteLowerBound(shardCandidates, keyPrefix); index < shardCandidates.length; index++) {
+          const candidate = shardCandidates[index];
+          if (!candidate.key.startsWith(keyPrefix)) break;
           entriesScanned++;
-          const candidate = {
-            ...parsed,
-            weight: entry.autocompleteWeight || entry.total || 0,
-            count: entry.total || 1
-          };
-          candidate.rank = autocompleteRank(candidate, root.weighted);
           mergeAutocompleteCandidate(best, candidate);
         }
       }
@@ -10641,12 +10785,70 @@ async function createSearch(options = {}) {
     const baseTerms = (await resolveQueryPlan(q)).baseTerms;
     return runCountSearch({ q, baseTerms });
   }
+  function linkRankBoostWeight(params) {
+    const cfg = manifest.linkGraph;
+    if (!cfg || !cfg.field) return 0;
+    if (!params.q || params.sort || params.geo?.sort) return 0;
+    if (params.linkRank === false || params.linkRankBoost === 0) return 0;
+    const weight = Number(params.linkRankBoost ?? cfg.boost ?? 0);
+    return weight > 0 ? weight : 0;
+  }
+  async function applyLinkRankBoostToResults(results, weight) {
+    const field = manifest.linkGraph?.field;
+    if (!field || !results?.length) return false;
+    const indexes = results.map((result) => result.index).filter(Number.isInteger);
+    if (!indexes.length) return false;
+    await ensureDocValuesManifest();
+    const store = await valueStoreForDocs([field], indexes);
+    let touched = false;
+    for (const result of results) {
+      if (!Number.isInteger(result.index)) continue;
+      const rank = valueForDoc(store, field, result.index);
+      if (typeof rank === "number" && Number.isFinite(rank) && rank > 0) {
+        result.score *= 1 + weight * rank;
+        touched = true;
+      }
+    }
+    if (touched) results.sort((a, b) => b.score - a.score || a.index - b.index);
+    return touched;
+  }
+  const LINKRANK_OVERFETCH = 4;
+  const LINKRANK_MAX_POOL = 100;
+  async function executeBoostedSearch(params, weight) {
+    const cfg = manifest.linkGraph;
+    const size = Math.max(1, Math.floor(Number(params.size ?? 10)));
+    const page = Math.max(1, Math.floor(Number(params.page ?? 1)));
+    const factor = Math.max(1, Number(params.linkRankOverfetch ?? cfg.overfetch ?? LINKRANK_OVERFETCH));
+    const windowSize = Math.min(LINKRANK_MAX_POOL, Math.max(size * page, Math.ceil(size * page * factor)));
+    const wide = await executeSearch({ ...params, size: windowSize, page: 1 });
+    const boosted = await applyLinkRankBoostToResults(wide.results, weight);
+    const offset = (page - 1) * size;
+    const results = (wide.results || []).slice(offset, offset + size);
+    const response = {
+      ...wide,
+      results,
+      page,
+      size,
+      stats: {
+        ...wide.stats || {},
+        linkRankBoost: boosted,
+        linkRankBoostPool: wide.results?.length || 0,
+        linkRankBoostWindow: results.length
+      }
+    };
+    if (params.facets) await traceSpan("facets.count", () => computeFacetCounts(params, response));
+    return response;
+  }
   async function search(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
     const response = await withRuntimeTrace(trace, () => traceSpan("search.total", async () => {
+      const boostWeight = linkRankBoostWeight(activeParams);
+      if (boostWeight > 0) {
+        return traceSpan("linkRank.boost", () => executeBoostedSearch(activeParams, boostWeight));
+      }
       const searchResponse = await executeSearch(activeParams);
       if (activeParams.facets) await traceSpan("facets.count", () => computeFacetCounts(activeParams, searchResponse));
       return searchResponse;
@@ -10787,25 +10989,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     }));
     return pageRows.map((row) => hydrated.get(`${row.generation}:${row.index}`)).filter(Boolean);
   }
-  function mergeFacetResponses(responses) {
-    const facets = {};
-    for (const response of responses) {
-      for (const [field, data] of Object.entries(response.facets || {})) {
-        const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: /* @__PURE__ */ new Map() });
-        target.exact = target.exact && data.exact !== false;
-        for (const item of data.values) {
-          const existing = target.byValue.get(item.value);
-          if (existing) existing.count += item.count;
-          else target.byValue.set(item.value, { ...item });
-        }
-      }
-    }
-    for (const data of Object.values(facets)) {
-      data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
-      delete data.byValue;
-    }
-    return facets;
-  }
+  const mergeFacetResponses = mergeFederatedFacets;
   function applyMergedHighlights(params, q, results, correctedQuery) {
     if (!params.highlight || !results.length || !q) return;
     const highlightOptions = params.highlight === true ? {} : params.highlight;
@@ -10868,6 +11052,10 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const pageRows = merged.slice(offset, offset + size);
     const results = await hydrateMergedRows(pageRows);
     const response = mergedResponseShell(responses, results, page, size);
+    if (responses.some((r) => r?.stats?.linkRankBoost)) {
+      response.stats.linkRankBoost = true;
+      response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);
+    }
     applyMergedHighlights(activeParams, q, results, response.correctedQuery);
     if (activeParams.facets) response.facets = mergeFacetResponses(responses);
     if (normalizedQuery !== surfaceQuery) {
@@ -11098,9 +11286,541 @@ async function createGenerationalSearch(root, options, baseUrl) {
     loadFacetValues: (field) => engines[0].loadFacetValues(field)
   };
 }
+function mergeFederatedFacets(responses) {
+  const facets = {};
+  for (const response of responses) {
+    for (const [field, data] of Object.entries(response.facets || {})) {
+      const target = facets[field] || (facets[field] = { values: [], exact: true, byValue: /* @__PURE__ */ new Map() });
+      target.exact = target.exact && data.exact !== false;
+      for (const item of data.values) {
+        const existing = target.byValue.get(item.value);
+        if (existing) existing.count += item.count;
+        else target.byValue.set(item.value, { ...item });
+      }
+    }
+  }
+  for (const data of Object.values(facets)) {
+    data.values = [...data.byValue.values()].sort((a, b) => b.count - a.count || (a.value < b.value ? -1 : 1));
+    delete data.byValue;
+  }
+  return facets;
+}
+var SHARD_ROUTING_SLACK_RATIO = 1.05;
+var SHARD_ROUTING_SLACK_METERS = 1e4;
+function shardRoutingBudget(meters) {
+  return meters * SHARD_ROUTING_SLACK_RATIO + SHARD_ROUTING_SLACK_METERS;
+}
+function wrapLonDelta(a, b) {
+  return (a - b + 540) % 360 - 180;
+}
+function shardBboxDistanceMeters(bbox, lat, lon) {
+  const clampedLat = Math.min(Math.max(lat, bbox[0]), bbox[2]);
+  let clampedLon = lon;
+  if (!(lon >= bbox[1] && lon <= bbox[3])) {
+    clampedLon = Math.abs(wrapLonDelta(lon, bbox[1])) <= Math.abs(wrapLonDelta(lon, bbox[3])) ? bbox[1] : bbox[3];
+  }
+  return haversineMetersE7(latToE7(lat), lonToE7(lon), latToE7(clampedLat), lonToE7(clampedLon));
+}
+function shardBoxIntersects(bbox, box) {
+  const minLat = Math.min(Number(box.minLat), Number(box.maxLat));
+  const maxLat = Math.max(Number(box.minLat), Number(box.maxLat));
+  if (bbox[2] < minLat || bbox[0] > maxLat) return false;
+  const minLon = Number(box.minLon);
+  const maxLon = Number(box.maxLon);
+  if (minLon <= maxLon) return bbox[3] >= minLon && bbox[1] <= maxLon;
+  return bbox[3] >= minLon || bbox[1] <= maxLon;
+}
+async function createShardedSearch(root, options, baseUrl) {
+  const shards = (root.shards || []).map((shard, index) => ({
+    id: String(shard.id || `shard-${index}`),
+    index,
+    path: shard.path || "",
+    manifestName: shard.manifest || "manifest.min.json",
+    total: shard.total || 0,
+    bbox: Array.isArray(shard.bbox) && shard.bbox.length === 4 ? shard.bbox.map(Number) : null,
+    groups: Array.isArray(shard.groups) ? shard.groups.map(String) : []
+  }));
+  if (!shards.length) throw new Error("Rangefind: sharded manifest has no shards.");
+  const engines = new Array(shards.length).fill(null);
+  function engineAt(index) {
+    if (!engines[index]) {
+      const shard = shards[index];
+      const manifestName = shard.manifestName.startsWith(shard.path) && shard.path ? shard.manifestName.slice(shard.path.length) : shard.manifestName;
+      engines[index] = createSearch({
+        ...options,
+        baseUrl: new URL(shard.path || "./", baseUrl).href,
+        manifestName,
+        maxPageSize: 1e3
+      });
+    }
+    return engines[index];
+  }
+  const sortableFields = new Set([
+    ...root.numbers || [],
+    ...root.booleans || []
+  ].map((field) => field.name));
+  function parseSortPlan(sort) {
+    if (!sort) return null;
+    const field = typeof sort === "string" ? sort.replace(/^-/, "") : sort.field;
+    if (!field || !sortableFields.has(field)) return null;
+    const order = typeof sort === "string" && sort.startsWith("-") ? "desc" : String(sort.order || sort.direction || "asc").toLowerCase();
+    return { field, desc: order === "desc" };
+  }
+  const shardIdIndex = new Map(shards.map((shard) => [shard.id, shard.index]));
+  const shardGroupIndex = /* @__PURE__ */ new Map();
+  for (const shard of shards) {
+    for (const group of shard.groups) {
+      if (!shardGroupIndex.has(group)) shardGroupIndex.set(group, []);
+      shardGroupIndex.get(group).push(shard.index);
+    }
+  }
+  function candidateShards(params) {
+    if (params?.shards == null) return shards;
+    const names = Array.isArray(params.shards) ? params.shards : [params.shards];
+    const picked = /* @__PURE__ */ new Set();
+    for (const name of names) {
+      const id = String(name);
+      const index = shardIdIndex.get(id);
+      if (index !== void 0) {
+        picked.add(index);
+        continue;
+      }
+      const members = shardGroupIndex.get(id);
+      if (!members) {
+        throw new Error(`Rangefind: unknown shard or group "${id}" (shards: ${shards.map((shard) => shard.id).join(", ")}${shardGroupIndex.size ? `; groups: ${[...shardGroupIndex.keys()].join(", ")}` : ""}).`);
+      }
+      for (const member of members) picked.add(member);
+    }
+    return [...picked].sort((a, b) => a - b).map((index) => shards[index]);
+  }
+  const textRouting = root.text_routing?.format === TEXT_ROUTING_FORMAT && root.text_routing.directory?.root ? createTextRoutingState(root.text_routing) : null;
+  function createTextRoutingState(block) {
+    const routedIds = new Set((block.shard_ids || []).map(String));
+    const shardIndexByOrdinal = (block.shard_ids || []).map((id) => shardIdIndex.get(String(id)) ?? -1);
+    const alwaysSelected = shards.filter((shard) => !routedIds.has(shard.id)).map((shard) => shard.index);
+    let analyzer = null;
+    let rootPromise = null;
+    const pageCache = /* @__PURE__ */ new Map();
+    const segmentCache = /* @__PURE__ */ new Map();
+    function routingAnalyzer() {
+      if (!analyzer) analyzer = analyzerFromManifest({ analysis: block.analysis || null });
+      return analyzer;
+    }
+    function loadRoot() {
+      if (!rootPromise) {
+        rootPromise = fetchGzipArrayBuffer(new URL(block.directory.root, baseUrl)).then(parseDirectoryRoot);
+      }
+      return rootPromise;
+    }
+    function loadPage(page) {
+      if (!pageCache.has(page.file)) {
+        const path = `${String(block.directory.pages || "text-routing/directory-pages/").replace(/\/?$/u, "/")}${page.file}`;
+        pageCache.set(page.file, fetchGzipArrayBuffer(new URL(path, baseUrl)).then((buffer) => {
+          const entries = parseDirectoryPage(buffer, { packTable: block.directory.pack_table || [] });
+          return { entries, keys: [...entries.keys()] };
+        }));
+      }
+      return pageCache.get(page.file);
+    }
+    function loadSegment(entry) {
+      const key = `${entry.pack}:${entry.offset}`;
+      if (!segmentCache.has(key)) {
+        segmentCache.set(key, fetchRange(new URL(`text-routing/packs/${entry.pack}`, baseUrl), entry.offset, entry.length).then((buffer) => inflateGzip(buffer)).then(parseTextRoutingSegment));
+      }
+      return segmentCache.get(key);
+    }
+    async function shardIndexesForTerm(term) {
+      const directoryRoot = await loadRoot();
+      const pageIndex = floorDirectoryPageIndex(directoryRoot, term);
+      if (pageIndex < 0) return [];
+      const page = await loadPage(directoryRoot.pages[pageIndex]);
+      const keyIndex = floorSortedKeyIndex(page.keys, term);
+      if (keyIndex < 0) return [];
+      const segment = await loadSegment(page.entries.get(page.keys[keyIndex]));
+      const ordinals = segment.get(term);
+      if (!ordinals) return [];
+      const indexes = [];
+      for (const ordinal2 of ordinals) {
+        const index = shardIndexByOrdinal[ordinal2];
+        if (index >= 0) indexes.push(index);
+      }
+      return indexes;
+    }
+    async function selectShards(q) {
+      const plan = routingAnalyzer().queryPlan(q);
+      const plans = [plan, ...plan.altPlans || []];
+      const uniqueTerms = /* @__PURE__ */ new Set();
+      for (const item of plans) for (const term of item.baseTerms) uniqueTerms.add(term);
+      if (!uniqueTerms.size) return null;
+      const byTerm = new Map(await Promise.all([...uniqueTerms].map(async (term) => [term, await shardIndexesForTerm(term)])));
+      const selected = new Set(alwaysSelected);
+      for (const item of plans) {
+        const planTerms = [...new Set(item.baseTerms)];
+        if (!planTerms.length) continue;
+        const need = Math.min(planTerms.length, Math.max(1, minShouldMatchFor(item.baseTerms)));
+        const support = /* @__PURE__ */ new Map();
+        for (const term of planTerms) {
+          for (const index of byTerm.get(term) || []) support.set(index, (support.get(index) || 0) + 1);
+        }
+        for (const [index, count2] of support) {
+          if (count2 >= need) selected.add(index);
+        }
+      }
+      return { selected, terms: uniqueTerms.size };
+    }
+    return { selectShards };
+  }
+  async function withTextRoute(route, q) {
+    if (!textRouting || !q) return { route, stats: null };
+    let selection;
+    try {
+      selection = await textRouting.selectShards(q);
+    } catch {
+      return { route, stats: { fallback: "error" } };
+    }
+    if (!selection) return { route, stats: null };
+    const narrowed = route.expanding ? { selected: null, expanding: route.expanding.filter((item) => selection.selected.has(item.index)) } : { selected: route.selected.filter((index) => selection.selected.has(index)), expanding: null };
+    const kept = route.expanding ? narrowed.expanding.length : narrowed.selected.length;
+    if (!kept) return { route, stats: { terms: selection.terms, fallback: "no-shard-support" } };
+    return { route: narrowed, stats: { terms: selection.terms, selected: kept } };
+  }
+  function routeShards(geo, params) {
+    const candidates = candidateShards(params);
+    const all = candidates.map((shard) => shard.index);
+    if (!geo || !candidates.some((shard) => shard.bbox)) return { selected: all, expanding: null };
+    if (geo.near) {
+      const lat = Number(geo.near.lat);
+      const lon = Number(geo.near.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return { selected: all, expanding: null };
+      const distances = candidates.map((shard) => ({
+        index: shard.index,
+        meters: shard.bbox ? shardBboxDistanceMeters(shard.bbox, lat, lon) : 0
+      }));
+      const radius = Number(geo.near.radiusMeters);
+      if (Number.isFinite(radius) && radius > 0) {
+        return {
+          selected: distances.filter((item) => item.meters <= shardRoutingBudget(radius)).map((item) => item.index),
+          expanding: null
+        };
+      }
+      return { selected: null, expanding: distances.sort((a, b) => a.meters - b.meters) };
+    }
+    if (geo.box) {
+      return {
+        selected: candidates.filter((shard) => !shard.bbox || shardBoxIntersects(shard.bbox, geo.box)).map((shard) => shard.index),
+        expanding: null
+      };
+    }
+    return { selected: all, expanding: null };
+  }
+  function stampShard(result, shardIndex) {
+    const id = shards[shardIndex].id;
+    return { ...result, shard: result.shard != null ? `${id}/${result.shard}` : id };
+  }
+  async function searchShard(index, params) {
+    const engine = await engineAt(index);
+    return { index, response: await engine.search(params) };
+  }
+  async function expandingNearestQuery(front, params, need) {
+    const queried = [];
+    const distances = [];
+    let cursor = 0;
+    while (cursor < front.length) {
+      if (distances.length >= need) {
+        distances.sort((a, b) => a - b);
+        if (front[cursor].meters > shardRoutingBudget(distances[need - 1])) break;
+      }
+      const batch = front.slice(cursor, cursor + 2);
+      cursor += batch.length;
+      const batchResults = await Promise.all(batch.map((item) => searchShard(item.index, params)));
+      for (const item of batchResults) {
+        queried.push(item);
+        for (const result of item.response.results || []) {
+          if (result.distanceMeters != null) distances.push(result.distanceMeters);
+        }
+      }
+    }
+    return { queried, partial: cursor < front.length };
+  }
+  function compareByScore(a, b) {
+    return (b.result.score || 0) - (a.result.score || 0) || a.shardIndex - b.shardIndex || (a.result.index || 0) - (b.result.index || 0);
+  }
+  function sortKeyNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  function shardResponseShell(responses, results, page, size, meta = {}) {
+    const correctedQuery = responses.map((response) => response.correctedQuery).find(Boolean);
+    const total = responses.reduce((sum, response) => sum + (response.total || 0), 0);
+    return {
+      total: Math.max(results.length, total),
+      results,
+      page,
+      size,
+      approximate: Boolean(meta.partial) || responses.some((response) => response.approximate),
+      ...correctedQuery ? { correctedQuery, corrections: responses.find((r) => r.correctedQuery)?.corrections } : {},
+      stats: {
+        shards: shards.length,
+        shardsQueried: responses.length,
+        shardTotals: responses.map((response) => response.total || 0),
+        ...meta.stats || {}
+      }
+    };
+  }
+  async function search(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    if (activeParams.vector) return hybridSearch(activeParams);
+    const q = String(activeParams.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    const need = offset + size;
+    const sortPlan = parseSortPlan(params.sort);
+    const geoDistanceSort = activeParams.geo?.sort === "distance";
+    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    const routed = await withTextRoute(routeShards(activeParams.geo, activeParams), q);
+    const route = routed.route;
+    const perShardParams = { ...activeParams, shards: void 0, page: 1, size: Math.min(1e3, need) };
+    let queried;
+    let partial = need > 1e3;
+    if (route.expanding) {
+      const expanded = await expandingNearestQuery(route.expanding, perShardParams, need);
+      queried = expanded.queried;
+      partial = partial || expanded.partial;
+    } else {
+      queried = await Promise.all(route.selected.map((index) => searchShard(index, perShardParams)));
+    }
+    const rows = [];
+    for (const { index, response: response2 } of queried) {
+      for (const result of response2.results || []) {
+        rows.push({ shardIndex: index, result });
+      }
+    }
+    if (sortPlan) {
+      rows.sort((a, b) => {
+        const left = sortKeyNumber(a.result[sortPlan.field]);
+        const right = sortKeyNumber(b.result[sortPlan.field]);
+        if (left == null || right == null) {
+          if (left == null && right == null) return compareByScore(a, b);
+          return left == null ? 1 : -1;
+        }
+        if (left !== right) return sortPlan.desc ? right - left : left - right;
+        return compareByScore(a, b);
+      });
+    } else if (geoDistanceSort) {
+      rows.sort((a, b) => {
+        const left = a.result.distanceMeters;
+        const right = b.result.distanceMeters;
+        if (left == null || right == null) {
+          if (left == null && right == null) return compareByScore(a, b);
+          return left == null ? 1 : -1;
+        }
+        return left - right || compareByScore(a, b);
+      });
+    } else if (q) {
+      rows.sort(compareByScore);
+    }
+    const results = rows.slice(offset, need).map((row) => stampShard(row.result, row.shardIndex));
+    const responses = queried.map((item) => item.response);
+    const response = shardResponseShell(responses, results, page, size, {
+      partial,
+      ...routed.stats ? { stats: { textRouting: routed.stats } } : {}
+    });
+    if (responses.some((r) => r?.stats?.linkRankBoost)) {
+      response.stats.linkRankBoost = true;
+      response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);
+    }
+    if (activeParams.facets) {
+      response.facets = mergeFederatedFacets(responses);
+      if (partial) {
+        for (const facet of Object.values(response.facets)) facet.exact = false;
+      }
+    }
+    if (normalizedQuery !== surfaceQuery) {
+      response.normalizedQuery = normalizedQuery;
+      response.stats.postalCodeNormalized = true;
+    }
+    return response;
+  }
+  async function hybridSearch(params) {
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(100, Math.floor(Number(params.size || 10))));
+    const offset = (page - 1) * size;
+    const route = routeShards(params.geo, params);
+    const selected = route.expanding ? route.expanding.map((item) => item.index) : route.selected;
+    const poolSize = Math.max(size * 3, Math.min(100, size * 5));
+    async function lane(laneParams) {
+      const queried = await Promise.all(selected.map((index) => searchShard(index, { ...laneParams, shards: void 0, page: 1, size: Math.min(1e3, poolSize) })));
+      const rows = [];
+      for (const { index, response } of queried) {
+        for (const result of response.results || []) {
+          rows.push({ shardIndex: index, result });
+        }
+      }
+      rows.sort(compareByScore);
+      return { rows: rows.slice(0, poolSize), responses: queried.map((item) => item.response) };
+    }
+    const vectorLaneParams = {
+      q: "",
+      vector: params.vector,
+      vectorField: params.vectorField,
+      hybrid: params.hybrid,
+      filters: params.filters,
+      geo: params.geo
+    };
+    if (!q) {
+      const { rows, responses } = await lane(vectorLaneParams);
+      const results2 = rows.slice(offset, offset + size).map((row) => stampShard(row.result, row.shardIndex));
+      const response = shardResponseShell(responses, results2, page, size);
+      response.approximate = true;
+      return response;
+    }
+    const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
+    const [textLane, vectorLane] = await Promise.all([
+      lane({ ...params, vector: void 0, vectorField: void 0, hybrid: void 0 }),
+      lane(vectorLaneParams)
+    ]);
+    const fused = /* @__PURE__ */ new Map();
+    const addRanked = (rows, laneName) => {
+      rows.forEach((row, rank) => {
+        const key = `${row.shardIndex}:${row.result.generation ?? ""}:${row.result.index}`;
+        const entry = fused.get(key) || { shardIndex: row.shardIndex, result: row.result, score: 0, hybrid: {} };
+        entry.score += 1 / (rrfK + rank + 1);
+        entry.hybrid[laneName] = rank + 1;
+        fused.set(key, entry);
+      });
+    };
+    addRanked(textLane.rows, "text");
+    addRanked(vectorLane.rows, "vector");
+    const ranked = [...fused.values()].sort((a, b) => b.score - a.score || a.shardIndex - b.shardIndex || (a.result.index || 0) - (b.result.index || 0));
+    const results = ranked.slice(offset, offset + size).map((entry) => ({
+      ...stampShard(entry.result, entry.shardIndex),
+      score: entry.score,
+      hybrid: entry.hybrid
+    }));
+    return {
+      total: ranked.length,
+      results,
+      page,
+      size,
+      approximate: true,
+      stats: { shards: shards.length, shardsQueried: selected.length, hybrid: true }
+    };
+  }
+  async function vectorSearch(params = {}) {
+    const k = Math.max(1, Math.min(200, Math.floor(Number(params.k || 10))));
+    const queried = await Promise.all(candidateShards(params).map(async (shard) => {
+      const engine = await engineAt(shard.index);
+      return { index: shard.index, response: await engine.vectorSearch({ ...params, shards: void 0, k }) };
+    }));
+    const rows = [];
+    for (const { index, response } of queried) {
+      for (const result of response.results || []) {
+        rows.push({ shardIndex: index, result });
+      }
+    }
+    rows.sort(compareByScore);
+    const results = rows.slice(0, k).map((row) => stampShard(row.result, row.shardIndex));
+    return {
+      total: rows.length,
+      results,
+      stats: {
+        shards: shards.length,
+        perShard: queried.map((item) => item.response.stats || {}),
+        exact: false,
+        approximate: true
+      }
+    };
+  }
+  async function suggest(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const responses = await Promise.all(candidateShards(activeParams).map(async (shard) => {
+      const engine = await engineAt(shard.index);
+      return engine.suggest({ ...activeParams, shards: void 0 });
+    }));
+    const merged = /* @__PURE__ */ new Map();
+    for (const response of responses) {
+      for (const item of response.suggestions) {
+        const existing = merged.get(item.text);
+        if (existing) {
+          existing.count += item.count;
+          existing.weight = Math.max(existing.weight, item.weight);
+        } else {
+          merged.set(item.text, { ...item });
+        }
+      }
+    }
+    const suggestions = [...merged.values()].sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1)).slice(0, size);
+    return {
+      q: surfaceQuery,
+      suggestions,
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        shards: shards.length,
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
+    };
+  }
+  async function count(params = {}) {
+    const surfaceQuery = String(params.q || "");
+    const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
+    const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
+    const routed = await withTextRoute(routeShards(activeParams.geo, activeParams), String(activeParams.q || "").trim());
+    const route = routed.route;
+    const selected = route.expanding ? route.expanding.map((item) => item.index) : route.selected;
+    const responses = await Promise.all(selected.map(async (index) => {
+      const engine = await engineAt(index);
+      return engine.count({ ...activeParams, shards: void 0 });
+    }));
+    return {
+      total: responses.reduce((sum, response) => sum + (response.total || 0), 0),
+      totalExact: responses.every((response) => response.totalExact),
+      approximate: responses.some((response) => response.approximate),
+      ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+      stats: {
+        shards: shards.length,
+        shardsQueried: selected.length,
+        ...routed.stats ? { textRouting: routed.stats } : {},
+        ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+      }
+    };
+  }
+  async function loadFacetValues(field) {
+    const dictionaries = await Promise.all(shards.map(async (shard) => {
+      const engine = await engineAt(shard.index);
+      return engine.loadFacetValues(field);
+    }));
+    const merged = /* @__PURE__ */ new Map();
+    for (const values of dictionaries) {
+      for (const item of values || []) {
+        if (!item?.value) continue;
+        const existing = merged.get(item.value);
+        if (existing) existing.n += item.n || 0;
+        else merged.set(item.value, { ...item });
+      }
+    }
+    return [...merged.values()].sort((a, b) => (b.n || 0) - (a.n || 0) || (a.value < b.value ? -1 : 1));
+  }
+  return {
+    manifest: root,
+    shards: shards.map((shard) => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
+    search,
+    suggest,
+    count,
+    vectorSearch,
+    loadFacetValues
+  };
+}
 var runtime_default = createSearch;
 export {
   createSearch,
   runtime_default as default,
-  setFetchImplementation
+  setFetchImplementation,
+  setInflateImplementation
 };
