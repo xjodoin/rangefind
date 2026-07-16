@@ -4234,6 +4234,7 @@ var GEO_LEAF_PAGE_BATCH_SIZE = 16;
 var GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
 var GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 var GEO_TEXT_MAX_CANDIDATE_POINTS = 1e5;
+var GEO_TEXT_DOC_SET_HARD_CAP = 1e6;
 var GEO_TEXT_SORT_MAX_DF = 2e5;
 var FACET_COUNT_MAX_CHUNKS = 32;
 var FACET_COUNT_SIZE = 10;
@@ -5114,6 +5115,21 @@ async function createSearch(options = {}) {
     const store = mergeValueStores(await valueStoreForDocs(fields, docs), bitmapStore);
     if (!store && filterPlan.geo?.docSet) return { _geoDocSet: true };
     return store;
+  }
+  async function prefetchFilterPlanDocValues(filterPlan, docsPerBlock) {
+    if (!filterPlan?.active) return;
+    const union = [];
+    for (const docs of docsPerBlock) {
+      if (docs) for (const doc of docs) union.push(doc);
+    }
+    if (!union.length) return;
+    if (!docValues) await ensureDocValuesManifest();
+    if (!docValues) return;
+    const bitmapStore = await filterBitmapStoreForPlan(filterPlan);
+    const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
+    const fields = filterPlanFields(filterPlan).filter((field) => !bitmapCovered.has(field));
+    if (!fields.length) return;
+    await ensureDocValuesForDocs(fields, union);
   }
   function docValue(field, doc) {
     const fieldMeta = docValueField(field);
@@ -6242,15 +6258,37 @@ async function createSearch(options = {}) {
       branchFetchStats: { wanted: 0, fetched: 0, groups: 0 }
     };
   }
-  async function buildGeoDocSetIfCheap(geoPlan) {
+  async function estimateGeoFilterDocValueBytes(geoPlan, verifiedDocs) {
+    await ensureDocValuesManifest();
+    if (!docValues) return null;
+    let bytes = 0;
+    for (const field of [geoPlan.latField, geoPlan.lonField]) {
+      const chunks = docValueField(field)?.chunks || [];
+      let chunkCount = 0;
+      let chunkBytes = 0;
+      for (const chunk of chunks) {
+        if (!chunk) continue;
+        chunkCount++;
+        chunkBytes += chunk.length || 0;
+      }
+      if (!chunkCount) continue;
+      bytes += Math.min(verifiedDocs, chunkCount) * (chunkBytes / chunkCount);
+    }
+    return bytes || null;
+  }
+  async function buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate = null) {
     if (!geoPlan?.filtered) return;
     const root = await loadGeoTreeRoot(geoPlan.field);
     if (!root) return;
     const tracking = geoTraversalTracking();
     let candidatePoints = 0;
+    let candidateLeafBytes = 0;
     if (root.levels === 1) {
       for (const leaf of root.leaves) {
-        if (geoLeafCandidate(geoPlan, leaf)) candidatePoints += leaf.count;
+        if (geoLeafCandidate(geoPlan, leaf)) {
+          candidatePoints += leaf.count;
+          candidateLeafBytes += leaf.length || 0;
+        }
       }
     } else {
       const candidateBranches = root.branches.filter((branch) => geoLeafCandidate(geoPlan, branch));
@@ -6259,11 +6297,19 @@ async function createSearch(options = {}) {
       const pages = await loadGeoBranchPages(geoPlan.field, root, candidateBranches, tracking.branchFetchStats);
       for (const page of pages) {
         for (const leaf of page.leaves) {
-          if (geoLeafCandidate(geoPlan, leaf)) candidatePoints += leaf.count;
+          if (geoLeafCandidate(geoPlan, leaf)) {
+            candidatePoints += leaf.count;
+            candidateLeafBytes += leaf.length || 0;
+          }
         }
       }
     }
-    if (candidatePoints > geoTextMaxCandidatePoints) return;
+    if (candidatePoints > geoTextMaxCandidatePoints) {
+      if (!(textPostingsEstimate > 0)) return;
+      if (candidatePoints > GEO_TEXT_DOC_SET_HARD_CAP) return;
+      const docValueBytes = await estimateGeoFilterDocValueBytes(geoPlan, textPostingsEstimate);
+      if (!docValueBytes || candidateLeafBytes >= docValueBytes) return;
+    }
     const docSet = /* @__PURE__ */ new Set();
     for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, false, tracking)) {
       for (let i = 0; i < leafPage.count; i++) {
@@ -6276,6 +6322,7 @@ async function createSearch(options = {}) {
     geoPlan.docSetStats = {
       candidateLeaves: tracking.counters.candidateLeaves,
       candidatePoints,
+      candidateLeafBytes,
       matchedDocs: docSet.size,
       leafPagesFetched: tracking.leafFetchStats.fetched,
       leafPageFetchGroups: tracking.leafFetchStats.groups,
@@ -8944,6 +8991,7 @@ async function createSearch(options = {}) {
       fetchedBlocks += decoded.fetchedBlocks;
       fetchGroups += decoded.fetchGroups;
       wantedBlocks += decoded.wantedBlocks;
+      const pendingBlocks = [];
       for (const { cursor, blockIndex, rows: rows2 } of decoded.blocks) {
         const block = cursor.entry.blocks?.[blockIndex];
         const blockKey = postingBlockKey(cursor, blockIndex);
@@ -8957,6 +9005,15 @@ async function createSearch(options = {}) {
         if (hasFilters && !docsInRange.length) continue;
         const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
+        pendingBlocks.push({ cursor, rows: rows2, docsInRange, filterSummaryProvesBlock });
+      }
+      if (hasFilters) {
+        await prefetchFilterPlanDocValues(
+          docFilterPlan,
+          pendingBlocks.filter((item) => !item.filterSummaryProvesBlock).map((item) => item.docsInRange)
+        );
+      }
+      for (const { cursor, rows: rows2, docsInRange, filterSummaryProvesBlock } of pendingBlocks) {
         const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : filterSummaryProvesBlock ? null : fallbackCodeData;
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRowsInDocRange(
@@ -9163,9 +9220,18 @@ async function createSearch(options = {}) {
       frontierFetchedBlocks += decoded.fetchedBlocks;
       frontierFetchGroups += decoded.fetchGroups;
       frontierWantedBlocks += decoded.wantedBlocks;
-      for (const { cursor, rows: rows2 } of decoded.blocks) {
-        const block = cursor.entry.blocks[cursor.blockIndex];
-        const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
+      const batchBlocks = decoded.blocks.map(({ cursor, rows: rows2 }) => ({
+        cursor,
+        rows: rows2,
+        filterSummaryProvesBlock: hasFilters && blockDefinitelyPassesDocFilter(cursor.entry.blocks[cursor.blockIndex], docFilterPlan)
+      }));
+      if (hasFilters) {
+        await prefetchFilterPlanDocValues(
+          docFilterPlan,
+          batchBlocks.filter((item) => !item.filterSummaryProvesBlock).map((item) => postingDocs(item.rows))
+        );
+      }
+      for (const { cursor, rows: rows2, filterSummaryProvesBlock } of batchBlocks) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
@@ -10095,7 +10161,10 @@ async function createSearch(options = {}) {
       };
       return geoResponse;
     }
-    if (geoPlan?.filtered) await buildGeoDocSetIfCheap(geoPlan);
+    if (geoPlan?.filtered) {
+      const textPostingsEstimate = q && baseTerms.length ? (await termEntries(baseTerms)).reduce((sum, item) => sum + (item.entry.df || 0), 0) : null;
+      await buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate);
+    }
     if (params.exact) await ensureFullManifest();
     else if (sortPlan) await ensureDocValueSortedManifest();
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;

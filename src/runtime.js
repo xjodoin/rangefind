@@ -81,6 +81,10 @@ const GEO_LEAF_PAGE_BATCH_SIZE = 16;
 const GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
 const GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 const GEO_TEXT_MAX_CANDIDATE_POINTS = 100000;
+// With a text query, the geo doc set may grow beyond the base cap when its
+// exact leaf-page cost undercuts the doc-value chunks the text lane would
+// otherwise fetch to verify matches. The hard cap bounds the in-memory Set.
+const GEO_TEXT_DOC_SET_HARD_CAP = 1000000;
 const GEO_TEXT_SORT_MAX_DF = 200000;
 const FACET_COUNT_MAX_CHUNKS = 32;
 const FACET_COUNT_SIZE = 10;
@@ -1079,6 +1083,29 @@ export async function createSearch(options = {}) {
     // store as "nothing to filter", so hand back a marker store instead.
     if (!store && filterPlan.geo?.docSet) return { _geoDocSet: true };
     return store;
+  }
+
+  // Warms the doc-value chunk cache for a whole decoded block batch in one
+  // pass, so the chunk range requests coalesce across blocks instead of
+  // going out block by block (a filtered text query over scattered doc ids
+  // otherwise pays one small fetch per posting block). Field selection
+  // mirrors valueStoreForFilterPlan's sparse (bitmap-covered) case; the
+  // per-block calls that follow keep their exact behavior and simply hit
+  // the cache.
+  async function prefetchFilterPlanDocValues(filterPlan, docsPerBlock) {
+    if (!filterPlan?.active) return;
+    const union = [];
+    for (const docs of docsPerBlock) {
+      if (docs) for (const doc of docs) union.push(doc);
+    }
+    if (!union.length) return;
+    if (!docValues) await ensureDocValuesManifest();
+    if (!docValues) return;
+    const bitmapStore = await filterBitmapStoreForPlan(filterPlan);
+    const bitmapCovered = bitmapStore?.covered || new Set();
+    const fields = filterPlanFields(filterPlan).filter(field => !bitmapCovered.has(field));
+    if (!fields.length) return;
+    await ensureDocValuesForDocs(fields, union);
   }
 
   function docValue(field, doc) {
@@ -2322,15 +2349,41 @@ export async function createSearch(options = {}) {
   // For text queries with a selective geo filter, resolving the matching doc
   // ids from the tree once is far cheaper than verifying scattered text
   // candidates against lat/lon doc-value chunks.
-  async function buildGeoDocSetIfCheap(geoPlan) {
+  // Prices what the doc-value lane would transfer to verify `verifiedDocs`
+  // text matches against the geo filter: scattered matches touch about one
+  // chunk per doc per component field, saturating at the whole column.
+  async function estimateGeoFilterDocValueBytes(geoPlan, verifiedDocs) {
+    await ensureDocValuesManifest();
+    if (!docValues) return null;
+    let bytes = 0;
+    for (const field of [geoPlan.latField, geoPlan.lonField]) {
+      const chunks = docValueField(field)?.chunks || [];
+      let chunkCount = 0;
+      let chunkBytes = 0;
+      for (const chunk of chunks) {
+        if (!chunk) continue;
+        chunkCount++;
+        chunkBytes += chunk.length || 0;
+      }
+      if (!chunkCount) continue;
+      bytes += Math.min(verifiedDocs, chunkCount) * (chunkBytes / chunkCount);
+    }
+    return bytes || null;
+  }
+
+  async function buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate = null) {
     if (!geoPlan?.filtered) return;
     const root = await loadGeoTreeRoot(geoPlan.field);
     if (!root) return;
     const tracking = geoTraversalTracking();
     let candidatePoints = 0;
+    let candidateLeafBytes = 0;
     if (root.levels === 1) {
       for (const leaf of root.leaves) {
-        if (geoLeafCandidate(geoPlan, leaf)) candidatePoints += leaf.count;
+        if (geoLeafCandidate(geoPlan, leaf)) {
+          candidatePoints += leaf.count;
+          candidateLeafBytes += leaf.length || 0;
+        }
       }
     } else {
       // Branch counts alone are far too coarse an estimate (one branch can
@@ -2343,11 +2396,22 @@ export async function createSearch(options = {}) {
       const pages = await loadGeoBranchPages(geoPlan.field, root, candidateBranches, tracking.branchFetchStats);
       for (const page of pages) {
         for (const leaf of page.leaves) {
-          if (geoLeafCandidate(geoPlan, leaf)) candidatePoints += leaf.count;
+          if (geoLeafCandidate(geoPlan, leaf)) {
+            candidatePoints += leaf.count;
+            candidateLeafBytes += leaf.length || 0;
+          }
         }
       }
     }
-    if (candidatePoints > geoTextMaxCandidatePoints) return;
+    if (candidatePoints > geoTextMaxCandidatePoints) {
+      // Above the base cap the doc set can still be the cheaper verifier:
+      // compare its exact leaf-page bytes against the doc-value chunks the
+      // text lane would otherwise fetch.
+      if (!(textPostingsEstimate > 0)) return;
+      if (candidatePoints > GEO_TEXT_DOC_SET_HARD_CAP) return;
+      const docValueBytes = await estimateGeoFilterDocValueBytes(geoPlan, textPostingsEstimate);
+      if (!docValueBytes || candidateLeafBytes >= docValueBytes) return;
+    }
     const docSet = new Set();
     for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, false, tracking)) {
       for (let i = 0; i < leafPage.count; i++) {
@@ -2360,6 +2424,7 @@ export async function createSearch(options = {}) {
     geoPlan.docSetStats = {
       candidateLeaves: tracking.counters.candidateLeaves,
       candidatePoints,
+      candidateLeafBytes,
       matchedDocs: docSet.size,
       leafPagesFetched: tracking.leafFetchStats.fetched,
       leafPageFetchGroups: tracking.leafFetchStats.groups,
@@ -5294,6 +5359,7 @@ export async function createSearch(options = {}) {
       fetchedBlocks += decoded.fetchedBlocks;
       fetchGroups += decoded.fetchGroups;
       wantedBlocks += decoded.wantedBlocks;
+      const pendingBlocks = [];
       for (const { cursor, blockIndex, rows } of decoded.blocks) {
         const block = cursor.entry.blocks?.[blockIndex];
         const blockKey = postingBlockKey(cursor, blockIndex);
@@ -5307,6 +5373,18 @@ export async function createSearch(options = {}) {
         if (hasFilters && !docsInRange.length) continue;
         const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
+        pendingBlocks.push({ cursor, rows, docsInRange, filterSummaryProvesBlock });
+      }
+      // One chunk-cache warm-up for the whole batch: per-block filter
+      // verification below then reads cached chunks instead of issuing one
+      // small range request per block.
+      if (hasFilters) {
+        await prefetchFilterPlanDocValues(
+          docFilterPlan,
+          pendingBlocks.filter(item => !item.filterSummaryProvesBlock).map(item => item.docsInRange)
+        );
+      }
+      for (const { cursor, rows, docsInRange, filterSummaryProvesBlock } of pendingBlocks) {
         const codeData = hasFilters && !filterSummaryProvesBlock && docValues
           ? await valueStoreForFilterPlan(docFilterPlan, docsInRange)
           : filterSummaryProvesBlock ? null : fallbackCodeData;
@@ -5533,9 +5611,26 @@ export async function createSearch(options = {}) {
       frontierFetchedBlocks += decoded.fetchedBlocks;
       frontierFetchGroups += decoded.fetchGroups;
       frontierWantedBlocks += decoded.wantedBlocks;
-      for (const { cursor, rows } of decoded.blocks) {
-        const block = cursor.entry.blocks[cursor.blockIndex];
-        const filterSummaryProvesBlock = hasFilters && blockDefinitelyPassesDocFilter(block, docFilterPlan);
+      // Each frontier cursor contributes exactly one block per batch, so the
+      // block summaries can be read (without advancing cursors) to warm the
+      // doc-value chunk cache for the whole batch at once — the per-block
+      // verification below then reads cached chunks instead of issuing one
+      // small range request per block. Cursor advancement and the top-k
+      // proofs stay interleaved: a proof must still see unapplied blocks as
+      // remaining potential.
+      const batchBlocks = decoded.blocks.map(({ cursor, rows }) => ({
+        cursor,
+        rows,
+        filterSummaryProvesBlock: hasFilters
+          && blockDefinitelyPassesDocFilter(cursor.entry.blocks[cursor.blockIndex], docFilterPlan)
+      }));
+      if (hasFilters) {
+        await prefetchFilterPlanDocValues(
+          docFilterPlan,
+          batchBlocks.filter(item => !item.filterSummaryProvesBlock).map(item => postingDocs(item.rows))
+        );
+      }
+      for (const { cursor, rows, filterSummaryProvesBlock } of batchBlocks) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
@@ -6554,7 +6649,15 @@ export async function createSearch(options = {}) {
       };
       return geoResponse;
     }
-    if (geoPlan?.filtered) await buildGeoDocSetIfCheap(geoPlan);
+    if (geoPlan?.filtered) {
+      // Term entries are already cached by resolveQueryPlan, so the df sum
+      // costs no extra fetches. It bounds the postings the doc-value lane
+      // would have to verify, which prices the doc-set alternative.
+      const textPostingsEstimate = q && baseTerms.length
+        ? (await termEntries(baseTerms)).reduce((sum, item) => sum + (item.entry.df || 0), 0)
+        : null;
+      await buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate);
+    }
     if (params.exact) await ensureFullManifest();
     else if (sortPlan) await ensureDocValueSortedManifest();
     const searchFn = params.exact ? runFullSearch : runSkippedSearch;

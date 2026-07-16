@@ -27,6 +27,14 @@
 - **Text top-k selection**: early-terminated search lanes and the repeated
   top-k stability proofs now select the best k rows with a bounded heap
   instead of materializing and fully sorting every scored document.
+- **Geo-filtered text transfer**: the geo doc-set prune now prices itself
+  against the doc-value chunks the text lane would otherwise fetch (exact
+  candidate leaf-page bytes vs estimated chunk bytes per verified match)
+  instead of a fixed candidate-point cap, so city-radius text+near queries
+  ride the well-merged geo tree pages — a live text+near+boost query dropped
+  from 15.5 MB / 370 requests to 5.3 MB / 193 requests cold with identical
+  results. Doc-value chunk fetches for filtered text queries also coalesce
+  across each decoded posting-block batch instead of going out per block.
 
 - **Mobile runtime** (`rangefind/mobile`): the full query engine on embedded
   JS hosts — React Native/Hermes, QuickJS, JavaScriptCore. Local indexes
