@@ -41,6 +41,10 @@
       "node": "./src/runtime.node.js",
       "default": "./src/node_only_entry.js"
     },
+    "./mobile": {
+      "types": "./types/mobile.d.ts",
+      "default": "./src/runtime.mobile.js"
+    },
     "./browser": {
       "types": "./types/runtime.d.ts",
       "default": "./dist/runtime.browser.js"

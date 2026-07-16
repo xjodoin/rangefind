@@ -212,9 +212,30 @@ function finalizeRuntimeTrace(trace) {
   };
 }
 
+// Injectable gzip inflation: browsers and Node use DecompressionStream, while
+// hosts without it (React Native/Hermes, QuickJS, JavaScriptCore) install an
+// implementation such as pako.ungzip via setInflateImplementation().
+let inflateImpl = null;
+
+export function setInflateImplementation(fn) {
+  inflateImpl = typeof fn === "function" ? fn : null;
+}
+
+function viewToArrayBuffer(bytes) {
+  if (bytes instanceof ArrayBuffer) return bytes;
+  if (ArrayBuffer.isView(bytes)) return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  throw new Error("Inflate implementation must return an ArrayBuffer or a typed array.");
+}
+
 async function inflateGzip(responseOrBuffer) {
+  if (inflateImpl) {
+    const compressed = responseOrBuffer instanceof ArrayBuffer
+      ? responseOrBuffer
+      : await responseOrBuffer.arrayBuffer();
+    return viewToArrayBuffer(await inflateImpl(compressed));
+  }
   if (!("DecompressionStream" in globalThis)) {
-    throw new Error("Rangefind requires DecompressionStream for compressed static index files.");
+    throw new Error("Rangefind requires DecompressionStream for compressed static index files. On hosts without it, provide one with setInflateImplementation().");
   }
   const stream = responseOrBuffer instanceof ArrayBuffer
     ? new Blob([responseOrBuffer]).stream()

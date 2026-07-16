@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Mobile runtime** (`rangefind/mobile`): the full query engine on embedded
+  JS hosts — React Native/Hermes, QuickJS, JavaScriptCore. Local indexes
+  (bundled with the app or downloaded to device storage) are searched fully
+  offline through positional reads on a caller-provided io adapter; http(s)
+  indexes get the caching a browser would provide (bytes-bounded memory LRU
+  plus an optional persistent cache adapter for content-addressed objects).
+  `docs/mobile.md` covers React Native, Expo, WebView/Capacitor, Flutter, and
+  native Swift/Kotlin integration paths.
+- **`setInflateImplementation(fn)`** in the core runtime: injectable gzip
+  inflation for hosts without `DecompressionStream` (e.g. `pako.ungzip` on
+  Hermes), mirroring the existing injectable fetch transport.
+
 ## 0.3.1 — 2026-07-14
 
 ### Added

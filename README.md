@@ -28,6 +28,11 @@ a large thesis corpus.
   HTTP(S) indexes, with browser-equivalent caching — immutable
   content-addressed objects cached on disk and in a memory LRU, manifests
   revalidated with ETags.
+- Mobile runtime (`rangefind/mobile`) for React Native/Hermes and other
+  embedded JS hosts: fully offline search over a bundled or downloaded index
+  via positional file reads, or remote HTTP(S) indexes with memory + persistent
+  caching — see `docs/mobile.md` (covers WebView, Flutter, and native apps
+  too).
 - Lazy paged binary range directories at `terms/directory-root.<hash>.bin.gz`
   and `terms/directory-pages/*.bin.gz`.
 - ZFS-inspired object pointers with SHA-256 verification before decompression.

@@ -143,4 +143,13 @@ export interface CreateSearchOptions {
 
 export function createSearch(options?: CreateSearchOptions): Promise<SearchEngine>;
 export function setFetchImplementation(fn: typeof fetch): void;
+/**
+ * Install a gzip inflate implementation for hosts without DecompressionStream
+ * (React Native/Hermes, QuickJS, JavaScriptCore). Receives the compressed
+ * bytes and returns the inflated bytes (e.g. pako.ungzip). Pass null to
+ * restore the default DecompressionStream path.
+ */
+export function setInflateImplementation(
+  fn: ((compressed: ArrayBuffer) => ArrayBuffer | Uint8Array | Promise<ArrayBuffer | Uint8Array>) | null
+): void;
 export default createSearch;
