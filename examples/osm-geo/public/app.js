@@ -26,6 +26,8 @@ const collapsedSelection = document.querySelector("#collapsedSelection");
 // publishes the rolling regional shards. Every root-manifest update is picked
 // up by the demo without copying index artifacts into the Pages deployment.
 const OSM_INDEX_BASE_URL = "https://osm.rangefind.dev/";
+const SUGGEST_MIN_CHARACTERS = 3;
+const SUGGEST_DEBOUNCE_MS = 180;
 
 let engine;
 let markers = [];
@@ -411,7 +413,7 @@ function cancelSuggestions() {
 async function showSuggestions() {
   const q = queryInput.value.trim();
   const token = ++suggestToken;
-  if (!engine || !q || suggestionsSuppressed) {
+  if (!engine || Array.from(q).length < SUGGEST_MIN_CHARACTERS || suggestionsSuppressed) {
     hideSuggestions();
     return;
   }
@@ -479,7 +481,7 @@ queryInput.addEventListener("input", () => {
   }
   clearTimeout(suggestTimer);
   if (suggestionsSuppressed) return;
-  suggestTimer = setTimeout(showSuggestions, 90);
+  suggestTimer = setTimeout(showSuggestions, SUGGEST_DEBOUNCE_MS);
 });
 
 queryInput.addEventListener("keydown", event => {

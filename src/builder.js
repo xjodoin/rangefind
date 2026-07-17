@@ -4379,7 +4379,7 @@ export async function build({ configPath, update = false, compact = false }) {
       pack_table: filterBitmaps.pack_table
     },
     initial_results: runData.initialResults,
-    fields: config.fields.map(({ name, weight, b, phrase, proximity, proximityWeight }) => ({ name, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
+    fields: config.fields.map(({ name, path, weight, b, phrase, proximity, proximityWeight }) => ({ name, path, weight, b, phrase: !!phrase, proximity: !!proximity, proximityWeight: proximityWeight || 0 })),
     facets: Object.fromEntries(Object.entries(facetDictionaries.fields).map(([name, field]) => [name, { count: field.count }])),
     facet_dictionaries: facetDictionaries,
     numbers: config.numbers.map(n => ({

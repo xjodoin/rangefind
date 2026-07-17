@@ -11376,6 +11376,8 @@ function mergeFederatedFacets(responses) {
 }
 var SHARD_ROUTING_SLACK_RATIO = 1.05;
 var SHARD_ROUTING_SLACK_METERS = 1e4;
+var TEXT_ROUTING_PREFIX_MIN_LENGTH = 3;
+var TEXT_ROUTING_PREFIX_SEGMENT_LIMIT = 8;
 function shardRoutingBudget(meters) {
   return meters * SHARD_ROUTING_SLACK_RATIO + SHARD_ROUTING_SLACK_METERS;
 }
@@ -11515,6 +11517,41 @@ async function createShardedSearch(root, options, baseUrl) {
       }
       return indexes;
     }
+    async function shardIndexesForPrefix(prefix) {
+      const directoryRoot = await loadRoot();
+      if (!directoryRoot.pages?.length) return { indexes: [], complete: true, segments: 0 };
+      let pageIndex = floorDirectoryPageIndex(directoryRoot, prefix);
+      if (pageIndex < 0) pageIndex = 0;
+      const upper = `${prefix}\uFFFF`;
+      const selected = /* @__PURE__ */ new Set();
+      let segments = 0;
+      for (; pageIndex < directoryRoot.pages.length; pageIndex++) {
+        const pageSummary = directoryRoot.pages[pageIndex];
+        if (pageSummary.first > upper) break;
+        const page = await loadPage(pageSummary);
+        let keyIndex = floorSortedKeyIndex(page.keys, prefix);
+        if (keyIndex < 0) keyIndex = 0;
+        for (; keyIndex < page.keys.length; keyIndex++) {
+          const key = page.keys[keyIndex];
+          if (key > upper) return { indexes: [...selected], complete: true, segments };
+          if (segments >= TEXT_ROUTING_PREFIX_SEGMENT_LIMIT) {
+            return { indexes: [], complete: false, segments };
+          }
+          segments++;
+          const segment = await loadSegment(page.entries.get(key));
+          for (const [term, ordinals] of segment) {
+            if (term < prefix) continue;
+            if (term > upper) return { indexes: [...selected], complete: true, segments };
+            if (!term.startsWith(prefix)) continue;
+            for (const ordinal2 of ordinals) {
+              const index = shardIndexByOrdinal[ordinal2];
+              if (index >= 0) selected.add(index);
+            }
+          }
+        }
+      }
+      return { indexes: [...selected], complete: true, segments };
+    }
     async function selectShards(q) {
       const plan = routingAnalyzer().queryPlan(q);
       const plans = [plan, ...plan.altPlans || []];
@@ -11537,7 +11574,31 @@ async function createShardedSearch(root, options, baseUrl) {
       }
       return { selected, terms: uniqueTerms.size };
     }
-    return { selectShards };
+    async function selectSuggestShards(q) {
+      if (block.suggest_prefix !== true) return null;
+      const plan = routingAnalyzer().queryPlan(q);
+      const plans = [plan, ...plan.altPlans || []];
+      const prefixes = /* @__PURE__ */ new Set();
+      for (const item of plans) {
+        const prefix = item.baseTerms.at(-1) || "";
+        if (Array.from(prefix).length >= TEXT_ROUTING_PREFIX_MIN_LENGTH) prefixes.add(prefix);
+      }
+      if (!prefixes.size) return null;
+      const scans = await Promise.all([...prefixes].map((prefix) => shardIndexesForPrefix(prefix)));
+      const segments = scans.reduce((sum, scan) => sum + scan.segments, 0);
+      if (scans.some((scan) => !scan.complete)) {
+        return { fallback: "prefix-scan-limit", prefixes: prefixes.size, segments };
+      }
+      const matched = /* @__PURE__ */ new Set();
+      for (const scan of scans) for (const index of scan.indexes) matched.add(index);
+      return {
+        selected: /* @__PURE__ */ new Set([...alwaysSelected, ...matched]),
+        matched: matched.size,
+        prefixes: prefixes.size,
+        segments
+      };
+    }
+    return { selectShards, selectSuggestShards };
   }
   async function withTextRoute(route, q) {
     if (!textRouting || !q) return { route, stats: null };
@@ -11552,6 +11613,37 @@ async function createShardedSearch(root, options, baseUrl) {
     const kept = route.expanding ? narrowed.expanding.length : narrowed.selected.length;
     if (!kept) return { route, stats: { terms: selection.terms, fallback: "no-shard-support" } };
     return { route: narrowed, stats: { terms: selection.terms, selected: kept } };
+  }
+  async function withSuggestRoute(params, q) {
+    const candidates = candidateShards(params);
+    if (!textRouting || !q) return { shards: candidates, stats: null };
+    let selection;
+    try {
+      selection = await textRouting.selectSuggestShards(q);
+    } catch {
+      return { shards: candidates, stats: { fallback: "error" } };
+    }
+    if (!selection) return { shards: candidates, stats: null };
+    if (selection.fallback) return { shards: candidates, stats: selection };
+    const narrowed = candidates.filter((shard) => selection.selected.has(shard.index));
+    if (!selection.matched || !narrowed.length) {
+      return {
+        shards: candidates,
+        stats: {
+          prefixes: selection.prefixes,
+          segments: selection.segments,
+          fallback: "no-shard-support"
+        }
+      };
+    }
+    return {
+      shards: narrowed,
+      stats: {
+        prefixes: selection.prefixes,
+        segments: selection.segments,
+        selected: narrowed.length
+      }
+    };
   }
   function routeShards(geo, params) {
     const candidates = candidateShards(params);
@@ -11809,7 +11901,8 @@ async function createShardedSearch(root, options, baseUrl) {
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const responses = await Promise.all(candidateShards(activeParams).map(async (shard) => {
+    const routed = await withSuggestRoute(activeParams, normalizedQuery.trim());
+    const responses = await Promise.all(routed.shards.map(async (shard) => {
       const engine = await engineAt(shard.index);
       return engine.suggest({ ...activeParams, shards: void 0 });
     }));
@@ -11832,6 +11925,8 @@ async function createShardedSearch(root, options, baseUrl) {
       ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
       stats: {
         shards: shards.length,
+        shardsQueried: routed.shards.length,
+        ...routed.stats ? { textRouting: routed.stats } : {},
         ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
       }
     };

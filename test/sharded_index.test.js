@@ -48,6 +48,7 @@ async function serveStatic(root) {
 }
 
 const TOPICS = ["glacier", "harbor", "meadow", "quarry", "lagoon"];
+const SUGGEST_MARKERS = ["", "alpineunique", "borealunique", "coastalunique"];
 
 // Three geographic bands, one per shard; vocabulary is shared across bands
 // so text queries exercise cross-shard merging.
@@ -56,7 +57,9 @@ function makeDoc(i, band) {
   const filler = `filler${i % 11} common shared corpus text`.repeat(1 + (i % 3));
   return {
     id: `doc-${band}-${i}`,
-    title: `Entry ${i} about ${topic} in band ${band}`,
+    title: i === 0
+      ? `${SUGGEST_MARKERS[band]} landmark in band ${band}`
+      : `Entry ${i} about ${topic} in band ${band}`,
     // bandmarkN is unique to its band: text routing should resolve queries
     // containing it to exactly one shard.
     body: `${topic} ${topic} study number ${i} bandmark${band}. ${filler}`,
@@ -205,6 +208,21 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
       shardSuggest.suggestions.map(item => item.text).slice(0, 3),
       monoSuggest.suggestions.map(item => item.text).slice(0, 3)
     );
+    assert.equal(shardSuggest.stats.shardsQueried, 3, "broad prefixes should retain all shards");
+
+    // Prefix-aware routing keeps autocomplete on the shard whose indexed
+    // suggest field can contain the requested prefix.
+    const routedSuggest = await sharded.suggest({ q: "borealunique" });
+    const monoRoutedSuggest = await mono.suggest({ q: "borealunique" });
+    assert.equal(routedSuggest.stats.shardsQueried, 1);
+    assert.equal(routedSuggest.stats.textRouting?.selected, 1);
+    assert.ok(routedSuggest.suggestions.length > 0);
+    assert.ok(routedSuggest.suggestions.every(item => item.text.startsWith("borealunique")));
+    assert.deepEqual(routedSuggest.suggestions, monoRoutedSuggest.suggestions);
+
+    const unroutedSuggest = await sharded.suggest({ q: "borealuniqxe" });
+    assert.equal(unroutedSuggest.stats.shardsQueried, 3);
+    assert.equal(unroutedSuggest.stats.textRouting?.fallback, "no-shard-support");
 
     // Sorted browse merges by the real key across shards.
     const shardSorted = await sharded.search({ q: "study", sort: "-population", size: 30 });
@@ -569,6 +587,8 @@ test("term-set sidecars rebuild identical text routing", { timeout: 120000 }, as
   });
   assert.equal(fromSidecars.term_count, rootManifest.text_routing.term_count);
   assert.deepEqual(fromSidecars.shard_ids, rootManifest.text_routing.shard_ids);
+  assert.equal(fromSidecars.suggest_prefix, true);
+  assert.equal(fromSidecars.suggest_prefix, rootManifest.text_routing.suggest_prefix);
   // Same inputs must produce the same content-addressed artifact.
   assert.equal(fromSidecars.directory.root_hash, rootManifest.text_routing.directory.root_hash);
 });

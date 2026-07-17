@@ -140,6 +140,30 @@ function analysisOf(dir) {
   return generations[0].manifest.analysis || null;
 }
 
+// Prefix routing is safe for autocomplete only when every suggest source is
+// also an always-indexed text field. Otherwise a suggestion can exist in the
+// authority lexicon without a corresponding posting in the term directory,
+// and routing by term prefix could incorrectly exclude its shard.
+function manifestSupportsSuggestPrefixRouting(manifest) {
+  const suggestFields = manifest.authority?.autocomplete?.fields || [];
+  if (!suggestFields.length) return false;
+  const alwaysIndexed = new Set(manifest.stats?.always_index_fields || []);
+  const textFields = manifest.fields || [];
+  return suggestFields.every(suggest => textFields.some(field => (
+    field.path
+    && field.path === suggest.path
+    && alwaysIndexed.has(field.name)
+  )));
+}
+
+function suggestPrefixRoutingOf(dir) {
+  const manifest = manifestAt(dir, "manifest.min.json");
+  if (Array.isArray(manifest.shards)) return false;
+  const generations = generationsOf(dir, manifest);
+  return generations.length > 0
+    && generations.every(generation => manifestSupportsSuggestPrefixRouting(generation.manifest));
+}
+
 // Term-set sidecar ("rftermset-v1"): one shard's sorted unique terms plus its
 // analysis profile, as a gzipped newline stream with a JSON header line.
 // Pipelines that reclaim shard artifacts after upload persist this small file
@@ -148,7 +172,8 @@ const TERM_SET_FORMAT = "rftermset-v1";
 
 export function writeShardTermSet({ dir, outFile }) {
   const analysis = analysisOf(dir);
-  const lines = [JSON.stringify({ format: TERM_SET_FORMAT, analysis })];
+  const suggestPrefix = suggestPrefixRoutingOf(dir);
+  const lines = [JSON.stringify({ format: TERM_SET_FORMAT, analysis, suggest_prefix: suggestPrefix })];
   let terms = 0;
   for (const term of indexTerms(dir)) {
     lines.push(term);
@@ -157,7 +182,7 @@ export function writeShardTermSet({ dir, outFile }) {
   lines.push("");
   mkdirSync(dirname(resolve(outFile)), { recursive: true });
   writeFileSync(resolve(outFile), gzipSync(Buffer.from(lines.join("\n"), "utf8"), { level: 9 }));
-  return { terms, analysis };
+  return { terms, analysis, suggestPrefix };
 }
 
 function readTermSet(file) {
@@ -167,7 +192,7 @@ function readTermSet(file) {
   if (header.format !== TERM_SET_FORMAT) throw new Error(`Unsupported Rangefind term set ${file} (${header.format}).`);
   const terms = separator < 0 ? [] : text.slice(separator + 1).split("\n");
   while (terms.length && terms[terms.length - 1] === "") terms.pop();
-  return { analysis: header.analysis || null, terms };
+  return { analysis: header.analysis || null, suggestPrefix: header.suggest_prefix === true, terms };
 }
 
 function* arrayTerms(terms) {
@@ -184,9 +209,13 @@ export async function writeTextRoutingIndex({ outDir, shards, segmentTerms = DEF
   const sources = shards.map(shard => {
     if (shard.termSet) {
       const parsed = readTermSet(shard.termSet);
-      return { analysis: parsed.analysis, stream: () => arrayTerms(parsed.terms) };
+      return { analysis: parsed.analysis, suggestPrefix: parsed.suggestPrefix, stream: () => arrayTerms(parsed.terms) };
     }
-    return { analysis: analysisOf(shard.dir), stream: () => indexTerms(shard.dir) };
+    return {
+      analysis: analysisOf(shard.dir),
+      suggestPrefix: suggestPrefixRoutingOf(shard.dir),
+      stream: () => indexTerms(shard.dir)
+    };
   });
   const analysis = sources[0].analysis;
   const analysisKey = JSON.stringify(analysis);
@@ -251,6 +280,7 @@ export async function writeTextRoutingIndex({ outDir, shards, segmentTerms = DEF
     version: TEXT_ROUTING_VERSION,
     term_count: termCount,
     shard_ids: shardIds,
+    suggest_prefix: sources.every(source => source.suggestPrefix),
     ...(analysis ? { analysis } : {}),
     directory
   };
