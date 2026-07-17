@@ -162,6 +162,12 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
     const mono = await createSearch({ baseUrl: monoServer.baseUrl });
     const sharded = await createSearch({ baseUrl: shardServer.baseUrl });
 
+    const traced = await sharded.search({ q: "glacier bandmark2", size: 5, trace: true });
+    const fetchSpans = traced.stats.trace?.spans?.filter(span => span.name.endsWith(".fetch")) || [];
+    assert.ok(fetchSpans.reduce((sum, span) => sum + span.count, 0) > 0, "federated trace should count static reads");
+    assert.ok(traced.stats.trace.totalBytes > 0, "federated trace should report transferred bytes");
+    assert.ok(traced.stats.trace.spans.some(span => span.name === "shards.searchTotal"));
+
     // Text queries: identical per-document scores (frozen stats invariant)
     // and identical score-ordered ranking. Search `total` is approximate
     // under early termination, so exact totals are compared via count().

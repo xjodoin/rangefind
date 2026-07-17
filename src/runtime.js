@@ -168,12 +168,13 @@ function traceLabelBucket(label) {
   return "object";
 }
 
-function recordTraceSpan(trace, name, ms) {
+function recordTraceSpan(trace, name, ms, bytes = 0) {
   if (!trace || !Number.isFinite(ms)) return;
-  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0 };
+  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0, bytes: 0 };
   current.count++;
   current.totalMs += ms;
   current.maxMs = Math.max(current.maxMs, ms);
+  if (Number.isFinite(bytes) && bytes > 0) current.bytes += bytes;
   trace.spans.set(name, current);
 }
 
@@ -185,6 +186,20 @@ async function traceSpan(name, fn) {
     return await fn();
   } finally {
     recordTraceSpan(trace, name, nowMs() - started);
+  }
+}
+
+async function traceFetch(bucket, fn) {
+  const trace = activeRuntimeTrace;
+  if (!trace) return fn();
+  const started = nowMs();
+  let response;
+  try {
+    response = await fn();
+    return response;
+  } finally {
+    const bytes = Number(response?.headers?.get?.("content-length") || 0);
+    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, bytes);
   }
 }
 
@@ -211,16 +226,19 @@ async function withRuntimeTrace(trace, fn) {
 
 function finalizeRuntimeTrace(trace) {
   if (!trace) return null;
+  const spans = [...trace.spans.values()]
+    .map(span => ({
+      name: span.name,
+      count: span.count,
+      totalMs: span.totalMs,
+      maxMs: span.maxMs,
+      ...(span.bytes > 0 ? { bytes: span.bytes } : {})
+    }))
+    .sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name));
   return {
     totalMs: nowMs() - trace.started,
-    spans: [...trace.spans.values()]
-      .map(span => ({
-        name: span.name,
-        count: span.count,
-        totalMs: span.totalMs,
-        maxMs: span.maxMs
-      }))
-      .sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name))
+    totalBytes: spans.reduce((sum, span) => sum + Number(span.bytes || 0), 0),
+    spans
   };
 }
 
@@ -267,14 +285,14 @@ export function setFetchImplementation(fn) {
 
 async function fetchGzipArrayBuffer(url) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url));
+  const response = await traceFetch(bucket, () => fetchImpl(url));
   if (!response.ok) throw new Error(`Unable to fetch ${url}`);
   return traceSpan(`${bucket}.inflate`, () => inflateGzip(response));
 }
 
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url, {
+  const response = await traceFetch(bucket, () => fetchImpl(url, {
     headers: { Range: `bytes=${offset}-${offset + length - 1}` }
   }));
   if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
@@ -311,7 +329,8 @@ function facetCodeMatches(words, selected) {
 export async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   async function fetchJsonIfOk(path) {
-    const response = await fetchImpl(new URL(path, baseUrl));
+    const url = new URL(path, baseUrl);
+    const response = await traceFetch(traceBucketFromUrl(url), () => fetchImpl(url));
     return response.ok ? response.json() : null;
   }
 
@@ -319,7 +338,7 @@ export async function createSearch(options = {}) {
     if (!path) return null;
     if (!String(path).endsWith(".gz")) return fetchJsonIfOk(path);
     const url = new URL(path, baseUrl);
-    const response = await fetchImpl(url);
+    const response = await traceFetch(traceBucketFromUrl(url), () => fetchImpl(url));
     if (!response.ok) return null;
     const inflated = await traceSpan("manifest.inflate", () => inflateGzip(response));
     return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder.decode(inflated)));
@@ -1271,7 +1290,7 @@ export async function createSearch(options = {}) {
     if (!segmentTermsCache.has(key)) {
       const path = segment.files?.terms?.path;
       segmentTermsCache.set(key, path
-        ? fetchImpl(new URL(path, baseUrl)).then(response => {
+        ? traceFetch(traceBucketFromUrl(new URL(path, baseUrl)), () => fetchImpl(new URL(path, baseUrl))).then(response => {
             if (!response.ok) throw new Error(`Unable to fetch ${path}`);
             return response.arrayBuffer();
           }).then(buffer => traceSpanSync("segments.parseTerms", () => parseSegmentTerms(buffer)))
@@ -8141,7 +8160,11 @@ async function createShardedSearch(root, options, baseUrl) {
         ...options,
         baseUrl: new URL(shard.path || "./", baseUrl).href,
         manifestName,
-        maxPageSize: 1000
+        maxPageSize: 1000,
+        // The federated root owns one trace spanning every child. Giving each
+        // concurrent shard its own module-level trace would fragment or mix
+        // the receipt; child operations inherit the root's active trace.
+        trace: false
       });
     }
     return engines[index];
@@ -8521,7 +8544,7 @@ async function createShardedSearch(root, options, baseUrl) {
     };
   }
 
-  async function search(params = {}) {
+  async function executeShardedSearch(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
@@ -8614,6 +8637,22 @@ async function createShardedSearch(root, options, baseUrl) {
       response.stats.postalCodeNormalized = true;
     }
     return response;
+  }
+
+  async function search(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    if (!trace) return executeShardedSearch(params);
+    const response = await withRuntimeTrace(trace, () => traceSpan(
+      "shards.searchTotal",
+      () => executeShardedSearch({ ...params, trace: false })
+    ));
+    return {
+      ...response,
+      stats: {
+        ...(response.stats || {}),
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
   }
 
   // Hybrid text + vector across shards: fuse at the merged level, like the

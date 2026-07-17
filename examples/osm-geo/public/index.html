@@ -21,6 +21,19 @@
       <span id="mapHudText">Connecting to the atlas</span>
     </div>
 
+    <section id="placeLens" class="place-lens" aria-label="Explore around the selected place" hidden>
+      <button id="placeLensClose" class="place-lens__close" type="button" aria-label="Close discovery orbit">×</button>
+      <p class="place-lens__eyebrow"><span aria-hidden="true"></span> Discovery orbit</p>
+      <h2 id="placeLensTitle">Explore this place</h2>
+      <p id="placeLensCopy">Search nearby without opening a search server.</p>
+      <div class="place-lens__actions" aria-label="Nearby searches">
+        <button type="button" data-orbit-query="cafe" data-orbit-label="Cafés">Cafés</button>
+        <button type="button" data-orbit-query="restaurant" data-orbit-label="Restaurants">Restaurants</button>
+        <button type="button" data-orbit-query="pharmacy" data-orbit-label="Pharmacies">Pharmacies</button>
+        <button type="button" data-orbit-query="park" data-orbit-label="Parks">Parks</button>
+      </div>
+    </section>
+
     <aside id="searchPanel" class="panel" aria-label="OpenStreetMap search">
       <header class="panel-header">
         <div class="brand-row">
@@ -108,6 +121,18 @@
 
       <section class="results" aria-label="Search results">
         <p id="statusLine" class="status-line" data-state="loading" aria-live="polite">Loading the place index…</p>
+        <details id="queryReceipt" class="query-receipt" hidden>
+          <summary>
+            <span class="query-receipt__label"><i aria-hidden="true"></i> Query X-Ray</span>
+            <strong id="queryReceiptSummary">Tracing byte ranges…</strong>
+            <span class="query-receipt__chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <div class="query-receipt__body">
+            <p id="queryReceiptRoute" class="query-receipt__route"></p>
+            <div id="queryReceiptBars" class="query-receipt__bars" aria-label="Static index reads by data structure"></div>
+            <p class="query-receipt__proof"><b>Zero-server proof.</b> These are immutable HTTP range reads performed by this browser—no search API or query database was contacted.</p>
+          </div>
+        </details>
         <div id="emptyState" class="empty-state">
           <span class="empty-state__graphic" aria-hidden="true"><i></i><i></i><i></i></span>
           <strong id="emptyTitle">Find a place</strong>

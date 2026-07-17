@@ -80,13 +80,27 @@ test("OSM category-locality search resolves a place then searches nearby", async
       if (params.filters?.facets?.category?.includes("place")) {
         return {
           total: 1,
-          results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.6323155, lon: -73.8052338 }]
+          results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.6323155, lon: -73.8052338 }],
+          stats: {
+            trace: {
+              totalMs: 5,
+              totalBytes: 100,
+              spans: [{ name: "manifest.fetch", count: 1, totalMs: 4, maxMs: 4, bytes: 100 }]
+            }
+          }
         };
       }
       return {
         total: 2,
         results: [{ name: "Jean Coutu", type: "pharmacy", distanceMeters: 814.7 }],
-        stats: { geoLane: "nearestText" }
+        stats: {
+          geoLane: "nearestText",
+          trace: {
+            totalMs: 7,
+            totalBytes: 200,
+            spans: [{ name: "terms.fetch", count: 2, totalMs: 6, maxMs: 3, bytes: 200 }]
+          }
+        }
       };
     }
   };
@@ -97,6 +111,9 @@ test("OSM category-locality search resolves a place then searches nearby", async
   assert.equal(calls[1].geo.near.radiusMeters, 10000);
   assert.equal(response.resolvedQuery, "Pharmacie Rosemère");
   assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+  assert.equal(response.stats.trace.totalMs, 12);
+  assert.equal(response.stats.trace.totalBytes, 300);
+  assert.equal(response.stats.trace.spans.length, 2);
   assert.equal(response.results[0].name, "Jean Coutu");
   await searchOsmQuery(engine, { q: "Rosemère pharmacie", size: 10 });
   assert.equal(calls.length, 3);
@@ -127,6 +144,10 @@ test("OSM exact locality search returns the city instead of matching addresses",
 
   await searchOsmQuery(engine, { q: "Laval", shards: ["quebec"], size: 30 });
   assert.deepEqual(calls[1].shards, ["quebec"]);
+  const warm = await searchOsmQuery(engine, { q: "Laval", shards: ["quebec"], size: 30, trace: true });
+  assert.equal(calls.length, 2, "warm locality should not reopen its shard");
+  assert.equal(warm.stats.trace.totalBytes, 0);
+  assert.deepEqual(warm.stats.trace.spans, []);
 });
 
 test("OSM street-locality search avoids common road-designator posting exhaustion", async () => {

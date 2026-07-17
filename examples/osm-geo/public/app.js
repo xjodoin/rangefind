@@ -21,6 +21,14 @@ const mapHudText = document.querySelector("#mapHudText");
 const searchPanel = document.querySelector("#searchPanel");
 const panelToggle = document.querySelector("#panelToggle");
 const collapsedSelection = document.querySelector("#collapsedSelection");
+const queryReceipt = document.querySelector("#queryReceipt");
+const queryReceiptSummary = document.querySelector("#queryReceiptSummary");
+const queryReceiptRoute = document.querySelector("#queryReceiptRoute");
+const queryReceiptBars = document.querySelector("#queryReceiptBars");
+const placeLens = document.querySelector("#placeLens");
+const placeLensTitle = document.querySelector("#placeLensTitle");
+const placeLensCopy = document.querySelector("#placeLensCopy");
+const placeLensClose = document.querySelector("#placeLensClose");
 
 // The client ships with Rangefind; ../osm-rangefind-index independently
 // publishes the rolling regional shards. Every root-manifest update is picked
@@ -43,7 +51,23 @@ let selectedSuggestionHint = null;
 let visibleSuggestions = [];
 let suggestInFlight = false;
 let suggestQueued = false;
+let selectedPlace = null;
+let activeQueryOverride = null;
 const suggestionCache = new Map();
+
+const TRACE_LABELS = new Map([
+  ["manifest", "Route manifests"],
+  ["textRouting", "Region routing"],
+  ["directory", "Term directory"],
+  ["terms", "Posting lists"],
+  ["postingBlocks", "Posting blocks"],
+  ["docs", "Result documents"],
+  ["docPages", "Result pages"],
+  ["docPointers", "Document pointers"],
+  ["geo", "Geo index"],
+  ["filterBitmaps", "Facet filters"],
+  ["authority", "Address authority"]
+]);
 
 const CANADIAN_POSTAL_CODE = /\b[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\b/iu;
 
@@ -94,6 +118,13 @@ function formatCompact(value) {
     notation: "compact",
     maximumFractionDigits: 1
   }).format(Number(value || 0));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes < 1024) return `${formatNumber(bytes)} B`;
+  if (bytes < 1024 ** 2) return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(bytes / 1024)} KB`;
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(bytes / 1024 ** 2)} MB`;
 }
 
 function formatDistance(meters) {
@@ -166,6 +197,70 @@ function setStatus(text, state = "ready") {
   searchButton.dataset.state = state;
 }
 
+function beginQueryReceipt() {
+  queryReceipt.hidden = false;
+  queryReceipt.open = false;
+  queryReceipt.dataset.state = "loading";
+  queryReceiptSummary.textContent = "Tracing byte ranges…";
+  queryReceiptRoute.textContent = "Following the request from this browser into the static index.";
+  queryReceiptBars.replaceChildren();
+}
+
+function renderQueryReceipt(response, shown) {
+  const trace = response.stats?.trace;
+  if (!trace) {
+    queryReceipt.hidden = true;
+    return;
+  }
+  const fetchSpans = (trace?.spans || []).filter(span => span.name.endsWith(".fetch") && span.count > 0);
+  const queried = Number(response.stats?.shardsQueried || 1);
+  const available = Number(response.stats?.shards || engine.shards?.length || 1);
+  queryReceipt.hidden = false;
+  queryReceipt.dataset.state = "ready";
+  if (!fetchSpans.length) {
+    queryReceiptSummary.textContent = "0 network reads · memory hit";
+    queryReceiptRoute.textContent = `This browser → memory cache → ${formatNumber(shown)} hydrated ${shown === 1 ? "result" : "results"}`;
+    const warm = document.createElement("p");
+    warm.className = "query-receipt__warm";
+    warm.textContent = "Everything required for this query was already resident in this tab.";
+    queryReceiptBars.replaceChildren(warm);
+    return;
+  }
+  const reads = fetchSpans.reduce((sum, span) => sum + Number(span.count || 0), 0);
+  const bytes = Number(trace.totalBytes || fetchSpans.reduce((sum, span) => sum + Number(span.bytes || 0), 0));
+  queryReceiptSummary.textContent = `${formatNumber(reads)} static ${reads === 1 ? "read" : "reads"} · ${formatBytes(bytes)}`;
+  queryReceiptRoute.textContent = `This browser → ${formatNumber(queried)} of ${formatNumber(available)} regions → ${formatNumber(shown)} hydrated ${shown === 1 ? "result" : "results"}`;
+
+  const ranked = fetchSpans
+    .map(span => ({ ...span, cost: Number(span.bytes || 0) || Number(span.count || 0) }))
+    .sort((left, right) => right.cost - left.cost)
+    .slice(0, 5);
+  const maxCost = Math.max(1, ...ranked.map(span => span.cost));
+  queryReceiptBars.replaceChildren(...ranked.map(span => {
+    const bucket = span.name.slice(0, -".fetch".length);
+    const row = document.createElement("div");
+    row.className = "query-receipt__bar";
+    const label = document.createElement("span");
+    label.textContent = TRACE_LABELS.get(bucket) || humanize(bucket);
+    const rail = document.createElement("i");
+    const fill = document.createElement("b");
+    fill.style.width = `${Math.max(5, Math.round((span.cost / maxCost) * 100))}%`;
+    rail.append(fill);
+    const value = document.createElement("strong");
+    value.textContent = span.bytes
+      ? formatBytes(span.bytes)
+      : `${formatNumber(span.count)} ${span.count === 1 ? "read" : "reads"}`;
+    row.append(label, rail, value);
+    return row;
+  }));
+}
+
+function interruptQueryReceipt() {
+  if (queryReceipt.hidden) return;
+  queryReceipt.dataset.state = "error";
+  queryReceiptSummary.textContent = "Trace interrupted";
+}
+
 function showEmpty(title, copy) {
   emptyTitle.textContent = title;
   emptyCopy.textContent = copy;
@@ -184,6 +279,49 @@ function setPanelCollapsed(collapsed, selection = "") {
     queryInput.blur();
   }
   requestAnimationFrame(() => map.resize());
+}
+
+function hidePlaceLens() {
+  placeLens.hidden = true;
+  selectedPlace = null;
+}
+
+function openPlaceLens(item) {
+  if (!Number.isFinite(item?.lat) || !Number.isFinite(item?.lon)) return;
+  selectedPlace = item;
+  const title = item.name || item.title || item.id;
+  const location = resultLocation(item);
+  const kind = humanize(item.type || item.category || "place");
+  placeLensTitle.textContent = title;
+  placeLensCopy.textContent = `${kind}${location ? ` · ${location}` : ""}. Search within a 2.5 km orbit.`;
+  placeLens.hidden = false;
+}
+
+function runDiscoveryOrbit(query, label) {
+  if (!selectedPlace) return;
+  const place = selectedPlace;
+  const title = place.name || place.title || place.id;
+  const displayQuery = `${label} around ${title}`;
+  const rootShard = String(place.shard || "").split("/")[0];
+  activeQueryOverride = {
+    displayQuery,
+    mode: "discovery orbit",
+    params: {
+      q: query,
+      geo: {
+        near: { lat: place.lat, lon: place.lon, radiusMeters: 2500 },
+        sort: "distance"
+      },
+      ...(rootShard ? { shards: [rootShard] } : {})
+    }
+  };
+  queryInput.value = displayQuery;
+  selectedSuggestionHint = null;
+  clearButton.hidden = false;
+  areaToggle.checked = false;
+  hidePlaceLens();
+  setPanelCollapsed(false);
+  runSearch({ fit: true });
 }
 
 function clearMarkers() {
@@ -208,6 +346,7 @@ function markerFor(item, index) {
     .addTo(map);
   element.addEventListener("click", () => {
     mapHudText.textContent = `Selected ${title}`;
+    openPlaceLens(item);
     setPanelCollapsed(true, title);
   });
   // MapLibre supplies a generic marker label during construction; restore the
@@ -286,6 +425,7 @@ function renderResults(results, { fit = false, query = "" } = {}) {
         markerEntry.marker.togglePopup();
       }
       mapHudText.textContent = `Selected ${title}`;
+      openPlaceLens(item);
       setPanelCollapsed(true, title);
     };
     button.addEventListener("click", flyToResult);
@@ -318,15 +458,21 @@ async function runSearch({ fit = false } = {}) {
   if (!engine) return;
   const token = ++searchToken;
   const q = queryInput.value.trim();
-  const addressLookup = looksLikeAddress(q);
+  const queryOverride = activeQueryOverride?.displayQuery === q ? activeQueryOverride : null;
+  const addressLookup = !queryOverride && looksLikeAddress(q);
   const areaWasChecked = areaToggle.checked;
-  const useArea = areaToggle.checked && !addressLookup;
+  const useArea = !queryOverride && areaToggle.checked && !addressLookup;
   if (addressLookup && areaWasChecked) areaToggle.checked = false;
   clearButton.hidden = !q;
   searchPanel.classList.toggle("has-query", Boolean(q));
+  hidePlaceLens();
 
-  const params = { q, size: resultLimit() };
-  const hintedShards = selectedSuggestionHint?.query === q
+  const params = {
+    ...(queryOverride?.params || { q }),
+    size: resultLimit(),
+    trace: true
+  };
+  const hintedShards = !queryOverride && selectedSuggestionHint?.query === q
     ? selectedSuggestionHint.shards
     : [];
   if (hintedShards?.length) params.shards = hintedShards;
@@ -338,6 +484,7 @@ async function runSearch({ fit = false } = {}) {
   }
   if (areaBox) params.geo = { box: areaBox };
   if (!q && !useArea) {
+    queryReceipt.hidden = true;
     resultList.replaceChildren();
     clearMarkers();
     setStatus("Ready to search", "ready");
@@ -346,6 +493,7 @@ async function runSearch({ fit = false } = {}) {
     return;
   }
 
+  beginQueryReceipt();
   setStatus("Scanning static byte ranges…", "loading");
   mapHudText.textContent = q ? `Searching “${q}”` : "Scanning this viewport";
   const started = performance.now();
@@ -367,15 +515,18 @@ async function runSearch({ fit = false } = {}) {
       ? ` · ${formatNumber(queried)} of ${formatNumber(available)} shards`
       : "";
     const directText = hintedShards?.length ? " · direct suggestion route" : "";
+    const modeText = queryOverride?.mode ? ` · ${queryOverride.mode}` : "";
     const shown = Math.min(response.results.length, resultLimit());
     const timing = `${(ms / 1000).toFixed(1)}s${shardText}`;
     setStatus(response.total
-      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}`
-      : `No matches · ${timing}${directText}`);
+      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${modeText}`
+      : `No matches · ${timing}${directText}${modeText}`);
+    renderQueryReceipt(response, shown);
     mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${useArea ? "this map area" : "everywhere"}`;
   } catch (error) {
     if (token !== searchToken) return;
     const message = error?.message || "Search failed";
+    interruptQueryReceipt();
     setStatus(message, "error");
     mapHudText.textContent = "Search interrupted";
     showEmpty("The atlas lost the trail", "The public index could not answer this query. Try again in a moment.");
@@ -409,6 +560,7 @@ function setActiveSuggestion(index) {
 function chooseSuggestion(suggestion) {
   const item = typeof suggestion === "string" ? { text: suggestion } : suggestion;
   queryInput.value = item.text;
+  activeQueryOverride = null;
   selectedSuggestionHint = item.shards?.length
     ? { query: item.text.trim(), shards: [...item.shards] }
     : null;
@@ -539,6 +691,7 @@ async function loadIndexStatus() {
 }
 
 queryInput.addEventListener("input", () => {
+  activeQueryOverride = null;
   clearButton.hidden = !queryInput.value;
   if (selectedSuggestionHint?.query !== queryInput.value.trim()) selectedSuggestionHint = null;
   if (queryInput.value !== suppressedQuery) {
@@ -579,6 +732,7 @@ queryInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
 
 clearButton.addEventListener("click", () => {
   queryInput.value = "";
+  activeQueryOverride = null;
   selectedSuggestionHint = null;
   clearButton.hidden = true;
   areaToggle.checked = false;
@@ -597,9 +751,19 @@ panelToggle.addEventListener("click", () => {
   setPanelCollapsed(!searchPanel.classList.contains("is-collapsed"));
 });
 
+placeLensClose.addEventListener("click", hidePlaceLens);
+
+for (const action of document.querySelectorAll("[data-orbit-query]")) {
+  action.addEventListener("click", () => runDiscoveryOrbit(
+    action.dataset.orbitQuery,
+    action.dataset.orbitLabel
+  ));
+}
+
 for (const example of document.querySelectorAll("[data-query]")) {
   example.addEventListener("click", () => {
     queryInput.value = example.dataset.query;
+    activeQueryOverride = null;
     clearButton.hidden = false;
     areaToggle.checked = false;
     cancelSuggestions();
@@ -607,7 +771,10 @@ for (const example of document.querySelectorAll("[data-query]")) {
   });
 }
 
-areaToggle.addEventListener("change", () => runSearch());
+areaToggle.addEventListener("change", () => {
+  activeQueryOverride = null;
+  runSearch();
+});
 
 document.addEventListener("keydown", event => {
   const shortcut = event.key === "/" && document.activeElement !== queryInput;

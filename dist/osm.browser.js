@@ -51,6 +51,34 @@ var STREET_DESIGNATORS = /* @__PURE__ */ new Set([
   "road",
   "street"
 ]);
+function mergeRuntimeTraces(...values) {
+  const traces = [...new Set(values.filter((trace) => trace?.spans?.length))];
+  if (!traces.length) return null;
+  if (traces.length === 1) return traces[0];
+  const byName = /* @__PURE__ */ new Map();
+  for (const trace of traces) {
+    for (const span of trace.spans) {
+      const current = byName.get(span.name) || {
+        name: span.name,
+        count: 0,
+        totalMs: 0,
+        maxMs: 0,
+        bytes: 0
+      };
+      current.count += Number(span.count || 0);
+      current.totalMs += Number(span.totalMs || 0);
+      current.maxMs = Math.max(current.maxMs, Number(span.maxMs || 0));
+      current.bytes += Number(span.bytes || 0);
+      byName.set(span.name, current);
+    }
+  }
+  const spans = [...byName.values()].map(({ bytes, ...span }) => bytes > 0 ? { ...span, bytes } : span).sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name));
+  return {
+    totalMs: traces.reduce((sum, trace) => sum + Number(trace.totalMs || 0), 0),
+    totalBytes: spans.reduce((sum, span) => sum + Number(span.bytes || 0), 0),
+    spans
+  };
+}
 function fold(value) {
   return String(value || "").normalize("NFKD").replaceAll(/\p{M}+/gu, "").toLocaleLowerCase("en-US").replaceAll(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
@@ -189,16 +217,29 @@ async function resolveLocality(engine, surface, params = {}) {
   const localityKey = `${normalizedLocality}\0${shardScope.join("\0")}`;
   if (!LOCALITY_CACHE.has(engine)) LOCALITY_CACHE.set(engine, /* @__PURE__ */ new Map());
   const cache = LOCALITY_CACHE.get(engine);
-  if (cache.has(localityKey)) return cache.get(localityKey);
+  if (cache.has(localityKey)) {
+    const cached = cache.get(localityKey);
+    if (!cached) return null;
+    const resolved2 = { ...cached };
+    if (params.trace) {
+      Object.defineProperty(resolved2, LOCALITY_SEARCH_STATS, {
+        value: { trace: { totalMs: 0, totalBytes: 0, spans: [] } },
+        enumerable: false
+      });
+    }
+    return resolved2;
+  }
   const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
   const localityResponse = await engine.search(postalMatch ? {
     q: surface,
     size: 8,
+    ...params.trace ? { trace: params.trace } : {},
     ...shardScope.length ? { shards: shardScope } : {}
   } : {
     q: surface,
     filters: { facets: { category: ["place"] } },
     size: 8,
+    ...params.trace ? { trace: params.trace } : {},
     ...shardScope.length ? { shards: shardScope } : {}
   });
   const matches = localityResponse.results.filter((result) => {
@@ -213,12 +254,14 @@ async function resolveLocality(engine, surface, params = {}) {
   matches.sort((left, right) => (typePriority.get(right.type) || 0) - (typePriority.get(left.type) || 0) || Number(right.population || 0) - Number(left.population || 0));
   const resolved = matches[0] || null;
   if (resolved) {
+    cache.set(localityKey, { ...resolved });
     Object.defineProperty(resolved, LOCALITY_SEARCH_STATS, {
       value: localityResponse.stats || {},
       enumerable: false
     });
+  } else {
+    cache.set(localityKey, null);
   }
-  cache.set(localityKey, resolved);
   return resolved;
 }
 async function resolveStreetLocality(engine, surface, params) {
@@ -253,6 +296,7 @@ async function resolveStreetLocality(engine, surface, params) {
     });
     const street = response.results.find((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && fold(result.name || result.title) === streetKey);
     if (!street) return null;
+    const trace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
     return {
       total: 1,
       page: 1,
@@ -270,6 +314,7 @@ async function resolveStreetLocality(engine, surface, params) {
       resolvedQuery: `${streetSurface}, ${locality.name || localitySurface}`,
       stats: {
         ...response.stats || {},
+        ...trace ? { trace } : {},
         plannerLane: "osmStreetLocality",
         osmIntentStreet: streetSurface,
         osmIntentLocality: locality.name || localitySurface,
@@ -321,11 +366,13 @@ async function searchOsmQuery(engine, params = {}) {
       sort: "distance"
     }
   });
+  const trace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
   return {
     ...response,
     resolvedQuery: `${intent.category.label} ${locality.name || intent.locality}`,
     stats: {
       ...response.stats || {},
+      ...trace ? { trace } : {},
       plannerLane: "osmCategoryLocality",
       osmIntentCategory: intent.category.query,
       osmIntentLocality: locality.name || intent.locality,
