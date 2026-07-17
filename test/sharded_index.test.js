@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import { build } from "../src/builder.js";
 import { readConfig } from "../src/config.js";
 import { collectScoringStats, loadScoringStats } from "../src/scoring_stats.js";
@@ -605,4 +607,52 @@ test("term-set sidecars rebuild identical text routing", { timeout: 120000 }, as
   assert.equal(fromSidecars.suggest_prefix, rootManifest.text_routing.suggest_prefix);
   // Same inputs must produce the same content-addressed artifact.
   assert.equal(fromSidecars.directory.root_hash, rootManifest.text_routing.directory.root_hash);
+});
+
+test("text routing streams large term-set merges within a bounded heap", { timeout: 120000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-routing-memory-"));
+  const shardCount = 310;
+  const termCount = 2000;
+  const suffix = "x".repeat(128);
+  const terms = Array.from({ length: termCount }, (_, index) => `term-${String(index).padStart(6, "0")}-${suffix}`);
+  const header = JSON.stringify({ format: "rftermset-v1", analysis: null, suggest_prefix: false });
+  const compressed = gzipSync(Buffer.from(`${header}\n${terms.join("\n")}\n`, "utf8"), { level: 1 });
+  await Promise.all(Array.from({ length: shardCount }, (_, index) => (
+    writeFile(join(root, `shard-${index}.terms.gz`), compressed)
+  )));
+
+  const script = `
+    const { writeTextRoutingIndex } = await import("./src/text_routing.js");
+    const root = process.env.RANGEFIND_MEMORY_TEST_ROOT;
+    const shardCount = Number(process.env.RANGEFIND_MEMORY_TEST_SHARDS);
+    const expectedTerms = Number(process.env.RANGEFIND_MEMORY_TEST_TERMS);
+    const shards = Array.from({ length: shardCount }, (_, index) => ({
+      id: \`shard-\${index}\`,
+      termSet: \`\${root}/shard-\${index}.terms.gz\`
+    }));
+    const result = await writeTextRoutingIndex({ outDir: \`\${root}/out\`, shards, segmentTerms: 64 });
+    if (result.term_count !== expectedTerms) {
+      throw new Error(\`Expected \${expectedTerms} merged terms, received \${result.term_count}.\`);
+    }
+  `;
+  const child = spawn(process.execPath, ["--max-old-space-size=64", "--input-type=module", "--eval", script], {
+    cwd: resolve("."),
+    env: {
+      ...process.env,
+      RANGEFIND_MEMORY_TEST_ROOT: root,
+      RANGEFIND_MEMORY_TEST_SHARDS: String(shardCount),
+      RANGEFIND_MEMORY_TEST_TERMS: String(termCount)
+    },
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", chunk => {
+    if (stderr.length < 12000) stderr += chunk;
+  });
+  const { code, signal } = await new Promise((resolveChild, rejectChild) => {
+    child.once("error", rejectChild);
+    child.once("close", (code, signal) => resolveChild({ code, signal }));
+  });
+  assert.equal(code, 0, `low-heap routing merge failed (${signal || "exit"}):\n${stderr}`);
 });

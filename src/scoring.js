@@ -2,6 +2,19 @@ import { proximityTerm } from "./terms.js";
 import { analyzerForConfig } from "./analysis.js";
 import { getPath } from "./config.js";
 
+const EMPTY_ALWAYS_INDEX_FIELDS = new Set();
+const alwaysIndexFieldsByConfig = new WeakMap();
+
+function alwaysIndexFieldNames(config) {
+  const source = config?.alwaysIndexFields;
+  if (!Array.isArray(source) || !source.length) return EMPTY_ALWAYS_INDEX_FIELDS;
+  const cached = alwaysIndexFieldsByConfig.get(config);
+  if (cached?.source === source && cached.length === source.length) return cached.names;
+  const names = new Set(source.map(String));
+  alwaysIndexFieldsByConfig.set(config, { source, length: source.length, names });
+  return names;
+}
+
 function addWeighted(scores, term, weight) {
   if (!term || weight <= 0) return;
   scores.set(term, (scores.get(term) || 0) + weight);
@@ -26,7 +39,7 @@ export function fieldText(doc, field) {
 }
 
 export function isAlwaysIndexField(field, config = {}) {
-  const names = new Set((config.alwaysIndexFields || []).map(String));
+  const names = alwaysIndexFieldNames(config);
   return names.has(String(field.name || "")) || names.has(String(field.path || ""));
 }
 
@@ -137,7 +150,7 @@ export function analyzeDocumentForIndex(doc, config, avgLens, options = {}) {
   const always = new Map();
   const weighted = new Map();
   const expansion = new Map();
-  const alwaysNames = new Set((config.alwaysIndexFields || []).map(String));
+  const alwaysNames = alwaysIndexFieldNames(config);
   const includeFieldTerms = Boolean(options.includeFieldTerms);
   const fieldTerms = includeFieldTerms ? new Array(config.fields.length).fill(null) : null;
   const analyzer = analyzerForConfig(config);

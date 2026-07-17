@@ -1,6 +1,7 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { StringDecoder } from "node:string_decoder";
+import { createGunzip, gunzipSync, gzipSync } from "node:zlib";
 import { parsePostingSegment } from "./codec.js";
 import { parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
@@ -131,6 +132,128 @@ function* mergeSortedStreams(streams, onSources) {
   }
 }
 
+// Async counterpart used by routing sidecars. Unlike readFile + gunzip +
+// split, this keeps only one current value (plus bounded stream buffers) per
+// shard, regardless of the total vocabulary size. A min-heap selects the next
+// term in O(log shard count), avoiding a full shard scan for every term.
+async function* mergeSortedAsyncStreams(streams, onSources) {
+  const heads = streams.map((stream, index) => ({
+    stream: stream[Symbol.asyncIterator]?.() || stream[Symbol.iterator]?.(),
+    index,
+    value: null,
+    done: false
+  }));
+  if (heads.some(head => !head.stream)) throw new TypeError("Rangefind text routing: term source is not iterable.");
+
+  async function advance(head) {
+    while (true) {
+      const next = await head.stream.next();
+      if (next.done) {
+        head.done = true;
+        head.value = null;
+        return;
+      }
+      if (next.value !== head.value) {
+        head.value = next.value;
+        return;
+      }
+    }
+  }
+
+  const heap = [];
+  const nodeByValue = new Map();
+  // Recycle hot-path containers. Their high-water mark is capped by the
+  // number of source streams, so the pool cannot grow with term count.
+  const freeNodes = [];
+  const freeHeadLists = [];
+  function compare(left, right) {
+    if (left.value < right.value) return -1;
+    if (left.value > right.value) return 1;
+    return 0;
+  }
+  function push(node) {
+    let index = heap.length;
+    heap.push(node);
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (compare(heap[parent], node) <= 0) break;
+      heap[index] = heap[parent];
+      index = parent;
+    }
+    heap[index] = node;
+  }
+  function pop() {
+    const first = heap[0];
+    const last = heap.pop();
+    if (heap.length) {
+      let index = 0;
+      while (true) {
+        const left = index * 2 + 1;
+        if (left >= heap.length) break;
+        const right = left + 1;
+        const child = right < heap.length && compare(heap[right], heap[left]) < 0 ? right : left;
+        if (compare(last, heap[child]) <= 0) break;
+        heap[index] = heap[child];
+        index = child;
+      }
+      heap[index] = last;
+    }
+    nodeByValue.delete(first.value);
+    return first;
+  }
+  function add(head) {
+    const existing = nodeByValue.get(head.value);
+    if (existing) {
+      existing.heads.push(head);
+      return;
+    }
+    const node = freeNodes.pop() || { value: null, heads: null };
+    const nodeHeads = freeHeadLists.pop() || [];
+    node.value = head.value;
+    node.heads = nodeHeads;
+    nodeHeads.push(head);
+    nodeByValue.set(node.value, node);
+    push(node);
+  }
+  function recycleNode(node) {
+    node.value = null;
+    node.heads = null;
+    freeNodes.push(node);
+  }
+  function recycleHeadList(nodeHeads) {
+    nodeHeads.length = 0;
+    freeHeadLists.push(nodeHeads);
+  }
+
+  const sources = [];
+  try {
+    for (const head of heads) {
+      await advance(head);
+      if (!head.done) add(head);
+    }
+    while (heap.length) {
+      const node = pop();
+      const min = node.value;
+      const matchingHeads = node.heads;
+      matchingHeads.sort((left, right) => left.index - right.index);
+      sources.length = 0;
+      for (const head of matchingHeads) {
+        sources.push(head.index);
+      }
+      for (const head of matchingHeads) await advance(head);
+      recycleNode(node);
+      for (const head of matchingHeads) {
+        if (!head.done) add(head);
+      }
+      recycleHeadList(matchingHeads);
+      onSources(min, sources);
+      yield min;
+    }
+  } finally {
+    await Promise.allSettled(heads.map(head => head.done ? undefined : head.stream.return?.()));
+  }
+}
+
 function analysisOf(dir) {
   const manifest = manifestAt(dir, "manifest.min.json");
   if (Array.isArray(manifest.shards)) {
@@ -185,18 +308,70 @@ export function writeShardTermSet({ dir, outFile }) {
   return { terms, analysis, suggestPrefix };
 }
 
-function readTermSet(file) {
-  const text = gunzipSync(readFileSync(resolve(file))).toString("utf8");
-  const separator = text.indexOf("\n");
-  const header = JSON.parse(separator < 0 ? text : text.slice(0, separator));
+function parseTermSetHeader(line, file) {
+  if (line === undefined) throw new Error(`Invalid empty Rangefind term set ${file}.`);
+  const header = JSON.parse(line);
   if (header.format !== TERM_SET_FORMAT) throw new Error(`Unsupported Rangefind term set ${file} (${header.format}).`);
-  const terms = separator < 0 ? [] : text.slice(separator + 1).split("\n");
-  while (terms.length && terms[terms.length - 1] === "") terms.pop();
-  return { analysis: header.analysis || null, suggestPrefix: header.suggest_prefix === true, terms };
+  return { analysis: header.analysis || null, suggestPrefix: header.suggest_prefix === true };
 }
 
-function* arrayTerms(terms) {
-  yield* terms;
+async function* gzipLines(file) {
+  const input = createReadStream(resolve(file));
+  const gunzip = createGunzip();
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  const forwardInputError = error => gunzip.destroy(error);
+  input.on("error", forwardInputError);
+  input.pipe(gunzip);
+  try {
+    for await (const chunk of gunzip) {
+      pending += decoder.write(chunk);
+      let separator;
+      while ((separator = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, separator);
+        pending = pending.slice(separator + 1);
+        yield line.endsWith("\r") ? line.slice(0, -1) : line;
+      }
+    }
+    pending += decoder.end();
+    if (pending) yield pending.endsWith("\r") ? pending.slice(0, -1) : pending;
+  } finally {
+    input.off("error", forwardInputError);
+    gunzip.destroy();
+    input.destroy();
+  }
+}
+
+async function readTermSetHeader(file) {
+  const lines = gzipLines(file);
+  try {
+    const first = await lines.next();
+    return parseTermSetHeader(first.done ? undefined : first.value, file);
+  } finally {
+    await lines.return();
+  }
+}
+
+async function* termSetTerms(file) {
+  let first = true;
+  let trailingEmptyLines = 0;
+  for await (const line of gzipLines(file)) {
+    if (first) {
+      parseTermSetHeader(line, file);
+      first = false;
+      continue;
+    }
+    if (line === "") {
+      trailingEmptyLines++;
+      continue;
+    }
+    while (trailingEmptyLines > 0) {
+      yield "";
+      trailingEmptyLines--;
+    }
+    yield line;
+  }
+  if (first) parseTermSetHeader(undefined, file);
 }
 
 // Builds the routing directory for a sharded root. `shards` mirrors the
@@ -206,17 +381,19 @@ function* arrayTerms(terms) {
 export async function writeTextRoutingIndex({ outDir, shards, segmentTerms = DEFAULT_SEGMENT_TERMS, packTargetBytes = DEFAULT_PACK_TARGET_BYTES, directoryPageBytes }) {
   if (!Array.isArray(shards) || !shards.length) throw new Error("Rangefind text routing: no shards.");
   const shardIds = shards.map((shard, index) => String(shard.id || `shard-${index}`));
-  const sources = shards.map(shard => {
+  const sources = [];
+  for (const shard of shards) {
     if (shard.termSet) {
-      const parsed = readTermSet(shard.termSet);
-      return { analysis: parsed.analysis, suggestPrefix: parsed.suggestPrefix, stream: () => arrayTerms(parsed.terms) };
+      const parsed = await readTermSetHeader(shard.termSet);
+      sources.push({ analysis: parsed.analysis, suggestPrefix: parsed.suggestPrefix, stream: () => termSetTerms(shard.termSet) });
+      continue;
     }
-    return {
+    sources.push({
       analysis: analysisOf(shard.dir),
       suggestPrefix: suggestPrefixRoutingOf(shard.dir),
       stream: () => indexTerms(shard.dir)
-    };
-  });
+    });
+  }
   const analysis = sources[0].analysis;
   const analysisKey = JSON.stringify(analysis);
   for (let index = 1; index < sources.length; index++) {
@@ -229,28 +406,40 @@ export async function writeTextRoutingIndex({ outDir, shards, segmentTerms = DEF
   const packWriter = createAppendOnlyPackWriter(resolve(routingDir, "packs"), packTargetBytes);
   const segments = [];
   let termCount = 0;
-  let batch = [];
+  const batch = [];
+  // At most `segmentTerms` entries are retained and reused after each flush.
+  const freeBatchEntries = [];
 
   function flushSegment() {
     if (!batch.length) return;
+    const firstTerm = batch[0].term;
     const encoded = encodeTextRoutingSegment(batch);
     const compressed = gzipSync(encoded, { level: 9 });
-    const entry = writePackedShard(packWriter, batch[0].term, compressed, { logicalLength: encoded.length });
-    segments.push({ key: batch[0].term, entry });
-    batch = [];
+    const entry = writePackedShard(packWriter, firstTerm, compressed, { logicalLength: encoded.length });
+    segments.push({ key: firstTerm, entry });
+    for (const batchEntry of batch) {
+      batchEntry.term = null;
+      batchEntry.shards.length = 0;
+      freeBatchEntries.push(batchEntry);
+    }
+    batch.length = 0;
   }
 
   let currentShards = null;
   const streamRecorder = (term, sources) => {
     currentShards = sources;
   };
-  const merged = mergeSortedStreams(sources.map(source => source.stream()), streamRecorder);
-  for (const term of merged) {
-    batch.push({ term, shards: currentShards.slice() });
+  const merged = mergeSortedAsyncStreams(sources.map(source => source.stream()), streamRecorder);
+  for await (const term of merged) {
+    const batchEntry = freeBatchEntries.pop() || { term: null, shards: [] };
+    batchEntry.term = term;
+    for (const shard of currentShards) batchEntry.shards.push(shard);
+    batch.push(batchEntry);
     termCount++;
     if (batch.length >= segmentTerms) flushSegment();
   }
   flushSegment();
+  freeBatchEntries.length = 0;
   finalizePackWriter(packWriter);
 
   const packTable = packWriter.packs.map(pack => pack.file);
