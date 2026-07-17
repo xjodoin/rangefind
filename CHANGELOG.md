@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4 — 2026-07-17
+
+### Fixed
+
+- **Byte-stable static hosting**: range-addressed packs and dense pointer
+  tables now use a `.bin.gz` suffix so GitHub Pages and similar static hosts
+  do not transparently gzip `.bin` responses and invalidate byte offsets.
+  Existing manifests and `.bin` indexes remain readable.
+
 ## 0.3.3 — 2026-07-17
 
 ### Added
