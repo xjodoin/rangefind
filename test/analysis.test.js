@@ -294,6 +294,17 @@ test("multilingual index is searchable end to end in every language", async (t) 
   await expectTopHit("русская литература", "ru1");
   await expectTopHit("東京タワー", "ja1");
 
+  // A repeated plan is admitted on its second use, and concurrent readers
+  // share the same in-flight resolution without changing result ordering.
+  const repeated = await Promise.all([
+    client.search({ q: "walking singer", size: 3 }),
+    client.search({ q: "walking singer", size: 3 })
+  ]);
+  assert.deepEqual(
+    repeated.map(response => response.results.map(result => result.id)),
+    [["en1"], ["en1"]]
+  );
+
   // Highlights carry analyzer-aware ranges (CJK bigram spans included).
   const highlighted = await client.search({ q: "東京", size: 1, highlight: true });
   assert.equal(highlighted.results[0].id, "ja1");

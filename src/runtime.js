@@ -412,6 +412,9 @@ export async function createSearch(options = {}) {
   const docValueStore = { _docValues: true };
   const maxPageSize = Math.max(1, Math.min(1000, Math.floor(Number(options.maxPageSize || 100))));
   const topKProofMaxK = Math.max(1, Math.min(1000, Math.floor(Number(options.topKProofMaxK || 100))));
+  const queryPlanCacheSize = Math.max(0, Math.min(1024, Math.floor(Number(options.queryPlanCacheSize ?? 128)) || 0));
+  const queryPlanCache = new Map();
+  const seenQueryPlans = new Set();
   const filterBitmapCache = new Map();
   const numberFields = new Map((manifest.numbers || []).map(field => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map(field => [field.name, field]));
@@ -2704,7 +2707,7 @@ export async function createSearch(options = {}) {
   // directory, the alternate-language plan with the most indexed stems takes
   // over. Directory shard loads are cached, so the winning plan's lookups
   // are reused by the search itself.
-  async function resolveQueryPlan(q) {
+  async function resolveQueryPlanUncached(q) {
     const plan = analyzer.queryPlan(q);
     if (!plan.altPlans?.length || !plan.baseTerms.length) return plan;
     async function presentCount(baseTerms) {
@@ -2724,6 +2727,36 @@ export async function createSearch(options = {}) {
       }
     }
     return best;
+  }
+
+  function resolveQueryPlan(q) {
+    // Query plans are immutable for the lifetime of an engine. Reusing the
+    // resolved promise avoids repeating multilingual tokenization and term
+    // presence sets for common queries, while the entry cap and query-length
+    // guard keep retained memory independent of total query traffic.
+    if (!queryPlanCacheSize || q.length > 64) return resolveQueryPlanUncached(q);
+    const cached = queryPlanCache.get(q);
+    if (cached) {
+      queryPlanCache.delete(q);
+      queryPlanCache.set(q, cached);
+      return cached;
+    }
+    if (!seenQueryPlans.delete(q)) {
+      seenQueryPlans.add(q);
+      if (seenQueryPlans.size > queryPlanCacheSize) {
+        seenQueryPlans.delete(seenQueryPlans.values().next().value);
+      }
+      return resolveQueryPlanUncached(q);
+    }
+    const pending = resolveQueryPlanUncached(q).catch(error => {
+      if (queryPlanCache.get(q) === pending) queryPlanCache.delete(q);
+      throw error;
+    });
+    queryPlanCache.set(q, pending);
+    if (queryPlanCache.size > queryPlanCacheSize) {
+      queryPlanCache.delete(queryPlanCache.keys().next().value);
+    }
+    return pending;
   }
 
   function collectEligibleScores(scores, hits, minShouldMatch) {
