@@ -4,8 +4,28 @@
 var CATEGORY_INTENTS = /* @__PURE__ */ new Map([
   ["pharmacie", { query: "pharmacy", label: "Pharmacie" }],
   ["pharmacy", { query: "pharmacy", label: "Pharmacy" }],
-  ["pharmacies", { query: "pharmacy", label: "Pharmacies" }]
+  ["pharmacies", { query: "pharmacy", label: "Pharmacies" }],
+  ["cafe", { query: "cafe", label: "Cafe" }],
+  ["cafes", { query: "cafe", label: "Cafes" }],
+  ["coffee", { query: "cafe", label: "Coffee" }],
+  ["restaurant", { query: "restaurant", label: "Restaurant" }],
+  ["restaurants", { query: "restaurant", label: "Restaurants" }],
+  ["hotel", { query: "hotel", label: "Hotel" }],
+  ["hotels", { query: "hotel", label: "Hotels" }],
+  ["hospital", { query: "hospital", label: "Hospital" }],
+  ["hospitals", { query: "hospital", label: "Hospitals" }],
+  ["hopital", { query: "hospital", label: "Hopital" }],
+  ["hopitaux", { query: "hospital", label: "Hopitaux" }],
+  ["park", { query: "park", label: "Park" }],
+  ["parks", { query: "park", label: "Parks" }],
+  ["parc", { query: "park", label: "Parc" }],
+  ["parcs", { query: "park", label: "Parcs" }],
+  ["supermarket", { query: "supermarket", label: "Supermarket" }],
+  ["supermarkets", { query: "supermarket", label: "Supermarkets" }],
+  ["epicerie", { query: "supermarket", label: "Epicerie" }],
+  ["epiceries", { query: "supermarket", label: "Epiceries" }]
 ]);
+var LOCALITY_CONNECTORS = /* @__PURE__ */ new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
 var LOCALITY_CACHE = /* @__PURE__ */ new WeakMap();
 var CANADIAN_POSTAL_CODE = /^\s*([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\s*$/iu;
 var LOCALITY_TYPES = /* @__PURE__ */ new Set(["city", "town", "municipality", "village", "hamlet"]);
@@ -39,9 +59,12 @@ function parseOsmQueryIntent(value) {
   if (tokens.length < 2) return null;
   const first = CATEGORY_INTENTS.get(fold(tokens[0]));
   if (first) {
+    const localityTokens = tokens.slice(1);
+    while (LOCALITY_CONNECTORS.has(fold(localityTokens[0]))) localityTokens.shift();
+    if (!localityTokens.length) return null;
     return {
       category: first,
-      locality: tokens.slice(1).join(" "),
+      locality: localityTokens.join(" "),
       order: "category-locality"
     };
   }

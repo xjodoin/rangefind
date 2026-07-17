@@ -69,35 +69,37 @@
       <section class="search-area" aria-label="Search controls">
         <label class="visually-hidden" for="queryInput">Search a place or address</label>
         <div class="search-box">
-          <span class="search-icon" aria-hidden="true"></span>
           <input
             id="queryInput"
             type="search"
-            placeholder="Try “Monaco” or an address"
+            placeholder="Place, address, or “pharmacy in Birmingham”"
             autocomplete="off"
             spellcheck="false"
+            enterkeyhint="search"
             aria-autocomplete="list"
             aria-controls="suggestList"
             aria-expanded="false"
             autofocus>
-          <kbd aria-hidden="true">/</kbd>
+          <button id="searchButton" class="search-submit" type="button" aria-label="Search">
+            <span class="search-submit__icon" aria-hidden="true"></span>
+          </button>
           <ul id="suggestList" role="listbox" hidden></ul>
         </div>
 
         <div class="query-examples" aria-label="Example searches">
-          <span>Try</span>
+          <span>Examples</span>
           <button type="button" data-query="Monaco">Monaco</button>
           <button type="button" data-query="Monte Carlo">Monte Carlo</button>
-          <button type="button" data-query="pharmacy">pharmacy</button>
+          <button type="button" data-query="pharmacy in Birmingham">pharmacy in Birmingham</button>
         </div>
 
         <div class="search-toolbar">
           <label class="area-toggle">
-            <input id="areaToggle" type="checkbox" checked>
+            <input id="areaToggle" type="checkbox">
             <span class="switch" aria-hidden="true"><i></i></span>
             <span>
-              <b>Search this view</b>
-              <small>Updates when the map moves</small>
+              <b>Limit to this map area</b>
+              <small>Best for nearby shops and places</small>
             </span>
           </label>
           <button id="clearButton" class="clear-button" type="button" hidden>Clear</button>
@@ -105,11 +107,11 @@
       </section>
 
       <section class="results" aria-label="Search results">
-        <p id="statusLine" class="status-line" data-state="loading" aria-live="polite">Loading manifest…</p>
+        <p id="statusLine" class="status-line" data-state="loading" aria-live="polite">Loading the place index…</p>
         <div id="emptyState" class="empty-state">
           <span class="empty-state__graphic" aria-hidden="true"><i></i><i></i><i></i></span>
-          <strong id="emptyTitle">Warming up the atlas</strong>
-          <p id="emptyCopy">Rangefind is reading a tiny manifest, then only the byte ranges this map needs.</p>
+          <strong id="emptyTitle">Find a place</strong>
+          <p id="emptyCopy">Search by name or address, or try a category with a place such as “pharmacy in Birmingham”.</p>
         </div>
         <ol id="resultList" hidden></ol>
       </section>

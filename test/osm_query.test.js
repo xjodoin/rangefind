@@ -6,7 +6,7 @@ import {
   suggestOsmQuery
 } from "../src/integrations/osm/query.js";
 
-test("OSM query intents recognize pharmacy and locality in either order", () => {
+test("OSM query intents recognize common categories and natural locality phrasing", () => {
   assert.deepEqual(parseOsmQueryIntent("Pharmacie Rosemère"), {
     category: { query: "pharmacy", label: "Pharmacie" },
     locality: "Rosemère",
@@ -17,8 +17,27 @@ test("OSM query intents recognize pharmacy and locality in either order", () => 
     locality: "Rosemère",
     order: "locality-category"
   });
+  assert.deepEqual(parseOsmQueryIntent("coffee in Montreal"), {
+    category: { query: "cafe", label: "Coffee" },
+    locality: "Montreal",
+    order: "category-locality"
+  });
+  assert.deepEqual(parseOsmQueryIntent("cafés près de Monaco"), {
+    category: { query: "cafe", label: "Cafes" },
+    locality: "Monaco",
+    order: "category-locality"
+  });
+  assert.deepEqual(parseOsmQueryIntent("Monaco restaurants"), {
+    category: { query: "restaurant", label: "Restaurants" },
+    locality: "Monaco",
+    order: "locality-category"
+  });
   assert.equal(parseOsmQueryIntent("Pharmacie"), null);
-  assert.equal(parseOsmQueryIntent("Café Rosemère"), null);
+  assert.deepEqual(parseOsmQueryIntent("Café Rosemère"), {
+    category: { query: "cafe", label: "Cafe" },
+    locality: "Rosemère",
+    order: "category-locality"
+  });
 });
 
 test("OSM autocomplete collapses civic matches into street-locality suggestions", async () => {

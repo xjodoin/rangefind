@@ -2,6 +2,7 @@ import { createSearch } from "./runtime.browser.js";
 import { searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
 
 const queryInput = document.querySelector("#queryInput");
+const searchButton = document.querySelector("#searchButton");
 const suggestList = document.querySelector("#suggestList");
 const resultList = document.querySelector("#resultList");
 const statusLine = document.querySelector("#statusLine");
@@ -62,8 +63,11 @@ const map = new maplibregl.Map({
       }
     }]
   },
-  center: [-73.6, 45.53],
-  zoom: 12
+  // Birmingham is already covered by the rolling public index and gives the
+  // first visit a useful, searchable map instead of the midpoint of a global
+  // bounding box.
+  center: [-86.8025, 33.5207],
+  zoom: 11
 });
 
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
@@ -97,14 +101,48 @@ function formatDate(value) {
   return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" }).format(date);
 }
 
+function humanize(value) {
+  return String(value || "")
+    .replaceAll(/[-_]+/gu, " ")
+    .replaceAll(/\b\p{L}/gu, letter => letter.toLocaleUpperCase());
+}
+
+function resultLocation(item) {
+  const name = item.name || item.title || item.id;
+  if (item.address && item.address !== name) return item.address;
+  const parts = [item.suburb, item.city, item.district, item.state, item.postcode, item.country]
+    .map(value => String(value || "").trim())
+    .filter((value, index, values) => value && values.indexOf(value) === index);
+  return parts.join(", ") || humanize(item.shard);
+}
+
+function resultLimit() {
+  return window.matchMedia("(max-width: 720px)").matches ? 12 : 18;
+}
+
+function resultFitPadding() {
+  const compact = window.matchMedia("(max-width: 720px)").matches;
+  const panelBox = searchPanel.getBoundingClientRect();
+  if (compact) {
+    return {
+      top: 56,
+      right: 32,
+      bottom: Math.min(panelBox.height + 24, window.innerHeight - 150),
+      left: 32
+    };
+  }
+  return { top: 70, right: 70, bottom: 70, left: panelBox.width + 44 };
+}
+
 function viewportBox() {
   const bounds = map.getBounds();
-  return {
+  const box = {
     minLat: bounds.getSouth(),
     maxLat: bounds.getNorth(),
     minLon: bounds.getWest(),
     maxLon: bounds.getEast()
   };
+  return Object.values(box).every(Number.isFinite) ? box : null;
 }
 
 function looksLikeAddress(value) {
@@ -117,6 +155,7 @@ function looksLikeAddress(value) {
 function setStatus(text, state = "ready") {
   statusLine.textContent = text;
   statusLine.dataset.state = state;
+  searchButton.dataset.state = state;
 }
 
 function showEmpty(title, copy) {
@@ -145,25 +184,27 @@ function clearMarkers() {
 }
 
 function markerFor(item, index) {
+  const title = item.name || item.title || item.id;
+  const location = resultLocation(item);
+  const accessibleLabel = location ? `${title}, ${location}` : title;
   const element = document.createElement("button");
   element.className = "result-marker";
   element.type = "button";
-  element.setAttribute("aria-label", item.name || item.title || item.id);
+  element.setAttribute("aria-label", accessibleLabel);
   const label = document.createElement("span");
   label.textContent = index + 1;
   element.append(label);
-  element.addEventListener(
-    "click",
-    () => setPanelCollapsed(true, item.name || item.title || item.id),
-    { capture: true }
-  );
   const marker = new maplibregl.Marker({ element, anchor: "bottom" })
     .setLngLat([item.lon, item.lat])
-    .setPopup(new maplibregl.Popup({ closeButton: false, offset: 18 }).setText(item.name || item.title || item.id))
+    .setPopup(new maplibregl.Popup({ closeButton: false, offset: 18 }).setText(accessibleLabel))
     .addTo(map);
+  element.addEventListener("click", () => {
+    mapHudText.textContent = `Selected ${title}`;
+    setPanelCollapsed(true, title);
+  });
   // MapLibre supplies a generic marker label during construction; restore the
   // real place name once the marker is mounted.
-  element.setAttribute("aria-label", item.name || item.title || item.id);
+  element.setAttribute("aria-label", accessibleLabel);
   return { marker, element };
 }
 
@@ -171,8 +212,9 @@ function renderResults(results, { fit = false, query = "" } = {}) {
   clearMarkers();
   resultList.replaceChildren();
   const bounds = new maplibregl.LngLatBounds();
+  const visibleResults = results.slice(0, resultLimit());
 
-  for (const [index, item] of results.entries()) {
+  for (const [index, item] of visibleResults.entries()) {
     const hasPoint = Number.isFinite(item.lat) && Number.isFinite(item.lon);
     const markerEntry = hasPoint ? markerFor(item, index) : null;
     if (markerEntry) {
@@ -184,7 +226,9 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "result-card";
-    button.setAttribute("aria-label", `${item.name || item.title || item.id}${item.address ? `, ${item.address}` : ""}`);
+    const title = item.name || item.title || item.id;
+    const location = resultLocation(item);
+    button.setAttribute("aria-label", `${title}${location ? `, ${location}` : ""}`);
 
     const number = document.createElement("span");
     number.className = "result-card__number";
@@ -194,13 +238,13 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     body.className = "result-card__body";
     const name = document.createElement("span");
     name.className = "name";
-    name.textContent = item.name || item.title || item.id;
+    name.textContent = title;
     body.append(name);
 
-    if (item.address && item.address !== (item.name || item.title)) {
+    if (location) {
       const address = document.createElement("span");
       address.className = "address";
-      address.textContent = item.address;
+      address.textContent = location;
       body.append(address);
     }
 
@@ -233,7 +277,8 @@ function renderResults(results, { fit = false, query = "" } = {}) {
         map.flyTo({ center: [item.lon, item.lat], zoom: Math.max(map.getZoom(), 15), essential: true });
         markerEntry.marker.togglePopup();
       }
-      setPanelCollapsed(true, item.name || item.title || item.id);
+      mapHudText.textContent = `Selected ${title}`;
+      setPanelCollapsed(true, title);
     };
     button.addEventListener("click", flyToResult);
     button.addEventListener("mouseenter", () => markerEntry?.element.classList.add("active"));
@@ -244,11 +289,11 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     resultList.append(listItem);
   }
 
-  if (!results.length) {
+  if (!visibleResults.length) {
     showEmpty(
       query ? "No signal found" : "This view is quiet",
       query
-        ? `No indexed place matched “${query}”. Try a broader name or move the map.`
+        ? `No indexed place matched “${query}”. Try another spelling or a published region.`
         : "Move or zoom the map to scan another published region."
     );
     return;
@@ -256,7 +301,9 @@ function renderResults(results, { fit = false, query = "" } = {}) {
 
   emptyState.hidden = true;
   resultList.hidden = false;
-  if (fit && !bounds.isEmpty()) map.fitBounds(bounds, { padding: 90, maxZoom: 15, duration: 700 });
+  if (fit && !bounds.isEmpty()) {
+    map.fitBounds(bounds, { padding: resultFitPadding(), maxZoom: 15, duration: 700 });
+  }
 }
 
 async function runSearch({ fit = false } = {}) {
@@ -268,15 +315,22 @@ async function runSearch({ fit = false } = {}) {
   const useArea = areaToggle.checked && !addressLookup;
   if (addressLookup && areaWasChecked) areaToggle.checked = false;
   clearButton.hidden = !q;
+  searchPanel.classList.toggle("has-query", Boolean(q));
 
-  const params = { q, size: 30 };
-  if (useArea) params.geo = { box: viewportBox() };
+  const params = { q, size: resultLimit() };
+  const areaBox = useArea ? viewportBox() : null;
+  if (useArea && !areaBox) {
+    setStatus("Waiting for the map to settle…", "ready");
+    mapHudText.textContent = "Move or zoom the map, then search this area";
+    return;
+  }
+  if (areaBox) params.geo = { box: areaBox };
   if (!q && !useArea) {
     resultList.replaceChildren();
     clearMarkers();
-    setStatus("Viewport search paused", "ready");
-    mapHudText.textContent = "Search this view is off";
-    showEmpty("Where should we look?", "Search for a place or turn on Search this view to browse the map.");
+    setStatus("Ready to search", "ready");
+    mapHudText.textContent = "Search anywhere in the published index";
+    showEmpty("Find a place", "Search by name or address, or try a category with a place such as “pharmacy in Birmingham”.");
     return;
   }
 
@@ -298,12 +352,14 @@ async function runSearch({ fit = false } = {}) {
     const queried = response.stats?.shardsQueried;
     const available = response.stats?.shards || engine.shards?.length;
     const shardText = queried != null
-      ? ` // ${formatNumber(queried)} OF ${formatNumber(available)} SHARDS`
+      ? ` · ${formatNumber(queried)} of ${formatNumber(available)} shards`
       : "";
-    setStatus(`${formatNumber(response.total)}${response.approximate ? "+" : ""} MATCHES // ${ms} MS${shardText}`);
-    mapHudText.textContent = queried != null
-      ? `${formatNumber(queried)} ${queried === 1 ? "shard" : "shards"} touched · ${formatNumber(response.results.length)} shown`
-      : `${formatNumber(response.results.length)} results plotted`;
+    const shown = Math.min(response.results.length, resultLimit());
+    const timing = `${(ms / 1000).toFixed(1)}s${shardText}`;
+    setStatus(response.total
+      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}`
+      : `No matches · ${timing}`);
+    mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${useArea ? "this map area" : "everywhere"}`;
   } catch (error) {
     if (token !== searchToken) return;
     const message = error?.message || "Search failed";
@@ -455,10 +511,15 @@ queryInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
 clearButton.addEventListener("click", () => {
   queryInput.value = "";
   clearButton.hidden = true;
-  areaToggle.checked = true;
+  areaToggle.checked = false;
   cancelSuggestions();
   queryInput.focus();
   runSearch();
+});
+
+searchButton.addEventListener("click", () => {
+  cancelSuggestions();
+  runSearch({ fit: !areaToggle.checked });
 });
 
 panelToggle.addEventListener("click", () => {
@@ -501,7 +562,6 @@ async function boot() {
   loadIndexStatus();
   engine = await createSearch({ baseUrl: OSM_INDEX_BASE_URL });
   const total = engine.manifest.total || 0;
-  const geoField = engine.manifest.geo?.fields?.location;
   const shardCount = engine.shards?.length || 1;
   const builtAt = formatDate(engine.manifest.built_at);
   placeMetric.textContent = formatCompact(total);
@@ -509,13 +569,6 @@ async function boot() {
   regionMetric.textContent = formatNumber(shardCount);
   indexMeta.textContent = `${builtAt ? `Manifest ${builtAt}. ` : ""}Queries run entirely in this browser over immutable HTTP byte ranges.`;
 
-  if (geoField?.bbox) {
-    const { minLatE7, maxLatE7, minLonE7, maxLonE7 } = geoField.bbox;
-    map.fitBounds(
-      [[minLonE7 / 1e7, minLatE7 / 1e7], [maxLonE7 / 1e7, maxLatE7 / 1e7]],
-      { padding: 70, maxZoom: 11, duration: 0 }
-    );
-  }
   await runSearch();
 }
 
