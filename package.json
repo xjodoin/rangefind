@@ -1,6 +1,6 @@
 {
   "name": "rangefind",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",

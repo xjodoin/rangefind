@@ -4309,12 +4309,13 @@ function traceLabelBucket(label) {
   if (value.startsWith("filter bitmap")) return "filterBitmaps";
   return "object";
 }
-function recordTraceSpan(trace, name, ms) {
+function recordTraceSpan(trace, name, ms, bytes = 0) {
   if (!trace || !Number.isFinite(ms)) return;
-  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0 };
+  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0, bytes: 0 };
   current.count++;
   current.totalMs += ms;
   current.maxMs = Math.max(current.maxMs, ms);
+  if (Number.isFinite(bytes) && bytes > 0) current.bytes += bytes;
   trace.spans.set(name, current);
 }
 async function traceSpan(name, fn) {
@@ -4325,6 +4326,19 @@ async function traceSpan(name, fn) {
     return await fn();
   } finally {
     recordTraceSpan(trace, name, nowMs() - started);
+  }
+}
+async function traceFetch(bucket, fn) {
+  const trace = activeRuntimeTrace;
+  if (!trace) return fn();
+  const started = nowMs();
+  let response;
+  try {
+    response = await fn();
+    return response;
+  } finally {
+    const bytes = Number(response?.headers?.get?.("content-length") || 0);
+    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, bytes);
   }
 }
 function traceSpanSync(name, fn) {
@@ -4348,14 +4362,17 @@ async function withRuntimeTrace(trace, fn) {
 }
 function finalizeRuntimeTrace(trace) {
   if (!trace) return null;
+  const spans = [...trace.spans.values()].map((span) => ({
+    name: span.name,
+    count: span.count,
+    totalMs: span.totalMs,
+    maxMs: span.maxMs,
+    ...span.bytes > 0 ? { bytes: span.bytes } : {}
+  })).sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name));
   return {
     totalMs: nowMs() - trace.started,
-    spans: [...trace.spans.values()].map((span) => ({
-      name: span.name,
-      count: span.count,
-      totalMs: span.totalMs,
-      maxMs: span.maxMs
-    })).sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name))
+    totalBytes: spans.reduce((sum, span) => sum + Number(span.bytes || 0), 0),
+    spans
   };
 }
 var inflateImpl = null;
@@ -4379,13 +4396,13 @@ async function inflateGzip(responseOrBuffer) {
 var fetchImpl = (url, init) => fetch(url, init);
 async function fetchGzipArrayBuffer(url) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url));
+  const response = await traceFetch(bucket, () => fetchImpl(url));
   if (!response.ok) throw new Error(`Unable to fetch ${url}`);
   return traceSpan(`${bucket}.inflate`, () => inflateGzip(response));
 }
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceSpan(`${bucket}.fetch`, () => fetchImpl(url, {
+  const response = await traceFetch(bucket, () => fetchImpl(url, {
     headers: { Range: `bytes=${offset}-${offset + length - 1}` }
   }));
   if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
@@ -4419,14 +4436,15 @@ function facetCodeMatches(words, selected) {
 async function createSearch(options = {}) {
   const baseUrl = options.baseUrl || "./rangefind/";
   async function fetchJsonIfOk(path) {
-    const response = await fetchImpl(new URL(path, baseUrl));
+    const url = new URL(path, baseUrl);
+    const response = await traceFetch(traceBucketFromUrl(url), () => fetchImpl(url));
     return response.ok ? response.json() : null;
   }
   async function fetchManifestJsonIfOk(path) {
     if (!path) return null;
     if (!String(path).endsWith(".gz")) return fetchJsonIfOk(path);
     const url = new URL(path, baseUrl);
-    const response = await fetchImpl(url);
+    const response = await traceFetch(traceBucketFromUrl(url), () => fetchImpl(url));
     if (!response.ok) return null;
     const inflated = await traceSpan("manifest.inflate", () => inflateGzip(response));
     return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder4.decode(inflated)));
@@ -4495,6 +4513,9 @@ async function createSearch(options = {}) {
   const docValueStore = { _docValues: true };
   const maxPageSize = Math.max(1, Math.min(1e3, Math.floor(Number(options.maxPageSize || 100))));
   const topKProofMaxK = Math.max(1, Math.min(1e3, Math.floor(Number(options.topKProofMaxK || 100))));
+  const queryPlanCacheSize = Math.max(0, Math.min(1024, Math.floor(Number(options.queryPlanCacheSize ?? 128)) || 0));
+  const queryPlanCache = /* @__PURE__ */ new Map();
+  const seenQueryPlans = /* @__PURE__ */ new Set();
   const filterBitmapCache = /* @__PURE__ */ new Map();
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
@@ -5282,7 +5303,7 @@ async function createSearch(options = {}) {
     const key = segment.id || String(segment.ordinal);
     if (!segmentTermsCache.has(key)) {
       const path = segment.files?.terms?.path;
-      segmentTermsCache.set(key, path ? fetchImpl(new URL(path, baseUrl)).then((response) => {
+      segmentTermsCache.set(key, path ? traceFetch(traceBucketFromUrl(new URL(path, baseUrl)), () => fetchImpl(new URL(path, baseUrl))).then((response) => {
         if (!response.ok) throw new Error(`Unable to fetch ${path}`);
         return response.arrayBuffer();
       }).then((buffer) => traceSpanSync("segments.parseTerms", () => parseSegmentTerms(buffer))) : Promise.resolve(null));
@@ -6543,7 +6564,7 @@ async function createSearch(options = {}) {
     }
     return true;
   }
-  async function resolveQueryPlan(q) {
+  async function resolveQueryPlanUncached(q) {
     const plan = analyzer.queryPlan(q);
     if (!plan.altPlans?.length || !plan.baseTerms.length) return plan;
     async function presentCount(baseTerms) {
@@ -6563,6 +6584,31 @@ async function createSearch(options = {}) {
       }
     }
     return best;
+  }
+  function resolveQueryPlan(q) {
+    if (!queryPlanCacheSize || q.length > 64) return resolveQueryPlanUncached(q);
+    const cached = queryPlanCache.get(q);
+    if (cached) {
+      queryPlanCache.delete(q);
+      queryPlanCache.set(q, cached);
+      return cached;
+    }
+    if (!seenQueryPlans.delete(q)) {
+      seenQueryPlans.add(q);
+      if (seenQueryPlans.size > queryPlanCacheSize) {
+        seenQueryPlans.delete(seenQueryPlans.values().next().value);
+      }
+      return resolveQueryPlanUncached(q);
+    }
+    const pending = resolveQueryPlanUncached(q).catch((error) => {
+      if (queryPlanCache.get(q) === pending) queryPlanCache.delete(q);
+      throw error;
+    });
+    queryPlanCache.set(q, pending);
+    if (queryPlanCache.size > queryPlanCacheSize) {
+      queryPlanCache.delete(queryPlanCache.keys().next().value);
+    }
+    return pending;
   }
   function collectEligibleScores(scores, hits, minShouldMatch) {
     return [...scores.entries()].filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch)).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
@@ -11371,6 +11417,8 @@ function mergeFederatedFacets(responses) {
 }
 var SHARD_ROUTING_SLACK_RATIO = 1.05;
 var SHARD_ROUTING_SLACK_METERS = 1e4;
+var TEXT_ROUTING_PREFIX_MIN_LENGTH = 3;
+var TEXT_ROUTING_PREFIX_SEGMENT_LIMIT = 8;
 function shardRoutingBudget(meters) {
   return meters * SHARD_ROUTING_SLACK_RATIO + SHARD_ROUTING_SLACK_METERS;
 }
@@ -11414,7 +11462,11 @@ async function createShardedSearch(root, options, baseUrl) {
         ...options,
         baseUrl: new URL(shard.path || "./", baseUrl).href,
         manifestName,
-        maxPageSize: 1e3
+        maxPageSize: 1e3,
+        // The federated root owns one trace spanning every child. Giving each
+        // concurrent shard its own module-level trace would fragment or mix
+        // the receipt; child operations inherit the root's active trace.
+        trace: false
       });
     }
     return engines[index];
@@ -11510,6 +11562,41 @@ async function createShardedSearch(root, options, baseUrl) {
       }
       return indexes;
     }
+    async function shardIndexesForPrefix(prefix) {
+      const directoryRoot = await loadRoot();
+      if (!directoryRoot.pages?.length) return { indexes: [], complete: true, segments: 0 };
+      let pageIndex = floorDirectoryPageIndex(directoryRoot, prefix);
+      if (pageIndex < 0) pageIndex = 0;
+      const upper = `${prefix}\uFFFF`;
+      const selected = /* @__PURE__ */ new Set();
+      let segments = 0;
+      for (; pageIndex < directoryRoot.pages.length; pageIndex++) {
+        const pageSummary = directoryRoot.pages[pageIndex];
+        if (pageSummary.first > upper) break;
+        const page = await loadPage(pageSummary);
+        let keyIndex = floorSortedKeyIndex(page.keys, prefix);
+        if (keyIndex < 0) keyIndex = 0;
+        for (; keyIndex < page.keys.length; keyIndex++) {
+          const key = page.keys[keyIndex];
+          if (key > upper) return { indexes: [...selected], complete: true, segments };
+          if (segments >= TEXT_ROUTING_PREFIX_SEGMENT_LIMIT) {
+            return { indexes: [], complete: false, segments };
+          }
+          segments++;
+          const segment = await loadSegment(page.entries.get(key));
+          for (const [term, ordinals] of segment) {
+            if (term < prefix) continue;
+            if (term > upper) return { indexes: [...selected], complete: true, segments };
+            if (!term.startsWith(prefix)) continue;
+            for (const ordinal2 of ordinals) {
+              const index = shardIndexByOrdinal[ordinal2];
+              if (index >= 0) selected.add(index);
+            }
+          }
+        }
+      }
+      return { indexes: [...selected], complete: true, segments };
+    }
     async function selectShards(q) {
       const plan = routingAnalyzer().queryPlan(q);
       const plans = [plan, ...plan.altPlans || []];
@@ -11532,7 +11619,31 @@ async function createShardedSearch(root, options, baseUrl) {
       }
       return { selected, terms: uniqueTerms.size };
     }
-    return { selectShards };
+    async function selectSuggestShards(q) {
+      if (block.suggest_prefix !== true) return null;
+      const plan = routingAnalyzer().queryPlan(q);
+      const plans = [plan, ...plan.altPlans || []];
+      const prefixes = /* @__PURE__ */ new Set();
+      for (const item of plans) {
+        const prefix = item.baseTerms.at(-1) || "";
+        if (Array.from(prefix).length >= TEXT_ROUTING_PREFIX_MIN_LENGTH) prefixes.add(prefix);
+      }
+      if (!prefixes.size) return null;
+      const scans = await Promise.all([...prefixes].map((prefix) => shardIndexesForPrefix(prefix)));
+      const segments = scans.reduce((sum, scan) => sum + scan.segments, 0);
+      if (scans.some((scan) => !scan.complete)) {
+        return { fallback: "prefix-scan-limit", prefixes: prefixes.size, segments };
+      }
+      const matched = /* @__PURE__ */ new Set();
+      for (const scan of scans) for (const index of scan.indexes) matched.add(index);
+      return {
+        selected: /* @__PURE__ */ new Set([...alwaysSelected, ...matched]),
+        matched: matched.size,
+        prefixes: prefixes.size,
+        segments
+      };
+    }
+    return { selectShards, selectSuggestShards };
   }
   async function withTextRoute(route, q) {
     if (!textRouting || !q) return { route, stats: null };
@@ -11547,6 +11658,37 @@ async function createShardedSearch(root, options, baseUrl) {
     const kept = route.expanding ? narrowed.expanding.length : narrowed.selected.length;
     if (!kept) return { route, stats: { terms: selection.terms, fallback: "no-shard-support" } };
     return { route: narrowed, stats: { terms: selection.terms, selected: kept } };
+  }
+  async function withSuggestRoute(params, q) {
+    const candidates = candidateShards(params);
+    if (!textRouting || !q) return { shards: candidates, stats: null };
+    let selection;
+    try {
+      selection = await textRouting.selectSuggestShards(q);
+    } catch {
+      return { shards: candidates, stats: { fallback: "error" } };
+    }
+    if (!selection) return { shards: candidates, stats: null };
+    if (selection.fallback) return { shards: candidates, stats: selection };
+    const narrowed = candidates.filter((shard) => selection.selected.has(shard.index));
+    if (!selection.matched || !narrowed.length) {
+      return {
+        shards: candidates,
+        stats: {
+          prefixes: selection.prefixes,
+          segments: selection.segments,
+          fallback: "no-shard-support"
+        }
+      };
+    }
+    return {
+      shards: narrowed,
+      stats: {
+        prefixes: selection.prefixes,
+        segments: selection.segments,
+        selected: narrowed.length
+      }
+    };
   }
   function routeShards(geo, params) {
     const candidates = candidateShards(params);
@@ -11631,7 +11773,7 @@ async function createShardedSearch(root, options, baseUrl) {
       }
     };
   }
-  async function search(params = {}) {
+  async function executeShardedSearch(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
@@ -11707,6 +11849,21 @@ async function createShardedSearch(root, options, baseUrl) {
       response.stats.postalCodeNormalized = true;
     }
     return response;
+  }
+  async function search(params = {}) {
+    const trace = params.trace || options.trace ? createRuntimeTrace() : null;
+    if (!trace) return executeShardedSearch(params);
+    const response = await withRuntimeTrace(trace, () => traceSpan(
+      "shards.searchTotal",
+      () => executeShardedSearch({ ...params, trace: false })
+    ));
+    return {
+      ...response,
+      stats: {
+        ...response.stats || {},
+        trace: finalizeRuntimeTrace(trace)
+      }
+    };
   }
   async function hybridSearch(params) {
     const q = String(params.q || "").trim();
@@ -11804,19 +11961,25 @@ async function createShardedSearch(root, options, baseUrl) {
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const responses = await Promise.all(candidateShards(activeParams).map(async (shard) => {
+    const routed = await withSuggestRoute(activeParams, normalizedQuery.trim());
+    const responses = await Promise.all(routed.shards.map(async (shard) => {
       const engine = await engineAt(shard.index);
-      return engine.suggest({ ...activeParams, shards: void 0 });
+      return { shard, response: await engine.suggest({ ...activeParams, shards: void 0 }) };
     }));
     const merged = /* @__PURE__ */ new Map();
-    for (const response of responses) {
+    for (const { shard, response } of responses) {
       for (const item of response.suggestions) {
         const existing = merged.get(item.text);
         if (existing) {
           existing.count += item.count;
-          existing.weight = Math.max(existing.weight, item.weight);
+          if (item.weight > existing.weight) {
+            existing.weight = item.weight;
+            existing.shards = [shard.id];
+          } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
+            existing.shards.push(shard.id);
+          }
         } else {
-          merged.set(item.text, { ...item });
+          merged.set(item.text, { ...item, shards: [shard.id] });
         }
       }
     }
@@ -11827,6 +11990,8 @@ async function createShardedSearch(root, options, baseUrl) {
       ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
       stats: {
         shards: shards.length,
+        shardsQueried: routed.shards.length,
+        ...routed.stats ? { textRouting: routed.stats } : {},
         ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
       }
     };

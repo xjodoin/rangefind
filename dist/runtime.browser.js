@@ -4518,6 +4518,9 @@ async function createSearch(options = {}) {
   const docValueStore = { _docValues: true };
   const maxPageSize = Math.max(1, Math.min(1e3, Math.floor(Number(options.maxPageSize || 100))));
   const topKProofMaxK = Math.max(1, Math.min(1e3, Math.floor(Number(options.topKProofMaxK || 100))));
+  const queryPlanCacheSize = Math.max(0, Math.min(1024, Math.floor(Number(options.queryPlanCacheSize ?? 128)) || 0));
+  const queryPlanCache = /* @__PURE__ */ new Map();
+  const seenQueryPlans = /* @__PURE__ */ new Set();
   const filterBitmapCache = /* @__PURE__ */ new Map();
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
@@ -6566,7 +6569,7 @@ async function createSearch(options = {}) {
     }
     return true;
   }
-  async function resolveQueryPlan(q) {
+  async function resolveQueryPlanUncached(q) {
     const plan = analyzer.queryPlan(q);
     if (!plan.altPlans?.length || !plan.baseTerms.length) return plan;
     async function presentCount(baseTerms) {
@@ -6586,6 +6589,31 @@ async function createSearch(options = {}) {
       }
     }
     return best;
+  }
+  function resolveQueryPlan(q) {
+    if (!queryPlanCacheSize || q.length > 64) return resolveQueryPlanUncached(q);
+    const cached = queryPlanCache.get(q);
+    if (cached) {
+      queryPlanCache.delete(q);
+      queryPlanCache.set(q, cached);
+      return cached;
+    }
+    if (!seenQueryPlans.delete(q)) {
+      seenQueryPlans.add(q);
+      if (seenQueryPlans.size > queryPlanCacheSize) {
+        seenQueryPlans.delete(seenQueryPlans.values().next().value);
+      }
+      return resolveQueryPlanUncached(q);
+    }
+    const pending = resolveQueryPlanUncached(q).catch((error) => {
+      if (queryPlanCache.get(q) === pending) queryPlanCache.delete(q);
+      throw error;
+    });
+    queryPlanCache.set(q, pending);
+    if (queryPlanCache.size > queryPlanCacheSize) {
+      queryPlanCache.delete(queryPlanCache.keys().next().value);
+    }
+    return pending;
   }
   function collectEligibleScores(scores, hits, minShouldMatch) {
     return [...scores.entries()].filter(([doc]) => (hits.get(doc) || 0) >= Math.max(1, minShouldMatch)).sort((a, b) => b[1] - a[1] || a[0] - b[0]);

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.3 — 2026-07-17
+
+### Added
+
+- **Prefix-aware sharded routing**: root text routing carries prefix matches
+  into autocomplete and propagates shard hints through OSM locality search,
+  avoiding unnecessary shard fan-out while preserving fail-open behavior.
+- **OSM discovery diagnostics**: the map demo exposes query trace receipts and
+  discovery-orbit status alongside improved geo intent parsing and navigation.
+
+### Changed
+
+- **Bounded routing finalization**: gzipped shard term sets are streamed and
+  merged through a min-heap with bounded reusable buffers instead of eagerly
+  inflating every shard vocabulary into memory. Large routing rebuilds now
+  finalize without making heap use grow with the combined term count.
+- **Recurring query plans**: short plans are admitted to a 128-entry LRU only
+  after their second use, sharing in-flight multilingual analysis between
+  concurrent searches. A 30,000-document benchmark improved 1,000 recurring
+  searches by 16% (57.4 ms to 48.2 ms) while cold result-bearing queries stayed
+  flat; long and one-off queries do not retain full plans.
+- **Builder scoring metadata**: stable `alwaysIndexFields` metadata is reused
+  across document analysis instead of rebuilding a set per field. OSM-shaped
+  analysis benchmarks reduced lookup time and retained heap without changing
+  full-build performance.
+
 ## 0.3.2 — 2026-07-16
 
 ### Added
