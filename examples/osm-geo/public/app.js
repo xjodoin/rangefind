@@ -28,6 +28,7 @@ const collapsedSelection = document.querySelector("#collapsedSelection");
 const OSM_INDEX_BASE_URL = "https://osm.rangefind.dev/";
 const SUGGEST_MIN_CHARACTERS = 3;
 const SUGGEST_DEBOUNCE_MS = 180;
+const SUGGEST_CACHE_LIMIT = 32;
 
 let engine;
 let markers = [];
@@ -38,6 +39,11 @@ let searchToken = 0;
 let activeSuggestion = -1;
 let suggestionsSuppressed = false;
 let suppressedQuery = "";
+let selectedSuggestionHint = null;
+let visibleSuggestions = [];
+let suggestInFlight = false;
+let suggestQueued = false;
+const suggestionCache = new Map();
 
 const CANADIAN_POSTAL_CODE = /\b[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\b/iu;
 
@@ -320,6 +326,10 @@ async function runSearch({ fit = false } = {}) {
   searchPanel.classList.toggle("has-query", Boolean(q));
 
   const params = { q, size: resultLimit() };
+  const hintedShards = selectedSuggestionHint?.query === q
+    ? selectedSuggestionHint.shards
+    : [];
+  if (hintedShards?.length) params.shards = hintedShards;
   const areaBox = useArea ? viewportBox() : null;
   if (useArea && !areaBox) {
     setStatus("Waiting for the map to settle…", "ready");
@@ -356,11 +366,12 @@ async function runSearch({ fit = false } = {}) {
     const shardText = queried != null
       ? ` · ${formatNumber(queried)} of ${formatNumber(available)} shards`
       : "";
+    const directText = hintedShards?.length ? " · direct suggestion route" : "";
     const shown = Math.min(response.results.length, resultLimit());
     const timing = `${(ms / 1000).toFixed(1)}s${shardText}`;
     setStatus(response.total
-      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}`
-      : `No matches · ${timing}`);
+      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}`
+      : `No matches · ${timing}${directText}`);
     mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${useArea ? "this map area" : "everywhere"}`;
   } catch (error) {
     if (token !== searchToken) return;
@@ -374,6 +385,7 @@ async function runSearch({ fit = false } = {}) {
 function hideSuggestions() {
   suggestList.hidden = true;
   suggestList.replaceChildren();
+  visibleSuggestions = [];
   activeSuggestion = -1;
   queryInput.setAttribute("aria-expanded", "false");
   queryInput.removeAttribute("aria-activedescendant");
@@ -394,17 +406,40 @@ function setActiveSuggestion(index) {
   }
 }
 
-function chooseSuggestion(value) {
-  queryInput.value = value;
+function chooseSuggestion(suggestion) {
+  const item = typeof suggestion === "string" ? { text: suggestion } : suggestion;
+  queryInput.value = item.text;
+  selectedSuggestionHint = item.shards?.length
+    ? { query: item.text.trim(), shards: [...item.shards] }
+    : null;
   clearButton.hidden = false;
   hideSuggestions();
   areaToggle.checked = false;
   runSearch({ fit: true });
 }
 
+function adoptExactSuggestionHint() {
+  const query = queryInput.value.trim();
+  if (!query || selectedSuggestionHint?.query === query) return;
+  const exact = visibleSuggestions.find(item => (
+    item.shards?.length
+    && item.text.localeCompare(query, undefined, { sensitivity: "base" }) === 0
+  ));
+  if (exact) selectedSuggestionHint = { query, shards: [...exact.shards] };
+}
+
+function suggestionRegionLabel(shards) {
+  const labels = (shards || []).map(shard => String(shard)
+    .replaceAll("-", " ")
+    .replace(/\b\p{L}/gu, letter => letter.toLocaleUpperCase()));
+  if (labels.length <= 2) return labels.join(" + ");
+  return `${labels.length} regions`;
+}
+
 function cancelSuggestions() {
   clearTimeout(suggestTimer);
   suggestToken++;
+  suggestQueued = false;
   suggestionsSuppressed = true;
   suppressedQuery = queryInput.value;
   hideSuggestions();
@@ -417,39 +452,69 @@ async function showSuggestions() {
     hideSuggestions();
     return;
   }
+  const cacheKey = q.toLocaleLowerCase();
+  const cached = suggestionCache.get(cacheKey);
+  if (cached) {
+    suggestionCache.delete(cacheKey);
+    suggestionCache.set(cacheKey, cached);
+    renderSuggestions(cached);
+    return;
+  }
+  if (suggestInFlight) {
+    suggestQueued = true;
+    return;
+  }
+  suggestInFlight = true;
   try {
     const response = await suggestOsmQuery(engine, { q, size: 8 });
     if (token !== suggestToken || suggestionsSuppressed) return;
-    if (!response.suggestions.length) {
-      hideSuggestions();
-      return;
+    suggestionCache.set(cacheKey, response);
+    if (suggestionCache.size > SUGGEST_CACHE_LIMIT) {
+      suggestionCache.delete(suggestionCache.keys().next().value);
     }
-    suggestList.replaceChildren(...response.suggestions.map((item, index) => {
-      const option = document.createElement("li");
-      option.id = `suggestion-${index}`;
-      option.setAttribute("role", "option");
-      option.setAttribute("aria-selected", "false");
-      const text = document.createElement("span");
-      text.textContent = item.text;
-      const count = document.createElement("span");
-      count.className = "count";
-      count.textContent = item.type === "street"
-        ? "street"
-        : item.interpolated
-          ? "interpolated"
-          : item.count > 1 ? `×${formatNumber(item.count)}` : "place";
-      option.append(text, count);
-      option.addEventListener("pointerdown", event => {
-        event.preventDefault();
-        chooseSuggestion(item.text);
-      });
-      return option;
-    }));
-    suggestList.hidden = false;
-    queryInput.setAttribute("aria-expanded", "true");
+    renderSuggestions(response);
   } catch {
-    hideSuggestions();
+    if (token === suggestToken) hideSuggestions();
+  } finally {
+    suggestInFlight = false;
+    if (suggestQueued && !suggestionsSuppressed) {
+      suggestQueued = false;
+      queueMicrotask(showSuggestions);
+    }
   }
+}
+
+function renderSuggestions(response) {
+  if (!response.suggestions.length) {
+    hideSuggestions();
+    return;
+  }
+  visibleSuggestions = response.suggestions;
+  suggestList.replaceChildren(...response.suggestions.map((item, index) => {
+    const option = document.createElement("li");
+    option.id = `suggestion-${index}`;
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", "false");
+    const text = document.createElement("span");
+    text.textContent = item.text;
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = item.type === "street"
+      ? "street"
+      : item.interpolated
+        ? "interpolated"
+        : item.shards?.length
+          ? suggestionRegionLabel(item.shards)
+          : item.count > 1 ? `×${formatNumber(item.count)}` : "place";
+    option.append(text, count);
+    option.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      chooseSuggestion(item);
+    });
+    return option;
+  }));
+  suggestList.hidden = false;
+  queryInput.setAttribute("aria-expanded", "true");
 }
 
 async function loadIndexStatus() {
@@ -475,6 +540,7 @@ async function loadIndexStatus() {
 
 queryInput.addEventListener("input", () => {
   clearButton.hidden = !queryInput.value;
+  if (selectedSuggestionHint?.query !== queryInput.value.trim()) selectedSuggestionHint = null;
   if (queryInput.value !== suppressedQuery) {
     suggestionsSuppressed = false;
     suppressedQuery = "";
@@ -499,8 +565,9 @@ queryInput.addEventListener("keydown", event => {
   if (event.key === "Enter") {
     event.preventDefault();
     if (activeSuggestion >= 0 && options[activeSuggestion]) {
-      chooseSuggestion(options[activeSuggestion].querySelector("span")?.textContent || "");
+      chooseSuggestion(visibleSuggestions[activeSuggestion] || options[activeSuggestion].querySelector("span")?.textContent || "");
     } else {
+      adoptExactSuggestionHint();
       cancelSuggestions();
       runSearch({ fit: !areaToggle.checked });
     }
@@ -512,6 +579,7 @@ queryInput.addEventListener("blur", () => setTimeout(hideSuggestions, 150));
 
 clearButton.addEventListener("click", () => {
   queryInput.value = "";
+  selectedSuggestionHint = null;
   clearButton.hidden = true;
   areaToggle.checked = false;
   cancelSuggestions();
@@ -520,6 +588,7 @@ clearButton.addEventListener("click", () => {
 });
 
 searchButton.addEventListener("click", () => {
+  adoptExactSuggestionHint();
   cancelSuggestions();
   runSearch({ fit: !areaToggle.checked });
 });

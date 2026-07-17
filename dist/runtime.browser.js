@@ -11904,17 +11904,22 @@ async function createShardedSearch(root, options, baseUrl) {
     const routed = await withSuggestRoute(activeParams, normalizedQuery.trim());
     const responses = await Promise.all(routed.shards.map(async (shard) => {
       const engine = await engineAt(shard.index);
-      return engine.suggest({ ...activeParams, shards: void 0 });
+      return { shard, response: await engine.suggest({ ...activeParams, shards: void 0 }) };
     }));
     const merged = /* @__PURE__ */ new Map();
-    for (const response of responses) {
+    for (const { shard, response } of responses) {
       for (const item of response.suggestions) {
         const existing = merged.get(item.text);
         if (existing) {
           existing.count += item.count;
-          existing.weight = Math.max(existing.weight, item.weight);
+          if (item.weight > existing.weight) {
+            existing.weight = item.weight;
+            existing.shards = [shard.id];
+          } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
+            existing.shards.push(shard.id);
+          }
         } else {
-          merged.set(item.text, { ...item });
+          merged.set(item.text, { ...item, shards: [shard.id] });
         }
       }
     }

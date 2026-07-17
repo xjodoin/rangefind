@@ -59,6 +59,8 @@ function makeDoc(i, band) {
     id: `doc-${band}-${i}`,
     title: i === 0
       ? `${SUGGEST_MARKERS[band]} landmark in band ${band}`
+      : i === 119
+        ? "Shared landmark"
       : `Entry ${i} about ${topic} in band ${band}`,
     // bandmarkN is unique to its band: text routing should resolve queries
     // containing it to exactly one shard.
@@ -209,6 +211,11 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
       monoSuggest.suggestions.map(item => item.text).slice(0, 3)
     );
     assert.equal(shardSuggest.stats.shardsQueried, 3, "broad prefixes should retain all shards");
+    assert.deepEqual(shardSuggest.suggestions[0].shards, ["band-1"]);
+
+    const sharedSuggest = await sharded.suggest({ q: "shared" });
+    assert.equal(sharedSuggest.suggestions[0].text, "Shared landmark");
+    assert.deepEqual(sharedSuggest.suggestions[0].shards, ["band-1", "band-2", "band-3"]);
 
     // Prefix-aware routing keeps autocomplete on the shard whose indexed
     // suggest field can contain the requested prefix.
@@ -218,7 +225,8 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
     assert.equal(routedSuggest.stats.textRouting?.selected, 1);
     assert.ok(routedSuggest.suggestions.length > 0);
     assert.ok(routedSuggest.suggestions.every(item => item.text.startsWith("borealunique")));
-    assert.deepEqual(routedSuggest.suggestions, monoRoutedSuggest.suggestions);
+    assert.deepEqual(routedSuggest.suggestions.map(({ shards, ...item }) => item), monoRoutedSuggest.suggestions);
+    assert.deepEqual(routedSuggest.suggestions[0].shards, ["band-2"]);
 
     const unroutedSuggest = await sharded.suggest({ q: "borealuniqxe" });
     assert.equal(unroutedSuggest.stats.shardsQueried, 3);

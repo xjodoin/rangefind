@@ -47,8 +47,8 @@ test("OSM autocomplete collapses civic matches into street-locality suggestions"
       calls.push(params);
       return {
         suggestions: [
-          { text: "200 Rue Libersan, Sainte-Thérèse", weight: 2, count: 2 },
-          { text: "202 Rue Libersan, Sainte-Thérèse", weight: 1, count: 1 },
+          { text: "200 Rue Libersan, Sainte-Thérèse", weight: 2, count: 2, shards: ["quebec"] },
+          { text: "202 Rue Libersan, Sainte-Thérèse", weight: 1, count: 1, shards: ["quebec", "ontario"] },
           { text: "202–218 Rue Libersan, Sainte-Thérèse", weight: 1, count: 1 },
           { text: "3024 Rue Libersan, Sainte-Marthe-sur-le-Lac", weight: 1, count: 1 },
           { text: "3028 Rue Libersan, Sainte-Marthe-sur-le-Lac", weight: 1, count: 1 }
@@ -65,6 +65,7 @@ test("OSM autocomplete collapses civic matches into street-locality suggestions"
   ]);
   assert.equal(response.suggestions[0].type, "street");
   assert.equal(response.suggestions[0].count, 4);
+  assert.deepEqual(response.suggestions[0].shards, ["ontario", "quebec"]);
   assert.equal(response.stats.osmStreetSuggestionsCollapsed, 2);
 
   await suggestOsmQuery(engine, { q: "214 Rue Libersan Saint", size: 8 });
@@ -123,6 +124,9 @@ test("OSM exact locality search returns the city instead of matching addresses",
   assert.equal(response.total, 1);
   assert.equal(response.results[0].type, "city");
   assert.equal(response.stats.plannerLane, "osmLocalityExact");
+
+  await searchOsmQuery(engine, { q: "Laval", shards: ["quebec"], size: 30 });
+  assert.deepEqual(calls[1].shards, ["quebec"]);
 });
 
 test("OSM street-locality search avoids common road-designator posting exhaustion", async () => {

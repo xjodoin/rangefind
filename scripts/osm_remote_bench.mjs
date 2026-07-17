@@ -16,6 +16,7 @@ import { writeFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { createFetchMeter, kb, mean, quantile } from "./bench_support.mjs";
 import { createSearch } from "../src/runtime.js";
+import { searchOsmQuery, suggestOsmQuery } from "../src/integrations/osm/query.js";
 
 function parseArgs(argv) {
   const args = {
@@ -70,6 +71,19 @@ function buildLanes(size) {
     { name: "text-common", run: engine => engine.search({ q: "restaurant", size }) },
     { name: "text-city", run: engine => engine.search({ q: "berlin hauptbahnhof", size }) },
     { name: "suggest", run: engine => engine.suggest({ q: "berl" }) },
+    { name: "locality-global", run: engine => searchOsmQuery(engine, { q: "Berlin", size }) },
+    {
+      name: "suggest-select",
+      run: async engine => {
+        const suggested = await suggestOsmQuery(engine, { q: "berl", size: 8 });
+        const item = suggested.suggestions.find(candidate => candidate.text === "Berlin") || suggested.suggestions[0];
+        return searchOsmQuery(engine, {
+          q: item?.text || "Berlin",
+          size,
+          ...(item?.shards?.length ? { shards: item.shards } : {})
+        });
+      }
+    },
     { name: "nearest", run: engine => engine.search({ q: "", geo: { near: CALGARY, sort: "distance" }, size }) },
     { name: "nearest-radius-2km", run: engine => engine.search({ q: "", geo: { near: { ...CALGARY, radiusMeters: 2000 }, sort: "distance" }, size }) },
     { name: "text+near-boost", run: engine => engine.search({ q: "coffee", geo: { near: { ...BERLIN, radiusMeters: 5000 }, boost: { weight: 2, pivotMeters: 2000 } }, size }) },

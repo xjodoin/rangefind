@@ -27,6 +27,7 @@ var CATEGORY_INTENTS = /* @__PURE__ */ new Map([
 ]);
 var LOCALITY_CONNECTORS = /* @__PURE__ */ new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
 var LOCALITY_CACHE = /* @__PURE__ */ new WeakMap();
+var LOCALITY_SEARCH_STATS = Symbol("rangefind.localitySearchStats");
 var CANADIAN_POSTAL_CODE = /^\s*([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\s*$/iu;
 var LOCALITY_TYPES = /* @__PURE__ */ new Set(["city", "town", "municipality", "village", "hamlet"]);
 var STREET_DESIGNATORS = /* @__PURE__ */ new Set([
@@ -125,14 +126,19 @@ function collapseStreetSuggestions(response, params = {}) {
       weight: 0,
       count: 0,
       matches: 0,
-      type: "street"
+      type: "street",
+      shards: /* @__PURE__ */ new Set()
     };
     current.weight += Number(item.weight || 0);
     current.count += Number(item.count || 1);
     current.matches++;
+    for (const shard of item.shards || []) current.shards.add(shard);
     grouped.set(surface.key, current);
   }
-  const streets = [...grouped.values()].filter((item) => item.matches >= 2).map(({ matches, ...item }) => item);
+  const streets = [...grouped.values()].filter((item) => item.matches >= 2).map(({ matches, shards, ...item }) => ({
+    ...item,
+    ...shards.size ? { shards: [...shards].sort() } : {}
+  }));
   const collapsedKeys = new Set(streets.map((item) => fold(item.text)));
   const remaining = passthrough.concat((response.suggestions || []).filter((item) => {
     const surface = streetLocalitySurface(item.text);
@@ -177,19 +183,23 @@ function collapseCivicDuplicates(response) {
     stats: { ...response.stats || {}, osmCivicDuplicatesCollapsed: removed }
   };
 }
-async function resolveLocality(engine, surface) {
-  const localityKey = fold(surface);
+async function resolveLocality(engine, surface, params = {}) {
+  const normalizedLocality = fold(surface);
+  const shardScope = params.shards == null ? [] : (Array.isArray(params.shards) ? params.shards : [params.shards]).map(String).sort();
+  const localityKey = `${normalizedLocality}\0${shardScope.join("\0")}`;
   if (!LOCALITY_CACHE.has(engine)) LOCALITY_CACHE.set(engine, /* @__PURE__ */ new Map());
   const cache = LOCALITY_CACHE.get(engine);
   if (cache.has(localityKey)) return cache.get(localityKey);
   const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
   const localityResponse = await engine.search(postalMatch ? {
     q: surface,
-    size: 8
+    size: 8,
+    ...shardScope.length ? { shards: shardScope } : {}
   } : {
     q: surface,
     filters: { facets: { category: ["place"] } },
-    size: 8
+    size: 8,
+    ...shardScope.length ? { shards: shardScope } : {}
   });
   const matches = localityResponse.results.filter((result) => {
     if (!Number.isFinite(result.lat) || !Number.isFinite(result.lon)) return false;
@@ -197,11 +207,17 @@ async function resolveLocality(engine, surface) {
       const expected = `${postalMatch[1]} ${postalMatch[2]}`.toUpperCase();
       return result.type === "postal_code" && String(result.postcode || "").toUpperCase() === expected;
     }
-    return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === localityKey;
+    return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === normalizedLocality;
   });
   const typePriority = /* @__PURE__ */ new Map([["city", 5], ["town", 4], ["municipality", 3], ["village", 2], ["hamlet", 1]]);
   matches.sort((left, right) => (typePriority.get(right.type) || 0) - (typePriority.get(left.type) || 0) || Number(right.population || 0) - Number(left.population || 0));
   const resolved = matches[0] || null;
+  if (resolved) {
+    Object.defineProperty(resolved, LOCALITY_SEARCH_STATS, {
+      value: localityResponse.stats || {},
+      enumerable: false
+    });
+  }
   cache.set(localityKey, resolved);
   return resolved;
 }
@@ -218,7 +234,7 @@ async function resolveStreetLocality(engine, surface, params) {
     const coreTokens = streetTokens.filter((token) => !STREET_DESIGNATORS.has(fold(token)));
     if (!coreTokens.length) continue;
     const localitySurface = tokens.slice(split).join(" ");
-    const locality = await resolveLocality(engine, localitySurface);
+    const locality = await resolveLocality(engine, localitySurface, params);
     if (!locality) continue;
     const streetSurface = streetTokens.join(" ");
     const streetKey = fold(streetSurface);
@@ -271,7 +287,7 @@ async function searchOsmQuery(engine, params = {}) {
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
     if (possibleLocalityQuery(q)) {
-      const locality2 = await resolveLocality(engine, q);
+      const locality2 = await resolveLocality(engine, q, params);
       if (locality2) {
         return {
           total: 1,
@@ -281,6 +297,7 @@ async function searchOsmQuery(engine, params = {}) {
           results: [locality2],
           resolvedQuery: locality2.name || q,
           stats: {
+            ...locality2[LOCALITY_SEARCH_STATS] || {},
             plannerLane: "osmLocalityExact",
             osmIntentLocality: locality2.name || q,
             osmIntentLocalityType: locality2.type || ""
@@ -290,7 +307,7 @@ async function searchOsmQuery(engine, params = {}) {
     }
     return collapseCivicDuplicates(await engine.search(params));
   }
-  const locality = await resolveLocality(engine, intent.locality);
+  const locality = await resolveLocality(engine, intent.locality, params);
   if (!locality) return collapseCivicDuplicates(await engine.search(params));
   const response = await engine.search({
     ...params,
