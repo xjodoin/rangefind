@@ -33,10 +33,10 @@ request, or none.
 ```
 rangefind/
   manifest.min.json          entry point: schema, analysis profile, pointers
-  terms/packs/*.bin          posting segments, impact-ordered, compressed
+  terms/packs/*.bin.gz       posting segments, impact-ordered, compressed
   terms/directory-*.bin.gz   paged binary range directory
-  docs/packs/*.bin           locality-ordered document payloads
-  docs/pages/*.bin           dense page payloads for browse/filter/sort
+  docs/packs/*.bin.gz        locality-ordered document payloads
+  docs/pages/*.bin.gz        dense page payloads for browse/filter/sort
   doc-values/                typed numeric/date/boolean columns
   facets/                    range-packed facet dictionaries
   geo/                       static KD trees (when geo fields exist)

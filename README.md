@@ -21,7 +21,7 @@ a large thesis corpus.
 - BM25F-style field scoring.
 - Phrase signals for title/heading fields.
 - Adaptive posting segments.
-- Independently compressed posting segments packed into `terms/packs/*.bin`.
+- Independently compressed posting segments packed into `terms/packs/*.bin.gz`.
 - Single ESM browser runtime bundle at `dist/runtime.browser.js`.
 - Node runtime (`rangefind/node`) for MCP servers, CLIs, and SSR: same query
   engine over local index directories (positional file reads) or remote
@@ -263,7 +263,7 @@ Use `npm run build:wiki-site:full` to build the full default dump with the
 bounded body cap, or `npm run build:wiki-site:fr:full` for the full French
 Wikipedia dump. The generated site lives at `examples/wiki-search/public/` and
 keeps the same static hosting requirement as every Rangefind index: the host
-must support HTTP `Range` requests for `.bin` files.
+must support HTTP `Range` requests for `.bin.gz` files.
 
 ## French Wikipedia Scalability Fixture
 
@@ -496,7 +496,7 @@ first-page hits but `static search` does, the response includes:
 
 ## Static Hosting Requirement
 
-The runtime expects the host to support HTTP `Range` requests for `.bin` files.
+The runtime expects the host to support HTTP `Range` requests for `.bin.gz` files.
 GitHub Pages supports this. The included local server also supports it.
 
 ## Development

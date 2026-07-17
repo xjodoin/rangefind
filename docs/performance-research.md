@@ -42,7 +42,7 @@ indexed text so large pages can be fully indexed while search results stay
 compact.
 
 The next format step is now implemented for high-df terms: eligible posting
-blocks are stored in `terms/block-packs/*.bin` and referenced from
+blocks are stored in `terms/block-packs/*.bin.gz` and referenced from
 `rfsegpost-v6` posting-segment metadata. Each posting block carries doc-id
 min/max bounds, sparse per-block doc-id-range max-impact rows, each superblock
 carries an aggregate doc-id span, and each term can emit sparse quantized

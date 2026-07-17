@@ -241,7 +241,11 @@ export function finalizePackWriter(writer) {
   for (const pack of writer.packs) {
     const hash = pack.contentDigest;
     const prefix = String(pack.index).padStart(4, "0");
-    const file = `${prefix}.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}.bin`;
+    // The pack already consists of independently compressed gzip members. The
+    // .bin.gz suffix prevents static hosts such as GitHub Pages from applying
+    // an additional transfer encoding, which would make HTTP byte ranges refer
+    // to the outer encoding instead of these immutable pack bytes.
+    const file = `${prefix}.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}.bin.gz`;
     const path = resolve(writer.outDir, file);
     if (path !== pack.path) {
       if (existsSync(path)) unlinkSync(pack.path);

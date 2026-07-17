@@ -16,8 +16,10 @@ work — they just transfer more than needed.
 Two things to verify on exotic setups:
 
 - **No compression middleware on packs.** The packs are already compressed
-  internally; a proxy that gzips them on the fly breaks range math. Serve
-  `.bin` files as `application/octet-stream` without transform.
+  internally; a proxy that gzips them on the fly breaks range math. Current
+  Rangefind builds use a `.bin.gz` suffix for every range-addressed object so
+  static hosts such as GitHub Pages do not apply transparent compression. For
+  older `.bin` indexes, serve the files without transformation.
 - **CORS, if the index lives on another origin.** Allow `GET` with the
   `Range` header and expose `Content-Range`.
 
@@ -27,8 +29,8 @@ Everything except the manifests is immutable and content-addressed:
 
 ```
 /rangefind/manifest*.json      Cache-Control: max-age=60, must-revalidate
-/rangefind/**/*.bin            Cache-Control: public, max-age=31536000, immutable
 /rangefind/**/*.bin.gz         Cache-Control: public, max-age=31536000, immutable
+/rangefind/**/*.bin            Cache-Control: public, max-age=31536000, immutable # legacy
 ```
 
 With those headers, [incremental updates](../incremental-updates/) are
@@ -38,8 +40,9 @@ site update invalidates only the small manifests.
 ## Small sites
 
 For a docs or marketing site the index is usually a few megabytes — host it
-with the site itself and stop thinking about it. This site does exactly
-that on GitHub Pages.
+with the site itself and stop thinking about it. This site does exactly that
+on GitHub Pages; the `.bin.gz` object suffix keeps byte ranges stable through
+Pages' automatic content encoding.
 
 ## Large indexes on object storage
 

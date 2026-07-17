@@ -21,7 +21,7 @@ test("pack writer uses content-addressed immutable names", async () => {
   finalizePackWriter(writer);
 
   const hash = sha256Hex(bytes);
-  assert.equal(writer.packs[0].file, `0000.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}.bin`);
+  assert.equal(writer.packs[0].file, `0000.${hash.slice(0, OBJECT_NAME_HASH_LENGTH)}.bin.gz`);
   assert.equal(writer.packs[0].contentHash, hash);
   assert.equal(writer.packs[0].immutable, true);
   assert.equal(writer.entries.a.pack, writer.packs[0].file);

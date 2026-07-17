@@ -905,12 +905,13 @@ generations or 25% tombstoned documents. See
 
 ## Deployment requirements
 
-- **Static host with HTTP `Range` support** for `.bin` files (GitHub Pages,
+- **Static host with HTTP `Range` support** for `.bin.gz` files (GitHub Pages,
   Netlify, S3/CloudFront, nginx, etc. all qualify). The runtime relies on
   `206 Partial Content`.
-- **MIME/encoding**: serve `.bin` as a binary type and do **not** let the host
-  gzip-transcode them (they contain independently-compressed members). `.gz`
-  manifests/directories are pre-gzipped; serve them as-is.
+- **MIME/encoding**: do **not** let the host gzip-transcode range-addressed
+  objects (they contain independently compressed members). Current builds use
+  the `.bin.gz` suffix so hosts such as GitHub Pages serve their bytes as-is;
+  manifests and directories with the same suffix are also pre-gzipped.
 - **Immutable caching**: pack and directory filenames are content-addressed, so
   serve them with long-lived `Cache-Control: immutable`. Only the small
   `manifest.min.json` changes between builds.

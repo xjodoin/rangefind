@@ -21,35 +21,35 @@ rangefind/
     manifest.json.gz
   doc-values/
     packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
     sorted/
       bodyLength.<hash>.bin.gz
     sorted-packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
   facets/
     directory-root.<hash>.bin.gz
     directory-pages/
       0000.<hash>.bin.gz
     packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
   docs/
     pointers/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
     pages/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
     page-packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
     packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
   terms/
     directory-root.<hash>.bin.gz
     directory-pages/
       0000.<hash>.bin.gz
     block-packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
     packs/
-      0000.<hash>.bin
-      0001.<hash>.bin
+      0000.<hash>.bin.gz
+      0001.<hash>.bin.gz
   authority/
     lexicon-root.<hash>.bin.gz
     hot/
@@ -58,11 +58,11 @@ rangefind/
     directory-pages/
       0000.<hash>.bin.gz
     packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
   geo/
     location.<hash>.bin.gz
     point-packs/
-      0000.<hash>.bin
+      0000.<hash>.bin.gz
 ```
 
 `manifest.json` is small enough for page initialization. It lists schema,
@@ -78,7 +78,7 @@ that can be fetched independently is described by the same pointer shape:
 
 ```json
 {
-  "pack": "0000.<hash>.bin",
+  "pack": "0000.<hash>.bin.gz",
   "offset": 12345,
   "length": 678,
   "physicalLength": 678,
@@ -116,14 +116,14 @@ is intentionally exact only: near-duplicate text or cross-block semantic dedup
 would add runtime indirection and extra range fetches, which is usually a bad
 trade for a latency-sensitive browser index.
 
-`facets/packs/*.bin` store independently compressed binary facet dictionaries
+`facets/packs/*.bin.gz` store independently compressed binary facet dictionaries
 addressed through `facets/directory-root.<hash>.bin.gz` and
 `facets/directory-pages/*.bin.gz`. The runtime lazy-loads a dictionary only when
 that facet is selected or an application asks for its values. The small facet
 directory manifest is lazy at `facets/manifest.json.gz`, so filtered paths do
 not need `manifest.full.json` just to resolve facet codes.
 
-`doc-values/packs/*.bin` store range-addressed column chunks used by filters and
+`doc-values/packs/*.bin.gz` store range-addressed column chunks used by filters and
 sorting. Keyword facets are encoded as per-document bitsets, so a facet can be
 single-value or multi-value. Numeric and date fields are encoded as typed
 range/sort values, and booleans use a compact tristate representation for
@@ -132,7 +132,7 @@ filter and sort queries can fetch only the involved columns and skip chunks that
 cannot match instead of downloading one global code table.
 
 `doc-values/sorted/*.bin.gz` stores a lazy binary directory per numeric/date/
-boolean field. Each directory points into `doc-values/sorted-packs/*.bin`, where
+boolean field. Each directory points into `doc-values/sorted-packs/*.bin.gz`, where
 `rfdocvaluesortpage-v1` pages keep value-sorted `(value, docId)` rows plus
 per-page min/max summaries for every sortable/filterable typed field. Sorted
 top-k browse loads the directory for the requested sort field, fetches only the
@@ -145,15 +145,15 @@ chunks in doc-id order and stops after enough matches, preserving the dense
 doc-page payload lane. This gives both value-order pruning for sorted views and
 low-request dense browsing for broad filters.
 
-`docs/pointers/*.bin` is a dense fixed-record pointer table keyed directly by
+`docs/pointers/*.bin.gz` is a dense fixed-record pointer table keyed directly by
 numeric document id. Result fetching no longer walks a generic string directory
 or a separate ordinal table for documents. The builder writes document payload
 packs in retrieval-local order, and the runtime fetches doc-id pointer records
 directly before range-fetching the referenced compressed payloads from
-`docs/packs/*.bin`.
+`docs/packs/*.bin.gz`.
 
-`docs/pages/*.bin` is a second dense pointer table keyed by document-id page,
-and `docs/page-packs/*.bin` stores `rfdocpagecols-v1` binary column pages in
+`docs/pages/*.bin.gz` is a second dense pointer table keyed by document-id page,
+and `docs/page-packs/*.bin.gz` stores `rfdocpagecols-v1` binary column pages in
 original document-id order. The format stores the page field list once in the
 manifest, writes typed column values for each page, and treats `index` as an
 implicit document-id offset. This lane is optimized for browse, filter, and sort
@@ -166,10 +166,10 @@ query. It contains page bounds and a compact Bloom filter for adaptive shard
 resolution. Only touched `terms/directory-pages/*.bin.gz` files are fetched, and
 each page maps logical shard names to checksummed object pointers.
 
-`terms/packs/*.bin` contain many independently compressed posting segments. The
+`terms/packs/*.bin.gz` contain many independently compressed posting segments. The
 browser requests exactly the byte span it needs and decompresses that one
 segment. High-df posting lists can move their posting blocks into
-`terms/block-packs/*.bin`; the posting segment then carries term metadata,
+`terms/block-packs/*.bin.gz`; the posting segment then carries term metadata,
 block-max scores, filter summaries, and byte ranges for external blocks.
 The text top-k runtime schedules a small frontier of the highest-impact active
 cursors, then batches external posting-block misses across those cursors before
@@ -218,7 +218,7 @@ skipped segment count, intermediate bytes, write amplification, and whether a
 budget prevented the requested target from being reached.
 
 Term pack assembly uses the same append-only direction. As posting partitions
-are compressed into `terms/packs/*.bin`, the builder writes compact binary
+are compressed into `terms/packs/*.bin.gz`, the builder writes compact binary
 directory-entry records into `_build/terms-directory.run`. After immutable pack
 renaming, those spooled rows are sorted through bounded chunks and streamed into
 the paged term directory. This removes the old dependency on a retained
@@ -297,7 +297,7 @@ observable before the final telemetry file exists.
 Authority fields use the same file-backed run/reduce pattern as postings. Each
 configured title, entity-name, slug, or alias value emits surface-exact,
 folded-exact, and token authority keys into temporary run files. The reducer
-writes `rfauth-v2` shards into immutable `authority/packs/*.bin` objects and a
+writes `rfauth-v2` shards into immutable `authority/packs/*.bin.gz` objects and a
 paged range directory. Authority has its own shard budget
 (`authorityTargetShardRows`) and deeper max shard depth
 (`authorityMaxShardDepth`) and smaller directory pages
@@ -335,7 +335,7 @@ metadata. The runtime uses those block maxima for single-term and multi-term
 top-k queries: it decodes the highest-potential blocks first and can stop once
 no remaining block can change the requested top results.
 
-For high-df terms, decoded blocks are fetched from `terms/block-packs/*.bin`
+For high-df terms, decoded blocks are fetched from `terms/block-packs/*.bin.gz`
 only when the block-max scheduler chooses them. The runtime prefetches a small
 adjacent block window, so medium lists behave like range-addressed superblocks
 while very large lists can still avoid downloading their full posting payload.
@@ -362,7 +362,7 @@ range requests:
   physically wider dimension (longitude spans shrink by cos(latitude)) until
   leaves hold `geoLeafSize` points (default 512). Leaves are written in
   depth-first order so spatially adjacent leaves stay adjacent inside
-  `geo/point-packs/*.bin` and coalesce into few range requests.
+  `geo/point-packs/*.bin.gz` and coalesce into few range requests.
 - Each leaf page stores its bounding box plus delta-encoded fixed-width
   lat/lon/doc columns, individually gzipped and checksummed like every other
   range object.
@@ -416,7 +416,7 @@ pruning and containment proofs never drop a matching document.
 run/reduce pipeline. Diacritic-folded, punctuation-collapsed full surfaces and
 token suffixes are written directly to bounded external runs; no scan-wide map
 of unique surfaces exists. The authority reducer aggregates document counts
-and maximum explicit weights while writing the same `authority/packs/*.bin`
+and maximum explicit weights while writing the same `authority/packs/*.bin.gz`
 objects used for canonical-label rescue.
 
 Autocomplete entries in `rfauth-v2` store display text, count, and final weight
@@ -456,9 +456,9 @@ vectors/
   <field>.<hash>.bin.gz        # root: int8 centroids, cluster pointers,
                                # dimension permutation, refine layout
   <field>/packs/               # cluster pages: doc ids, refine ordinals,
-    0000.<hash>.bin            # scales, int8 coarse-dim rows (gzip members)
+    0000.<hash>.bin.gz         # scales, int8 coarse-dim rows (gzip members)
   <field>/refine-packs/        # fixed-width full-dim int8 rows addressed by
-    0000.<hash>.bin            # ordinal * rowBytes (raw, random access)
+    0000.<hash>.bin.gz         # ordinal * rowBytes (raw, random access)
 ```
 
 Query execution (`vectorSearch` / hybrid `search({ q, vector })`):

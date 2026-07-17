@@ -1041,7 +1041,7 @@ async function finishDocPacks(out, spool, total, config) {
     closeSync(entryInFd);
   }
   const hash = sha256Hex(pointerTable.buffer);
-  const file = `docs/pointers/${hashedFile("0000", hash, ".bin")}`;
+  const file = `docs/pointers/${hashedFile("0000", hash, ".bin.gz")}`;
   mkdirSync(resolve(out, "docs", "pointers"), { recursive: true });
   writeFileSync(resolve(out, file), pointerTable.buffer);
   return {
@@ -1118,7 +1118,7 @@ async function finishDocPages(out, spool, total, config) {
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const pointerTable = buildDocPagePointerTable(entries.map(entry => resolvePackEntry(packWriter, entry)), packIndexes);
   const hash = sha256Hex(pointerTable.buffer);
-  const file = `docs/pages/${hashedFile("0000", hash, ".bin")}`;
+  const file = `docs/pages/${hashedFile("0000", hash, ".bin.gz")}`;
   mkdirSync(resolve(out, "docs", "pages"), { recursive: true });
   writeFileSync(resolve(out, file), pointerTable.buffer);
   return {
@@ -2411,7 +2411,7 @@ async function writeSortReplicaDocPages(out, config, replica, rows, spool) {
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const pointerTable = buildDocPagePointerTable(entries.map(entry => resolvePackEntry(packWriter, entry)), packIndexes);
   const hash = sha256Hex(pointerTable.buffer);
-  const file = `${pointerBase}/${hashedFile("0000", hash, ".bin")}`;
+  const file = `${pointerBase}/${hashedFile("0000", hash, ".bin.gz")}`;
   mkdirSync(resolve(out, pointerBase), { recursive: true });
   writeFileSync(resolve(out, file), pointerTable.buffer);
   return {

@@ -455,7 +455,7 @@ binary doc page.
 
 High-cardinality facet dictionaries are stored with the same range-directory
 and pack strategy as terms and documents. The 50k manifest is 104.7 KB; the
-large category dictionary lives in `facets/packs/*.bin` and is fetched only when
+large category dictionary lives in `facets/packs/*.bin.gz` and is fetched only when
 that facet is selected or a UI asks for its values.
 
 The current index uses `rfdir-v2` directory pages, a dense doc-id-keyed
