@@ -4402,11 +4402,30 @@ async function fetchGzipArrayBuffer(url) {
 }
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceFetch(bucket, () => fetchImpl(url, {
-    headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-  }));
-  if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
-  return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+  for (let attempt = 0; ; attempt++) {
+    const response = await traceFetch(bucket, () => fetchImpl(url, {
+      headers: { Range: `bytes=${offset}-${offset + length - 1}` }
+    }));
+    if (response.status === 206) {
+      return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+    }
+    if (response.status === 200) {
+      const total = Number(response.headers.get("content-length") || 0);
+      if (total > 0 && total <= Math.max(length * 4, 1 << 20)) {
+        const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+        return body.slice(offset, offset + length);
+      }
+      try {
+        await response.body?.cancel?.();
+      } catch {
+      }
+      if (attempt < 2) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 150 * (attempt + 1)));
+        continue;
+      }
+    }
+    throw new Error(`Range request failed for ${url}`);
+  }
 }
 function selectedFacetCodes(manifest, field, selected) {
   if (!selected?.size) return null;
@@ -5127,9 +5146,29 @@ async function createSearch(options = {}) {
     if (!primary) return bitmapStore;
     return { ...primary, _filterBitmaps: bitmapStore };
   }
+  async function docFilterPlanNeedsDocValues(filterPlan) {
+    if (!filterPlan?.active) return false;
+    if (filterPlan.numbers.length) return true;
+    if (filterPlan.geo && !filterPlan.geo.docSet) return true;
+    if (!filterBitmaps) await ensureFilterBitmapManifest();
+    if (!filterBitmaps?.fields) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      const meta = filterBitmapField(field);
+      if (meta?.kind !== "facet") return true;
+      for (const code of selected) {
+        if (!meta.values?.[String(code)]) return true;
+      }
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const meta = filterBitmapField(field);
+      if (meta?.kind !== "boolean") return true;
+      if (!meta.values?.[expected ? "true" : "false"]) return true;
+    }
+    return false;
+  }
   async function valueStoreForFilterPlan(filterPlan, docs, omittedFields = []) {
     if (!filterPlan?.active) return null;
-    const bitmapStore = docs.length <= FILTER_BITMAP_SPARSE_DOC_LIMIT ? await filterBitmapStoreForPlan(filterPlan) : null;
+    const bitmapStore = docs.length <= FILTER_BITMAP_SPARSE_DOC_LIMIT || !docValues ? await filterBitmapStoreForPlan(filterPlan) : null;
     const omitted = new Set(omittedFields);
     const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
     const fields = filterPlanFields(filterPlan).filter((field) => !omitted.has(field) && !bitmapCovered.has(field));
@@ -5144,12 +5183,12 @@ async function createSearch(options = {}) {
       if (docs) for (const doc of docs) union.push(doc);
     }
     if (!union.length) return;
-    if (!docValues) await ensureDocValuesManifest();
-    if (!docValues) return;
     const bitmapStore = await filterBitmapStoreForPlan(filterPlan);
     const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
     const fields = filterPlanFields(filterPlan).filter((field) => !bitmapCovered.has(field));
     if (!fields.length) return;
+    if (!docValues) await ensureDocValuesManifest();
+    if (!docValues) return;
     await ensureDocValuesForDocs(fields, union);
   }
   function docValue(field, doc) {
@@ -7898,7 +7937,6 @@ async function createSearch(options = {}) {
     if (!field || !docValueSortField(field) || !baseTerms.length || terms.length > SKIP_MAX_TERMS) return null;
     if (rerank !== false && dependencyTerms(baseTerms).length) return null;
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const directory = await loadDocValueSortDirectory(field);
     if (!directory?.pages?.length) return null;
@@ -7918,6 +7956,7 @@ async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    if (hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan)) await ensureDocValuesManifest();
     const filterFields = filterPlanFields(docFilterPlan).filter((item) => item !== field);
     const desc = !!sortPlan.desc;
     const candidatePages = sortedDirectoryPages(directory, desc, docFilterPlan);
@@ -8403,8 +8442,9 @@ async function createSearch(options = {}) {
         continue;
       }
       hasRangeBounds = true;
+      const cursorRemainingMax = remainingBlockMaxImpact(cursor) || block.maxImpact || 0;
       for (const range of ranges) {
-        const impact = Math.min(block.maxImpact || 0, range.maxImpact || 0);
+        const impact = Math.min(cursorRemainingMax, range.maxImpact || 0);
         if (!impact) continue;
         rangeBounds.set(range.index, (rangeBounds.get(range.index) || 0) + impact);
       }
@@ -8888,7 +8928,6 @@ async function createSearch(options = {}) {
     hasFilters,
     blockFilterPlan,
     docFilterPlan,
-    fallbackCodeData,
     rerank,
     candidateK,
     minShouldMatch,
@@ -9060,7 +9099,7 @@ async function createSearch(options = {}) {
         );
       }
       for (const { cursor, rows: rows2, docsInRange, filterSummaryProvesBlock } of pendingBlocks) {
-        const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : filterSummaryProvesBlock ? null : fallbackCodeData;
+        const codeData = hasFilters && !filterSummaryProvesBlock ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : null;
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRowsInDocRange(
           cursor,
@@ -9171,12 +9210,10 @@ async function createSearch(options = {}) {
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank, includeResults });
     if (bundleResponse) return bundleResponse;
-    if (hasFilters) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const fallbackCodeData = hasFilters && !docValues ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
     const minShouldMatch = minShouldMatchFor(baseTerms);
@@ -9199,7 +9236,6 @@ async function createSearch(options = {}) {
       hasFilters,
       blockFilterPlan,
       docFilterPlan,
-      fallbackCodeData,
       rerank,
       candidateK,
       minShouldMatch,
@@ -9246,9 +9282,57 @@ async function createSearch(options = {}) {
         Math.max(topKProofCheckInterval, Math.floor(scores.size / topKProofCheckScoresPerBlock))
       );
     }
+    let conjunctionTailCandidates = -1;
+    let conjunctionTailBlocks = 0;
+    async function drainConjunctionTail(active, activeBase) {
+      const candidateDocs = /* @__PURE__ */ new Set();
+      for (const [doc, count2] of hits) {
+        if (count2 + activeBase >= minShouldMatch) candidateDocs.add(doc);
+      }
+      conjunctionTailCandidates = candidateDocs.size;
+      const sortedCandidates = Int32Array.from(candidateDocs).sort();
+      const overlapsCandidates = (block) => {
+        if (!Number.isFinite(block?.docMin) || !Number.isFinite(block?.docMax)) return true;
+        let low = 0;
+        let high = sortedCandidates.length;
+        while (low < high) {
+          const mid = low + high >>> 1;
+          if (sortedCandidates[mid] < block.docMin) low = mid + 1;
+          else high = mid;
+        }
+        return low < sortedCandidates.length && sortedCandidates[low] <= block.docMax;
+      };
+      for (const cursor of active) {
+        const blocks = cursor.entry.blocks || [];
+        const wanted = [];
+        for (let blockIndex = cursor.blockIndex; blockIndex < blocks.length; blockIndex++) {
+          if (candidateDocs.size && blockMayPass(blocks[blockIndex], blockFilterPlan) && overlapsCandidates(blocks[blockIndex])) {
+            wanted.push(blockIndex);
+          } else {
+            cursor.skippedBlocks++;
+          }
+        }
+        cursor.blockIndex = blocks.length;
+        if (!wanted.length) continue;
+        conjunctionTailBlocks += wanted.length;
+        for (const { rows: rows2 } of await lookupEntryBlocks(cursor.shard, cursor.entry, wanted, candidateDocs)) {
+          if (!rows2.length) continue;
+          const codeData = hasFilters ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
+          blocksDecoded++;
+          postingsDecoded += rows2.length / 2;
+          postingsAccepted += applyBlockRows(cursor, rows2, codeData, docFilterPlan, scores, hits, masks);
+        }
+      }
+    }
     while (true) {
       const active = cursors.filter((cursor) => advanceCursor(cursor, blockFilterPlan));
       if (!active.length) {
+        exhausted = true;
+        break;
+      }
+      const activeBase = active.reduce((sum, cursor) => sum + (cursor.isBase ? 1 : 0), 0);
+      if (activeBase < minShouldMatch && options.conjunctionTail !== false) {
+        await drainConjunctionTail(active, activeBase);
         exhausted = true;
         break;
       }
@@ -9281,7 +9365,7 @@ async function createSearch(options = {}) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : filterSummaryProvesBlock ? null : fallbackCodeData;
+        const codeData = hasFilters && !filterSummaryProvesBlock ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
         blocksDecoded++;
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRows(cursor, rows2, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
@@ -9338,6 +9422,7 @@ async function createSearch(options = {}) {
         postingSuperblocksSkipped: cursors.reduce((sum, cursor) => sum + cursor.skippedSuperblocks, 0),
         postingSuperblocksDecoded: cursors.reduce((sum, cursor) => sum + cursor.superblocksDecoded, 0),
         filterSummaryProofBlocks,
+        ...conjunctionTailCandidates >= 0 ? { conjunctionTailCandidates, conjunctionTailBlocks } : {},
         plannerFallbackReason: budgetExhausted ? "block_budget" : exhausted ? "tail_exhausted" : "",
         ...topKProofStatsObject(proofStats, budgetExhausted ? "block_budget" : exhausted ? "tail_exhausted" : ""),
         docPayloadLane: resultContext.docPayloadLane,
@@ -9353,7 +9438,7 @@ async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters || sortPlan) await ensureDocValuesManifest();
+    if (sortPlan) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const segmentSearch = await segmentTermEntries(terms);
     if (!segmentSearch) return null;
@@ -9380,9 +9465,9 @@ async function createSearch(options = {}) {
       for (let i = 0; i < rows2.length; i += 2) candidateDocs.add(rows2[i]);
     }
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters && docValues) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
+    if (hasFilters) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     let postingsAccepted = 0;
@@ -9444,7 +9529,7 @@ async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters || sortPlan) await ensureDocValuesManifest();
+    if (sortPlan) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
@@ -9463,9 +9548,9 @@ async function createSearch(options = {}) {
     const hits = /* @__PURE__ */ new Map();
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters && docValues) {
+    if (hasFilters) {
       const docs = /* @__PURE__ */ new Set();
       for (const { shard, entry } of entries) {
         const postings = await decodeEntryPostings(shard, entry);
@@ -9703,6 +9788,7 @@ async function createSearch(options = {}) {
   }
   function shouldAttemptTypoFallback(params, response) {
     if (runtimeTypo.mode === "off") return false;
+    if (params.typo === false) return false;
     if (params.page !== 1 || params.sort) return false;
     if (response.total === 0) return true;
     if (runtimeTypo.trigger !== "zero-or-weak") return false;
@@ -10227,7 +10313,7 @@ async function createSearch(options = {}) {
       plannerFallbackReason: params.exact ? "exact_requested" : "full_scan"
     });
     const includeResults = params.includeResults !== false;
-    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults }, response, baseTerms, analyzedTerms);
+    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults, typo: params.typo }, response, baseTerms, analyzedTerms);
     const rerankedResponse = await maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, includeResults, authority: params.authority }, typoResponse);
     if (params.highlight && includeResults && rerankedResponse?.results?.length) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
@@ -11728,6 +11814,7 @@ async function createShardedSearch(root, options, baseUrl) {
     return { index, response: await engine.search(params) };
   }
   async function expandingNearestQuery(front, params, need) {
+    const batchSize = 4;
     const queried = [];
     const distances = [];
     let cursor = 0;
@@ -11736,8 +11823,12 @@ async function createShardedSearch(root, options, baseUrl) {
         distances.sort((a, b) => a - b);
         if (front[cursor].meters > shardRoutingBudget(distances[need - 1])) break;
       }
-      const batch = front.slice(cursor, cursor + 2);
+      const batch = front.slice(cursor, cursor + batchSize);
       cursor += batch.length;
+      for (const item of front.slice(cursor, cursor + batchSize)) {
+        engineAt(item.index).catch(() => {
+        });
+      }
       const batchResults = await Promise.all(batch.map((item) => searchShard(item.index, params)));
       for (const item of batchResults) {
         queried.push(item);
@@ -11789,14 +11880,22 @@ async function createShardedSearch(root, options, baseUrl) {
     const routed = await withTextRoute(routeShards(activeParams.geo, activeParams), q);
     const route = routed.route;
     const perShardParams = { ...activeParams, shards: void 0, page: 1, size: Math.min(1e3, need) };
-    let queried;
     let partial = need > 1e3;
-    if (route.expanding) {
-      const expanded = await expandingNearestQuery(route.expanding, perShardParams, need);
-      queried = expanded.queried;
-      partial = partial || expanded.partial;
-    } else {
-      queried = await Promise.all(route.selected.map((index) => searchShard(index, perShardParams)));
+    async function runFanout(fanoutParams) {
+      if (route.expanding) {
+        const expanded = await expandingNearestQuery(route.expanding, fanoutParams, need);
+        partial = partial || expanded.partial;
+        return expanded.queried;
+      }
+      return Promise.all(route.selected.map((index) => searchShard(index, fanoutParams)));
+    }
+    const shardTypo = normalizeMainIndexTypoOptions(options, root);
+    const typoDeferred = shardTypo.mode !== "off" && Boolean(q) && activeParams.typo !== false;
+    let queried = await runFanout(typoDeferred ? { ...perShardParams, typo: false } : perShardParams);
+    if (typoDeferred) {
+      const mergedTotal = queried.reduce((sum, item) => sum + (item.response.total || 0), 0);
+      const weak = shardTypo.trigger === "zero-or-weak" && mergedTotal <= (shardTypo.weakResultTotal || 0);
+      if (mergedTotal === 0 || weak) queried = await runFanout(perShardParams);
     }
     const rows = [];
     for (const { index, response: response2 } of queried) {

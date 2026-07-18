@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.5 — 2026-07-18
+
+### Added
+
+- **Mobile browser benchmark**: `scripts/osm_mobile_bench.mjs` runs the real
+  browser bundles in headless Chromium with CPU and network throttling
+  against a live deployment, reporting cold/warm latency, requests, transfer,
+  and JS heap per demo lane.
+- **Demo-flow benchmark lanes**: `scripts/osm_remote_bench.mjs` now covers
+  every OSM demo flow — category/street/civic intents, postal codes, map-area
+  boxes, discovery orbit, zero-result typo, and address suggest — with a
+  retrying, concurrency-capped fetch so large runs survive transient network
+  failures.
+
+### Changed
+
+- **Sharded cold queries**: filtered text search skips the per-shard
+  doc-values manifest when filter bitmaps cover the plan, and number/geo
+  verification loads doc values lazily so only shards with real candidates
+  pay for them; typo correction defers to a second fan-out that only runs
+  when the merged page is empty; conjunction tails resolve by candidate-doc
+  lookup once minShouldMatch can no longer be reached by unseen documents;
+  the expanding nearest front queries wider batches and prefetches shard
+  engines. On a live 310-shard planet index, locality queries dropped from
+  19.2s/109MB to ~3s/23MB, two-term city queries from 8.6s to 1.5s cold
+  (736ms to 9ms warm), and nearest-first from 9.3s to under 1s.
+- **OSM locality and address resolution**: common locality names resolve to
+  their populous bearer ("laval" → Laval, Québec) through a population-gated
+  retry; street and civic-address queries resolve inside the locality's own
+  shard instead of a full-index fan-out, and civic addresses match through
+  their structured house-number and street fields (13.2s → ~2s cold).
+
+### Fixed
+
+- **Range-ignoring CDN responses**: `fetchRange` now tolerates servers that
+  answer a Range request with 200 and the full object — small bodies are
+  sliced, large ones aborted and retried — instead of failing the query or
+  downloading a multi-hundred-MB file onto a phone.
+- **Doc-range top-k proof bound**: the doc-range-aware stability proof capped
+  remaining potential with the current block's max impact; doc-id-ordered
+  postings could hide a higher-impact posting in a later block and wrongly
+  prove a top-k missing the best documents. The bound now uses the
+  remaining-suffix maximum.
+
 ## 0.3.4 — 2026-07-17
 
 ### Fixed
