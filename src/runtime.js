@@ -1092,9 +1092,40 @@ export async function createSearch(options = {}) {
     return { ...primary, _filterBitmaps: bitmapStore };
   }
 
+  // A doc filter plan whose every facet/boolean value is covered by the
+  // filter-bitmap sidecar can be verified from bitmaps alone. Number ranges
+  // and unresolved geo predicates still read doc values, and any field or
+  // value missing from the bitmap manifest falls back to doc values too.
+  // Skipping the doc-values manifest for covered plans matters on sharded
+  // deployments: that manifest is the single largest per-shard metadata
+  // fetch, paid per routed shard before a single candidate is known.
+  async function docFilterPlanNeedsDocValues(filterPlan) {
+    if (!filterPlan?.active) return false;
+    if (filterPlan.numbers.length) return true;
+    if (filterPlan.geo && !filterPlan.geo.docSet) return true;
+    if (!filterBitmaps) await ensureFilterBitmapManifest();
+    if (!filterBitmaps?.fields) return true;
+    for (const [field, selected] of filterPlan.facets) {
+      const meta = filterBitmapField(field);
+      if (meta?.kind !== "facet") return true;
+      for (const code of selected) {
+        if (!meta.values?.[String(code)]) return true;
+      }
+    }
+    for (const [field, expected] of filterPlan.booleans) {
+      const meta = filterBitmapField(field);
+      if (meta?.kind !== "boolean") return true;
+      if (!meta.values?.[expected ? "true" : "false"]) return true;
+    }
+    return false;
+  }
+
   async function valueStoreForFilterPlan(filterPlan, docs, omittedFields = []) {
     if (!filterPlan?.active) return null;
-    const bitmapStore = docs.length <= FILTER_BITMAP_SPARSE_DOC_LIMIT
+    // Without a loaded doc-values manifest, bitmaps are the cheap lane at
+    // any candidate count — the sparse cutoff only arbitrates when both
+    // stores are available.
+    const bitmapStore = docs.length <= FILTER_BITMAP_SPARSE_DOC_LIMIT || !docValues
       ? await filterBitmapStoreForPlan(filterPlan)
       : null;
     const omitted = new Set(omittedFields);
@@ -1121,12 +1152,14 @@ export async function createSearch(options = {}) {
       if (docs) for (const doc of docs) union.push(doc);
     }
     if (!union.length) return;
-    if (!docValues) await ensureDocValuesManifest();
-    if (!docValues) return;
+    // Resolve bitmap coverage before touching the doc-values manifest so a
+    // fully bitmap-covered plan never downloads it just to prefetch nothing.
     const bitmapStore = await filterBitmapStoreForPlan(filterPlan);
     const bitmapCovered = bitmapStore?.covered || new Set();
     const fields = filterPlanFields(filterPlan).filter(field => !bitmapCovered.has(field));
     if (!fields.length) return;
+    if (!docValues) await ensureDocValuesManifest();
+    if (!docValues) return;
     await ensureDocValuesForDocs(fields, union);
   }
 
@@ -4166,7 +4199,6 @@ export async function createSearch(options = {}) {
     if (rerank !== false && dependencyTerms(baseTerms).length) return null;
 
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const directory = await loadDocValueSortDirectory(field);
     if (!directory?.pages?.length) return null;
@@ -4187,6 +4219,7 @@ export async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const k = offset + size;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    if (hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan)) await ensureDocValuesManifest();
     const filterFields = filterPlanFields(docFilterPlan).filter(item => item !== field);
     const desc = !!sortPlan.desc;
     const candidatePages = sortedDirectoryPages(directory, desc, docFilterPlan);
@@ -5563,12 +5596,13 @@ export async function createSearch(options = {}) {
     const bundleResponse = await tryQueryBundleSearch({ page, size, baseTerms, filters, sortPlan, rerank, includeResults });
     if (bundleResponse) return bundleResponse;
 
-    if (hasFilters) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const fallbackCodeData = hasFilters && !docValues ? await loadCodes() : null;
+    const needsDocValues = hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan);
+    if (needsDocValues) await ensureDocValuesManifest();
+    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
     const minShouldMatch = minShouldMatchFor(baseTerms);
@@ -5641,9 +5675,68 @@ export async function createSearch(options = {}) {
       );
     }
 
+    let conjunctionTailCandidates = -1;
+    let conjunctionTailBlocks = 0;
+
+    // Once fewer base terms remain active than a fresh doc needs to reach
+    // minShouldMatch, the eligible-doc set is closed: only docs already in
+    // `hits` with enough remaining potential can still qualify. Scanning the
+    // remaining blocks (typically one common term's long tail — "berlin" in
+    // a Berlin extract after "hauptbahnhof" exhausts) would decode them all;
+    // instead the survivors are looked up by candidate doc id, skipping
+    // every block whose doc range holds no candidate.
+    async function drainConjunctionTail(active, activeBase) {
+      const candidateDocs = new Set();
+      for (const [doc, count] of hits) {
+        if (count + activeBase >= minShouldMatch) candidateDocs.add(doc);
+      }
+      conjunctionTailCandidates = candidateDocs.size;
+      const sortedCandidates = Int32Array.from(candidateDocs).sort();
+      const overlapsCandidates = block => {
+        if (!Number.isFinite(block?.docMin) || !Number.isFinite(block?.docMax)) return true;
+        let low = 0;
+        let high = sortedCandidates.length;
+        while (low < high) {
+          const mid = (low + high) >>> 1;
+          if (sortedCandidates[mid] < block.docMin) low = mid + 1;
+          else high = mid;
+        }
+        return low < sortedCandidates.length && sortedCandidates[low] <= block.docMax;
+      };
+      for (const cursor of active) {
+        const blocks = cursor.entry.blocks || [];
+        const wanted = [];
+        for (let blockIndex = cursor.blockIndex; blockIndex < blocks.length; blockIndex++) {
+          if (candidateDocs.size && blockMayPass(blocks[blockIndex], blockFilterPlan) && overlapsCandidates(blocks[blockIndex])) {
+            wanted.push(blockIndex);
+          } else {
+            cursor.skippedBlocks++;
+          }
+        }
+        cursor.blockIndex = blocks.length;
+        if (!wanted.length) continue;
+        conjunctionTailBlocks += wanted.length;
+        for (const { rows } of await lookupEntryBlocks(cursor.shard, cursor.entry, wanted, candidateDocs)) {
+          if (!rows.length) continue;
+          const codeData = hasFilters && (docValues || !needsDocValues)
+            ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
+            : fallbackCodeData;
+          blocksDecoded++;
+          postingsDecoded += rows.length / 2;
+          postingsAccepted += applyBlockRows(cursor, rows, codeData, docFilterPlan, scores, hits, masks);
+        }
+      }
+    }
+
     while (true) {
       const active = cursors.filter(cursor => advanceCursor(cursor, blockFilterPlan));
       if (!active.length) {
+        exhausted = true;
+        break;
+      }
+      const activeBase = active.reduce((sum, cursor) => sum + (cursor.isBase ? 1 : 0), 0);
+      if (activeBase < minShouldMatch) {
+        await drainConjunctionTail(active, activeBase);
         exhausted = true;
         break;
       }
@@ -5686,7 +5779,7 @@ export async function createSearch(options = {}) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && !filterSummaryProvesBlock && docValues
+        const codeData = hasFilters && !filterSummaryProvesBlock && (docValues || !needsDocValues)
           ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
           : filterSummaryProvesBlock ? null : fallbackCodeData;
         blocksDecoded++;
@@ -5750,6 +5843,7 @@ export async function createSearch(options = {}) {
         postingSuperblocksSkipped: cursors.reduce((sum, cursor) => sum + cursor.skippedSuperblocks, 0),
         postingSuperblocksDecoded: cursors.reduce((sum, cursor) => sum + cursor.superblocksDecoded, 0),
         filterSummaryProofBlocks,
+        ...(conjunctionTailCandidates >= 0 ? { conjunctionTailCandidates, conjunctionTailBlocks } : {}),
         plannerFallbackReason: budgetExhausted ? "block_budget" : exhausted ? "tail_exhausted" : "",
         ...topKProofStatsObject(proofStats, budgetExhausted ? "block_budget" : exhausted ? "tail_exhausted" : ""),
         docPayloadLane: resultContext.docPayloadLane,
@@ -5766,7 +5860,7 @@ export async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters || sortPlan) await ensureDocValuesManifest();
+    if (sortPlan) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const segmentSearch = await segmentTermEntries(terms);
     if (!segmentSearch) return null;
@@ -5795,9 +5889,11 @@ export async function createSearch(options = {}) {
     }
 
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    const needsDocValues = Boolean(sortPlan) || (hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan));
+    if (needsDocValues) await ensureDocValuesManifest();
+    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters && docValues) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
+    if (hasFilters && (docValues || !needsDocValues)) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
 
     const scores = new Map();
     const hits = new Map();
@@ -5864,7 +5960,7 @@ export async function createSearch(options = {}) {
     const offset = (page - 1) * size;
     const sortPlan = makeSortPlan(sort);
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
-    if (hasFilters || sortPlan) await ensureDocValuesManifest();
+    if (sortPlan) await ensureDocValuesManifest();
     await ensureFacetDictionaries(filters);
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
@@ -5883,10 +5979,12 @@ export async function createSearch(options = {}) {
     const hits = new Map();
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const fallbackCodeData = (hasFilters || sortPlan) && !docValues ? await loadCodes() : null;
+    const needsDocValues = Boolean(sortPlan) || (hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan));
+    if (needsDocValues) await ensureDocValuesManifest();
+    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
 
-    if (hasFilters && docValues) {
+    if (hasFilters && (docValues || !needsDocValues)) {
       const docs = new Set();
       for (const { shard, entry } of entries) {
         const postings = await decodeEntryPostings(shard, entry);
@@ -6156,6 +6254,9 @@ export async function createSearch(options = {}) {
 
   function shouldAttemptTypoFallback(params, response) {
     if (runtimeTypo.mode === "off") return false;
+    // Callers that already know a better answer exists elsewhere (the
+    // sharded merge layer) can veto the local correction scan per query.
+    if (params.typo === false) return false;
     if (params.page !== 1 || params.sort) return false;
     if (response.total === 0) return true;
     if (runtimeTypo.trigger !== "zero-or-weak") return false;
@@ -6726,7 +6827,7 @@ export async function createSearch(options = {}) {
       plannerFallbackReason: params.exact ? "exact_requested" : "full_scan"
     });
     const includeResults = params.includeResults !== false;
-    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults }, response, baseTerms, analyzedTerms);
+    const typoResponse = await maybeTypoFallback({ q, page, size, filters, sort, rerank: params.rerank, includeResults, typo: params.typo }, response, baseTerms, analyzedTerms);
     const rerankedResponse = await maybeAuthorityRerank({ q, page, size, filters, sort, rerank: params.rerank, includeResults, authority: params.authority }, typoResponse);
     if (params.highlight && includeResults && rerankedResponse?.results?.length) {
       const highlightOptions = params.highlight === true ? {} : params.highlight;
@@ -8522,8 +8623,13 @@ async function createShardedSearch(root, options, baseUrl) {
 
   // Expanding nearest-first: query shards in bbox-distance order and stop
   // once the merged page cannot improve — the next shard's minimum possible
-  // distance already exceeds the page's worst kept result.
+  // distance already exceeds the page's worst kept result. Overlapping
+  // bboxes (continent-scale shards all containing the query point) keep
+  // several front shards at distance zero, so batches of one or two turn
+  // into a long serial chain of cold shard opens; a wider batch trades a
+  // few possibly-wasted shard queries for far fewer round-trip rounds.
   async function expandingNearestQuery(front, params, need) {
+    const batchSize = 4;
     const queried = [];
     const distances = [];
     let cursor = 0;
@@ -8534,8 +8640,13 @@ async function createShardedSearch(root, options, baseUrl) {
         // possible distance clearly exceeds the page's worst kept result.
         if (front[cursor].meters > shardRoutingBudget(distances[need - 1])) break;
       }
-      const batch = front.slice(cursor, cursor + 2);
+      const batch = front.slice(cursor, cursor + batchSize);
       cursor += batch.length;
+      // Warm the likely next batch's engines (manifest fetch) while this
+      // batch queries — wasted only when the front stops exactly here.
+      for (const item of front.slice(cursor, cursor + batchSize)) {
+        engineAt(item.index).catch(() => {});
+      }
       const batchResults = await Promise.all(batch.map(item => searchShard(item.index, params)));
       for (const item of batchResults) {
         queried.push(item);
@@ -8595,17 +8706,34 @@ async function createShardedSearch(root, options, baseUrl) {
     const route = routed.route;
     const perShardParams = { ...activeParams, shards: undefined, page: 1, size: Math.min(1000, need) };
 
-    let queried;
     // Beyond each shard's 1000-row page cap the merge can no longer prove
     // completeness; the response is flagged approximate instead of silently
     // dropping rows.
     let partial = need > 1000;
-    if (route.expanding) {
-      const expanded = await expandingNearestQuery(route.expanding, perShardParams, need);
-      queried = expanded.queried;
-      partial = partial || expanded.partial;
-    } else {
-      queried = await Promise.all(route.selected.map(index => searchShard(index, perShardParams)));
+    async function runFanout(fanoutParams) {
+      if (route.expanding) {
+        const expanded = await expandingNearestQuery(route.expanding, fanoutParams, need);
+        partial = partial || expanded.partial;
+        return expanded.queried;
+      }
+      return Promise.all(route.selected.map(index => searchShard(index, fanoutParams)));
+    }
+
+    // Typo correction is deferred to a second fan-out. Routing guarantees
+    // each shard holds the query's terms, not that they co-occur, so broad
+    // queries leave most shards with zero local hits — and each would pay
+    // the expensive correction scan for corrections the merge then discards
+    // because other shards matched the query as written. Correct only when
+    // the merged result itself is empty (or weak, mirroring the single
+    // engine's trigger); this also stops corrected rows from unrelated
+    // shards blending into a page of exact matches.
+    const shardTypo = normalizeMainIndexTypoOptions(options, root);
+    const typoDeferred = shardTypo.mode !== "off" && Boolean(q) && activeParams.typo !== false;
+    let queried = await runFanout(typoDeferred ? { ...perShardParams, typo: false } : perShardParams);
+    if (typoDeferred) {
+      const mergedTotal = queried.reduce((sum, item) => sum + (item.response.total || 0), 0);
+      const weak = shardTypo.trigger === "zero-or-weak" && mergedTotal <= (shardTypo.weakResultTotal || 0);
+      if (mergedTotal === 0 || weak) queried = await runFanout(perShardParams);
     }
 
     const rows = [];

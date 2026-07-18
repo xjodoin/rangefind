@@ -91,6 +91,47 @@ function buildLanes(size) {
   ];
 }
 
+// Remote benches run thousands of concurrent requests against a live CDN.
+// Node's fetch opens one socket per in-flight request, so an uncapped storm
+// exhausts the OS and times out; browsers multiplex over a handful of
+// connections instead. Cap in-flight requests to browser-like concurrency
+// and retry transient network failures so one hiccup doesn't kill a lane.
+function installRetryingFetch({ attempts = 3, delayMs = 250, concurrency = 64 } = {}) {
+  const nativeFetch = globalThis.fetch;
+  let active = 0;
+  const waiters = [];
+  const acquire = () => active < concurrency
+    ? (active++, Promise.resolve())
+    : new Promise(resolve => waiters.push(resolve));
+  const release = () => {
+    active--;
+    const next = waiters.shift();
+    if (next) {
+      active++;
+      next();
+    }
+  };
+  globalThis.fetch = async (input, init) => {
+    await acquire();
+    try {
+      let lastError = null;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (attempt) await new Promise(r => setTimeout(r, delayMs * attempt));
+        try {
+          const response = await nativeFetch(input, init);
+          if (attempt < attempts - 1 && [429, 500, 502, 503, 504].includes(response.status)) continue;
+          return response;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError;
+    } finally {
+      release();
+    }
+  };
+}
+
 async function timeQuery(engine, run) {
   const started = performance.now();
   const response = await run(engine);
@@ -100,6 +141,7 @@ async function timeQuery(engine, run) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const lanes = buildLanes(args.size).filter(lane => !args.lanes || args.lanes.includes(lane.name));
+  installRetryingFetch();
   const meter = createFetchMeter(/./u, bucketFromUrl);
   const report = { base: args.base, runs: args.runs, at: new Date().toISOString(), lanes: {} };
 
