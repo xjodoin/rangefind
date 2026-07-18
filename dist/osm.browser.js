@@ -249,21 +249,40 @@ async function resolveLocality(engine, surface, params = {}) {
     ...params.trace ? { trace: params.trace } : {},
     ...shardScope.length ? { shards: shardScope } : {}
   });
-  const matches = localityResponse.results.filter((result) => {
-    if (!Number.isFinite(result.lat) || !Number.isFinite(result.lon)) return false;
-    if (postalMatch) {
-      const expected = `${postalMatch[1]} ${postalMatch[2]}`.toUpperCase();
-      return result.type === "postal_code" && String(result.postcode || "").toUpperCase() === expected;
-    }
-    return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === normalizedLocality;
-  });
   const typePriority = /* @__PURE__ */ new Map([["city", 5], ["town", 4], ["municipality", 3], ["village", 2], ["hamlet", 1]]);
-  matches.sort((left, right) => (typePriority.get(right.type) || 0) - (typePriority.get(left.type) || 0) || Number(right.population || 0) - Number(left.population || 0));
-  const resolved = matches[0] || null;
+  const bestMatch = (results) => {
+    const matches = (results || []).filter((result) => {
+      if (!Number.isFinite(result.lat) || !Number.isFinite(result.lon)) return false;
+      if (postalMatch) {
+        const expected = `${postalMatch[1]} ${postalMatch[2]}`.toUpperCase();
+        return result.type === "postal_code" && String(result.postcode || "").toUpperCase() === expected;
+      }
+      return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === normalizedLocality;
+    });
+    matches.sort((left, right) => (typePriority.get(right.type) || 0) - (typePriority.get(left.type) || 0) || Number(right.population || 0) - Number(left.population || 0));
+    return matches[0] || null;
+  };
+  let resolved = bestMatch(localityResponse.results);
+  let resolvedStats = localityResponse.stats || {};
+  if (!postalMatch && localityResponse.total > 0 && (typePriority.get(resolved?.type) || 0) <= 2) {
+    const populousResponse = await engine.search({
+      q: surface,
+      filters: { facets: { category: ["place"] }, numbers: { population: { min: 25e3 } } },
+      size: 8,
+      ...params.trace ? { trace: params.trace } : {},
+      ...shardScope.length ? { shards: shardScope } : {}
+    });
+    const populous = bestMatch(populousResponse.results);
+    if (populous) {
+      resolved = populous;
+      const trace = mergeRuntimeTraces(localityResponse.stats?.trace, populousResponse.stats?.trace);
+      resolvedStats = { ...populousResponse.stats || {}, ...trace ? { trace } : {} };
+    }
+  }
   if (resolved) {
     cache.set(localityKey, { ...resolved });
     Object.defineProperty(resolved, LOCALITY_SEARCH_STATS, {
-      value: localityResponse.stats || {},
+      value: resolvedStats,
       enumerable: false
     });
   } else {

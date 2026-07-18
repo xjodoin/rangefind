@@ -150,6 +150,54 @@ test("OSM exact locality search returns the city instead of matching addresses",
   assert.deepEqual(warm.stats.trace.spans, []);
 });
 
+test("OSM locality resolution prefers the populous bearer of a common name", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.numbers?.population) {
+        return {
+          total: 2,
+          results: [
+            { name: "Laval", category: "place", type: "town", lat: 48.07, lon: -0.77, shard: "pays-de-la-loire" },
+            { name: "Laval", category: "place", type: "city", lat: 45.58, lon: -73.75, shard: "quebec" }
+          ]
+        };
+      }
+      return {
+        total: 260,
+        results: [
+          { name: "Laval", category: "place", type: "hamlet", lat: 44.1, lon: 1.4, shard: "midi-pyrenees" },
+          { name: "Laval-sur-Luzège", category: "place", type: "village", lat: 45.3, lon: 2.1, shard: "limousin" }
+        ]
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "Laval", size: 10 });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].size, 32);
+  assert.equal(calls[1].filters.numbers.population.min, 25000);
+  assert.deepEqual(calls[1].filters.facets, { category: ["place"] });
+  assert.equal(response.total, 1);
+  assert.equal(response.results[0].type, "city");
+  assert.equal(response.results[0].shard, "quebec");
+  assert.equal(response.stats.plannerLane, "osmLocalityExact");
+
+  // A small real place resolves on the first page and never pays the retry.
+  const smallCalls = [];
+  const smallEngine = {
+    async search(params) {
+      smallCalls.push(params);
+      return {
+        total: 1,
+        results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.63, lon: -73.8 }]
+      };
+    }
+  };
+  await searchOsmQuery(smallEngine, { q: "Rosemère", size: 10 });
+  assert.equal(smallCalls.length, 1);
+});
+
 test("OSM street-locality search avoids common road-designator posting exhaustion", async () => {
   const calls = [];
   const engine = {
