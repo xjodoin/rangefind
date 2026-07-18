@@ -4742,8 +4742,13 @@ export async function createSearch(options = {}) {
         continue;
       }
       hasRangeBounds = true;
+      // Blocks are doc-id-ordered, so the current block's maxImpact is NOT
+      // an upper bound on what later blocks may hold — a high-impact posting
+      // at a high doc id would be understated and the proof could wrongly
+      // succeed. Cap ranges with the remaining-suffix maximum instead.
+      const cursorRemainingMax = remainingBlockMaxImpact(cursor) || block.maxImpact || 0;
       for (const range of ranges) {
-        const impact = Math.min(block.maxImpact || 0, range.maxImpact || 0);
+        const impact = Math.min(cursorRemainingMax, range.maxImpact || 0);
         if (!impact) continue;
         rangeBounds.set(range.index, (rangeBounds.get(range.index) || 0) + impact);
       }
@@ -5735,7 +5740,7 @@ export async function createSearch(options = {}) {
         break;
       }
       const activeBase = active.reduce((sum, cursor) => sum + (cursor.isBase ? 1 : 0), 0);
-      if (activeBase < minShouldMatch) {
+      if (activeBase < minShouldMatch && options.conjunctionTail !== false) {
         await drainConjunctionTail(active, activeBase);
         exhausted = true;
         break;
