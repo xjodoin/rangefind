@@ -178,11 +178,76 @@ test("OSM street-locality search avoids common road-designator posting exhaustio
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0].filters, { facets: { category: ["place"] } });
   assert.equal(calls[0].q, "Rosemère");
+  assert.equal(calls[0].size, 32);
   assert.equal(calls[1].q, "Hector");
-  assert.equal(calls[1].geo.sort, "distance");
+  // Plain text relevance, no geo machinery: a distance sort decodes every
+  // posting inside the radius (common street tokens exhaust the
+  // geoTextSortMaxDf budget in dense shards) and a radius filter verifies
+  // every candidate through doc-value chunks. The integration checks the
+  // returned page against the locality radius itself.
+  assert.equal(calls[1].geo, undefined);
   assert.equal(response.total, 1);
   assert.equal(response.results[0].name, "Rue Hector");
   assert.equal(response.results[0].address, "Rue Hector, Rosemère");
+  assert.equal(response.results[0].type, "street");
+  assert.equal(response.stats.plannerLane, "osmStreetLocality");
+});
+
+test("OSM street-locality search returns a matching civic address directly", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Calgary", category: "place", type: "city", population: 1306784, lat: 51.0456, lon: -114.0575, shard: "alberta" }]
+        };
+      }
+      return {
+        total: 1,
+        results: [
+          { id: "way/259692476", name: "Tower Centre", type: "address", house_number: "101", street: "9 Avenue SW", city: "Calgary", lat: 51.0447, lon: -114.0632, distanceMeters: 400 }
+        ],
+        stats: {}
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "101 9 avenue sw, calgary", size: 10 });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].shards, ["alberta"]);
+  assert.equal(response.total, 1);
+  assert.equal(response.results[0].name, "Tower Centre");
+  assert.equal(response.results[0].address, "101 9 Avenue SW, Calgary");
+  assert.equal(response.stats.plannerLane, "osmStreetLocality");
+  assert.equal(response.stats.osmIntentCivicAddress, true);
+});
+
+test("OSM street-locality search anchors a street through its civic addresses", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Montréal", category: "place", type: "city", population: 1704694, lat: 45.5032, lon: -73.5698, shard: "quebec" }]
+        };
+      }
+      return {
+        total: 30,
+        results: [
+          { id: "node/9", name: "1000 Rue Saint-Denis", type: "address", street: "Rue Saint-Denis", city: "Montréal", lat: 45.512, lon: -73.561, distanceMeters: 1100 }
+        ],
+        stats: {}
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "rue saint denis, montreal", size: 10 });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(response.total, 1);
+  assert.equal(response.results[0].name, "rue saint denis");
   assert.equal(response.results[0].type, "street");
   assert.equal(response.stats.plannerLane, "osmStreetLocality");
 });

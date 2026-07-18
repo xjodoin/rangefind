@@ -99,6 +99,15 @@ export function parseOsmQueryIntent(value) {
   return null;
 }
 
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad;
+  const dLon = (lon2 - lon1) * rad;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 function localityRadiusMeters(type) {
   if (type === "postal_code") return 5000;
   if (type === "city") return 30000;
@@ -252,6 +261,12 @@ async function resolveLocality(engine, surface, params = {}) {
     return resolved;
   }
   const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
+  // Locality names are common worldwide ("Montréal" is also a Mauritius
+  // suburb and a Brazilian allotment) and BM25 scores tie tightly across
+  // shards, so the real city can sit well below the first page. Fetch a
+  // wider page and let the type-priority/population sort below pick the
+  // actual locality; a too-small page here silently degrades the whole
+  // query into an unscoped global fan-out.
   const localityResponse = await engine.search(postalMatch ? {
     q: surface,
     size: 8,
@@ -260,7 +275,7 @@ async function resolveLocality(engine, surface, params = {}) {
   } : {
     q: surface,
     filters: { facets: { category: ["place"] } },
-    size: 8,
+    size: 32,
     ...(params.trace ? { trace: params.trace } : {}),
     ...(shardScope.length ? { shards: shardScope } : {})
   });
@@ -317,25 +332,90 @@ async function resolveStreetLocality(engine, surface, params) {
 
     const streetSurface = streetTokens.join(" ");
     const streetKey = fold(streetSurface);
-    const response = await engine.search({
-      ...params,
-      q: coreTokens.join(" "),
-      size: Math.max(30, Number(params.size || 10)),
-      geo: {
-        near: {
-          lat: locality.lat,
-          lon: locality.lon,
-          radiusMeters: localityRadiusMeters(locality.type)
-        },
-        sort: "distance"
-      }
-    });
+    // Rank by plain text relevance, scoped to the locality's root shard,
+    // and enforce the locality radius on the returned page here instead of
+    // through the engine's geo machinery. A distance sort would decode
+    // every posting in the radius (street tokens like "saint" blow through
+    // the geoTextSortMaxDf budget in dense shards and fail the query), and
+    // a radius filter verifies every text candidate's lat/lon through
+    // doc-value chunks — both cost far more than checking thirty results.
+    // A miss falls back to the surrounding cascade like before.
+    const localityShard = String(locality.shard || "").split("/")[0];
+    let response;
+    try {
+      response = await engine.search({
+        ...params,
+        q: coreTokens.join(" "),
+        size: Math.max(30, Number(params.size || 10)),
+        geo: undefined,
+        ...(localityShard ? { shards: [localityShard] } : {})
+      });
+    } catch {
+      // A shard-level posting budget or transport failure must not kill the
+      // whole query — fall back to the surrounding cascade.
+      return null;
+    }
+    const radiusMeters = localityRadiusMeters(locality.type);
+    const nearLocality = result => haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters;
     const street = response.results.find(result => (
       Number.isFinite(result.lat)
       && Number.isFinite(result.lon)
+      && nearLocality(result)
       && fold(result.name || result.title) === streetKey
     ));
-    if (!street) return null;
+    // Civic addresses are usually named after the occupant ("Tower Centre"),
+    // not the address, so a name match misses them. Their structured
+    // house_number + street fields are the address — matching those returns
+    // the exact point directly instead of abandoning the resolved locality
+    // for a full-index text fan-out.
+    const civic = street ? null : response.results.find(result => (
+      Number.isFinite(result.lat)
+      && Number.isFinite(result.lon)
+      && nearLocality(result)
+      && result.house_number != null
+      && result.street
+      && fold(`${result.house_number} ${result.street}`) === streetKey
+    ));
+    // Streets themselves often rank below the wall of civic addresses that
+    // sit on them. A civic address whose street FIELD matches confirms the
+    // street exists and anchors its location — good enough for the street
+    // result the demo renders.
+    const streetAnchor = street || civic ? null : response.results.find(result => (
+      Number.isFinite(result.lat)
+      && Number.isFinite(result.lon)
+      && nearLocality(result)
+      && result.street
+      && fold(result.street) === streetKey
+    ));
+    if (civic) {
+      const civicCity = civic.city || locality.name || localitySurface;
+      const civicTrace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
+      return {
+        total: 1,
+        page: 1,
+        size: Number(params.size || 10),
+        approximate: false,
+        results: [{
+          ...civic,
+          address: `${civic.house_number} ${civic.street}, ${civicCity}`,
+          city: civicCity,
+          distanceMeters: undefined
+        }],
+        resolvedQuery: `${civic.house_number} ${civic.street}, ${civicCity}`,
+        stats: {
+          ...(response.stats || {}),
+          ...(civicTrace ? { trace: civicTrace } : {}),
+          plannerLane: "osmStreetLocality",
+          osmIntentStreet: streetSurface,
+          osmIntentLocality: locality.name || localitySurface,
+          osmIntentLocalityType: locality.type || "",
+          osmIntentRadiusMeters: localityRadiusMeters(locality.type),
+          osmIntentCivicAddress: true
+        }
+      };
+    }
+    const anchor = street || streetAnchor;
+    if (!anchor) return null;
     const trace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
     return {
       total: 1,
@@ -343,7 +423,7 @@ async function resolveStreetLocality(engine, surface, params) {
       size: Number(params.size || 10),
       approximate: false,
       results: [{
-        ...street,
+        ...anchor,
         name: streetSurface,
         address: `${streetSurface}, ${locality.name || localitySurface}`,
         city: locality.name || localitySurface,

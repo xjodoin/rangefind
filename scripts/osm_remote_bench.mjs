@@ -64,6 +64,8 @@ function bucketFromUrl(url) {
 const CALGARY = { lat: 51.0447, lon: -114.0719 };
 // Berlin Mitte: dense European coverage.
 const BERLIN = { lat: 52.52, lon: 13.405 };
+// A central-Berlin viewport, matching the demo's "search this area" toggle.
+const BERLIN_BOX = { minLat: 52.49, maxLat: 52.55, minLon: 13.35, maxLon: 13.46 };
 
 function buildLanes(size) {
   return [
@@ -84,6 +86,26 @@ function buildLanes(size) {
         });
       }
     },
+    // The demo's intent lanes: category + locality ("pharmacy in Birmingham"
+    // is the app's own placeholder), street + locality, civic address with a
+    // house number, and a Canadian postal code.
+    { name: "category-locality", run: engine => searchOsmQuery(engine, { q: "pharmacy in Birmingham", size }) },
+    { name: "street-locality", run: engine => searchOsmQuery(engine, { q: "rue saint denis, montreal", size }) },
+    { name: "civic-address", run: engine => searchOsmQuery(engine, { q: "101 9 avenue sw, calgary", size }) },
+    { name: "postal-code", run: engine => searchOsmQuery(engine, { q: "H2X 1Y4", size }) },
+    // The map's "search this area" toggle issues geo.box queries, with and
+    // without text.
+    { name: "area-box", run: engine => engine.search({ q: "", geo: { box: BERLIN_BOX }, size }) },
+    { name: "area-box-text", run: engine => engine.search({ q: "cafe", geo: { box: BERLIN_BOX }, size }) },
+    // Clicking a result offers a "discovery orbit": category text, tight
+    // radius, distance sort, scoped to the clicked result's root shard.
+    { name: "discovery-orbit", run: engine => engine.search({ q: "cafe", geo: { near: { ...BERLIN, radiusMeters: 2500 }, sort: "distance" }, shards: ["berlin"], size }) },
+    // A misspelled query with zero exact hits prices the deferred federated
+    // typo retry (a second fan-out on top of the first).
+    { name: "typo-zero", run: engine => engine.search({ q: "hauptbanhof berlin", size }) },
+    // House-number prefixes take the address branch of suggestOsmQuery
+    // (no street collapse, straight authority lookup).
+    { name: "suggest-address", run: engine => suggestOsmQuery(engine, { q: "101 9 av", size: 8 }) },
     { name: "nearest", run: engine => engine.search({ q: "", geo: { near: CALGARY, sort: "distance" }, size }) },
     { name: "nearest-radius-2km", run: engine => engine.search({ q: "", geo: { near: { ...CALGARY, radiusMeters: 2000 }, sort: "distance" }, size }) },
     { name: "text+near-boost", run: engine => engine.search({ q: "coffee", geo: { near: { ...BERLIN, radiusMeters: 5000 }, boost: { weight: 2, pivotMeters: 2000 } }, size }) },
@@ -173,7 +195,7 @@ async function main() {
       warmKbPerRun: Math.round(kb(warmMeter.bytes) / args.runs),
       total: warmResponse.total,
       shardsQueried: warmResponse.stats?.shardsQueried ?? null,
-      topIds: (warmResponse.results || warmResponse.suggestions || []).slice(0, 3).map(item => item.id || item.text)
+      topIds: (warmResponse.results || warmResponse.suggestions || []).slice(0, 3).map(item => item.id || item.text || item.name)
     };
     const r = report.lanes[lane.name];
     console.log(`  ${lane.name}: cold ${r.coldMs}ms / ${r.coldRequests} req / ${r.coldKb}KB — warm ${r.warmMeanMs}ms (p95 ${r.warmP95Ms}) / ${r.warmRequestsPerRun} req / ${r.warmKbPerRun}KB${r.shardsQueried != null ? ` — shards ${r.shardsQueried}` : ""}`);

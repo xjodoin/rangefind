@@ -107,6 +107,13 @@ function parseOsmQueryIntent(value) {
   }
   return null;
 }
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad;
+  const dLon = (lon2 - lon1) * rad;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+  return 6371e3 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 function localityRadiusMeters(type) {
   if (type === "postal_code") return 5e3;
   if (type === "city") return 3e4;
@@ -238,7 +245,7 @@ async function resolveLocality(engine, surface, params = {}) {
   } : {
     q: surface,
     filters: { facets: { category: ["place"] } },
-    size: 8,
+    size: 32,
     ...params.trace ? { trace: params.trace } : {},
     ...shardScope.length ? { shards: shardScope } : {}
   });
@@ -281,21 +288,53 @@ async function resolveStreetLocality(engine, surface, params) {
     if (!locality) continue;
     const streetSurface = streetTokens.join(" ");
     const streetKey = fold(streetSurface);
-    const response = await engine.search({
-      ...params,
-      q: coreTokens.join(" "),
-      size: Math.max(30, Number(params.size || 10)),
-      geo: {
-        near: {
-          lat: locality.lat,
-          lon: locality.lon,
-          radiusMeters: localityRadiusMeters(locality.type)
-        },
-        sort: "distance"
-      }
-    });
-    const street = response.results.find((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && fold(result.name || result.title) === streetKey);
-    if (!street) return null;
+    const localityShard = String(locality.shard || "").split("/")[0];
+    let response;
+    try {
+      response = await engine.search({
+        ...params,
+        q: coreTokens.join(" "),
+        size: Math.max(30, Number(params.size || 10)),
+        geo: void 0,
+        ...localityShard ? { shards: [localityShard] } : {}
+      });
+    } catch {
+      return null;
+    }
+    const radiusMeters = localityRadiusMeters(locality.type);
+    const nearLocality = (result) => haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters;
+    const street = response.results.find((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && nearLocality(result) && fold(result.name || result.title) === streetKey);
+    const civic = street ? null : response.results.find((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && nearLocality(result) && result.house_number != null && result.street && fold(`${result.house_number} ${result.street}`) === streetKey);
+    const streetAnchor = street || civic ? null : response.results.find((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && nearLocality(result) && result.street && fold(result.street) === streetKey);
+    if (civic) {
+      const civicCity = civic.city || locality.name || localitySurface;
+      const civicTrace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
+      return {
+        total: 1,
+        page: 1,
+        size: Number(params.size || 10),
+        approximate: false,
+        results: [{
+          ...civic,
+          address: `${civic.house_number} ${civic.street}, ${civicCity}`,
+          city: civicCity,
+          distanceMeters: void 0
+        }],
+        resolvedQuery: `${civic.house_number} ${civic.street}, ${civicCity}`,
+        stats: {
+          ...response.stats || {},
+          ...civicTrace ? { trace: civicTrace } : {},
+          plannerLane: "osmStreetLocality",
+          osmIntentStreet: streetSurface,
+          osmIntentLocality: locality.name || localitySurface,
+          osmIntentLocalityType: locality.type || "",
+          osmIntentRadiusMeters: localityRadiusMeters(locality.type),
+          osmIntentCivicAddress: true
+        }
+      };
+    }
+    const anchor = street || streetAnchor;
+    if (!anchor) return null;
     const trace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
     return {
       total: 1,
@@ -303,7 +342,7 @@ async function resolveStreetLocality(engine, surface, params) {
       size: Number(params.size || 10),
       approximate: false,
       results: [{
-        ...street,
+        ...anchor,
         name: streetSurface,
         address: `${streetSurface}, ${locality.name || localitySurface}`,
         city: locality.name || localitySurface,
