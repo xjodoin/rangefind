@@ -292,11 +292,37 @@ async function fetchGzipArrayBuffer(url) {
 
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceFetch(bucket, () => fetchImpl(url, {
-    headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-  }));
-  if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
-  return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+  for (let attempt = 0; ; attempt++) {
+    const response = await traceFetch(bucket, () => fetchImpl(url, {
+      headers: { Range: `bytes=${offset}-${offset + length - 1}` }
+    }));
+    if (response.status === 206) {
+      return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+    }
+    if (response.status === 200) {
+      // Servers and CDN cache layers may ignore Range and answer with the
+      // whole object (Cloudflare does this while an object is un-cached).
+      // Small objects are salvaged by slicing; large ones are aborted — a
+      // multi-hundred-MB pointer file must never be pulled onto a phone —
+      // and retried, since caches usually honor Range once the object is
+      // resident.
+      const total = Number(response.headers.get("content-length") || 0);
+      if (total > 0 && total <= Math.max(length * 4, 1 << 20)) {
+        const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+        return body.slice(offset, offset + length);
+      }
+      try {
+        await response.body?.cancel?.();
+      } catch {
+        // Cancellation is best-effort; some transports have no body stream.
+      }
+      if (attempt < 2) {
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 150 * (attempt + 1)));
+        continue;
+      }
+    }
+    throw new Error(`Range request failed for ${url}`);
+  }
 }
 
 function selectedFacetCodes(manifest, field, selected) {
@@ -5292,7 +5318,6 @@ export async function createSearch(options = {}) {
     hasFilters,
     blockFilterPlan,
     docFilterPlan,
-    fallbackCodeData,
     rerank,
     candidateK,
     minShouldMatch,
@@ -5475,9 +5500,9 @@ export async function createSearch(options = {}) {
         );
       }
       for (const { cursor, rows, docsInRange, filterSummaryProvesBlock } of pendingBlocks) {
-        const codeData = hasFilters && !filterSummaryProvesBlock && docValues
+        const codeData = hasFilters && !filterSummaryProvesBlock
           ? await valueStoreForFilterPlan(docFilterPlan, docsInRange)
-          : filterSummaryProvesBlock ? null : fallbackCodeData;
+          : null;
         postingsDecoded += rows.length / 2;
         postingsAccepted += applyBlockRowsInDocRange(
           cursor,
@@ -5605,9 +5630,12 @@ export async function createSearch(options = {}) {
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const needsDocValues = hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan);
-    if (needsDocValues) await ensureDocValuesManifest();
-    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
+    // Doc values load lazily through valueStoreForFilterPlan: only shards
+    // whose blocks actually surface candidates pay the (large) doc-values
+    // manifest; bitmap-covered plans never load it at all. On a wide
+    // fan-out most shards are barren, and the per-shard manifest is the
+    // single biggest metadata download.
+
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
     const minShouldMatch = minShouldMatchFor(baseTerms);
@@ -5630,7 +5658,6 @@ export async function createSearch(options = {}) {
       hasFilters,
       blockFilterPlan,
       docFilterPlan,
-      fallbackCodeData,
       rerank,
       candidateK,
       minShouldMatch,
@@ -5723,9 +5750,9 @@ export async function createSearch(options = {}) {
         conjunctionTailBlocks += wanted.length;
         for (const { rows } of await lookupEntryBlocks(cursor.shard, cursor.entry, wanted, candidateDocs)) {
           if (!rows.length) continue;
-          const codeData = hasFilters && (docValues || !needsDocValues)
+          const codeData = hasFilters
             ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
-            : fallbackCodeData;
+            : null;
           blocksDecoded++;
           postingsDecoded += rows.length / 2;
           postingsAccepted += applyBlockRows(cursor, rows, codeData, docFilterPlan, scores, hits, masks);
@@ -5784,9 +5811,9 @@ export async function createSearch(options = {}) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && !filterSummaryProvesBlock && (docValues || !needsDocValues)
+        const codeData = hasFilters && !filterSummaryProvesBlock
           ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
-          : filterSummaryProvesBlock ? null : fallbackCodeData;
+          : null;
         blocksDecoded++;
         postingsDecoded += rows.length / 2;
         postingsAccepted += applyBlockRows(cursor, rows, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
@@ -5894,11 +5921,9 @@ export async function createSearch(options = {}) {
     }
 
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const needsDocValues = Boolean(sortPlan) || (hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan));
-    if (needsDocValues) await ensureDocValuesManifest();
-    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
+    const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters && (docValues || !needsDocValues)) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
+    if (hasFilters) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
 
     const scores = new Map();
     const hits = new Map();
@@ -5984,12 +6009,10 @@ export async function createSearch(options = {}) {
     const hits = new Map();
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const needsDocValues = Boolean(sortPlan) || (hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan));
-    if (needsDocValues) await ensureDocValuesManifest();
-    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
+    const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
 
-    if (hasFilters && (docValues || !needsDocValues)) {
+    if (hasFilters) {
       const docs = new Set();
       for (const { shard, entry } of entries) {
         const postings = await decodeEntryPostings(shard, entry);

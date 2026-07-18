@@ -4407,11 +4407,30 @@ async function fetchGzipArrayBuffer(url) {
 }
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
-  const response = await traceFetch(bucket, () => fetchImpl(url, {
-    headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-  }));
-  if (response.status !== 206) throw new Error(`Range request failed for ${url}`);
-  return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+  for (let attempt = 0; ; attempt++) {
+    const response = await traceFetch(bucket, () => fetchImpl(url, {
+      headers: { Range: `bytes=${offset}-${offset + length - 1}` }
+    }));
+    if (response.status === 206) {
+      return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+    }
+    if (response.status === 200) {
+      const total = Number(response.headers.get("content-length") || 0);
+      if (total > 0 && total <= Math.max(length * 4, 1 << 20)) {
+        const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+        return body.slice(offset, offset + length);
+      }
+      try {
+        await response.body?.cancel?.();
+      } catch {
+      }
+      if (attempt < 2) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 150 * (attempt + 1)));
+        continue;
+      }
+    }
+    throw new Error(`Range request failed for ${url}`);
+  }
 }
 function selectedFacetCodes(manifest, field, selected) {
   if (!selected?.size) return null;
@@ -8914,7 +8933,6 @@ async function createSearch(options = {}) {
     hasFilters,
     blockFilterPlan,
     docFilterPlan,
-    fallbackCodeData,
     rerank,
     candidateK,
     minShouldMatch,
@@ -9086,7 +9104,7 @@ async function createSearch(options = {}) {
         );
       }
       for (const { cursor, rows: rows2, docsInRange, filterSummaryProvesBlock } of pendingBlocks) {
-        const codeData = hasFilters && !filterSummaryProvesBlock && docValues ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : filterSummaryProvesBlock ? null : fallbackCodeData;
+        const codeData = hasFilters && !filterSummaryProvesBlock ? await valueStoreForFilterPlan(docFilterPlan, docsInRange) : null;
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRowsInDocRange(
           cursor,
@@ -9201,9 +9219,6 @@ async function createSearch(options = {}) {
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const needsDocValues = hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan);
-    if (needsDocValues) await ensureDocValuesManifest();
-    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
     const minShouldMatch = minShouldMatchFor(baseTerms);
@@ -9226,7 +9241,6 @@ async function createSearch(options = {}) {
       hasFilters,
       blockFilterPlan,
       docFilterPlan,
-      fallbackCodeData,
       rerank,
       candidateK,
       minShouldMatch,
@@ -9308,7 +9322,7 @@ async function createSearch(options = {}) {
         conjunctionTailBlocks += wanted.length;
         for (const { rows: rows2 } of await lookupEntryBlocks(cursor.shard, cursor.entry, wanted, candidateDocs)) {
           if (!rows2.length) continue;
-          const codeData = hasFilters && (docValues || !needsDocValues) ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : fallbackCodeData;
+          const codeData = hasFilters ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
           blocksDecoded++;
           postingsDecoded += rows2.length / 2;
           postingsAccepted += applyBlockRows(cursor, rows2, codeData, docFilterPlan, scores, hits, masks);
@@ -9356,7 +9370,7 @@ async function createSearch(options = {}) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && !filterSummaryProvesBlock && (docValues || !needsDocValues) ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : filterSummaryProvesBlock ? null : fallbackCodeData;
+        const codeData = hasFilters && !filterSummaryProvesBlock ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
         blocksDecoded++;
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRows(cursor, rows2, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
@@ -9456,11 +9470,9 @@ async function createSearch(options = {}) {
       for (let i = 0; i < rows2.length; i += 2) candidateDocs.add(rows2[i]);
     }
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const needsDocValues = Boolean(sortPlan) || hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan);
-    if (needsDocValues) await ensureDocValuesManifest();
-    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
+    const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters && (docValues || !needsDocValues)) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
+    if (hasFilters) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     let postingsAccepted = 0;
@@ -9541,11 +9553,9 @@ async function createSearch(options = {}) {
     const hits = /* @__PURE__ */ new Map();
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const filterFields = filterPlanFields(docFilterPlan);
-    const needsDocValues = Boolean(sortPlan) || hasFilters && await docFilterPlanNeedsDocValues(docFilterPlan);
-    if (needsDocValues) await ensureDocValuesManifest();
-    const fallbackCodeData = needsDocValues && !docValues ? await loadCodes() : null;
+    const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters && (docValues || !needsDocValues)) {
+    if (hasFilters) {
       const docs = /* @__PURE__ */ new Set();
       for (const { shard, entry } of entries) {
         const postings = await decodeEntryPostings(shard, entry);
