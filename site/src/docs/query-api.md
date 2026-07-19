@@ -86,6 +86,20 @@ const { total, totalExact } = await rf.count({ q: "harbor" });
 
 Exact totals for text queries without paying for result hydration.
 
+## Sorting
+
+Results rank by BM25F relevance unless you ask otherwise:
+
+```js
+await rf.search({ q: "harbor", sort: "-year" });
+```
+
+`sort` takes the name of a [number or boolean
+field](../build-configuration/#facets-numbers-booleans), prefixed with `-`
+for descending; sorting reads that field's doc values. For nearest-first
+geo ordering use `geo: { sort: "distance" }` instead — see [geo
+queries](#geo-queries).
+
 ## Geo queries
 
 ```js

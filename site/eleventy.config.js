@@ -42,15 +42,42 @@ export default function (eleventyConfig) {
     }
   });
 
+  // GitHub-style heading ids so #fragment links between docs pages resolve.
+  eleventyConfig.amendLibrary("md", mdLib => {
+    const slugify = text =>
+      text.toLowerCase().trim().replace(/[^\w\s-]/gu, "").replace(/\s+/gu, "-");
+    mdLib.core.ruler.push("heading_ids", state => {
+      const seen = new Map();
+      for (let i = 0; i < state.tokens.length; i++) {
+        if (state.tokens[i].type !== "heading_open") continue;
+        const inline = state.tokens[i + 1];
+        const text = (inline?.children ?? [])
+          .filter(t => t.type === "text" || t.type === "code_inline")
+          .map(t => t.content)
+          .join("");
+        let slug = slugify(text) || "section";
+        const count = seen.get(slug) ?? 0;
+        seen.set(slug, count + 1);
+        if (count) slug = `${slug}-${count}`;
+        state.tokens[i].attrSet("id", slug);
+      }
+    });
+  });
+
   eleventyConfig.addPassthroughCopy({ "src/assets": "assets" });
 
   // The changelog page renders the repository's CHANGELOG.md verbatim, so
-  // the site can never drift from the source of truth.
+  // the site can never drift from the source of truth. Repo-relative links
+  // (e.g. packages/rangefind-astro) only resolve on GitHub, so point them at
+  // the repository tree instead of letting them 404 under /changelog/.
   eleventyConfig.addGlobalData("changelogHtml", () => {
     const md = markdownIt({ html: false, linkify: true });
+    const repoTree = "https://github.com/xjodoin/rangefind/tree/main/";
     const source = readFileSync(resolve(siteDir, "../CHANGELOG.md"), "utf8")
       .replace(/^# Changelog\s*/u, ""); // the page supplies its own H1
-    return md.render(source);
+    return md
+      .render(source)
+      .replace(/href="(?!(?:[a-z][a-z0-9+.-]*:|\/|#))([^"]+)"/gu, `href="${repoTree}$1"`);
   });
 
   // llms-full.txt: every docs page as raw Markdown (front matter stripped,

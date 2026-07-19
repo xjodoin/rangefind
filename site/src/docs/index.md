@@ -18,7 +18,7 @@ npm install rangefind
 ```
 
 Node ≥ 22 is required for building. Querying happens in any modern browser
-(or in Node via [`rangefind/node`](../node-runtime/)).
+(or in Node via [`rangefind/node`](node-runtime/)).
 
 ## Option A — index a built site
 
@@ -51,7 +51,7 @@ Then drop the search component into your pages:
 ```
 
 If you use Eleventy, Astro, Docusaurus, MkDocs, or Hugo, a
-[plugin](../plugins/) wires all of this into your build automatically —
+[plugin](plugins/) wires all of this into your build automatically —
 including copying the component assets.
 
 ## Option B — index structured data
@@ -78,7 +78,7 @@ npx rangefind build --config rangefind.config.json
 ```
 
 Every relevance, facet, geo, and vector capability is driven from this one
-config — see the [build configuration reference](../build-configuration/).
+config — see the [build configuration reference](build-configuration/).
 
 ## Query it
 
@@ -95,8 +95,8 @@ const typing = await rf.suggest({ q: "harb" });
 ```
 
 The same `createSearch` call transparently handles single indexes,
-[incrementally updated](../incremental-updates/) generational indexes, and
-[sharded](../sharded-indexes/) indexes — the manifest tells the runtime what
+[incrementally updated](incremental-updates/) generational indexes, and
+[sharded](sharded-indexes/) indexes — the manifest tells the runtime what
 it's looking at.
 
 ## Serve it
@@ -109,10 +109,10 @@ npx serve dist   # or your generator's dev server
 ```
 
 For production hosting, caching headers, and CDN guidance, read
-[Hosting the index](../hosting/).
+[Hosting the index](hosting/).
 
 ## Where next
 
-- [How it works](../how-it-works/) — what's actually in those files.
-- [Search component](../search-component/) — every attribute and CSS hook.
-- [Query API](../query-api/) — filters, facets, sorting, geo, vectors.
+- [How it works](how-it-works/) — what's actually in those files.
+- [Search component](search-component/) — every attribute and CSS hook.
+- [Query API](query-api/) — filters, facets, sorting, geo, vectors.
