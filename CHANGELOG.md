@@ -21,6 +21,20 @@
   straight from the root artifact and scope the follow-up search to the
   shards that own the name, replacing the global fan-out that opened ~200
   shards per cold locality query. Advisory: a scoped miss retries unscoped.
+- **OSM locality enrichment**: extraction now stamps every document that
+  lacks a mapper-provided `addr:city` with its actual municipality —
+  administrative-boundary containment first (`boundary=administrative`
+  relations at admin_level 8/7, assembled into polygons from a new relation
+  pass in the PBF reader), nearest place node as fallback where boundaries
+  are missing or clipped at extract edges. The derived name lands in the
+  `city` display field and the indexed `address_search` text, so
+  brand-plus-town queries ("jean coutu rosemère") match the POI even though
+  the OSM node carries only name and amenity tags; the formatted address
+  and the authority address lane stay untouched. Luxembourg: 99% of
+  documents carry a city after enrichment. Extraction schema v9
+  — cached corpora re-extract, and planet deployments should regenerate
+  scoring stats alongside the rebuild (locality terms change document
+  frequencies corpus-wide).
 
 ## 0.3.5 — 2026-07-18
 

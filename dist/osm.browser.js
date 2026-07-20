@@ -237,18 +237,6 @@ async function resolveLocality(engine, surface, params = {}) {
     return resolved2;
   }
   const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
-  const localityResponse = await engine.search(postalMatch ? {
-    q: surface,
-    size: 8,
-    ...params.trace ? { trace: params.trace } : {},
-    ...shardScope.length ? { shards: shardScope } : {}
-  } : {
-    q: surface,
-    filters: { facets: { category: ["place"] } },
-    size: 32,
-    ...params.trace ? { trace: params.trace } : {},
-    ...shardScope.length ? { shards: shardScope } : {}
-  });
   const typePriority = /* @__PURE__ */ new Map([["city", 5], ["town", 4], ["municipality", 3], ["village", 2], ["hamlet", 1]]);
   const bestMatch = (results) => {
     const matches = (results || []).filter((result) => {
@@ -262,23 +250,61 @@ async function resolveLocality(engine, surface, params = {}) {
     matches.sort((left, right) => (typePriority.get(right.type) || 0) - (typePriority.get(left.type) || 0) || Number(right.population || 0) - Number(left.population || 0));
     return matches[0] || null;
   };
-  let resolved = bestMatch(localityResponse.results);
-  let resolvedStats = localityResponse.stats || {};
-  if (!postalMatch && localityResponse.total > 0 && (typePriority.get(resolved?.type) || 0) <= 2) {
-    const populousResponse = await engine.search({
-      q: surface,
-      filters: { facets: { category: ["place"] }, numbers: { population: { min: 25e3 } } },
-      size: 8,
-      ...params.trace ? { trace: params.trace } : {},
-      ...shardScope.length ? { shards: shardScope } : {}
-    });
-    const populous = bestMatch(populousResponse.results);
-    if (populous) {
-      resolved = populous;
-      const trace = mergeRuntimeTraces(localityResponse.stats?.trace, populousResponse.stats?.trace);
-      resolvedStats = { ...populousResponse.stats || {}, ...trace ? { trace } : {} };
+  let authorityShards = null;
+  if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
+    try {
+      const lookup = await engine.authorityLookup(surface, { size: 8 });
+      const scoped = [];
+      for (const match of lookup?.matches || []) {
+        if (!Array.isArray(match.shards) || !match.shards.length) continue;
+        if (fold(match.text) !== normalizedLocality) continue;
+        for (const id of match.shards) {
+          if (!scoped.includes(id)) scoped.push(id);
+        }
+        if (scoped.length >= 4) break;
+      }
+      if (scoped.length) authorityShards = scoped.slice(0, 4).sort();
+    } catch {
     }
   }
+  const attemptResolve = async (scope) => {
+    const localityResponse = await engine.search(postalMatch ? {
+      q: surface,
+      size: 8,
+      ...params.trace ? { trace: params.trace } : {},
+      ...scope ? { shards: scope } : {}
+    } : {
+      q: surface,
+      filters: { facets: { category: ["place"] } },
+      size: 32,
+      ...params.trace ? { trace: params.trace } : {},
+      ...scope ? { shards: scope } : {}
+    });
+    let resolved2 = bestMatch(localityResponse.results);
+    let resolvedStats2 = localityResponse.stats || {};
+    if (!postalMatch && localityResponse.total > 0 && (typePriority.get(resolved2?.type) || 0) <= 2) {
+      const populousResponse = await engine.search({
+        q: surface,
+        filters: { facets: { category: ["place"] }, numbers: { population: { min: 25e3 } } },
+        size: 8,
+        ...params.trace ? { trace: params.trace } : {},
+        ...scope ? { shards: scope } : {}
+      });
+      const populous = bestMatch(populousResponse.results);
+      if (populous) {
+        resolved2 = populous;
+        const trace = mergeRuntimeTraces(localityResponse.stats?.trace, populousResponse.stats?.trace);
+        resolvedStats2 = { ...populousResponse.stats || {}, ...trace ? { trace } : {} };
+      }
+    }
+    return { resolved: resolved2, resolvedStats: resolvedStats2 };
+  };
+  let outcome = await attemptResolve(authorityShards || (shardScope.length ? shardScope : null));
+  if (!outcome.resolved && authorityShards) {
+    outcome = await attemptResolve(shardScope.length ? shardScope : null);
+  }
+  const resolved = outcome.resolved;
+  const resolvedStats = outcome.resolvedStats;
   if (resolved) {
     cache.set(localityKey, { ...resolved });
     Object.defineProperty(resolved, LOCALITY_SEARCH_STATS, {

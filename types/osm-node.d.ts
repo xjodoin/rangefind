@@ -65,5 +65,14 @@ export function extractOsmPlaces(options?: ExtractOsmPlacesOptions): Promise<{
   docs: number;
   bytes?: number;
   seconds?: number;
+  /** Locality enrichment: municipality boundaries assembled and documents stamped. */
+  locality?: {
+    boundaries: number;
+    boundariesDropped: number;
+    ringsDropped: number;
+    places: number;
+    enrichedFromBoundaries: number;
+    enrichedFromPlaces: number;
+  };
   [key: string]: unknown;
 }>;

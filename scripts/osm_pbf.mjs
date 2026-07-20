@@ -1,8 +1,9 @@
 // Minimal pure-Node OpenStreetMap PBF reader.
 //
-// Supports the subset of the OSM PBF format needed to extract tagged nodes
-// and tagged ways from Geofabrik-style extracts: file blobs, zlib blob
-// compression, dense nodes, plain nodes, and ways (tags + node refs).
+// Supports the subset of the OSM PBF format needed to extract tagged nodes,
+// tagged ways, and relations from Geofabrik-style extracts: file blobs, zlib
+// blob compression, dense nodes, plain nodes, ways (tags + node refs), and
+// relations (tags + typed members with roles).
 // See https://wiki.openstreetmap.org/wiki/PBF_Format for the schema.
 
 import { openSync, readSync, closeSync } from "node:fs";
@@ -167,12 +168,47 @@ function parseWay(bytes) {
   return way;
 }
 
+// Relation member types per the OSM PBF enum.
+const MEMBER_TYPES = ["node", "way", "relation"];
+
+function parseRelation(bytes) {
+  const relation = { id: 0, keys: [], vals: [], rolesSid: [], memids: [], types: [] };
+  for (const { field, wireType, state } of fields(bytes)) {
+    if (field === 1) relation.id = readVarint53(bytes, state);
+    else if (field === 2 && wireType === WIRE_BYTES) readPackedUint(bytes, state, relation.keys);
+    else if (field === 3 && wireType === WIRE_BYTES) readPackedUint(bytes, state, relation.vals);
+    else if (field === 8 && wireType === WIRE_BYTES) readPackedUint(bytes, state, relation.rolesSid);
+    else if (field === 9 && wireType === WIRE_BYTES) readPackedSint(bytes, state, relation.memids);
+    else if (field === 10 && wireType === WIRE_BYTES) readPackedUint(bytes, state, relation.types);
+    else skipField(bytes, state, wireType);
+  }
+  let acc = 0;
+  for (let i = 0; i < relation.memids.length; i++) {
+    acc += relation.memids[i];
+    relation.memids[i] = acc;
+  }
+  return relation;
+}
+
+function relationMembers(relation, strings) {
+  const members = new Array(relation.memids.length);
+  for (let i = 0; i < relation.memids.length; i++) {
+    members[i] = {
+      type: MEMBER_TYPES[relation.types[i]] || "node",
+      ref: relation.memids[i],
+      role: strings[relation.rolesSid[i]] || ""
+    };
+  }
+  return members;
+}
+
 function parsePrimitiveGroup(bytes, selected) {
-  const group = { dense: null, nodes: [], ways: [] };
+  const group = { dense: null, nodes: [], ways: [], relations: [] };
   for (const { field, wireType, state } of fields(bytes)) {
     if (field === 1 && wireType === WIRE_BYTES && selected.nodes) group.nodes.push(parseNode(readBytes(bytes, state)));
     else if (field === 2 && wireType === WIRE_BYTES && selected.nodes) group.dense = parseDenseNodes(readBytes(bytes, state));
     else if (field === 3 && wireType === WIRE_BYTES && selected.ways) group.ways.push(parseWay(readBytes(bytes, state)));
+    else if (field === 4 && wireType === WIRE_BYTES && selected.relations) group.relations.push(parseRelation(readBytes(bytes, state)));
     else skipField(bytes, state, wireType);
   }
   return group;
@@ -243,12 +279,14 @@ function elementTags(keys, vals, strings) {
   return tags;
 }
 
-// Streams { id, lat, lon, tags } for every node, and { id, refs, tags } for
-// every way when handlers ask for them. `onNode(id, lat, lon, tags)` receives
-// tags as null when a node has none, so dense untagged nodes stay cheap.
-export function scanPbf(path, { onNode = null, onWay = null } = {}) {
-  const counts = { nodes: 0, ways: 0, blocks: 0 };
-  const selected = { nodes: Boolean(onNode), ways: Boolean(onWay) };
+// Streams { id, lat, lon, tags } for every node, { id, refs, tags } for
+// every way, and { id, members, tags } for every relation when handlers ask
+// for them. `onNode(id, lat, lon, tags)` receives tags as null when a node
+// has none, so dense untagged nodes stay cheap. Members are
+// { type: "node"|"way"|"relation", ref, role }.
+export function scanPbf(path, { onNode = null, onWay = null, onRelation = null } = {}) {
+  const counts = { nodes: 0, ways: 0, relations: 0, blocks: 0 };
+  const selected = { nodes: Boolean(onNode), ways: Boolean(onWay), relations: Boolean(onRelation) };
   for (const blob of rawBlobs(path)) {
     if (blob.type !== "OSMData") continue;
     const block = parsePrimitiveBlock(parseBlob(blob.bytes), selected);
@@ -292,6 +330,12 @@ export function scanPbf(path, { onNode = null, onWay = null } = {}) {
           onWay(way.id, way.refs, elementTags(way.keys, way.vals, strings));
         }
         counts.ways += group.ways.length;
+      }
+      if (group.relations.length && onRelation) {
+        for (const relation of group.relations) {
+          onRelation(relation.id, relationMembers(relation, strings), elementTags(relation.keys, relation.vals, strings));
+        }
+        counts.relations += group.relations.length;
       }
     }
   }

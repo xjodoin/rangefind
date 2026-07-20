@@ -194,6 +194,30 @@ export function placeDoc(osmType, osmId, lat, lon, tags) {
   return doc;
 }
 
+// Stamps a spatially derived locality onto a document that has no
+// mapper-provided city. The name lands in `city` (display, street/civic
+// matching) and in `address_search` (indexed text), so "jean coutu rosemère"
+// matches the Rosemère pharmacy even though the OSM node carries only
+// name+amenity. The formatted `address` and the authority address lane stay
+// untouched — the derived locality is a search hint, not an address claim.
+export function enrichDocLocality(doc, city) {
+  if (!doc || doc.city) return false;
+  // Places name localities; stamping a city onto a city (or its own suburbs
+  // onto itself) would only distort ranking.
+  if (doc.category === "place") return false;
+  const cityText = cleanText(city);
+  if (!cityText) return false;
+  doc.city = cityText;
+  const search = cleanText(doc.address_search);
+  const key = cityText.toLocaleLowerCase("en-US");
+  if (!search) {
+    doc.address_search = cityText;
+  } else if (!search.toLocaleLowerCase("en-US").includes(key)) {
+    doc.address_search = `${search}, ${cityText}`;
+  }
+  return true;
+}
+
 function interpolationStep(value) {
   const normalized = cleanText(value).toLowerCase();
   if (normalized === "all") return 1;

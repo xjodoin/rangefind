@@ -38,12 +38,19 @@ import { fileURLToPath } from "node:url";
 import { scanPbf } from "./osm_pbf.mjs";
 import {
   addressFromTags,
+  enrichDocLocality,
   interpolationRangeDocs,
   placeDoc,
   retainedAddressTagEntries,
   searchablePlaceTags,
   wayDocTagEntries
 } from "../src/integrations/osm/documents.js";
+import {
+  assembleRings,
+  createLocalityIndex,
+  LOCALITY_ADMIN_LEVELS,
+  PLACE_RADII_METERS
+} from "../src/integrations/osm/locality_index.js";
 import {
   coordinateStoreExists,
   createAnchorRefWriter,
@@ -66,7 +73,9 @@ const REGIONS = {
 // Included in every reusable extraction-stage identity. Bump this whenever
 // document selection or normalized output changes so a large PBF can never
 // silently reuse an older corpus shape.
-const OSM_FIXTURE_SCHEMA_VERSION = 8;
+// v9: locality enrichment — documents without addr:city get their containing
+// municipality (admin boundary containment, place-node radius fallback).
+const OSM_FIXTURE_SCHEMA_VERSION = 9;
 
 function parseArgs(argv) {
   const args = {
@@ -174,13 +183,6 @@ async function eachJsonLine(path, handler) {
   }
 }
 
-async function eachRawLine(path, handler) {
-  const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-  for await (const line of lines) {
-    if (line && await handler(line)) break;
-  }
-}
-
 function pbfIdentity(path) {
   const absolute = resolve(path);
   const stat = statSync(absolute);
@@ -242,6 +244,13 @@ async function writeJsonl(args) {
   const nodeMetaPath = resolve(args.root, "data", "osm-node-docs.meta.json");
   const coordPath = resolve(args.root, "data", "osm-way-anchor-coords.sqlite");
   const coordMetaPath = resolve(args.root, "data", "osm-way-anchor-coords.meta.json");
+  const boundaryRelationsPath = resolve(args.root, "data", "osm-boundary-relations.jsonl");
+  const boundaryRelationsPartialPath = `${boundaryRelationsPath}.partial`;
+  const boundaryRelationsMetaPath = resolve(args.root, "data", "osm-boundary-relations.meta.json");
+  const boundaryWaysPath = resolve(args.root, "data", "osm-boundary-ways.jsonl");
+  const boundaryWaysPartialPath = `${boundaryWaysPath}.partial`;
+  const placeNodesPath = resolve(args.root, "data", "osm-place-nodes.jsonl");
+  const placeNodesPartialPath = `${placeNodesPath}.partial`;
   mkdirSync(dirname(outPath), { recursive: true });
   ensurePbf(args);
   const identity = pbfIdentity(args.pbf);
@@ -254,28 +263,88 @@ async function writeJsonl(args) {
   }
   const t0 = performance.now();
   const stageSeconds = {};
+
+  // Stage 1/5: administrative boundary relations (municipality polygons for
+  // locality enrichment). Relations sit after ways in the PBF, so knowing
+  // which ways are boundary members before the way scan requires this
+  // dedicated pass; node and way groups are skipped undecoded.
+  let boundaryRelations = 0;
+  let reusableBoundaries = false;
+  if (!args.force && existsSync(boundaryRelationsPath) && existsSync(boundaryRelationsMetaPath)) {
+    const meta = JSON.parse(readFileSync(boundaryRelationsMetaPath, "utf8"));
+    if (matchesPbf(meta, identity)) {
+      console.log(`[osm] reusing ${meta.boundaryRelations.toLocaleString()} boundary relations`);
+      boundaryRelations = meta.boundaryRelations;
+      reusableBoundaries = true;
+    }
+  }
+  if (!reusableBoundaries) {
+    const stageStart = performance.now();
+    console.log(`[osm] stage 1/5: scanning boundary relations from ${args.pbf}`);
+    const writer = createBufferedJsonlWriter(boundaryRelationsPartialPath);
+    const adminLevels = new Set(LOCALITY_ADMIN_LEVELS.map(String));
+    scanPbf(args.pbf, {
+      onRelation(id, members, tags) {
+        if (tags.get("boundary") !== "administrative") return;
+        if (!adminLevels.has(tags.get("admin_level"))) return;
+        const name = tags.get("name");
+        if (!name) return;
+        const wayIds = [];
+        for (const member of members) {
+          // Inner rings join the even-odd containment test alongside outers,
+          // so both roles spool; other roles (admin_centre, label) are nodes.
+          if (member.type === "way" && (member.role === "outer" || member.role === "inner" || member.role === "")) {
+            wayIds.push(member.ref);
+          }
+        }
+        if (!wayIds.length) return;
+        writer.write([id, name, Number(tags.get("admin_level")), wayIds]);
+        boundaryRelations++;
+      }
+    });
+    writer.close();
+    renameSync(boundaryRelationsPartialPath, boundaryRelationsPath);
+    writeFileSync(boundaryRelationsMetaPath, JSON.stringify({ ...identity, boundaryRelations }, null, 2));
+    stageSeconds.boundaryRelations = elapsedSeconds(stageStart);
+  }
+  const boundaryWayIds = new Set();
+  await eachJsonLine(boundaryRelationsPath, ([, , , wayIds]) => {
+    for (const wayId of wayIds) boundaryWayIds.add(wayId);
+  });
+
   let ways = 0;
   let interpolationWays = 0;
+  let boundaryWays = 0;
   let reusableWays = false;
-  if (!args.force && existsSync(wayPath) && existsSync(wayMetaPath)) {
+  if (!args.force && existsSync(wayPath) && existsSync(wayMetaPath) && existsSync(boundaryWaysPath)) {
     const meta = JSON.parse(readFileSync(wayMetaPath, "utf8"));
     if (matchesPbf(meta, identity)) {
       console.log(`[osm] reusing disk-backed candidate-way spool (${meta.ways} ways, ${meta.bytes} bytes)`);
       ways = meta.ways;
       interpolationWays = meta.interpolationWays || 0;
+      boundaryWays = meta.boundaryWays || 0;
       reusableWays = true;
     }
   }
   if (!reusableWays) {
     const stageStart = performance.now();
-    console.log(`[osm] stage 1/4: spooling candidate ways and anchor references from ${args.pbf}`);
+    console.log(`[osm] stage 2/5: spooling candidate ways and anchor references from ${args.pbf}`);
     const writer = createBufferedJsonlWriter(wayPartialPath);
+    const boundaryWriter = createBufferedJsonlWriter(boundaryWaysPartialPath);
     const anchorWriter = createAnchorRefWriter(anchorRawPath);
     const progress = progressLogger("candidate ways");
     try {
       scanPbf(args.pbf, {
         onWay(id, refs, tags) {
           if (!refs.length) return;
+          if (boundaryWayIds.has(id)) {
+            // Boundary geometry rides the anchor store: every vertex needs a
+            // coordinate for ring assembly, resolved by the same sorted-anchor
+            // pass that resolves way anchors.
+            boundaryWriter.write([id, refs]);
+            for (const ref of refs) anchorWriter.write(ref);
+            boundaryWays++;
+          }
           if (!searchablePlaceTags(tags)) return;
           const interpolation = Boolean(tags.get("addr:interpolation"));
           const anchorRefs = interpolation ? refs : refs[0];
@@ -292,10 +361,12 @@ async function writeJsonl(args) {
       });
     } finally {
       writer.close();
+      boundaryWriter.close();
       anchorWriter.close();
     }
     renameSync(wayPartialPath, wayPath);
-    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, interpolationWays, bytes: statSync(wayPath).size }, null, 2));
+    renameSync(boundaryWaysPartialPath, boundaryWaysPath);
+    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, interpolationWays, boundaryWays, bytes: statSync(wayPath).size }, null, 2));
     stageSeconds.candidateWays = elapsedSeconds(stageStart);
   }
 
@@ -320,11 +391,14 @@ async function writeJsonl(args) {
           read++;
           progress(() => `${read.toLocaleString()}/${ways.toLocaleString()} references`);
         });
+        await eachJsonLine(boundaryWaysPath, ([, refs]) => {
+          for (const item of refs) anchorWriter.write(item);
+        });
       } finally {
         anchorWriter.close();
       }
     }
-    console.log("[osm] stage 2/4: externally sorting and deduplicating way anchors");
+    console.log("[osm] stage 3/5: externally sorting and deduplicating way anchors");
     const stageStart = performance.now();
     rmSync(anchorScratchPath, { recursive: true, force: true });
     const sorted = sortUniqueAnchorRefs(anchorRawPath, anchorSortedPath, anchorScratchPath);
@@ -339,7 +413,7 @@ async function writeJsonl(args) {
   const uniqueAnchors = anchorMeta.anchors;
 
   let nodeMeta = null;
-  if (!args.force && existsSync(nodePath) && existsSync(nodeMetaPath)
+  if (!args.force && existsSync(nodePath) && existsSync(nodeMetaPath) && existsSync(placeNodesPath)
       && coordinateStoreExists(coordPath) && existsSync(coordMetaPath)) {
     const candidateNodeMeta = JSON.parse(readFileSync(nodeMetaPath, "utf8"));
     const candidateCoordMeta = JSON.parse(readFileSync(coordMetaPath, "utf8"));
@@ -350,11 +424,13 @@ async function writeJsonl(args) {
   }
   if (!nodeMeta) {
     const stageStart = performance.now();
-    console.log(`[osm] stage 3/4: scanning nodes (${ways.toLocaleString()} candidate ways, ${uniqueAnchors.toLocaleString()} unique anchors)`);
+    console.log(`[osm] stage 4/5: scanning nodes (${ways.toLocaleString()} candidate ways, ${uniqueAnchors.toLocaleString()} unique anchors)`);
     const nodeWriter = createBufferedJsonlWriter(nodePartialPath);
+    const placeNodeWriter = createBufferedJsonlWriter(placeNodesPartialPath);
     const anchors = openSortedAnchorRefs(anchorSortedPath);
     const coords = createCoordinateStore(coordPath, { reset: true });
     let nodeDocs = 0;
+    let placeNodes = 0;
     let anchorsResolved = 0;
     let lastNodeId = -1;
     let storedCoords = 0;
@@ -372,6 +448,13 @@ async function writeJsonl(args) {
             anchors.advance();
           }
           if (tags) {
+            // Locality fallback candidates for documents outside any
+            // assembled boundary: place nodes sit at settlement centers.
+            const placeType = tags.get("place");
+            if (placeType && PLACE_RADII_METERS[placeType] && tags.get("name")) {
+              placeNodeWriter.write([tags.get("name"), placeType, lat, lon]);
+              placeNodes++;
+            }
             const doc = placeDoc("node", id, lat, lon, tags);
             if (doc) {
               nodeWriter.write(doc);
@@ -384,11 +467,13 @@ async function writeJsonl(args) {
       storedCoords = coords.count();
     } finally {
       nodeWriter.close();
+      placeNodeWriter.close();
       coords.close();
       anchors.close();
     }
     renameSync(nodePartialPath, nodePath);
-    nodeMeta = { ...identity, nodeDocs, anchors: uniqueAnchors, anchorsResolved: storedCoords, bytes: statSync(nodePath).size };
+    renameSync(placeNodesPartialPath, placeNodesPath);
+    nodeMeta = { ...identity, nodeDocs, placeNodes, anchors: uniqueAnchors, anchorsResolved: storedCoords, bytes: statSync(nodePath).size };
     writeFileSync(nodeMetaPath, JSON.stringify(nodeMeta, null, 2));
     writeFileSync(coordMetaPath, JSON.stringify({ ...identity, anchors: uniqueAnchors, anchorsResolved: storedCoords, bytes: statSync(coordPath).size }, null, 2));
     stageSeconds.nodes = elapsedSeconds(stageStart);
@@ -396,7 +481,7 @@ async function writeJsonl(args) {
     console.log(`[osm] reusing ${nodeMeta.nodeDocs.toLocaleString()} node documents and ${nodeMeta.anchorsResolved.toLocaleString()} anchor coordinates`);
   }
 
-  console.log("[osm] stage 4/4: materializing searchable node and way documents");
+  console.log("[osm] stage 5/5: materializing searchable node and way documents");
   const outputStart = performance.now();
   const writer = createBufferedJsonlWriter(outPartialPath);
   const coords = createCoordinateStore(coordPath);
@@ -405,11 +490,62 @@ async function writeJsonl(args) {
   let waysRead = 0;
   let wayDocs = 0;
   let interpolationRangeDocsWritten = 0;
+  const enriched = { boundary: 0, place: 0 };
+  let localityStats = { boundaries: 0, boundariesDropped: 0, ringsDropped: 0, places: 0 };
   const outputProgress = progressLogger("output documents");
   try {
-    await eachRawLine(nodePath, line => {
+    // Locality index: assemble municipality polygons from the boundary
+    // spools (vertex coordinates come from the anchor store) and load the
+    // place-node fallback candidates.
+    const locality = createLocalityIndex();
+    const boundaryWayRefs = new Map();
+    await eachJsonLine(boundaryWaysPath, ([id, refs]) => {
+      boundaryWayRefs.set(id, refs);
+    });
+    await eachJsonLine(boundaryRelationsPath, ([, name, adminLevel, wayIds]) => {
+      const memberWays = wayIds.map(wayId => boundaryWayRefs.get(wayId)).filter(Boolean);
+      if (!memberWays.length) {
+        localityStats.boundariesDropped++;
+        return;
+      }
+      const assembly = assembleRings(memberWays);
+      localityStats.ringsDropped += assembly.dropped;
+      const rings = [];
+      for (const ring of assembly.rings) {
+        const points = [];
+        for (const nodeId of ring) {
+          const point = coords.get(nodeId);
+          if (!point) {
+            points.length = 0;
+            break;
+          }
+          points.push([point.lat, point.lon]);
+        }
+        if (points.length) rings.push(points);
+      }
+      if (rings.length && locality.addBoundary({ id: 0, name, adminLevel, rings })) {
+        localityStats.boundaries++;
+      } else {
+        localityStats.boundariesDropped++;
+      }
+    });
+    await eachJsonLine(placeNodesPath, ([name, type, lat, lon]) => {
+      if (locality.addPlace({ name, type, lat, lon })) localityStats.places++;
+    });
+    locality.finalize();
+    boundaryWayRefs.clear();
+    console.log(`[osm] locality index: ${localityStats.boundaries.toLocaleString()} boundaries (${localityStats.boundariesDropped} dropped, ${localityStats.ringsDropped} open rings), ${localityStats.places.toLocaleString()} place nodes`);
+
+    const enrich = doc => {
+      if (doc.city || doc.category === "place") return;
+      const resolved = locality.resolve(doc.lat, doc.lon);
+      if (resolved && enrichDocLocality(doc, resolved.city)) enriched[resolved.source]++;
+    };
+
+    await eachJsonLine(nodePath, doc => {
       if (args.limit && docs >= args.limit) return true;
-      writer.writeLine(line);
+      enrich(doc);
+      writer.write(doc);
       docs++;
       nodeDocs++;
       outputProgress(() => `${docs.toLocaleString()} documents`);
@@ -434,6 +570,7 @@ async function writeJsonl(args) {
           if (point) {
             const doc = placeDoc("way", id, point.lat, point.lon, tags);
             if (doc) {
+              enrich(doc);
               writer.write(doc);
               docs++;
               wayDocs++;
@@ -442,6 +579,7 @@ async function writeJsonl(args) {
           if ((!args.limit || docs < args.limit) && Array.isArray(ref)) {
             for (const doc of interpolationRangeDocs(id, refs, points, tags)) {
               if (args.limit && docs >= args.limit) break;
+              enrich(doc);
               writer.write(doc);
               docs++;
               interpolationRangeDocsWritten++;
@@ -467,13 +605,15 @@ async function writeJsonl(args) {
     interpolationWays,
     interpolationRangeDocs: interpolationRangeDocsWritten,
     ways,
+    boundaryWays,
     anchors: uniqueAnchors,
+    locality: { ...localityStats, enrichedFromBoundaries: enriched.boundary, enrichedFromPlaces: enriched.place },
     bytes: statSync(outPath).size,
     stageSeconds,
     seconds: Math.round((performance.now() - t0) / 100) / 10
   };
   writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  console.log(`[osm] wrote ${docs} docs to ${outPath} in ${meta.seconds}s`);
+  console.log(`[osm] wrote ${docs} docs to ${outPath} in ${meta.seconds}s (locality: ${enriched.boundary.toLocaleString()} from boundaries, ${enriched.place.toLocaleString()} from place nodes)`);
   return finishOsmCorpus(args, outPath, meta);
 }
 
