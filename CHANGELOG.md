@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Location-anchored OSM search** (`params.near`): callers pass an advisory
+  anchor (user location or map viewport center) and the query cascade uses
+  it wherever the text itself names no place. Bare categories and near-me
+  phrasing ("pharmacy near me", "restaurants", "cafés autour de moi")
+  become a nearest-sorted search around the anchor — against the live
+  planet index, "restaurant" drops from a ~4,700-request unroutable
+  fan-out to ~95 requests / 2MB with walkable results first. Plain text
+  tries a proximity-boosted search scoped to the anchor's 50 km radius
+  (geo routing opens only the shards under the caller) and falls back to
+  the global cascade when the local page is empty. Explicit intents —
+  named localities, streets, an explicit `geo`, suggestion shard hints —
+  always outrank the anchor. The map demo now feeds this anchor from
+  browser geolocation (adopted silently when permission is already
+  granted, one tap on the locate control otherwise) with the map center
+  as fallback, and labels anchored results "near you" / "near map view".
+
 ## 0.3.6 — 2026-07-19
 
 ### Added

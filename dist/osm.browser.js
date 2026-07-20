@@ -107,6 +107,43 @@ function parseOsmQueryIntent(value) {
   }
   return null;
 }
+var NEARBY_SUFFIXES = [
+  "near me",
+  "nearby",
+  "around me",
+  "close by",
+  "close to me",
+  "pres de moi",
+  "autour de moi",
+  "a proximite",
+  "proche",
+  "proches"
+];
+function parseNearbyCategoryIntent(value) {
+  let normalized = fold(value);
+  if (!normalized) return null;
+  for (const suffix of NEARBY_SUFFIXES) {
+    if (normalized === suffix) return null;
+    if (normalized.endsWith(` ${suffix}`)) {
+      normalized = normalized.slice(0, -suffix.length - 1).trim();
+      break;
+    }
+  }
+  return CATEGORY_INTENTS.get(normalized) || null;
+}
+function nearAnchor(params) {
+  const near = params?.near;
+  const lat = Number(near?.lat);
+  const lon = Number(near?.lon);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
+}
+function engineParams(params) {
+  const { near, ...rest } = params;
+  return rest;
+}
+var NEARBY_CATEGORY_RADII_METERS = [1e4, 5e4];
+var NEAR_TEXT_RADIUS_METERS = 5e4;
+var NEAR_TEXT_BOOST = { weight: 2, pivotMeters: 2e3 };
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const rad = Math.PI / 180;
   const dLat = (lat2 - lat1) * rad;
@@ -189,7 +226,8 @@ function collapseStreetSuggestions(response, params = {}) {
     }
   };
 }
-async function suggestOsmQuery(engine, params = {}) {
+async function suggestOsmQuery(engine, rawParams = {}) {
+  const params = engineParams(rawParams);
   const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
   const response = await engine.suggest({
     ...params,
@@ -409,10 +447,40 @@ async function resolveStreetLocality(engine, surface, params) {
   }
   return null;
 }
-async function searchOsmQuery(engine, params = {}) {
+async function searchOsmQuery(engine, rawParams = {}) {
+  const anchor = rawParams.geo == null ? nearAnchor(rawParams) : null;
+  const params = engineParams(rawParams);
   const q = String(params.q || "").trim();
-  const intent = parseOsmQueryIntent(q);
+  const nearbyCategory = parseNearbyCategoryIntent(q);
+  const intent = nearbyCategory ? null : parseOsmQueryIntent(q);
   if (!intent) {
+    if (nearbyCategory && anchor) {
+      let response2 = null;
+      let radiusMeters = 0;
+      for (const radius of NEARBY_CATEGORY_RADII_METERS) {
+        radiusMeters = radius;
+        response2 = await engine.search({
+          ...params,
+          q: nearbyCategory.query,
+          geo: {
+            near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: radius },
+            sort: "distance"
+          }
+        });
+        if (response2.total > 0) break;
+      }
+      return {
+        ...response2,
+        resolvedQuery: `${nearbyCategory.label} nearby`,
+        stats: {
+          ...response2.stats || {},
+          plannerLane: "osmCategoryNearby",
+          osmIntentCategory: nearbyCategory.query,
+          osmIntentRadiusMeters: radiusMeters
+        }
+      };
+    }
+    if (nearbyCategory) return collapseCivicDuplicates(await engine.search(params));
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
     if (possibleLocalityQuery(q)) {
@@ -433,6 +501,35 @@ async function searchOsmQuery(engine, params = {}) {
           }
         };
       }
+    }
+    if (anchor && q) {
+      const local = await engine.search({
+        ...params,
+        geo: {
+          near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+          boost: NEAR_TEXT_BOOST
+        }
+      });
+      if (local.total > 0 && local.results.length) {
+        return collapseCivicDuplicates({
+          ...local,
+          stats: {
+            ...local.stats || {},
+            plannerLane: "osmNearText",
+            osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS
+          }
+        });
+      }
+      const global = await engine.search(params);
+      const trace2 = mergeRuntimeTraces(local.stats?.trace, global.stats?.trace);
+      return collapseCivicDuplicates({
+        ...global,
+        stats: {
+          ...global.stats || {},
+          ...trace2 ? { trace: trace2 } : {},
+          osmNearFallback: true
+        }
+      });
     }
     return collapseCivicDuplicates(await engine.search(params));
   }
@@ -467,6 +564,7 @@ async function searchOsmQuery(engine, params = {}) {
 }
 export {
   collapseStreetSuggestions,
+  parseNearbyCategoryIntent,
   parseOsmQueryIntent,
   searchOsmQuery,
   suggestOsmQuery

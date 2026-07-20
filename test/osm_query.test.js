@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  parseNearbyCategoryIntent,
   parseOsmQueryIntent,
   searchOsmQuery,
   suggestOsmQuery
@@ -417,4 +418,131 @@ test("OSM locality resolution retries unscoped when the authority scope misses",
   assert.deepEqual(calls[0].shards, ["wrong-shard"]);
   assert.equal(calls[1].shards, undefined);
   assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+});
+
+test("nearby category intents strip near-me phrasing in both languages", () => {
+  assert.equal(parseNearbyCategoryIntent("pharmacy near me").query, "pharmacy");
+  assert.equal(parseNearbyCategoryIntent("Pharmacies nearby").query, "pharmacy");
+  assert.equal(parseNearbyCategoryIntent("cafés autour de moi").query, "cafe");
+  assert.equal(parseNearbyCategoryIntent("restaurants").query, "restaurant");
+  assert.equal(parseNearbyCategoryIntent("épicerie à proximité").query, "supermarket");
+  assert.equal(parseNearbyCategoryIntent("near me"), null);
+  assert.equal(parseNearbyCategoryIntent("jean coutu near me"), null);
+  assert.equal(parseNearbyCategoryIntent("pharmacy in Birmingham"), null);
+});
+
+test("OSM search runs bare categories as nearest-first around the anchor", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      return { total: 3, results: [{ name: "Jean Coutu", type: "pharmacy", distanceMeters: 480 }], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "pharmacy near me", size: 10, near: { lat: 45.63, lon: -73.8 } });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "pharmacy");
+  assert.equal(calls[0].near, undefined);
+  assert.equal(calls[0].geo.sort, "distance");
+  assert.equal(calls[0].geo.near.radiusMeters, 10000);
+  assert.equal(response.stats.plannerLane, "osmCategoryNearby");
+  assert.equal(response.resolvedQuery, "Pharmacy nearby");
+
+  // Rural anchor: an empty 10 km orbit widens once before giving up.
+  const sparse = [];
+  const ruralEngine = {
+    async search(params) {
+      sparse.push(params);
+      return sparse.length === 1
+        ? { total: 0, results: [], stats: {} }
+        : { total: 1, results: [{ name: "Pharmacie du Village", type: "pharmacy" }], stats: {} };
+    }
+  };
+  const rural = await searchOsmQuery(ruralEngine, { q: "pharmacie", size: 10, near: { lat: 48.1, lon: -79.0 } });
+  assert.deepEqual(sparse.map(params => params.geo.near.radiusMeters), [10000, 50000]);
+  assert.equal(rural.stats.osmIntentRadiusMeters, 50000);
+});
+
+test("OSM plain text tries the anchor's radius first and falls back globally", async () => {
+  const calls = [];
+  const localEngine = {
+    async search(params) {
+      calls.push(params);
+      // The locality resolver probes the name as a place first; a zero-hit
+      // page ends that cascade without a populous retry.
+      if (params.filters) return { total: 0, results: [], stats: {} };
+      return { total: 2, results: [{ name: "Jean Coutu", type: "pharmacy" }], stats: {} };
+    }
+  };
+  const local = await searchOsmQuery(localEngine, { q: "jean coutu", size: 10, near: { lat: 45.63, lon: -73.8 } });
+  const nearCall = calls.at(-1);
+  assert.equal(nearCall.q, "jean coutu");
+  assert.equal(nearCall.filters, undefined);
+  assert.equal(nearCall.geo.near.radiusMeters, 50000);
+  assert.ok(nearCall.geo.boost);
+  assert.equal(nearCall.near, undefined);
+  assert.equal(local.stats.plannerLane, "osmNearText");
+
+  const fallbackCalls = [];
+  const fallbackEngine = {
+    async search(params) {
+      fallbackCalls.push(params);
+      if (params.filters) return { total: 0, results: [], stats: {} };
+      return params.geo
+        ? { total: 0, results: [], stats: {} }
+        : { total: 1, results: [{ name: "Calgary Tower", type: "attraction" }], stats: { plannerLane: "fullFallback" } };
+    }
+  };
+  const fallback = await searchOsmQuery(fallbackEngine, { q: "calgary tower", size: 10, near: { lat: 48.85, lon: 2.35 } });
+  const nearAttempt = fallbackCalls.at(-2);
+  const globalCall = fallbackCalls.at(-1);
+  assert.equal(nearAttempt.geo.near.radiusMeters, 50000);
+  assert.equal(globalCall.geo, undefined);
+  assert.equal(globalCall.filters, undefined);
+  assert.equal(fallback.results[0].name, "Calgary Tower");
+  assert.equal(fallback.stats.osmNearFallback, true);
+});
+
+test("OSM search ignores the anchor when explicit geo or intents are present", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      return { total: 1, results: [{ name: "Cafe X" }], stats: {} };
+    }
+  };
+  // Explicit geo (the demo's area toggle) outranks the anchor entirely.
+  await searchOsmQuery(engine, {
+    q: "cafe",
+    geo: { box: { minLat: 52.49, maxLat: 52.55, minLon: 13.35, maxLon: 13.46 } },
+    near: { lat: 45.63, lon: -73.8 },
+    size: 10
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.keys(calls[0].geo), ["box"]);
+  assert.equal(calls[0].near, undefined);
+
+  // Category + locality still resolves the named place, not the anchor.
+  const localityCalls = [];
+  const localityEngine = {
+    async search(params) {
+      localityCalls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.6323, lon: -73.8052 }],
+          stats: {}
+        };
+      }
+      return { total: 1, results: [{ name: "Jean Coutu", type: "pharmacy" }], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(localityEngine, {
+    q: "pharmacy in Rosemère",
+    size: 10,
+    near: { lat: 51.04, lon: -114.07 }
+  });
+  assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+  const categoryCall = localityCalls.at(-1);
+  assert.equal(categoryCall.geo.near.lat, 45.6323);
 });

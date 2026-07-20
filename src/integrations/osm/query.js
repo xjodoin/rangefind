@@ -99,6 +99,47 @@ export function parseOsmQueryIntent(value) {
   return null;
 }
 
+// "pharmacy near me", "cafés nearby", "restaurants autour de moi", or just
+// "pharmacie": a category with no locality. Without an anchor these fall to
+// the global text lane; with `params.near` they become a nearest-sorted
+// search around the caller's location — the difference between an
+// unroutable single-common-term fan-out and a one-shard geo query.
+const NEARBY_SUFFIXES = [
+  "near me", "nearby", "around me", "close by", "close to me",
+  "pres de moi", "autour de moi", "a proximite", "proche", "proches"
+];
+
+export function parseNearbyCategoryIntent(value) {
+  let normalized = fold(value);
+  if (!normalized) return null;
+  for (const suffix of NEARBY_SUFFIXES) {
+    if (normalized === suffix) return null;
+    if (normalized.endsWith(` ${suffix}`)) {
+      normalized = normalized.slice(0, -suffix.length - 1).trim();
+      break;
+    }
+  }
+  return CATEGORY_INTENTS.get(normalized) || null;
+}
+
+function nearAnchor(params) {
+  const near = params?.near;
+  const lat = Number(near?.lat);
+  const lon = Number(near?.lon);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
+}
+
+// Callers pass `near` as advisory context for the OSM cascade; the engine
+// itself only understands `geo`, so the hint never travels further down.
+function engineParams(params) {
+  const { near, ...rest } = params;
+  return rest;
+}
+
+const NEARBY_CATEGORY_RADII_METERS = [10000, 50000];
+const NEAR_TEXT_RADIUS_METERS = 50000;
+const NEAR_TEXT_BOOST = { weight: 2, pivotMeters: 2000 };
+
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const rad = Math.PI / 180;
   const dLat = (lat2 - lat1) * rad;
@@ -202,7 +243,8 @@ export function collapseStreetSuggestions(response, params = {}) {
   };
 }
 
-export async function suggestOsmQuery(engine, params = {}) {
+export async function suggestOsmQuery(engine, rawParams = {}) {
+  const params = engineParams(rawParams);
   const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
   const response = await engine.suggest({
     ...params,
@@ -508,10 +550,52 @@ async function resolveStreetLocality(engine, surface, params) {
   return null;
 }
 
-export async function searchOsmQuery(engine, params = {}) {
+export async function searchOsmQuery(engine, rawParams = {}) {
+  // `near` is an advisory anchor (user location or map viewport center) for
+  // the cascade only; the engine never sees it. Explicit place intents in
+  // the query text always outrank proximity.
+  const anchor = rawParams.geo == null ? nearAnchor(rawParams) : null;
+  const params = engineParams(rawParams);
   const q = String(params.q || "").trim();
-  const intent = parseOsmQueryIntent(q);
+  // "pharmacy near me" parses before category-locality — otherwise "me"
+  // would be treated as a locality name and resolved against the planet.
+  const nearbyCategory = parseNearbyCategoryIntent(q);
+  const intent = nearbyCategory ? null : parseOsmQueryIntent(q);
   if (!intent) {
+    // Bare category (or explicit near-me phrasing) with an anchor: a
+    // nearest-sorted category search around the caller instead of an
+    // unroutable global single-term fan-out. The wider retry covers rural
+    // anchors where 10 km holds nothing.
+    if (nearbyCategory && anchor) {
+      let response = null;
+      let radiusMeters = 0;
+      for (const radius of NEARBY_CATEGORY_RADII_METERS) {
+        radiusMeters = radius;
+        response = await engine.search({
+          ...params,
+          q: nearbyCategory.query,
+          geo: {
+            near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: radius },
+            sort: "distance"
+          }
+        });
+        if (response.total > 0) break;
+      }
+      return {
+        ...response,
+        resolvedQuery: `${nearbyCategory.label} nearby`,
+        stats: {
+          ...(response.stats || {}),
+          plannerLane: "osmCategoryNearby",
+          osmIntentCategory: nearbyCategory.query,
+          osmIntentRadiusMeters: radiusMeters
+        }
+      };
+    }
+    // Near-me phrasing without a usable anchor: the words themselves are
+    // not a place, so skip the street/locality resolvers and search the
+    // category text directly.
+    if (nearbyCategory) return collapseCivicDuplicates(await engine.search(params));
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
     if (possibleLocalityQuery(q)) {
@@ -532,6 +616,40 @@ export async function searchOsmQuery(engine, params = {}) {
           }
         };
       }
+    }
+    // Local-first text: scoped to the anchor's radius, geo routing opens the
+    // one or two shards whose coverage contains the caller instead of every
+    // shard holding the terms, and proximity boosts break BM25 ties toward
+    // the nearby bearer of a common name. An empty local page (totals are
+    // real counts, never floors) falls back to the global cascade.
+    if (anchor && q) {
+      const local = await engine.search({
+        ...params,
+        geo: {
+          near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+          boost: NEAR_TEXT_BOOST
+        }
+      });
+      if (local.total > 0 && local.results.length) {
+        return collapseCivicDuplicates({
+          ...local,
+          stats: {
+            ...(local.stats || {}),
+            plannerLane: "osmNearText",
+            osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS
+          }
+        });
+      }
+      const global = await engine.search(params);
+      const trace = mergeRuntimeTraces(local.stats?.trace, global.stats?.trace);
+      return collapseCivicDuplicates({
+        ...global,
+        stats: {
+          ...(global.stats || {}),
+          ...(trace ? { trace } : {}),
+          osmNearFallback: true
+        }
+      });
     }
     return collapseCivicDuplicates(await engine.search(params));
   }

@@ -103,11 +103,43 @@ const map = new maplibregl.Map({
 });
 
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
-map.addControl(new maplibregl.GeolocateControl({
+const geolocateControl = new maplibregl.GeolocateControl({
   positionOptions: { enableHighAccuracy: true },
   trackUserLocation: false,
   showUserHeading: true
-}), "top-right");
+});
+map.addControl(geolocateControl, "top-right");
+
+// The user's location anchors searches: bare categories ("pharmacy") become
+// nearest-first, and plain text tries the shard under the user before fanning
+// out. Never prompt on load — adopt the position silently when permission was
+// already granted, otherwise the anchor is the map center (panning the map is
+// itself an expression of where the user cares about).
+let userLocation = null;
+geolocateControl.on("geolocate", event => {
+  const { latitude, longitude } = event.coords || {};
+  if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+    userLocation = { lat: latitude, lon: longitude };
+    mapHudText.textContent = "Searches now prioritize places near you";
+  }
+});
+if (navigator.permissions?.query) {
+  navigator.permissions.query({ name: "geolocation" })
+    .then(status => {
+      if (status.state !== "granted") return;
+      if (map.loaded()) geolocateControl.trigger();
+      else map.once("load", () => geolocateControl.trigger());
+    })
+    .catch(() => {});
+}
+
+function searchAnchor() {
+  if (userLocation) return { ...userLocation, source: "you" };
+  const center = map.getCenter();
+  return Number.isFinite(center?.lat) && Number.isFinite(center?.lng)
+    ? { lat: center.lat, lon: center.lng, source: "map view" }
+    : null;
+}
 
 function formatNumber(value) {
   return new Intl.NumberFormat().format(Number(value || 0));
@@ -483,13 +515,19 @@ async function runSearch({ fit = false } = {}) {
     return;
   }
   if (areaBox) params.geo = { box: areaBox };
+  // Anchor plain queries to the user (or the viewport they chose): bare
+  // categories become nearest-first and text search tries the local shard
+  // before the world. Explicit modes — a suggestion's home shard, the area
+  // toggle, a discovery orbit — already carry stronger intent.
+  const anchor = !queryOverride && !areaBox && !hintedShards?.length ? searchAnchor() : null;
+  if (anchor) params.near = { lat: anchor.lat, lon: anchor.lon };
   if (!q && !useArea) {
     queryReceipt.hidden = true;
     resultList.replaceChildren();
     clearMarkers();
     setStatus("Ready to search", "ready");
     mapHudText.textContent = "Search anywhere in the published index";
-    showEmpty("Find a place", "Search by name or address, or try a category with a place such as “pharmacy in Birmingham”.");
+    showEmpty("Find a place", "Search by name or address, try “pharmacy near me”, or a category with a place such as “pharmacy in Birmingham”.");
     return;
   }
 
@@ -515,12 +553,15 @@ async function runSearch({ fit = false } = {}) {
       ? ` · ${formatNumber(queried)} of ${formatNumber(available)} shards`
       : "";
     const directText = hintedShards?.length ? " · direct suggestion route" : "";
+    const nearLane = response.stats?.plannerLane === "osmCategoryNearby"
+      || response.stats?.plannerLane === "osmNearText";
+    const nearText = nearLane && anchor ? ` · near ${anchor.source}` : "";
     const modeText = queryOverride?.mode ? ` · ${queryOverride.mode}` : "";
     const shown = Math.min(response.results.length, resultLimit());
     const timing = `${(ms / 1000).toFixed(1)}s${shardText}`;
     setStatus(response.total
-      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${modeText}`
-      : `No matches · ${timing}${directText}${modeText}`);
+      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${nearText}${modeText}`
+      : `No matches · ${timing}${directText}${nearText}${modeText}`);
     renderQueryReceipt(response, shown);
     mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${useArea ? "this map area" : "everywhere"}`;
   } catch (error) {
