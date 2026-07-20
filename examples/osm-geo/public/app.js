@@ -133,12 +133,20 @@ if (navigator.permissions?.query) {
     .catch(() => {});
 }
 
+// The anchor is always where the map is looking: geolocation centers the
+// map on the user at startup, and panning to another city moves the anchor
+// with the view — "pharmacy" always means pharmacies around the visible
+// area. The label says "near you" only while the view actually sits on the
+// user's position.
 function searchAnchor() {
-  if (userLocation) return { ...userLocation, source: "you" };
   const center = map.getCenter();
-  return Number.isFinite(center?.lat) && Number.isFinite(center?.lng)
-    ? { lat: center.lat, lon: center.lng, source: "map view" }
-    : null;
+  if (!Number.isFinite(center?.lat) || !Number.isFinite(center?.lng)) {
+    return userLocation ? { ...userLocation, source: "you" } : null;
+  }
+  const onUser = userLocation
+    && Math.abs(center.lat - userLocation.lat) < 0.03
+    && Math.abs(center.lng - userLocation.lon) < 0.04;
+  return { lat: center.lat, lon: center.lng, source: onUser ? "you" : "map view" };
 }
 
 function formatNumber(value) {
