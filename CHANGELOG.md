@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.7 — 2026-07-20
+
 ### Fixed
 
 - Suggest-set sidecars are now written as bounded concatenated gzip members,

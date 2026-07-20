@@ -2827,8 +2827,10 @@ function interpolateAddressRangePoint(encodedGeometry, start, end, houseNumber) 
 
 // src/authority_codec.js
 var AUTHORITY_FORMAT = "rfauth-v2";
+var SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v1";
 var AUTHORITY_VERSION = 2;
 var AUTHORITY_LEGACY_VERSION = 1;
+var AUTHORITY_ORDINAL_ROWS_VERSION = 3;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
@@ -2892,9 +2894,10 @@ function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION) {
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
+  const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = /* @__PURE__ */ new Map();
   let previous = "";
@@ -2904,14 +2907,21 @@ function parseAuthorityShard(buffer) {
     const key = previous.slice(0, prefix) + suffix;
     const total = readVarint(bytes, state);
     if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
-      entries.set(key, { total, complete: true, rows: [], autocompleteWeight: readVarint(bytes, state) });
+      const autocompleteWeight = readVarint(bytes, state);
+      let rows2 = [];
+      if (ordinalRows) {
+        const rowCount2 = readVarint(bytes, state);
+        rows2 = new Array(rowCount2);
+        for (let j = 0; j < rowCount2; j++) rows2[j] = [readVarint(bytes, state), readVarint(bytes, state)];
+      }
+      entries.set(key, { total, complete: true, rows: rows2, autocompleteWeight, ...ordinalRows ? { ordinalRows: true } : {} });
       previous = key;
       continue;
     }
     const rowCount = readVarint(bytes, state);
     const rows = new Array(rowCount);
     for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
-    entries.set(key, { total, complete: total === rowCount, rows });
+    entries.set(key, { total, complete: total === rowCount, rows, ...ordinalRows ? { ordinalRows: true } : {} });
     previous = key;
   }
   return { format: version === AUTHORITY_LEGACY_VERSION ? "rfauth-v1" : AUTHORITY_FORMAT, entries };
@@ -4468,7 +4478,7 @@ async function createSearch(options = {}) {
     const inflated = await traceSpan("manifest.inflate", () => inflateGzip(response));
     return traceSpanSync("manifest.parse", () => JSON.parse(textDecoder4.decode(inflated)));
   }
-  const manifest = options.manifestName ? await fetchJsonIfOk(options.manifestName) : await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
+  const manifest = options.manifest && typeof options.manifest === "object" ? options.manifest : options.manifestName ? await fetchJsonIfOk(options.manifestName) : await fetchJsonIfOk("manifest.min.json") || await fetchJsonIfOk("manifest.json");
   if (!manifest) throw new Error("Rangefind manifest could not be loaded.");
   if (Array.isArray(manifest.shards)) {
     return createShardedSearch(manifest, options, baseUrl);
@@ -7855,7 +7865,9 @@ async function createSearch(options = {}) {
     }
     const totalExact = exhausted;
     return {
-      total: totalExact ? ranked.length : Math.max(ranked.length, k),
+      // Approximate totals report the eligible rows actually collected —
+      // never a k floor, which would overstate sparse result sets.
+      total: ranked.length,
       page,
       size,
       results,
@@ -9124,7 +9136,10 @@ async function createSearch(options = {}) {
     const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
     const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
-      total: exhausted ? ranked.length : Math.max(ranked.length, offset + size),
+      // Lower bound under early termination: the stability proof implies at
+      // least k eligible documents, so no artificial floor is needed — and a
+      // floor would invent matches when fewer than a page's worth exist.
+      total: ranked.length,
       page,
       size,
       approximate: !exhausted,
@@ -9389,7 +9404,11 @@ async function createSearch(options = {}) {
     const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
     const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
-      total: exhausted ? ranked.length : Math.max(ranked.length, k),
+      // Under early termination `total` is a lower bound on the eligible
+      // documents actually seen. A successful stability proof guarantees at
+      // least k of them, but the block-budget stop does not — flooring at k
+      // here used to invent matches for pages that hold none.
+      total: ranked.length,
       page,
       size,
       approximate: budgetExhausted || !exhausted,
@@ -10629,6 +10648,19 @@ async function createSearch(options = {}) {
     const previous = best.get(item.display);
     if (!previous || compareAutocomplete(item, previous) < 0) best.set(item.display, item);
   }
+  function lexiconSuggestion(candidate) {
+    const suggestion = { text: candidate.display, weight: candidate.weight, count: candidate.count };
+    if (candidate.rows?.length) {
+      const top = candidate.rows[0][1];
+      const ordinals = [];
+      for (const [ordinal2, weight] of candidate.rows) {
+        if (weight !== top) break;
+        ordinals.push(ordinal2);
+      }
+      suggestion.ordinals = ordinals;
+    }
+    return suggestion;
+  }
   function autocompleteCandidatesForShard(shard, weighted) {
     if (shard.autocompleteCandidates) return shard.autocompleteCandidates;
     const list = [];
@@ -10640,7 +10672,10 @@ async function createSearch(options = {}) {
         ...parsed,
         weight: entry.autocompleteWeight || entry.total || 0,
         count: entry.total || 1,
-        full: suggestKey(parsed.display) === parsed.normalized
+        full: suggestKey(parsed.display) === parsed.normalized,
+        // Root suggest-routing artifacts store [shard ordinal, weight] rows
+        // on autocomplete entries; provenance travels with the candidate.
+        ...entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {}
       };
       candidate.rank = autocompleteRank(candidate, weighted);
       list.push(candidate);
@@ -10730,7 +10765,7 @@ async function createSearch(options = {}) {
     return {
       q,
       prefix,
-      suggestions: ranked.map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
+      suggestions: ranked.map((candidate) => lexiconSuggestion(candidate)),
       stats: {
         exact: true,
         suggestLane: "authority-lexicon",
@@ -10836,6 +10871,39 @@ async function createSearch(options = {}) {
     const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
     if (legacy) return legacy;
     throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");
+  }
+  async function authorityLookup(surface, params = {}) {
+    const root = await loadAuthorityLexiconRoot();
+    if (!root) return null;
+    const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const prefix = suggestKey(String(surface || ""));
+    if (!prefix) return { surface: String(surface || ""), prefix, matches: [] };
+    const keyPrefix = `${AUTOCOMPLETE_PREFIX}${prefix}${AUTOCOMPLETE_SEPARATOR}`;
+    const candidates = lexiconCandidateShards(root.shards, keyPrefix);
+    const resolved = [];
+    const directoryRoot = await loadDirectoryRoot(authorityDirectory);
+    for (const summary of candidates) {
+      const item = await directoryEntryFromRoot(authorityDirectory, directoryRoot, summary.shard);
+      if (item) resolved.push(item);
+    }
+    const loaded = await loadAuthorityShards(resolved);
+    const matches = [];
+    for (const item of resolved) {
+      const shard = loaded.get(item.shard);
+      if (!shard) continue;
+      const shardCandidates = autocompleteCandidatesForShard(shard, root.weighted);
+      for (let index = autocompleteLowerBound(shardCandidates, keyPrefix); index < shardCandidates.length; index++) {
+        const candidate = shardCandidates[index];
+        if (!candidate.key.startsWith(keyPrefix)) break;
+        matches.push(candidate);
+      }
+    }
+    matches.sort(compareAutocomplete);
+    return {
+      surface: String(surface || ""),
+      prefix,
+      matches: matches.slice(0, size).map((candidate) => ({ ...lexiconSuggestion(candidate), full: candidate.full }))
+    };
   }
   function normalizeFacetsParam(param) {
     if (!param) return null;
@@ -11127,6 +11195,7 @@ async function createSearch(options = {}) {
     search,
     count,
     suggest,
+    authorityLookup,
     vectorSearch,
     hydrateRows,
     loadDocValues,
@@ -11596,6 +11665,47 @@ async function createShardedSearch(root, options, baseUrl) {
     return [...picked].sort((a, b) => a - b).map((index) => shards[index]);
   }
   const textRouting = root.text_routing?.format === TEXT_ROUTING_FORMAT && root.text_routing.directory?.root ? createTextRoutingState(root.text_routing) : null;
+  const suggestRouting = root.suggest_routing?.format === SUGGEST_ROUTING_FORMAT && root.suggest_routing.authority?.directory?.root ? root.suggest_routing : null;
+  let rootAuthorityEnginePromise = null;
+  function rootAuthorityEngine() {
+    if (!rootAuthorityEnginePromise) {
+      rootAuthorityEnginePromise = createSearch({
+        ...options,
+        baseUrl,
+        trace: false,
+        manifest: {
+          version: 1,
+          engine: "rangefind",
+          features: {},
+          total: root.total || 0,
+          // The synthetic engine only ever serves suggest/authorityLookup;
+          // aliasing the authority directory satisfies the term-directory
+          // requirement without fetching anything text-related.
+          directory: suggestRouting.authority.directory,
+          authority: suggestRouting.authority
+        }
+      });
+      rootAuthorityEnginePromise.catch(() => {
+        rootAuthorityEnginePromise = null;
+      });
+    }
+    return rootAuthorityEnginePromise;
+  }
+  const suggestRoutingShardIds = (suggestRouting?.shard_ids || []).map(String);
+  function suggestRoutingShards(ordinals) {
+    if (!Array.isArray(ordinals) || !ordinals.length) return null;
+    const ids = [];
+    for (const ordinal2 of ordinals) {
+      const id = suggestRoutingShardIds[ordinal2];
+      if (id !== void 0 && shardIdIndex.has(id) && !ids.includes(id)) ids.push(id);
+    }
+    return ids.length ? ids.sort() : null;
+  }
+  function remapSuggestRoutingItem(item) {
+    const { ordinals, ...rest } = item;
+    const ids = suggestRoutingShards(ordinals);
+    return ids ? { ...rest, shards: ids } : rest;
+  }
   function createTextRoutingState(block) {
     const routedIds = new Set((block.shard_ids || []).map(String));
     const shardIndexByOrdinal = (block.shard_ids || []).map((id) => shardIdIndex.get(String(id)) ?? -1);
@@ -12060,6 +12170,25 @@ async function createShardedSearch(root, options, baseUrl) {
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    if (suggestRouting && params.shards == null) {
+      try {
+        const rootEngine = await rootAuthorityEngine();
+        const response = await rootEngine.suggest({ ...activeParams, size });
+        return {
+          q: surfaceQuery,
+          suggestions: (response.suggestions || []).map(remapSuggestRoutingItem),
+          ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
+          stats: {
+            ...response.stats || {},
+            shards: shards.length,
+            shardsQueried: 0,
+            suggestRouting: "root-authority",
+            ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
+          }
+        };
+      } catch {
+      }
+    }
     const routed = await withSuggestRoute(activeParams, normalizedQuery.trim());
     const responses = await Promise.all(routed.shards.map(async (shard) => {
       const engine = await engineAt(shard.index);
@@ -12135,12 +12264,24 @@ async function createShardedSearch(root, options, baseUrl) {
     }
     return [...merged.values()].sort((a, b) => (b.n || 0) - (a.n || 0) || (a.value < b.value ? -1 : 1));
   }
+  async function authorityLookup(surface, params = {}) {
+    if (!suggestRouting) return null;
+    try {
+      const rootEngine = await rootAuthorityEngine();
+      const response = await rootEngine.authorityLookup(surface, params);
+      if (!response) return null;
+      return { ...response, matches: (response.matches || []).map(remapSuggestRoutingItem) };
+    } catch {
+      return null;
+    }
+  }
   return {
     manifest: root,
     shards: shards.map((shard) => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
     search,
     suggest,
     count,
+    authorityLookup,
     vectorSearch,
     loadFacetValues
   };
