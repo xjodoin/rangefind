@@ -53,6 +53,10 @@ let suggestInFlight = false;
 let suggestQueued = false;
 let selectedPlace = null;
 let activeQueryOverride = null;
+// True while the last search was anchored to the map view (a plain category
+// or text query, not a resolved locality/address). Such results change with
+// the viewport, so panning the map re-runs them.
+let anchoredQueryActive = false;
 const suggestionCache = new Map();
 
 const TRACE_LABELS = new Map([
@@ -530,6 +534,7 @@ async function runSearch({ fit = false } = {}) {
   const anchor = !queryOverride && !areaBox && !hintedShards?.length ? searchAnchor() : null;
   if (anchor) params.near = { lat: anchor.lat, lon: anchor.lon };
   if (!q && !useArea) {
+    anchoredQueryActive = false;
     queryReceipt.hidden = true;
     resultList.replaceChildren();
     clearMarkers();
@@ -550,6 +555,8 @@ async function runSearch({ fit = false } = {}) {
       || response.stats?.plannerLane === "osmLocalityExact"
       || response.stats?.plannerLane === "osmStreetLocality";
     if (resolvedLocation) areaToggle.checked = false;
+    // A view-anchored result (not a named place): panning re-runs it.
+    anchoredQueryActive = Boolean(anchor) && !resolvedLocation;
     renderResults(response.results, {
       fit: fit || resolvedLocation || (addressLookup && areaWasChecked),
       query: q
@@ -571,9 +578,15 @@ async function runSearch({ fit = false } = {}) {
       ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${nearText}${modeText}`
       : `No matches · ${timing}${directText}${nearText}${modeText}`);
     renderQueryReceipt(response, shown);
-    mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${useArea ? "this map area" : "everywhere"}`;
+    const scopeText = useArea
+      ? "this map area"
+      : anchoredQueryActive
+        ? "drag to refresh"
+        : "everywhere";
+    mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${scopeText}`;
   } catch (error) {
     if (token !== searchToken) return;
+    anchoredQueryActive = false;
     const message = error?.message || "Search failed";
     interruptQueryReceipt();
     setStatus(message, "error");
@@ -835,14 +848,28 @@ document.addEventListener("keydown", event => {
   queryInput.select();
 });
 
-map.on("movestart", () => {
-  if (areaToggle.checked && engine) mapHudText.textContent = "New viewport detected";
+map.on("movestart", event => {
+  if (!engine) return;
+  if (areaToggle.checked) mapHudText.textContent = "New viewport detected";
+  else if (anchoredQueryActive && event.originalEvent) mapHudText.textContent = "Release to search this area";
 });
 
-map.on("moveend", () => {
-  if (!areaToggle.checked || !engine) return;
-  clearTimeout(moveTimer);
-  moveTimer = setTimeout(() => runSearch(), 250);
+map.on("moveend", event => {
+  if (!engine) return;
+  // Area toggle: the box IS the query, so any settle re-runs it.
+  if (areaToggle.checked) {
+    clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => runSearch(), 250);
+    return;
+  }
+  // View-anchored query: re-run only when the USER moved the map (drag,
+  // scroll-zoom, pinch — all carry originalEvent), never on the programmatic
+  // recentring the app does after a search, which would loop. A refresh
+  // must not yank the map back to the result bounds, so it never fits.
+  if (anchoredQueryActive && event.originalEvent) {
+    clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => runSearch({ fit: false }), 320);
+  }
 });
 
 async function boot() {

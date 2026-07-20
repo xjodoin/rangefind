@@ -19,6 +19,9 @@
   browser geolocation (adopted silently when permission is already
   granted, one tap on the locate control otherwise) with the map center
   as fallback, and labels anchored results "near you" / "near map view".
+  Dragging or zooming the map re-runs a view-anchored query for the new
+  area (debounced, and only on genuine user gestures, never the app's own
+  post-search recentring); resolved-place queries stay put.
 
 ## 0.3.6 — 2026-07-19
 
