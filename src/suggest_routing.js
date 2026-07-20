@@ -1,4 +1,15 @@
-import { closeSync, createReadStream, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  createReadStream,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  writeSync
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -33,6 +44,7 @@ export { SUGGEST_ROUTING_FORMAT } from "./authority_codec.js";
 const SUGGEST_ROUTING_VERSION = 1;
 const SUGGEST_SET_FORMAT = "rfsuggestset-v1";
 const DEFAULT_PACK_TARGET_BYTES = 8 * 1024 * 1024;
+const DEFAULT_SUGGEST_SET_CHUNK_BYTES = 8 * 1024 * 1024;
 // Root partitions group at depth 4 ("s|" plus two characters) instead of the
 // per-shard depth 3: a planet-scale merge holds one group in memory at a
 // time, and one-letter buckets would be gigabytes.
@@ -146,19 +158,50 @@ function* indexSuggestEntries(dir) {
 // lexicon as a gzipped JSONL stream — header line, then [key, weight, count]
 // rows. Pipelines that reclaim shard artifacts after upload keep this small
 // file so the routing merge never needs the full shard on disk.
-export function writeShardSuggestSet({ dir, outFile }) {
+export function writeShardSuggestSet({ dir, outFile, chunkTargetBytes = DEFAULT_SUGGEST_SET_CHUNK_BYTES }) {
   const manifest = manifestAt(resolve(dir), "manifest.min.json");
   const generations = generationsOf(resolve(dir), manifest);
   const weighted = generations.some(generation => autocompleteWeightedOf(generation.manifest));
-  const lines = [JSON.stringify({ format: SUGGEST_SET_FORMAT, weighted })];
+  const target = resolve(outFile);
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+  const targetBytes = Math.max(1, Math.floor(Number(chunkTargetBytes) || DEFAULT_SUGGEST_SET_CHUNK_BYTES));
+  let fd;
+  let lines = [];
+  let lineBytes = 0;
   let keys = 0;
-  for (const item of indexSuggestEntries(resolve(dir))) {
-    lines.push(JSON.stringify([item.key, item.weight, item.count]));
-    keys++;
+
+  const flush = () => {
+    if (lines.length === 0) return;
+    const compressed = gzipSync(Buffer.from(lines.join(""), "utf8"), { level: 9 });
+    let offset = 0;
+    while (offset < compressed.length) offset += writeSync(fd, compressed, offset, compressed.length - offset);
+    lines = [];
+    lineBytes = 0;
+  };
+  const appendLine = value => {
+    const line = `${value}\n`;
+    lines.push(line);
+    lineBytes += Buffer.byteLength(line);
+    if (lineBytes >= targetBytes) flush();
+  };
+
+  mkdirSync(dirname(target), { recursive: true });
+  try {
+    fd = openSync(temporary, "wx");
+    appendLine(JSON.stringify({ format: SUGGEST_SET_FORMAT, weighted }));
+    for (const item of indexSuggestEntries(resolve(dir))) {
+      appendLine(JSON.stringify([item.key, item.weight, item.count]));
+      keys++;
+    }
+    flush();
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temporary, target);
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temporary, { force: true });
+    throw error;
   }
-  lines.push("");
-  mkdirSync(dirname(resolve(outFile)), { recursive: true });
-  writeFileSync(resolve(outFile), gzipSync(Buffer.from(lines.join("\n"), "utf8"), { level: 9 }));
   return { keys, weighted };
 }
 

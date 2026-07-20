@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Suggest-set sidecars are now written as bounded concatenated gzip members,
+  avoiding V8's maximum string length on multi-million-key OSM shards.
+
 ### Added
 
 - **Location-anchored OSM search** (`params.near`): callers pass an advisory

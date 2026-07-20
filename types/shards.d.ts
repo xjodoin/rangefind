@@ -102,7 +102,12 @@ export interface WriteSuggestRoutingIndexOptions {
  * sidecar, so the root suggest artifact can be rebuilt after the shard's
  * local artifacts are reclaimed. Regenerate whenever the shard changes.
  */
-export function writeShardSuggestSet(options: { dir: string; outFile: string }): { keys: number; weighted: boolean };
+export function writeShardSuggestSet(options: {
+  dir: string;
+  outFile: string;
+  /** Uncompressed JSONL bytes per concatenated gzip member. */
+  chunkTargetBytes?: number;
+}): { keys: number; weighted: boolean };
 
 /**
  * Merges every shard's authority autocomplete lexicon into one root-level
