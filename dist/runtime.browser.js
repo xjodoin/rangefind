@@ -7870,7 +7870,9 @@ async function createSearch(options = {}) {
     }
     const totalExact = exhausted;
     return {
-      total: totalExact ? ranked.length : Math.max(ranked.length, k),
+      // Approximate totals report the eligible rows actually collected —
+      // never a k floor, which would overstate sparse result sets.
+      total: ranked.length,
       page,
       size,
       results,
@@ -9139,7 +9141,10 @@ async function createSearch(options = {}) {
     const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
     const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
-      total: exhausted ? ranked.length : Math.max(ranked.length, offset + size),
+      // Lower bound under early termination: the stability proof implies at
+      // least k eligible documents, so no artificial floor is needed — and a
+      // floor would invent matches when fewer than a page's worth exist.
+      total: ranked.length,
       page,
       size,
       approximate: !exhausted,
@@ -9404,7 +9409,11 @@ async function createSearch(options = {}) {
     const resultContext = { hasTextTerms: true, preferDocPages: "auto" };
     const results = await rowsToSearchResults(rows, resultContext, includeResults);
     return {
-      total: exhausted ? ranked.length : Math.max(ranked.length, k),
+      // Under early termination `total` is a lower bound on the eligible
+      // documents actually seen. A successful stability proof guarantees at
+      // least k of them, but the block-budget stop does not — flooring at k
+      // here used to invent matches for pages that hold none.
+      total: ranked.length,
       page,
       size,
       approximate: budgetExhausted || !exhausted,

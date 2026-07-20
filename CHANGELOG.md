@@ -36,6 +36,16 @@
   scoring stats alongside the rebuild (locality terms change document
   frequencies corpus-wide).
 
+### Fixed
+
+- **Phantom approximate totals**: early-terminated search lanes floored
+  `total` at the requested page size, so a block-budget stop that found no
+  eligible documents reported "5 results" with an empty page ("st hubert
+  terrebonne" on a Quebec OSM index). Approximate totals now report the
+  eligible documents actually seen — zero stays zero, which also lets the
+  federated deferred-typo retry and the OSM locality cascade react to
+  genuinely empty pages instead of trusting invented counts.
+
 ## 0.3.5 — 2026-07-18
 
 ### Added

@@ -94,3 +94,62 @@ test("doc-range top-k proof bound covers high-impact postings in later blocks", 
     await server.close();
   }
 });
+
+// Regression: the block-budget stop used to floor `total` at k even when no
+// document reached minShouldMatch within the budget — the response claimed
+// "5 results" while carrying an empty page ("st hubert terrebonne" against a
+// Quebec OSM index). An approximate total is a lower bound on eligible
+// documents actually seen; with none seen it must be zero.
+test("block-budget exhaustion with no eligible documents reports total 0", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-topk-budget-"));
+  // alpha/beta/gamma each appear in many documents but never together, so a
+  // three-term query (minShouldMatch = 3) has zero eligible documents while
+  // every term still has plenty of posting blocks to scan.
+  const docs = [];
+  const terms = ["alpha", "beta", "gamma"];
+  for (let i = 0; i < 60; i++) {
+    const term = terms[i % 3];
+    docs.push(JSON.stringify({ id: `doc${i}`, title: `${term} entry ${i}`, body: `${term} filler ${i} common corpus text`, url: `/doc${i}` }));
+  }
+  await writeFile(join(root, "docs.jsonl"), docs.join("\n"));
+  await writeFile(join(root, "rangefind.config.json"), JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    postingBlockSize: 2,
+    maxTermsPerDoc: 64,
+    externalPostingBlockMinBlocks: 1,
+    externalPostingBlockMinBytes: 0,
+    fields: [
+      { name: "title", path: "title", weight: 4.5, b: 0.55 },
+      { name: "body", path: "body", weight: 1.0, b: 0.75 }
+    ],
+    display: ["title", "url"]
+  }));
+  await build({ configPath: join(root, "rangefind.config.json") });
+
+  const server = await serveStatic(join(root, "public"));
+  try {
+    // A one-block budget forces the budget stop before the scan can prove
+    // anything; the conjunction tail is disabled so the lane cannot finish
+    // the scan exactly, and typo correction must not replace the query.
+    const search = await createSearch({
+      baseUrl: server.baseUrl,
+      docRangePlanner: false,
+      conjunctionTail: false,
+      topKBlockBudget: 1
+    });
+    const response = await search.search({ q: "alpha beta gamma", size: 5, typo: false });
+    assert.equal(response.stats.plannerLane, "blockBudget");
+    assert.equal(response.results.length, 0);
+    assert.equal(response.total, 0);
+    assert.equal(response.approximate, true);
+
+    // Control: the same query without a budget scans to exhaustion and
+    // agrees there is nothing to find.
+    const exact = await createSearch({ baseUrl: server.baseUrl, docRangePlanner: false });
+    const full = await exact.search({ q: "alpha beta gamma", size: 5, typo: false });
+    assert.equal(full.total, 0);
+  } finally {
+    await server.close();
+  }
+});
