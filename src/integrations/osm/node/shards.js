@@ -7,6 +7,7 @@ import { readConfig } from "../../../config.js";
 import { collectScoringStats } from "../../../scoring_stats.js";
 import { writeShardedRootManifest } from "../../../index_shards.js";
 import { writeTextRoutingIndex } from "../../../text_routing.js";
+import { writeSuggestRoutingIndex } from "../../../suggest_routing.js";
 import { createOsmIndexConfig } from "../schema.js";
 
 // Sharded OSM build: one Rangefind index per region, every shard consuming
@@ -91,11 +92,25 @@ export async function buildOsmShardedIndex(options = {}) {
     console.log(`Rangefind: text routing ready — ${textRouting.term_count.toLocaleString()} terms`);
   }
 
+  // Root suggest artifact: the merged authority lexicon answers federated
+  // autocomplete and locality resolution from the root instead of fanning
+  // out to every shard's authority sidecar per keystroke.
+  let suggestRouting = null;
+  if (options.suggestRouting !== false) {
+    console.log("Rangefind: building suggest routing artifact");
+    suggestRouting = await writeSuggestRoutingIndex({
+      outDir: output,
+      shards: shardEntries.map(entry => ({ id: entry.id, dir: resolve(output, entry.path) }))
+    });
+    console.log(`Rangefind: suggest routing ready — ${suggestRouting.keys.toLocaleString()} lexicon keys`);
+  }
+
   const rootManifest = writeShardedRootManifest({
     outDir: output,
     shards: shardEntries,
     scoringStats: stats.stats,
-    textRouting
+    textRouting,
+    suggestRouting
   });
   const seconds = Math.round((performance.now() - started) / 100) / 10;
   console.log(`Rangefind: sharded index ready — ${rootManifest.shards.length} shards, ${rootManifest.total.toLocaleString()} docs, ${seconds}s`);

@@ -357,3 +357,64 @@ test("OSM query intent falls back when the locality cannot be resolved", async (
   assert.equal(calls[1].q, "Pharmacie Nowhere");
   assert.equal(response.stats.plannerLane, "fullFallback");
 });
+
+test("OSM locality resolution scopes to root-authority shards when available", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      return {
+        surface,
+        prefix: "rosemere",
+        matches: [
+          { text: "Rosemère", weight: 14294, count: 3, full: true, shards: ["quebec"] },
+          { text: "Rue de Rosemère", weight: 12, count: 9, full: false, shards: ["ontario"] }
+        ]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.6323155, lon: -73.8052338 }],
+          stats: {}
+        };
+      }
+      return { total: 1, results: [{ name: "Jean Coutu", type: "pharmacy" }], stats: {} };
+    }
+  };
+  await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
+  // The locality search runs scoped to the shard the root lexicon named;
+  // the street-token match must not widen the scope.
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.ok(calls[0].filters?.facets?.category?.includes("place"));
+});
+
+test("OSM locality resolution retries unscoped when the authority scope misses", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      return {
+        surface,
+        prefix: "rosemere",
+        matches: [{ text: "Rosemère", weight: 14294, count: 3, full: true, shards: ["wrong-shard"] }]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.shards) return { total: 0, results: [], stats: {} };
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.6323155, lon: -73.8052338 }],
+          stats: {}
+        };
+      }
+      return { total: 1, results: [{ name: "Jean Coutu", type: "pharmacy" }], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
+  assert.deepEqual(calls[0].shards, ["wrong-shard"]);
+  assert.equal(calls[1].shards, undefined);
+  assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+});

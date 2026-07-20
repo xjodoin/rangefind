@@ -6,8 +6,16 @@ import { autocompleteEntrySummary, isAutocompleteKey } from "./authority_lexicon
 import { normalizeAddressAuthorityKey } from "./address.js";
 
 export const AUTHORITY_FORMAT = "rfauth-v2";
+// Root-level suggest routing artifact for sharded indexes (the block lives
+// in the sharded root manifest as `suggest_routing`; see suggest_routing.js).
+export const SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v1";
 const AUTHORITY_VERSION = 2;
 const AUTHORITY_LEGACY_VERSION = 1;
+// Version 3 is written only by root-level suggest routing artifacts
+// (src/suggest_routing.js): autocomplete entries keep their summary weight
+// but also carry rows, whose "doc" column holds a federation shard ordinal
+// instead of a document index — provenance for merged suggestions.
+const AUTHORITY_ORDINAL_ROWS_VERSION = 3;
 const SURFACE_PREFIX = "r|";
 const EXACT_PREFIX = "x|";
 const TOKEN_PREFIX = "t|";
@@ -128,21 +136,33 @@ function compareRows(left, right) {
 
 export function buildAuthorityShard(entries, options = {}) {
   const maxRows = Math.max(1, Math.floor(Number(options.maxRows || 16)));
+  const ordinalRows = options.ordinalRows === true;
   const out = new AuthorityByteWriter();
   for (const byte of AUTHORITY_SHARD_MAGIC) out.push(byte);
-  pushVarint(out, AUTHORITY_VERSION);
+  pushVarint(out, ordinalRows ? AUTHORITY_ORDINAL_ROWS_VERSION : AUTHORITY_VERSION);
   pushVarint(out, entries.length);
   let previous = "";
-  for (const [key, rows] of entries) {
+  for (const [key, rows, meta] of entries) {
     const autocomplete = autocompleteEntrySummary(key, rows);
     const sorted = rows.slice().sort(compareRows);
     const kept = sorted.slice(0, maxRows);
     const prefix = commonPrefixLength(previous, key);
     pushVarint(out, prefix);
     pushUtf8(out, key.slice(prefix));
-    pushVarint(out, rows.length);
+    // Ordinal-row entries aggregate many documents behind each row (one row
+    // per federation shard), so the true document count travels separately.
+    pushVarint(out, ordinalRows ? Math.max(rows.length, Math.floor(Number(meta?.total || 0))) : rows.length);
     if (autocomplete) {
+      // Ordinal-row artifacts append the rows after the summary weight so
+      // readers can recover which federation shards back the suggestion.
       pushVarint(out, autocomplete.weight);
+      if (ordinalRows) {
+        pushVarint(out, kept.length);
+        for (const [doc, score] of kept) {
+          pushVarint(out, doc);
+          pushVarint(out, score);
+        }
+      }
       previous = key;
       continue;
     }
@@ -161,9 +181,10 @@ export function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION) {
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
+  const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = new Map();
   let previous = "";
@@ -173,14 +194,21 @@ export function parseAuthorityShard(buffer) {
     const key = previous.slice(0, prefix) + suffix;
     const total = readVarint(bytes, state);
     if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
-      entries.set(key, { total, complete: true, rows: [], autocompleteWeight: readVarint(bytes, state) });
+      const autocompleteWeight = readVarint(bytes, state);
+      let rows = [];
+      if (ordinalRows) {
+        const rowCount = readVarint(bytes, state);
+        rows = new Array(rowCount);
+        for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
+      }
+      entries.set(key, { total, complete: true, rows, autocompleteWeight, ...(ordinalRows ? { ordinalRows: true } : {}) });
       previous = key;
       continue;
     }
     const rowCount = readVarint(bytes, state);
     const rows = new Array(rowCount);
     for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
-    entries.set(key, { total, complete: total === rowCount, rows });
+    entries.set(key, { total, complete: total === rowCount, rows, ...(ordinalRows ? { ordinalRows: true } : {}) });
     previous = key;
   }
   return { format: version === AUTHORITY_LEGACY_VERSION ? "rfauth-v1" : AUTHORITY_FORMAT, entries };

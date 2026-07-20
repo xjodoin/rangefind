@@ -261,24 +261,6 @@ async function resolveLocality(engine, surface, params = {}) {
     return resolved;
   }
   const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
-  // Locality names are common worldwide ("Montréal" is also a Mauritius
-  // suburb and a Brazilian allotment) and BM25 scores tie tightly across
-  // shards, so the real city can sit well below the first page. Fetch a
-  // wider page and let the type-priority/population sort below pick the
-  // actual locality; a too-small page here silently degrades the whole
-  // query into an unscoped global fan-out.
-  const localityResponse = await engine.search(postalMatch ? {
-    q: surface,
-    size: 8,
-    ...(params.trace ? { trace: params.trace } : {}),
-    ...(shardScope.length ? { shards: shardScope } : {})
-  } : {
-    q: surface,
-    filters: { facets: { category: ["place"] } },
-    size: 32,
-    ...(params.trace ? { trace: params.trace } : {}),
-    ...(shardScope.length ? { shards: shardScope } : {})
-  });
   const typePriority = new Map([["city", 5], ["town", 4], ["municipality", 3], ["village", 2], ["hamlet", 1]]);
   const bestMatch = results => {
     const matches = (results || []).filter(result => {
@@ -295,31 +277,84 @@ async function resolveLocality(engine, surface, params = {}) {
     ));
     return matches[0] || null;
   };
-  let resolved = bestMatch(localityResponse.results);
-  let resolvedStats = localityResponse.stats || {};
-  // Popular locality names drown their major bearer under a wall of
-  // same-named hamlets ("Laval": 260 place docs; the 438k-person city ties
-  // every BM25 score and never reaches the page). When the first page
-  // resolves to nothing better than a village, ask again restricted to
-  // populated places — population is a doc-value number filter, so it works
-  // even where the type facet cannot be used for filtering.
-  // A zero-hit first page proves the retry hopeless: the populous query
-  // selects a strict subset of the same place-filtered docs.
-  if (!postalMatch && localityResponse.total > 0 && (typePriority.get(resolved?.type) || 0) <= 2) {
-    const populousResponse = await engine.search({
-      q: surface,
-      filters: { facets: { category: ["place"] }, numbers: { population: { min: 25000 } } },
-      size: 8,
-      ...(params.trace ? { trace: params.trace } : {}),
-      ...(shardScope.length ? { shards: shardScope } : {})
-    });
-    const populous = bestMatch(populousResponse.results);
-    if (populous) {
-      resolved = populous;
-      const trace = mergeRuntimeTraces(localityResponse.stats?.trace, populousResponse.stats?.trace);
-      resolvedStats = { ...(populousResponse.stats || {}), ...(trace ? { trace } : {}) };
+  // Sharded roots with a suggest-routing artifact resolve the name's home
+  // shard(s) from the root authority lexicon in a couple of small reads. The
+  // locality search below then runs scoped to those shards instead of
+  // fanning out to the whole federation — on a planet index that is the
+  // difference between ~100KB and tens of megabytes per cold locality. The
+  // lookup is advisory: a scoped miss retries unscoped.
+  let authorityShards = null;
+  if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
+    try {
+      const lookup = await engine.authorityLookup(surface, { size: 8 });
+      const scoped = [];
+      for (const match of lookup?.matches || []) {
+        if (!Array.isArray(match.shards) || !match.shards.length) continue;
+        if (fold(match.text) !== normalizedLocality) continue;
+        for (const id of match.shards) {
+          if (!scoped.includes(id)) scoped.push(id);
+        }
+        if (scoped.length >= 4) break;
+      }
+      if (scoped.length) authorityShards = scoped.slice(0, 4).sort();
+    } catch {
+      // The lexicon is an accelerator, never a gate.
     }
   }
+
+  // Locality names are common worldwide ("Montréal" is also a Mauritius
+  // suburb and a Brazilian allotment) and BM25 scores tie tightly across
+  // shards, so the real city can sit well below the first page. Fetch a
+  // wider page and let the type-priority/population sort above pick the
+  // actual locality; a too-small page here silently degrades the whole
+  // query into an unscoped global fan-out.
+  const attemptResolve = async scope => {
+    const localityResponse = await engine.search(postalMatch ? {
+      q: surface,
+      size: 8,
+      ...(params.trace ? { trace: params.trace } : {}),
+      ...(scope ? { shards: scope } : {})
+    } : {
+      q: surface,
+      filters: { facets: { category: ["place"] } },
+      size: 32,
+      ...(params.trace ? { trace: params.trace } : {}),
+      ...(scope ? { shards: scope } : {})
+    });
+    let resolved = bestMatch(localityResponse.results);
+    let resolvedStats = localityResponse.stats || {};
+    // Popular locality names drown their major bearer under a wall of
+    // same-named hamlets ("Laval": 260 place docs; the 438k-person city ties
+    // every BM25 score and never reaches the page). When the first page
+    // resolves to nothing better than a village, ask again restricted to
+    // populated places — population is a doc-value number filter, so it works
+    // even where the type facet cannot be used for filtering.
+    // A zero-hit first page proves the retry hopeless: the populous query
+    // selects a strict subset of the same place-filtered docs.
+    if (!postalMatch && localityResponse.total > 0 && (typePriority.get(resolved?.type) || 0) <= 2) {
+      const populousResponse = await engine.search({
+        q: surface,
+        filters: { facets: { category: ["place"] }, numbers: { population: { min: 25000 } } },
+        size: 8,
+        ...(params.trace ? { trace: params.trace } : {}),
+        ...(scope ? { shards: scope } : {})
+      });
+      const populous = bestMatch(populousResponse.results);
+      if (populous) {
+        resolved = populous;
+        const trace = mergeRuntimeTraces(localityResponse.stats?.trace, populousResponse.stats?.trace);
+        resolvedStats = { ...(populousResponse.stats || {}), ...(trace ? { trace } : {}) };
+      }
+    }
+    return { resolved, resolvedStats };
+  };
+
+  let outcome = await attemptResolve(authorityShards || (shardScope.length ? shardScope : null));
+  if (!outcome.resolved && authorityShards) {
+    outcome = await attemptResolve(shardScope.length ? shardScope : null);
+  }
+  const resolved = outcome.resolved;
+  const resolvedStats = outcome.resolvedStats;
   if (resolved) {
     cache.set(localityKey, { ...resolved });
     Object.defineProperty(resolved, LOCALITY_SEARCH_STATS, {

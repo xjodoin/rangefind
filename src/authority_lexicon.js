@@ -4,7 +4,7 @@ import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 
 export const AUTHORITY_LEXICON_FORMAT = "rflexicon-v1";
 export const AUTOCOMPLETE_PREFIX = "s|";
-const AUTOCOMPLETE_SEPARATOR = "\u0000";
+export const AUTOCOMPLETE_SEPARATOR = "\u0000";
 const AUTHORITY_LEXICON_VERSION = 1;
 const UNWEIGHTED_SURFACE_BONUS = 2 ** 32;
 

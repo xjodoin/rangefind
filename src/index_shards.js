@@ -15,6 +15,7 @@ import { resolve } from "node:path";
 export const SHARDED_INDEX_FORMAT = "rangefind-sharded-v1";
 
 export { TEXT_ROUTING_FORMAT, writeShardTermSet, writeTextRoutingIndex } from "./text_routing.js";
+export { SUGGEST_ROUTING_FORMAT, writeShardSuggestSet, writeSuggestRoutingIndex } from "./suggest_routing.js";
 
 function normalizedShardPath(path) {
   const trimmed = String(path || "").replace(/^\.?\//u, "");
@@ -31,7 +32,10 @@ function normalizedBbox(bbox) {
 // already contain a built index (single or generational).
 // textRouting: the block returned by writeTextRoutingIndex (text_routing.js);
 // when present, text queries route to the shards that contain their terms.
-export function writeShardedRootManifest({ outDir, shards, scoringStats = null, textRouting = null, extra = {} }) {
+// suggestRouting: the block returned by writeSuggestRoutingIndex
+// (suggest_routing.js); when present, autocomplete is answered from the
+// root-level merged authority lexicon instead of fanning out per shard.
+export function writeShardedRootManifest({ outDir, shards, scoringStats = null, textRouting = null, suggestRouting = null, extra = {} }) {
   const root = resolve(outDir);
   mkdirSync(root, { recursive: true });
   const entries = (shards || []).map((shard, index) => {
@@ -77,6 +81,7 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
       }
     } : {}),
     ...(textRouting ? { text_routing: textRouting } : {}),
+    ...(suggestRouting ? { suggest_routing: suggestRouting } : {}),
     shards: entries.map(item => item.entry),
     ...extra
   };

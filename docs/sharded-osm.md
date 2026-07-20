@@ -161,12 +161,35 @@ federated engine. Nothing changes for callers.
   generations are invisible to a stale table until then. Responses report
   `stats.textRouting` (`terms`, `selected` or `fallback`).
 
+- **Suggest routing** — when the root carries a `suggest_routing` block
+  (built by `writeSuggestRoutingIndex` from `rangefind/shards`, or from
+  `writeShardSuggestSet` sidecars when shard files are reclaimed after
+  upload), autocomplete stops fanning out entirely. The artifact is every
+  shard's authority autocomplete lexicon merged into one standard authority
+  sidecar at `<root>/authority/` — hot lists make early keystrokes one small
+  fetch, longer prefixes cost a directory page plus a partition read, all
+  edge-cacheable. Entry rows store federation shard ordinals (authority
+  codec v3), so `suggestions[].shards` still reports the region(s) whose
+  weight won — the same provenance the fan-out produced — and a selected
+  suggestion can scope its follow-up search. `stats.suggestRouting:
+  "root-authority"` marks the lane; hot-list answers carry no provenance.
+  The root artifact also powers `engine.authorityLookup(surface)`: an
+  exact-surface lexicon lookup that returns each matching display with its
+  weight and home shards. The OSM integration resolves locality names
+  through it ("pharmacy in Birmingham" no longer opens ~200 shards to find
+  Birmingham) and falls back to the unscoped search when the scoped page
+  misses. Everything is fail-open: no artifact, a broken artifact, or an
+  explicit `shards:` scope falls back to the per-shard fan-out. Rebuild the
+  artifact whenever shard contents change, alongside text routing.
+
 Current limitations (v1): `count()` stays text-only, like the single engine;
-suggest, vector, and hybrid lanes fan out to every shard (suggestions and
-vector neighbors can come from anywhere); cross-shard `sort` browse reads the
-sort key from the hydrated payload, so sharded sort fields belong in
-`display`; shard coverage bboxes do not model antimeridian-crossing regions
-(split such regions into two shards).
+vector and hybrid lanes fan out to every shard (vector neighbors can come
+from anywhere), as does suggest when the root has no `suggest_routing`
+artifact; root-served address suggestions come from the merged lexicon only
+(per-shard address interpolation enrichment does not run at the root);
+cross-shard `sort` browse reads the sort key from the hydrated payload, so
+sharded sort fields belong in `display`; shard coverage bboxes do not model
+antimeridian-crossing regions (split such regions into two shards).
 
 ### Incremental shard updates
 

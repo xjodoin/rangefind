@@ -124,6 +124,18 @@ export interface SearchEngine {
   search(params?: SearchParams): Promise<SearchResponse>;
   suggest(params?: { q?: string; size?: number; shards?: string | string[]; [key: string]: unknown }): Promise<SuggestResponse>;
   count(params?: { q?: string; shards?: string | string[]; [key: string]: unknown }): Promise<CountResponse>;
+  /**
+   * Exact-surface lookup against the authority autocomplete lexicon: every
+   * display whose normalized form equals the surface's, best rank first.
+   * Sharded roots serve it from the suggest-routing artifact and add
+   * `shards` (federation provenance) to each match; returns null when the
+   * index has no lexicon (or the sharded root has no artifact).
+   */
+  authorityLookup?(surface: string, params?: { size?: number }): Promise<{
+    surface: string;
+    prefix: string;
+    matches: Array<{ text: string; weight: number; count: number; full: boolean; shards?: string[] }>;
+  } | null>;
   vectorSearch(params?: Record<string, unknown>): Promise<SearchResponse>;
   loadFacetValues(field: string): Promise<FacetValue[]>;
   /** Sharded engines: the shard descriptors (id, path, total, bbox). */

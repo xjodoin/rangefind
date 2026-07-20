@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Root suggest routing for sharded indexes** (`rfsuggestroute-v1`): every
+  shard's authority autocomplete lexicon merges into one root-level artifact
+  (`writeSuggestRoutingIndex`, with `writeShardSuggestSet` sidecars for
+  pipelines that reclaim shard files). A federated `suggest()` is answered
+  from the root in a couple of small range reads instead of opening every
+  shard's authority sidecar — on the live 310-shard planet index a cold
+  keystroke was ~1,600 requests / 23MB (≈30s on a throttled 4G phone).
+  Merged entries keep federation provenance: suggestion rows store shard
+  ordinals (authority codec v3), so `suggestions[].shards` still names the
+  region(s) that back each suggestion. Fail-open: any missing or broken
+  artifact falls back to the per-shard fan-out.
+- **`engine.authorityLookup(surface)`**: exact-surface lookup against the
+  authority autocomplete lexicon (single or sharded root). The OSM
+  integration uses it to resolve locality names ("Berlin", "montreal")
+  straight from the root artifact and scope the follow-up search to the
+  shards that own the name, replacing the global fan-out that opened ~200
+  shards per cold locality query. Advisory: a scoped miss retries unscoped.
+
 ## 0.3.5 — 2026-07-18
 
 ### Added

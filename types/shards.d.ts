@@ -19,6 +19,8 @@ export interface WriteShardedRootManifestOptions {
   scoringStats?: { total: number; df_terms?: number } | null;
   /** Block returned by writeTextRoutingIndex; enables federated text routing. */
   textRouting?: TextRoutingBlock | null;
+  /** Block returned by writeSuggestRoutingIndex; serves federated autocomplete from the root. */
+  suggestRouting?: SuggestRoutingBlock | null;
   /** Extra root-manifest fields; `extra.meta` overrides the provenance block. */
   extra?: Record<string, unknown>;
 }
@@ -63,3 +65,50 @@ export function writeShardTermSet(options: { dir: string; outFile: string }): { 
  * shard's contents change; stale routing can hide terms added by deltas.
  */
 export function writeTextRoutingIndex(options: WriteTextRoutingIndexOptions): Promise<TextRoutingBlock>;
+
+export const SUGGEST_ROUTING_FORMAT: string;
+
+export interface SuggestRoutingBlock {
+  format: string;
+  version: number;
+  /** Shard ids in ordinal order; suggestion rows reference these. */
+  shard_ids: string[];
+  weighted: boolean;
+  keys: number;
+  rows: number;
+  /** Standard authority sidecar block rooted at <root>/authority/. */
+  authority: Record<string, unknown>;
+}
+
+export interface WriteSuggestRoutingIndexOptions {
+  /** Sharded root directory; the artifact lands in <outDir>/authority/. */
+  outDir: string;
+  /**
+   * In the sharded root's shard order: either the built shard index
+   * directory or a suggest-set sidecar written by writeShardSuggestSet.
+   */
+  shards: Array<{ id: string; dir: string } | { id: string; suggestSet: string }>;
+  baseShardDepth?: number;
+  maxShardDepth?: number;
+  targetShardRows?: number;
+  maxRowsPerKey?: number;
+  hotListSize?: number;
+  directoryPageBytes?: number;
+  packTargetBytes?: number;
+}
+
+/**
+ * Persists one shard's authority autocomplete lexicon as a small gzipped
+ * sidecar, so the root suggest artifact can be rebuilt after the shard's
+ * local artifacts are reclaimed. Regenerate whenever the shard changes.
+ */
+export function writeShardSuggestSet(options: { dir: string; outFile: string }): { keys: number; weighted: boolean };
+
+/**
+ * Merges every shard's authority autocomplete lexicon into one root-level
+ * artifact so federated suggest() and authorityLookup() answer from the
+ * root instead of fanning out per keystroke. Entry rows keep federation
+ * shard ordinals for suggestion provenance. Rebuild alongside text routing
+ * whenever any shard changes.
+ */
+export function writeSuggestRoutingIndex(options: WriteSuggestRoutingIndexOptions): Promise<SuggestRoutingBlock>;
