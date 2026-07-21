@@ -19,3 +19,31 @@ export interface OsmIndexConfigOptions {
 }
 
 export function createOsmIndexConfig(options?: OsmIndexConfigOptions): Record<string, unknown>;
+
+export const OSM_CATEGORY_LEXICON_VERSION: number;
+export const OSM_CANONICAL_TYPES: readonly string[];
+export const OSM_TYPE_ALIASES: Readonly<Record<string, readonly string[]>>;
+
+export interface OsmCategoryLexiconArtifact {
+  version: number;
+  facet: "type";
+  types: string[];
+  /** folded alias surface → canonical type value */
+  aliases: Record<string, string>;
+}
+
+export type OsmCategoryLexicon = Map<string, { type: string; query: string }>;
+
+export function fold(value: unknown): string;
+export function typeQueryText(type: unknown): string;
+export function buildCategoryLexicon(
+  typeValues?: OsmCategoryLexiconArtifact | Array<string | { value?: string; n?: number }> | null
+): OsmCategoryLexicon;
+export function buildCategoryLexiconArtifact(
+  typeValues: Array<string | { value?: string; n?: number }>
+): OsmCategoryLexiconArtifact;
+export function lookupCategory(
+  lexicon: OsmCategoryLexicon,
+  surface: unknown
+): { query: string; label: string } | null;
+export function defaultCategoryLexicon(): OsmCategoryLexicon;

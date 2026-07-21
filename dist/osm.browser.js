@@ -295,6 +295,34 @@ var OSM_TYPE_ALIASES = Object.freeze({
   castle: ["ch\xE2teau"],
   police: ["poste de police", "police station"]
 });
+var CATEGORY_EXCLUDED_TYPES = /* @__PURE__ */ new Set([
+  "address",
+  "interpolated_address_range",
+  "postal_code",
+  "city",
+  "town",
+  "village",
+  "hamlet",
+  "municipality",
+  "borough",
+  "suburb",
+  "neighbourhood",
+  "quarter",
+  "locality",
+  "isolated_dwelling",
+  "island",
+  "islet",
+  "archipelago",
+  "region",
+  "district",
+  "province",
+  "state",
+  "county",
+  "country",
+  "continent",
+  "sea",
+  "ocean"
+]);
 function fold(value) {
   return String(value || "").normalize("NFKD").replaceAll(/\p{M}+/gu, "").toLocaleLowerCase("en-US").replaceAll(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
@@ -309,6 +337,11 @@ function addEntry(lexicon, key, type) {
   if (!folded || lexicon.has(folded)) return;
   lexicon.set(folded, { type, query: typeQueryText(type) });
 }
+function gateableType(type) {
+  if (CATEGORY_EXCLUDED_TYPES.has(type)) return false;
+  const folded = fold(typeQueryText(type));
+  return Boolean(folded) && folded.length <= 32 && folded.split(" ").length <= 3 && /\p{L}/u.test(folded);
+}
 function buildCategoryLexicon(typeValues = null) {
   const lexicon = /* @__PURE__ */ new Map();
   if (typeValues && !Array.isArray(typeValues) && Array.isArray(typeValues.types)) {
@@ -318,7 +351,7 @@ function buildCategoryLexicon(typeValues = null) {
     for (const type of typeValues.types) addEntry(lexicon, typeQueryText(type), type);
     return lexicon;
   }
-  const types = Array.isArray(typeValues) && typeValues.length ? typeValues.map((item) => String(item?.value ?? item ?? "")).filter(Boolean) : [...OSM_CANONICAL_TYPES];
+  const types = Array.isArray(typeValues) && typeValues.length ? typeValues.map((item) => String(item?.value ?? item ?? "")).filter(gateableType) : [...OSM_CANONICAL_TYPES];
   const present = new Set(types);
   for (const [type, aliases] of Object.entries(OSM_TYPE_ALIASES)) {
     if (!present.has(type)) continue;
@@ -885,7 +918,7 @@ async function searchOsmQuery(engine, rawParams = {}) {
     return collapseCivicDuplicates(await engine.search(params));
   }
   let locality;
-  if (intent.order === "category-locality" && !intent.connector) {
+  if (!intent.connector) {
     const [wholePlace, split] = await Promise.all([
       resolveLocality(engine, q, params),
       resolveLocality(engine, intent.locality, params)

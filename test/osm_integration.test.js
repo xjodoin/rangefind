@@ -139,7 +139,9 @@ test("Sharded OSM build embeds the category lexicon and keeps categories local",
     const lexicon = built.rootManifest.category_lexicon;
     assert.equal(lexicon.facet, "type");
     assert.ok(lexicon.types.includes("cinema"));
-    assert.ok(lexicon.types.includes("village"));
+    // Place values never gate as categories ("Quebec City" stays a city).
+    assert.ok(!lexicon.types.includes("village"));
+    assert.ok(!lexicon.types.includes("city"));
     assert.equal(lexicon.aliases.cinema, "cinema");
     assert.equal(lexicon.aliases["movie theater"], "cinema");
 

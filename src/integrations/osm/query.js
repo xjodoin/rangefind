@@ -668,16 +668,16 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     }
     return collapseCivicDuplicates(await engine.search(params));
   }
-  // "Bar Harbor", "Park City", "Market Harborough": place names that open
-  // with a category word. Before splitting a connectorless category-first
-  // query, the whole surface gets one shot at resolving as a locality —
-  // the resolver caches misses, and "cinema in Nice" (connector) states
-  // its intent explicitly and skips straight to the split. Both resolutions
-  // are independent reads, so they run concurrently: the probe usually
-  // misses, and paying its latency serially would double a cold
+  // "Bar Harbor", "Park City", "Miami Beach", "Market Harborough": place
+  // names that open or close with a category word. Before splitting a
+  // connectorless query, the whole surface gets one shot at resolving as a
+  // locality — the resolver caches misses, and "cinema in Nice" (connector)
+  // states its intent explicitly and skips straight to the split. Both
+  // resolutions are independent reads, so they run concurrently: the probe
+  // usually misses, and paying its latency serially would double a cold
   // "cinema laval" for nothing.
   let locality;
-  if (intent.order === "category-locality" && !intent.connector) {
+  if (!intent.connector) {
     const [wholePlace, split] = await Promise.all([
       resolveLocality(engine, q, params),
       resolveLocality(engine, intent.locality, params)

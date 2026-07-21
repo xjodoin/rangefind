@@ -136,9 +136,11 @@ test("OSM category-locality search resolves a place then searches nearby", async
   assert.equal(response.stats.trace.totalBytes, 300);
   assert.equal(response.stats.trace.spans.length, 2);
   assert.equal(response.results[0].name, "Jean Coutu");
+  // The locality-category form pays its own whole-surface probe (miss +
+  // populous retry); "Rosemère" itself is already cached.
   await searchOsmQuery(engine, { q: "Rosemère pharmacie", size: 10 });
-  assert.equal(calls.length, 5);
-  assert.equal(calls[4].q, "pharmacy");
+  assert.equal(calls.length, 7);
+  assert.equal(calls[6].q, "pharmacy");
 });
 
 test("OSM exact locality search returns the city instead of matching addresses", async () => {
@@ -467,7 +469,13 @@ test("category lexicon artifact joins the corpus vocabulary with the alias table
   const artifact = buildCategoryLexiconArtifact([
     { value: "cinema", n: 120 },
     { value: "fast_food", n: 3400 },
-    { value: "velodrome", n: 2 }
+    { value: "velodrome", n: 1200 },
+    // The freeform tail must not gate: rare one-off values, long phrases,
+    // and place/address types stay out of the artifact.
+    { value: "church_tent", n: 3 },
+    { value: "school_mother_touch_community_hall", n: 9999 },
+    { value: "city", n: 999999 },
+    { value: "address", n: 999999 }
   ]);
   assert.equal(artifact.facet, "type");
   assert.deepEqual(artifact.types, ["cinema", "fast_food", "velodrome"]);
@@ -481,6 +489,7 @@ test("category lexicon artifact joins the corpus vocabulary with the alias table
   assert.equal(lookupCategory(lexicon, "fast food").query, "fast food");
   assert.equal(lookupCategory(lexicon, "velodromes").query, "velodrome");
   assert.equal(lookupCategory(lexicon, "bakery"), null);
+  assert.equal(lookupCategory(lexicon, "city"), null);
 });
 
 test("category lexicon covers the OSM type vocabulary, aliases, and plurals", () => {
@@ -551,6 +560,29 @@ test("OSM category-first place names still resolve as localities", async () => {
   assert.equal(response.stats.plannerLane, "osmLocalityExact");
   assert.equal(response.results[0].name, "Bar Harbor");
   assert.equal(response.results[0].type, "town");
+});
+
+test("OSM category-last place names still resolve as localities", async () => {
+  // "Miami Beach" ends with a corpus category word ("beach"); the whole
+  // surface must resolve as the city, never as beaches around Miami.
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      category_lexicon: { version: 1, facet: "type", types: ["beach"], aliases: {} }
+    },
+    async search(params) {
+      if (params.q === "miami beach" && params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Miami Beach", category: "place", type: "city", population: 82890, lat: 25.79, lon: -80.13 }]
+        };
+      }
+      return { total: 0, results: [], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "miami beach", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmLocalityExact");
+  assert.equal(response.results[0].name, "Miami Beach");
 });
 
 test("OSM category lexicon prefers the manifest artifact, then the facet dictionary", async () => {

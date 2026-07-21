@@ -5,6 +5,7 @@ import { performance } from "node:perf_hooks";
 import { build } from "../../../builder.js";
 import { createOsmIndexConfig } from "../schema.js";
 
+export * from "../category_lexicon.js";
 export * from "../documents.js";
 export * from "../schema.js";
 export * from "./rqa.js";

@@ -179,6 +179,18 @@ export const OSM_TYPE_ALIASES = Object.freeze({
   police: ["poste de police", "police station"]
 });
 
+// Types that must never gate as categories. Place and address values are
+// how localities are typed — if "city" became a category word, "Quebec
+// City" would turn into a nearest-city search around Québec instead of
+// resolving the city itself.
+export const CATEGORY_EXCLUDED_TYPES = new Set([
+  "address", "interpolated_address_range", "postal_code",
+  "city", "town", "village", "hamlet", "municipality", "borough",
+  "suburb", "neighbourhood", "quarter", "locality", "isolated_dwelling",
+  "island", "islet", "archipelago", "region", "district", "province",
+  "state", "county", "country", "continent", "sea", "ocean"
+]);
+
 // The planner's shared text folding: accent-strip, lowercase, and collapse
 // punctuation to spaces so "Crème-Glacée" and "creme glacee" meet.
 export function fold(value) {
@@ -207,6 +219,19 @@ function addEntry(lexicon, key, type) {
   lexicon.set(folded, { type, query: typeQueryText(type) });
 }
 
+// OSM `type` is a freeform tag value: a planet corpus holds tens of
+// thousands of one-off strings ("church tent", "school mother touch") that
+// would make terrible category gates. A gate must look like a category
+// word: short, wordy, and not a place/address value.
+function gateableType(type) {
+  if (CATEGORY_EXCLUDED_TYPES.has(type)) return false;
+  const folded = fold(typeQueryText(type));
+  return Boolean(folded)
+    && folded.length <= 32
+    && folded.split(" ").length <= 3
+    && /\p{L}/u.test(folded);
+}
+
 // Build the folded alias → {type, query} map. `typeValues` may be:
 //   - null/empty → bundled canonical vocabulary
 //   - an array of strings or facet {value} rows (a type facet dictionary)
@@ -224,7 +249,7 @@ export function buildCategoryLexicon(typeValues = null) {
     return lexicon;
   }
   const types = Array.isArray(typeValues) && typeValues.length
-    ? typeValues.map(item => String(item?.value ?? item ?? "")).filter(Boolean)
+    ? typeValues.map(item => String(item?.value ?? item ?? "")).filter(gateableType)
     : [...OSM_CANONICAL_TYPES];
   const present = new Set(types);
   for (const [type, aliases] of Object.entries(OSM_TYPE_ALIASES)) {
@@ -238,10 +263,19 @@ export function buildCategoryLexicon(typeValues = null) {
 // Compose the artifact a sharded root manifest embeds: the corpus's own type
 // vocabulary joined with the alias table, resolved once at build time so
 // query runtimes need no package-version agreement to translate.
-export function buildCategoryLexiconArtifact(typeValues) {
+//
+// `minCount` prunes the freeform tail: a planet corpus carries ~37k distinct
+// type values of which ~1.2k appear 250+ times — the rest are one-off
+// strings that would bloat the root manifest and misgate real queries.
+// Curated types (canonical vocabulary or alias table) always survive, so
+// small corpora and demo fixtures keep their categories.
+export function buildCategoryLexiconArtifact(typeValues, { minCount = 250 } = {}) {
+  const curated = new Set([...OSM_CANONICAL_TYPES, ...Object.keys(OSM_TYPE_ALIASES)]);
   const types = (typeValues || [])
     .map(item => ({ value: String(item?.value ?? item ?? ""), n: Number(item?.n || 0) }))
-    .filter(item => item.value);
+    .filter(item => item.value
+      && gateableType(item.value)
+      && (curated.has(item.value) || item.n >= minCount));
   const present = new Set(types.map(item => item.value));
   const aliases = {};
   for (const [type, list] of Object.entries(OSM_TYPE_ALIASES)) {

@@ -15,6 +15,12 @@
   holds — "cinema", "bakery", "boulangerie", "dépanneur", "movie theater"
   — now gates as a category, so bare category words become nearest-first
   searches around the anchor instead of leaking into locality resolution.
+  The artifact vocabulary is pruned to gateable values: a frequency floor
+  (default 250) drops the freeform tail of one-off tag strings (a planet
+  corpus holds ~37k distinct type values, ~1.2k of them real categories),
+  and place/address types are excluded so "Quebec City" and "Miami Beach"
+  keep resolving as the cities they are — backed by a whole-surface
+  locality probe on every connectorless category/locality split.
 
 ### Fixed
 
