@@ -6,12 +6,18 @@ import {
   searchOsmQuery,
   suggestOsmQuery
 } from "../src/integrations/osm/query.js";
+import {
+  buildCategoryLexicon,
+  buildCategoryLexiconArtifact,
+  lookupCategory
+} from "../src/integrations/osm/category_lexicon.js";
 
 test("OSM query intents recognize common categories and natural locality phrasing", () => {
   assert.deepEqual(parseOsmQueryIntent("Pharmacie Rosemère"), {
     category: { query: "pharmacy", label: "Pharmacie" },
     locality: "Rosemère",
-    order: "category-locality"
+    order: "category-locality",
+    connector: false
   });
   assert.deepEqual(parseOsmQueryIntent("Rosemère pharmacy"), {
     category: { query: "pharmacy", label: "Pharmacy" },
@@ -21,12 +27,14 @@ test("OSM query intents recognize common categories and natural locality phrasin
   assert.deepEqual(parseOsmQueryIntent("coffee in Montreal"), {
     category: { query: "cafe", label: "Coffee" },
     locality: "Montreal",
-    order: "category-locality"
+    order: "category-locality",
+    connector: true
   });
   assert.deepEqual(parseOsmQueryIntent("cafés près de Monaco"), {
     category: { query: "cafe", label: "Cafes" },
     locality: "Monaco",
-    order: "category-locality"
+    order: "category-locality",
+    connector: true
   });
   assert.deepEqual(parseOsmQueryIntent("Monaco restaurants"), {
     category: { query: "restaurant", label: "Restaurants" },
@@ -37,8 +45,17 @@ test("OSM query intents recognize common categories and natural locality phrasin
   assert.deepEqual(parseOsmQueryIntent("Café Rosemère"), {
     category: { query: "cafe", label: "Cafe" },
     locality: "Rosemère",
-    order: "category-locality"
+    order: "category-locality",
+    connector: false
   });
+  // The lexicon vocabulary reaches far beyond the old hardcoded list.
+  assert.deepEqual(parseOsmQueryIntent("cinema in Birmingham"), {
+    category: { query: "cinema", label: "Cinema" },
+    locality: "Birmingham",
+    order: "category-locality",
+    connector: true
+  });
+  assert.equal(parseOsmQueryIntent("boulangeries à Québec").category.query, "bakery");
 });
 
 test("OSM autocomplete collapses civic matches into street-locality suggestions", async () => {
@@ -106,10 +123,13 @@ test("OSM category-locality search resolves a place then searches nearby", async
     }
   };
   const response = await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].q, "pharmacy");
-  assert.equal(calls[1].geo.sort, "distance");
-  assert.equal(calls[1].geo.near.radiusMeters, 10000);
+  // The connectorless category-first form first probes the whole surface as
+  // a locality (miss + populous retry), then resolves "Rosemère" and runs
+  // the nearest-sorted category search.
+  assert.equal(calls.length, 4);
+  assert.equal(calls[3].q, "pharmacy");
+  assert.equal(calls[3].geo.sort, "distance");
+  assert.equal(calls[3].geo.near.radiusMeters, 10000);
   assert.equal(response.resolvedQuery, "Pharmacie Rosemère");
   assert.equal(response.stats.plannerLane, "osmCategoryLocality");
   assert.equal(response.stats.trace.totalMs, 12);
@@ -117,8 +137,8 @@ test("OSM category-locality search resolves a place then searches nearby", async
   assert.equal(response.stats.trace.spans.length, 2);
   assert.equal(response.results[0].name, "Jean Coutu");
   await searchOsmQuery(engine, { q: "Rosemère pharmacie", size: 10 });
-  assert.equal(calls.length, 3);
-  assert.equal(calls[2].q, "pharmacy");
+  assert.equal(calls.length, 5);
+  assert.equal(calls[4].q, "pharmacy");
 });
 
 test("OSM exact locality search returns the city instead of matching addresses", async () => {
@@ -316,10 +336,14 @@ test("OSM category search resolves a compact postal area before geo ranking", as
     }
   };
   const response = await searchOsmQuery(engine, { q: "Pharmacie J7A1V6", size: 10 });
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].filters, undefined);
-  assert.equal(calls[1].q, "pharmacy");
-  assert.equal(calls[1].geo.near.radiusMeters, 5000);
+  // The whole-surface locality probe pays place-filtered misses concurrently
+  // with the postal-code resolution, which runs filterless.
+  assert.equal(calls.length, 4);
+  const postalCall = calls.find(params => params.q === "J7A1V6");
+  assert.equal(postalCall.filters, undefined);
+  const categoryCall = calls.at(-1);
+  assert.equal(categoryCall.q, "pharmacy");
+  assert.equal(categoryCall.geo.near.radiusMeters, 5000);
   assert.equal(response.stats.osmIntentLocalityType, "postal_code");
 });
 
@@ -354,8 +378,8 @@ test("OSM query intent falls back when the locality cannot be resolved", async (
     }
   };
   const response = await searchOsmQuery(engine, { q: "Pharmacie Nowhere", size: 10 });
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].q, "Pharmacie Nowhere");
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].q, "Pharmacie Nowhere");
   assert.equal(response.stats.plannerLane, "fullFallback");
 });
 
@@ -385,10 +409,14 @@ test("OSM locality resolution scopes to root-authority shards when available", a
     }
   };
   await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
-  // The locality search runs scoped to the shard the root lexicon named;
-  // the street-token match must not widen the scope.
-  assert.deepEqual(calls[0].shards, ["quebec"]);
-  assert.ok(calls[0].filters?.facets?.category?.includes("place"));
+  // The whole-surface probe runs (and misses) unscoped; the locality search
+  // runs scoped to the shard the root lexicon named — the street-token
+  // match must not widen the scope.
+  const scoped = calls.find(params => params.shards);
+  assert.deepEqual(scoped.shards, ["quebec"]);
+  assert.ok(scoped.filters?.facets?.category?.includes("place"));
+  assert.ok(calls.some(params => params.shards === undefined
+    && params.filters?.facets?.category?.includes("place")));
 });
 
 test("OSM locality resolution retries unscoped when the authority scope misses", async () => {
@@ -415,8 +443,12 @@ test("OSM locality resolution retries unscoped when the authority scope misses",
     }
   };
   const response = await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
-  assert.deepEqual(calls[0].shards, ["wrong-shard"]);
-  assert.equal(calls[1].shards, undefined);
+  // The authority-scoped locality attempt hits the wrong shard, then the
+  // unscoped retry resolves; the whole-surface probe misses around them.
+  const scopedIndex = calls.findIndex(params => params.shards);
+  assert.deepEqual(calls[scopedIndex].shards, ["wrong-shard"]);
+  assert.ok(calls.slice(scopedIndex + 1).some(params => params.shards === undefined
+    && params.filters?.facets?.category?.includes("place")));
   assert.equal(response.stats.plannerLane, "osmCategoryLocality");
 });
 
@@ -429,6 +461,154 @@ test("nearby category intents strip near-me phrasing in both languages", () => {
   assert.equal(parseNearbyCategoryIntent("near me"), null);
   assert.equal(parseNearbyCategoryIntent("jean coutu near me"), null);
   assert.equal(parseNearbyCategoryIntent("pharmacy in Birmingham"), null);
+});
+
+test("category lexicon artifact joins the corpus vocabulary with the alias table", () => {
+  const artifact = buildCategoryLexiconArtifact([
+    { value: "cinema", n: 120 },
+    { value: "fast_food", n: 3400 },
+    { value: "velodrome", n: 2 }
+  ]);
+  assert.equal(artifact.facet, "type");
+  assert.deepEqual(artifact.types, ["cinema", "fast_food", "velodrome"]);
+  // Aliases only for types the corpus actually holds.
+  assert.equal(artifact.aliases.cinema, "cinema");
+  assert.equal(artifact.aliases["movie theater"], "cinema");
+  assert.equal(artifact.aliases.boulangerie, undefined);
+
+  const lexicon = buildCategoryLexicon(artifact);
+  assert.equal(lookupCategory(lexicon, "cinéma").query, "cinema");
+  assert.equal(lookupCategory(lexicon, "fast food").query, "fast food");
+  assert.equal(lookupCategory(lexicon, "velodromes").query, "velodrome");
+  assert.equal(lookupCategory(lexicon, "bakery"), null);
+});
+
+test("category lexicon covers the OSM type vocabulary, aliases, and plurals", () => {
+  assert.equal(parseNearbyCategoryIntent("cinema").query, "cinema");
+  assert.equal(parseNearbyCategoryIntent("cinémas près de moi").query, "cinema");
+  assert.equal(parseNearbyCategoryIntent("movie theater near me").query, "cinema");
+  assert.equal(parseNearbyCategoryIntent("boulangeries").query, "bakery");
+  assert.equal(parseNearbyCategoryIntent("dépanneur").query, "convenience");
+  assert.equal(parseNearbyCategoryIntent("fast food nearby").query, "fast food");
+  assert.equal(parseNearbyCategoryIntent("hôpitaux").query, "hospital");
+  assert.equal(parseNearbyCategoryIntent("churches close by").query, "place of worship");
+  // Locality names must never fold into category intents.
+  assert.equal(parseNearbyCategoryIntent("paris"), null);
+  assert.equal(parseNearbyCategoryIntent("tours"), null);
+  assert.equal(parseNearbyCategoryIntent("nice"), null);
+});
+
+test("OSM bare category words no longer teleport to a same-named village", async () => {
+  // Before the lexicon, "cinema" was not a known category, passed the
+  // locality gate, and resolved to an actual village named Cinema — the
+  // demo map then flew across the planet. With an anchor it must be a
+  // nearest-first category search; without one, a plain text search. The
+  // place-filtered locality probe must never run for a category word.
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Cinema", category: "place", type: "village", lat: -0.34, lon: 31.74 }]
+        };
+      }
+      return { total: 4, results: [{ name: "Cinéma Kirkland", type: "cinema", distanceMeters: 900 }], stats: {} };
+    }
+  };
+  const near = await searchOsmQuery(engine, { q: "cinema", size: 10, near: { lat: 45.63, lon: -73.8 } });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "cinema");
+  assert.equal(calls[0].geo.sort, "distance");
+  assert.equal(near.stats.plannerLane, "osmCategoryNearby");
+  assert.equal(near.results[0].name, "Cinéma Kirkland");
+
+  const global = await searchOsmQuery(engine, { q: "cinema", size: 10 });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].q, "cinema");
+  assert.equal(calls[1].filters, undefined);
+  assert.notEqual(global.stats.plannerLane, "osmLocalityExact");
+});
+
+test("OSM category-first place names still resolve as localities", async () => {
+  // "Bar Harbor" opens with a category word ("bar"), but the whole surface
+  // is a real town — the connectorless form probes the full name first.
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.q === "bar harbor" && params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{ name: "Bar Harbor", category: "place", type: "town", population: 5089, lat: 44.39, lon: -68.2 }]
+        };
+      }
+      return { total: 0, results: [], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "bar harbor", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmLocalityExact");
+  assert.equal(response.results[0].name, "Bar Harbor");
+  assert.equal(response.results[0].type, "town");
+});
+
+test("OSM category lexicon prefers the manifest artifact, then the facet dictionary", async () => {
+  // A sharded root built with the artifact: its own vocabulary gates, even
+  // for types the bundled fallback does not carry.
+  const embedded = {
+    manifest: {
+      features: { shards: true },
+      category_lexicon: {
+        version: 1,
+        facet: "type",
+        types: ["velodrome", "cinema"],
+        aliases: { "velodrome couvert": "velodrome" }
+      }
+    },
+    async search(params) {
+      this.calls = [...(this.calls || []), params];
+      return { total: 1, results: [{ name: "Vélodrome", type: "velodrome" }], stats: {} };
+    }
+  };
+  const artifact = await searchOsmQuery(embedded, { q: "velodrome couvert near me", size: 10, near: { lat: 45.5, lon: -73.6 } });
+  assert.equal(artifact.stats.plannerLane, "osmCategoryNearby");
+  assert.equal(embedded.calls[0].q, "velodrome");
+
+  // A single index reads its lazy type facet dictionary — once per engine.
+  let dictionaryReads = 0;
+  const single = {
+    manifest: { features: {} },
+    async loadFacetValues(field) {
+      dictionaryReads += 1;
+      assert.equal(field, "type");
+      return [{ value: "windmill", n: 3 }, { value: "cinema", n: 8 }];
+    },
+    async search(params) {
+      this.calls = [...(this.calls || []), params];
+      return { total: 1, results: [{ name: "De Gooyer", type: "windmill" }], stats: {} };
+    }
+  };
+  const windmill = await searchOsmQuery(single, { q: "windmill", size: 10, near: { lat: 52.37, lon: 4.93 } });
+  assert.equal(windmill.stats.plannerLane, "osmCategoryNearby");
+  assert.equal(single.calls[0].q, "windmill");
+  await searchOsmQuery(single, { q: "windmill", size: 10, near: { lat: 52.37, lon: 4.93 } });
+  assert.equal(dictionaryReads, 1, "the facet dictionary is read once per engine");
+
+  // A sharded root without the artifact must not fan out per shard for a
+  // dictionary merge — the bundled vocabulary still covers common words.
+  const bare = {
+    manifest: { features: { shards: true } },
+    async loadFacetValues() {
+      throw new Error("sharded dictionary merge must not run for the lexicon");
+    },
+    async search(params) {
+      this.calls = [...(this.calls || []), params];
+      return { total: 1, results: [{ name: "Cineplex", type: "cinema" }], stats: {} };
+    }
+  };
+  const fallback = await searchOsmQuery(bare, { q: "cinema", size: 10, near: { lat: 45.5, lon: -73.6 } });
+  assert.equal(fallback.stats.plannerLane, "osmCategoryNearby");
 });
 
 test("OSM search runs bare categories as nearest-first around the anchor", async () => {

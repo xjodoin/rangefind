@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Added
+
+- **Data-driven OSM category lexicon**: the query planner's category
+  vocabulary now comes from the index instead of a hardcoded seven-word
+  list. Sharded OSM builds merge every shard's `type` facet dictionary,
+  join it with a bundled multilingual alias table (French forms, English
+  synonyms, irregular plurals), and embed the result in the root manifest
+  (`category_lexicon`); single indexes read their lazy `type` facet
+  dictionary at query time; indexes without either fall back to a bundled
+  canonical OSM vocabulary of ~180 common type values. Any type the corpus
+  holds — "cinema", "bakery", "boulangerie", "dépanneur", "movie theater"
+  — now gates as a category, so bare category words become nearest-first
+  searches around the anchor instead of leaking into locality resolution.
+
+### Fixed
+
+- **Bare category words no longer teleport the map to a same-named
+  village.** "cinema" was not in the old hardcoded category list, passed
+  the locality gate, and resolved `osmLocalityExact` to an actual village
+  named Cinema — the demo map then flew across the planet. Category words
+  are now recognized via the lexicon and never enter locality resolution.
+- **Category-first place names resolve as places again.** Connectorless
+  category-first queries ("Bar Harbor", "Park City", "Market Harborough")
+  give the whole surface one shot at resolving as a locality before being
+  split into category + locality; "cinema in Nice" states its intent
+  explicitly and skips straight to the split.
+
 ## 0.3.7 — 2026-07-20
 
 ### Fixed

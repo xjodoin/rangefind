@@ -8,7 +8,9 @@ import {
   OSM_INTEGRATION_SCHEMA_VERSION,
   createOsmIndexConfig
 } from "../src/integrations/osm/schema.js";
-import { buildOsmIndex, writeOsmSite } from "../src/integrations/osm/node/builder.js";
+import { buildOsmIndex, buildOsmShardedIndex, writeOsmSite } from "../src/integrations/osm/node/builder.js";
+import { createNodeSearch } from "../src/runtime.node.js";
+import { searchOsmQuery } from "../src/integrations/osm/query.js";
 
 test("OSM integration publishes the canonical Rangefind schema", () => {
   const config = createOsmIndexConfig({
@@ -95,6 +97,66 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     assert.equal(manifest.features.geo, true);
     assert.equal(built.config.output, "public/rangefind");
     assert.equal(built.seconds >= 0, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Sharded OSM build embeds the category lexicon and keeps categories local", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-osm-sharded-"));
+  try {
+    await mkdir(join(root, "data"), { recursive: true });
+    const doc = (id, fields) => `${JSON.stringify({ id, ...fields })}\n`;
+    // Quebec shard: a cinema POI near Montreal plus its host city.
+    await writeFile(join(root, "data", "quebec.jsonl"),
+      doc("node/1", {
+        name: "Cinéma Beaubien", search_name: "Cinéma Beaubien", body: "cinema amenity",
+        category: "amenity", type: "cinema",
+        lat: 45.535, lon: -73.58, geo_lat: 45.535, geo_lon: -73.58
+      })
+      + doc("node/2", {
+        name: "Montréal", search_name: "Montréal", body: "city place",
+        category: "place", type: "city", population: 1704694,
+        lat: 45.5032, lon: -73.5698, geo_lat: 45.5032, geo_lon: -73.5698
+      }));
+    // Uganda shard: a village literally named Cinema — the old planner's trap.
+    await writeFile(join(root, "data", "uganda.jsonl"),
+      doc("node/3", {
+        name: "Cinema", search_name: "Cinema", body: "village place",
+        category: "place", type: "village",
+        lat: -0.3408, lon: 31.739, geo_lat: -0.3408, geo_lon: 31.739
+      }));
+    const output = join(root, "public", "rangefind");
+    const built = await buildOsmShardedIndex({
+      output,
+      workerCount: 1,
+      buildProgressLogMs: 0,
+      shards: [
+        { id: "quebec", input: join(root, "data", "quebec.jsonl") },
+        { id: "uganda", input: join(root, "data", "uganda.jsonl") }
+      ]
+    });
+    const lexicon = built.rootManifest.category_lexicon;
+    assert.equal(lexicon.facet, "type");
+    assert.ok(lexicon.types.includes("cinema"));
+    assert.ok(lexicon.types.includes("village"));
+    assert.equal(lexicon.aliases.cinema, "cinema");
+    assert.equal(lexicon.aliases["movie theater"], "cinema");
+
+    const engine = await createNodeSearch({ source: output });
+    // Anchored near Montreal, "cinema" is a nearest-first category search —
+    // not a teleport to the same-named village.
+    const near = await searchOsmQuery(engine, {
+      q: "cinema", size: 5, near: { lat: 45.5, lon: -73.57 }
+    });
+    assert.equal(near.stats.plannerLane, "osmCategoryNearby");
+    assert.equal(near.results[0]?.name, "Cinéma Beaubien");
+    // The French alias resolves through the embedded lexicon too.
+    const french = await searchOsmQuery(engine, {
+      q: "cinéma près de moi", size: 5, near: { lat: 45.5, lon: -73.57 }
+    });
+    assert.equal(french.stats.plannerLane, "osmCategoryNearby");
+    assert.equal(french.resolvedQuery, "Cinema nearby");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

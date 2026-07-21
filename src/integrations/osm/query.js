@@ -1,27 +1,10 @@
-const CATEGORY_INTENTS = new Map([
-  ["pharmacie", { query: "pharmacy", label: "Pharmacie" }],
-  ["pharmacy", { query: "pharmacy", label: "Pharmacy" }],
-  ["pharmacies", { query: "pharmacy", label: "Pharmacies" }],
-  ["cafe", { query: "cafe", label: "Cafe" }],
-  ["cafes", { query: "cafe", label: "Cafes" }],
-  ["coffee", { query: "cafe", label: "Coffee" }],
-  ["restaurant", { query: "restaurant", label: "Restaurant" }],
-  ["restaurants", { query: "restaurant", label: "Restaurants" }],
-  ["hotel", { query: "hotel", label: "Hotel" }],
-  ["hotels", { query: "hotel", label: "Hotels" }],
-  ["hospital", { query: "hospital", label: "Hospital" }],
-  ["hospitals", { query: "hospital", label: "Hospitals" }],
-  ["hopital", { query: "hospital", label: "Hopital" }],
-  ["hopitaux", { query: "hospital", label: "Hopitaux" }],
-  ["park", { query: "park", label: "Park" }],
-  ["parks", { query: "park", label: "Parks" }],
-  ["parc", { query: "park", label: "Parc" }],
-  ["parcs", { query: "park", label: "Parcs" }],
-  ["supermarket", { query: "supermarket", label: "Supermarket" }],
-  ["supermarkets", { query: "supermarket", label: "Supermarkets" }],
-  ["epicerie", { query: "supermarket", label: "Epicerie" }],
-  ["epiceries", { query: "supermarket", label: "Epiceries" }]
-]);
+import {
+  buildCategoryLexicon,
+  defaultCategoryLexicon,
+  fold,
+  lookupCategory
+} from "./category_lexicon.js";
+
 const LOCALITY_CONNECTORS = new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
 const LOCALITY_CACHE = new WeakMap();
 const LOCALITY_SEARCH_STATS = Symbol("rangefind.localitySearchStats");
@@ -64,31 +47,27 @@ function mergeRuntimeTraces(...values) {
   };
 }
 
-function fold(value) {
-  return String(value || "")
-    .normalize("NFKD")
-    .replaceAll(/\p{M}+/gu, "")
-    .toLocaleLowerCase("en-US")
-    .replaceAll(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
-export function parseOsmQueryIntent(value) {
+export function parseOsmQueryIntent(value, lexicon = defaultCategoryLexicon()) {
   const surface = String(value || "").trim();
   const tokens = surface.split(/\s+/u).filter(Boolean);
   if (tokens.length < 2) return null;
-  const first = CATEGORY_INTENTS.get(fold(tokens[0]));
+  const first = lookupCategory(lexicon, tokens[0]);
   if (first) {
     const localityTokens = tokens.slice(1);
-    while (LOCALITY_CONNECTORS.has(fold(localityTokens[0]))) localityTokens.shift();
+    let connector = false;
+    while (LOCALITY_CONNECTORS.has(fold(localityTokens[0]))) {
+      localityTokens.shift();
+      connector = true;
+    }
     if (!localityTokens.length) return null;
     return {
       category: first,
       locality: localityTokens.join(" "),
-      order: "category-locality"
+      order: "category-locality",
+      connector
     };
   }
-  const last = CATEGORY_INTENTS.get(fold(tokens.at(-1)));
+  const last = lookupCategory(lexicon, tokens.at(-1));
   if (last) {
     return {
       category: last,
@@ -109,7 +88,7 @@ const NEARBY_SUFFIXES = [
   "pres de moi", "autour de moi", "a proximite", "proche", "proches"
 ];
 
-export function parseNearbyCategoryIntent(value) {
+export function parseNearbyCategoryIntent(value, lexicon = defaultCategoryLexicon()) {
   let normalized = fold(value);
   if (!normalized) return null;
   for (const suffix of NEARBY_SUFFIXES) {
@@ -119,7 +98,40 @@ export function parseNearbyCategoryIntent(value) {
       break;
     }
   }
-  return CATEGORY_INTENTS.get(normalized) || null;
+  return lookupCategory(lexicon, normalized);
+}
+
+// Category vocabulary for an engine, resolved once and cached. A sharded
+// root built with the lexicon artifact carries it in the manifest (its own
+// corpus vocabulary joined with the alias table at build time); a single
+// index reads its lazy `type` facet dictionary — one small cached fetch.
+// Everything else (older roots, test doubles) gets the bundled canonical
+// vocabulary, so category gating never depends on a rebuild.
+const CATEGORY_LEXICON_CACHE = new WeakMap();
+
+function engineCategoryLexicon(engine) {
+  if (!engine || typeof engine !== "object") return defaultCategoryLexicon();
+  if (!CATEGORY_LEXICON_CACHE.has(engine)) {
+    CATEGORY_LEXICON_CACHE.set(engine, (async () => {
+      const embedded = engine.manifest?.category_lexicon;
+      if (Array.isArray(embedded?.types) && embedded.types.length) {
+        return buildCategoryLexicon(embedded);
+      }
+      // A sharded root without the artifact would pay a full per-shard
+      // fan-out to merge dictionaries — never worth it for a gate.
+      const sharded = Boolean(engine.manifest?.features?.shards);
+      if (!sharded && typeof engine.loadFacetValues === "function") {
+        try {
+          const values = await engine.loadFacetValues("type");
+          if (Array.isArray(values) && values.length) return buildCategoryLexicon(values);
+        } catch {
+          // The dictionary is an accelerator, never a gate.
+        }
+      }
+      return defaultCategoryLexicon();
+    })());
+  }
+  return CATEGORY_LEXICON_CACHE.get(engine);
 }
 
 function nearAnchor(params) {
@@ -157,14 +169,14 @@ function localityRadiusMeters(type) {
   return 5000;
 }
 
-function possibleLocalityQuery(value) {
+function possibleLocalityQuery(value, lexicon) {
   const surface = String(value || "").trim();
   const normalized = fold(surface);
   const tokens = normalized.split(" ").filter(Boolean);
   return tokens.length >= 1
     && tokens.length <= 4
     && !tokens.some(token => /\d/u.test(token))
-    && !CATEGORY_INTENTS.has(normalized);
+    && !lookupCategory(lexicon || defaultCategoryLexicon(), normalized);
 }
 
 function hasHouseNumber(value) {
@@ -550,6 +562,23 @@ async function resolveStreetLocality(engine, surface, params) {
   return null;
 }
 
+function localityExactResponse(locality, params, surface) {
+  return {
+    total: 1,
+    page: 1,
+    size: Number(params.size || 10),
+    approximate: false,
+    results: [locality],
+    resolvedQuery: locality.name || surface,
+    stats: {
+      ...(locality[LOCALITY_SEARCH_STATS] || {}),
+      plannerLane: "osmLocalityExact",
+      osmIntentLocality: locality.name || surface,
+      osmIntentLocalityType: locality.type || ""
+    }
+  };
+}
+
 export async function searchOsmQuery(engine, rawParams = {}) {
   // `near` is an advisory anchor (user location or map viewport center) for
   // the cascade only; the engine never sees it. Explicit place intents in
@@ -557,10 +586,11 @@ export async function searchOsmQuery(engine, rawParams = {}) {
   const anchor = rawParams.geo == null ? nearAnchor(rawParams) : null;
   const params = engineParams(rawParams);
   const q = String(params.q || "").trim();
+  const lexicon = await engineCategoryLexicon(engine);
   // "pharmacy near me" parses before category-locality — otherwise "me"
   // would be treated as a locality name and resolved against the planet.
-  const nearbyCategory = parseNearbyCategoryIntent(q);
-  const intent = nearbyCategory ? null : parseOsmQueryIntent(q);
+  const nearbyCategory = parseNearbyCategoryIntent(q, lexicon);
+  const intent = nearbyCategory ? null : parseOsmQueryIntent(q, lexicon);
   if (!intent) {
     // Bare category (or explicit near-me phrasing) with an anchor: a
     // nearest-sorted category search around the caller instead of an
@@ -598,24 +628,9 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     if (nearbyCategory) return collapseCivicDuplicates(await engine.search(params));
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
-    if (possibleLocalityQuery(q)) {
+    if (possibleLocalityQuery(q, lexicon)) {
       const locality = await resolveLocality(engine, q, params);
-      if (locality) {
-        return {
-          total: 1,
-          page: 1,
-          size: Number(params.size || 10),
-          approximate: false,
-          results: [locality],
-          resolvedQuery: locality.name || q,
-          stats: {
-            ...(locality[LOCALITY_SEARCH_STATS] || {}),
-            plannerLane: "osmLocalityExact",
-            osmIntentLocality: locality.name || q,
-            osmIntentLocalityType: locality.type || ""
-          }
-        };
-      }
+      if (locality) return localityExactResponse(locality, params, q);
     }
     // Local-first text: scoped to the anchor's radius, geo routing opens the
     // one or two shards whose coverage contains the caller instead of every
@@ -653,7 +668,25 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     }
     return collapseCivicDuplicates(await engine.search(params));
   }
-  const locality = await resolveLocality(engine, intent.locality, params);
+  // "Bar Harbor", "Park City", "Market Harborough": place names that open
+  // with a category word. Before splitting a connectorless category-first
+  // query, the whole surface gets one shot at resolving as a locality —
+  // the resolver caches misses, and "cinema in Nice" (connector) states
+  // its intent explicitly and skips straight to the split. Both resolutions
+  // are independent reads, so they run concurrently: the probe usually
+  // misses, and paying its latency serially would double a cold
+  // "cinema laval" for nothing.
+  let locality;
+  if (intent.order === "category-locality" && !intent.connector) {
+    const [wholePlace, split] = await Promise.all([
+      resolveLocality(engine, q, params),
+      resolveLocality(engine, intent.locality, params)
+    ]);
+    if (wholePlace) return localityExactResponse(wholePlace, params, q);
+    locality = split;
+  } else {
+    locality = await resolveLocality(engine, intent.locality, params);
+  }
   if (!locality) return collapseCivicDuplicates(await engine.search(params));
 
   const response = await engine.search({

@@ -8,6 +8,8 @@ import { collectScoringStats } from "../../../scoring_stats.js";
 import { writeShardedRootManifest } from "../../../index_shards.js";
 import { writeTextRoutingIndex } from "../../../text_routing.js";
 import { writeSuggestRoutingIndex } from "../../../suggest_routing.js";
+import { createNodeSearch } from "../../../runtime.node.js";
+import { buildCategoryLexiconArtifact } from "../category_lexicon.js";
 import { createOsmIndexConfig } from "../schema.js";
 
 // Sharded OSM build: one Rangefind index per region, every shard consuming
@@ -105,12 +107,34 @@ export async function buildOsmShardedIndex(options = {}) {
     console.log(`Rangefind: suggest routing ready — ${suggestRouting.keys.toLocaleString()} lexicon keys`);
   }
 
+  // Category lexicon: the merged `type` facet vocabulary across every shard,
+  // joined with the package's alias table and embedded in the root manifest.
+  // Bare category words ("cinema", "boulangerie") then gate on the corpus's
+  // own vocabulary at query time — no fetch, no hardcoded list.
+  let categoryLexicon = null;
+  if (options.categoryLexicon !== false) {
+    console.log("Rangefind: merging category lexicon");
+    const typeCounts = new Map();
+    for (const entry of shardEntries) {
+      const engine = await createNodeSearch({ source: resolve(output, entry.path) });
+      for (const item of await engine.loadFacetValues("type")) {
+        if (!item?.value) continue;
+        typeCounts.set(item.value, (typeCounts.get(item.value) || 0) + Number(item.n || 0));
+      }
+    }
+    categoryLexicon = buildCategoryLexiconArtifact(
+      [...typeCounts].map(([value, n]) => ({ value, n }))
+    );
+    console.log(`Rangefind: category lexicon ready — ${categoryLexicon.types.length} types, ${Object.keys(categoryLexicon.aliases).length} aliases`);
+  }
+
   const rootManifest = writeShardedRootManifest({
     outDir: output,
     shards: shardEntries,
     scoringStats: stats.stats,
     textRouting,
-    suggestRouting
+    suggestRouting,
+    ...(categoryLexicon ? { extra: { category_lexicon: categoryLexicon } } : {})
   });
   const seconds = Math.round((performance.now() - started) / 100) / 10;
   console.log(`Rangefind: sharded index ready — ${rootManifest.shards.length} shards, ${rootManifest.total.toLocaleString()} docs, ${seconds}s`);
