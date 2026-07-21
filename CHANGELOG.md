@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.8 — 2026-07-20
+
 ### Added
 
 - **Data-driven OSM category lexicon**: the query planner's category
