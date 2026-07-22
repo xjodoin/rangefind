@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Root suggest-routing finalization now reuses its partition metadata array
+  when resolving content-addressed pack names instead of duplicating every
+  directory entry at once. Planet-scale merges no longer exhaust the V8 heap
+  after all sidecar streams and packs have already completed.
+
 ## 0.3.8 — 2026-07-20
 
 ### Added

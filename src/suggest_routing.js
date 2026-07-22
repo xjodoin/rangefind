@@ -394,7 +394,12 @@ export async function writeSuggestRoutingIndex({
   mkdirSync(authorityDir, { recursive: true });
   const packWriter = createAppendOnlyPackWriter(resolve(authorityDir, "packs"), packTargetBytes);
   const shardConfig = { baseShardDepth, maxShardDepth, targetShardPostings: targetShardRows };
-  const partitions = [];
+  // Keep one directory-metadata array throughout the merge. Planet builds
+  // can produce millions of physical partitions; retaining `{ shard, entry }`
+  // objects and then mapping them into a second `directoryEntries` array
+  // briefly doubled the live heap after the expensive stream merge had
+  // already completed.
+  const directoryEntries = [];
   const autocompleteShards = [];
   const hotLimit = Math.max(8, Math.floor(Number(hotListSize)));
   const hot = new Map();
@@ -440,7 +445,14 @@ export async function writeSuggestRoutingIndex({
       for (const item of partition.entries) {
         maxRank = Math.max(maxRank, item.rank);
       }
-      partitions.push({ shard: partition.name, entry });
+      directoryEntries.push({
+        shard: partition.name,
+        pack: entry.pack,
+        offset: entry.offset,
+        length: entry.length,
+        logicalLength: entry.logicalLength || 0,
+        checksum: entry.checksum
+      });
       autocompleteShards.push({ shard: partition.name, maxRank, count: partition.entries.length });
     }
     group.length = 0;
@@ -479,17 +491,11 @@ export async function writeSuggestRoutingIndex({
 
   const packTable = packWriter.packs.map(pack => pack.file);
   const packIndexByFile = new Map(packTable.map((file, index) => [file, index]));
-  const directoryEntries = partitions.map(partition => {
-    const pack = packWriter.packNameMap?.get(partition.entry.pack) || partition.entry.pack;
-    return {
-      shard: partition.shard,
-      packIndex: packIndexByFile.get(pack),
-      offset: partition.entry.offset,
-      length: partition.entry.length,
-      logicalLength: partition.entry.logicalLength || 0,
-      checksum: partition.entry.checksum
-    };
-  });
+  for (const item of directoryEntries) {
+    const pack = packWriter.packNameMap?.get(item.pack) || item.pack;
+    item.packIndex = packIndexByFile.get(pack);
+    delete item.pack;
+  }
   const directory = await writeDirectoryFilesFromSortedEntries(
     authorityDir,
     directoryEntries,
