@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.9 — 2026-07-22
+
 ### Fixed
 
 - Root suggest-routing finalization now reuses its partition metadata array
