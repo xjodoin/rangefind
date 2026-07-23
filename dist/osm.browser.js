@@ -526,6 +526,27 @@ function engineParams(params) {
 var NEARBY_CATEGORY_RADII_METERS = [1e4, 5e4];
 var NEAR_TEXT_RADIUS_METERS = 5e4;
 var NEAR_TEXT_BOOST = { weight: 2, pivotMeters: 2e3 };
+function isGeoTextSortBudgetError(error) {
+  return error?.code === "RANGEFIND_GEO_TEXT_SORT_BUDGET" || String(error?.message || "").includes("geoTextSortMaxDf");
+}
+async function searchNearestWithBudgetFallback(engine, params) {
+  try {
+    return await engine.search(params);
+  } catch (error) {
+    if (params.geo?.sort !== "distance" || !params.geo?.near || !isGeoTextSortBudgetError(error)) {
+      throw error;
+    }
+    const { sort, ...geo } = params.geo;
+    const response = await engine.search({ ...params, geo: { ...geo, boost: NEAR_TEXT_BOOST } });
+    const meters = (value) => Number.isFinite(value) ? value : Infinity;
+    const results = [...response.results || []].sort((left, right) => meters(left.distanceMeters) - meters(right.distanceMeters));
+    return {
+      ...response,
+      results,
+      stats: { ...response.stats || {}, osmDistanceSortFallback: "geo-boost" }
+    };
+  }
+}
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const rad = Math.PI / 180;
   const dLat = (lat2 - lat1) * rad;
@@ -539,6 +560,11 @@ function localityRadiusMeters(type) {
   if (type === "town" || type === "municipality") return 1e4;
   if (type === "village") return 7e3;
   return 5e3;
+}
+var LOCALITY_TYPE_PRIORITY = /* @__PURE__ */ new Map([["city", 5], ["town", 4], ["municipality", 3], ["village", 2], ["hamlet", 1]]);
+var WEAK_LOCALITY_ANCHOR_METERS = 1e5;
+function typePriority(type) {
+  return LOCALITY_TYPE_PRIORITY.get(type) || 0;
 }
 function possibleLocalityQuery(value, lexicon) {
   const surface = String(value || "").trim();
@@ -657,7 +683,6 @@ async function resolveLocality(engine, surface, params = {}) {
     return resolved2;
   }
   const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
-  const typePriority = /* @__PURE__ */ new Map([["city", 5], ["town", 4], ["municipality", 3], ["village", 2], ["hamlet", 1]]);
   const bestMatch = (results) => {
     const matches = (results || []).filter((result) => {
       if (!Number.isFinite(result.lat) || !Number.isFinite(result.lon)) return false;
@@ -667,7 +692,7 @@ async function resolveLocality(engine, surface, params = {}) {
       }
       return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === normalizedLocality;
     });
-    matches.sort((left, right) => (typePriority.get(right.type) || 0) - (typePriority.get(left.type) || 0) || Number(right.population || 0) - Number(left.population || 0));
+    matches.sort((left, right) => typePriority(right.type) - typePriority(left.type) || Number(right.population || 0) - Number(left.population || 0));
     return matches[0] || null;
   };
   let authorityShards = null;
@@ -702,7 +727,7 @@ async function resolveLocality(engine, surface, params = {}) {
     });
     let resolved2 = bestMatch(localityResponse.results);
     let resolvedStats2 = localityResponse.stats || {};
-    if (!postalMatch && localityResponse.total > 0 && (typePriority.get(resolved2?.type) || 0) <= 2) {
+    if (!postalMatch && localityResponse.total > 0 && typePriority(resolved2?.type) <= 2) {
       const populousResponse = await engine.search({
         q: surface,
         filters: { facets: { category: ["place"] }, numbers: { population: { min: 25e3 } } },
@@ -858,7 +883,7 @@ async function searchOsmQuery(engine, rawParams = {}) {
       let radiusMeters = 0;
       for (const radius of NEARBY_CATEGORY_RADII_METERS) {
         radiusMeters = radius;
-        response2 = await engine.search({
+        response2 = await searchNearestWithBudgetFallback(engine, {
           ...params,
           q: nearbyCategory.query,
           geo: {
@@ -879,7 +904,7 @@ async function searchOsmQuery(engine, rawParams = {}) {
         }
       };
     }
-    if (nearbyCategory) return collapseCivicDuplicates(await engine.search(params));
+    if (nearbyCategory) return collapseCivicDuplicates(await searchNearestWithBudgetFallback(engine, params));
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
     if (possibleLocalityQuery(q, lexicon)) {
@@ -915,7 +940,7 @@ async function searchOsmQuery(engine, rawParams = {}) {
         }
       });
     }
-    return collapseCivicDuplicates(await engine.search(params));
+    return collapseCivicDuplicates(await searchNearestWithBudgetFallback(engine, params));
   }
   let locality;
   if (!intent.connector) {
@@ -928,8 +953,30 @@ async function searchOsmQuery(engine, rawParams = {}) {
   } else {
     locality = await resolveLocality(engine, intent.locality, params);
   }
-  if (!locality) return collapseCivicDuplicates(await engine.search(params));
-  const response = await engine.search({
+  if (!locality) return collapseCivicDuplicates(await searchNearestWithBudgetFallback(engine, params));
+  const weakDistantLocality = anchor && typePriority(locality.type) <= 2 && !Number(locality.population || 0) && haversineMeters(anchor.lat, anchor.lon, locality.lat, locality.lon) > WEAK_LOCALITY_ANCHOR_METERS;
+  let weakLocalProbe = null;
+  if (weakDistantLocality) {
+    weakLocalProbe = await engine.search({
+      ...params,
+      geo: {
+        near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+        boost: NEAR_TEXT_BOOST
+      }
+    });
+    if (weakLocalProbe.total > 0 && weakLocalProbe.results.length) {
+      return collapseCivicDuplicates({
+        ...weakLocalProbe,
+        stats: {
+          ...weakLocalProbe.stats || {},
+          plannerLane: "osmNearText",
+          osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS,
+          osmWeakLocalityTextFirst: true
+        }
+      });
+    }
+  }
+  const response = await searchNearestWithBudgetFallback(engine, {
     ...params,
     q: intent.category.query,
     geo: {
@@ -941,7 +988,11 @@ async function searchOsmQuery(engine, rawParams = {}) {
       sort: "distance"
     }
   });
-  const trace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
+  const trace = mergeRuntimeTraces(
+    locality[LOCALITY_SEARCH_STATS]?.trace,
+    weakLocalProbe?.stats?.trace,
+    response.stats?.trace
+  );
   return {
     ...response,
     resolvedQuery: `${intent.category.label} ${locality.name || intent.locality}`,
@@ -952,7 +1003,8 @@ async function searchOsmQuery(engine, rawParams = {}) {
       osmIntentCategory: intent.category.query,
       osmIntentLocality: locality.name || intent.locality,
       osmIntentLocalityType: locality.type || "",
-      osmIntentRadiusMeters: localityRadiusMeters(locality.type)
+      osmIntentRadiusMeters: localityRadiusMeters(locality.type),
+      ...weakLocalProbe ? { osmWeakLocalityTextProbe: true } : {}
     }
   };
 }

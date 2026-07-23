@@ -758,3 +758,172 @@ test("OSM search ignores the anchor when explicit geo or intents are present", a
   const categoryCall = localityCalls.at(-1);
   assert.equal(categoryCall.geo.near.lat, 45.6323);
 });
+
+test("OSM category-locality search degrades to a proximity boost when distance sort exceeds the posting budget", async () => {
+  // Live shape of "garage brunet": the category-first intent resolves the
+  // village of Brunet (Provence), and "car repair" blows through the dense
+  // shard's geoTextSortMaxDf budget. The refusal must degrade to relevance +
+  // proximity boost in the same radius, never surface as a failed query.
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.numbers?.population) {
+        return { total: 0, results: [] };
+      }
+      if (params.filters?.facets?.category?.includes("place")) {
+        if (params.q !== "brunet") return { total: 0, results: [] };
+        return {
+          total: 1,
+          results: [{ name: "Brunet", category: "place", type: "village", lat: 43.8912, lon: 6.0303 }]
+        };
+      }
+      if (params.geo?.sort === "distance") {
+        const budgetError = new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+        budgetError.code = "RANGEFIND_GEO_TEXT_SORT_BUDGET";
+        throw budgetError;
+      }
+      return {
+        total: 2,
+        results: [
+          { name: "agricenter - val'agri", type: "car_repair", distanceMeters: 6815 },
+          { name: "TAXIL", type: "car_repair", distanceMeters: 6764 }
+        ],
+        stats: { geoLane: "boostedText" }
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "garage brunet", size: 10 });
+  const fallbackCall = calls.at(-1);
+  assert.equal(fallbackCall.q, "car repair");
+  assert.equal(fallbackCall.geo.sort, undefined);
+  assert.equal(fallbackCall.geo.near.radiusMeters, 7000);
+  assert.deepEqual(fallbackCall.geo.boost, { weight: 2, pivotMeters: 2000 });
+  assert.equal(response.total, 2);
+  // The degraded page is still presented nearest-first.
+  assert.deepEqual(response.results.map(result => result.name), ["TAXIL", "agricenter - val'agri"]);
+  assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+  assert.equal(response.stats.osmDistanceSortFallback, "geo-boost");
+  assert.equal(response.resolvedQuery, "Garage Brunet");
+});
+
+test("OSM distance-sort fallback rethrows errors other than the posting budget", async () => {
+  const engine = {
+    async search(params) {
+      if (params.filters?.numbers?.population) return { total: 0, results: [] };
+      if (params.filters?.facets?.category?.includes("place")) {
+        if (params.q !== "brunet") return { total: 0, results: [] };
+        return {
+          total: 1,
+          results: [{ name: "Brunet", category: "place", type: "village", lat: 43.8912, lon: 6.0303 }]
+        };
+      }
+      throw new Error("fetch failed");
+    }
+  };
+  await assert.rejects(
+    searchOsmQuery(engine, { q: "garage brunet", size: 10 }),
+    /fetch failed/u
+  );
+});
+
+test("OSM anchored search tries local text before a weak faraway locality interpretation", async () => {
+  // "garage brunet" from Rosemère: the only locality named Brunet is a
+  // no-population Provence village 6,000km away, while the actual Garage
+  // Marcel Brunet sits 2km from the anchor. The anchored text lane gets the
+  // first shot; the category interpretation stays the fallback.
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.numbers?.population) return { total: 0, results: [] };
+      if (params.filters?.facets?.category?.includes("place")) {
+        if (params.q !== "brunet") return { total: 0, results: [] };
+        return {
+          total: 1,
+          results: [{ name: "Brunet", category: "place", type: "village", lat: 43.8912, lon: 6.0303 }]
+        };
+      }
+      return {
+        total: 1,
+        results: [{ name: "Garage Marcel Brunet Filles et Fils Inc", type: "car_repair", lat: 45.6393, lon: -73.8267, distanceMeters: 2100 }],
+        stats: { geoLane: "boostedText" }
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, {
+    q: "garage brunet",
+    size: 10,
+    near: { lat: 45.636, lon: -73.805 }
+  });
+  const localCall = calls.at(-1);
+  assert.equal(localCall.q, "garage brunet");
+  assert.equal(localCall.geo.near.radiusMeters, 50000);
+  assert.deepEqual(localCall.geo.boost, { weight: 2, pivotMeters: 2000 });
+  assert.equal(localCall.near, undefined);
+  assert.equal(response.results[0].name, "Garage Marcel Brunet Filles et Fils Inc");
+  assert.equal(response.stats.plannerLane, "osmNearText");
+  assert.equal(response.stats.osmWeakLocalityTextFirst, true);
+});
+
+test("OSM anchored search falls through to the category lane when local text is empty", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.numbers?.population) return { total: 0, results: [] };
+      if (params.filters?.facets?.category?.includes("place")) {
+        if (params.q !== "brunet") return { total: 0, results: [] };
+        return {
+          total: 1,
+          results: [{ name: "Brunet", category: "place", type: "village", lat: 43.8912, lon: 6.0303 }]
+        };
+      }
+      if (params.geo?.boost && !params.geo?.sort) return { total: 0, results: [] };
+      return {
+        total: 1,
+        results: [{ name: "TAXIL", type: "car_repair", distanceMeters: 6764 }],
+        stats: {}
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, {
+    q: "garage brunet",
+    size: 10,
+    near: { lat: 45.636, lon: -73.805 }
+  });
+  const categoryCall = calls.at(-1);
+  assert.equal(categoryCall.q, "car repair");
+  assert.equal(categoryCall.geo.sort, "distance");
+  assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+  assert.equal(response.results[0].name, "TAXIL");
+});
+
+test("OSM anchored search keeps the category lane for strong or nearby localities", async () => {
+  const calls = [];
+  const engine = {
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        if (params.q !== "laval") return { total: 0, results: [] };
+        return {
+          total: 1,
+          results: [{ name: "Laval", category: "place", type: "city", population: 438366, lat: 45.5833, lon: -73.75 }]
+        };
+      }
+      return {
+        total: 1,
+        results: [{ name: "Cinéma Cineplex", type: "cinema", distanceMeters: 3200 }],
+        stats: {}
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, {
+    q: "cinema laval",
+    size: 10,
+    near: { lat: 45.636, lon: -73.805 }
+  });
+  // No anchored-text probe: the city interpretation goes straight through.
+  assert.equal(calls.filter(call => call.geo?.boost && !call.geo?.sort).length, 0);
+  assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+});

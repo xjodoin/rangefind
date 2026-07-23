@@ -10293,7 +10293,9 @@ async function createSearch(options = {}) {
     if (geoPlan?.sort) {
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
-        throw new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+        const budgetError = new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+        budgetError.code = "RANGEFIND_GEO_TEXT_SORT_BUDGET";
+        throw budgetError;
       }
       const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
       if (hasUserFilters) await ensureDocValuesManifest();
