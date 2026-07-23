@@ -143,6 +143,55 @@ export function encodeAuthorityLexiconRoot({ shards, hot, weighted = false }) {
   return Buffer.from(Uint8Array.from(out));
 }
 
+// Streaming variant for planet-scale routing artifacts. `shards` must already
+// be in code-unit shard order and `shardCount` must be exact, which lets the
+// caller keep the directory metadata in an on-disk spool instead of retaining
+// and sorting millions of JavaScript objects.
+export async function* encodeAuthorityLexiconRootChunks({
+  shards,
+  shardCount,
+  hot,
+  weighted = false
+}) {
+  const count = Math.max(0, Math.floor(Number(shardCount) || 0));
+  const header = [...AUTHORITY_LEXICON_MAGIC];
+  pushVarint(header, AUTHORITY_LEXICON_VERSION);
+  pushVarint(header, weighted ? 1 : 0);
+  pushVarint(header, count);
+  yield Buffer.from(header);
+
+  let previousShard = "";
+  let actualCount = 0;
+  for await (const shard of shards) {
+    if (actualCount && shard.shard < previousShard) {
+      throw new Error("Rangefind authority lexicon shards must be sorted.");
+    }
+    const out = [];
+    pushFrontCoded(out, shard.shard, previousShard);
+    pushVarint(out, shard.maxRank);
+    pushVarint(out, shard.count);
+    yield Buffer.from(out);
+    previousShard = shard.shard;
+    actualCount++;
+  }
+  if (actualCount !== count) {
+    throw new Error(`Rangefind authority lexicon expected ${count} shards, received ${actualCount}.`);
+  }
+
+  const hotEntries = [...hot.entries()].sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  const hotHeader = [];
+  pushVarint(hotHeader, hotEntries.length);
+  yield Buffer.from(hotHeader);
+  for (const [prefix, entry] of hotEntries) {
+    const out = [];
+    pushUtf8(out, prefix);
+    pushUtf8(out, entry.file);
+    pushVarint(out, entry.bytes);
+    pushVarint(out, entry.count);
+    yield Buffer.from(out);
+  }
+}
+
 export function parseAuthorityLexiconRoot(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, AUTHORITY_LEXICON_MAGIC, "Unsupported Rangefind authority lexicon root");

@@ -11,9 +11,10 @@ import {
   writeSync
 } from "node:fs";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { dirname, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { createGunzip, gunzipSync, gzipSync } from "node:zlib";
+import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
 import { parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
 import { createAppendOnlyPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
@@ -23,7 +24,7 @@ import {
   autocompleteRank,
   compareAutocomplete,
   encodeAuthorityHotList,
-  encodeAuthorityLexiconRoot,
+  encodeAuthorityLexiconRootChunks,
   isAutocompleteKey,
   parseAutocompleteKey,
   suggestKey
@@ -52,6 +53,7 @@ const DEFAULT_BASE_SHARD_DEPTH = 4;
 const DEFAULT_MAX_SHARD_DEPTH = 10;
 const DEFAULT_TARGET_SHARD_ROWS = 4096;
 const DEFAULT_HOT_LIST_SIZE = 64;
+const METADATA_SPOOL_BUFFER_BYTES = 1024 * 1024;
 
 function manifestAt(dir, name) {
   return JSON.parse(readFileSync(resolve(dir, name), "utf8"));
@@ -232,6 +234,137 @@ async function* gzipLines(file) {
   }
 }
 
+async function* fileLines(file) {
+  const input = createReadStream(resolve(file));
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  try {
+    for await (const chunk of input) {
+      pending += decoder.write(chunk);
+      let separator;
+      while ((separator = pending.indexOf("\n")) >= 0) {
+        yield pending.slice(0, separator);
+        pending = pending.slice(separator + 1);
+      }
+    }
+    pending += decoder.end();
+    if (pending) yield pending;
+  } finally {
+    input.destroy();
+  }
+}
+
+function createMetadataSpool(file) {
+  const target = resolve(file);
+  let fd = openSync(target, "wx");
+  let buffered = [];
+  let bufferedBytes = 0;
+
+  function flush() {
+    if (!buffered.length) return;
+    const bytes = Buffer.from(buffered.join(""), "utf8");
+    let offset = 0;
+    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    buffered = [];
+    bufferedBytes = 0;
+  }
+
+  return {
+    append(entry) {
+      const line = `${JSON.stringify(entry)}\n`;
+      buffered.push(line);
+      bufferedBytes += Buffer.byteLength(line);
+      if (bufferedBytes >= METADATA_SPOOL_BUFFER_BYTES) flush();
+    },
+    close() {
+      if (fd === undefined) return;
+      flush();
+      closeSync(fd);
+      fd = undefined;
+    },
+    cleanup() {
+      this.close();
+      rmSync(target, { force: true });
+    }
+  };
+}
+
+async function* metadataSpoolRows(file) {
+  for await (const line of fileLines(file)) {
+    if (line) yield JSON.parse(line);
+  }
+}
+
+async function* directoryEntriesFromSpool(file) {
+  for await (const row of metadataSpoolRows(file)) {
+    yield {
+      shard: row[0],
+      packIndex: row[1],
+      offset: row[2],
+      length: row[3],
+      logicalLength: row[4],
+      checksum: { algorithm: row[5], value: row[6] }
+    };
+  }
+}
+
+async function* lexiconShardsFromSpool(file) {
+  for await (const row of metadataSpoolRows(file)) {
+    yield { shard: row[0], maxRank: row[7], count: row[8] };
+  }
+}
+
+async function writeGzipContentAddressed({
+  outDir,
+  relativeDir,
+  name,
+  chunks,
+  level = 9
+}) {
+  const destinationDir = resolve(outDir, relativeDir);
+  mkdirSync(destinationDir, { recursive: true });
+  const temporary = resolve(destinationDir, `.${name}.${process.pid}.${Date.now()}.tmp`);
+  let fd;
+  let bytes = 0;
+  let logicalBytes = 0;
+  const hash = createHash("sha256");
+  const gzip = createGzip({ level });
+  try {
+    fd = openSync(temporary, "wx");
+    const finished = new Promise((resolveDone, rejectDone) => {
+      gzip.once("error", rejectDone);
+      gzip.once("end", resolveDone);
+    });
+    gzip.on("data", chunk => {
+      hash.update(chunk);
+      bytes += chunk.length;
+      let offset = 0;
+      while (offset < chunk.length) offset += writeSync(fd, chunk, offset, chunk.length - offset);
+    });
+    for await (const chunk of chunks) {
+      logicalBytes += chunk.length;
+      if (!gzip.write(chunk)) await once(gzip, "drain");
+    }
+    gzip.end();
+    await finished;
+    closeSync(fd);
+    fd = undefined;
+    const digest = hash.digest("hex");
+    const fileName = `${name}.${digest.slice(0, 24)}.bin.gz`;
+    renameSync(temporary, resolve(destinationDir, fileName));
+    return {
+      file: `${relativeDir.replace(/\/?$/u, "/")}${fileName}`,
+      bytes,
+      logicalBytes
+    };
+  } catch (error) {
+    gzip.destroy();
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
 function parseSuggestSetHeader(line, file) {
   if (line === undefined) throw new Error(`Invalid empty Rangefind suggest set ${file}.`);
   const header = JSON.parse(line);
@@ -394,13 +527,13 @@ export async function writeSuggestRoutingIndex({
   mkdirSync(authorityDir, { recursive: true });
   const packWriter = createAppendOnlyPackWriter(resolve(authorityDir, "packs"), packTargetBytes);
   const shardConfig = { baseShardDepth, maxShardDepth, targetShardPostings: targetShardRows };
-  // Keep one directory-metadata array throughout the merge. Planet builds
-  // can produce millions of physical partitions; retaining `{ shard, entry }`
-  // objects and then mapping them into a second `directoryEntries` array
-  // briefly doubled the live heap after the expensive stream merge had
-  // already completed.
-  const directoryEntries = [];
-  const autocompleteShards = [];
+  // Deep prefix partitioning can produce millions of physical shards. Keep
+  // their directory and lexicon metadata in one compact disk spool, then read
+  // it sequentially into the two final artifacts. Neither phase retains the
+  // full metadata set in the V8 heap.
+  const metadataSpoolFile = resolve(authorityDir, `.suggest-routing-metadata.${process.pid}.${Date.now()}.jsonl`);
+  const metadataSpool = createMetadataSpool(metadataSpoolFile);
+  let autocompleteShardCount = 0;
   const hotLimit = Math.max(8, Math.floor(Number(hotListSize)));
   const hot = new Map();
   const hotSeen = new Map();
@@ -445,124 +578,132 @@ export async function writeSuggestRoutingIndex({
       for (const item of partition.entries) {
         maxRank = Math.max(maxRank, item.rank);
       }
-      directoryEntries.push({
-        shard: partition.name,
-        pack: entry.pack,
-        offset: entry.offset,
-        length: entry.length,
-        logicalLength: entry.logicalLength || 0,
-        checksum: entry.checksum
-      });
-      autocompleteShards.push({ shard: partition.name, maxRank, count: partition.entries.length });
+      metadataSpool.append([
+        partition.name,
+        packWriter.packs.length - 1,
+        entry.offset,
+        entry.length,
+        entry.logicalLength || 0,
+        entry.checksum.algorithm,
+        entry.checksum.value,
+        maxRank,
+        partition.entries.length
+      ]);
+      autocompleteShardCount++;
     }
     group.length = 0;
   }
 
-  let group = [];
-  let groupKey = null;
-  for await (const merged of mergeShardSuggestStreams(sources.map(source => source.stream()))) {
-    const parsed = parseAutocompleteKey(merged.key);
-    if (!parsed) continue;
-    const base = shardKey(merged.key, baseShardDepth);
-    if (groupKey !== null && base !== groupKey) flushGroup(group);
-    groupKey = base;
-    const entry = [merged.key, merged.rows, { total: merged.count }];
-    // partitionEntries and the hot merge both want the summary item; rank it
-    // once here with the artifact-wide weighting mode.
-    let weight = 0;
-    for (const row of merged.rows) weight = Math.max(weight, row[1]);
-    const item = {
-      key: merged.key,
-      normalized: parsed.normalized,
-      display: parsed.display,
-      weight: weight || merged.rows.length,
-      count: merged.count,
-      full: suggestKey(parsed.display) === parsed.normalized
-    };
-    item.rank = autocompleteRank(item, weighted);
-    entry.rank = item.rank;
-    group.push(entry);
-    mergeHotCandidate(item);
-    keyCount++;
-    rowCount += merged.rows.length;
-  }
-  flushGroup(group);
-  finalizePackWriter(packWriter);
+  try {
+    let group = [];
+    let groupKey = null;
+    for await (const merged of mergeShardSuggestStreams(sources.map(source => source.stream()))) {
+      const parsed = parseAutocompleteKey(merged.key);
+      if (!parsed) continue;
+      const base = shardKey(merged.key, baseShardDepth);
+      if (groupKey !== null && base !== groupKey) flushGroup(group);
+      groupKey = base;
+      const entry = [merged.key, merged.rows, { total: merged.count }];
+      // partitionEntries and the hot merge both want the summary item; rank it
+      // once here with the artifact-wide weighting mode.
+      let weight = 0;
+      for (const row of merged.rows) weight = Math.max(weight, row[1]);
+      const item = {
+        key: merged.key,
+        normalized: parsed.normalized,
+        display: parsed.display,
+        weight: weight || merged.rows.length,
+        count: merged.count,
+        full: suggestKey(parsed.display) === parsed.normalized
+      };
+      item.rank = autocompleteRank(item, weighted);
+      entry.rank = item.rank;
+      group.push(entry);
+      mergeHotCandidate(item);
+      keyCount++;
+      rowCount += merged.rows.length;
+    }
+    flushGroup(group);
+    metadataSpool.close();
+    finalizePackWriter(packWriter);
 
-  const packTable = packWriter.packs.map(pack => pack.file);
-  const packIndexByFile = new Map(packTable.map((file, index) => [file, index]));
-  for (const item of directoryEntries) {
-    const pack = packWriter.packNameMap?.get(item.pack) || item.pack;
-    item.packIndex = packIndexByFile.get(pack);
-    delete item.pack;
-  }
-  const directory = await writeDirectoryFilesFromSortedEntries(
-    authorityDir,
-    directoryEntries,
-    directoryEntries.length,
-    directoryPageBytes,
-    "authority",
-    { packTable }
-  );
+    const packTable = packWriter.packs.map(pack => pack.file);
+    const directory = await writeDirectoryFilesFromSortedEntries(
+      authorityDir,
+      directoryEntriesFromSpool(metadataSpoolFile),
+      autocompleteShardCount,
+      directoryPageBytes,
+      "authority",
+      { packTable }
+    );
 
-  const hotLists = new Map();
-  for (const [prefix, bucket] of hot) {
-    if (Array.from(prefix).length > 1 && (hotSeen.get(prefix) || 0) <= hotLimit * 4) continue;
-    hotLists.set(prefix, [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit));
-  }
-  const hotObjects = new Map();
-  let hotBytes = 0;
-  mkdirSync(resolve(authorityDir, "hot"), { recursive: true });
-  for (const [prefix, items] of hotLists) {
-    const source = encodeAuthorityHotList(items);
-    const compressed = gzipSync(source, { level: 9 });
-    const hash = createHash("sha256").update(compressed).digest("hex");
-    const file = `authority/hot/${hash.slice(0, 24)}.bin.gz`;
-    writeFileSync(resolve(outDir, file), compressed);
-    hotBytes += compressed.length;
-    hotObjects.set(prefix, { file, bytes: compressed.length, count: items.length });
-  }
-  const lexiconRoot = encodeAuthorityLexiconRoot({ shards: autocompleteShards, hot: hotObjects, weighted });
-  const lexiconCompressed = gzipSync(lexiconRoot, { level: 9 });
-  const lexiconHash = createHash("sha256").update(lexiconCompressed).digest("hex");
-  const lexiconFile = `authority/lexicon-root.${lexiconHash.slice(0, 24)}.bin.gz`;
-  writeFileSync(resolve(outDir, lexiconFile), lexiconCompressed);
+    const hotLists = new Map();
+    for (const [prefix, bucket] of hot) {
+      if (Array.from(prefix).length > 1 && (hotSeen.get(prefix) || 0) <= hotLimit * 4) continue;
+      hotLists.set(prefix, [...bucket.values()].sort(compareAutocomplete).slice(0, hotLimit));
+    }
+    const hotObjects = new Map();
+    let hotBytes = 0;
+    mkdirSync(resolve(authorityDir, "hot"), { recursive: true });
+    for (const [prefix, items] of hotLists) {
+      const source = encodeAuthorityHotList(items);
+      const compressed = gzipSync(source, { level: 9 });
+      const hash = createHash("sha256").update(compressed).digest("hex");
+      const file = `authority/hot/${hash.slice(0, 24)}.bin.gz`;
+      writeFileSync(resolve(outDir, file), compressed);
+      hotBytes += compressed.length;
+      hotObjects.set(prefix, { file, bytes: compressed.length, count: items.length });
+    }
+    const lexicon = await writeGzipContentAddressed({
+      outDir,
+      relativeDir: "authority",
+      name: "lexicon-root",
+      chunks: encodeAuthorityLexiconRootChunks({
+        shards: lexiconShardsFromSpool(metadataSpoolFile),
+        shardCount: autocompleteShardCount,
+        hot: hotObjects,
+        weighted
+      })
+    });
 
-  return {
-    format: SUGGEST_ROUTING_FORMAT,
-    version: SUGGEST_ROUTING_VERSION,
-    shard_ids: shardIds,
-    weighted,
-    keys: keyCount,
-    rows: rowCount,
-    authority: {
-      storage: "range-pack-v1",
-      compression: "gzip-member",
-      format: AUTHORITY_FORMAT,
-      // No legacy authority fields: the root artifact is autocomplete-only,
-      // which switches every consumer to the lexicon lane.
-      fields: [],
-      max_rows_per_key: Math.max(1, Math.floor(Number(maxRowsPerKey))),
-      base_shard_depth: baseShardDepth,
-      max_shard_depth: maxShardDepth,
-      target_shard_rows: targetShardRows,
+    return {
+      format: SUGGEST_ROUTING_FORMAT,
+      version: SUGGEST_ROUTING_VERSION,
+      shard_ids: shardIds,
+      weighted,
       keys: keyCount,
       rows: rowCount,
-      shards: autocompleteShards.length,
-      autocomplete: {
-        format: AUTHORITY_LEXICON_FORMAT,
+      authority: {
+        storage: "range-pack-v1",
+        compression: "gzip-member",
+        format: AUTHORITY_FORMAT,
+        // No legacy authority fields: the root artifact is autocomplete-only,
+        // which switches every consumer to the lexicon lane.
+        fields: [],
+        max_rows_per_key: Math.max(1, Math.floor(Number(maxRowsPerKey))),
+        base_shard_depth: baseShardDepth,
+        max_shard_depth: maxShardDepth,
+        target_shard_rows: targetShardRows,
         keys: keyCount,
         rows: rowCount,
-        shards: autocompleteShards.length,
-        hot_prefixes: hotLists.size,
-        hot_list_size: hotLimit,
-        hot_bytes: hotBytes,
-        directory: { file: lexiconFile, bytes: lexiconCompressed.length, logical_bytes: lexiconRoot.length, immutable: true }
-      },
-      directory,
-      packs: packWriter.packs,
-      pack_bytes: packWriter.bytes,
-      directory_bytes: directory.total_bytes
-    }
-  };
+        shards: autocompleteShardCount,
+        autocomplete: {
+          format: AUTHORITY_LEXICON_FORMAT,
+          keys: keyCount,
+          rows: rowCount,
+          shards: autocompleteShardCount,
+          hot_prefixes: hotLists.size,
+          hot_list_size: hotLimit,
+          hot_bytes: hotBytes,
+          directory: { file: lexicon.file, bytes: lexicon.bytes, logical_bytes: lexicon.logicalBytes, immutable: true }
+        },
+        directory,
+        packs: packWriter.packs,
+        pack_bytes: packWriter.bytes,
+        directory_bytes: directory.total_bytes
+      }
+    };
+  } finally {
+    metadataSpool.cleanup();
+  }
 }

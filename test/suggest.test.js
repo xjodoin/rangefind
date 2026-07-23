@@ -10,6 +10,7 @@ import {
   autocompleteKeysForValue,
   encodeAuthorityHotList,
   encodeAuthorityLexiconRoot,
+  encodeAuthorityLexiconRootChunks,
   parseAuthorityHotList,
   parseAuthorityLexiconRoot,
   suggestKey
@@ -48,6 +49,29 @@ test("authority lexicon shard summaries and hot lists round trip", () => {
   assert.deepEqual(decoded.shards, shards);
   assert.deepEqual(decoded.hot.get("a"), hot.get("a"));
   assert.deepEqual(parseAuthorityHotList(encodeAuthorityHotList(hotItems)), hotItems);
+});
+
+test("streamed authority lexicon root matches the in-memory codec", async () => {
+  const shards = [
+    { shard: "s|alpha", maxRank: 19, count: 40 },
+    { shard: "s|alpine", maxRank: 17, count: 31 },
+    { shard: "s|beta", maxRank: 11, count: 22 }
+  ];
+  const hot = new Map([
+    ["a", { file: "authority/hot/a.bin.gz", bytes: 42, count: 2 }],
+    ["b", { file: "authority/hot/b.bin.gz", bytes: 31, count: 1 }]
+  ]);
+  const chunks = [];
+  for await (const chunk of encodeAuthorityLexiconRootChunks({
+    shards: (async function* () { yield* shards; })(),
+    shardCount: shards.length,
+    hot,
+    weighted: true
+  })) chunks.push(chunk);
+  assert.deepEqual(
+    Buffer.concat(chunks),
+    encodeAuthorityLexiconRoot({ shards, hot, weighted: true })
+  );
 });
 
 async function serveStatic(root) {

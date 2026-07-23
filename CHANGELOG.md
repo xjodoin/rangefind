@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Planet-scale root suggest-routing finalization now spools physical shard
+  metadata to disk and streams both directory pages and the lexicon root from
+  that spool. Deep prefix partitioning no longer retains millions of directory
+  and autocomplete-shard objects in the V8 heap.
+
 ## 0.3.9 — 2026-07-22
 
 ### Fixed
