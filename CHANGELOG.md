@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.10 — 2026-07-23
+
 ### Fixed
 
 - Planet-scale root suggest-routing finalization now spools physical shard
