@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Disk-spooled suggest-routing metadata is now externally ordered by an
+  indexed UTF-16 sort key before directory and lexicon emission. Physical
+  partitions emitted out of order no longer abort finalization, and sorting
+  remains bounded by SQLite's file-backed page cache.
+
 ## 0.3.10 — 2026-07-23
 
 ### Fixed

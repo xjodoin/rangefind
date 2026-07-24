@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
@@ -53,7 +54,8 @@ const DEFAULT_BASE_SHARD_DEPTH = 4;
 const DEFAULT_MAX_SHARD_DEPTH = 10;
 const DEFAULT_TARGET_SHARD_ROWS = 4096;
 const DEFAULT_HOT_LIST_SIZE = 64;
-const METADATA_SPOOL_BUFFER_BYTES = 1024 * 1024;
+const METADATA_SPOOL_TRANSACTION_ROWS = 10000;
+const require = createRequire(import.meta.url);
 
 function manifestAt(dir, name) {
   return JSON.parse(readFileSync(resolve(dir, name), "utf8"));
@@ -234,83 +236,119 @@ async function* gzipLines(file) {
   }
 }
 
-async function* fileLines(file) {
-  const input = createReadStream(resolve(file));
-  const decoder = new StringDecoder("utf8");
-  let pending = "";
-  try {
-    for await (const chunk of input) {
-      pending += decoder.write(chunk);
-      let separator;
-      while ((separator = pending.indexOf("\n")) >= 0) {
-        yield pending.slice(0, separator);
-        pending = pending.slice(separator + 1);
-      }
-    }
-    pending += decoder.end();
-    if (pending) yield pending;
-  } finally {
-    input.destroy();
-  }
-}
-
 function createMetadataSpool(file) {
   const target = resolve(file);
-  let fd = openSync(target, "wx");
-  let buffered = [];
-  let bufferedBytes = 0;
+  const { DatabaseSync } = require("node:sqlite");
+  let database = new DatabaseSync(target);
+  database.exec(`
+    PRAGMA journal_mode = OFF;
+    PRAGMA synchronous = OFF;
+    PRAGMA temp_store = FILE;
+    PRAGMA cache_size = -65536;
+    CREATE TABLE metadata (
+      sequence INTEGER PRIMARY KEY,
+      sort_key BLOB NOT NULL,
+      shard TEXT NOT NULL,
+      pack_index INTEGER NOT NULL,
+      offset INTEGER NOT NULL,
+      length INTEGER NOT NULL,
+      logical_length INTEGER NOT NULL,
+      checksum_algorithm TEXT NOT NULL,
+      checksum_value TEXT NOT NULL,
+      max_rank INTEGER NOT NULL,
+      entry_count INTEGER NOT NULL
+    );
+    BEGIN IMMEDIATE;
+  `);
+  const insert = database.prepare(`
+    INSERT INTO metadata (
+      sort_key, shard, pack_index, offset, length, logical_length,
+      checksum_algorithm, checksum_value, max_rank, entry_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  let transactionRows = 0;
+  let closedWrites = false;
 
-  function flush() {
-    if (!buffered.length) return;
-    const bytes = Buffer.from(buffered.join(""), "utf8");
-    let offset = 0;
-    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
-    buffered = [];
-    bufferedBytes = 0;
+  function sortKey(value) {
+    const text = String(value);
+    const key = Buffer.allocUnsafe(text.length * 2);
+    for (let index = 0; index < text.length; index++) key.writeUInt16BE(text.charCodeAt(index), index * 2);
+    return key;
+  }
+
+  function closeWrites() {
+    if (closedWrites) return;
+    database.exec(`
+      COMMIT;
+      CREATE INDEX metadata_sort ON metadata (sort_key, sequence);
+    `);
+    closedWrites = true;
   }
 
   return {
-    append(entry) {
-      const line = `${JSON.stringify(entry)}\n`;
-      buffered.push(line);
-      bufferedBytes += Buffer.byteLength(line);
-      if (bufferedBytes >= METADATA_SPOOL_BUFFER_BYTES) flush();
+    append(row) {
+      if (closedWrites) throw new Error("Rangefind suggest routing metadata spool is already finalized.");
+      insert.run(sortKey(row[0]), ...row);
+      transactionRows++;
+      if (transactionRows >= METADATA_SPOOL_TRANSACTION_ROWS) {
+        database.exec("COMMIT; BEGIN IMMEDIATE;");
+        transactionRows = 0;
+      }
     },
-    close() {
-      if (fd === undefined) return;
-      flush();
-      closeSync(fd);
-      fd = undefined;
+    closeWrites,
+    *rows() {
+      closeWrites();
+      yield* database.prepare(`
+        SELECT
+          shard,
+          pack_index AS packIndex,
+          offset,
+          length,
+          logical_length AS logicalLength,
+          checksum_algorithm AS checksumAlgorithm,
+          checksum_value AS checksumValue,
+          max_rank AS maxRank,
+          entry_count AS entryCount
+        FROM metadata
+        ORDER BY sort_key, sequence
+      `).iterate();
     },
     cleanup() {
-      this.close();
+      if (database) {
+        if (!closedWrites) {
+          try {
+            database.exec("ROLLBACK;");
+          } catch {
+            // COMMIT may already have succeeded before a later index failure.
+          }
+        }
+        database.close();
+        database = undefined;
+      }
       rmSync(target, { force: true });
+      rmSync(`${target}-journal`, { force: true });
+      rmSync(`${target}-shm`, { force: true });
+      rmSync(`${target}-wal`, { force: true });
     }
   };
 }
 
-async function* metadataSpoolRows(file) {
-  for await (const line of fileLines(file)) {
-    if (line) yield JSON.parse(line);
-  }
-}
-
-async function* directoryEntriesFromSpool(file) {
-  for await (const row of metadataSpoolRows(file)) {
+async function* directoryEntriesFromSpool(spool) {
+  for (const row of spool.rows()) {
     yield {
-      shard: row[0],
-      packIndex: row[1],
-      offset: row[2],
-      length: row[3],
-      logicalLength: row[4],
-      checksum: { algorithm: row[5], value: row[6] }
+      shard: row.shard,
+      packIndex: row.packIndex,
+      offset: row.offset,
+      length: row.length,
+      logicalLength: row.logicalLength,
+      checksum: { algorithm: row.checksumAlgorithm, value: row.checksumValue }
     };
   }
 }
 
-async function* lexiconShardsFromSpool(file) {
-  for await (const row of metadataSpoolRows(file)) {
-    yield { shard: row[0], maxRank: row[7], count: row[8] };
+async function* lexiconShardsFromSpool(spool) {
+  for (const row of spool.rows()) {
+    yield { shard: row.shard, maxRank: row.maxRank, count: row.entryCount };
   }
 }
 
@@ -531,7 +569,7 @@ export async function writeSuggestRoutingIndex({
   // their directory and lexicon metadata in one compact disk spool, then read
   // it sequentially into the two final artifacts. Neither phase retains the
   // full metadata set in the V8 heap.
-  const metadataSpoolFile = resolve(authorityDir, `.suggest-routing-metadata.${process.pid}.${Date.now()}.jsonl`);
+  const metadataSpoolFile = resolve(authorityDir, `.suggest-routing-metadata.${process.pid}.${Date.now()}.sqlite`);
   const metadataSpool = createMetadataSpool(metadataSpoolFile);
   let autocompleteShardCount = 0;
   const hotLimit = Math.max(8, Math.floor(Number(hotListSize)));
@@ -624,13 +662,13 @@ export async function writeSuggestRoutingIndex({
       rowCount += merged.rows.length;
     }
     flushGroup(group);
-    metadataSpool.close();
+    metadataSpool.closeWrites();
     finalizePackWriter(packWriter);
 
     const packTable = packWriter.packs.map(pack => pack.file);
     const directory = await writeDirectoryFilesFromSortedEntries(
       authorityDir,
-      directoryEntriesFromSpool(metadataSpoolFile),
+      directoryEntriesFromSpool(metadataSpool),
       autocompleteShardCount,
       directoryPageBytes,
       "authority",
@@ -659,7 +697,7 @@ export async function writeSuggestRoutingIndex({
       relativeDir: "authority",
       name: "lexicon-root",
       chunks: encodeAuthorityLexiconRootChunks({
-        shards: lexiconShardsFromSpool(metadataSpoolFile),
+        shards: lexiconShardsFromSpool(metadataSpool),
         shardCount: autocompleteShardCount,
         hot: hotObjects,
         weighted
