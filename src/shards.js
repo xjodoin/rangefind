@@ -4,7 +4,22 @@ export function shardKey(term, depth) {
   // Do not pad short terms: "ai" padded to "ai_" collides with a real
   // underscore-bearing expansion term. Variable-length directory keys are
   // already supported and keep every partition address unique.
-  return String(term || "").slice(0, depth);
+  const value = String(term || "");
+  let end = Math.min(value.length, Math.max(0, Math.floor(Number(depth) || 0)));
+  // JavaScript slice offsets are UTF-16 code units. Never leave a high
+  // surrogate at the end of a physical shard name: UTF-8 encoders replace
+  // that unpaired code unit, changing both its persisted value and sort order.
+  if (
+    end > 0
+    && end < value.length
+    && value.charCodeAt(end - 1) >= 0xd800
+    && value.charCodeAt(end - 1) <= 0xdbff
+    && value.charCodeAt(end) >= 0xdc00
+    && value.charCodeAt(end) <= 0xdfff
+  ) {
+    end++;
+  }
+  return value.slice(0, end);
 }
 
 export function baseShardFor(term, config) {

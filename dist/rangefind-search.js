@@ -4019,7 +4019,12 @@ function decodeSegmentRows(buffer, entry, options = {}) {
 // src/shards.js
 var RANGE_MERGE_GAP_BYTES = 8 * 1024;
 function shardKey(term, depth) {
-  return String(term || "").slice(0, depth);
+  const value = String(term || "");
+  let end = Math.min(value.length, Math.max(0, Math.floor(Number(depth) || 0)));
+  if (end > 0 && end < value.length && value.charCodeAt(end - 1) >= 55296 && value.charCodeAt(end - 1) <= 56319 && value.charCodeAt(end) >= 56320 && value.charCodeAt(end) <= 57343) {
+    end++;
+  }
+  return value.slice(0, end);
 }
 function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
   const mergeGapBytes = typeof options === "number" ? options : options.mergeGapBytes ?? RANGE_MERGE_GAP_BYTES;
@@ -10288,7 +10293,9 @@ async function createSearch(options = {}) {
     if (geoPlan?.sort) {
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
-        throw new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+        const budgetError = new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+        budgetError.code = "RANGEFIND_GEO_TEXT_SORT_BUDGET";
+        throw budgetError;
       }
       const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
       if (hasUserFilters) await ensureDocValuesManifest();

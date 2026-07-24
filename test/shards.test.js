@@ -7,6 +7,12 @@ test("shardKey keeps short and underscore-bearing terms distinct", () => {
   assert.equal(shardKey("ai_", 3), "ai_");
 });
 
+test("shardKey never splits a UTF-16 surrogate pair", () => {
+  assert.equal(shardKey("abcdefg😀suffix", 8), "abcdefg😀");
+  assert.equal(shardKey("abcdefg😀suffix", 9), "abcdefg😀");
+  assert.equal(shardKey("abcdefg😀suffix", 10), "abcdefg😀s");
+});
+
 test("partitionEntries does not emit duplicate names for short-term collisions", () => {
   const entries = [["ai", [[0, 1]]], ["ai_", [[1, 1]]]];
   const partitions = partitionEntries(entries, { baseShardDepth: 3, maxShardDepth: 5, targetShardPostings: 1 });

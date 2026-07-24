@@ -247,8 +247,7 @@ function createMetadataSpool(file) {
     PRAGMA cache_size = -65536;
     CREATE TABLE metadata (
       sequence INTEGER PRIMARY KEY,
-      sort_key BLOB NOT NULL,
-      shard TEXT NOT NULL,
+      shard BLOB NOT NULL,
       pack_index INTEGER NOT NULL,
       offset INTEGER NOT NULL,
       length INTEGER NOT NULL,
@@ -262,25 +261,34 @@ function createMetadataSpool(file) {
   `);
   const insert = database.prepare(`
     INSERT INTO metadata (
-      sort_key, shard, pack_index, offset, length, logical_length,
+      shard, pack_index, offset, length, logical_length,
       checksum_algorithm, checksum_value, max_rank, entry_count
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   let transactionRows = 0;
   let closedWrites = false;
 
-  function sortKey(value) {
+  function encodeShard(value) {
     const text = String(value);
     const key = Buffer.allocUnsafe(text.length * 2);
     for (let index = 0; index < text.length; index++) key.writeUInt16BE(text.charCodeAt(index), index * 2);
     return key;
   }
 
+  function decodeShard(value) {
+    const key = Buffer.from(value);
+    let text = "";
+    for (let index = 0; index < key.length; index += 2) {
+      text += String.fromCharCode(key.readUInt16BE(index));
+    }
+    return text;
+  }
+
   function closeWrites() {
     if (closedWrites) return;
     database.exec(`
       COMMIT;
-      CREATE INDEX metadata_sort ON metadata (sort_key, sequence);
+      CREATE INDEX metadata_sort ON metadata (shard, sequence);
     `);
     closedWrites = true;
   }
@@ -288,7 +296,7 @@ function createMetadataSpool(file) {
   return {
     append(row) {
       if (closedWrites) throw new Error("Rangefind suggest routing metadata spool is already finalized.");
-      insert.run(sortKey(row[0]), ...row);
+      insert.run(encodeShard(row[0]), ...row.slice(1));
       transactionRows++;
       if (transactionRows >= METADATA_SPOOL_TRANSACTION_ROWS) {
         database.exec("COMMIT; BEGIN IMMEDIATE;");
@@ -298,7 +306,7 @@ function createMetadataSpool(file) {
     closeWrites,
     *rows() {
       closeWrites();
-      yield* database.prepare(`
+      for (const row of database.prepare(`
         SELECT
           shard,
           pack_index AS packIndex,
@@ -310,8 +318,10 @@ function createMetadataSpool(file) {
           max_rank AS maxRank,
           entry_count AS entryCount
         FROM metadata
-        ORDER BY sort_key, sequence
-      `).iterate();
+        ORDER BY shard, sequence
+      `).iterate()) {
+        yield { ...row, shard: decodeShard(row.shard) };
+      }
     },
     cleanup() {
       if (database) {

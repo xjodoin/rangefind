@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Suggest-routing shard prefixes no longer split astral Unicode characters at
+  UTF-16 depth boundaries. The disk metadata spool now stores shard keys as
+  lossless big-endian UTF-16 BLOBs, preserving embedded NULs and exact binary
+  order instead of letting SQLite text conversion corrupt or reorder them.
+
 ## 0.3.11 — 2026-07-24
 
 ### Fixed
