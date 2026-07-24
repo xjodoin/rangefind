@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.12 — 2026-07-24
+
 ### Fixed
 
 - Suggest-routing shard prefixes no longer split astral Unicode characters at
