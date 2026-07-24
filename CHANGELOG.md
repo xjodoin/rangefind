@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.11 — 2026-07-24
+
 ### Fixed
 
 - Disk-spooled suggest-routing metadata is now externally ordered by an
