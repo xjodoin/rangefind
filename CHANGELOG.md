@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.13 — 2026-07-25
+
 ### Changed
 
 - Sharded-root autocomplete now uses a paged `rflexicon-v2` directory and
