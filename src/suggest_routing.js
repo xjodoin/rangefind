@@ -17,15 +17,16 @@ import { dirname, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
 import { parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
-import { writeDirectoryFilesFromSortedEntries } from "./directory_writer.js";
+import { writeDirectoryFiles } from "./directory_writer.js";
 import { createAppendOnlyPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import { AUTHORITY_FORMAT, SUGGEST_ROUTING_FORMAT, buildAuthorityShard, parseAuthorityShard } from "./authority_codec.js";
 import {
-  AUTHORITY_LEXICON_FORMAT,
+  AUTHORITY_LEXICON_PAGED_FORMAT,
   autocompleteRank,
   compareAutocomplete,
   encodeAuthorityHotList,
-  encodeAuthorityLexiconRootChunks,
+  encodeAuthorityLexiconRoot,
+  encodeAuthorityLexiconSegment,
   isAutocompleteKey,
   parseAutocompleteKey,
   suggestKey
@@ -37,10 +38,9 @@ import { partitionEntries, shardKey } from "./shards.js";
 // used to fan out to hundreds of shards (each pulling its own authority
 // ranges) is answered from the root in a couple of small range reads, and the
 // entry rows carry federation shard ordinals so a selected suggestion still
-// knows which region produced it. The artifact is a standard authority
-// lexicon living at `<root>/authority/`, so the runtime consumes it with the
-// single-index suggest machinery unchanged — only the row payload differs
-// (codec version 3, see authority_codec.js).
+// knows which region produced it. Its lexicon uses the same directory →
+// packed-segment → byte-range pattern as text routing. Each segment embeds
+// direct physical-authority pointers, avoiding any corpus-sized routing root.
 
 export { SUGGEST_ROUTING_FORMAT } from "./authority_codec.js";
 const SUGGEST_ROUTING_VERSION = 1;
@@ -54,6 +54,7 @@ const DEFAULT_BASE_SHARD_DEPTH = 4;
 const DEFAULT_MAX_SHARD_DEPTH = 10;
 const DEFAULT_TARGET_SHARD_ROWS = 4096;
 const DEFAULT_HOT_LIST_SIZE = 64;
+const DEFAULT_LEXICON_SEGMENT_SHARDS = 512;
 const METADATA_SPOOL_TRANSACTION_ROWS = 10000;
 const require = createRequire(import.meta.url);
 
@@ -343,23 +344,96 @@ function createMetadataSpool(file) {
   };
 }
 
-async function* directoryEntriesFromSpool(spool) {
-  for (const row of spool.rows()) {
-    yield {
+async function writePagedAuthorityLexicon({
+  outDir,
+  authorityDir,
+  metadataSpool,
+  authorityPacks,
+  shardCount,
+  directoryPageBytes,
+  hot,
+  weighted
+}) {
+  const segmentPackWriter = createAppendOnlyPackWriter(
+    resolve(authorityDir, "lexicon-packs"),
+    DEFAULT_PACK_TARGET_BYTES
+  );
+  const segmentDirectoryEntries = [];
+  let current = [];
+
+  function flushSegment() {
+    if (!current.length) return;
+    const first = current[0].shard;
+    const buffer = encodeAuthorityLexiconSegment(current);
+    const packed = writePackedShard(segmentPackWriter, first, gzipSync(buffer, { level: 9 }), {
+      kind: "authority-lexicon-segment",
+      codec: "rflexicon-segment-v1",
+      logicalLength: buffer.length
+    });
+    segmentDirectoryEntries.push({
+      shard: first,
+      packIndex: segmentPackWriter.packs.length - 1,
+      offset: packed.offset,
+      length: packed.length,
+      logicalLength: packed.logicalLength || 0,
+      checksum: packed.checksum
+    });
+    current = [];
+  }
+
+  for (const row of metadataSpool.rows()) {
+    current.push({
       shard: row.shard,
+      maxRank: row.maxRank,
+      count: row.entryCount,
       packIndex: row.packIndex,
       offset: row.offset,
       length: row.length,
       logicalLength: row.logicalLength,
-      checksum: { algorithm: row.checksumAlgorithm, value: row.checksumValue }
-    };
+      checksum: {
+        algorithm: row.checksumAlgorithm,
+        value: row.checksumValue
+      }
+    });
+    if (current.length >= DEFAULT_LEXICON_SEGMENT_SHARDS) flushSegment();
   }
-}
+  flushSegment();
+  finalizePackWriter(segmentPackWriter);
 
-async function* lexiconShardsFromSpool(spool) {
-  for (const row of spool.rows()) {
-    yield { shard: row.shard, maxRank: row.maxRank, count: row.entryCount };
-  }
+  const segmentDirectory = writeDirectoryFiles(
+    resolve(authorityDir, "lexicon-directory"),
+    segmentDirectoryEntries,
+    directoryPageBytes,
+    "authority/lexicon-directory",
+    { packTable: segmentPackWriter.packs }
+  );
+  const root = await writeGzipContentAddressed({
+    outDir,
+    relativeDir: "authority",
+    name: "lexicon-root",
+    chunks: [encodeAuthorityLexiconRoot({ shards: [], hot, weighted })]
+  });
+
+  return {
+    format: AUTHORITY_LEXICON_PAGED_FORMAT,
+    weighted,
+    root: {
+      file: root.file,
+      bytes: root.bytes,
+      logical_bytes: root.logicalBytes,
+      immutable: true
+    },
+    segments: {
+      entries: shardCount,
+      segment_shards: DEFAULT_LEXICON_SEGMENT_SHARDS,
+      count: segmentDirectoryEntries.length,
+      directory: segmentDirectory,
+      pack_dir: "authority/lexicon-packs/",
+      packs: segmentPackWriter.packs,
+      pack_bytes: segmentPackWriter.bytes
+    },
+    authority_packs: authorityPacks.length
+  };
 }
 
 async function writeGzipContentAddressed({
@@ -675,16 +749,6 @@ export async function writeSuggestRoutingIndex({
     metadataSpool.closeWrites();
     finalizePackWriter(packWriter);
 
-    const packTable = packWriter.packs.map(pack => pack.file);
-    const directory = await writeDirectoryFilesFromSortedEntries(
-      authorityDir,
-      directoryEntriesFromSpool(metadataSpool),
-      autocompleteShardCount,
-      directoryPageBytes,
-      "authority",
-      { packTable }
-    );
-
     const hotLists = new Map();
     for (const [prefix, bucket] of hot) {
       if (Array.from(prefix).length > 1 && (hotSeen.get(prefix) || 0) <= hotLimit * 4) continue;
@@ -702,16 +766,15 @@ export async function writeSuggestRoutingIndex({
       hotBytes += compressed.length;
       hotObjects.set(prefix, { file, bytes: compressed.length, count: items.length });
     }
-    const lexicon = await writeGzipContentAddressed({
+    const autocomplete = await writePagedAuthorityLexicon({
       outDir,
-      relativeDir: "authority",
-      name: "lexicon-root",
-      chunks: encodeAuthorityLexiconRootChunks({
-        shards: lexiconShardsFromSpool(metadataSpool),
-        shardCount: autocompleteShardCount,
-        hot: hotObjects,
-        weighted
-      })
+      authorityDir,
+      metadataSpool,
+      authorityPacks: packWriter.packs,
+      shardCount: autocompleteShardCount,
+      directoryPageBytes,
+      hot: hotObjects,
+      weighted
     });
 
     return {
@@ -736,19 +799,16 @@ export async function writeSuggestRoutingIndex({
         rows: rowCount,
         shards: autocompleteShardCount,
         autocomplete: {
-          format: AUTHORITY_LEXICON_FORMAT,
+          ...autocomplete,
           keys: keyCount,
           rows: rowCount,
           shards: autocompleteShardCount,
           hot_prefixes: hotLists.size,
           hot_list_size: hotLimit,
-          hot_bytes: hotBytes,
-          directory: { file: lexicon.file, bytes: lexicon.bytes, logical_bytes: lexicon.logicalBytes, immutable: true }
+          hot_bytes: hotBytes
         },
-        directory,
         packs: packWriter.packs,
-        pack_bytes: packWriter.bytes,
-        directory_bytes: directory.total_bytes
+        pack_bytes: packWriter.bytes
       }
     };
   } finally {

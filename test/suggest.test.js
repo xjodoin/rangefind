@@ -11,8 +11,10 @@ import {
   encodeAuthorityHotList,
   encodeAuthorityLexiconRoot,
   encodeAuthorityLexiconRootChunks,
+  encodeAuthorityLexiconSegment,
   parseAuthorityHotList,
   parseAuthorityLexiconRoot,
+  parseAuthorityLexiconSegment,
   suggestKey
 } from "../src/authority_lexicon.js";
 
@@ -72,6 +74,51 @@ test("streamed authority lexicon root matches the in-memory codec", async () => 
     Buffer.concat(chunks),
     encodeAuthorityLexiconRoot({ shards, hot, weighted: true })
   );
+});
+
+test("paged authority lexicon segments preserve direct range pointers", () => {
+  const entries = [
+    {
+      shard: "s|alpha",
+      maxRank: 19,
+      count: 40,
+      packIndex: 1,
+      offset: 120,
+      length: 42,
+      logicalLength: 180,
+      checksum: { algorithm: "sha256", value: "a".repeat(64) }
+    },
+    {
+      shard: "s|alpine",
+      maxRank: 17,
+      count: 31,
+      packIndex: 2,
+      offset: 500,
+      length: 54,
+      logicalLength: 210,
+      checksum: { algorithm: "sha256", value: "b".repeat(64) }
+    }
+  ];
+  const parsed = parseAuthorityLexiconSegment(
+    encodeAuthorityLexiconSegment(entries),
+    { packTable: ["zero.bin", "one.bin", "two.bin"] }
+  );
+  assert.equal(parsed.format, "rflexicon-segment-v1");
+  assert.equal(parsed.first, "s|alpha");
+  assert.equal(parsed.last, "s|alpine");
+  assert.deepEqual(parsed.entries, entries.map(entry => ({
+    shard: entry.shard,
+    maxRank: entry.maxRank,
+    count: entry.count,
+    entry: {
+      pack: entry.packIndex === 1 ? "one.bin" : "two.bin",
+      offset: entry.offset,
+      length: entry.length,
+      physicalLength: entry.length,
+      logicalLength: entry.logicalLength,
+      checksum: entry.checksum
+    }
+  })));
 });
 
 async function serveStatic(root) {

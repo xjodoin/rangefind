@@ -1,11 +1,20 @@
-import { AUTHORITY_HOT_MAGIC, AUTHORITY_LEXICON_MAGIC, pushVarint, readVarint } from "./binary.js";
+import {
+  AUTHORITY_HOT_MAGIC,
+  AUTHORITY_LEXICON_MAGIC,
+  AUTHORITY_LEXICON_SEGMENT_MAGIC,
+  pushVarint,
+  readVarint
+} from "./binary.js";
 import { foldMulti } from "./analysis_fold.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 
 export const AUTHORITY_LEXICON_FORMAT = "rflexicon-v1";
+export const AUTHORITY_LEXICON_PAGED_FORMAT = "rflexicon-v2";
+export const AUTHORITY_LEXICON_SEGMENT_FORMAT = "rflexicon-segment-v1";
 export const AUTOCOMPLETE_PREFIX = "s|";
 export const AUTOCOMPLETE_SEPARATOR = "\u0000";
 const AUTHORITY_LEXICON_VERSION = 1;
+const AUTHORITY_LEXICON_SEGMENT_VERSION = 1;
 const UNWEIGHTED_SURFACE_BONUS = 2 ** 32;
 
 export function suggestKey(value) {
@@ -223,6 +232,77 @@ export function parseAuthorityLexiconRoot(buffer) {
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind authority lexicon root has trailing bytes.");
   return { format: AUTHORITY_LEXICON_FORMAT, weighted, shards, hot };
+}
+
+// Range-addressable lexicon segment. Each summary carries the immutable
+// authority-pack pointer it describes, so a paged lexicon lookup can jump
+// directly from one small routing segment to the requested authority bytes
+// without loading the global authority directory.
+export function encodeAuthorityLexiconSegment(entries) {
+  const out = [...AUTHORITY_LEXICON_SEGMENT_MAGIC];
+  pushVarint(out, AUTHORITY_LEXICON_SEGMENT_VERSION);
+  pushVarint(out, entries.length);
+  let previousShard = "";
+  for (const entry of entries) {
+    pushFrontCoded(out, entry.shard, previousShard);
+    pushVarint(out, entry.maxRank);
+    pushVarint(out, entry.count);
+    pushVarint(out, entry.packIndex);
+    pushVarint(out, entry.offset);
+    pushVarint(out, entry.length);
+    pushVarint(out, entry.logicalLength || 0);
+    pushUtf8(out, entry.checksum?.algorithm || "sha256");
+    pushUtf8(out, entry.checksum?.value || "");
+    previousShard = entry.shard;
+  }
+  return Buffer.from(Uint8Array.from(out));
+}
+
+export function parseAuthorityLexiconSegment(buffer, options = {}) {
+  const packTable = options.packTable || options.packs || [];
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, AUTHORITY_LEXICON_SEGMENT_MAGIC, "Unsupported Rangefind authority lexicon segment");
+  const state = { pos: AUTHORITY_LEXICON_SEGMENT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== AUTHORITY_LEXICON_SEGMENT_VERSION) {
+    throw new Error(`Unsupported Rangefind authority lexicon segment version ${version}`);
+  }
+  const count = readVarint(bytes, state);
+  const entries = new Array(count);
+  let previousShard = "";
+  for (let index = 0; index < count; index++) {
+    const shard = readFrontCoded(bytes, state, previousShard);
+    const maxRank = readVarint(bytes, state);
+    const entryCount = readVarint(bytes, state);
+    const packIndex = readVarint(bytes, state);
+    const offset = readVarint(bytes, state);
+    const length = readVarint(bytes, state);
+    const logicalLength = readVarint(bytes, state);
+    const algorithm = readUtf8(bytes, state) || "sha256";
+    const value = readUtf8(bytes, state);
+    if (!value) throw new Error(`Rangefind authority lexicon segment entry ${shard} is missing a checksum.`);
+    entries[index] = {
+      shard,
+      maxRank,
+      count: entryCount,
+      entry: {
+        pack: packTable[packIndex] || `${String(packIndex).padStart(4, "0")}.bin`,
+        offset,
+        length,
+        physicalLength: length,
+        logicalLength: logicalLength || null,
+        checksum: { algorithm, value }
+      }
+    };
+    previousShard = shard;
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind authority lexicon segment has trailing bytes.");
+  return {
+    format: AUTHORITY_LEXICON_SEGMENT_FORMAT,
+    entries,
+    first: entries[0]?.shard || "",
+    last: entries.at(-1)?.shard || ""
+  };
 }
 
 export function encodeAuthorityHotList(entries) {

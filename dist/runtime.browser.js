@@ -1880,6 +1880,7 @@ var DOC_VALUE_SORT_PAGE_MAGIC = [82, 70, 68, 86];
 var QUERY_BUNDLE_MAGIC = [82, 70, 81, 66];
 var AUTHORITY_SHARD_MAGIC = [82, 70, 65, 85];
 var AUTHORITY_LEXICON_MAGIC = [82, 70, 76, 88];
+var AUTHORITY_LEXICON_SEGMENT_MAGIC = [82, 70, 76, 80];
 var AUTHORITY_HOT_MAGIC = [82, 70, 76, 72];
 var GEO_TREE_ROOT_MAGIC = [82, 70, 71, 82];
 var GEO_BRANCH_PAGE_MAGIC = [82, 70, 71, 66];
@@ -2501,9 +2502,12 @@ function parseFacetDictionary(buffer) {
 
 // src/authority_lexicon.js
 var AUTHORITY_LEXICON_FORMAT = "rflexicon-v1";
+var AUTHORITY_LEXICON_PAGED_FORMAT = "rflexicon-v2";
+var AUTHORITY_LEXICON_SEGMENT_FORMAT = "rflexicon-segment-v1";
 var AUTOCOMPLETE_PREFIX = "s|";
 var AUTOCOMPLETE_SEPARATOR = "\0";
 var AUTHORITY_LEXICON_VERSION = 1;
+var AUTHORITY_LEXICON_SEGMENT_VERSION = 1;
 var UNWEIGHTED_SURFACE_BONUS = 2 ** 32;
 function suggestKey(value) {
   return foldMulti(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
@@ -2571,6 +2575,52 @@ function parseAuthorityLexiconRoot(buffer) {
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind authority lexicon root has trailing bytes.");
   return { format: AUTHORITY_LEXICON_FORMAT, weighted, shards, hot };
+}
+function parseAuthorityLexiconSegment(buffer, options = {}) {
+  const packTable = options.packTable || options.packs || [];
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, AUTHORITY_LEXICON_SEGMENT_MAGIC, "Unsupported Rangefind authority lexicon segment");
+  const state = { pos: AUTHORITY_LEXICON_SEGMENT_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== AUTHORITY_LEXICON_SEGMENT_VERSION) {
+    throw new Error(`Unsupported Rangefind authority lexicon segment version ${version}`);
+  }
+  const count = readVarint(bytes, state);
+  const entries = new Array(count);
+  let previousShard = "";
+  for (let index = 0; index < count; index++) {
+    const shard = readFrontCoded(bytes, state, previousShard);
+    const maxRank = readVarint(bytes, state);
+    const entryCount = readVarint(bytes, state);
+    const packIndex = readVarint(bytes, state);
+    const offset = readVarint(bytes, state);
+    const length = readVarint(bytes, state);
+    const logicalLength = readVarint(bytes, state);
+    const algorithm = readUtf8(bytes, state) || "sha256";
+    const value = readUtf8(bytes, state);
+    if (!value) throw new Error(`Rangefind authority lexicon segment entry ${shard} is missing a checksum.`);
+    entries[index] = {
+      shard,
+      maxRank,
+      count: entryCount,
+      entry: {
+        pack: packTable[packIndex] || `${String(packIndex).padStart(4, "0")}.bin`,
+        offset,
+        length,
+        physicalLength: length,
+        logicalLength: logicalLength || null,
+        checksum: { algorithm, value }
+      }
+    };
+    previousShard = shard;
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind authority lexicon segment has trailing bytes.");
+  return {
+    format: AUTHORITY_LEXICON_SEGMENT_FORMAT,
+    entries,
+    first: entries[0]?.shard || "",
+    last: entries.at(-1)?.shard || ""
+  };
 }
 function parseAuthorityHotList(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -4279,6 +4329,7 @@ function traceBucketFromPath(path) {
   if (path.includes("/terms/block-packs/")) return "postingBlocks";
   if (path.includes("/terms/packs/")) return "terms";
   if (path.includes("/bundles/packs/")) return "queryBundles";
+  if (path.includes("/authority/lexicon-packs/")) return "authorityLexicon";
   if (path.includes("/authority/packs/")) return "authority";
   if (path.includes("/authority/lexicon-root.")) return "authorityLexicon";
   if (path.includes("/authority/hot/")) return "authorityHot";
@@ -4501,6 +4552,10 @@ async function createSearch(options = {}) {
   const termDirectory = createDirectoryState(manifest.directory);
   const queryBundleDirectory = manifest.query_bundles?.directory ? createDirectoryState(manifest.query_bundles.directory) : null;
   const authorityDirectory = manifest.authority?.directory ? createDirectoryState(manifest.authority.directory) : null;
+  const authorityAutocomplete = manifest.authority?.autocomplete || null;
+  const authorityLexiconSegmentDirectory = authorityAutocomplete?.format === AUTHORITY_LEXICON_PAGED_FORMAT && authorityAutocomplete.segments?.directory ? createDirectoryState(authorityAutocomplete.segments.directory) : null;
+  const authorityPackTableSource = Array.isArray(manifest.authority?.packs) ? manifest.authority.packs : manifest.object_store?.pack_table?.authority || [];
+  const authorityPackTable = authorityPackTableSource.map((pack) => typeof pack === "string" ? pack : pack.file);
   const docPointers = manifest.docs?.pointers;
   const docPages = manifest.docs?.pages || null;
   let facetDictionaries = manifest.facet_dictionaries || null;
@@ -4522,6 +4577,7 @@ async function createSearch(options = {}) {
   const geoBranchPageCache = /* @__PURE__ */ new Map();
   const geoLeafPageCache = /* @__PURE__ */ new Map();
   let authorityLexiconRootPromise = null;
+  const authorityLexiconSegmentCache = /* @__PURE__ */ new Map();
   const authorityHotCache = /* @__PURE__ */ new Map();
   const vectorRootCache = /* @__PURE__ */ new Map();
   const vectorClusterPageCache = /* @__PURE__ */ new Map();
@@ -5045,15 +5101,74 @@ async function createSearch(options = {}) {
     });
   }
   async function loadAuthorityLexiconRoot() {
-    const meta = manifest.authority?.autocomplete;
-    if (!meta?.directory?.file) return null;
+    const meta = authorityAutocomplete;
+    const file = meta?.format === AUTHORITY_LEXICON_PAGED_FORMAT ? meta.root?.file : meta?.directory?.file;
+    if (!file) return null;
     if (!authorityLexiconRootPromise) {
-      authorityLexiconRootPromise = fetchGzipArrayBuffer(new URL(meta.directory.file, baseUrl)).then(parseAuthorityLexiconRoot);
+      authorityLexiconRootPromise = fetchGzipArrayBuffer(new URL(file, baseUrl)).then(parseAuthorityLexiconRoot).then((root) => meta.format === AUTHORITY_LEXICON_PAGED_FORMAT ? { ...root, format: AUTHORITY_LEXICON_PAGED_FORMAT, weighted: meta.weighted === true, paged: true } : root);
       authorityLexiconRootPromise.catch(() => {
         authorityLexiconRootPromise = null;
       });
     }
     return authorityLexiconRootPromise;
+  }
+  async function loadAuthorityLexiconSegment(item) {
+    const entry = item?.entry;
+    if (!entry) return null;
+    const key = `${entry.pack}:${entry.offset}:${entry.length}`;
+    if (!authorityLexiconSegmentCache.has(key)) {
+      const packDir = String(authorityAutocomplete?.segments?.pack_dir || "authority/lexicon-packs/").replace(/\/?$/u, "/");
+      const promise = fetchRange(new URL(`${packDir}${entry.pack}`, baseUrl), entry.offset, entry.length).then((compressed) => inflateObject(compressed, entry, `authority lexicon segment ${item.shard}`)).then((buffer) => parseAuthorityLexiconSegment(buffer, { packTable: authorityPackTable }));
+      promise.catch(() => authorityLexiconSegmentCache.delete(key));
+      authorityLexiconSegmentCache.set(key, promise);
+    }
+    return authorityLexiconSegmentCache.get(key);
+  }
+  async function authorityLexiconSegmentPointers(prefix) {
+    const state = authorityLexiconSegmentDirectory;
+    if (!state) return { entries: [], pagesVisited: 0 };
+    const root = await loadDirectoryRoot(state);
+    if (!root.pages?.length) return { entries: [], pagesVisited: 0 };
+    const upper = `${prefix}\uFFFF`;
+    let pageIndex = floorDirectoryPageIndex(root, prefix);
+    if (pageIndex < 0) pageIndex = 0;
+    const entries = [];
+    let pagesVisited = 0;
+    let first = true;
+    for (; pageIndex < root.pages.length; pageIndex++) {
+      const pageSummary = root.pages[pageIndex];
+      if (!first && pageSummary.first > upper) break;
+      const page = await loadDirectoryPage(state, pageSummary);
+      pagesVisited++;
+      const keys = [...page.keys()];
+      let keyIndex = first ? floorSortedKeyIndex(keys, prefix) : 0;
+      if (keyIndex < 0) keyIndex = 0;
+      first = false;
+      for (; keyIndex < keys.length; keyIndex++) {
+        const shard = keys[keyIndex];
+        if (entries.length && shard > upper) return { entries, pagesVisited };
+        entries.push({ shard, entry: page.get(shard) });
+      }
+    }
+    return { entries, pagesVisited };
+  }
+  async function pagedAuthorityLexiconCandidates(prefix) {
+    const pointers = await authorityLexiconSegmentPointers(prefix);
+    const entries = [];
+    for (let index = 0; index < pointers.entries.length; index += 8) {
+      const slice = pointers.entries.slice(index, index + 8);
+      const segments = await Promise.all(slice.map(loadAuthorityLexiconSegment));
+      for (const segment of segments) {
+        for (const item of segment?.entries || []) {
+          if (prefix.startsWith(item.shard) || item.shard.startsWith(prefix)) entries.push(item);
+        }
+      }
+    }
+    return {
+      entries,
+      pagesVisited: pointers.pagesVisited,
+      segmentsVisited: pointers.entries.length
+    };
   }
   async function loadAuthorityHotList(prefix, entry) {
     if (!entry?.file) return [];
@@ -10727,12 +10842,14 @@ async function createSearch(options = {}) {
       }
     }
     const keyPrefix = `${AUTOCOMPLETE_PREFIX}${prefix}`;
-    const candidates = lexiconCandidateShards(root.shards, keyPrefix);
+    const paged = root.paged ? await pagedAuthorityLexiconCandidates(keyPrefix) : null;
+    const candidates = paged?.entries || lexiconCandidateShards(root.shards, keyPrefix);
     const ordered = candidates.slice().sort((left, right) => right.maxRank - left.maxRank || (left.shard < right.shard ? -1 : left.shard > right.shard ? 1 : 0));
     const best = /* @__PURE__ */ new Map();
     let entriesScanned = 0;
     let shardsVisited = 0;
-    let directoryPagesVisited = 0;
+    let directoryPagesVisited = paged?.pagesVisited || 0;
+    const lexiconSegmentsVisited = paged?.segmentsVisited || 0;
     const directoryPages = /* @__PURE__ */ new Set();
     const kthRank = () => {
       if (best.size < size) return -1;
@@ -10743,7 +10860,7 @@ async function createSearch(options = {}) {
       }
       return sorted[size - 1].rank;
     };
-    const directoryRoot = await loadDirectoryRoot(authorityDirectory);
+    const directoryRoot = root.paged ? null : await loadDirectoryRoot(authorityDirectory);
     let batch = 1;
     for (let position = 0; position < ordered.length; ) {
       const boundary = kthRank();
@@ -10752,12 +10869,16 @@ async function createSearch(options = {}) {
       batch = Math.min(8, batch * 2);
       const resolved = [];
       for (const summary of slice) {
+        if (root.paged) {
+          resolved.push({ shard: summary.shard, entry: summary.entry });
+          continue;
+        }
         const page = findDirectoryPage(directoryRoot, summary.shard);
         if (page) directoryPages.add(page.file);
         const item = await directoryEntryFromRoot(authorityDirectory, directoryRoot, summary.shard);
         if (item) resolved.push(item);
       }
-      directoryPagesVisited = directoryPages.size;
+      if (!root.paged) directoryPagesVisited = directoryPages.size;
       const loaded = await loadAuthorityShards(resolved);
       for (const item of resolved) {
         const shard = loaded.get(item.shard);
@@ -10784,6 +10905,7 @@ async function createSearch(options = {}) {
         suggestCandidateShards: candidates.length,
         suggestShardsVisited: shardsVisited,
         suggestDirectoryPagesVisited: directoryPagesVisited,
+        ...root.paged ? { suggestLexiconSegmentsVisited: lexiconSegmentsVisited } : {},
         suggestEntriesScanned: entriesScanned
       }
     };
@@ -10891,12 +11013,15 @@ async function createSearch(options = {}) {
     const prefix = suggestKey(String(surface || ""));
     if (!prefix) return { surface: String(surface || ""), prefix, matches: [] };
     const keyPrefix = `${AUTOCOMPLETE_PREFIX}${prefix}${AUTOCOMPLETE_SEPARATOR}`;
-    const candidates = lexiconCandidateShards(root.shards, keyPrefix);
-    const resolved = [];
-    const directoryRoot = await loadDirectoryRoot(authorityDirectory);
-    for (const summary of candidates) {
-      const item = await directoryEntryFromRoot(authorityDirectory, directoryRoot, summary.shard);
-      if (item) resolved.push(item);
+    const paged = root.paged ? await pagedAuthorityLexiconCandidates(keyPrefix) : null;
+    const candidates = paged?.entries || lexiconCandidateShards(root.shards, keyPrefix);
+    const resolved = root.paged ? candidates.map((summary) => ({ shard: summary.shard, entry: summary.entry })) : [];
+    if (!root.paged) {
+      const directoryRoot = await loadDirectoryRoot(authorityDirectory);
+      for (const summary of candidates) {
+        const item = await directoryEntryFromRoot(authorityDirectory, directoryRoot, summary.shard);
+        if (item) resolved.push(item);
+      }
     }
     const loaded = await loadAuthorityShards(resolved);
     const matches = [];
@@ -11677,7 +11802,9 @@ async function createShardedSearch(root, options, baseUrl) {
     return [...picked].sort((a, b) => a - b).map((index) => shards[index]);
   }
   const textRouting = root.text_routing?.format === TEXT_ROUTING_FORMAT && root.text_routing.directory?.root ? createTextRoutingState(root.text_routing) : null;
-  const suggestRouting = root.suggest_routing?.format === SUGGEST_ROUTING_FORMAT && root.suggest_routing.authority?.directory?.root ? root.suggest_routing : null;
+  const suggestRoutingAuthority = root.suggest_routing?.authority;
+  const suggestRoutingDirectory = suggestRoutingAuthority?.autocomplete?.format === AUTHORITY_LEXICON_PAGED_FORMAT ? suggestRoutingAuthority.autocomplete.segments?.directory : suggestRoutingAuthority?.directory;
+  const suggestRouting = root.suggest_routing?.format === SUGGEST_ROUTING_FORMAT && suggestRoutingDirectory?.root ? root.suggest_routing : null;
   let rootAuthorityEnginePromise = null;
   function rootAuthorityEngine() {
     if (!rootAuthorityEnginePromise) {
@@ -11691,9 +11818,9 @@ async function createShardedSearch(root, options, baseUrl) {
           features: {},
           total: root.total || 0,
           // The synthetic engine only ever serves suggest/authorityLookup;
-          // aliasing the authority directory satisfies the term-directory
-          // requirement without fetching anything text-related.
-          directory: suggestRouting.authority.directory,
+          // Aliasing the suggest routing directory satisfies the
+          // term-directory requirement without fetching anything text-related.
+          directory: suggestRoutingDirectory,
           authority: suggestRouting.authority
         }
       });

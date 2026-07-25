@@ -425,6 +425,12 @@ authority shard's maximum composite rank and entry count. Per-character hot list
 small immutable objects under `authority/hot/`, fetched only for a
 single-character query; they do not inflate every cold prefix request.
 
+Sharded-root suggest routing uses the range-addressed `rflexicon-v2` variant.
+Its small `rfdir-v2` directory floor-selects a packed lexicon segment for the
+requested prefix. That segment contains the matching shard summaries and their
+direct `authority/packs/` byte pointers, so the runtime never downloads a
+planet-scale lexicon root or physical authority directory.
+
 Query execution remains exact top-k:
 
 - A prefix selects authority leaf shards by their trie prefixes, including

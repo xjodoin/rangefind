@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- Sharded-root autocomplete now uses a paged `rflexicon-v2` directory and
+  range-packed lexicon segments. Each segment carries direct authority-pack
+  pointers, so a cold suggestion or locality lookup fetches only the small
+  routing page, matching lexicon segment, and required authority ranges
+  instead of downloading corpus-sized lexicon and authority-directory roots.
+
 ## 0.3.12 — 2026-07-24
 
 ### Fixed
