@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.3.14 — 2026-07-25
+
+### Fixed
+
+- Connectorless OSM category/locality queries use a successful root-authority
+  miss to skip the global whole-phrase place probe, then scope the category
+  search to the locality's owning shard. Queries such as `cinema laval` no
+  longer open every shard manifest before searching Québec.
+- Facet summary words now remain unsigned when bit 31 is set. Block, doc-value,
+  and geo-cell summaries no longer serialize an entire 32-value word as zero;
+  older indexes fail open instead of using potentially corrupt facet summaries.
+  Rebuilt sharded roots advertise the safe encoding and use exact OSM `type`
+  facets to prune sparse-category nearest searches before fetching geo pages.
+
 ## 0.3.13 — 2026-07-25
 
 ### Changed

@@ -4610,6 +4610,7 @@ async function createSearch(options = {}) {
   const numberFields = new Map((manifest.numbers || []).map((field) => [field.name, field]));
   const booleanFields = new Map((manifest.booleans || []).map((field) => [field.name, field]));
   let blockFilterFields = new Set((manifest.block_filters || []).map((filter) => filter.name));
+  let facetSummaryUint32 = manifest.features?.facetSummaryUint32 === true;
   const rangePlans = {
     default: { mergeGapBytes: 8 * 1024, maxOverfetchBytes: 64 * 1024, maxOverfetchRatio: 4 },
     docPointers: { mergeGapBytes: 32 * 1024, maxOverfetchBytes: 32 * 1024, maxOverfetchRatio: Infinity },
@@ -4643,6 +4644,7 @@ async function createSearch(options = {}) {
         facetDictionaries = manifest.facet_dictionaries || null;
         facetDirectory = facetDictionaries?.directory ? createDirectoryState(facetDictionaries.directory) : null;
         blockFilterFields = new Set((manifest.block_filters || []).map((filter) => filter.name));
+        facetSummaryUint32 = manifest.features?.facetSummaryUint32 === true;
         fullManifestLoaded = true;
         return manifest;
       });
@@ -6671,7 +6673,7 @@ async function createSearch(options = {}) {
     for (const [field, values] of Object.entries(filters.facets || {})) {
       const selected = selectedFacetCodes(manifest, field, new Set(values));
       if (!selected?.size) continue;
-      if (blockFilterFields.has(field)) facets.push([field, selected]);
+      if (blockFilterFields.has(field) && facetSummaryUint32) facets.push([field, selected]);
       else unknownFields.push(field);
     }
     for (const [field, range] of Object.entries(filters.numbers || {})) {

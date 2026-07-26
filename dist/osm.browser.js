@@ -372,7 +372,7 @@ function lookupCategory(lexicon, surface) {
   if (!folded) return null;
   for (const key of lookupKeys(folded)) {
     const entry = lexicon.get(key);
-    if (entry) return { query: entry.query, label: labelize(folded) };
+    if (entry) return { type: entry.type, query: entry.query, label: labelize(folded) };
   }
   return null;
 }
@@ -664,7 +664,7 @@ function collapseCivicDuplicates(response) {
     stats: { ...response.stats || {}, osmCivicDuplicatesCollapsed: removed }
   };
 }
-async function resolveLocality(engine, surface, params = {}) {
+async function resolveLocality(engine, surface, params = {}, options = {}) {
   const normalizedLocality = fold(surface);
   const shardScope = params.shards == null ? [] : (Array.isArray(params.shards) ? params.shards : [params.shards]).map(String).sort();
   const localityKey = `${normalizedLocality}\0${shardScope.join("\0")}`;
@@ -696,22 +696,29 @@ async function resolveLocality(engine, surface, params = {}) {
     return matches[0] || null;
   };
   let authorityShards = null;
+  let authoritativeMiss = false;
   if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
     try {
       const lookup = await engine.authorityLookup(surface, { size: 8 });
       const scoped = [];
+      let exactMatchWithoutShard = false;
       for (const match of lookup?.matches || []) {
-        if (!Array.isArray(match.shards) || !match.shards.length) continue;
         if (fold(match.text) !== normalizedLocality) continue;
+        if (!Array.isArray(match.shards) || !match.shards.length) {
+          exactMatchWithoutShard = true;
+          continue;
+        }
         for (const id of match.shards) {
           if (!scoped.includes(id)) scoped.push(id);
         }
         if (scoped.length >= 4) break;
       }
       if (scoped.length) authorityShards = scoped.slice(0, 4).sort();
+      authoritativeMiss = lookup != null && !authorityShards && !exactMatchWithoutShard;
     } catch {
     }
   }
+  if (options.authorityMissIsFinal && authoritativeMiss) return null;
   const attemptResolve = async (scope) => {
     const localityResponse = await engine.search(postalMatch ? {
       q: surface,
@@ -945,7 +952,7 @@ async function searchOsmQuery(engine, rawParams = {}) {
   let locality;
   if (!intent.connector) {
     const [wholePlace, split] = await Promise.all([
-      resolveLocality(engine, q, params),
+      resolveLocality(engine, q, params, { authorityMissIsFinal: true }),
       resolveLocality(engine, intent.locality, params)
     ]);
     if (wholePlace) return localityExactResponse(wholePlace, params, q);
@@ -976,9 +983,25 @@ async function searchOsmQuery(engine, rawParams = {}) {
       });
     }
   }
+  const localityShard = String(locality.shard || "").split("/")[0];
+  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true;
   const response = await searchNearestWithBudgetFallback(engine, {
     ...params,
+    ...params.shards == null && localityShard ? { shards: [localityShard] } : {},
     q: intent.category.query,
+    // The category lexicon resolves the user's alias to the corpus's exact
+    // OSM `type` value. Supplying it as a facet lets the geo tree reject
+    // cells that cannot contain the category before opening their range
+    // pages; the text term remains for compatibility and scoring.
+    ...categoryFacetSafe ? {
+      filters: {
+        ...params.filters || {},
+        facets: {
+          ...params.filters?.facets || {},
+          type: [intent.category.type]
+        }
+      }
+    } : {},
     geo: {
       near: {
         lat: locality.lat,
@@ -1001,9 +1024,12 @@ async function searchOsmQuery(engine, rawParams = {}) {
       ...trace ? { trace } : {},
       plannerLane: "osmCategoryLocality",
       osmIntentCategory: intent.category.query,
+      osmIntentCategoryType: intent.category.type,
+      ...categoryFacetSafe ? { osmIntentCategoryFacet: true } : {},
       osmIntentLocality: locality.name || intent.locality,
       osmIntentLocalityType: locality.type || "",
       osmIntentRadiusMeters: localityRadiusMeters(locality.type),
+      ...localityShard ? { osmIntentShard: localityShard } : {},
       ...weakLocalProbe ? { osmWeakLocalityTextProbe: true } : {}
     }
   };
