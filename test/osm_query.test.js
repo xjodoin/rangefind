@@ -466,7 +466,15 @@ test("OSM category-locality uses an authority miss and locality provenance to av
   const calls = [];
   const lookups = [];
   const engine = {
-    manifest: { features: { shards: true, facetSummaryUint32: true } },
+    // Mixed root: Quebec has been rebuilt with unsigned facet summaries,
+    // while another shard still requires the fail-open compatibility path.
+    manifest: {
+      features: { shards: true, facetSummaryUint32: false },
+      shards: [
+        { id: "quebec", features: { facetSummaryUint32: true } },
+        { id: "legacy" }
+      ]
+    },
     async authorityLookup(surface) {
       lookups.push(surface);
       if (surface === "cinema laval") {

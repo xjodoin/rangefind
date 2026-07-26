@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.15 — 2026-07-25
+
+### Changed
+
+- Sharded roots now preserve unsigned-facet-summary support on each shard
+  descriptor. A locality-scoped OSM category query can use safe geo/facet
+  pruning as soon as its shard is rebuilt, without waiting for every legacy
+  shard in a mixed planet root.
+
 ## 0.3.14 — 2026-07-25
 
 ### Fixed

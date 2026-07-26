@@ -984,7 +984,8 @@ async function searchOsmQuery(engine, rawParams = {}) {
     }
   }
   const localityShard = String(locality.shard || "").split("/")[0];
-  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true;
+  const localityShardDescriptor = localityShard ? engine.manifest?.shards?.find((shard) => String(shard.id) === localityShard) : null;
+  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true || localityShardDescriptor?.features?.facetSummaryUint32 === true;
   const response = await searchNearestWithBudgetFallback(engine, {
     ...params,
     ...params.shards == null && localityShard ? { shards: [localityShard] } : {},

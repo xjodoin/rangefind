@@ -157,6 +157,8 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
   assert.equal(rootManifest.total, 360);
   assert.equal(rootManifest.shards.length, 3);
   assert.ok(rootManifest.shards.every(shard => Array.isArray(shard.bbox)));
+  assert.equal(rootManifest.features.facetSummaryUint32, true);
+  assert.ok(rootManifest.shards.every(shard => shard.features?.facetSummaryUint32 === true));
 
   const monoServer = await serveStatic(join(monoRoot, "public"));
   const shardServer = await serveStatic(join(shardRoot, "public"));

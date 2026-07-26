@@ -50,6 +50,12 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
         manifest: manifestName,
         total: manifest.total || 0,
         bbox: normalizedBbox(shard.bbox),
+        // Preserve safety capabilities per child so a mixed root can use
+        // new pruning on rebuilt shards immediately while older siblings
+        // continue on the compatibility lane.
+        ...(manifest.features?.facetSummaryUint32 === true
+          ? { features: { facetSummaryUint32: true } }
+          : {}),
         // Hierarchy labels ("canada", "north-america", …): queries scope to
         // a whole group with shards: ["canada"] instead of listing members.
         ...(Array.isArray(shard.groups) && shard.groups.length
@@ -69,9 +75,9 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
     ...(first.meta ? { meta: first.meta } : {}),
     features: {
       shards: true,
-      // Only advertise facet-backed geo pruning when every child was built
-      // with unsigned 32-bit summary words. Mixed/older roots remain on the
-      // text-only compatibility lane until their last shard is rebuilt.
+      // Root-wide searches may use facet-backed geo pruning only after every
+      // child is safe. Scoped searches can consult the child descriptor above
+      // and benefit as soon as their specific shard has been rebuilt.
       facetSummaryUint32: entries.every(item => item.manifest.features?.facetSummaryUint32 === true)
     },
     total: entries.reduce((sum, item) => sum + (item.entry.total || 0), 0),
