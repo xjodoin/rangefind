@@ -4246,6 +4246,7 @@ export async function build({ configPath, update = false, compact = false }) {
         docPages: true,
         rangeDirectoryV2: true,
         fieldRowPipeline: true,
+        facetSummaryUint32: true,
         docValues: true,
         docValueSorted: true,
         filterBitmaps: Object.keys(filterBitmaps.fields).length > 0,

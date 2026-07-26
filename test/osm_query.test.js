@@ -14,43 +14,43 @@ import {
 
 test("OSM query intents recognize common categories and natural locality phrasing", () => {
   assert.deepEqual(parseOsmQueryIntent("Pharmacie Rosemère"), {
-    category: { query: "pharmacy", label: "Pharmacie" },
+    category: { type: "pharmacy", query: "pharmacy", label: "Pharmacie" },
     locality: "Rosemère",
     order: "category-locality",
     connector: false
   });
   assert.deepEqual(parseOsmQueryIntent("Rosemère pharmacy"), {
-    category: { query: "pharmacy", label: "Pharmacy" },
+    category: { type: "pharmacy", query: "pharmacy", label: "Pharmacy" },
     locality: "Rosemère",
     order: "locality-category"
   });
   assert.deepEqual(parseOsmQueryIntent("coffee in Montreal"), {
-    category: { query: "cafe", label: "Coffee" },
+    category: { type: "cafe", query: "cafe", label: "Coffee" },
     locality: "Montreal",
     order: "category-locality",
     connector: true
   });
   assert.deepEqual(parseOsmQueryIntent("cafés près de Monaco"), {
-    category: { query: "cafe", label: "Cafes" },
+    category: { type: "cafe", query: "cafe", label: "Cafes" },
     locality: "Monaco",
     order: "category-locality",
     connector: true
   });
   assert.deepEqual(parseOsmQueryIntent("Monaco restaurants"), {
-    category: { query: "restaurant", label: "Restaurants" },
+    category: { type: "restaurant", query: "restaurant", label: "Restaurants" },
     locality: "Monaco",
     order: "locality-category"
   });
   assert.equal(parseOsmQueryIntent("Pharmacie"), null);
   assert.deepEqual(parseOsmQueryIntent("Café Rosemère"), {
-    category: { query: "cafe", label: "Cafe" },
+    category: { type: "cafe", query: "cafe", label: "Cafe" },
     locality: "Rosemère",
     order: "category-locality",
     connector: false
   });
   // The lexicon vocabulary reaches far beyond the old hardcoded list.
   assert.deepEqual(parseOsmQueryIntent("cinema in Birmingham"), {
-    category: { query: "cinema", label: "Cinema" },
+    category: { type: "cinema", query: "cinema", label: "Cinema" },
     locality: "Birmingham",
     order: "category-locality",
     connector: true
@@ -403,7 +403,14 @@ test("OSM locality resolution scopes to root-authority shards when available", a
       if (params.filters?.facets?.category?.includes("place")) {
         return {
           total: 1,
-          results: [{ name: "Rosemère", category: "place", type: "town", lat: 45.6323155, lon: -73.8052338 }],
+          results: [{
+            name: "Rosemère",
+            category: "place",
+            type: "town",
+            lat: 45.6323155,
+            lon: -73.8052338,
+            shard: "quebec"
+          }],
           stats: {}
         };
       }
@@ -411,14 +418,14 @@ test("OSM locality resolution scopes to root-authority shards when available", a
     }
   };
   await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
-  // The whole-surface probe runs (and misses) unscoped; the locality search
-  // runs scoped to the shard the root lexicon named — the street-token
-  // match must not widen the scope.
-  const scoped = calls.find(params => params.shards);
-  assert.deepEqual(scoped.shards, ["quebec"]);
-  assert.ok(scoped.filters?.facets?.category?.includes("place"));
-  assert.ok(calls.some(params => params.shards === undefined
-    && params.filters?.facets?.category?.includes("place")));
+  // The root lexicon proves the whole phrase is not a locality without a
+  // global place search. Both the locality resolution and the final category
+  // search stay on the shard named by the exact Rosemère authority row.
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.ok(calls[0].filters?.facets?.category?.includes("place"));
+  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(calls[1].q, "pharmacy");
 });
 
 test("OSM locality resolution retries unscoped when the authority scope misses", async () => {
@@ -446,12 +453,102 @@ test("OSM locality resolution retries unscoped when the authority scope misses",
   };
   const response = await searchOsmQuery(engine, { q: "Pharmacie Rosemère", size: 10 });
   // The authority-scoped locality attempt hits the wrong shard, then the
-  // unscoped retry resolves; the whole-surface probe misses around them.
+  // unscoped retry resolves. The whole-surface authority miss performs no
+  // global place search.
   const scopedIndex = calls.findIndex(params => params.shards);
   assert.deepEqual(calls[scopedIndex].shards, ["wrong-shard"]);
   assert.ok(calls.slice(scopedIndex + 1).some(params => params.shards === undefined
     && params.filters?.facets?.category?.includes("place")));
   assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+});
+
+test("OSM category-locality uses an authority miss and locality provenance to avoid federation fan-out", async () => {
+  const calls = [];
+  const lookups = [];
+  const engine = {
+    manifest: { features: { shards: true, facetSummaryUint32: true } },
+    async authorityLookup(surface) {
+      lookups.push(surface);
+      if (surface === "cinema laval") {
+        return { surface, prefix: "cinema laval", matches: [] };
+      }
+      return {
+        surface,
+        prefix: "laval",
+        matches: [{ text: "Laval", weight: 438366, count: 8, full: true, shards: ["quebec"] }]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{
+            name: "Laval",
+            category: "place",
+            type: "city",
+            population: 438366,
+            lat: 45.5833,
+            lon: -73.75,
+            shard: "quebec"
+          }],
+          stats: {}
+        };
+      }
+      return {
+        total: 1,
+        results: [{ name: "Cinéma Cineplex Laval", type: "cinema", distanceMeters: 3200 }],
+        stats: { shards: 310, shardsQueried: 1 }
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, { q: "cinema laval", size: 10 });
+
+  assert.deepEqual(lookups.sort(), ["cinema laval", "laval"]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls.some(call => call.q === "cinema laval"), false);
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(calls[1].q, "cinema");
+  assert.deepEqual(calls[1].filters.facets.type, ["cinema"]);
+  assert.equal(response.results[0].name, "Cinéma Cineplex Laval");
+  assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+  assert.equal(response.stats.osmIntentShard, "quebec");
+  assert.equal(response.stats.osmIntentCategoryFacet, true);
+});
+
+test("OSM whole-place ambiguity probe remains fail-open without a usable authority artifact", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup() {
+      return null;
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.q === "bar harbor" && params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{
+            name: "Bar Harbor",
+            category: "place",
+            type: "town",
+            population: 5089,
+            lat: 44.39,
+            lon: -68.2
+          }]
+        };
+      }
+      return { total: 0, results: [], stats: {} };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, { q: "bar harbor", size: 10 });
+
+  assert.ok(calls.some(call => call.q === "bar harbor"
+    && call.filters?.facets?.category?.includes("place")));
+  assert.equal(response.stats.plannerLane, "osmLocalityExact");
+  assert.equal(response.results[0].name, "Bar Harbor");
 });
 
 test("nearby category intents strip near-me phrasing in both languages", () => {

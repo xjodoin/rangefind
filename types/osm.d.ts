@@ -45,5 +45,5 @@ export function buildCategoryLexiconArtifact(
 export function lookupCategory(
   lexicon: OsmCategoryLexicon,
   surface: unknown
-): { query: string; label: string } | null;
+): { type: string; query: string; label: string } | null;
 export function defaultCategoryLexicon(): OsmCategoryLexicon;

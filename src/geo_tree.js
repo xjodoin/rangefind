@@ -387,7 +387,9 @@ export function mergeBlockFilterSummaries(blockFilters, summaries) {
       const item = summary?.[filter.name];
       const target = merged[filter.name];
       if (filter.kind === "facet") {
-        for (let w = 0; w < filter.words; w++) target.words[w] |= item?.words?.[w] || 0;
+        for (let w = 0; w < filter.words; w++) {
+          target.words[w] = ((target.words[w] || 0) | (item?.words?.[w] || 0)) >>> 0;
+        }
       } else {
         if (Number.isFinite(item?.min)) target.min = target.min == null ? item.min : Math.min(target.min, item.min);
         if (Number.isFinite(item?.max)) target.max = target.max == null ? item.max : Math.max(target.max, item.max);

@@ -312,7 +312,7 @@ export function lookupCategory(lexicon, surface) {
   if (!folded) return null;
   for (const key of lookupKeys(folded)) {
     const entry = lexicon.get(key);
-    if (entry) return { query: entry.query, label: labelize(folded) };
+    if (entry) return { type: entry.type, query: entry.query, label: labelize(folded) };
   }
   return null;
 }

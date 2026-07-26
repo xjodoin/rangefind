@@ -128,7 +128,11 @@ function addBit(words, value) {
   if (value < 0) return;
   const word = Math.floor(value / 32);
   const bit = value % 32;
-  words[word] |= 2 ** bit;
+  // Bitwise operators return signed Int32 values. Keep the stored word
+  // explicitly unsigned or setting bit 31 makes the whole word negative;
+  // varint/fixed-width writers then clamp it to zero and silently erase all
+  // 32 facet-presence bits from block and geo summaries.
+  words[word] = ((words[word] || 0) | (2 ** bit)) >>> 0;
 }
 
 function facetCodes(value) {
@@ -156,7 +160,9 @@ function updateSummary(summary, filters, codes, doc) {
         for (const item of codesForDoc) addBit(summary[i].words, item);
       } else if (Array.isArray(value)) {
         if (value.length === summary[i].words.length) {
-          for (let w = 0; w < summary[i].words.length; w++) summary[i].words[w] |= value[w] || 0;
+          for (let w = 0; w < summary[i].words.length; w++) {
+            summary[i].words[w] = ((summary[i].words[w] || 0) | (value[w] || 0)) >>> 0;
+          }
         } else {
           for (const item of value) addBit(summary[i].words, item);
         }
@@ -182,7 +188,9 @@ function mergeBlockFilterSummary(target, filters, source) {
     const sourceItem = Array.isArray(source) ? source[i] : source?.[filter.name];
     if (!sourceItem) continue;
     if (filter.kind === "facet") {
-      for (let w = 0; w < filter.words; w++) targetItem.words[w] |= sourceItem.words?.[w] || 0;
+      for (let w = 0; w < filter.words; w++) {
+        targetItem.words[w] = ((targetItem.words[w] || 0) | (sourceItem.words?.[w] || 0)) >>> 0;
+      }
     } else {
       const min = sourceItem.min;
       const max = sourceItem.max;
@@ -1518,7 +1526,9 @@ function summarizeFacetRows(rows, words) {
   const summary = new Array(words).fill(0);
   for (const value of rows) {
     const row = facetWords(value, words);
-    for (let word = 0; word < words; word++) summary[word] |= row[word] || 0;
+    for (let word = 0; word < words; word++) {
+      summary[word] = ((summary[word] || 0) | (row[word] || 0)) >>> 0;
+    }
   }
   return { words: summary };
 }

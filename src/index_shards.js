@@ -67,7 +67,13 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
     // corpus family, so the first shard's meta speaks for the root unless
     // the caller overrides it via `extra.meta`.
     ...(first.meta ? { meta: first.meta } : {}),
-    features: { shards: true },
+    features: {
+      shards: true,
+      // Only advertise facet-backed geo pruning when every child was built
+      // with unsigned 32-bit summary words. Mixed/older roots remain on the
+      // text-only compatibility lane until their last shard is rebuilt.
+      facetSummaryUint32: entries.every(item => item.manifest.features?.facetSummaryUint32 === true)
+    },
     total: entries.reduce((sum, item) => sum + (item.entry.total || 0), 0),
     // The merge layer parses sort plans and geo params without opening a
     // shard first; shards share one schema, so the first speaks for all.

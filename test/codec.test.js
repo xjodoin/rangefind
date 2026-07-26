@@ -628,6 +628,37 @@ test("doc-value chunks round-trip typed column slices", () => {
   assert.deepEqual(parseDocValueChunk(bool.buffer).values, [false, true]);
 });
 
+test("facet bit 31 remains unsigned across summaries and doc-value encoding", () => {
+  const values = Array.from({ length: 33 }, (_, index) => ({ value: String(index) }));
+  const config = {
+    facets: [{ name: "category" }],
+    numbers: [],
+    booleans: [],
+    postingBlockSize: 2,
+    postingSuperblockSize: 2
+  };
+  const dicts = { category: { values } };
+  const codes = { category: [{ codes: [5, 31] }, { codes: [31] }] };
+  const filters = buildBlockFilters(config, dicts);
+  const expectedWord = (2 ** 5) + (2 ** 31);
+
+  const segment = buildPostingSegment(
+    [["marker", [[0, 1000], [1, 500]]]],
+    2,
+    codes,
+    filters,
+    config
+  );
+  const entry = parsePostingSegment(segment.buffer, { block_filters: filters }).terms.get("marker");
+  assert.deepEqual(entry.blocks[0].filters.category.words, [expectedWord, 0]);
+  assert.deepEqual(entry.superblocks[0].filters.category.words, [expectedWord, 0]);
+
+  const [field] = docValueFields(config, { _dicts: dicts });
+  const chunk = buildDocValueChunk(field, 0, codes.category);
+  assert.deepEqual(chunk.summary.words, [expectedWord, 0]);
+  assert.deepEqual(parseDocValueChunk(chunk.buffer).values, codes.category);
+});
+
 test("sparse facet doc-value chunks do not allocate dense high-cardinality summaries", () => {
   const values = Array.from({ length: 3000 }, (_, index) => ({ value: String(index) }));
   const [field] = docValueFields({ facets: [{ name: "tag" }], numbers: [], booleans: [] }, {

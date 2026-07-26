@@ -333,7 +333,7 @@ function collapseCivicDuplicates(response) {
   };
 }
 
-async function resolveLocality(engine, surface, params = {}) {
+async function resolveLocality(engine, surface, params = {}, options = {}) {
   const normalizedLocality = fold(surface);
   const shardScope = params.shards == null
     ? []
@@ -379,23 +379,35 @@ async function resolveLocality(engine, surface, params = {}) {
   // difference between ~100KB and tens of megabytes per cold locality. The
   // lookup is advisory: a scoped miss retries unscoped.
   let authorityShards = null;
+  let authoritativeMiss = false;
   if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
     try {
       const lookup = await engine.authorityLookup(surface, { size: 8 });
       const scoped = [];
+      let exactMatchWithoutShard = false;
       for (const match of lookup?.matches || []) {
-        if (!Array.isArray(match.shards) || !match.shards.length) continue;
         if (fold(match.text) !== normalizedLocality) continue;
+        if (!Array.isArray(match.shards) || !match.shards.length) {
+          exactMatchWithoutShard = true;
+          continue;
+        }
         for (const id of match.shards) {
           if (!scoped.includes(id)) scoped.push(id);
         }
         if (scoped.length >= 4) break;
       }
       if (scoped.length) authorityShards = scoped.slice(0, 4).sort();
+      // A non-null response proves the root authority lexicon was read
+      // successfully. For the connectorless whole-query ambiguity probe,
+      // absence there is decisive: do not turn "cinema laval" into a
+      // federation-wide place search merely to prove it is not a city.
+      // An exact legacy row without shard provenance remains fail-open.
+      authoritativeMiss = lookup != null && !authorityShards && !exactMatchWithoutShard;
     } catch {
       // The lexicon is an accelerator, never a gate.
     }
   }
+  if (options.authorityMissIsFinal && authoritativeMiss) return null;
 
   // Locality names are common worldwide ("Montréal" is also a Mauritius
   // suburb and a Brazilian allotment) and BM25 scores tie tightly across
@@ -720,7 +732,7 @@ export async function searchOsmQuery(engine, rawParams = {}) {
   let locality;
   if (!intent.connector) {
     const [wholePlace, split] = await Promise.all([
-      resolveLocality(engine, q, params),
+      resolveLocality(engine, q, params, { authorityMissIsFinal: true }),
       resolveLocality(engine, intent.locality, params)
     ]);
     if (wholePlace) return localityExactResponse(wholePlace, params, q);
@@ -764,9 +776,30 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     }
   }
 
+  // Federation results carry their owning shard. Once the locality has
+  // resolved, that provenance is a stronger route than the category's
+  // global text directory: searching "cinema" around Laval needs Quebec,
+  // not every shard that happens to contain the word and lacks a usable
+  // bbox. Preserve an explicit caller scope when one was supplied.
+  const localityShard = String(locality.shard || "").split("/")[0];
+  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true;
   const response = await searchNearestWithBudgetFallback(engine, {
     ...params,
+    ...(params.shards == null && localityShard ? { shards: [localityShard] } : {}),
     q: intent.category.query,
+    // The category lexicon resolves the user's alias to the corpus's exact
+    // OSM `type` value. Supplying it as a facet lets the geo tree reject
+    // cells that cannot contain the category before opening their range
+    // pages; the text term remains for compatibility and scoring.
+    ...(categoryFacetSafe ? {
+      filters: {
+        ...(params.filters || {}),
+        facets: {
+          ...(params.filters?.facets || {}),
+          type: [intent.category.type]
+        }
+      }
+    } : {}),
     geo: {
       near: {
         lat: locality.lat,
@@ -789,9 +822,12 @@ export async function searchOsmQuery(engine, rawParams = {}) {
       ...(trace ? { trace } : {}),
       plannerLane: "osmCategoryLocality",
       osmIntentCategory: intent.category.query,
+      osmIntentCategoryType: intent.category.type,
+      ...(categoryFacetSafe ? { osmIntentCategoryFacet: true } : {}),
       osmIntentLocality: locality.name || intent.locality,
       osmIntentLocalityType: locality.type || "",
       osmIntentRadiusMeters: localityRadiusMeters(locality.type),
+      ...(localityShard ? { osmIntentShard: localityShard } : {}),
       ...(weakLocalProbe ? { osmWeakLocalityTextProbe: true } : {})
     }
   };
