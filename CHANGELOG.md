@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.20 — 2026-07-27
+
+### Performance
+
+- Nearby OSM category searches pass their resolved `type` facet into geo
+  traversal when safe facet summaries are available. Queries such as
+  "gas station near me" skip geo cells that cannot contain fuel stations
+  instead of downloading every spatial page in the radius.
+
 ## 0.3.19 — 2026-07-27
 
 ### Performance

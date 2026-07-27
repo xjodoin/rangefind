@@ -751,6 +751,7 @@ test("OSM category lexicon prefers the manifest artifact, then the facet diction
 test("OSM search runs bare categories as nearest-first around the anchor", async () => {
   const calls = [];
   const engine = {
+    manifest: { features: { facetSummaryUint32: true } },
     async search(params) {
       calls.push(params);
       return { total: 3, results: [{ name: "Jean Coutu", type: "pharmacy", distanceMeters: 480 }], stats: {} };
@@ -762,12 +763,15 @@ test("OSM search runs bare categories as nearest-first around the anchor", async
   assert.equal(calls[0].near, undefined);
   assert.equal(calls[0].geo.sort, "distance");
   assert.equal(calls[0].geo.near.radiusMeters, 10000);
+  assert.deepEqual(calls[0].filters.facets.type, ["pharmacy"]);
   assert.equal(response.stats.plannerLane, "osmCategoryNearby");
+  assert.equal(response.stats.osmIntentCategoryFacet, true);
   assert.equal(response.resolvedQuery, "Pharmacy nearby");
 
   // Rural anchor: an empty 10 km orbit widens once before giving up.
   const sparse = [];
   const ruralEngine = {
+    manifest: { features: { facetSummaryUint32: true } },
     async search(params) {
       sparse.push(params);
       return sparse.length === 1
@@ -777,6 +781,7 @@ test("OSM search runs bare categories as nearest-first around the anchor", async
   };
   const rural = await searchOsmQuery(ruralEngine, { q: "pharmacie", size: 10, near: { lat: 48.1, lon: -79.0 } });
   assert.deepEqual(sparse.map(params => params.geo.near.radiusMeters), [10000, 50000]);
+  assert.ok(sparse.every(params => params.filters.facets.type[0] === "pharmacy"));
   assert.equal(rural.stats.osmIntentRadiusMeters, 50000);
 });
 

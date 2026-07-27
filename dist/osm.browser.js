@@ -888,11 +888,24 @@ async function searchOsmQuery(engine, rawParams = {}) {
     if (nearbyCategory && anchor) {
       let response2 = null;
       let radiusMeters = 0;
+      const categoryFacetSafe2 = engine.manifest?.features?.facetSummaryUint32 === true;
       for (const radius of NEARBY_CATEGORY_RADII_METERS) {
         radiusMeters = radius;
         response2 = await searchNearestWithBudgetFallback(engine, {
           ...params,
           q: nearbyCategory.query,
+          // The category lexicon already resolved the user's wording to the
+          // exact OSM type. Safe unsigned facet summaries let the geo tree
+          // reject irrelevant cells before fetching their point pages.
+          ...categoryFacetSafe2 ? {
+            filters: {
+              ...params.filters || {},
+              facets: {
+                ...params.filters?.facets || {},
+                type: [nearbyCategory.type]
+              }
+            }
+          } : {},
           geo: {
             near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: radius },
             sort: "distance"
@@ -907,7 +920,8 @@ async function searchOsmQuery(engine, rawParams = {}) {
           ...response2.stats || {},
           plannerLane: "osmCategoryNearby",
           osmIntentCategory: nearbyCategory.query,
-          osmIntentRadiusMeters: radiusMeters
+          osmIntentRadiusMeters: radiusMeters,
+          ...categoryFacetSafe2 ? { osmIntentCategoryFacet: true } : {}
         }
       };
     }
