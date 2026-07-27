@@ -5280,8 +5280,8 @@ async function createSearch(options = {}) {
   async function pagedAuthorityLexiconCandidates(prefix) {
     const pointers = await authorityLexiconSegmentPointers(prefix);
     const entries = [];
-    for (let index = 0; index < pointers.entries.length; index += 8) {
-      const slice = pointers.entries.slice(index, index + 8);
+    for (let index = 0; index < pointers.entries.length; index += 32) {
+      const slice = pointers.entries.slice(index, index + 32);
       const segments = await Promise.all(slice.map(loadAuthorityLexiconSegment));
       for (const segment of segments) {
         for (const item of segment?.entries || []) {
@@ -6611,28 +6611,30 @@ async function createSearch(options = {}) {
     }
     return bytes || null;
   }
-  async function buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate = null) {
+  async function buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate = null, filters = {}) {
     if (!geoPlan?.filtered) return;
     const root = await loadGeoTreeRoot(geoPlan.field);
     if (!root) return;
+    await ensureFacetDictionaries(filters);
+    const blockFilterPlan = makeBlockFilterPlan(filters);
     const tracking = geoTraversalTracking();
     let candidatePoints = 0;
     let candidateLeafBytes = 0;
     if (root.levels === 1) {
       for (const leaf of root.leaves) {
-        if (geoLeafCandidate(geoPlan, leaf)) {
+        if (geoLeafCandidate(geoPlan, leaf, blockFilterPlan)) {
           candidatePoints += leaf.count;
           candidateLeafBytes += leaf.length || 0;
         }
       }
     } else {
-      const candidateBranches = root.branches.filter((branch) => geoLeafCandidate(geoPlan, branch));
+      const candidateBranches = root.branches.filter((branch) => geoLeafCandidate(geoPlan, branch, blockFilterPlan));
       const maxBranchOpens = 32;
       if (candidateBranches.length > maxBranchOpens) return;
       const pages = await loadGeoBranchPages(geoPlan.field, root, candidateBranches, tracking.branchFetchStats);
       for (const page of pages) {
         for (const leaf of page.leaves) {
-          if (geoLeafCandidate(geoPlan, leaf)) {
+          if (geoLeafCandidate(geoPlan, leaf, blockFilterPlan)) {
             candidatePoints += leaf.count;
             candidateLeafBytes += leaf.length || 0;
           }
@@ -6646,7 +6648,13 @@ async function createSearch(options = {}) {
       if (!docValueBytes || candidateLeafBytes >= docValueBytes) return;
     }
     const docSet = /* @__PURE__ */ new Set();
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, false, tracking)) {
+    for await (const { candidate, leafPage } of geoCandidateLeafPages(
+      geoPlan,
+      root,
+      false,
+      tracking,
+      blockFilterPlan
+    )) {
       for (let i = 0; i < leafPage.count; i++) {
         if (candidate.geoDefinite || geoPointMatchesE7(geoPlan, leafPage.latsE7[i], leafPage.lonsE7[i])) {
           docSet.add(leafPage.docs[i]);
@@ -10583,7 +10591,7 @@ async function createSearch(options = {}) {
     }
     if (geoPlan?.filtered) {
       const textPostingsEstimate = q && baseTerms.length ? (await termEntries(baseTerms)).reduce((sum, item) => sum + (item.entry.df || 0), 0) : null;
-      await buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate);
+      await buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate, userFilters);
     }
     if (params.exact) await ensureFullManifest();
     else if (sortPlan) await ensureDocValueSortedManifest();
@@ -11003,7 +11011,7 @@ async function createSearch(options = {}) {
       return sorted[size - 1].rank;
     };
     const directoryRoot = root.paged ? null : await loadDirectoryRoot(authorityDirectory);
-    let batch = 1;
+    let batch = 8;
     for (let position = 0; position < ordered.length; ) {
       const boundary = kthRank();
       if (boundary >= 0 && ordered[position].maxRank < boundary) break;

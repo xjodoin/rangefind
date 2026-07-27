@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 0.3.21 — 2026-07-27
+
+### Added
+
+- A reproducible 18-case production benchmark covers common interactive map
+  searches: autocomplete, localities, landmarks, brands, categories, nearby
+  searches, addresses, postal codes, viewports, typos, and Unicode names.
+
+### Performance
+
+- Anchored landmark and brand queries use exact root authority as a gate, map
+  coverage to select the local shard, and a bounded text window whose embedded
+  coordinates are ranked locally. Common POI names no longer pay global
+  locality probes or scattered lat/lon doc-value reads.
+- Explicit viewport category queries use their exact OSM `type` facet as the
+  geo predicate. Facet-aware geo browse prunes irrelevant cells and stops when
+  the requested page is full instead of materializing the viewport's entire
+  text/geo intersection.
+- Root autocomplete fetches bounded lexicon segments and its first ranked
+  authority candidates concurrently, removing serial network waves from broad
+  prefixes.
+- Geo doc-set construction passes safe facet summaries into branch and leaf
+  selection, avoiding spatial pages that cannot satisfy the query filters.
+- Ambiguous locality authority matches route through the highest-weight exact
+  bearer instead of opening every same-named region.
+
+### Fixed
+
+- A unique one-edit typo in the first or last category token is corrected
+  before locality routing, so queries such as `cinma laval` remain bounded and
+  return cinemas instead of falling into a global fuzzy fan-out.
+- Anchored one-edit landmark queries use the local shard's normal typo
+  correction and return the nearby corrected result.
+
 ## 0.3.20 — 2026-07-27
 
 ### Performance

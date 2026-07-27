@@ -1,6 +1,6 @@
 {
   "name": "rangefind",
-  "version": "0.3.20",
+  "version": "0.3.21",
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",
@@ -143,6 +143,7 @@
     "bench:frwiki": "node scripts/frwiki_fixture.mjs all",
     "bench:osm-geo": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
     "bench:osm-address": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_address_bench.mjs --root=examples/osm-geo",
+    "bench:osm-maps": "node scripts/osm_maps_bench.mjs",
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",
     "bench:link-rank": "node scripts/link_rank_bench.mjs",

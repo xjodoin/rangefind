@@ -1115,8 +1115,12 @@ export async function createSearch(options = {}) {
   async function pagedAuthorityLexiconCandidates(prefix) {
     const pointers = await authorityLexiconSegmentPointers(prefix);
     const entries = [];
-    for (let index = 0; index < pointers.entries.length; index += 8) {
-      const slice = pointers.entries.slice(index, index + 8);
+    // A broad four-character prefix can touch a few dozen small lexicon
+    // segments. Fetch them in one normal browser connection wave instead of
+    // serial groups of eight; the objects are bounded by the directory and
+    // independently cacheable.
+    for (let index = 0; index < pointers.entries.length; index += 32) {
+      const slice = pointers.entries.slice(index, index + 32);
       const segments = await Promise.all(slice.map(loadAuthorityLexiconSegment));
       for (const segment of segments) {
         for (const item of segment?.entries || []) {
@@ -2603,16 +2607,18 @@ export async function createSearch(options = {}) {
     return bytes || null;
   }
 
-  async function buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate = null) {
+  async function buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate = null, filters = {}) {
     if (!geoPlan?.filtered) return;
     const root = await loadGeoTreeRoot(geoPlan.field);
     if (!root) return;
+    await ensureFacetDictionaries(filters);
+    const blockFilterPlan = makeBlockFilterPlan(filters);
     const tracking = geoTraversalTracking();
     let candidatePoints = 0;
     let candidateLeafBytes = 0;
     if (root.levels === 1) {
       for (const leaf of root.leaves) {
-        if (geoLeafCandidate(geoPlan, leaf)) {
+        if (geoLeafCandidate(geoPlan, leaf, blockFilterPlan)) {
           candidatePoints += leaf.count;
           candidateLeafBytes += leaf.length || 0;
         }
@@ -2622,13 +2628,13 @@ export async function createSearch(options = {}) {
       // cover a whole city). Branch pages cost a few KB each, so open the
       // candidates and estimate from leaf-level counts instead, unless the
       // constraint spans so many branches that it is clearly unselective.
-      const candidateBranches = root.branches.filter(branch => geoLeafCandidate(geoPlan, branch));
+      const candidateBranches = root.branches.filter(branch => geoLeafCandidate(geoPlan, branch, blockFilterPlan));
       const maxBranchOpens = 32;
       if (candidateBranches.length > maxBranchOpens) return;
       const pages = await loadGeoBranchPages(geoPlan.field, root, candidateBranches, tracking.branchFetchStats);
       for (const page of pages) {
         for (const leaf of page.leaves) {
-          if (geoLeafCandidate(geoPlan, leaf)) {
+          if (geoLeafCandidate(geoPlan, leaf, blockFilterPlan)) {
             candidatePoints += leaf.count;
             candidateLeafBytes += leaf.length || 0;
           }
@@ -2645,7 +2651,13 @@ export async function createSearch(options = {}) {
       if (!docValueBytes || candidateLeafBytes >= docValueBytes) return;
     }
     const docSet = new Set();
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, false, tracking)) {
+    for await (const { candidate, leafPage } of geoCandidateLeafPages(
+      geoPlan,
+      root,
+      false,
+      tracking,
+      blockFilterPlan
+    )) {
       for (let i = 0; i < leafPage.count; i++) {
         if (candidate.geoDefinite || geoPointMatchesE7(geoPlan, leafPage.latsE7[i], leafPage.lonsE7[i])) {
           docSet.add(leafPage.docs[i]);
@@ -7006,7 +7018,7 @@ export async function createSearch(options = {}) {
       const textPostingsEstimate = q && baseTerms.length
         ? (await termEntries(baseTerms)).reduce((sum, item) => sum + (item.entry.df || 0), 0)
         : null;
-      await buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate);
+      await buildGeoDocSetIfCheap(geoPlan, textPostingsEstimate, userFilters);
     }
     if (params.exact) await ensureFullManifest();
     else if (sortPlan) await ensureDocValueSortedManifest();
@@ -7493,7 +7505,10 @@ export async function createSearch(options = {}) {
       return sorted[size - 1].rank;
     };
     const directoryRoot = root.paged ? null : await loadDirectoryRoot(authorityDirectory);
-    let batch = 1;
+    // Rank bounds still stop before irrelevant authority shards, but opening
+    // the first eight candidates together removes four serial network
+    // round-trips from ordinary broad prefixes.
+    let batch = 8;
     for (let position = 0; position < ordered.length;) {
       const boundary = kthRank();
       if (boundary >= 0 && ordered[position].maxRank < boundary) break;

@@ -56,6 +56,20 @@ test("OSM query intents recognize common categories and natural locality phrasin
     connector: true
   });
   assert.equal(parseOsmQueryIntent("boulangeries à Québec").category.query, "bakery");
+  assert.deepEqual(parseOsmQueryIntent("cinma laval"), {
+    category: {
+      type: "cinema",
+      query: "cinema",
+      label: "Cinma",
+      correctedFrom: "cinma",
+      correctedTo: "cinema"
+    },
+    locality: "laval",
+    order: "category-locality",
+    connector: false
+  });
+  assert.equal(parseOsmQueryIntent("bar laval").category.correctedFrom, undefined);
+  assert.equal(parseOsmQueryIntent("xyz laval"), null);
 });
 
 test("OSM autocomplete collapses civic matches into street-locality suggestions", async () => {
@@ -394,6 +408,7 @@ test("OSM locality resolution scopes to root-authority shards when available", a
         prefix: "rosemere",
         matches: [
           { text: "Rosemère", weight: 14294, count: 3, full: true, shards: ["quebec"] },
+          { text: "Rosemere", weight: 12, count: 1, full: true, shards: ["france"] },
           { text: "Rue de Rosemère", weight: 12, count: 9, full: false, shards: ["ontario"] }
         ]
       };
@@ -825,9 +840,67 @@ test("OSM plain text tries the anchor's radius first and falls back globally", a
   assert.equal(fallback.stats.osmNearFallback, true);
 });
 
+test("OSM anchored exact and one-edit landmark names bypass locality parsing", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      shards: [
+        { id: "france", bbox: [41, -5, 51, 10] },
+        { id: "quebec", bbox: [44.9, -79.9, 62.7, -57] }
+      ]
+    },
+    async authorityLookup(surface) {
+      return surface === "McGill University"
+        ? {
+            matches: [{
+              text: "McGill University",
+              weight: 100,
+              shards: ["quebec"]
+            }]
+          }
+        : { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 1,
+        results: [{
+          name: "McGill University",
+          type: "university",
+          lat: 45.5048,
+          lon: -73.5772
+        }],
+        stats: {}
+      };
+    }
+  };
+  const exact = await searchOsmQuery(engine, {
+    q: "McGill University",
+    size: 10,
+    near: { lat: 45.5019, lon: -73.5674 }
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].filters, undefined);
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.equal(calls[0].geo, undefined);
+  assert.equal(exact.stats.plannerLane, "osmNearExactText");
+
+  const fuzzy = await searchOsmQuery(engine, {
+    q: "McGil University",
+    size: 10,
+    near: { lat: 45.5019, lon: -73.5674 }
+  });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(fuzzy.stats.plannerLane, "osmNearFuzzyText");
+  assert.equal(fuzzy.results[0].name, "McGill University");
+});
+
 test("OSM search ignores the anchor when explicit geo or intents are present", async () => {
   const calls = [];
   const engine = {
+    manifest: { features: { facetSummaryUint32: true } },
     async search(params) {
       calls.push(params);
       return { total: 1, results: [{ name: "Cafe X" }], stats: {} };
@@ -841,8 +914,10 @@ test("OSM search ignores the anchor when explicit geo or intents are present", a
     size: 10
   });
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "");
   assert.deepEqual(Object.keys(calls[0].geo), ["box"]);
   assert.equal(calls[0].near, undefined);
+  assert.deepEqual(calls[0].filters.facets.type, ["cafe"]);
 
   // Category + locality still resolves the named place, not the anchor.
   const localityCalls = [];

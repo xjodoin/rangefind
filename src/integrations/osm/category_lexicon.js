@@ -317,6 +317,66 @@ export function lookupCategory(lexicon, surface) {
   return null;
 }
 
+// A conservative typo gate for the category token at either edge of a
+// category-locality query. Only one edit is accepted, only for words of four
+// or more characters, and every matching lexicon surface must resolve to the
+// same OSM type. Those constraints turn "cinma laval" into cinema + Laval
+// without treating arbitrary short place names as categories.
+export function withinOneEdit(left, right) {
+  if (left === right) return true;
+  if (Math.abs(left.length - right.length) > 1) return false;
+  if (left.length === right.length) {
+    const differences = [];
+    for (let index = 0; index < left.length; index++) {
+      if (left[index] !== right[index]) differences.push(index);
+      if (differences.length > 2) return false;
+    }
+    if (differences.length === 1) return true;
+    return differences.length === 2
+      && differences[1] === differences[0] + 1
+      && left[differences[0]] === right[differences[1]]
+      && left[differences[1]] === right[differences[0]];
+  }
+  const shorter = left.length < right.length ? left : right;
+  const longer = left.length < right.length ? right : left;
+  let shortIndex = 0;
+  let longIndex = 0;
+  let edits = 0;
+  while (shortIndex < shorter.length && longIndex < longer.length) {
+    if (shorter[shortIndex] === longer[longIndex]) {
+      shortIndex++;
+      longIndex++;
+      continue;
+    }
+    if (++edits > 1) return false;
+    longIndex++;
+  }
+  return true;
+}
+
+export function lookupCategoryFuzzy(lexicon, surface) {
+  const folded = fold(surface);
+  if (folded.length < 4 || folded.includes(" ")) return null;
+  const matches = [];
+  for (const [key, entry] of lexicon) {
+    if (key.includes(" ") || Math.abs(key.length - folded.length) > 1) continue;
+    if (withinOneEdit(folded, key)) matches.push({ key, entry });
+  }
+  const types = new Set(matches.map(match => match.entry.type));
+  if (types.size !== 1) return null;
+  const match = matches
+    .sort((left, right) => Math.abs(left.key.length - folded.length) - Math.abs(right.key.length - folded.length)
+      || left.key.localeCompare(right.key))[0];
+  if (!match) return null;
+  return {
+    type: match.entry.type,
+    query: match.entry.query,
+    label: labelize(folded),
+    correctedFrom: folded,
+    correctedTo: match.key
+  };
+}
+
 let bundledLexicon = null;
 
 // The zero-configuration lexicon: canonical vocabulary + aliases, used when
