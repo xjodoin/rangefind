@@ -55,6 +55,7 @@ import {
 } from "./address.js";
 import { decodeSegmentRows, parseSegmentTerms } from "./segment_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
+import { parseMultipartByteRanges, selectMultipartByteRanges } from "./http_ranges.js";
 import {
   bestMainIndexTypoDistance,
   isTypoCorrectionToken,
@@ -282,9 +283,12 @@ async function inflateGzip(responseOrBuffer) {
 // Node runtime (src/runtime.node.js) installs a scheme-routing fetch that adds
 // file:// support and browser-equivalent HTTP caching.
 let fetchImpl = (url, init) => fetch(url, init);
+let fetchSupportsMultiRange = true;
 
-export function setFetchImplementation(fn) {
-  fetchImpl = typeof fn === "function" ? fn : ((url, init) => fetch(url, init));
+export function setFetchImplementation(fn, capabilities = {}) {
+  const custom = typeof fn === "function";
+  fetchImpl = custom ? fn : ((url, init) => fetch(url, init));
+  fetchSupportsMultiRange = custom ? capabilities.multiRange === true : true;
 }
 
 async function fetchGzipArrayBuffer(url) {
@@ -327,6 +331,45 @@ async function fetchRange(url, offset, length) {
     }
     throw new Error(`Range request failed for ${url}`);
   }
+}
+
+async function fetchRanges(url, ranges, options = {}) {
+  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false) {
+    return Promise.all(ranges.map(range => fetchRange(url, range.offset, range.length)));
+  }
+  const maxRanges = Math.max(2, Math.min(64, Math.floor(Number(options.multiRangeMaxRanges || 32))));
+  if (ranges.length > maxRanges) {
+    const buffers = [];
+    for (let offset = 0; offset < ranges.length; offset += maxRanges) {
+      buffers.push(...await fetchRanges(url, ranges.slice(offset, offset + maxRanges), options));
+    }
+    return buffers;
+  }
+
+  const bucket = traceBucketFromUrl(url);
+  let response;
+  try {
+    response = await traceFetch(bucket, () => fetchImpl(url, {
+      headers: {
+        Range: `bytes=${ranges.map(range => `${range.offset}-${range.offset + range.length - 1}`).join(",")}`
+      }
+    }));
+    const contentType = response.headers?.get?.("content-type") || "";
+    if (response.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(contentType)) {
+      const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+      const parts = parseMultipartByteRanges(body, contentType);
+      return selectMultipartByteRanges(parts, ranges);
+    }
+  } catch {
+    // Cross-origin servers may reject non-safelisted multi-range headers.
+    // Exact single-range reads below remain universally compatible.
+  }
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+    // Cancellation is best-effort for response-like custom transports.
+  }
+  return Promise.all(ranges.map(range => fetchRange(url, range.offset, range.length)));
 }
 
 function selectedFacetCodes(manifest, field, selected) {
@@ -1880,17 +1923,32 @@ export async function createSearch(options = {}) {
       });
     }
 
-    await Promise.all(rangeGroups(pending, "docPointers").map(async (group) => {
+    const groupsByPack = new Map();
+    for (const group of rangeGroups(pending, "docPointers")) {
+      if (!groupsByPack.has(group.pack)) groupsByPack.set(group.pack, []);
+      groupsByPack.get(group.pack).push(group);
+    }
+    await Promise.all([...groupsByPack].map(async ([pack, groups]) => {
       try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
-        for (const item of group.items) {
-          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
-          item.resolve(pointer);
+        const buffers = await fetchRanges(
+          new URL(pack, baseUrl),
+          groups.map(group => ({ offset: group.start, length: group.end - group.start })),
+          options
+        );
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+          const group = groups[groupIndex];
+          const buffer = buffers[groupIndex];
+          for (const item of group.items) {
+            const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
+            item.resolve(pointer);
+          }
         }
       } catch (error) {
-        for (const item of group.items) {
-          docPointerCache.delete(item.index);
-          item.reject(error);
+        for (const group of groups) {
+          for (const item of group.items) {
+            docPointerCache.delete(item.index);
+            item.reject(error);
+          }
         }
         throw error;
       }

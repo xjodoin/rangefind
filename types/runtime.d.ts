@@ -150,11 +150,18 @@ export interface CreateSearchOptions {
   maxPageSize?: number;
   verifyChecksums?: boolean;
   trace?: boolean;
+  /** Batch scattered byte ranges from one object into multipart HTTP requests. */
+  multiRangeRequests?: boolean;
+  /** Maximum byte ranges per multipart request (default 32, clamped to 2–64). */
+  multiRangeMaxRanges?: number;
   [key: string]: unknown;
 }
 
 export function createSearch(options?: CreateSearchOptions): Promise<SearchEngine>;
-export function setFetchImplementation(fn: typeof fetch): void;
+export function setFetchImplementation(
+  fn: typeof fetch,
+  capabilities?: { multiRange?: boolean }
+): void;
 /**
  * Install a gzip inflate implementation for hosts without DecompressionStream
  * (React Native/Hermes, QuickJS, JavaScriptCore). Receives the compressed

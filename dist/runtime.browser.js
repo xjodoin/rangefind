@@ -4116,6 +4116,60 @@ function groupRanges(items, options = RANGE_MERGE_GAP_BYTES) {
   return groups;
 }
 
+// src/http_ranges.js
+var latin1Decoder = new TextDecoder("iso-8859-1");
+function multipartBoundary(contentType) {
+  const match = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;\s]+))/iu.exec(String(contentType || ""));
+  return match?.[1] || match?.[2] || null;
+}
+function parseMultipartByteRanges(buffer, contentType) {
+  const boundary = multipartBoundary(contentType);
+  if (!boundary) throw new Error("Multipart byte-range response is missing its boundary.");
+  const bytes = new Uint8Array(buffer);
+  const text = latin1Decoder.decode(bytes);
+  const marker = `--${boundary}`;
+  const parts = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const markerOffset = text.indexOf(marker, cursor);
+    if (markerOffset < 0) break;
+    let headerOffset = markerOffset + marker.length;
+    if (text.startsWith("--", headerOffset)) break;
+    if (text.startsWith("\r\n", headerOffset)) headerOffset += 2;
+    else if (text.startsWith("\n", headerOffset)) headerOffset += 1;
+    const crlfSeparator = text.indexOf("\r\n\r\n", headerOffset);
+    const headerEnd = crlfSeparator >= 0 ? crlfSeparator : text.indexOf("\n\n", headerOffset);
+    const separatorBytes = crlfSeparator >= 0 ? 4 : 2;
+    if (headerEnd < 0) throw new Error("Multipart byte-range response has malformed headers.");
+    const headers = text.slice(headerOffset, headerEnd);
+    const range = /(?:^|\r?\n)content-range:\s*bytes\s+(\d+)-(\d+)\/(?:\d+|\*)/iu.exec(headers);
+    if (!range) throw new Error("Multipart byte-range part is missing Content-Range.");
+    const start = Number(range[1]);
+    const inclusiveEnd = Number(range[2]);
+    const bodyOffset = headerEnd + separatorBytes;
+    const length = inclusiveEnd - start + 1;
+    if (!Number.isSafeInteger(start) || length <= 0 || bodyOffset + length > bytes.byteLength) {
+      throw new Error("Multipart byte-range part has an invalid Content-Range.");
+    }
+    parts.push({
+      start,
+      end: inclusiveEnd + 1,
+      buffer: buffer.slice(bodyOffset, bodyOffset + length)
+    });
+    cursor = bodyOffset + length;
+  }
+  if (!parts.length) throw new Error("Multipart byte-range response contains no parts.");
+  return parts;
+}
+function selectMultipartByteRanges(parts, ranges) {
+  return ranges.map(({ offset, length }) => {
+    const end = offset + length;
+    const part = parts.find((item) => item.start <= offset && item.end >= end);
+    if (!part) throw new Error(`Multipart byte-range response omitted bytes ${offset}-${end - 1}.`);
+    return part.buffer.slice(offset - part.start, end - part.start);
+  });
+}
+
 // src/typo_main_index.js
 var COMMON_SUBSTITUTIONS = "aeiourstnlcmpdbfgvhqxyzkjw";
 var COMMON_SUFFIXES = [
@@ -4462,8 +4516,11 @@ async function inflateGzip(responseOrBuffer) {
   return new Response(stream.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 }
 var fetchImpl = (url, init) => fetch(url, init);
-function setFetchImplementation(fn) {
-  fetchImpl = typeof fn === "function" ? fn : ((url, init) => fetch(url, init));
+var fetchSupportsMultiRange = true;
+function setFetchImplementation(fn, capabilities = {}) {
+  const custom = typeof fn === "function";
+  fetchImpl = custom ? fn : ((url, init) => fetch(url, init));
+  fetchSupportsMultiRange = custom ? capabilities.multiRange === true : true;
 }
 async function fetchGzipArrayBuffer(url) {
   const bucket = traceBucketFromUrl(url);
@@ -4497,6 +4554,40 @@ async function fetchRange(url, offset, length) {
     }
     throw new Error(`Range request failed for ${url}`);
   }
+}
+async function fetchRanges(url, ranges, options = {}) {
+  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false) {
+    return Promise.all(ranges.map((range) => fetchRange(url, range.offset, range.length)));
+  }
+  const maxRanges = Math.max(2, Math.min(64, Math.floor(Number(options.multiRangeMaxRanges || 32))));
+  if (ranges.length > maxRanges) {
+    const buffers = [];
+    for (let offset = 0; offset < ranges.length; offset += maxRanges) {
+      buffers.push(...await fetchRanges(url, ranges.slice(offset, offset + maxRanges), options));
+    }
+    return buffers;
+  }
+  const bucket = traceBucketFromUrl(url);
+  let response;
+  try {
+    response = await traceFetch(bucket, () => fetchImpl(url, {
+      headers: {
+        Range: `bytes=${ranges.map((range) => `${range.offset}-${range.offset + range.length - 1}`).join(",")}`
+      }
+    }));
+    const contentType = response.headers?.get?.("content-type") || "";
+    if (response.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(contentType)) {
+      const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+      const parts = parseMultipartByteRanges(body, contentType);
+      return selectMultipartByteRanges(parts, ranges);
+    }
+  } catch {
+  }
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+  }
+  return Promise.all(ranges.map((range) => fetchRange(url, range.offset, range.length)));
 }
 function selectedFacetCodes(manifest, field, selected) {
   if (!selected?.size) return null;
@@ -5874,17 +5965,32 @@ async function createSearch(options = {}) {
         reject: rejectPointer
       });
     }
-    await Promise.all(rangeGroups(pending, "docPointers").map(async (group) => {
+    const groupsByPack = /* @__PURE__ */ new Map();
+    for (const group of rangeGroups(pending, "docPointers")) {
+      if (!groupsByPack.has(group.pack)) groupsByPack.set(group.pack, []);
+      groupsByPack.get(group.pack).push(group);
+    }
+    await Promise.all([...groupsByPack].map(async ([pack, groups]) => {
       try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
-        for (const item of group.items) {
-          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
-          item.resolve(pointer);
+        const buffers = await fetchRanges(
+          new URL(pack, baseUrl),
+          groups.map((group) => ({ offset: group.start, length: group.end - group.start })),
+          options
+        );
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+          const group = groups[groupIndex];
+          const buffer = buffers[groupIndex];
+          for (const item of group.items) {
+            const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
+            item.resolve(pointer);
+          }
         }
       } catch (error) {
-        for (const item of group.items) {
-          docPointerCache.delete(item.index);
-          item.reject(error);
+        for (const group of groups) {
+          for (const item of group.items) {
+            docPointerCache.delete(item.index);
+            item.reject(error);
+          }
         }
         throw error;
       }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.18 — 2026-07-27
+
+### Performance
+
+- Browser searches batch scattered dense document-pointer reads into exact
+  multipart HTTP range requests. Supporting origins such as Cloudflare/R2 can
+  return dozens of non-contiguous pointer records in one response without
+  overfetching the gaps; other transports retain the single-range fallback.
+
 ## 0.3.17 — 2026-07-26
 
 ### Performance

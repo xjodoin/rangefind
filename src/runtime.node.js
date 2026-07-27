@@ -299,7 +299,7 @@ function installRouter(options) {
       const href = String(url);
       if (href.startsWith("file:")) return fileFetch(router.pool, href, init, router.stats);
       return httpFetch(router, href, init, router.stats);
-    });
+    }, { multiRange: false });
   }
   if (options.diskCache !== false && !router.disk) {
     router.disk = new DiskCache(options.cacheDir || join(tmpdir(), "rangefind-node-cache"));

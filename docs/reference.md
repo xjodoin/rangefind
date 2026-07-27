@@ -511,6 +511,8 @@ loadFacetValues }`.
 | `verifyChecksums` | `true` | — | SHA-256 verify range objects before use. |
 | `maxPageSize` | `100` | 1–1000 | Hard cap on `size`. |
 | `trace` | `false` | — | Attach a per-query fetch/latency trace to `stats`. |
+| `multiRangeRequests` | `true` in browsers | — | Batch scattered pointer ranges from one object; automatically falls back when unsupported. |
+| `multiRangeMaxRanges` | `32` | 2–64 | Maximum byte ranges in one multipart request. |
 | `rangePlans` | see below | — | Per-lane range-coalescing budgets. |
 | `topKProofMaxK` | `100` | 1–1000 | Max k eligible for the exact top-k proof. |
 | `postingBlockFrontier` | `4` | 1–16 | Posting blocks decoded per frontier batch. |

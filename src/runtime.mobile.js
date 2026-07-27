@@ -242,7 +242,7 @@ function installRouter(options) {
       const href = String(url);
       if (href.startsWith("file:")) return fileFetch(router.io, href, init, router.stats);
       return httpFetch(router, href, init, router.stats);
-    });
+    }, { multiRange: false });
   }
   if (options.io) router.io = wrapIo(options.io);
   if (options.fetch) router.fetch = options.fetch;
