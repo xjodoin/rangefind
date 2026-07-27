@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.17 — 2026-07-26
+
+### Performance
+
+- Geo browse and text-distance lanes no longer fetch the large doc-values
+  manifest when selected facet and boolean filters are fully covered by
+  filter bitmaps.
+
 ## 0.3.16 — 2026-07-26
 
 ### Performance

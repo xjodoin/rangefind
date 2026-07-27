@@ -128,6 +128,10 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     assert.equal(nearbyCinema.results[0]?.name, "Testville Cinema");
     assert.ok(nearbyCinema.stats.trace.spans.some(span => span.name === "filterBitmaps.fetch"));
     assert.ok(!nearbyCinema.stats.trace.spans.some(span => span.name === "docValues.fetch"));
+    assert.equal(
+      nearbyCinema.stats.trace.spans.find(span => span.name === "manifest.fetch")?.count,
+      2
+    );
     assert.equal(built.config.output, "public/rangefind");
     assert.equal(built.seconds >= 0, true);
   } finally {
