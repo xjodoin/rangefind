@@ -56,6 +56,7 @@ import {
 import { decodeSegmentRows, parseSegmentTerms } from "./segment_codec.js";
 import { groupRanges, shardKey } from "./shards.js";
 import { parseMultipartByteRanges, selectMultipartByteRanges } from "./http_ranges.js";
+import { shardBboxDistanceMeters, shardBoxIntersects } from "./geo_shard_routing.js";
 import {
   bestMainIndexTypoDistance,
   isTypoCorrectionToken,
@@ -8508,31 +8509,6 @@ const TEXT_ROUTING_PREFIX_SEGMENT_LIMIT = 8;
 
 function shardRoutingBudget(meters) {
   return meters * SHARD_ROUTING_SLACK_RATIO + SHARD_ROUTING_SLACK_METERS;
-}
-
-function wrapLonDelta(a, b) {
-  return ((a - b + 540) % 360) - 180;
-}
-
-function shardBboxDistanceMeters(bbox, lat, lon) {
-  const clampedLat = Math.min(Math.max(lat, bbox[0]), bbox[2]);
-  let clampedLon = lon;
-  if (!(lon >= bbox[1] && lon <= bbox[3])) {
-    // Outside the range: snap to whichever edge is nearer around the globe.
-    clampedLon = Math.abs(wrapLonDelta(lon, bbox[1])) <= Math.abs(wrapLonDelta(lon, bbox[3])) ? bbox[1] : bbox[3];
-  }
-  return haversineMetersE7(latToE7(lat), lonToE7(lon), latToE7(clampedLat), lonToE7(clampedLon));
-}
-
-function shardBoxIntersects(bbox, box) {
-  const minLat = Math.min(Number(box.minLat), Number(box.maxLat));
-  const maxLat = Math.max(Number(box.minLat), Number(box.maxLat));
-  if (bbox[2] < minLat || bbox[0] > maxLat) return false;
-  const minLon = Number(box.minLon);
-  const maxLon = Number(box.maxLon);
-  if (minLon <= maxLon) return bbox[3] >= minLon && bbox[1] <= maxLon;
-  // Query box crossing the antimeridian: two longitude ranges.
-  return bbox[3] >= minLon || bbox[1] <= maxLon;
 }
 
 // Sharded indexes: the root manifest lists independently built shard indexes

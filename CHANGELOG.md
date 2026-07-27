@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.19 — 2026-07-27
+
+### Performance
+
+- Sharded geo routing supports wrapped coverage bounds across the
+  antimeridian. Dateline-spanning regions stay narrow instead of becoming
+  effectively global and joining unrelated nearby or viewport searches.
+
 ## 0.3.18 — 2026-07-27
 
 ### Performance
