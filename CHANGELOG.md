@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.16 — 2026-07-26
+
+### Performance
+
+- Filter bitmaps can now target selected values on high-cardinality facets
+  within an explicit memory budget. The OSM integration materializes its
+  curated `type` categories, so exact nearest-category searches use one small
+  bitmap range instead of hundreds of scattered doc-value requests.
+
 ## 0.3.15 — 2026-07-25
 
 ### Changed

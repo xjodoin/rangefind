@@ -1335,6 +1335,9 @@ function writeFilterBitmapIndex(out, config, total, codes, dicts) {
   const packWriter = createPackWriter(resolve(out, "filter-bitmaps", "packs"), config.filterBitmapPackBytes || config.packBytes);
   const fields = {};
   const maxFacetValues = Math.max(0, Number(config.filterBitmapMaxFacetValues ?? 64));
+  const maxBitmapBytes = Math.max(0, Number(config.filterBitmapMaxBytes ?? 256 * 1024 * 1024));
+  const bytesPerBitmap = Math.ceil(Math.max(0, total) / 8);
+  const maxBitmaps = bytesPerBitmap > 0 ? Math.floor(maxBitmapBytes / bytesPerBitmap) : 0;
 
   const writeBitmap = (field, value, bytes, count) => {
     if (!count) return null;
@@ -1359,23 +1362,47 @@ function writeFilterBitmapIndex(out, config, total, codes, dicts) {
 
   if (config.filterBitmaps !== false) {
     for (const facet of config.facets || []) {
-      const valueCount = dicts?.[facet.name]?.values?.length || 0;
-      if (!valueCount || valueCount > maxFacetValues) continue;
-      const bitmaps = Array.from({ length: valueCount }, () => createFilterBitmap(total));
-      const counts = new Array(valueCount).fill(0);
+      const dict = dicts?.[facet.name];
+      const values = dict?.values || [];
+      const valueCount = values.length;
+      if (!valueCount || !maxBitmaps) continue;
+      const explicit = Array.isArray(config.filterBitmapFacetValues?.[facet.name])
+        ? config.filterBitmapFacetValues[facet.name]
+        : [];
+      const explicitCodes = explicit
+        .map(value => dict.ids?.get(String(value)))
+        .filter(code => Number.isInteger(code) && code >= 0 && code < valueCount);
+      const explicitCodeSet = new Set(explicitCodes);
+      const candidates = valueCount <= maxFacetValues
+        ? values.map((value, code) => ({ code, count: Number(value?.n || 0), explicit: explicitCodeSet.has(code) }))
+        : explicitCodes.map(code => ({ code, count: Number(values[code]?.n || 0), explicit: true }));
+      candidates.sort((a, b) => (
+        Number(b.explicit) - Number(a.explicit)
+        || b.count - a.count
+        || a.code - b.code
+      ));
+      const selectedCodes = [...new Set(candidates.slice(0, maxBitmaps).map(item => item.code))];
+      if (!selectedCodes.length) continue;
+      const selected = new Map(selectedCodes.map(code => [code, {
+        bytes: createFilterBitmap(total),
+        count: 0
+      }]));
       for (let doc = 0; doc < total; doc++) {
         for (const code of facetCodesForBitmap(codeValue(codes, facet.name, doc))) {
-          if (code < 0 || code >= valueCount) continue;
-          setFilterBitmapBit(bitmaps[code], doc);
-          counts[code]++;
+          const bitmap = selected.get(code);
+          if (!bitmap) continue;
+          setFilterBitmapBit(bitmap.bytes, doc);
+          bitmap.count++;
         }
       }
-      const values = {};
-      for (let code = 0; code < valueCount; code++) {
-        const entry = writeBitmap(facet.name, String(code), bitmaps[code], counts[code]);
-        if (entry) values[String(code)] = entry;
+      const bitmapValues = {};
+      for (const [code, bitmap] of selected) {
+        const entry = writeBitmap(facet.name, String(code), bitmap.bytes, bitmap.count);
+        if (entry) bitmapValues[String(code)] = entry;
       }
-      if (Object.keys(values).length) fields[facet.name] = { name: facet.name, kind: "facet", values };
+      if (Object.keys(bitmapValues).length) {
+        fields[facet.name] = { name: facet.name, kind: "facet", values: bitmapValues };
+      }
     }
 
     for (const field of config.booleans || []) {
@@ -1419,6 +1446,7 @@ function writeFilterBitmapIndex(out, config, total, codes, dicts) {
     compression: "gzip-member",
     format: FILTER_BITMAP_FORMAT,
     max_facet_values: maxFacetValues,
+    max_bitmap_bytes: maxBitmapBytes,
     fields,
     packs: packWriter.packs,
     pack_table: packTable(packWriter.packs),
@@ -4375,6 +4403,7 @@ export async function build({ configPath, update = false, compact = false }) {
       compression: filterBitmaps.compression,
       format: filterBitmaps.format,
       max_facet_values: filterBitmaps.max_facet_values,
+      max_bitmap_bytes: filterBitmaps.max_bitmap_bytes,
       fields: filterBitmaps.fields,
       packs: filterBitmaps.packs.length,
       pack_table: filterBitmaps.pack_table

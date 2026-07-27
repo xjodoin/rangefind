@@ -1,3 +1,5 @@
+import { OSM_CANONICAL_TYPES } from "./category_lexicon.js";
+
 export const OSM_INTEGRATION_SCHEMA_VERSION = 1;
 
 export const OSM_DISPLAY_FIELDS = Object.freeze([
@@ -77,6 +79,11 @@ export function createOsmIndexConfig(options = {}) {
       { name: "category", path: "category" },
       { name: "type", path: "type" }
     ],
+    // `type` is high-cardinality, so the generic bitmap builder would omit
+    // it. Materialize only the curated query categories: nearest-category
+    // searches then verify exact types with one tiny bitmap range instead of
+    // hundreds of scattered doc-value chunks.
+    filterBitmapFacetValues: { type: [...OSM_CANONICAL_TYPES] },
     numbers: [{ name: "population", path: "population", type: "int" }],
     geo: [{ name: "location", latPath: "geo_lat", lonPath: "geo_lon" }],
     suggest: [

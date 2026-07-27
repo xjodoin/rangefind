@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { gunzipSync } from "node:zlib";
 import {
   OSM_DISPLAY_FIELDS,
   OSM_INTEGRATION_SCHEMA_VERSION,
@@ -27,6 +28,7 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
   assert.deepEqual(config.geo, [{ name: "location", latPath: "geo_lat", lonPath: "geo_lon" }]);
   assert.deepEqual(config.display, [...OSM_DISPLAY_FIELDS]);
   assert.deepEqual(config.authority.map(field => field.name), ["address", "address_interpolation", "postcode"]);
+  assert.ok(config.filterBitmapFacetValues.type.includes("cinema"));
   assert.equal(config.buildProgressLogMs, 0);
 });
 
@@ -71,7 +73,7 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
   const root = await mkdtemp(join(tmpdir(), "rangefind-osm-build-"));
   try {
     await mkdir(join(root, "data"), { recursive: true });
-    await writeFile(join(root, "data", "osm-places.jsonl"), `${JSON.stringify({
+    await writeFile(join(root, "data", "osm-places.jsonl"), [{
       id: "node/1",
       name: "Testville",
       search_name: "Testville",
@@ -82,19 +84,50 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       lon: -73.6,
       geo_lat: 45.5,
       geo_lon: -73.6
-    })}\n`);
+    }, {
+      id: "node/2",
+      name: "Testville Cinema",
+      search_name: "Testville Cinema",
+      body: "cinema amenity",
+      category: "amenity",
+      type: "cinema",
+      lat: 45.51,
+      lon: -73.61,
+      geo_lat: 45.51,
+      geo_lon: -73.61
+    }].map(doc => JSON.stringify(doc)).join("\n"));
     const built = await buildOsmIndex({
       root,
       region: "luxembourg",
       rqa: false,
       workerCount: 1,
       buildProgressLogMs: 0,
+      config: { filterBitmapMaxFacetValues: 1 },
       runtimeBundlePath: join(root, "missing-runtime.js"),
       osmBundlePath: join(root, "missing-osm.js")
     });
     const manifest = JSON.parse(await readFile(join(root, "public", "rangefind", "manifest.json"), "utf8"));
-    assert.equal(manifest.total, 1);
+    const filterBitmaps = JSON.parse(gunzipSync(
+      await readFile(join(root, "public", "rangefind", "filter-bitmaps", "manifest.json.gz"))
+    ));
+    assert.equal(manifest.total, 2);
     assert.equal(manifest.features.geo, true);
+    // High-cardinality facets skip blanket bitmap generation, but the OSM
+    // category vocabulary still materializes its explicitly selected types.
+    assert.equal(Object.keys(filterBitmaps.fields.type.values).length, 1);
+    const engine = await createNodeSearch({ source: join(root, "public", "rangefind") });
+    const nearbyCinema = await engine.search({
+      size: 1,
+      filters: { facets: { type: ["cinema"] } },
+      geo: {
+        near: { lat: 45.5, lon: -73.6, radiusMeters: 5000 },
+        sort: "distance"
+      },
+      trace: true
+    });
+    assert.equal(nearbyCinema.results[0]?.name, "Testville Cinema");
+    assert.ok(nearbyCinema.stats.trace.spans.some(span => span.name === "filterBitmaps.fetch"));
+    assert.ok(!nearbyCinema.stats.trace.spans.some(span => span.name === "docValues.fetch"));
     assert.equal(built.config.output, "public/rangefind");
     assert.equal(built.seconds >= 0, true);
   } finally {

@@ -15,6 +15,8 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.docValueChunkSize, 2048);
   assert.equal(config.docValueLookupChunkSize, 2048);
   assert.equal(config.filterBitmapMaxFacetValues, 64);
+  assert.equal(config.filterBitmapFacetValues, null);
+  assert.equal(config.filterBitmapMaxBytes, 256 * 1024 * 1024);
   assert.equal(config.directorySortChunkEntries, 16384);
   assert.equal(config.builderWorkerCount, 1);
   assert.equal(config.partitionReducerWorkers, 0);

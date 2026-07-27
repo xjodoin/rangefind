@@ -24,6 +24,8 @@ export const DEFAULTS = {
   docValueLookupChunkSize: 2048,
   filterBitmaps: true,
   filterBitmapMaxFacetValues: 64,
+  filterBitmapFacetValues: null,
+  filterBitmapMaxBytes: 256 * 1024 * 1024,
   filterBitmapPackBytes: 4 * 1024 * 1024,
   baseShardDepth: 3,
   maxShardDepth: 5,
