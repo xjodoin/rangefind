@@ -42,6 +42,7 @@ export const OSM_CANONICAL_TYPES = Object.freeze([
   // transport
   "fuel", "charging_station", "parking", "bicycle_parking", "car_wash",
   "car_rental", "bicycle_rental", "bus_station", "ferry_terminal", "taxi",
+  "aerodrome",
   // shops — food
   "supermarket", "convenience", "bakery", "butcher", "greengrocer",
   "seafood", "deli", "cheese", "chocolate", "confectionery", "pastry",
@@ -112,6 +113,7 @@ export const OSM_TYPE_ALIASES = Object.freeze({
   fuel: ["essence", "station essence", "station-service", "gas station",
     "petrol station"],
   charging_station: ["borne de recharge", "ev charging"],
+  aerodrome: ["airport", "aéroport"],
   parking: ["stationnement"],
   car_wash: ["lave-auto"],
   bus_station: ["gare routière", "bus terminal"],
@@ -244,6 +246,15 @@ export function buildCategoryLexicon(typeValues = null) {
   if (typeValues && !Array.isArray(typeValues) && Array.isArray(typeValues.types)) {
     for (const [alias, type] of Object.entries(typeValues.aliases || {})) {
       addEntry(lexicon, alias, type);
+    }
+    // A newer runtime can safely teach an older embedded artifact aliases
+    // for type values that artifact already declares. Artifact mappings win;
+    // this only fills missing surfaces and does not invent categories absent
+    // from the indexed corpus.
+    const present = new Set(typeValues.types);
+    for (const [type, aliases] of Object.entries(OSM_TYPE_ALIASES)) {
+      if (!present.has(type)) continue;
+      for (const alias of aliases) addEntry(lexicon, alias, type);
     }
     for (const type of typeValues.types) addEntry(lexicon, typeQueryText(type), type);
     return lexicon;

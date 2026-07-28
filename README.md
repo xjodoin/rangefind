@@ -509,6 +509,7 @@ npm run test:all
 npm run bench:quality
 npm run bench:performance
 npm run bench:directories -- --index=/path/to/public/rangefind
+npm run bench:osm-maps
 ```
 
 The unit tests cover analyzer normalization, binary varint/fixed-width codecs,
@@ -523,6 +524,9 @@ structured filter/sort checks for facets, dates, booleans, and signed numbers.
 `bench:performance` reports query latency, HTTP request count, and transfer size.
 `bench:directories` compares global, naive prefix, and paged range-directory
 layouts against an existing built index.
+`bench:osm-maps` runs the weighted common map-search workload documented in
+[`docs/osm-maps-benchmark.md`](docs/osm-maps-benchmark.md), including locality,
+nearest-first, viewport, shard fan-out, and phone-budget checks.
 `docs/performance-research.md` tracks the top-k retrieval papers currently
 guiding format decisions.
 

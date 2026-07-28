@@ -144,6 +144,8 @@
     "bench:osm-geo": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",
     "bench:osm-address": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_address_bench.mjs --root=examples/osm-geo",
     "bench:osm-maps": "node scripts/osm_maps_bench.mjs",
+    "bench:osm-maps:full": "node scripts/osm_maps_bench.mjs --profile=full",
+    "bench:osm-maps:list": "node scripts/osm_maps_bench.mjs --list",
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",
     "bench:link-rank": "node scripts/link_rank_bench.mjs",

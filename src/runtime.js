@@ -687,6 +687,40 @@ export async function createSearch(options = {}) {
     return groupRanges(items, rangePlans[kind] || rangePlans.default);
   }
 
+  async function readRangeGroups(groups, urlForGroup, readGroup, rejectGroup = null) {
+    if (!groups.length) return;
+    const batches = new Map();
+    for (const group of groups) {
+      const url = urlForGroup(group);
+      const key = String(url);
+      if (!batches.has(key)) batches.set(key, { url, groups: [] });
+      batches.get(key).groups.push(group);
+    }
+    await Promise.all([...batches.values()].map(async ({ url, groups: batchGroups }) => {
+      let buffers;
+      try {
+        buffers = await fetchRanges(
+          url,
+          batchGroups.map(group => ({ offset: group.start, length: group.end - group.start })),
+          options
+        );
+      } catch (error) {
+        if (rejectGroup) {
+          for (const group of batchGroups) rejectGroup(group, error);
+        }
+        throw error;
+      }
+      await Promise.all(batchGroups.map(async (group, index) => {
+        try {
+          await readGroup(group, buffers[index]);
+        } catch (error) {
+          rejectGroup?.(group, error);
+          throw error;
+        }
+      }));
+    }));
+  }
+
   function createDirectoryState(directory) {
     if (!directory?.root || !directory?.pages) throw new Error("Rangefind index is missing a range directory.");
     return {
@@ -885,23 +919,24 @@ export async function createSearch(options = {}) {
         docValueCache.set(key, promise);
         pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
       }
-      await Promise.all(rangeGroups(pending).map(async (group) => {
-        try {
-          const compressed = await fetchRange(new URL(`doc-values/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+      await readRangeGroups(
+        rangeGroups(pending),
+        group => new URL(`doc-values/packs/${group.pack}`, baseUrl),
+        async (group, compressed) => {
           await Promise.all(group.items.map(async (item) => {
             const inflated = await inflateGroupItem(compressed, group.start, item, `doc-value ${item.field}:${item.index}`);
             const parsed = traceSpanSync("docValues.parse", () => parseDocValueChunk(inflated));
             docValueCache.set(docValueCacheKey(item.field, item.index, item.lookup), parsed);
             item.resolve(parsed);
           }));
-        } catch (error) {
+        },
+        (group, error) => {
           for (const item of group.items) {
             docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
             item.reject(error);
           }
-          throw error;
         }
-      }));
+      );
     });
   }
 
@@ -944,21 +979,22 @@ export async function createSearch(options = {}) {
       stats.fetched += pending.length;
       stats.groups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`doc-values/sorted-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(`doc-values/sorted-packs/${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc-value sort page ${item.field}:${item.pageIndex}`);
           item.resolve(traceSpanSync("docValueSorted.decode", () => decodeDocValueSortPage(inflated, { name: item.field })));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           docValueSortPageCache.delete(docValueSortPageCacheKey(item.field, item.pageIndex));
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     return Promise.all(wanted.map(pageIndexValue => docValueSortPageCache.get(docValueSortPageCacheKey(field, pageIndexValue))));
   }
@@ -1015,21 +1051,22 @@ export async function createSearch(options = {}) {
       stats.fetched += pending.length;
       stats.groups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`${packDir}/${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(`${packDir}/${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `${label} ${item.field}:${item.pageIndex}`);
           item.resolve(traceSpanSync(`${label}.decode`, () => decode(inflated)));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           cache.delete(cacheKey(item.field, item.pageIndex));
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     return Promise.all(wanted.map(index => cache.get(cacheKey(field, index))));
   }
@@ -1391,21 +1428,22 @@ export async function createSearch(options = {}) {
       pending.push({ shard, entry, resolve, reject });
     }
 
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`terms/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      rangeGroups(pending),
+      group => new URL(`terms/packs/${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `posting segment ${item.shard}`);
           item.resolve(traceSpanSync("terms.parse", () => parsePostingSegment(inflated, manifest)));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           shardCache.delete(item.shard);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     const out = new Map();
     await Promise.all(wanted.map(async (shard) => {
@@ -1435,21 +1473,22 @@ export async function createSearch(options = {}) {
       pending.push({ shard, entry, resolve: resolveAuthority, reject: rejectAuthority });
     }
 
-    await Promise.all(rangeGroups(pending, "authority").map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`authority/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      rangeGroups(pending, "authority"),
+      group => new URL(`authority/packs/${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `authority shard ${item.shard}`);
           item.resolve(traceSpanSync("authority.parse", () => parseAuthorityShard(inflated)));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           authorityShardCache.delete(item.shard);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     const out = new Map();
     await Promise.all(wanted.map(async (shard) => {
@@ -1928,36 +1967,22 @@ export async function createSearch(options = {}) {
       });
     }
 
-    const groupsByPack = new Map();
-    for (const group of rangeGroups(pending, "docPointers")) {
-      if (!groupsByPack.has(group.pack)) groupsByPack.set(group.pack, []);
-      groupsByPack.get(group.pack).push(group);
-    }
-    await Promise.all([...groupsByPack].map(async ([pack, groups]) => {
-      try {
-        const buffers = await fetchRanges(
-          new URL(pack, baseUrl),
-          groups.map(group => ({ offset: group.start, length: group.end - group.start })),
-          options
-        );
-        for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
-          const group = groups[groupIndex];
-          const buffer = buffers[groupIndex];
-          for (const item of group.items) {
-            const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
-            item.resolve(pointer);
-          }
+    await readRangeGroups(
+      rangeGroups(pending, "docPointers"),
+      group => new URL(group.pack, baseUrl),
+      (group, buffer) => {
+        for (const item of group.items) {
+          const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, docPointers, docPointers.pack_table || []);
+          item.resolve(pointer);
         }
-      } catch (error) {
-        for (const group of groups) {
-          for (const item of group.items) {
-            docPointerCache.delete(item.index);
-            item.reject(error);
-          }
+      },
+      (group, error) => {
+        for (const item of group.items) {
+          docPointerCache.delete(item.index);
+          item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
   }
 
   async function loadPackedDocs(indexes) {
@@ -1980,21 +2005,22 @@ export async function createSearch(options = {}) {
       pending.push({ index, entry, resolve: resolveDoc, reject: rejectDoc });
     }
 
-    await Promise.all(rangeGroups(pending, "docs").map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`docs/packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      rangeGroups(pending, "docs"),
+      group => new URL(`docs/packs/${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc ${item.index}`);
           item.resolve(traceSpanSync("docs.parse", () => JSON.parse(textDecoder.decode(new Uint8Array(inflated)))));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           packedDocCache.delete(item.index);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     return Promise.all(wanted.map(index => packedDocCache.get(index)));
   }
@@ -2068,21 +2094,22 @@ export async function createSearch(options = {}) {
       });
     }
 
-    await Promise.all(rangeGroups(pending, "docPagePointers").map(async (group) => {
-      try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      rangeGroups(pending, "docPagePointers"),
+      group => new URL(group.pack, baseUrl),
+      (group, buffer) => {
         for (const item of group.items) {
           const pointer = decodeDocPagePointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
           item.resolve(pointer);
         }
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           docPagePointerCache.delete(item.pageIndex);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
   }
 
   async function loadDocPages(indexes, plan) {
@@ -2102,21 +2129,22 @@ export async function createSearch(options = {}) {
       pending.push({ pageIndex: pageIndexValue, entry, resolve: resolvePage, reject: rejectPage });
     }
 
-    await Promise.all(rangeGroups(pending, "docPages").map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`docs/page-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      rangeGroups(pending, "docPages"),
+      group => new URL(`docs/page-packs/${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `doc page ${item.pageIndex}`);
           item.resolve(traceSpanSync("docPages.decode", () => decodeDocPagePayload(inflated, item.pageIndex)));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           docPageCache.delete(item.pageIndex);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     return Promise.all(indexes.map(async (index) => {
       const pageIndexValue = docPageIndex(index);
@@ -2216,9 +2244,10 @@ export async function createSearch(options = {}) {
       for (const [basePath, items] of pendingByBasePath) {
         for (const group of rangeGroups(items, rangePlan)) groups.push({ ...group, basePath });
       }
-      await Promise.all(groups.map(async (group) => {
-        try {
-          const compressed = await fetchRange(new URL(`${group.basePath.replace(/\/?$/u, "/")}${group.pack}`, baseUrl), group.start, group.end - group.start);
+      await readRangeGroups(
+        groups,
+        group => new URL(`${group.basePath.replace(/\/?$/u, "/")}${group.pack}`, baseUrl),
+        async (group, compressed) => {
           await Promise.all(group.items.map(async (item) => {
             const inflated = await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`);
             item.resolve(traceSpanSync("postingBlocks.decode", () => decodePostingBytes(
@@ -2226,14 +2255,14 @@ export async function createSearch(options = {}) {
               item.owner.blocks?.[item.blockIndex]
             )));
           }));
-        } catch (error) {
+        },
+        (group, error) => {
           for (const item of group.items) {
             item.owner.blockPostings.delete(item.blockIndex);
             item.reject(error);
           }
-          throw error;
         }
-      }));
+      );
 
       return { wanted, fetched: pending.length, groups: groups.length };
     });
@@ -2266,20 +2295,21 @@ export async function createSearch(options = {}) {
       }
 
       const groups = rangeGroups(pending, rangePlan);
-      await Promise.all(groups.map(async (group) => {
-        try {
-          const compressed = await fetchRange(new URL(`terms/block-packs/${group.pack}`, baseUrl), group.start, group.end - group.start);
+      await readRangeGroups(
+        groups,
+        group => new URL(`terms/block-packs/${group.pack}`, baseUrl),
+        async (group, compressed) => {
           await Promise.all(group.items.map(async (item) => {
             item.resolve(await inflateGroupItem(compressed, group.start, item, `posting block ${item.blockIndex}`));
           }));
-        } catch (error) {
+        },
+        (group, error) => {
           for (const item of group.items) {
             item.owner.blockBytes.delete(item.blockIndex);
             item.reject(error);
           }
-          throw error;
         }
-      }));
+      );
 
       return { wanted, fetched: pending.length, groups: groups.length };
     });
@@ -2418,7 +2448,13 @@ export async function createSearch(options = {}) {
       }
     }
     if (geo.box) {
-      if (plan.near) throw new Error("Rangefind: geo supports near or box, not both.");
+      // A center without a radius can order an explicit viewport by distance:
+      // `box` remains the exact acceptance predicate while `near` supplies the
+      // lower-bound traversal key. A radius plus a box would require
+      // intersecting two independent spatial predicates and remains rejected.
+      if (plan.near?.radiusMeters != null) {
+        throw new Error("Rangefind: geo supports a radius or box, not both.");
+      }
       plan.boxes = normalizeGeoBoxE7(geo.box);
     }
     if (geo.boost) {
@@ -3477,9 +3513,10 @@ export async function createSearch(options = {}) {
 
     const parseManifest = sortReplicaPostingManifest(replica);
     const blockBasePath = sortReplicaBlockPath(replica);
-    await Promise.all(rangeGroups(pending).map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`${sortReplicaTermsPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      rangeGroups(pending),
+      group => new URL(`${sortReplicaTermsPath(replica)}${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica segment ${replica.id}:${item.shard}`);
           const parsed = traceSpanSync("sortReplicas.parseTerms", () => parsePostingSegment(inflated, parseManifest));
@@ -3489,14 +3526,14 @@ export async function createSearch(options = {}) {
           }
           item.resolve(parsed);
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           sortReplicaShardCache.delete(item.cacheKey);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     const out = new Map();
     await Promise.all(wanted.map(async (shard) => {
@@ -3578,21 +3615,22 @@ export async function createSearch(options = {}) {
       stats.rankChunksFetched += pending.length;
       stats.rankChunkFetchGroups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`${sortReplicaRankPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(`${sortReplicaRankPath(replica)}${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica rank ${replica.id}:${item.chunkIndex}`);
           item.resolve(traceSpanSync("sortReplicas.decodeRankMap", () => decodeSortReplicaRankChunk(inflated, item.entry)));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           sortReplicaRankCache.delete(item.key);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
   }
 
   async function sortReplicaRankRows(replica, ranks, stats = null) {
@@ -3661,21 +3699,22 @@ export async function createSearch(options = {}) {
       stats.docPackPointerFetches += pending.length;
       stats.docPackPointerFetchGroups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(group.pack, baseUrl),
+      (group, buffer) => {
         for (const item of group.items) {
           const pointer = decodeDocPointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
           item.resolve(pointer);
         }
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           sortReplicaDocPointerCache.delete(item.key);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
     return wanted;
   }
 
@@ -3717,21 +3756,22 @@ export async function createSearch(options = {}) {
       stats.docPackFetches += pending.length;
       stats.docPackFetchGroups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`${sortReplicaDocPackPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(`${sortReplicaDocPackPath(replica)}${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica doc ${replica.id}:${item.rank}`);
           item.resolve(traceSpanSync("sortReplicas.parseDoc", () => JSON.parse(textDecoder.decode(new Uint8Array(inflated)))));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           sortReplicaPackedDocCache.delete(item.key);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
     const out = new Map();
     for (const rank of wanted) {
       const doc = await sortReplicaPackedDocCache.get(sortReplicaDocCacheKey(replica, rank));
@@ -3794,21 +3834,22 @@ export async function createSearch(options = {}) {
       stats.docPagePointerPagesFetched += pending.length;
       stats.docPagePointerFetchGroups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const buffer = await fetchRange(new URL(group.pack, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(group.pack, baseUrl),
+      (group, buffer) => {
         for (const item of group.items) {
           const pointer = decodeDocPagePointerRecord(buffer, item.entry.offset - group.start, pointerMeta, pointerMeta.pack_table || []);
           item.resolve(pointer);
         }
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           sortReplicaDocPagePointerCache.delete(item.key);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
   }
 
   function sortReplicaDocPageCacheKey(replica, pageIndex) {
@@ -3862,21 +3903,22 @@ export async function createSearch(options = {}) {
       stats.docPagesFetched += pending.length;
       stats.docPageFetchGroups += groups.length;
     }
-    await Promise.all(groups.map(async (group) => {
-      try {
-        const compressed = await fetchRange(new URL(`${sortReplicaDocPagePackPath(replica)}${group.pack}`, baseUrl), group.start, group.end - group.start);
+    await readRangeGroups(
+      groups,
+      group => new URL(`${sortReplicaDocPagePackPath(replica)}${group.pack}`, baseUrl),
+      async (group, compressed) => {
         await Promise.all(group.items.map(async (item) => {
           const inflated = await inflateGroupItem(compressed, group.start, item, `sort replica doc page ${replica.id}:${item.pageIndex}`);
           item.resolve(traceSpanSync("sortReplicas.decodeDocPage", () => decodeDocPageColumns(inflated, pages.fields || [], item.pageIndex * pageSize)));
         }));
-      } catch (error) {
+      },
+      (group, error) => {
         for (const item of group.items) {
           sortReplicaDocPageCache.delete(item.key);
           item.reject(error);
         }
-        throw error;
       }
-    }));
+    );
 
     const out = new Map();
     for (const rank of wantedRanks) {
@@ -7196,16 +7238,20 @@ export async function createSearch(options = {}) {
       const groups = rangeGroups(items, "vectorRefine");
       refineGroups = groups.length;
       const scored = [];
-      await Promise.all(groups.map(async (group) => {
-        const bytes = new Uint8Array(await fetchRange(new URL(`${meta.refine_pack_dir}/${group.pack}`, baseUrl), group.start, group.end - group.start));
-        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-        const codes = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-        for (const item of group.items) {
-          const at = item.entry.offset - group.start;
-          const scale = view.getFloat32(at, true);
-          scored.push([item.doc, dotInt8(query, codes, at + 4, root.dims, scale)]);
+      await readRangeGroups(
+        groups,
+        group => new URL(`${meta.refine_pack_dir}/${group.pack}`, baseUrl),
+        (group, buffer) => {
+          const bytes = new Uint8Array(buffer);
+          const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          const codes = new Int8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+          for (const item of group.items) {
+            const at = item.entry.offset - group.start;
+            const scale = view.getFloat32(at, true);
+            scored.push([item.doc, dotInt8(query, codes, at + 4, root.dims, scale)]);
+          }
         }
-      }));
+      );
       scored.sort((a, b) => b[1] - a[1] || a[0] - b[0]);
       rows = scored.slice(0, k);
     }

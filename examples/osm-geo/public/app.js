@@ -553,7 +553,9 @@ async function runSearch({ fit = false } = {}) {
     if (token !== searchToken) return;
     const resolvedLocation = response.stats?.plannerLane === "osmCategoryLocality"
       || response.stats?.plannerLane === "osmLocalityExact"
-      || response.stats?.plannerLane === "osmStreetLocality";
+      || response.stats?.plannerLane === "osmStreetLocality"
+      || response.stats?.plannerLane === "osmIntersectionLocality"
+      || response.stats?.plannerLane === "osmCoordinates";
     if (resolvedLocation) areaToggle.checked = false;
     // A view-anchored result (not a named place): panning re-runs it.
     anchoredQueryActive = Boolean(anchor) && !resolvedLocation;
@@ -569,7 +571,11 @@ async function runSearch({ fit = false } = {}) {
       : "";
     const directText = hintedShards?.length ? " · direct suggestion route" : "";
     const nearLane = response.stats?.plannerLane === "osmCategoryNearby"
-      || response.stats?.plannerLane === "osmNearText";
+      || response.stats?.plannerLane === "osmNearText"
+      || response.stats?.plannerLane === "osmNearExactText"
+      || response.stats?.plannerLane === "osmNearFuzzyText"
+      || response.stats?.plannerLane === "osmNearExactGeo"
+      || response.stats?.plannerLane === "osmNearFuzzyGeo";
     const nearText = nearLane && anchor ? ` · near ${anchor.source}` : "";
     const modeText = queryOverride?.mode ? ` · ${queryOverride.mode}` : "";
     const shown = Math.min(response.results.length, resultLimit());
@@ -632,16 +638,6 @@ function chooseSuggestion(suggestion) {
   runSearch({ fit: true });
 }
 
-function adoptExactSuggestionHint() {
-  const query = queryInput.value.trim();
-  if (!query || selectedSuggestionHint?.query === query) return;
-  const exact = visibleSuggestions.find(item => (
-    item.shards?.length
-    && item.text.localeCompare(query, undefined, { sensitivity: "base" }) === 0
-  ));
-  if (exact) selectedSuggestionHint = { query, shards: [...exact.shards] };
-}
-
 function suggestionRegionLabel(shards) {
   const labels = (shards || []).map(shard => String(shard)
     .replaceAll("-", " ")
@@ -666,7 +662,10 @@ async function showSuggestions() {
     hideSuggestions();
     return;
   }
-  const cacheKey = q.toLocaleLowerCase();
+  const anchor = searchAnchor();
+  const cacheKey = `${q.toLocaleLowerCase()}\0${anchor
+    ? `${anchor.lat.toFixed(1)},${anchor.lon.toFixed(1)}`
+    : ""}`;
   const cached = suggestionCache.get(cacheKey);
   if (cached) {
     suggestionCache.delete(cacheKey);
@@ -680,7 +679,11 @@ async function showSuggestions() {
   }
   suggestInFlight = true;
   try {
-    const response = await suggestOsmQuery(engine, { q, size: 8 });
+    const response = await suggestOsmQuery(engine, {
+      q,
+      size: 8,
+      ...(anchor ? { near: { lat: anchor.lat, lon: anchor.lon } } : {})
+    });
     if (token !== suggestToken || suggestionsSuppressed) return;
     suggestionCache.set(cacheKey, response);
     if (suggestionCache.size > SUGGEST_CACHE_LIMIT) {
@@ -782,7 +785,6 @@ queryInput.addEventListener("keydown", event => {
     if (activeSuggestion >= 0 && options[activeSuggestion]) {
       chooseSuggestion(visibleSuggestions[activeSuggestion] || options[activeSuggestion].querySelector("span")?.textContent || "");
     } else {
-      adoptExactSuggestionHint();
       cancelSuggestions();
       runSearch({ fit: !areaToggle.checked });
     }
@@ -804,7 +806,6 @@ clearButton.addEventListener("click", () => {
 });
 
 searchButton.addEventListener("click", () => {
-  adoptExactSuggestionHint();
   cancelSuggestions();
   runSearch({ fit: !areaToggle.checked });
 });

@@ -10,7 +10,7 @@ import { parseDocPagePointerPage } from "../src/doc_pages.js";
 import { parseDocPointerPage } from "../src/doc_pointers.js";
 import { createSearch } from "../src/runtime.js";
 
-async function serveStatic(root) {
+async function serveStatic(root, { multiRange = false } = {}) {
   const requests = [];
   const server = createServer(async (request, response) => {
     try {
@@ -22,6 +22,30 @@ async function serveStatic(root) {
         return;
       }
       const data = await readFile(path);
+      const multi = multiRange && request.headers.range?.match(/^bytes=(\d+-\d+(?:,\d+-\d+)+)$/u);
+      if (multi) {
+        const boundary = "rangefind-runtime-test";
+        const chunks = [];
+        for (const value of multi[1].split(",")) {
+          const [startText, endText] = value.split("-");
+          const start = Number(startText);
+          const end = Math.min(Number(endText), data.length - 1);
+          chunks.push(Buffer.from(
+            `--${boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes ${start}-${end}/${data.length}\r\n\r\n`
+          ));
+          chunks.push(data.subarray(start, end + 1));
+          chunks.push(Buffer.from("\r\n"));
+        }
+        chunks.push(Buffer.from(`--${boundary}--\r\n`));
+        const body = Buffer.concat(chunks);
+        response.writeHead(206, {
+          "Accept-Ranges": "bytes",
+          "Content-Length": String(body.length),
+          "Content-Type": `multipart/byteranges; boundary=${boundary}`
+        });
+        response.end(body);
+        return;
+      }
       const range = request.headers.range?.match(/^bytes=(\d+)-(\d+)$/);
       if (range) {
         const start = Number(range[1]);
@@ -397,7 +421,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(manifest.search.typo.mode, "main-index");
   assert.equal((await readdir(output)).includes("typo"), false);
 
-  const server = await serveStatic(join(root, "public"));
+  const server = await serveStatic(join(root, "public"), { multiRange: true });
   t.after(() => server.close());
   const search = await createSearch({ baseUrl: server.baseUrl });
   assert.ok(server.requests.some(request => request.pathname.endsWith("/manifest.min.json")));
@@ -434,6 +458,45 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.equal(results.stats.docPayloadLane, "docPages");
   assert.equal(results.stats.docPayloadAdaptive, true);
   assert.equal(results.stats.docPayloadForced, false);
+
+  const multipartStart = server.requests.length;
+  const multipartSearch = await createSearch({
+    baseUrl: server.baseUrl,
+    textDocPageHydration: false,
+    rangePlans: {
+      docPointers: { mergeGapBytes: 0, maxMergedBytes: 1 },
+      docs: { mergeGapBytes: 0, maxMergedBytes: 1 }
+    }
+  });
+  const multipartResults = await multipartSearch.search({ q: "search", size: 8, rerank: false });
+  assert.ok(multipartResults.results.length >= 3);
+  assert.ok(
+    server.requests.slice(multipartStart).some(request => (
+      request.pathname.includes("/docs/packs/")
+      && request.range.includes(",")
+    )),
+    "expected separated packed-document groups to share one multipart request"
+  );
+
+  const fallbackStart = server.requests.length;
+  const singleRangeSearch = await createSearch({
+    baseUrl: server.baseUrl,
+    multiRangeRequests: false,
+    textDocPageHydration: false,
+    rangePlans: {
+      docPointers: { mergeGapBytes: 0, maxMergedBytes: 1 },
+      docs: { mergeGapBytes: 0, maxMergedBytes: 1 }
+    }
+  });
+  const singleRangeResults = await singleRangeSearch.search({ q: "search", size: 8, rerank: false });
+  assert.deepEqual(
+    singleRangeResults.results.map(result => result.id),
+    multipartResults.results.map(result => result.id)
+  );
+  const fallbackDocRequests = server.requests.slice(fallbackStart)
+    .filter(request => request.pathname.includes("/docs/packs/"));
+  assert.ok(fallbackDocRequests.length >= 2);
+  assert.ok(fallbackDocRequests.every(request => !request.range.includes(",")));
 
   const exactResults = await search.search({ q: "static range search", size: 3, exact: true });
   assert.deepEqual(

@@ -403,6 +403,32 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
     assert.equal(nearestResponse.stats.exact, true);
     assert.ok(nearestResponse.stats.geoLeavesVisited < nearestResponse.stats.geoCandidateLeaves);
 
+    // An explicit viewport can be ordered from its center without admitting
+    // results outside the box. This is the map-search shape used for exact
+    // brands: the box is the hard predicate and near only supplies ordering.
+    const viewportNearest = await engine.search({
+      q: "bakery",
+      geo: { box, near: center, sort: "distance" },
+      size: 10
+    });
+    const viewportNearestExpected = boxExpected
+      .filter(point => point.category === "bakery")
+      .map(point => ({
+        title: point.title,
+        dist: haversineMetersE7(centerE7.latE7, centerE7.lonE7, point.latE7, point.lonE7)
+      }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 10);
+    assert.deepEqual(
+      viewportNearest.results.map(result => result.title),
+      viewportNearestExpected.map(item => item.title)
+    );
+    assert.deepEqual(
+      viewportNearest.results.map(result => result.distanceMeters),
+      viewportNearestExpected.map(item => Math.round(item.dist * 10) / 10)
+    );
+    assert.ok(viewportNearest.results.every(result => boxExpected.some(point => point.title === result.title)));
+
     // Nearest with facet + numeric filters.
     const filteredNearest = await engine.search({
       q: "",

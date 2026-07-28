@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  parseCoordinateIntent,
   parseNearbyCategoryIntent,
   parseOsmQueryIntent,
   searchOsmQuery,
@@ -11,6 +12,185 @@ import {
   buildCategoryLexiconArtifact,
   lookupCategory
 } from "../src/integrations/osm/category_lexicon.js";
+
+test("OSM coordinate intents open decimal latitude and longitude without an index fan-out", async () => {
+  assert.deepEqual(parseCoordinateIntent("45.5019, -73.5674"), { lat: 45.5019, lon: -73.5674 });
+  assert.deepEqual(parseCoordinateIntent("45.5019 -73.5674"), { lat: 45.5019, lon: -73.5674 });
+  assert.equal(parseCoordinateIntent("91, -73"), null);
+  assert.equal(parseCoordinateIntent("45.5, -181"), null);
+  assert.equal(parseCoordinateIntent("845 Sherbrooke"), null);
+
+  const engine = {
+    async search() {
+      throw new Error("coordinate intent must not query the index");
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "45.5019, -73.5674", size: 18 });
+  assert.equal(response.stats.plannerLane, "osmCoordinates");
+  assert.equal(response.stats.shardsQueried, 0);
+  assert.equal(response.results[0].type, "coordinate");
+  assert.equal(response.results[0].lat, 45.5019);
+  assert.equal(response.results[0].lon, -73.5674);
+});
+
+test("OSM autocomplete routes through the shard covering the current map", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      shards: [
+        { id: "ontario", bbox: [41.6, -95.2, 56.9, -74.3] },
+        { id: "quebec", bbox: [45, -79.9, 62.7, -57] }
+      ]
+    },
+    async suggest(params) {
+      calls.push(params);
+      return { suggestions: [{ text: "845 Rue Sherbrooke Ouest, Montréal" }], stats: {} };
+    }
+  };
+  const response = await suggestOsmQuery(engine, {
+    q: "845 sher",
+    near: { lat: 45.5019, lon: -73.5674 },
+    size: 8
+  });
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.deepEqual(response.stats.osmSuggestCoverageShards, ["quebec"]);
+});
+
+test("OSM autocomplete composes a category with matching locality suggestions", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      category_lexicon: { types: ["cinema"], aliases: {} },
+      shards: [{ id: "quebec", bbox: [45, -79.9, 62.7, -57] }]
+    },
+    async suggest(params) {
+      calls.push(params);
+      return {
+        suggestions: [{ text: "Laval", weight: 400000, shards: ["quebec"] }],
+        stats: {}
+      };
+    }
+  };
+  const response = await suggestOsmQuery(engine, {
+    q: "cinema lav",
+    near: { lat: 45.5019, lon: -73.5674 },
+    size: 8
+  });
+  assert.equal(calls[0].q, "lav");
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.equal(response.suggestions[0].text, "Cinema Laval");
+  assert.equal(response.suggestions[0].type, "category-locality");
+  assert.equal(response.stats.plannerLane, "osmSuggestCategoryLocality");
+});
+
+test("OSM intersection intent resolves two exact street surfaces inside one locality shard", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      shards: [{ id: "quebec", bbox: [45, -79.9, 62.7, -57] }]
+    },
+    async authorityLookup(surface) {
+      return surface === "Montréal"
+        ? { matches: [{ text: "Montréal", weight: 1000, shards: ["quebec"] }] }
+        : { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 1,
+          results: [{
+            name: "Montréal",
+            type: "city",
+            category: "place",
+            shard: "quebec",
+            lat: 45.5032,
+            lon: -73.5698
+          }],
+          stats: {}
+        };
+      }
+      if (params.q === "Saint-Laurent") {
+        return {
+          total: 1,
+          results: [{
+            name: "2027 Boulevard Saint-Laurent",
+            street: "Boulevard Saint-Laurent",
+            shard: "quebec",
+            lat: 45.5116,
+            lon: -73.5673
+          }],
+          stats: {}
+        };
+      }
+      if (params.q === "Sainte-Catherine") {
+        return {
+          total: 1,
+          results: [{
+            name: "680 Rue Sainte-Catherine",
+            street: "Rue Sainte-Catherine",
+            shard: "quebec",
+            lat: 45.5028,
+            lon: -73.57
+          }],
+          stats: {}
+        };
+      }
+      return { total: 0, results: [], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, {
+    q: "boulevard Saint-Laurent and rue Sainte-Catherine Montréal",
+    size: 18
+  });
+  assert.equal(response.stats.plannerLane, "osmIntersectionLocality");
+  assert.equal(response.results[0].type, "intersection");
+  assert.equal(response.results[0].shard, "quebec");
+  assert.ok(calls.every(call => call.shards?.[0] === "quebec"));
+});
+
+test("OSM anchored named destinations stay inside the map's radius coverage", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      features: { shards: true, facetSummaryUint32: true },
+      category_lexicon: { types: ["aerodrome"], aliases: {} },
+      shards: [
+        { id: "ontario", bbox: [41.6, -95.2, 56.9, -74.3] },
+        { id: "quebec", bbox: [45, -79.9, 62.7, -57] }
+      ]
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.filters?.facets?.category?.includes("place")) {
+        return { total: 0, results: [], stats: {} };
+      }
+      return {
+        total: 1,
+        results: [{
+          name: "Aéroport international Montréal-Trudeau",
+          type: "aerodrome",
+          shard: "quebec",
+          lat: 45.4706,
+          lon: -73.7408
+        }],
+        stats: {}
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, {
+    q: "Montréal Trudeau Airport",
+    near: { lat: 45.5019, lon: -73.5674 },
+    size: 18
+  });
+  const destinationCall = calls.find(call => call.filters?.facets?.type?.includes("aerodrome"));
+  assert.ok(destinationCall);
+  assert.deepEqual(destinationCall.shards, ["quebec"]);
+  assert.equal(destinationCall.q, "trudeau");
+  assert.equal(response.stats.plannerLane, "osmNearFuzzyText");
+  assert.deepEqual(response.stats.osmIntentCoverageShards, ["quebec"]);
+});
 
 test("OSM query intents recognize common categories and natural locality phrasing", () => {
   assert.deepEqual(parseOsmQueryIntent("Pharmacie Rosemère"), {
@@ -621,6 +801,7 @@ test("category lexicon covers the OSM type vocabulary, aliases, and plurals", ()
   assert.equal(parseNearbyCategoryIntent("fast food nearby").query, "fast food");
   assert.equal(parseNearbyCategoryIntent("hôpitaux").query, "hospital");
   assert.equal(parseNearbyCategoryIntent("churches close by").query, "place of worship");
+  assert.equal(parseNearbyCategoryIntent("airports nearby").query, "aerodrome");
   // Locality names must never fold into category intents.
   assert.equal(parseNearbyCategoryIntent("paris"), null);
   assert.equal(parseNearbyCategoryIntent("tours"), null);
@@ -831,8 +1012,8 @@ test("OSM plain text tries the anchor's radius first and falls back globally", a
     }
   };
   const fallback = await searchOsmQuery(fallbackEngine, { q: "calgary tower", size: 10, near: { lat: 48.85, lon: 2.35 } });
-  const nearAttempt = fallbackCalls.at(-2);
-  const globalCall = fallbackCalls.at(-1);
+  const nearAttempt = fallbackCalls.find(params => params.geo?.near);
+  const globalCall = fallbackCalls.findLast(params => !params.geo && !params.filters);
   assert.equal(nearAttempt.geo.near.radiusMeters, 50000);
   assert.equal(globalCall.geo, undefined);
   assert.equal(globalCall.filters, undefined);
@@ -895,6 +1076,125 @@ test("OSM anchored exact and one-edit landmark names bypass locality parsing", a
   assert.deepEqual(calls[1].shards, ["quebec"]);
   assert.equal(fuzzy.stats.plannerLane, "osmNearFuzzyText");
   assert.equal(fuzzy.results[0].name, "McGill University");
+});
+
+test("OSM repeated brand names use true nearest order inside the anchor shard", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      shards: [
+        { id: "ontario", bbox: [41.6, -95.2, 56.9, -74.3] },
+        { id: "quebec", bbox: [44.9, -79.9, 62.7, -57] }
+      ]
+    },
+    async authorityLookup(surface) {
+      // The singular surface exists in Ontario, but the map anchor is in
+      // Québec where the plural brand has hundreds of text matches.
+      return {
+        matches: surface === "Tim Hortons"
+          ? [{ text: "Tim Hortons", weight: 1790, count: 4504, shards: ["ontario"] }]
+          : [{ text: "Tim Horton", weight: 2, count: 4, shards: ["ontario"] }]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.geo?.sort === "distance") {
+        return {
+          total: 2,
+          results: [
+            { name: "Tim Hortons", shard: "quebec", lat: 45.608, lon: -73.709, distanceMeters: 313.3 },
+            { name: "Tim Hortons", shard: "quebec", lat: 45.61, lon: -73.73, distanceMeters: 1428.2 }
+          ],
+          stats: {}
+        };
+      }
+      return {
+        total: 597,
+        results: Array.from({ length: 32 }, (_, index) => ({
+          name: "Tim Hortons",
+          shard: "quebec",
+          lat: 45.7 + index / 1000,
+          lon: -73.8
+        })),
+        stats: {}
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, {
+    q: "Tim Horton",
+    size: 10,
+    near: { lat: 45.6066, lon: -73.7124 }
+  });
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.equal(calls[0].geo, undefined);
+  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(calls[1].geo.sort, "distance");
+  assert.equal(calls[1].geo.near.radiusMeters, 50000);
+  assert.equal(response.stats.plannerLane, "osmNearExactGeo");
+  assert.equal(response.results[0].distanceMeters, 313.3);
+  assert.ok(response.results.every(result => result.shard === "quebec"));
+
+  calls.length = 0;
+  const exact = await searchOsmQuery(engine, {
+    q: "Tim Hortons",
+    size: 10,
+    near: { lat: 45.6066, lon: -73.7124 }
+  });
+  assert.equal(calls.length, 1, "high authority counts should skip the hydration probe");
+  assert.equal(calls[0].geo.sort, "distance");
+  assert.equal(exact.results[0].distanceMeters, 313.3);
+});
+
+test("OSM viewport brand search orders locally and never accepts a foreign authority hint", async () => {
+  const calls = [];
+  const box = { minLat: 45.55, maxLat: 45.66, minLon: -73.8, maxLon: -73.62 };
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      shards: [
+        { id: "ontario", bbox: [41.6, -95.2, 56.9, -74.3] },
+        { id: "quebec", bbox: [44.9, -79.9, 62.7, -57] }
+      ]
+    },
+    async authorityLookup() {
+      return {
+        matches: [{ text: "Tim Horton", weight: 2, count: 4, shards: ["ontario"] }]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 1,
+        results: [{
+          name: "Tim Hortons",
+          shard: "quebec",
+          lat: 45.608,
+          lon: -73.709,
+          distanceMeters: 313.3
+        }],
+        stats: {}
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, {
+    q: "Tim Horton",
+    size: 10,
+    geo: { box }
+  });
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.deepEqual(calls[0].geo.box, box);
+  assert.ok(Math.abs(calls[0].geo.near.lat - 45.605) < 1e-9);
+  assert.ok(Math.abs(calls[0].geo.near.lon - -73.71) < 1e-9);
+  assert.equal(calls[0].geo.sort, "distance");
+  assert.equal(response.stats.plannerLane, "osmViewportExactGeo");
+  assert.equal(response.results[0].shard, "quebec");
 });
 
 test("OSM search ignores the anchor when explicit geo or intents are present", async () => {

@@ -18,6 +18,49 @@ const STREET_DESIGNATORS = new Set([
   "montee", "place", "rang", "route", "rue", "terrasse",
   "court", "drive", "highway", "lane", "road", "street"
 ]);
+const COORDINATE_NUMBER = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)";
+const DECIMAL_COORDINATES = new RegExp(
+  `^\\s*(${COORDINATE_NUMBER})(?:\\s*,\\s*|\\s+)(${COORDINATE_NUMBER})\\s*$`,
+  "u"
+);
+const INTERSECTION_CONNECTOR = /\s+(?:&|and|at|et|x)\s+|\s*\/\s*/iu;
+
+export function parseCoordinateIntent(value) {
+  const match = String(value || "").match(DECIMAL_COORDINATES);
+  if (!match) return null;
+  const lat = Number(match[1]);
+  const lon = Number(match[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    return null;
+  }
+  return { lat, lon };
+}
+
+function coordinateResponse(coordinate, params) {
+  const label = `${coordinate.lat.toFixed(6)}, ${coordinate.lon.toFixed(6)}`;
+  return {
+    total: 1,
+    page: 1,
+    size: Number(params.size || 10),
+    approximate: false,
+    results: [{
+      id: `coordinate:${coordinate.lat},${coordinate.lon}`,
+      name: label,
+      title: label,
+      address: label,
+      category: "place",
+      type: "coordinate",
+      lat: coordinate.lat,
+      lon: coordinate.lon,
+      distanceMeters: 0
+    }],
+    resolvedQuery: label,
+    stats: {
+      plannerLane: "osmCoordinates",
+      shardsQueried: 0
+    }
+  };
+}
 
 function mergeRuntimeTraces(...values) {
   const traces = [...new Set(values.filter(trace => trace?.spans?.length))];
@@ -167,7 +210,11 @@ async function exactAuthorityScope(engine, surface) {
           .map(String)
           .sort()
           .slice(0, 8);
-        return { shards, text: best[0].text };
+        return {
+          shards,
+          text: best[0].text,
+          count: Math.max(...best.map(match => Number(match.count || 0)))
+        };
       } catch {
         return null;
       }
@@ -195,7 +242,60 @@ function anchorCoverageShards(engine, anchor) {
     .sort();
 }
 
-async function anchoredExactText(engine, q, params, anchor, { allowUngatedFuzzy = false } = {}) {
+function anchorRadiusCoverageShards(engine, anchor, radiusMeters) {
+  const angularDistance = (left, right) => {
+    const distance = Math.abs(left - right) % 360;
+    return Math.min(distance, 360 - distance);
+  };
+  return (engine.manifest?.shards || [])
+    .filter(shard => {
+      if (!Array.isArray(shard.bbox) || shard.bbox.length !== 4) return false;
+      const [minLat, minLon, maxLat, maxLon] = shard.bbox.map(Number);
+      if (![minLat, minLon, maxLat, maxLon].every(Number.isFinite)) return false;
+      const lat = Math.max(minLat, Math.min(maxLat, anchor.lat));
+      let lon = anchor.lon;
+      if (!bboxContainsPoint(shard.bbox, lat, anchor.lon)) {
+        lon = angularDistance(anchor.lon, minLon) <= angularDistance(anchor.lon, maxLon)
+          ? minLon
+          : maxLon;
+      }
+      return haversineMeters(anchor.lat, anchor.lon, lat, lon) <= radiusMeters;
+    })
+    .map(shard => String(shard.id))
+    .sort();
+}
+
+function viewportAnchor(box) {
+  if (!box) return null;
+  const minLat = Number(box.minLat);
+  const maxLat = Number(box.maxLat);
+  const minLon = Number(box.minLon);
+  const maxLon = Number(box.maxLon);
+  if (![minLat, maxLat, minLon, maxLon].every(Number.isFinite) || minLat > maxLat) return null;
+  let lon = minLon <= maxLon
+    ? (minLon + maxLon) / 2
+    : (minLon + maxLon + 360) / 2;
+  if (lon > 180) lon -= 360;
+  return { lat: (minLat + maxLat) / 2, lon };
+}
+
+function exactGeoResponse(response, authority, scope, radiusMeters, lane) {
+  return collapseCivicDuplicates({
+    ...response,
+    stats: {
+      ...(response.stats || {}),
+      plannerLane: lane,
+      ...(radiusMeters ? { osmIntentRadiusMeters: radiusMeters } : {}),
+      ...(scope.length ? { osmIntentCoverageShards: scope } : {}),
+      ...(authority?.shards?.length ? { osmIntentAuthorityShards: authority.shards } : {})
+    }
+  });
+}
+
+async function anchoredExactText(engine, q, params, anchor, {
+  allowUngatedFuzzy = false,
+  intent = null
+} = {}) {
   const authority = await exactAuthorityScope(engine, q);
   if (!authority && !allowUngatedFuzzy) return null;
   const coverage = anchorCoverageShards(engine, anchor);
@@ -204,6 +304,58 @@ async function anchoredExactText(engine, q, params, anchor, { allowUngatedFuzzy 
     : [];
   const scope = authorityCoverage.length ? authorityCoverage : coverage;
   const requestedSize = Math.max(1, Number(params.size || 10));
+  const intentNameTokens = !authority && allowUngatedFuzzy && intent && !intent.connector
+    ? fold(intent.locality).split(" ").filter(token => token.length >= 3)
+    : [];
+  const distinctiveIntentToken = intentNameTokens.at(-1);
+  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true;
+  const probeParams = distinctiveIntentToken ? {
+    ...params,
+    q: distinctiveIntentToken,
+    ...(categoryFacetSafe ? {
+      filters: {
+        ...(params.filters || {}),
+        facets: {
+          ...(params.filters?.facets || {}),
+          type: [intent.category.type]
+        }
+      }
+    } : {})
+  } : params;
+  if (scope.length && params.geo?.box && authority) {
+    const response = await engine.search({
+      ...params,
+      shards: params.shards == null ? scope : params.shards,
+      geo: {
+        box: params.geo.box,
+        near: { lat: anchor.lat, lon: anchor.lon },
+        sort: "distance"
+      }
+    });
+    return exactGeoResponse(response, authority, scope, 0, "osmViewportExactGeo");
+  }
+  const nearestExact = async lane => {
+    try {
+      const response = await engine.search({
+        ...probeParams,
+        shards: params.shards == null ? scope : params.shards,
+        geo: {
+          near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+          sort: "distance"
+        }
+      });
+      return exactGeoResponse(response, authority, scope, NEAR_TEXT_RADIUS_METERS, lane);
+    } catch (error) {
+      if (!isGeoTextSortBudgetError(error)) throw error;
+      return null;
+    }
+  };
+  // A high root-authority count already proves this is a repeated name, so
+  // skip the text hydration probe and go straight to exact nearest traversal.
+  if (scope.length && Number(authority?.count || 0) >= Math.max(32, requestedSize * 2)) {
+    const nearest = await nearestExact("osmNearExactGeo");
+    if (nearest) return nearest;
+  }
   // A bounded text window is considerably cheaper than attaching lat/lon
   // doc-value chunks to every exact brand hit in a province. OSM documents
   // already carry their display coordinates, so the integration can verify
@@ -211,12 +363,12 @@ async function anchoredExactText(engine, q, params, anchor, { allowUngatedFuzzy 
   // selected the one geographic shard.
   const scopedText = scope.length > 0;
   const response = await engine.search(scopedText ? {
-    ...params,
+    ...probeParams,
     shards: params.shards == null ? scope : params.shards,
     size: Math.min(100, Math.max(32, requestedSize * 3)),
     geo: undefined
   } : {
-    ...params,
+    ...probeParams,
     geo: {
       near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
       boost: NEAR_TEXT_BOOST
@@ -227,8 +379,24 @@ async function anchoredExactText(engine, q, params, anchor, { allowUngatedFuzzy 
     ? response.correctedQuery
     : null;
   if (!authority && !corrected && allowUngatedFuzzy) {
-    const namedFuzzy = (response.results || []).some(result => withinOneFoldedEdit(result.name || result.title, q));
+    const namedFuzzy = (response.results || []).some(result => {
+      const name = fold(result.name || result.title);
+      return intentNameTokens.length
+        ? intentNameTokens.every(token => name.includes(token))
+        : withinOneFoldedEdit(name, q);
+    });
     if (!namedFuzzy) return null;
+  }
+  // Dense repeated names (brands and station entrances) need a real nearest
+  // traversal. The bounded text probe above prices the match set first: a
+  // sparse landmark page stays on the cheap embedded-coordinate lane, while
+  // a result set larger than the probe window is handed to the geo tree for
+  // an exact distance-ordered page.
+  if (scopedText && response.total > response.results.length) {
+    const nearest = await nearestExact(authority ? "osmNearExactGeo" : "osmNearFuzzyGeo");
+    if (nearest) return nearest;
+    // The bounded embedded-coordinate page below remains correct and local;
+    // it is only not guaranteed to contain every nearer repeated name.
   }
   const exact = [];
   const fuzzy = [];
@@ -266,6 +434,10 @@ async function anchoredExactText(engine, q, params, anchor, { allowUngatedFuzzy 
       ...(response.stats || {}),
       plannerLane: authority ? "osmNearExactText" : "osmNearFuzzyText",
       osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS,
+      ...(distinctiveIntentToken ? {
+        osmIntentCategoryFacet: categoryFacetSafe,
+        osmIntentNameToken: distinctiveIntentToken
+      } : {}),
       ...(scope.length ? { osmIntentCoverageShards: scope } : {}),
       ...(authority?.shards?.length ? { osmIntentAuthorityShards: authority.shards } : {})
     }
@@ -431,11 +603,54 @@ export function collapseStreetSuggestions(response, params = {}) {
 export async function suggestOsmQuery(engine, rawParams = {}) {
   const params = engineParams(rawParams);
   const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+  const anchor = nearAnchor(rawParams) || viewportAnchor(rawParams.geo?.box);
+  const coverage = anchor && params.shards == null ? anchorCoverageShards(engine, anchor) : [];
+  const q = String(params.q || "").trim();
+  const lexicon = await engineCategoryLexicon(engine);
+  const intent = parseOsmQueryIntent(q, lexicon);
+  if (intent?.locality && !intent.category.correctedFrom) {
+    const localityResponse = await engine.suggest({
+      ...params,
+      q: intent.locality,
+      ...(coverage.length ? { shards: coverage } : {}),
+      size: Math.max(32, requestedSize)
+    });
+    const suggestions = (localityResponse.suggestions || [])
+      .map(item => ({
+        ...item,
+        text: intent.order === "locality-category"
+          ? `${item.text} ${intent.category.label}`
+          : `${intent.category.label} ${item.text}`,
+        type: "category-locality",
+        category: intent.category.type,
+        locality: item.text
+      }))
+      .slice(0, requestedSize);
+    return {
+      ...localityResponse,
+      q,
+      suggestions,
+      stats: {
+        ...(localityResponse.stats || {}),
+        plannerLane: "osmSuggestCategoryLocality",
+        osmIntentCategory: intent.category.query,
+        ...(coverage.length ? { osmSuggestCoverageShards: coverage } : {})
+      }
+    };
+  }
   const response = await engine.suggest({
     ...params,
+    ...(coverage.length ? { shards: coverage } : {}),
     size: hasHouseNumber(params.q) ? requestedSize : Math.max(32, requestedSize)
   });
-  return collapseStreetSuggestions(response, { ...params, size: requestedSize });
+  const collapsed = collapseStreetSuggestions(response, { ...params, size: requestedSize });
+  return coverage.length ? {
+    ...collapsed,
+    stats: {
+      ...(collapsed.stats || {}),
+      osmSuggestCoverageShards: coverage
+    }
+  } : collapsed;
 }
 
 function collapseCivicDuplicates(response) {
@@ -610,6 +825,172 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
   return resolved;
 }
 
+function parsedStreetSurface(value) {
+  const tokens = String(value || "").trim().split(/\s+/u).filter(Boolean);
+  if (tokens.length < 2 || !tokens.some(token => STREET_DESIGNATORS.has(fold(token)))) return null;
+  const core = tokens.filter(token => !STREET_DESIGNATORS.has(fold(token)));
+  return core.length ? { text: tokens.join(" "), key: fold(tokens.join(" ")), core: core.join(" ") } : null;
+}
+
+function parseIntersectionSurface(value) {
+  const surface = String(value || "").trim().replaceAll(/\s*,\s*/gu, " ");
+  const connector = INTERSECTION_CONNECTOR.exec(surface);
+  if (!connector) return null;
+  const left = parsedStreetSurface(surface.slice(0, connector.index));
+  const right = surface.slice(connector.index + connector[0].length).trim();
+  return left && right ? { left, right } : null;
+}
+
+async function resolveIntersectionLocality(engine, surface, params, anchor = null) {
+  const parsed = parseIntersectionSurface(surface);
+  if (!parsed) return null;
+  const rightTokens = parsed.right.split(/\s+/u).filter(Boolean);
+  const coverage = anchor && params.shards == null ? anchorCoverageShards(engine, anchor) : [];
+  const routedParams = coverage.length ? { ...params, shards: coverage } : params;
+  const maxLocalityTokens = Math.min(4, rightTokens.length - 2);
+  let locality = null;
+  let rightStreet = null;
+  for (let localityLength = 1; localityLength <= maxLocalityTokens; localityLength++) {
+    const split = rightTokens.length - localityLength;
+    const candidateStreet = parsedStreetSurface(rightTokens.slice(0, split).join(" "));
+    if (!candidateStreet) continue;
+    const candidateLocality = await resolveLocality(
+      engine,
+      rightTokens.slice(split).join(" "),
+      routedParams,
+      { authorityMissIsFinal: true }
+    );
+    if (!candidateLocality) continue;
+    locality = candidateLocality;
+    rightStreet = candidateStreet;
+    break;
+  }
+  if (!locality || !rightStreet) {
+    return {
+      total: 0,
+      page: 1,
+      size: Number(params.size || 10),
+      approximate: false,
+      results: [],
+      stats: {
+        plannerLane: "osmIntersectionMiss",
+        ...(coverage.length ? { osmIntentCoverageShards: coverage } : {})
+      }
+    };
+  }
+
+  const localityShard = String(locality.shard || "").split("/")[0];
+  const searchStreet = async street => {
+    const scoped = {
+      ...params,
+      size: 100,
+      typo: false,
+      geo: undefined,
+      ...(localityShard ? { shards: [localityShard] } : coverage.length ? { shards: coverage } : {})
+    };
+    const primary = await engine.search({ ...scoped, q: street.core });
+    if (primary.total > 0) return primary;
+    // Hyphenated street names are sometimes indexed as one compound token
+    // while query analysis splits the typed surface. Retrying the most
+    // distinctive component gives the post-filter below candidates to
+    // verify without weakening the intersection's exact street-name check.
+    const fallbackTerm = street.core
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(token => Array.from(token).length >= 3)
+      .sort((left, right) => Array.from(right).length - Array.from(left).length)[0];
+    if (!fallbackTerm || fold(fallbackTerm) === fold(street.core)) return primary;
+    const fallback = await engine.search({ ...scoped, q: fallbackTerm });
+    const trace = mergeRuntimeTraces(primary.stats?.trace, fallback.stats?.trace);
+    return {
+      ...fallback,
+      stats: {
+        ...(fallback.stats || {}),
+        ...(trace ? { trace } : {}),
+        osmIntersectionStreetFallback: fallbackTerm
+      }
+    };
+  };
+  const [leftResponse, rightResponse] = await Promise.all([
+    searchStreet(parsed.left),
+    searchStreet(rightStreet)
+  ]);
+  const radiusMeters = localityRadiusMeters(locality.type);
+  const streetPoints = (response, street) => (response.results || []).filter(result => (
+    Number.isFinite(result.lat)
+    && Number.isFinite(result.lon)
+    && haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters
+    && (
+      fold(result.name || result.title) === street.key
+      || fold(result.street) === street.key
+      || fold(result.street).startsWith(`${street.key} `)
+    )
+  ));
+  const leftPoints = streetPoints(leftResponse, parsed.left);
+  const rightPoints = streetPoints(rightResponse, rightStreet);
+  let nearest = null;
+  for (const left of leftPoints) {
+    for (const right of rightPoints) {
+      const distance = haversineMeters(left.lat, left.lon, right.lat, right.lon);
+      if (!nearest || distance < nearest.distance) nearest = { left, right, distance };
+    }
+  }
+  const trace = mergeRuntimeTraces(
+    locality[LOCALITY_SEARCH_STATS]?.trace,
+    leftResponse.stats?.trace,
+    rightResponse.stats?.trace
+  );
+  if (!nearest || nearest.distance > 2000) {
+    return {
+      total: 0,
+      page: 1,
+      size: Number(params.size || 10),
+      approximate: false,
+      results: [],
+      stats: {
+        ...(trace ? { trace } : {}),
+        plannerLane: "osmIntersectionMiss",
+        osmIntentLocality: locality.name,
+        osmIntentIntersectionCandidateDistanceMeters: nearest?.distance ?? null,
+        ...(localityShard ? { osmIntentCoverageShards: [localityShard] } : {})
+      }
+    };
+  }
+
+  const lat = (nearest.left.lat + nearest.right.lat) / 2;
+  const lon = (nearest.left.lon + nearest.right.lon) / 2;
+  const name = `${parsed.left.text} & ${rightStreet.text}`;
+  const city = locality.name || "";
+  return {
+    total: 1,
+    page: 1,
+    size: Number(params.size || 10),
+    approximate: nearest.distance > 100,
+    results: [{
+      id: `intersection:${localityShard}:${fold(name)}`,
+      name,
+      title: name,
+      address: city ? `${name}, ${city}` : name,
+      city,
+      category: "highway",
+      type: "intersection",
+      shard: localityShard,
+      lat,
+      lon,
+      ...(anchor ? { distanceMeters: haversineMeters(anchor.lat, anchor.lon, lat, lon) } : {})
+    }],
+    resolvedQuery: city ? `${name}, ${city}` : name,
+    stats: {
+      ...(leftResponse.stats || {}),
+      ...(trace ? { trace } : {}),
+      plannerLane: "osmIntersectionLocality",
+      osmIntentLocality: city,
+      osmIntentStreets: [parsed.left.text, rightStreet.text],
+      osmIntentIntersectionCandidateDistanceMeters: nearest.distance,
+      ...(localityShard ? { osmIntentCoverageShards: [localityShard] } : {})
+    }
+  };
+}
+
 async function resolveStreetLocality(engine, surface, params) {
   const tokens = String(surface || "")
     .trim()
@@ -775,6 +1156,8 @@ export async function searchOsmQuery(engine, rawParams = {}) {
   const anchor = rawParams.geo == null ? nearAnchor(rawParams) : null;
   const params = engineParams(rawParams);
   const q = String(params.q || "").trim();
+  const coordinate = parseCoordinateIntent(q);
+  if (coordinate) return coordinateResponse(coordinate, params);
   const lexicon = await engineCategoryLexicon(engine);
   // "pharmacy near me" parses before category-locality — otherwise "me"
   // would be treated as a locality name and resolved against the planet.
@@ -787,9 +1170,13 @@ export async function searchOsmQuery(engine, rawParams = {}) {
   // open the local geo shard. A strict one-edit local check covers a category
   // at the end ("McGil University") without making broad typo queries fan
   // out.
-  if (anchor && q && !intent?.connector && !nearbyCategory) {
-    const exactText = await anchoredExactText(engine, q, params, anchor, {
-      allowUngatedFuzzy: intent?.order === "locality-category"
+  const mapAnchor = anchor || viewportAnchor(params.geo?.box);
+  const viewportWholeName = params.geo?.box
+    && (q.split(/\s+/u).filter(Boolean).length >= 2 || /[^\x00-\x7f]/u.test(q));
+  if (mapAnchor && q && !intent?.connector && !nearbyCategory && (anchor || viewportWholeName)) {
+    const exactText = await anchoredExactText(engine, q, params, mapAnchor, {
+      allowUngatedFuzzy: intent?.order === "locality-category",
+      intent
     });
     if (exactText) return exactText;
   }
@@ -874,20 +1261,24 @@ export async function searchOsmQuery(engine, rawParams = {}) {
         }
       });
     }
+    const intersection = await resolveIntersectionLocality(engine, q, params, mapAnchor);
+    if (intersection) return intersection;
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
-    if (possibleLocalityQuery(q, lexicon)) {
-      const locality = await resolveLocality(engine, q, params);
-      if (locality) return localityExactResponse(locality, params, q);
-    }
     // Local-first text: scoped to the anchor's radius, geo routing opens the
     // one or two shards whose coverage contains the caller instead of every
     // shard holding the terms, and proximity boosts break BM25 ties toward
-    // the nearby bearer of a common name. An empty local page (totals are
-    // real counts, never floors) falls back to the global cascade.
+    // the nearby bearer of a common name. Run this before the locality probe:
+    // a named destination ending in a place-like word must not open every
+    // shard merely to prove the full POI name is not a city.
+    let localProbeStats = null;
     if (anchor && q) {
+      const localScope = params.shards == null
+        ? anchorRadiusCoverageShards(engine, anchor, NEAR_TEXT_RADIUS_METERS)
+        : [];
       const local = await engine.search({
         ...params,
+        ...(localScope.length ? { shards: localScope } : {}),
         geo: {
           near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
           boost: NEAR_TEXT_BOOST
@@ -899,12 +1290,30 @@ export async function searchOsmQuery(engine, rawParams = {}) {
           stats: {
             ...(local.stats || {}),
             plannerLane: "osmNearText",
-            osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS
+            osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS,
+            ...(localScope.length ? { osmIntentCoverageShards: localScope } : {})
           }
         });
       }
+      localProbeStats = local.stats;
+    }
+    if (possibleLocalityQuery(q, lexicon)) {
+      const locality = await resolveLocality(engine, q, params);
+      if (locality) {
+        const response = localityExactResponse(locality, params, q);
+        const trace = mergeRuntimeTraces(localProbeStats?.trace, response.stats?.trace);
+        return {
+          ...response,
+          stats: {
+            ...(response.stats || {}),
+            ...(trace ? { trace } : {})
+          }
+        };
+      }
+    }
+    if (anchor && q) {
       const global = await engine.search(params);
-      const trace = mergeRuntimeTraces(local.stats?.trace, global.stats?.trace);
+      const trace = mergeRuntimeTraces(localProbeStats?.trace, global.stats?.trace);
       return collapseCivicDuplicates({
         ...global,
         stats: {
@@ -925,17 +1334,105 @@ export async function searchOsmQuery(engine, rawParams = {}) {
   // usually misses, and paying its latency serially would double a cold
   // "cinema laval" for nothing.
   let locality;
+  let localityProbeStats = null;
+  const anchorScope = mapAnchor && params.shards == null
+    ? anchorCoverageShards(engine, mapAnchor)
+    : [];
+  const routedParams = anchorScope.length ? { ...params, shards: anchorScope } : params;
   if (!intent.connector) {
     const [wholePlace, split] = await Promise.all([
-      resolveLocality(engine, q, params, { authorityMissIsFinal: true }),
-      resolveLocality(engine, intent.locality, params)
+      resolveLocality(engine, q, routedParams, { authorityMissIsFinal: true }),
+      resolveLocality(engine, intent.locality, routedParams)
     ]);
     if (wholePlace) return localityExactResponse(wholePlace, params, q);
     locality = split;
   } else {
-    locality = await resolveLocality(engine, intent.locality, params);
+    locality = await resolveLocality(engine, intent.locality, routedParams);
   }
-  if (!locality) return collapseCivicDuplicates(await searchNearestWithBudgetFallback(engine, params));
+  if (!locality && mapAnchor && q) {
+    const localScope = params.shards == null
+      ? anchorRadiusCoverageShards(engine, mapAnchor, NEAR_TEXT_RADIUS_METERS)
+      : [];
+    const intentNameTokens = !intent.connector
+      ? fold(intent.locality).split(" ").filter(token => token.length >= 3)
+      : [];
+    const distinctiveIntentToken = intentNameTokens.at(-1);
+    const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true;
+    const local = await engine.search({
+      ...params,
+      ...(localScope.length ? { shards: localScope } : {}),
+      ...(distinctiveIntentToken ? { q: distinctiveIntentToken } : {}),
+      ...(distinctiveIntentToken && categoryFacetSafe ? {
+        filters: {
+          ...(params.filters || {}),
+          facets: {
+            ...(params.filters?.facets || {}),
+            type: [intent.category.type]
+          }
+        }
+      } : {}),
+      size: Math.min(100, Math.max(32, Number(params.size || 10) * 3)),
+      geo: {
+        near: {
+          lat: mapAnchor.lat,
+          lon: mapAnchor.lon,
+          radiusMeters: NEAR_TEXT_RADIUS_METERS
+        },
+        boost: NEAR_TEXT_BOOST
+      }
+    });
+    localityProbeStats = local.stats;
+    const localResults = distinctiveIntentToken
+      ? (local.results || []).filter(result => {
+          const name = fold(result.name || result.title);
+          return intentNameTokens.every(token => name.includes(token));
+        })
+      : local.results || [];
+    if (localResults.length) {
+      return collapseCivicDuplicates({
+        ...local,
+        total: distinctiveIntentToken ? localResults.length : local.total,
+        size: Number(params.size || 10),
+        results: localResults.slice(0, Number(params.size || 10)),
+        stats: {
+          ...(local.stats || {}),
+          plannerLane: "osmNearText",
+          osmIntentRadiusMeters: NEAR_TEXT_RADIUS_METERS,
+          osmAmbiguousIntentTextFirst: true,
+          ...(distinctiveIntentToken ? {
+            osmIntentCategoryFacet: categoryFacetSafe,
+            osmIntentNameToken: distinctiveIntentToken
+          } : {}),
+          ...(localScope.length ? { osmIntentCoverageShards: localScope } : {})
+        }
+      });
+    }
+    // The map is context, not a restriction. If the bounded local probe
+    // misses, resolve the named place globally so an explicit query such as
+    // "restaurants New York" still travels away from the current viewport.
+    if (!intent.connector) {
+      const [wholePlace, split] = await Promise.all([
+        resolveLocality(engine, q, params, { authorityMissIsFinal: true }),
+        resolveLocality(engine, intent.locality, params)
+      ]);
+      if (wholePlace) return localityExactResponse(wholePlace, params, q);
+      locality = split;
+    } else {
+      locality = await resolveLocality(engine, intent.locality, params);
+    }
+  }
+  if (!locality) {
+    const response = await searchNearestWithBudgetFallback(engine, params);
+    const trace = mergeRuntimeTraces(localityProbeStats?.trace, response.stats?.trace);
+    return collapseCivicDuplicates({
+      ...response,
+      stats: {
+        ...(response.stats || {}),
+        ...(trace ? { trace } : {}),
+        ...(localityProbeStats ? { osmNearFallback: true } : {})
+      }
+    });
+  }
 
   // A category word plus a proper name often false-parses as category +
   // locality when some distant hamlet happens to bear the name: "garage

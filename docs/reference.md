@@ -511,7 +511,7 @@ loadFacetValues }`.
 | `verifyChecksums` | `true` | — | SHA-256 verify range objects before use. |
 | `maxPageSize` | `100` | 1–1000 | Hard cap on `size`. |
 | `trace` | `false` | — | Attach a per-query fetch/latency trace to `stats`. |
-| `multiRangeRequests` | `true` in browsers | — | Batch scattered pointer ranges from one object; automatically falls back when unsupported. |
+| `multiRangeRequests` | `true` in browsers | — | Batch separated grouped reads from the same immutable object; automatically falls back when unsupported. |
 | `multiRangeMaxRanges` | `32` | 2–64 | Maximum byte ranges in one multipart request. |
 | `rangePlans` | see below | — | Per-lane range-coalescing budgets. |
 | `topKProofMaxK` | `100` | 1–1000 | Max k eligible for the exact top-k proof. |
@@ -532,7 +532,10 @@ loadFacetValues }`.
 The **`rangePlans`** map controls HTTP range coalescing per lane. Each entry is
 `{ mergeGapBytes, maxOverfetchBytes, maxOverfetchRatio, maxMergedBytes? }`;
 adjacent ranges within `mergeGapBytes` are merged into one request, bounded by
-the overfetch limits. Keys and defaults:
+the overfetch limits. Remaining separated groups that target the same object
+share a multipart byte-range request in capable browser transports. Node,
+mobile, disabled multipart, and incompatible HTTP servers transparently use
+exact single-range or positional reads instead. Keys and defaults:
 
 | Lane | mergeGapBytes | maxOverfetchBytes |
 | --- | --- | --- |
