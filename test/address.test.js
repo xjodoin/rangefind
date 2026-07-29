@@ -352,4 +352,66 @@ test("exact, reordered, and component address forms bypass postings", async () =
   } finally {
     await engine.close();
   }
+
+  // Production shards become generational after an incremental build. The
+  // outer merge must let the owning generation hydrate the compact range and
+  // synthesize the requested house number before it applies tombstones.
+  await writeFile(join(root, "docs.jsonl"), JSON.stringify({
+    id: "delta-cafe",
+    name: "Delta Cafe",
+    address: "1 Rue Nouvelle, Sainte-Thérèse",
+    address_search: "1 Rue Nouvelle, Sainte-Thérèse",
+    house_number: "1",
+    street: "Rue Nouvelle",
+    city: "Sainte-Thérèse",
+    category: "amenity",
+    type: "cafe"
+  }));
+  await build({ configPath, update: true });
+
+  const generational = await createNodeSearch({ source: join(root, "public", "rangefind") });
+  try {
+    assert.equal(generational.manifest.generations.length, 2);
+    const interpolated = await generational.search({ q: "214 Rue Libersan", size: 2 });
+    assert.equal(interpolated.stats.plannerLane, "addressInterpolationExact");
+    assert.equal(interpolated.stats.generationalAddressAuthority, true);
+    assert.equal(interpolated.stats.blocksDecoded, 0);
+    assert.equal(interpolated.stats.postingsDecoded, 0);
+    assert.equal(interpolated.total, 1);
+    assert.equal(interpolated.results[0].address, "214 Rue Libersan, Sainte-Thérèse");
+    assert.equal(interpolated.results[0].house_number, "214");
+    assert.equal(interpolated.results[0].interpolated, true);
+    assert.equal(interpolated.results[0].generation, 0);
+  } finally {
+    await generational.close();
+  }
+
+  // Replacing the compact range in a later generation must suppress the base
+  // range before synthesis; otherwise the same house number would be emitted
+  // twice from stale and current geometry.
+  const replacement = {
+    ...interpolation[0],
+    lat: 45.6572,
+    lon: -73.8412,
+    geo_lat: 45.6572,
+    geo_lon: -73.8412,
+    _address_range_geometry: encodeAddressRangeGeometry([
+      { lat: 45.656577, lon: -73.840714 },
+      { lat: 45.6572, lon: -73.8412 },
+      { lat: 45.657881, lon: -73.841335 }
+    ])
+  };
+  await writeFile(join(root, "docs.jsonl"), JSON.stringify(replacement));
+  await build({ configPath, update: true });
+
+  const replaced = await createNodeSearch({ source: join(root, "public", "rangefind") });
+  try {
+    const interpolated = await replaced.search({ q: "214 Rue Libersan", size: 2 });
+    assert.equal(interpolated.total, 1);
+    assert.equal(interpolated.results.length, 1);
+    assert.equal(interpolated.results[0].generation, 2);
+    assert.ok(interpolated.results[0].lat > 45.6572);
+  } finally {
+    await replaced.close();
+  }
 });

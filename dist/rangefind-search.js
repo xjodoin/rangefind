@@ -11516,6 +11516,24 @@ async function createSearch(options = {}) {
   async function hydrateRows(rows, context = {}) {
     return rowsToResults(rows, context);
   }
+  async function searchAddressAuthority(params = {}) {
+    const q = String(params.q || "").trim();
+    const page = Math.max(1, Number(params.page || 1));
+    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
+    const filters = params.filters || {};
+    const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
+    if (page !== 1 || hasFilters || params.sort || params.geo || params.vector || params.authority === false || !looksLikeAddressQuery(q)) return null;
+    return tryAddressAuthorityFastPath({
+      q,
+      page,
+      size,
+      hasFilters: false,
+      sortPlan: null,
+      geoPlan: null,
+      includeResults: true,
+      authority: params.authority
+    });
+  }
   async function loadDocValues(fields, indexes) {
     if (!indexes.length) return [];
     await ensureDocValuesManifest();
@@ -11531,6 +11549,7 @@ async function createSearch(options = {}) {
     authorityLookup,
     vectorSearch,
     hydrateRows,
+    searchAddressAuthority,
     loadDocValues,
     loadBuildTelemetry,
     loadIndexOptimizer,
@@ -11612,6 +11631,65 @@ async function createGenerationalSearch(root, options, baseUrl) {
       }
     };
   }
+  async function generationalAddressAuthoritySearch(params, { q, page, size, offset }) {
+    if (page !== 1) return null;
+    const responses = await Promise.all(engines.map((engine, genIndex) => typeof engine.searchAddressAuthority === "function" ? engine.searchAddressAuthority({
+      ...params,
+      includeResults: true,
+      page: 1,
+      size: Math.min(1e3, offset + size + tombstones[genIndex].size)
+    }) : null));
+    if (!responses.some(Boolean)) return null;
+    const exact = [];
+    const interpolated = [];
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      const response2 = responses[genIndex];
+      if (!response2) continue;
+      const target = response2.stats?.plannerLane === "addressAuthorityExact" ? exact : response2.stats?.plannerLane === "addressInterpolationExact" ? interpolated : null;
+      if (!target) continue;
+      for (const result of response2.results || []) {
+        if (Number.isInteger(result.index) && tombstones[genIndex].has(result.index)) continue;
+        target.push({
+          generation: genIndex,
+          index: result.index,
+          score: result.score || 0,
+          result
+        });
+      }
+    }
+    const hasInterpolationLane = responses.some(
+      (response2) => response2?.stats?.plannerLane === "addressInterpolationExact"
+    );
+    const selected = exact.length ? exact : interpolated;
+    selected.sort(compareMergedTies);
+    const rows = selected.slice(offset, offset + size);
+    const results = rows.map((row) => ({ ...row.result, generation: row.generation }));
+    const lane = exact.length || !interpolated.length && !hasInterpolationLane ? "addressAuthorityExact" : "addressInterpolationExact";
+    const laneResponses = responses.filter((response2) => response2?.stats?.plannerLane === lane);
+    const complete = laneResponses.every((response2) => response2.stats?.topKProven !== false);
+    const response = {
+      total: selected.length,
+      results,
+      page,
+      size,
+      approximate: !complete,
+      stats: {
+        generations: engines.length,
+        generationTotals: responses.map((item) => item?.total || 0),
+        tombstones: tombstoneTotal,
+        plannerLane: lane,
+        exact: complete,
+        topKProven: complete,
+        totalExact: complete,
+        tailExhausted: complete,
+        generationalAddressAuthority: true,
+        blocksDecoded: laneResponses.reduce((sum, item) => sum + Number(item.stats?.blocksDecoded || 0), 0),
+        postingsDecoded: laneResponses.reduce((sum, item) => sum + Number(item.stats?.postingsDecoded || 0), 0)
+      }
+    };
+    applyMergedHighlights(params, q, results, void 0);
+    return response;
+  }
   async function search(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodeSpacing(surfaceQuery);
@@ -11624,6 +11702,17 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const sortPlan = parseSortPlan(params.sort);
     const geoDistanceSort = params.geo?.sort === "distance";
     if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    const addressResponse = await generationalAddressAuthoritySearch(
+      activeParams,
+      { q, page, size, offset }
+    );
+    if (addressResponse) {
+      if (normalizedQuery !== surfaceQuery) {
+        addressResponse.normalizedQuery = normalizedQuery;
+        addressResponse.stats.postalCodeNormalized = true;
+      }
+      return addressResponse;
+    }
     if (sortPlan || geoDistanceSort || params.geo && !q) {
       return orderedSearch(activeParams, { q, page, size, offset, sortPlan, geoDistanceSort });
     }
