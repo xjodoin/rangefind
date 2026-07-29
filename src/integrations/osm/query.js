@@ -296,9 +296,70 @@ async function anchoredExactText(engine, q, params, anchor, {
   allowUngatedFuzzy = false,
   intent = null
 } = {}) {
+  const coverage = anchorCoverageShards(engine, anchor);
+  const explicitScope = params.shards == null
+    ? []
+    : (Array.isArray(params.shards) ? params.shards : [params.shards]).map(String);
+  const directScope = explicitScope.length ? explicitScope : coverage;
+  const compoundName = fold(q).split(/[^\p{L}\p{N}]+/u).filter(Boolean).length >= 2;
+
+  // A geo-sorted local text result can prove its own whole-name match. For
+  // compound brands and landmarks, do that useful search first instead of
+  // serially downloading the root authority lexicon merely to authorize the
+  // exact same search. A one-edit whole-name match covers benign singulars
+  // and typos ("Tim Horton" -> "Tim Hortons"). Category-locality queries do
+  // not pass this gate because their result names do not equal the full
+  // surface, so they continue through the established intent resolver.
+  if (!intent && compoundName && directScope.length) {
+    try {
+      const viewport = params.geo?.box;
+      const direct = await engine.search({
+        ...params,
+        shards: directScope,
+        geo: viewport ? {
+          box: viewport,
+          near: { lat: anchor.lat, lon: anchor.lon },
+          sort: "distance"
+        } : {
+          near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+          sort: "distance"
+        }
+      });
+      const canonical = (direct.results || []).filter(result => {
+        const name = result.name || result.title;
+        return fold(name) === fold(q) || withinOneFoldedEdit(name, q);
+      });
+      if (canonical.length) {
+        const response = canonical.length === direct.results.length ? direct : {
+          ...direct,
+          total: canonical.length,
+          approximate: true,
+          results: canonical
+        };
+        const resolved = exactGeoResponse(
+          response,
+          null,
+          directScope,
+          viewport ? 0 : NEAR_TEXT_RADIUS_METERS,
+          viewport ? "osmViewportExactGeo" : "osmNearExactGeo"
+        );
+        return {
+          ...resolved,
+          stats: {
+            ...(resolved.stats || {}),
+            osmIntentLocalNameProof: true
+          }
+        };
+      }
+    } catch (error) {
+      if (!isGeoTextSortBudgetError(error)) throw error;
+      // Common text can exceed the exact distance-sort budget. Authority and
+      // the bounded embedded-coordinate lane below remain the fallback.
+    }
+  }
+
   const authority = await exactAuthorityScope(engine, q);
   if (!authority && !allowUngatedFuzzy) return null;
-  const coverage = anchorCoverageShards(engine, anchor);
   const authorityCoverage = authority?.shards?.length
     ? coverage.filter(shard => authority.shards.includes(shard))
     : [];
@@ -1013,11 +1074,75 @@ async function resolveStreetLocality(engine, surface, params) {
     const coreTokens = streetTokens.filter(token => !STREET_DESIGNATORS.has(fold(token)));
     if (!coreTokens.length) continue;
     const localitySurface = tokens.slice(split).join(" ");
-    const locality = await resolveLocality(engine, localitySurface, params);
-    if (!locality) continue;
-
     const streetSurface = streetTokens.join(" ");
     const streetKey = fold(streetSurface);
+    const civicLookup = hasHouseNumber(streetSurface);
+    const distinctiveStreetToken = coreTokens
+      .flatMap(token => String(token).split(/[^\p{L}\p{N}]+/u))
+      .filter(Boolean)
+      .at(-1);
+    const streetLookupQuery = civicLookup
+      ? streetSurface
+      : distinctiveStreetToken || coreTokens.join(" ");
+    const searchStreet = shards => engine.search({
+      ...params,
+      q: streetLookupQuery,
+      typo: false,
+      size: Math.max(30, Number(params.size || 10)),
+      geo: undefined,
+      ...(shards?.length ? { shards } : {})
+    });
+    const exactStreetResult = result => (
+      fold(result.name || result.title) === streetKey
+      || (
+        result.house_number != null
+        && result.street
+        && fold(`${result.house_number} ${result.street}`) === streetKey
+      )
+      || (result.street && fold(result.street) === streetKey)
+    );
+
+    let locality = null;
+    let response = null;
+    let authorityLocality = false;
+
+    // The root authority already proves which shard owns an exact locality.
+    // Search that shard immediately and validate the candidate's structured
+    // city. This removes a serial place search from the normal cold path.
+    // Documents without usable locality metadata retain the coordinate-based
+    // resolver below as the correctness fallback.
+    if (params.shards == null) {
+      const authority = await exactAuthorityScope(engine, localitySurface);
+      if (authority?.shards?.length) {
+        try {
+          const candidateResponse = await searchStreet(authority.shards);
+          const localityKeys = new Set([
+            fold(localitySurface),
+            fold(authority.text)
+          ].filter(Boolean));
+          const validated = candidateResponse.results.some(result => (
+            exactStreetResult(result)
+            && localityKeys.has(fold(result.city))
+          ));
+          if (validated) {
+            locality = {
+              name: authority.text || localitySurface,
+              type: "authority",
+              shard: authority.shards[0]
+            };
+            response = candidateResponse;
+            authorityLocality = true;
+          }
+        } catch {
+          // Root routing is an accelerator; the normal resolver is fail-open.
+        }
+      }
+    }
+
+    if (!locality) {
+      locality = await resolveLocality(engine, localitySurface, params);
+      if (!locality) continue;
+    }
     // Rank by plain text relevance, scoped to the locality's root shard,
     // and enforce the locality radius on the returned page here instead of
     // through the engine's geo machinery. A distance sort would decode
@@ -1027,22 +1152,23 @@ async function resolveStreetLocality(engine, surface, params) {
     // doc-value chunks — both cost far more than checking thirty results.
     // A miss falls back to the surrounding cascade like before.
     const localityShard = String(locality.shard || "").split("/")[0];
-    let response;
-    try {
-      response = await engine.search({
-        ...params,
-        q: coreTokens.join(" "),
-        size: Math.max(30, Number(params.size || 10)),
-        geo: undefined,
-        ...(localityShard ? { shards: [localityShard] } : {})
-      });
-    } catch {
-      // A shard-level posting budget or transport failure must not kill the
-      // whole query — fall back to the surrounding cascade.
-      return null;
+    if (!response) {
+      try {
+        response = await searchStreet(localityShard ? [localityShard] : null);
+      } catch {
+        // A shard-level posting budget or transport failure must not kill the
+        // whole query — fall back to the surrounding cascade.
+        return null;
+      }
     }
-    const radiusMeters = localityRadiusMeters(locality.type);
-    const nearLocality = result => haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters;
+    const radiusMeters = authorityLocality ? null : localityRadiusMeters(locality.type);
+    const authorityLocalityKeys = new Set([
+      fold(localitySurface),
+      fold(locality.name)
+    ].filter(Boolean));
+    const nearLocality = authorityLocality
+      ? result => authorityLocalityKeys.has(fold(result.city))
+      : result => haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters;
     const street = response.results.find(result => (
       Number.isFinite(result.lat)
       && Number.isFinite(result.lon)
@@ -1093,9 +1219,11 @@ async function resolveStreetLocality(engine, surface, params) {
           ...(civicTrace ? { trace: civicTrace } : {}),
           plannerLane: "osmStreetLocality",
           osmIntentStreet: streetSurface,
+          osmIntentStreetLookup: streetLookupQuery,
           osmIntentLocality: locality.name || localitySurface,
           osmIntentLocalityType: locality.type || "",
-          osmIntentRadiusMeters: localityRadiusMeters(locality.type),
+          ...(radiusMeters == null ? {} : { osmIntentRadiusMeters: radiusMeters }),
+          ...(authorityLocality ? { osmIntentLocalityAuthority: true } : {}),
           osmIntentCivicAddress: true
         }
       };
@@ -1123,9 +1251,11 @@ async function resolveStreetLocality(engine, surface, params) {
         ...(trace ? { trace } : {}),
         plannerLane: "osmStreetLocality",
         osmIntentStreet: streetSurface,
+        osmIntentStreetLookup: streetLookupQuery,
         osmIntentLocality: locality.name || localitySurface,
         osmIntentLocalityType: locality.type || "",
-        osmIntentRadiusMeters: localityRadiusMeters(locality.type)
+        ...(radiusMeters == null ? {} : { osmIntentRadiusMeters: radiusMeters }),
+        ...(authorityLocality ? { osmIntentLocalityAuthority: true } : {})
       }
     };
   }

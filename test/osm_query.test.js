@@ -458,6 +458,52 @@ test("OSM street-locality search avoids common road-designator posting exhaustio
   assert.equal(response.stats.plannerLane, "osmStreetLocality");
 });
 
+test("OSM street-locality search reuses exact root authority without resolving the place twice", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      assert.equal(surface, "Montréal");
+      return {
+        matches: [{
+          text: "Montréal",
+          weight: 1704694,
+          count: 1,
+          shards: ["quebec"]
+        }]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      assert.equal(params.filters?.facets?.category, undefined);
+      return {
+        total: 30,
+        results: [{
+          id: "node/9",
+          name: "1000 Rue Saint-Denis",
+          type: "address",
+          street: "Rue Saint-Denis",
+          city: "Montréal",
+          lat: 45.512,
+          lon: -73.561
+        }],
+        stats: {}
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, {
+    q: "Rue Saint-Denis, Montréal",
+    size: 10
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "Denis");
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.equal(response.total, 1);
+  assert.equal(response.results[0].name, "Rue Saint-Denis");
+  assert.equal(response.stats.plannerLane, "osmStreetLocality");
+  assert.equal(response.stats.osmIntentLocalityAuthority, true);
+  assert.equal(response.stats.osmIntentRadiusMeters, undefined);
+});
+
 test("OSM street-locality search returns a matching civic address directly", async () => {
   const calls = [];
   const engine = {
@@ -1128,13 +1174,12 @@ test("OSM repeated brand names use true nearest order inside the anchor shard", 
     near: { lat: 45.6066, lon: -73.7124 }
   });
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].shards, ["quebec"]);
-  assert.equal(calls[0].geo, undefined);
-  assert.deepEqual(calls[1].shards, ["quebec"]);
-  assert.equal(calls[1].geo.sort, "distance");
-  assert.equal(calls[1].geo.near.radiusMeters, 50000);
+  assert.equal(calls[0].geo.sort, "distance");
+  assert.equal(calls[0].geo.near.radiusMeters, 50000);
   assert.equal(response.stats.plannerLane, "osmNearExactGeo");
+  assert.equal(response.stats.osmIntentLocalNameProof, true);
   assert.equal(response.results[0].distanceMeters, 313.3);
   assert.ok(response.results.every(result => result.shard === "quebec"));
 
@@ -1144,7 +1189,7 @@ test("OSM repeated brand names use true nearest order inside the anchor shard", 
     size: 10,
     near: { lat: 45.6066, lon: -73.7124 }
   });
-  assert.equal(calls.length, 1, "high authority counts should skip the hydration probe");
+  assert.equal(calls.length, 1, "local whole-name proof should skip root authority");
   assert.equal(calls[0].geo.sort, "distance");
   assert.equal(exact.results[0].distanceMeters, 313.3);
 });

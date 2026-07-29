@@ -82,8 +82,9 @@ const DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.12;
 const DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 1024;
 const DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE = 32;
 const DOC_VALUE_SORT_PAGE_BATCH_SIZE = 16;
-const GEO_LEAF_PAGE_BATCH_SIZE = 16;
+const GEO_LEAF_PAGE_BATCH_SIZE = 64;
 const GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
+const GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE = 16;
 const GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 const GEO_TEXT_MAX_CANDIDATE_POINTS = 100000;
 // With a text query, the geo doc set may grow beyond the base cap when its
@@ -2521,9 +2522,19 @@ export async function createSearch(options = {}) {
   // arrive in globally non-decreasing min-distance order (each leaf's min
   // distance is at least its branch's), which the nearest lane's early-stop
   // proof relies on.
-  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, blockFilterPlan = null) {
+  async function* geoCandidateLeafPages(
+    geoPlan,
+    root,
+    distanceSorted,
+    tracking,
+    blockFilterPlan = null,
+    firstBatchHint = GEO_LEAF_PAGE_FIRST_BATCH_SIZE
+  ) {
     const { counters, leafFetchStats, branchFetchStats } = tracking;
-    const firstBatch = Math.min(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, geoLeafPageBatchSize);
+    const firstBatch = Math.min(
+      Math.max(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, firstBatchHint),
+      geoLeafPageBatchSize
+    );
 
     async function* yieldLeafBatches(candidates) {
       let batchSize = firstBatch;
@@ -4010,7 +4021,21 @@ export async function createSearch(options = {}) {
     const tracking = geoTraversalTracking();
     const kthDistance = () => (best.length >= k ? best[k - 1].dist : Infinity);
 
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, geoBlockFilterPlan)) {
+    // Once a selective text doc set exists, tiny speculative leaf waves only
+    // add round trips: most spatial pages will contain no matching text doc.
+    // Start with sixteen and ramp to sixty-four. Unfiltered browse and pure
+    // nearest queries retain the conservative four-page first wave.
+    const firstBatchHint = textMatchDocs
+      ? GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE
+      : GEO_LEAF_PAGE_FIRST_BATCH_SIZE;
+    for await (const { candidate, leafPage } of geoCandidateLeafPages(
+      geoPlan,
+      root,
+      distanceSorted,
+      tracking,
+      geoBlockFilterPlan,
+      firstBatchHint
+    )) {
       if (distanceSorted && best.length >= k && candidate.minDist > kthDistance()) {
         stoppedEarly = true;
         break;

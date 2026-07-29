@@ -4381,8 +4381,9 @@ var DOC_RANGE_PLANNER_MAX_CANDIDATE_BLOCK_RATIO = 0.12;
 var DOC_RANGE_BLOCK_PRUNE_BATCH_SIZE = 1024;
 var DOC_RANGE_BLOCK_PRUNE_INITIAL_BATCH_SIZE = 32;
 var DOC_VALUE_SORT_PAGE_BATCH_SIZE = 16;
-var GEO_LEAF_PAGE_BATCH_SIZE = 16;
+var GEO_LEAF_PAGE_BATCH_SIZE = 64;
 var GEO_LEAF_PAGE_FIRST_BATCH_SIZE = 4;
+var GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE = 16;
 var GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 var GEO_TEXT_MAX_CANDIDATE_POINTS = 1e5;
 var GEO_TEXT_DOC_SET_HARD_CAP = 1e6;
@@ -6533,9 +6534,12 @@ async function createSearch(options = {}) {
       geoDefinite: true
     };
   }
-  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, blockFilterPlan = null) {
+  async function* geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, blockFilterPlan = null, firstBatchHint = GEO_LEAF_PAGE_FIRST_BATCH_SIZE) {
     const { counters, leafFetchStats, branchFetchStats } = tracking;
-    const firstBatch = Math.min(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, geoLeafPageBatchSize);
+    const firstBatch = Math.min(
+      Math.max(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, firstBatchHint),
+      geoLeafPageBatchSize
+    );
     async function* yieldLeafBatches(candidates) {
       let batchSize = firstBatch;
       for (let position = 0; position < candidates.length; ) {
@@ -7851,7 +7855,15 @@ async function createSearch(options = {}) {
     let stoppedEarly = false;
     const tracking = geoTraversalTracking();
     const kthDistance = () => best.length >= k ? best[k - 1].dist : Infinity;
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(geoPlan, root, distanceSorted, tracking, geoBlockFilterPlan)) {
+    const firstBatchHint = textMatchDocs ? GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE : GEO_LEAF_PAGE_FIRST_BATCH_SIZE;
+    for await (const { candidate, leafPage } of geoCandidateLeafPages(
+      geoPlan,
+      root,
+      distanceSorted,
+      tracking,
+      geoBlockFilterPlan,
+      firstBatchHint
+    )) {
       if (distanceSorted && best.length >= k && candidate.minDist > kthDistance()) {
         stoppedEarly = true;
         break;
