@@ -42,6 +42,11 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
     const path = normalizedShardPath(shard.path ?? `shards/${shard.id}/`);
     const manifestName = shard.manifest || "manifest.min.json";
     const manifest = JSON.parse(readFileSync(resolve(root, path, manifestName), "utf8"));
+    const features = {
+      ...(manifest.features?.facetSummaryUint32 === true ? { facetSummaryUint32: true } : {}),
+      ...(manifest.features?.geoCapsules === true ? { geoCapsules: true } : {}),
+      ...(manifest.features?.geoCategoryCells === true ? { geoCategoryCells: true } : {})
+    };
     return {
       manifest,
       entry: {
@@ -53,9 +58,7 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
         // Preserve safety capabilities per child so a mixed root can use
         // new pruning on rebuilt shards immediately while older siblings
         // continue on the compatibility lane.
-        ...(manifest.features?.facetSummaryUint32 === true
-          ? { features: { facetSummaryUint32: true } }
-          : {}),
+        ...(Object.keys(features).length ? { features } : {}),
         // Hierarchy labels ("canada", "north-america", …): queries scope to
         // a whole group with shards: ["canada"] instead of listing members.
         ...(Array.isArray(shard.groups) && shard.groups.length
@@ -78,7 +81,9 @@ export function writeShardedRootManifest({ outDir, shards, scoringStats = null, 
       // Root-wide searches may use facet-backed geo pruning only after every
       // child is safe. Scoped searches can consult the child descriptor above
       // and benefit as soon as their specific shard has been rebuilt.
-      facetSummaryUint32: entries.every(item => item.manifest.features?.facetSummaryUint32 === true)
+      facetSummaryUint32: entries.every(item => item.manifest.features?.facetSummaryUint32 === true),
+      geoCapsules: entries.every(item => item.manifest.features?.geoCapsules === true),
+      geoCategoryCells: entries.every(item => item.manifest.features?.geoCategoryCells === true)
     },
     total: entries.reduce((sum, item) => sum + (item.entry.total || 0), 0),
     // The merge layer parses sort plans and geo params without opening a

@@ -20,6 +20,13 @@ import {
   pointToBoxDistanceMetersE7,
   pointToBoxMaxDistanceMetersE7
 } from "./geo_tree.js";
+import {
+  decodeGeoCellBlock,
+  geoCellBlock,
+  geoCellBlockKey,
+  geoCellRouteKey,
+  geoCellsForBoxes
+} from "./geo_cells.js";
 import { decodeDocPointerRecord } from "./doc_pointers.js";
 import { applyHighlights, highlightTermSet } from "./highlight.js";
 import {
@@ -140,6 +147,7 @@ function traceBucketFromPath(path) {
   if (path.includes("/docs/")) return "docs";
   if (path.includes("/facets/")) return "facetDictionaries";
   if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
+  if (path.includes("/geo/category-cells/")) return "geoCategoryCells";
   if (path.includes("/text-routing/")) return "textRouting";
   if (path.includes("/directory-")) return "directory";
   if (path.endsWith("/codes.bin.gz")) return "codes";
@@ -172,6 +180,7 @@ function traceLabelBucket(label) {
   if (value.startsWith("doc ")) return "docs";
   if (value.startsWith("facet dictionary")) return "facetDictionaries";
   if (value.startsWith("filter bitmap")) return "filterBitmaps";
+  if (value.startsWith("geo category cell")) return "geoCategoryCells";
   return "object";
 }
 
@@ -470,6 +479,8 @@ export async function createSearch(options = {}) {
   const geoTreeRootCache = new Map();
   const geoBranchPageCache = new Map();
   const geoLeafPageCache = new Map();
+  const geoCellDirectoryCache = new Map();
+  const geoCellBlockCache = new Map();
   let authorityLexiconRootPromise = null;
   const authorityLexiconSegmentCache = new Map();
   const authorityHotCache = new Map();
@@ -1205,6 +1216,157 @@ export async function createSearch(options = {}) {
       "geo branch page",
       stats
     );
+  }
+
+  function geoCellDirectoryState(index) {
+    const key = index.directory?.root || "";
+    if (!key) return null;
+    if (!geoCellDirectoryCache.has(key)) {
+      geoCellDirectoryCache.set(key, createDirectoryState(index.directory));
+    }
+    return geoCellDirectoryCache.get(key);
+  }
+
+  async function geoCellDirectoryEntries(index, keys) {
+    const state = geoCellDirectoryState(index);
+    if (!state || !keys.length) return new Map();
+    const root = await loadDirectoryRoot(state);
+    const resolved = await Promise.all(keys.map(async key => {
+      const item = await directoryEntryFromRoot(state, root, key);
+      return item ? [key, { ...item.entry, index: key }] : null;
+    }));
+    return new Map(resolved.filter(Boolean));
+  }
+
+  async function loadGeoCellBlocks(index, entries, stats) {
+    if (!entries.length) return [];
+    return loadPackedPages({
+      field: index.field,
+      entries,
+      cache: geoCellBlockCache,
+      cacheKey: (_field, key) => key,
+      decode: decodeGeoCellBlock,
+      label: "geo category cell block",
+      packDir: String(index.pack_dir || "geo/category-cells/packs").replace(/\/+$/u, ""),
+      rangePlan: "geoCategoryCells",
+      stats
+    });
+  }
+
+  function geoCellIndexForPlan(geoPlan, filterPlan) {
+    if (options.geoCellIndexes === false || !geoPlan?.boxes?.length || !filterPlan?.facets?.length) return null;
+    const indexes = geoPlan.meta?.category_cells || [];
+    for (const index of indexes) {
+      const facet = filterPlan.facets.find(([field]) => field === index.facet);
+      if (!facet) continue;
+      const selected = [...facet[1]].sort((a, b) => a - b);
+      const indexed = new Set(index.codes || []);
+      if (selected.length && selected.every(code => indexed.has(code))) {
+        return { index: { ...index, field: geoPlan.field }, selected };
+      }
+    }
+    return null;
+  }
+
+  async function geoCellRoutedLeaves(geoPlan, rootPromise, filterPlan, tracking) {
+    const planned = geoCellIndexForPlan(geoPlan, filterPlan);
+    if (!planned) return null;
+    const { index, selected } = planned;
+    const maxCells = Math.max(1, Number(index.max_cells_per_query || 48));
+    const groupSize = Math.max(1, Number(index.code_group_size || 16));
+    const selectedGroups = [...new Set(selected.map(code => Math.floor(code / groupSize)))];
+    let cells = null;
+    let level = null;
+    let requests = null;
+    for (const candidate of [...(index.levels || [])].sort((a, b) => b - a)) {
+      const next = geoCellsForBoxes(geoPlan.boxes, candidate, maxCells);
+      if (!next) continue;
+      const nextRequests = new Map();
+      for (const cell of next) {
+        const block = geoCellBlock(cell, index.block_zoom);
+        for (const group of selectedGroups) {
+          const key = geoCellBlockKey(index.field, index.facet, group, block);
+          if (!nextRequests.has(key)) nextRequests.set(key, { key, block, group });
+        }
+      }
+      if (nextRequests.size <= maxCells) {
+        cells = next;
+        level = candidate;
+        requests = nextRequests;
+        break;
+      }
+    }
+    if (!cells) return null;
+
+    const directoryEntries = await geoCellDirectoryEntries(index, [...requests.keys()]);
+    const blockStats = { wanted: requests.size, fetched: 0, groups: 0 };
+    const available = [...directoryEntries.values()];
+    const decoded = await loadGeoCellBlocks(index, available, blockStats);
+    const blocksByKey = new Map(available.map((entry, position) => [entry.index, decoded[position]]));
+    const ordinalsByLeaf = new Map();
+    for (const cell of cells) {
+      const block = geoCellBlock(cell, index.block_zoom);
+      for (const code of selected) {
+        const group = Math.floor(code / groupSize);
+        const key = geoCellBlockKey(index.field, index.facet, group, block);
+        const members = blocksByKey.get(key)?.routes?.get(geoCellRouteKey(level, cell.x, cell.y, code));
+        if (!members) continue;
+        for (const [leaf, ordinals] of members) {
+          if (!ordinalsByLeaf.has(leaf)) ordinalsByLeaf.set(leaf, new Set());
+          const accepted = ordinalsByLeaf.get(leaf);
+          for (const ordinal of ordinals) accepted.add(ordinal);
+        }
+      }
+    }
+
+    const wanted = [...ordinalsByLeaf.keys()].sort((a, b) => a - b);
+    const leaves = [];
+    const root = await rootPromise;
+    if (!root) return null;
+    if (root.levels === 1) {
+      for (const indexValue of wanted) {
+        if (root.leaves[indexValue]) leaves.push(root.leaves[indexValue]);
+      }
+    } else {
+      const branchIndexes = new Set();
+      let branchPosition = 0;
+      for (const indexValue of wanted) {
+        while (
+          branchPosition + 1 < root.branches.length
+          && root.branches[branchPosition].firstLeafIndex + root.branches[branchPosition].leafCount <= indexValue
+        ) {
+          branchPosition++;
+        }
+        const branch = root.branches[branchPosition];
+        if (
+          branch
+          && indexValue >= branch.firstLeafIndex
+          && indexValue < branch.firstLeafIndex + branch.leafCount
+        ) {
+          branchIndexes.add(branch.index);
+        }
+      }
+      const branches = [...branchIndexes].sort((a, b) => a - b).map(indexValue => root.branches[indexValue]);
+      const pages = await loadGeoBranchPages(geoPlan.field, root, branches, tracking.branchFetchStats);
+      const leafMap = new Map();
+      for (const page of pages) {
+        for (const leaf of page.leaves) leafMap.set(leaf.index, leaf);
+      }
+      for (const indexValue of wanted) {
+        const leaf = leafMap.get(indexValue);
+        if (leaf) leaves.push(leaf);
+      }
+    }
+    return {
+      leaves,
+      ordinalsByLeaf,
+      facet: index.facet,
+      level,
+      cells: cells.length,
+      blocksWanted: requests.size,
+      blocksFetched: blockStats.fetched,
+      blockFetchGroups: blockStats.groups
+    };
   }
 
   async function ensureDocValuesForDocs(fields, docs) {
@@ -2174,6 +2336,43 @@ export async function createSearch(options = {}) {
     });
   }
 
+  // Spatial capsules live inside geo leaf pages, indexed by the same point
+  // ordinal as coordinates and doc ids. A geo lane that already opened those
+  // leaves can therefore return the configured display subset without a
+  // second document-store round trip. Mixed/legacy leaves fail open by
+  // hydrating only the missing rows through the normal document reader.
+  async function rowsToGeoCapsuleResults(rows, capsuleByDoc, context = {}) {
+    const missing = rows.filter(([index]) => !capsuleByDoc.has(index));
+    const capsuleHits = rows.length - missing.length;
+    context.geoCapsuleHits = capsuleHits;
+    context.geoCapsuleMisses = missing.length;
+    if (!missing.length) {
+      context.docPayloadLane = "geoCapsules";
+      context.docPayloadPages = 0;
+      context.docPayloadRows = rows.length;
+      context.docPayloadOverfetchDocs = 0;
+      context.docPayloadAdaptive = false;
+      context.docPayloadForced = false;
+      return rows.map(([index, score]) => ({ ...capsuleByDoc.get(index), score, index }));
+    }
+    const fallbackContext = {};
+    const hydrated = await rowsToResults(missing, fallbackContext);
+    const hydratedByDoc = new Map(hydrated.map(result => [result.index, result]));
+    context.docPayloadLane = capsuleHits
+      ? `geoCapsules+${fallbackContext.docPayloadLane || "packedDocs"}`
+      : fallbackContext.docPayloadLane;
+    context.docPayloadPages = fallbackContext.docPayloadPages || 0;
+    context.docPayloadRows = rows.length;
+    context.docPayloadOverfetchDocs = fallbackContext.docPayloadOverfetchDocs || missing.length;
+    context.docPayloadAdaptive = Boolean(fallbackContext.docPayloadAdaptive);
+    context.docPayloadForced = Boolean(fallbackContext.docPayloadForced);
+    return rows.map(([index, score]) => (
+      capsuleByDoc.has(index)
+        ? { ...capsuleByDoc.get(index), score, index }
+        : hydratedByDoc.get(index)
+    ));
+  }
+
   async function rowsToSearchResults(rows, context = {}, includeResults = true) {
     if (includeResults === false) {
       context.docPayloadLane = "skipped";
@@ -2618,6 +2817,44 @@ export async function createSearch(options = {}) {
       if (!emit.length) continue;
       const pages = await loadGeoLeafPages(geoPlan.field, emit.map(item => item.leaf), leafFetchStats);
       for (let i = 0; i < emit.length; i++) yield { candidate: emit[i], leafPage: pages[i] };
+    }
+  }
+
+  async function* geoRoutedLeafPages(
+    geoPlan,
+    leaves,
+    distanceSorted,
+    tracking,
+    blockFilterPlan = null,
+    firstBatchHint = GEO_LEAF_PAGE_FIRST_BATCH_SIZE
+  ) {
+    const candidates = [];
+    for (const leaf of leaves) {
+      const candidate = geoLeafCandidate(geoPlan, leaf, blockFilterPlan);
+      if (candidate) candidates.push(candidate);
+    }
+    tracking.counters.candidateLeaves += candidates.length;
+    if (distanceSorted) {
+      candidates.sort((a, b) => a.minDist - b.minDist || a.leaf.index - b.leaf.index);
+    } else {
+      candidates.sort((a, b) => a.leaf.index - b.leaf.index);
+    }
+    let batchSize = Math.min(
+      Math.max(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, firstBatchHint),
+      geoLeafPageBatchSize
+    );
+    for (let position = 0; position < candidates.length;) {
+      const batch = candidates.slice(position, position + batchSize);
+      batchSize = Math.min(batchSize * 2, geoLeafPageBatchSize);
+      const pages = await loadGeoLeafPages(
+        geoPlan.field,
+        batch.map(item => item.leaf),
+        tracking.leafFetchStats
+      );
+      for (let index = 0; index < batch.length; index++) {
+        yield { candidate: batch[index], leafPage: pages[index] };
+      }
+      position += batch.length;
     }
   }
 
@@ -3992,33 +4229,54 @@ export async function createSearch(options = {}) {
   }
 
   async function runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
-    const root = await loadGeoTreeRoot(geoPlan.field);
-    if (!root) return null;
+    // The category-cell directory/block path and the ordinary geo-tree root
+    // are independent range reads. Start both immediately so a cold query
+    // pays the slower leg instead of their combined network latency.
+    const rootPromise = loadGeoTreeRoot(geoPlan.field);
     const offset = (page - 1) * size;
     const k = offset + size;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const near = geoPlan.near;
     const radius = near?.radiusMeters ?? null;
     const distanceSorted = !!geoPlan.sort;
+    const tracking = geoTraversalTracking();
+    const geoBlockFilterPlan = docFilterPlan?.active ? makeBlockFilterPlan(filters) : null;
+    const cellRoutingPromise = geoCellRoutedLeaves(geoPlan, rootPromise, docFilterPlan, tracking);
+    const [root, cellRouting] = await Promise.all([rootPromise, cellRoutingPromise]);
+    if (!root) return null;
+    const effectiveDocFilterPlan = cellRouting && docFilterPlan
+      ? {
+          ...docFilterPlan,
+          facets: docFilterPlan.facets.filter(([field]) => field !== cellRouting.facet)
+        }
+      : docFilterPlan;
+    if (effectiveDocFilterPlan) {
+      effectiveDocFilterPlan.active = effectiveDocFilterPlan.facets.length > 0
+        || effectiveDocFilterPlan.numbers.length > 0
+        || effectiveDocFilterPlan.booleans.length > 0
+        || !!effectiveDocFilterPlan.geo;
+    }
 
-    // Filter bitmaps cover whole-corpus facet/boolean checks with one fetch,
-    // no matter how many spatially clustered docs each leaf contributes.
-    const bitmapStore = docFilterPlan?.active ? await filterBitmapStoreForPlan(docFilterPlan) : null;
+    // Category-cell membership proves the indexed facet directly at the point
+    // ordinal. Remaining facet/boolean checks can still use whole-corpus
+    // bitmaps without fetching values for every spatially clustered document.
+    const bitmapStore = effectiveDocFilterPlan?.active
+      ? await filterBitmapStoreForPlan(effectiveDocFilterPlan)
+      : null;
     const bitmapCovered = bitmapStore?.covered || new Set();
-    const residualFilterFields = docFilterPlan?.active
-      ? [...new Set(filterPlanFields(docFilterPlan))].filter(field => !bitmapCovered.has(field))
+    const residualFilterFields = effectiveDocFilterPlan?.active
+      ? [...new Set(filterPlanFields(effectiveDocFilterPlan))].filter(field => !bitmapCovered.has(field))
       : [];
 
-    const geoBlockFilterPlan = docFilterPlan?.active ? makeBlockFilterPlan(filters) : null;
     const best = [];
     const collected = [];
     const distances = new Map();
+    const capsuleByDoc = new Map();
     let leavesVisited = 0;
     let pointsScanned = 0;
     let pointsAccepted = 0;
     let definiteLeaves = 0;
     let stoppedEarly = false;
-    const tracking = geoTraversalTracking();
     const kthDistance = () => (best.length >= k ? best[k - 1].dist : Infinity);
 
     // Once a selective text doc set exists, tiny speculative leaf waves only
@@ -4028,14 +4286,24 @@ export async function createSearch(options = {}) {
     const firstBatchHint = textMatchDocs
       ? GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE
       : GEO_LEAF_PAGE_FIRST_BATCH_SIZE;
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(
-      geoPlan,
-      root,
-      distanceSorted,
-      tracking,
-      geoBlockFilterPlan,
-      firstBatchHint
-    )) {
+    const leafPages = cellRouting
+      ? geoRoutedLeafPages(
+          geoPlan,
+          cellRouting.leaves,
+          distanceSorted,
+          tracking,
+          geoBlockFilterPlan,
+          firstBatchHint
+        )
+      : geoCandidateLeafPages(
+          geoPlan,
+          root,
+          distanceSorted,
+          tracking,
+          geoBlockFilterPlan,
+          firstBatchHint
+        );
+    for await (const { candidate, leafPage } of leafPages) {
       if (distanceSorted && best.length >= k && candidate.minDist > kthDistance()) {
         stoppedEarly = true;
         break;
@@ -4059,9 +4327,16 @@ export async function createSearch(options = {}) {
         }
         if (distanceSorted && best.length >= k && dist > kthDistance()) continue;
         const doc = docs[i];
+        if (cellRouting && !cellRouting.ordinalsByLeaf.get(candidate.leaf.index)?.has(i)) continue;
         if (textMatchDocs && !textMatchDocs.has(doc)) continue;
-        if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+        if (
+          effectiveDocFilterPlan?.active
+          && !passesFilterPlan(doc, codeData, effectiveDocFilterPlan)
+        ) continue;
         pointsAccepted++;
+        if (options.geoCapsules !== false && leafPage.capsules?.[i]) {
+          capsuleByDoc.set(doc, leafPage.capsules[i]);
+        }
         if (distanceSorted) {
           let lo = 0;
           let hi = best.length;
@@ -4091,7 +4366,9 @@ export async function createSearch(options = {}) {
       for (const item of best) distances.set(item.doc, item.dist);
     }
     const resultContext = { hasTextTerms: false, preferDocPages: true };
-    const results = await rowsToResults(rows, resultContext);
+    const results = capsuleByDoc.size
+      ? await rowsToGeoCapsuleResults(rows, capsuleByDoc, resultContext)
+      : await rowsToResults(rows, resultContext);
     if (near) {
       for (const result of results) {
         const dist = distances.get(result.index);
@@ -4108,7 +4385,9 @@ export async function createSearch(options = {}) {
       approximate: !exactTotal,
       stats: {
         exact: distanceSorted ? true : exactTotal,
-        geoLane: (distanceSorted ? "nearest" : "browse") + (textMatchDocs ? "Text" : ""),
+        geoLane: (distanceSorted ? "nearest" : "browse")
+          + (textMatchDocs ? "Text" : "")
+          + (cellRouting ? "CategoryCells" : ""),
         geoField: geoPlan.field,
         geoDistanceSorted: distanceSorted,
         geoTreeLevels: root.levels,
@@ -4116,6 +4395,12 @@ export async function createSearch(options = {}) {
         geoCandidateBranches: tracking.counters.candidateBranches,
         geoBranchPagesFetched: tracking.branchFetchStats.fetched,
         geoCandidateLeaves: tracking.counters.candidateLeaves,
+        geoCategoryCellLevel: cellRouting?.level ?? null,
+        geoCategoryCells: cellRouting?.cells ?? 0,
+        geoCategoryCellBlocksWanted: cellRouting?.blocksWanted ?? 0,
+        geoCategoryCellBlocksFetched: cellRouting?.blocksFetched ?? 0,
+        geoCategoryCellBlockFetchGroups: cellRouting?.blockFetchGroups ?? 0,
+        geoCategoryCellLeaves: cellRouting?.leaves.length ?? 0,
         geoLeavesVisited: leavesVisited,
         geoDefiniteLeaves: definiteLeaves,
         geoLeafPagesPrefetched: tracking.leafFetchStats.wanted,
@@ -4123,6 +4408,8 @@ export async function createSearch(options = {}) {
         geoLeafPageFetchGroups: tracking.leafFetchStats.groups,
         geoPointsScanned: pointsScanned,
         geoPointsAccepted: pointsAccepted,
+        geoCapsuleHits: resultContext.geoCapsuleHits ?? 0,
+        geoCapsuleMisses: resultContext.geoCapsuleMisses ?? rows.length,
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs

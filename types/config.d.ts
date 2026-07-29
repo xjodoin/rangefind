@@ -8,6 +8,23 @@ export interface RangefindConfig {
   numbers: Array<Record<string, unknown>>;
   booleans: Array<Record<string, unknown>>;
   geo: Array<{ name: string; latPath: string; lonPath: string }>;
+  /** Embed compact display rows in geo leaves for one-range map results. */
+  geoCapsules?: boolean;
+  /** Display payload fields stored in each geo leaf capsule. */
+  geoCapsuleFields?: string[];
+  /** Maximum document pages retained while building geo capsules. */
+  geoCapsuleDocPageCachePages?: number;
+  /** Multi-resolution geo-cell routing indexes keyed by a facet. */
+  geoCellIndexes?: Array<{
+    field: string;
+    facet: string;
+    levels?: number[];
+    blockZoom?: number;
+    codeGroupSize?: number;
+    maxCellsPerQuery?: number;
+    maxFacetValues?: number;
+    values?: string[];
+  }>;
   suggest: Array<Record<string, unknown>>;
   vectors: Array<Record<string, unknown>>;
   display: Array<string | Record<string, unknown>>;

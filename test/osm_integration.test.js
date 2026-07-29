@@ -112,6 +112,9 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     ));
     assert.equal(manifest.total, 2);
     assert.equal(manifest.features.geo, true);
+    assert.equal(manifest.features.geoCapsules, true);
+    assert.equal(manifest.features.geoCategoryCells, true);
+    assert.equal(manifest.geo.fields.location.category_cells[0].facet, "type");
     // High-cardinality facets skip blanket bitmap generation, but the OSM
     // category vocabulary still materializes its explicitly selected types.
     assert.equal(Object.keys(filterBitmaps.fields.type.values).length, 1);
@@ -126,7 +129,12 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       trace: true
     });
     assert.equal(nearbyCinema.results[0]?.name, "Testville Cinema");
-    assert.ok(nearbyCinema.stats.trace.spans.some(span => span.name === "filterBitmaps.fetch"));
+    assert.equal(nearbyCinema.results[0]?.id, "node/2");
+    assert.equal(nearbyCinema.stats.docPayloadLane, "geoCapsules");
+    assert.equal(nearbyCinema.stats.geoCapsuleHits, 1);
+    assert.match(nearbyCinema.stats.geoLane, /CategoryCells$/u);
+    assert.ok(nearbyCinema.stats.geoCategoryCellBlocksFetched >= 1);
+    assert.ok(!nearbyCinema.stats.trace.spans.some(span => span.name === "filterBitmaps.fetch"));
     assert.ok(!nearbyCinema.stats.trace.spans.some(span => span.name === "docValues.fetch"));
     assert.equal(
       nearbyCinema.stats.trace.spans.find(span => span.name === "manifest.fetch")?.count,
@@ -174,6 +182,17 @@ test("Sharded OSM build embeds the category lexicon and keeps categories local",
       ]
     });
     const lexicon = built.rootManifest.category_lexicon;
+    assert.equal(built.rootManifest.features.geoCapsules, true);
+    assert.ok(built.rootManifest.shards.every(shard => shard.features?.geoCapsules === true));
+    assert.equal(built.rootManifest.features.geoCategoryCells, false);
+    assert.equal(
+      built.rootManifest.shards.find(shard => shard.id === "quebec")?.features?.geoCategoryCells,
+      true
+    );
+    assert.equal(
+      built.rootManifest.shards.find(shard => shard.id === "uganda")?.features?.geoCategoryCells,
+      undefined
+    );
     assert.equal(lexicon.facet, "type");
     assert.ok(lexicon.types.includes("cinema"));
     // Place values never gate as categories ("Quebec City" stays a city).

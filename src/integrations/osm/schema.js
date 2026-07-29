@@ -79,13 +79,33 @@ export function createOsmIndexConfig(options = {}) {
       { name: "category", path: "category" },
       { name: "type", path: "type" }
     ],
-    // `type` is high-cardinality, so the generic bitmap builder would omit
-    // it. Materialize only the curated query categories: nearest-category
-    // searches then verify exact types with one tiny bitmap range instead of
-    // hundreds of scattered doc-value chunks.
+    // Keep curated type bitmaps for broad/text lanes that cannot use spatial
+    // category routing. Category-cell geo queries prove their type from the
+    // cell's point ordinals and do not fetch this global bitmap.
     filterBitmapFacetValues: { type: [...OSM_CANONICAL_TYPES] },
     numbers: [{ name: "population", path: "population", type: "int" }],
     geo: [{ name: "location", latPath: "geo_lat", lonPath: "geo_lon" }],
+    // Route common category + viewport/radius queries directly to the small
+    // set of geo leaves that contain that category. Three exact grid levels
+    // share compact block objects; result rows remain single-copy in capsules.
+    geoCellIndexes: [{
+      field: "location",
+      facet: "type",
+      levels: [9, 12, 15],
+      blockZoom: 9,
+      codeGroupSize: 16,
+      maxCellsPerQuery: 48,
+      values: [...OSM_CANONICAL_TYPES]
+    }],
+    // Geo leaf capsules turn the spatial range read into a self-contained
+    // result page for the fields used by the map UI. Less common metadata
+    // remains available through the ordinary document store on non-geo lanes.
+    geoCapsules: true,
+    geoCapsuleFields: [
+      "id", "name", "address", "house_number", "street", "unit", "suburb",
+      "city", "district", "state", "postcode", "country", "url", "category",
+      "type", "lat", "lon", "address_count"
+    ],
     suggest: [
       { path: "search_name", weightPath: "population" },
       { path: "aliases" }

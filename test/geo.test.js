@@ -22,6 +22,14 @@ import {
   pointToBoxDistanceMetersE7,
   pointToBoxMaxDistanceMetersE7
 } from "../src/geo_tree.js";
+import {
+  decodeGeoCellBlock,
+  encodeGeoCellBlock,
+  geoCellBlock,
+  geoCellBlockKey,
+  geoCellForE7,
+  geoCellsForBoxes
+} from "../src/geo_cells.js";
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -215,6 +223,82 @@ test("geo leaf pages and tree roots round trip", () => {
   }
 });
 
+test("geo leaf capsules round trip compact display rows", () => {
+  const lats = new Int32Array([latToE7(45.5), latToE7(45.6)]);
+  const lons = new Int32Array([lonToE7(-73.5), lonToE7(-73.6)]);
+  const docs = new Uint32Array([7, 19]);
+  const leaf = buildGeoTreeLeaves(lats, lons, docs, 16)[0];
+  const capsules = [
+    { title: "First place", category: "cafe", rating: 4.5 },
+    { title: "Second place", category: "museum", rating: 4.8 }
+  ];
+  const encoded = encodeGeoLeafPage("location", lats, lons, docs, leaf, {
+    capsules,
+    capsuleFields: ["title", "category", "rating"]
+  });
+  const decoded = decodeGeoLeafPage(encoded, { name: "location" });
+  assert.deepEqual(decoded.capsuleFields, ["title", "category", "rating"]);
+  assert.deepEqual(decoded.capsules, capsules);
+  assert.deepEqual([...decoded.docs], [7, 19]);
+});
+
+test("multi-resolution category-cell blocks round trip exact leaf routes", () => {
+  const cell = geoCellForE7(latToE7(45.5017), lonToE7(-73.5673), 15);
+  const block = geoCellBlock(cell, 9);
+  assert.match(geoCellBlockKey("location", "category", 2, block), /^location\|category\|/u);
+  const encoded = encodeGeoCellBlock({
+    blockZoom: block.zoom,
+    blockX: block.x,
+    blockY: block.y,
+    routes: [
+      {
+        zoom: 15,
+        x: cell.x,
+        y: cell.y,
+        code: 7,
+        members: [
+          { leaf: 2, ordinals: [0, 4] },
+          { leaf: 9, ordinals: [1] },
+          { leaf: 15, ordinals: [3, 8] }
+        ]
+      },
+      {
+        zoom: 12,
+        x: Math.floor(cell.x / 8),
+        y: Math.floor(cell.y / 8),
+        code: 7,
+        members: [
+          { leaf: 2, ordinals: [0, 4] },
+          { leaf: 15, ordinals: [3, 8] }
+        ]
+      }
+    ]
+  });
+  const decoded = decodeGeoCellBlock(encoded);
+  assert.deepEqual(
+    decoded.routes.get(`15:${cell.y}:${cell.x}:7`),
+    new Map([[2, [0, 4]], [9, [1]], [15, [3, 8]]])
+  );
+  assert.deepEqual(
+    decoded.routes.get(`12:${Math.floor(cell.y / 8)}:${Math.floor(cell.x / 8)}:7`),
+    new Map([[2, [0, 4]], [15, [3, 8]]])
+  );
+
+  const cells = geoCellsForBoxes([{
+    minLatE7: latToE7(45.49),
+    maxLatE7: latToE7(45.51),
+    minLonE7: lonToE7(-73.59),
+    maxLonE7: lonToE7(-73.55)
+  }], 12, 16);
+  assert.ok(cells.length >= 1 && cells.length <= 16);
+  assert.equal(geoCellsForBoxes([{
+    minLatE7: latToE7(-80),
+    maxLatE7: latToE7(80),
+    minLonE7: lonToE7(-170),
+    maxLonE7: lonToE7(170)
+  }], 15, 16), null);
+});
+
 async function serveStatic(root) {
   const requests = [];
   const server = createServer(async (request, response) => {
@@ -368,11 +452,19 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
       maxLonE7: lonToE7(box.maxLon)
     };
     const boxExpected = points.filter(point => boxContainsPointE7(boxE7, point.latE7, point.lonE7));
+    const boxRequestStart = server.requests.length;
     const boxResponse = await engine.search({ q: "", geo: { box }, size: 100 });
     assert.equal(boxResponse.total, boxExpected.length);
     assert.deepEqual(titles(boxResponse), boxExpected.map(point => point.title).sort());
     assert.equal(boxResponse.stats.geoLane, "browse");
     assert.ok(boxResponse.stats.geoLeavesVisited <= boxResponse.stats.geoDirectoryLeaves);
+    if (manifest.geo.fields.location.capsules) {
+      const boxRequests = server.requests.slice(boxRequestStart);
+      assert.equal(boxResponse.stats.docPayloadLane, "geoCapsules");
+      assert.equal(boxResponse.stats.geoCapsuleHits, boxResponse.results.length);
+      assert.equal(boxResponse.stats.geoCapsuleMisses, 0);
+      assert.ok(!boxRequests.some(request => request.pathname.includes("/docs/")));
+    }
 
     // Radius browse with distances.
     const center = { lat: 45.5017, lon: -73.5673 };
@@ -428,6 +520,77 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
       viewportNearestExpected.map(item => Math.round(item.dist * 10) / 10)
     );
     assert.ok(viewportNearest.results.every(result => boxExpected.some(point => point.title === result.title)));
+
+    if (manifest.geo.fields.location.category_cells?.length) {
+      const requestStart = server.requests.length;
+      const categoryCells = await engine.search({
+        q: "",
+        filters: { facets: { category: ["bakery"] } },
+        geo: { box, near: center, sort: "distance" },
+        size: 20
+      });
+      const cellRequests = server.requests.slice(requestStart);
+      const expected = boxExpected
+        .filter(point => point.category === "bakery")
+        .map(point => ({
+          title: point.title,
+          dist: haversineMetersE7(centerE7.latE7, centerE7.lonE7, point.latE7, point.lonE7)
+        }))
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, 20);
+      assert.deepEqual(categoryCells.results.map(result => result.title), expected.map(item => item.title));
+      assert.match(categoryCells.stats.geoLane, /CategoryCells$/u);
+      assert.ok(categoryCells.stats.geoCategoryCellLevel > 0);
+      assert.ok(categoryCells.stats.geoCategoryCellBlocksFetched > 0);
+      assert.ok(cellRequests.some(request => request.pathname.includes("/geo/category-cells/")));
+
+      const multiCategory = await engine.search({
+        q: "",
+        filters: { facets: { category: ["bakery", "museum"] } },
+        geo: { box, near: center, sort: "distance" },
+        size: 20
+      });
+      const multiExpected = boxExpected
+        .filter(point => point.category === "bakery" || point.category === "museum")
+        .map(point => ({
+          title: point.title,
+          dist: haversineMetersE7(centerE7.latE7, centerE7.lonE7, point.latE7, point.lonE7)
+        }))
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, 20);
+      assert.deepEqual(
+        multiCategory.results.map(result => result.title),
+        multiExpected.map(item => item.title)
+      );
+
+      const fallback = await createSearch({ baseUrl: server.baseUrl, geoCellIndexes: false });
+      const fallbackStart = server.requests.length;
+      const fallbackResponse = await fallback.search({
+        q: "",
+        filters: { facets: { category: ["bakery"] } },
+        geo: { box, near: center, sort: "distance" },
+        size: 20
+      });
+      const fallbackRequests = server.requests.slice(fallbackStart);
+      assert.deepEqual(
+        categoryCells.results.map(result => result.title),
+        fallbackResponse.results.map(result => result.title)
+      );
+      const pointPacks = requests => requests.filter(request => request.pathname.includes("/geo/point-packs/")).length;
+      assert.ok(
+        pointPacks(cellRequests) < pointPacks(fallbackRequests),
+        `category cells should fetch fewer point ranges (${pointPacks(cellRequests)} vs ${pointPacks(fallbackRequests)})`
+      );
+
+      const broadFallback = await engine.search({
+        q: "",
+        filters: { facets: { category: ["bakery"] } },
+        geo: { box: { minLat: -80, maxLat: 80, minLon: -170, maxLon: 170 } },
+        size: 5
+      });
+      assert.doesNotMatch(broadFallback.stats.geoLane, /CategoryCells/u);
+      assert.equal(broadFallback.stats.geoCategoryCellLevel, null);
+    }
 
     // Nearest with facet + numeric filters.
     const filteredNearest = await engine.search({
@@ -505,6 +668,21 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
     const datelineResponse = await engine.search({ q: "", geo: { box: datelineBox }, size: 100 });
     assert.equal(datelineResponse.total, datelineExpected.length);
     assert.deepEqual(titles(datelineResponse), datelineExpected.map(point => point.title).sort());
+    if (manifest.geo.fields.location.category_cells?.length) {
+      const datelineCategoryExpected = datelineExpected.filter(point => point.category === "bakery");
+      const datelineCategory = await engine.search({
+        q: "",
+        filters: { facets: { category: ["bakery"] } },
+        geo: { box: datelineBox },
+        size: 100
+      });
+      assert.match(datelineCategory.stats.geoLane, /CategoryCells$/u);
+      assert.equal(datelineCategory.total, datelineCategoryExpected.length);
+      assert.deepEqual(
+        titles(datelineCategory),
+        datelineCategoryExpected.map(point => point.title).sort()
+      );
+    }
 
     // Sorting by another field with a geo filter goes through the sorted lane.
     const sortedResponse = await engine.search({
@@ -601,6 +779,39 @@ test("geo queries agree with an exhaustive oracle (two-level branch-paged tree)"
   await runGeoOracleSuite({ geoBranchLeaves: 4 }, manifest => {
     assert.equal(manifest.geo.fields.location.levels, 2);
     assert.ok(manifest.geo.fields.location.branches >= 2);
+  });
+});
+
+test("geo cell capsules return complete map rows without document fetches", async () => {
+  await runGeoOracleSuite({ geoCapsules: true }, manifest => {
+    assert.equal(manifest.geo.page_format, "rfgeoleafpage-v2");
+    assert.deepEqual(
+      manifest.geo.fields.location.capsules.fields,
+      ["title", "category", "rating"]
+    );
+    assert.equal(manifest.geo.fields.location.capsules.rows, manifest.geo.fields.location.total);
+  });
+});
+
+test("multi-resolution category cells route exact map results to fewer geo leaves", async () => {
+  await runGeoOracleSuite({
+    geoCapsules: true,
+    geoBranchLeaves: 4,
+    geoCellSortChunkRecords: 20,
+    geoCellIndexes: [{
+      field: "location",
+      facet: "category",
+      levels: [6, 10, 14],
+      blockZoom: 6,
+      codeGroupSize: 4,
+      maxCellsPerQuery: 48,
+      values: ["bakery", "museum", "pharmacy", "cafe", "observatory"]
+    }]
+  }, manifest => {
+    assert.equal(manifest.features.geoCategoryCells, true);
+    assert.equal(manifest.geo.fields.location.category_cells[0].format, "rfgeocategorycell-v1");
+    assert.deepEqual(manifest.geo.fields.location.category_cells[0].levels, [6, 10, 14]);
+    assert.ok(manifest.geo.category_cell_packs >= 1);
   });
 });
 

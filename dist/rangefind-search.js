@@ -3365,6 +3365,7 @@ function parseDocValueSortDirectory(buffer) {
 var GEO_TREE_ROOT_FORMAT = "rfgeotreeroot-v1";
 var GEO_LEAF_PAGE_FORMAT = "rfgeoleafpage-v1";
 var FORMAT_VERSION2 = 1;
+var GEO_LEAF_CAPSULE_VERSION = 2;
 var LAT_E7_MIN = -9e8;
 var LAT_E7_MAX = 9e8;
 var LON_E7_MIN = -18e8;
@@ -3490,7 +3491,9 @@ function decodeGeoLeafPage(buffer, expected = {}) {
   assertMagic(bytes, GEO_LEAF_PAGE_MAGIC, "Unsupported Rangefind geo leaf page");
   const state = { pos: GEO_LEAF_PAGE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION2) throw new Error(`Unsupported Rangefind geo leaf page version ${version}`);
+  if (version !== FORMAT_VERSION2 && version !== GEO_LEAF_CAPSULE_VERSION) {
+    throw new Error(`Unsupported Rangefind geo leaf page version ${version}`);
+  }
   const field = readUtf8(bytes, state);
   if (expected.name && expected.name !== field) throw new Error(`Rangefind geo leaf page field mismatch: ${field}`);
   const count = readVarint(bytes, state);
@@ -3501,6 +3504,7 @@ function decodeGeoLeafPage(buffer, expected = {}) {
   const latWidth = bytes[state.pos++];
   const lonWidth = bytes[state.pos++];
   const docWidth = bytes[state.pos++];
+  const capsuleFields = version >= GEO_LEAF_CAPSULE_VERSION ? Array.from({ length: readVarint(bytes, state) }, () => readUtf8(bytes, state)) : [];
   const latsE7 = new Int32Array(count);
   const lonsE7 = new Int32Array(count);
   const docs = new Uint32Array(count);
@@ -3508,8 +3512,29 @@ function decodeGeoLeafPage(buffer, expected = {}) {
   for (let i = 0; i < count; i++, pos += latWidth) latsE7[i] = minLatE7 + readFixedInt(bytes, pos, latWidth);
   for (let i = 0; i < count; i++, pos += lonWidth) lonsE7[i] = minLonE7 + readFixedInt(bytes, pos, lonWidth);
   for (let i = 0; i < count; i++, pos += docWidth) docs[i] = readFixedInt(bytes, pos, docWidth);
+  let capsules = null;
+  if (version >= GEO_LEAF_CAPSULE_VERSION) {
+    capsules = decodeDocPageColumns(bytes.subarray(pos), capsuleFields, 0);
+    if (capsules.length !== count) {
+      throw new Error(`Rangefind geo leaf capsule row count ${capsules.length} does not match point count ${count}.`);
+    }
+    for (const capsule of capsules) delete capsule.index;
+    pos = bytes.length;
+  }
   if (pos !== bytes.length) throw new Error("Rangefind geo leaf page has trailing bytes.");
-  return { field, count, minLatE7, maxLatE7, minLonE7, maxLonE7, latsE7, lonsE7, docs };
+  return {
+    field,
+    count,
+    minLatE7,
+    maxLatE7,
+    minLonE7,
+    maxLonE7,
+    latsE7,
+    lonsE7,
+    docs,
+    capsuleFields,
+    capsules
+  };
 }
 function readObjectPointer(bytes, state, packTable, target) {
   const packIndex = readVarint(bytes, state);
@@ -3645,6 +3670,115 @@ function decodeGeoBranchPage(buffer, packTable, blockFilters = [], expected = {}
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind geo branch page has trailing bytes.");
   return { field, branchIndex, firstLeafIndex, bbox, leaves };
+}
+
+// src/geo_cells.js
+var GEO_CELL_BLOCK_MAGIC = [82, 70, 71, 67];
+var GEO_CELL_BLOCK_VERSION = 1;
+var WEB_MERCATOR_MAX_LAT = 85.05112878;
+var GEO_CATEGORY_CELL_FORMAT = "rfgeocategorycell-v1";
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+function geoCellForE7(latE7, lonE7, zoom) {
+  const z = clamp(Math.floor(Number(zoom) || 0), 0, 22);
+  const scale = 2 ** z;
+  const lon = clamp(Number(lonE7) / 1e7, -180, 180);
+  const lat = clamp(Number(latE7) / 1e7, -WEB_MERCATOR_MAX_LAT, WEB_MERCATOR_MAX_LAT);
+  const radians = lat * Math.PI / 180;
+  const x = clamp(Math.floor((lon + 180) / 360 * scale), 0, scale - 1);
+  const y = clamp(
+    Math.floor((1 - Math.asinh(Math.tan(radians)) / Math.PI) / 2 * scale),
+    0,
+    scale - 1
+  );
+  return { zoom: z, x, y };
+}
+function geoCellBlock(cell, blockZoom) {
+  const zoom = Math.min(cell.zoom, Math.max(0, Math.floor(Number(blockZoom) || 0)));
+  const shift = cell.zoom - zoom;
+  const divisor = 2 ** shift;
+  return {
+    zoom,
+    x: Math.floor(cell.x / divisor),
+    y: Math.floor(cell.y / divisor)
+  };
+}
+function geoCellBlockKey(field, facet, group, block) {
+  return [
+    encodeURIComponent(String(field)),
+    encodeURIComponent(String(facet)),
+    String(Math.max(0, Math.floor(group))).padStart(6, "0"),
+    String(block.zoom).padStart(2, "0"),
+    String(block.y).padStart(7, "0"),
+    String(block.x).padStart(7, "0")
+  ].join("|");
+}
+function geoCellRouteKey(zoom, x, y, code) {
+  return `${zoom}:${y}:${x}:${code}`;
+}
+function geoCellsForBoxes(boxes, zoom, limit = Infinity) {
+  const max = Math.max(1, Math.floor(Number(limit) || 1));
+  const cells = /* @__PURE__ */ new Map();
+  for (const box of boxes || []) {
+    const northWest = geoCellForE7(box.maxLatE7, box.minLonE7, zoom);
+    const southEast = geoCellForE7(box.minLatE7, box.maxLonE7, zoom);
+    for (let y = northWest.y; y <= southEast.y; y++) {
+      for (let x = northWest.x; x <= southEast.x; x++) {
+        const key = `${y}:${x}`;
+        if (!cells.has(key)) {
+          cells.set(key, { zoom: northWest.zoom, x, y });
+          if (cells.size > max) return null;
+        }
+      }
+    }
+  }
+  return [...cells.values()];
+}
+function decodeGeoCellBlock(buffer) {
+  const bytes = new Uint8Array(buffer);
+  assertMagic(bytes, GEO_CELL_BLOCK_MAGIC, "Unsupported Rangefind geo category-cell block");
+  const state = { pos: GEO_CELL_BLOCK_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== GEO_CELL_BLOCK_VERSION) {
+    throw new Error(`Unsupported Rangefind geo category-cell block version ${version}`);
+  }
+  const blockZoom = readVarint(bytes, state);
+  const blockX = readVarint(bytes, state);
+  const blockY = readVarint(bytes, state);
+  const count = readVarint(bytes, state);
+  const routes = /* @__PURE__ */ new Map();
+  for (let index = 0; index < count; index++) {
+    const zoom = readVarint(bytes, state);
+    const x = readVarint(bytes, state);
+    const y = readVarint(bytes, state);
+    const code = readVarint(bytes, state);
+    const memberCount = readVarint(bytes, state);
+    const members = /* @__PURE__ */ new Map();
+    let previousLeaf = 0;
+    for (let member = 0; member < memberCount; member++) {
+      previousLeaf += readVarint(bytes, state);
+      const ordinalCount = readVarint(bytes, state);
+      const ordinals = new Array(ordinalCount);
+      let previousOrdinal = 0;
+      for (let ordinal2 = 0; ordinal2 < ordinalCount; ordinal2++) {
+        previousOrdinal += readVarint(bytes, state);
+        ordinals[ordinal2] = previousOrdinal;
+      }
+      members.set(previousLeaf, ordinals);
+    }
+    routes.set(geoCellRouteKey(zoom, x, y, code), members);
+  }
+  if (state.pos !== bytes.length) {
+    throw new Error("Rangefind geo category-cell block has trailing bytes.");
+  }
+  return {
+    format: GEO_CATEGORY_CELL_FORMAT,
+    blockZoom,
+    blockX,
+    blockY,
+    routes
+  };
 }
 
 // src/highlight.js
@@ -4430,6 +4564,7 @@ function traceBucketFromPath(path) {
   if (path.includes("/docs/")) return "docs";
   if (path.includes("/facets/")) return "facetDictionaries";
   if (path.includes("/filter-bitmaps/")) return "filterBitmaps";
+  if (path.includes("/geo/category-cells/")) return "geoCategoryCells";
   if (path.includes("/text-routing/")) return "textRouting";
   if (path.includes("/directory-")) return "directory";
   if (path.endsWith("/codes.bin.gz")) return "codes";
@@ -4460,6 +4595,7 @@ function traceLabelBucket(label) {
   if (value.startsWith("doc ")) return "docs";
   if (value.startsWith("facet dictionary")) return "facetDictionaries";
   if (value.startsWith("filter bitmap")) return "filterBitmaps";
+  if (value.startsWith("geo category cell")) return "geoCategoryCells";
   return "object";
 }
 function recordTraceSpan(trace, name, ms, bytes = 0) {
@@ -4693,6 +4829,8 @@ async function createSearch(options = {}) {
   const geoTreeRootCache = /* @__PURE__ */ new Map();
   const geoBranchPageCache = /* @__PURE__ */ new Map();
   const geoLeafPageCache = /* @__PURE__ */ new Map();
+  const geoCellDirectoryCache = /* @__PURE__ */ new Map();
+  const geoCellBlockCache = /* @__PURE__ */ new Map();
   let authorityLexiconRootPromise = null;
   const authorityLexiconSegmentCache = /* @__PURE__ */ new Map();
   const authorityHotCache = /* @__PURE__ */ new Map();
@@ -5355,6 +5493,143 @@ async function createSearch(options = {}) {
       "geo branch page",
       stats
     );
+  }
+  function geoCellDirectoryState(index) {
+    const key = index.directory?.root || "";
+    if (!key) return null;
+    if (!geoCellDirectoryCache.has(key)) {
+      geoCellDirectoryCache.set(key, createDirectoryState(index.directory));
+    }
+    return geoCellDirectoryCache.get(key);
+  }
+  async function geoCellDirectoryEntries(index, keys) {
+    const state = geoCellDirectoryState(index);
+    if (!state || !keys.length) return /* @__PURE__ */ new Map();
+    const root = await loadDirectoryRoot(state);
+    const resolved = await Promise.all(keys.map(async (key) => {
+      const item = await directoryEntryFromRoot(state, root, key);
+      return item ? [key, { ...item.entry, index: key }] : null;
+    }));
+    return new Map(resolved.filter(Boolean));
+  }
+  async function loadGeoCellBlocks(index, entries, stats) {
+    if (!entries.length) return [];
+    return loadPackedPages({
+      field: index.field,
+      entries,
+      cache: geoCellBlockCache,
+      cacheKey: (_field, key) => key,
+      decode: decodeGeoCellBlock,
+      label: "geo category cell block",
+      packDir: String(index.pack_dir || "geo/category-cells/packs").replace(/\/+$/u, ""),
+      rangePlan: "geoCategoryCells",
+      stats
+    });
+  }
+  function geoCellIndexForPlan(geoPlan, filterPlan) {
+    if (options.geoCellIndexes === false || !geoPlan?.boxes?.length || !filterPlan?.facets?.length) return null;
+    const indexes = geoPlan.meta?.category_cells || [];
+    for (const index of indexes) {
+      const facet = filterPlan.facets.find(([field]) => field === index.facet);
+      if (!facet) continue;
+      const selected = [...facet[1]].sort((a, b) => a - b);
+      const indexed = new Set(index.codes || []);
+      if (selected.length && selected.every((code) => indexed.has(code))) {
+        return { index: { ...index, field: geoPlan.field }, selected };
+      }
+    }
+    return null;
+  }
+  async function geoCellRoutedLeaves(geoPlan, rootPromise, filterPlan, tracking) {
+    const planned = geoCellIndexForPlan(geoPlan, filterPlan);
+    if (!planned) return null;
+    const { index, selected } = planned;
+    const maxCells = Math.max(1, Number(index.max_cells_per_query || 48));
+    const groupSize = Math.max(1, Number(index.code_group_size || 16));
+    const selectedGroups = [...new Set(selected.map((code) => Math.floor(code / groupSize)))];
+    let cells = null;
+    let level = null;
+    let requests = null;
+    for (const candidate of [...index.levels || []].sort((a, b) => b - a)) {
+      const next = geoCellsForBoxes(geoPlan.boxes, candidate, maxCells);
+      if (!next) continue;
+      const nextRequests = /* @__PURE__ */ new Map();
+      for (const cell of next) {
+        const block = geoCellBlock(cell, index.block_zoom);
+        for (const group of selectedGroups) {
+          const key = geoCellBlockKey(index.field, index.facet, group, block);
+          if (!nextRequests.has(key)) nextRequests.set(key, { key, block, group });
+        }
+      }
+      if (nextRequests.size <= maxCells) {
+        cells = next;
+        level = candidate;
+        requests = nextRequests;
+        break;
+      }
+    }
+    if (!cells) return null;
+    const directoryEntries = await geoCellDirectoryEntries(index, [...requests.keys()]);
+    const blockStats = { wanted: requests.size, fetched: 0, groups: 0 };
+    const available = [...directoryEntries.values()];
+    const decoded = await loadGeoCellBlocks(index, available, blockStats);
+    const blocksByKey = new Map(available.map((entry, position) => [entry.index, decoded[position]]));
+    const ordinalsByLeaf = /* @__PURE__ */ new Map();
+    for (const cell of cells) {
+      const block = geoCellBlock(cell, index.block_zoom);
+      for (const code of selected) {
+        const group = Math.floor(code / groupSize);
+        const key = geoCellBlockKey(index.field, index.facet, group, block);
+        const members = blocksByKey.get(key)?.routes?.get(geoCellRouteKey(level, cell.x, cell.y, code));
+        if (!members) continue;
+        for (const [leaf, ordinals] of members) {
+          if (!ordinalsByLeaf.has(leaf)) ordinalsByLeaf.set(leaf, /* @__PURE__ */ new Set());
+          const accepted = ordinalsByLeaf.get(leaf);
+          for (const ordinal2 of ordinals) accepted.add(ordinal2);
+        }
+      }
+    }
+    const wanted = [...ordinalsByLeaf.keys()].sort((a, b) => a - b);
+    const leaves = [];
+    const root = await rootPromise;
+    if (!root) return null;
+    if (root.levels === 1) {
+      for (const indexValue of wanted) {
+        if (root.leaves[indexValue]) leaves.push(root.leaves[indexValue]);
+      }
+    } else {
+      const branchIndexes = /* @__PURE__ */ new Set();
+      let branchPosition = 0;
+      for (const indexValue of wanted) {
+        while (branchPosition + 1 < root.branches.length && root.branches[branchPosition].firstLeafIndex + root.branches[branchPosition].leafCount <= indexValue) {
+          branchPosition++;
+        }
+        const branch = root.branches[branchPosition];
+        if (branch && indexValue >= branch.firstLeafIndex && indexValue < branch.firstLeafIndex + branch.leafCount) {
+          branchIndexes.add(branch.index);
+        }
+      }
+      const branches = [...branchIndexes].sort((a, b) => a - b).map((indexValue) => root.branches[indexValue]);
+      const pages = await loadGeoBranchPages(geoPlan.field, root, branches, tracking.branchFetchStats);
+      const leafMap = /* @__PURE__ */ new Map();
+      for (const page of pages) {
+        for (const leaf of page.leaves) leafMap.set(leaf.index, leaf);
+      }
+      for (const indexValue of wanted) {
+        const leaf = leafMap.get(indexValue);
+        if (leaf) leaves.push(leaf);
+      }
+    }
+    return {
+      leaves,
+      ordinalsByLeaf,
+      facet: index.facet,
+      level,
+      cells: cells.length,
+      blocksWanted: requests.size,
+      blocksFetched: blockStats.fetched,
+      blockFetchGroups: blockStats.groups
+    };
   }
   async function ensureDocValuesForDocs(fields, docs) {
     if (!docValues) await ensureDocValuesManifest();
@@ -6220,6 +6495,31 @@ async function createSearch(options = {}) {
       return docs.map((doc, i) => ({ ...doc, score: rows[i][1], index: rows[i][0] }));
     });
   }
+  async function rowsToGeoCapsuleResults(rows, capsuleByDoc, context = {}) {
+    const missing = rows.filter(([index]) => !capsuleByDoc.has(index));
+    const capsuleHits = rows.length - missing.length;
+    context.geoCapsuleHits = capsuleHits;
+    context.geoCapsuleMisses = missing.length;
+    if (!missing.length) {
+      context.docPayloadLane = "geoCapsules";
+      context.docPayloadPages = 0;
+      context.docPayloadRows = rows.length;
+      context.docPayloadOverfetchDocs = 0;
+      context.docPayloadAdaptive = false;
+      context.docPayloadForced = false;
+      return rows.map(([index, score]) => ({ ...capsuleByDoc.get(index), score, index }));
+    }
+    const fallbackContext = {};
+    const hydrated = await rowsToResults(missing, fallbackContext);
+    const hydratedByDoc = new Map(hydrated.map((result) => [result.index, result]));
+    context.docPayloadLane = capsuleHits ? `geoCapsules+${fallbackContext.docPayloadLane || "packedDocs"}` : fallbackContext.docPayloadLane;
+    context.docPayloadPages = fallbackContext.docPayloadPages || 0;
+    context.docPayloadRows = rows.length;
+    context.docPayloadOverfetchDocs = fallbackContext.docPayloadOverfetchDocs || missing.length;
+    context.docPayloadAdaptive = Boolean(fallbackContext.docPayloadAdaptive);
+    context.docPayloadForced = Boolean(fallbackContext.docPayloadForced);
+    return rows.map(([index, score]) => capsuleByDoc.has(index) ? { ...capsuleByDoc.get(index), score, index } : hydratedByDoc.get(index));
+  }
   async function rowsToSearchResults(rows, context = {}, includeResults = true) {
     if (includeResults === false) {
       context.docPayloadLane = "skipped";
@@ -6612,6 +6912,36 @@ async function createSearch(options = {}) {
       if (!emit.length) continue;
       const pages = await loadGeoLeafPages(geoPlan.field, emit.map((item) => item.leaf), leafFetchStats);
       for (let i = 0; i < emit.length; i++) yield { candidate: emit[i], leafPage: pages[i] };
+    }
+  }
+  async function* geoRoutedLeafPages(geoPlan, leaves, distanceSorted, tracking, blockFilterPlan = null, firstBatchHint = GEO_LEAF_PAGE_FIRST_BATCH_SIZE) {
+    const candidates = [];
+    for (const leaf of leaves) {
+      const candidate = geoLeafCandidate(geoPlan, leaf, blockFilterPlan);
+      if (candidate) candidates.push(candidate);
+    }
+    tracking.counters.candidateLeaves += candidates.length;
+    if (distanceSorted) {
+      candidates.sort((a, b) => a.minDist - b.minDist || a.leaf.index - b.leaf.index);
+    } else {
+      candidates.sort((a, b) => a.leaf.index - b.leaf.index);
+    }
+    let batchSize = Math.min(
+      Math.max(GEO_LEAF_PAGE_FIRST_BATCH_SIZE, firstBatchHint),
+      geoLeafPageBatchSize
+    );
+    for (let position = 0; position < candidates.length; ) {
+      const batch = candidates.slice(position, position + batchSize);
+      batchSize = Math.min(batchSize * 2, geoLeafPageBatchSize);
+      const pages = await loadGeoLeafPages(
+        geoPlan.field,
+        batch.map((item) => item.leaf),
+        tracking.leafFetchStats
+      );
+      for (let index = 0; index < batch.length; index++) {
+        yield { candidate: batch[index], leafPage: pages[index] };
+      }
+      position += batch.length;
     }
   }
   function geoTraversalTracking() {
@@ -7833,37 +8163,55 @@ async function createSearch(options = {}) {
     return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs }));
   }
   async function runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
-    const root = await loadGeoTreeRoot(geoPlan.field);
-    if (!root) return null;
+    const rootPromise = loadGeoTreeRoot(geoPlan.field);
     const offset = (page - 1) * size;
     const k = offset + size;
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const near = geoPlan.near;
     const radius = near?.radiusMeters ?? null;
     const distanceSorted = !!geoPlan.sort;
-    const bitmapStore = docFilterPlan?.active ? await filterBitmapStoreForPlan(docFilterPlan) : null;
-    const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
-    const residualFilterFields = docFilterPlan?.active ? [...new Set(filterPlanFields(docFilterPlan))].filter((field) => !bitmapCovered.has(field)) : [];
+    const tracking = geoTraversalTracking();
     const geoBlockFilterPlan = docFilterPlan?.active ? makeBlockFilterPlan(filters) : null;
+    const cellRoutingPromise = geoCellRoutedLeaves(geoPlan, rootPromise, docFilterPlan, tracking);
+    const [root, cellRouting] = await Promise.all([rootPromise, cellRoutingPromise]);
+    if (!root) return null;
+    const effectiveDocFilterPlan = cellRouting && docFilterPlan ? {
+      ...docFilterPlan,
+      facets: docFilterPlan.facets.filter(([field]) => field !== cellRouting.facet)
+    } : docFilterPlan;
+    if (effectiveDocFilterPlan) {
+      effectiveDocFilterPlan.active = effectiveDocFilterPlan.facets.length > 0 || effectiveDocFilterPlan.numbers.length > 0 || effectiveDocFilterPlan.booleans.length > 0 || !!effectiveDocFilterPlan.geo;
+    }
+    const bitmapStore = effectiveDocFilterPlan?.active ? await filterBitmapStoreForPlan(effectiveDocFilterPlan) : null;
+    const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
+    const residualFilterFields = effectiveDocFilterPlan?.active ? [...new Set(filterPlanFields(effectiveDocFilterPlan))].filter((field) => !bitmapCovered.has(field)) : [];
     const best = [];
     const collected = [];
     const distances = /* @__PURE__ */ new Map();
+    const capsuleByDoc = /* @__PURE__ */ new Map();
     let leavesVisited = 0;
     let pointsScanned = 0;
     let pointsAccepted = 0;
     let definiteLeaves = 0;
     let stoppedEarly = false;
-    const tracking = geoTraversalTracking();
     const kthDistance = () => best.length >= k ? best[k - 1].dist : Infinity;
     const firstBatchHint = textMatchDocs ? GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE : GEO_LEAF_PAGE_FIRST_BATCH_SIZE;
-    for await (const { candidate, leafPage } of geoCandidateLeafPages(
+    const leafPages = cellRouting ? geoRoutedLeafPages(
+      geoPlan,
+      cellRouting.leaves,
+      distanceSorted,
+      tracking,
+      geoBlockFilterPlan,
+      firstBatchHint
+    ) : geoCandidateLeafPages(
       geoPlan,
       root,
       distanceSorted,
       tracking,
       geoBlockFilterPlan,
       firstBatchHint
-    )) {
+    );
+    for await (const { candidate, leafPage } of leafPages) {
       if (distanceSorted && best.length >= k && candidate.minDist > kthDistance()) {
         stoppedEarly = true;
         break;
@@ -7887,9 +8235,13 @@ async function createSearch(options = {}) {
         }
         if (distanceSorted && best.length >= k && dist > kthDistance()) continue;
         const doc = docs[i];
+        if (cellRouting && !cellRouting.ordinalsByLeaf.get(candidate.leaf.index)?.has(i)) continue;
         if (textMatchDocs && !textMatchDocs.has(doc)) continue;
-        if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+        if (effectiveDocFilterPlan?.active && !passesFilterPlan(doc, codeData, effectiveDocFilterPlan)) continue;
         pointsAccepted++;
+        if (options.geoCapsules !== false && leafPage.capsules?.[i]) {
+          capsuleByDoc.set(doc, leafPage.capsules[i]);
+        }
         if (distanceSorted) {
           let lo = 0;
           let hi = best.length;
@@ -7916,7 +8268,7 @@ async function createSearch(options = {}) {
       for (const item of best) distances.set(item.doc, item.dist);
     }
     const resultContext = { hasTextTerms: false, preferDocPages: true };
-    const results = await rowsToResults(rows, resultContext);
+    const results = capsuleByDoc.size ? await rowsToGeoCapsuleResults(rows, capsuleByDoc, resultContext) : await rowsToResults(rows, resultContext);
     if (near) {
       for (const result of results) {
         const dist = distances.get(result.index);
@@ -7933,7 +8285,7 @@ async function createSearch(options = {}) {
       approximate: !exactTotal,
       stats: {
         exact: distanceSorted ? true : exactTotal,
-        geoLane: (distanceSorted ? "nearest" : "browse") + (textMatchDocs ? "Text" : ""),
+        geoLane: (distanceSorted ? "nearest" : "browse") + (textMatchDocs ? "Text" : "") + (cellRouting ? "CategoryCells" : ""),
         geoField: geoPlan.field,
         geoDistanceSorted: distanceSorted,
         geoTreeLevels: root.levels,
@@ -7941,6 +8293,12 @@ async function createSearch(options = {}) {
         geoCandidateBranches: tracking.counters.candidateBranches,
         geoBranchPagesFetched: tracking.branchFetchStats.fetched,
         geoCandidateLeaves: tracking.counters.candidateLeaves,
+        geoCategoryCellLevel: cellRouting?.level ?? null,
+        geoCategoryCells: cellRouting?.cells ?? 0,
+        geoCategoryCellBlocksWanted: cellRouting?.blocksWanted ?? 0,
+        geoCategoryCellBlocksFetched: cellRouting?.blocksFetched ?? 0,
+        geoCategoryCellBlockFetchGroups: cellRouting?.blockFetchGroups ?? 0,
+        geoCategoryCellLeaves: cellRouting?.leaves.length ?? 0,
         geoLeavesVisited: leavesVisited,
         geoDefiniteLeaves: definiteLeaves,
         geoLeafPagesPrefetched: tracking.leafFetchStats.wanted,
@@ -7948,6 +8306,8 @@ async function createSearch(options = {}) {
         geoLeafPageFetchGroups: tracking.leafFetchStats.groups,
         geoPointsScanned: pointsScanned,
         geoPointsAccepted: pointsAccepted,
+        geoCapsuleHits: resultContext.geoCapsuleHits ?? 0,
+        geoCapsuleMisses: resultContext.geoCapsuleMisses ?? rows.length,
         docPayloadLane: resultContext.docPayloadLane,
         docPayloadPages: resultContext.docPayloadPages,
         docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs

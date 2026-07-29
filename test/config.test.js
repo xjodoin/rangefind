@@ -29,6 +29,10 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.builderMemoryBudgetBytes, 0);
   assert.equal(config.indexProfile, "static-large");
   assert.equal(config.queryBundles, false);
+  assert.equal(config.geoCapsules, false);
+  assert.deepEqual(config.geoCapsuleFields, []);
+  assert.equal(config.geoCapsuleDocPageCachePages, 256);
+  assert.deepEqual(config.geoCellIndexes, []);
   assert.equal(config.targetPostingsPerDoc, 12);
   assert.equal(config.maxTermsPerDoc, 12);
   assert.equal(config.bodyIndexChars, 6000);
@@ -81,6 +85,9 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
     docPackSpoolPreloadMaxBytes: 32 * 1024 * 1024,
     docPackSpoolPreloadChunkBytes: 128 * 1024,
     docLayoutStrategy: "doc-id",
+    geoCapsules: true,
+    geoCapsuleFields: ["name", "name", " city "],
+    geoCapsuleDocPageCachePages: 99999,
     postingGzipLevel: 3,
     typoMode: "off",
     typoMaxShardLookups: 4,
@@ -106,6 +113,9 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
   assert.equal(config.docPackSpoolPreloadMaxBytes, 32 * 1024 * 1024);
   assert.equal(config.docPackSpoolPreloadChunkBytes, 128 * 1024);
   assert.equal(config.docLayoutStrategy, "doc-id");
+  assert.equal(config.geoCapsules, true);
+  assert.deepEqual(config.geoCapsuleFields, ["name", "city"]);
+  assert.equal(config.geoCapsuleDocPageCachePages, 4096);
   assert.equal(config.postingGzipLevel, 3);
   assert.equal(config.typoMode, "off");
   assert.equal(config.typoMaxShardLookups, 4);
@@ -118,4 +128,35 @@ test("getPath reads nested values, arrays, nulls, and fallbacks", () => {
   assert.equal(getPath(object, "tags"), "static search");
   assert.equal(getPath(object, "empty", "fallback"), "fallback");
   assert.equal(getPath(object, "missing.value", "fallback"), "fallback");
+});
+
+test("readConfig normalizes multi-resolution geo-cell indexes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rangefind-config-geo-cells-"));
+  const configPath = join(dir, "rangefind.config.json");
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/search",
+    facets: [{ name: "category", path: "category" }],
+    geo: [{ name: "location", latPath: "lat", lonPath: "lon" }],
+    geoCellIndexes: [{
+      field: "location",
+      facet: "category",
+      levels: [15, 9, 12, 12],
+      blockZoom: 10,
+      codeGroupSize: 0,
+      maxCellsPerQuery: 999,
+      values: ["cafe", "cafe", " museum "]
+    }]
+  }));
+  const config = await readConfig(configPath);
+  assert.deepEqual(config.geoCellIndexes, [{
+    field: "location",
+    facet: "category",
+    levels: [9, 12, 15],
+    blockZoom: 9,
+    codeGroupSize: 1,
+    maxCellsPerQuery: 256,
+    maxFacetValues: 256,
+    values: ["cafe", "museum"]
+  }]);
 });

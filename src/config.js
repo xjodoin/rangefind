@@ -12,6 +12,19 @@ export const DEFAULTS = {
   linkGraph: null,
   geoLeafSize: 512,
   geoPackBytes: 4 * 1024 * 1024,
+  // Optional spatial result capsules. When enabled, every geo leaf carries
+  // the configured display-field subset beside its coordinates/doc ids, so
+  // nearest and viewport lanes can return results from the same range read
+  // instead of opening the document store afterward.
+  geoCapsules: false,
+  geoCapsuleFields: [],
+  geoCapsuleDocPageCachePages: 256,
+  // Optional multi-resolution facet routing over geo cells. Cell blocks carry
+  // exact leaf/point ordinals; result payloads remain single-copy in geo leaves.
+  geoCellIndexes: [],
+  geoCellPackBytes: 4 * 1024 * 1024,
+  geoCellDirectoryPageBytes: 64 * 1024,
+  geoCellSortChunkRecords: 262144,
   suggestMaxTokenKeys: 4,
   suggestMinKeyLength: 1,
   suggestHotListSize: 64,
@@ -164,6 +177,71 @@ function applyIndexProfile(config, raw) {
   config.postingGzipLevel = clampInt(config.postingGzipLevel, DEFAULTS.postingGzipLevel, 0, 9);
   config.docLayoutStrategy = String(config.docLayoutStrategy || DEFAULTS.docLayoutStrategy).toLowerCase();
   if (!["locality", "doc-id"].includes(config.docLayoutStrategy)) config.docLayoutStrategy = DEFAULTS.docLayoutStrategy;
+  config.geoCapsules = config.geoCapsules === true;
+  config.geoCapsuleDocPageCachePages = clampInt(
+    config.geoCapsuleDocPageCachePages,
+    DEFAULTS.geoCapsuleDocPageCachePages,
+    1,
+    4096
+  );
+  config.geoCapsuleFields = Array.isArray(config.geoCapsuleFields)
+    ? [...new Set(config.geoCapsuleFields.map(String).map(field => field.trim()).filter(Boolean))]
+    : [];
+  if (config.geoCapsules && !config.geoCapsuleFields.length) {
+    config.geoCapsuleFields = (config.display || [])
+      .map(field => typeof field === "string" ? field : field?.name)
+      .map(String)
+      .map(field => field.trim())
+      .filter(Boolean);
+  }
+  const geoNames = new Set((config.geo || []).map(field => field.name));
+  const facetNames = new Set((config.facets || []).map(field => field.name));
+  config.geoCellIndexes = (Array.isArray(config.geoCellIndexes) ? config.geoCellIndexes : []).map((item, index) => {
+    const field = String(item?.field || item?.geoField || "").trim();
+    const facet = String(item?.facet || "").trim();
+    if (!geoNames.has(field)) {
+      throw new Error(`Rangefind geoCellIndexes[${index}] references unknown geo field "${field}".`);
+    }
+    if (!facetNames.has(facet)) {
+      throw new Error(`Rangefind geoCellIndexes[${index}] references unknown facet "${facet}".`);
+    }
+    const rawLevels = Array.isArray(item.levels) && item.levels.length ? item.levels : [9, 12, 15];
+    const levels = [...new Set(rawLevels
+      .map(value => Number(value))
+      .filter(Number.isFinite)
+      .map(value => Math.max(0, Math.min(22, Math.floor(value)))))]
+      .sort((a, b) => a - b);
+    if (!levels.length) {
+      throw new Error(`Rangefind geoCellIndexes[${index}] needs at least one numeric level.`);
+    }
+    const blockZoom = clampInt(item.blockZoom, Math.min(9, levels[0]), 0, levels[0]);
+    return {
+      field,
+      facet,
+      levels,
+      blockZoom,
+      codeGroupSize: clampInt(item.codeGroupSize, 16, 1, 256),
+      maxCellsPerQuery: clampInt(item.maxCellsPerQuery, 48, 1, 256),
+      maxFacetValues: clampInt(item.maxFacetValues, 256, 1, 4096),
+      values: Array.isArray(item.values)
+        ? [...new Set(item.values.map(String).map(value => value.trim()).filter(Boolean))]
+        : []
+    };
+  });
+  const geoCellPairs = new Set();
+  for (const item of config.geoCellIndexes) {
+    const key = `${item.field}\u0000${item.facet}`;
+    if (geoCellPairs.has(key)) {
+      throw new Error(`Rangefind geoCellIndexes contains duplicate ${item.field} × ${item.facet} indexes.`);
+    }
+    geoCellPairs.add(key);
+  }
+  config.geoCellSortChunkRecords = clampInt(
+    config.geoCellSortChunkRecords,
+    DEFAULTS.geoCellSortChunkRecords,
+    1,
+    4 * 1024 * 1024
+  );
   return config;
 }
 

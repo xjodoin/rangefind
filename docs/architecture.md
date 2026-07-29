@@ -366,6 +366,21 @@ range requests:
 - Each leaf page stores its bounding box plus delta-encoded fixed-width
   lat/lon/doc columns, individually gzipped and checksummed like every other
   range object.
+- With `geoCapsules: true`, each leaf also stores a columnar subset of display
+  fields selected by `geoCapsuleFields`. Viewport and nearest lanes can then
+  return their page from the same spatial range read, without opening document
+  pointers or payload packs. Missing/legacy capsule rows fall back to normal
+  document hydration, so mixed generations remain safe.
+- `geoCellIndexes` optionally adds exact multi-resolution routing for a geo
+  field plus facet (for example `location × type`). The builder externally
+  sorts compact `cell/category -> geo leaf + point ordinal` references at
+  configured zoom levels and groups them into range-addressed blocks. The
+  browser chooses the finest level within its cell/request budget, opens only
+  blocks for the selected facet codes, and scans only the referenced points.
+  That ordinal membership proves the indexed facet without a global bitmap or
+  doc-value read; exact geometry and any remaining filters still use the
+  ordinary runtime predicates. Documents and capsules are not duplicated.
+  Broad boxes, unindexed values, and legacy generations use the geo tree.
 - A gzipped tree root (`geo/<field>.<hash>.bin.gz`) is loaded lazily on the
   first geo query. Small trees list every leaf inline; large trees are
   two-level: the root lists branch entries (bbox, point count, object pointer)

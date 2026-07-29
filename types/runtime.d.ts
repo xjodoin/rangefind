@@ -154,6 +154,10 @@ export interface CreateSearchOptions {
   multiRangeRequests?: boolean;
   /** Maximum byte ranges per multipart request (default 32, clamped to 2–64). */
   multiRangeMaxRanges?: number;
+  /** Use display rows embedded in geo leaves; set false to force document hydration. */
+  geoCapsules?: boolean;
+  /** Use multi-resolution facet-to-geo-cell routing; set false to force tree traversal. */
+  geoCellIndexes?: boolean;
   [key: string]: unknown;
 }
 

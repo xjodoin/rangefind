@@ -225,15 +225,32 @@ const GEO_VECTOR_CONFIG = {
   vectors: [{ name: "embedding", path: "embedding", dims: 8 }]
 };
 
+const GEO_VECTOR_CAPSULE_CONFIG = {
+  ...GEO_VECTOR_CONFIG,
+  geoCapsules: true,
+  geoCapsuleFields: ["id", "title", "topic", "year"],
+  geoCellIndexes: [{
+    field: "location",
+    facet: "topic",
+    levels: [6, 10, 14],
+    blockZoom: 6,
+    codeGroupSize: 4,
+    values: [...TOPICS]
+  }]
+};
+
 test("geo and vector lanes merge across generations", async () => {
   const fullRoot = await mkdtemp(join(tmpdir(), "rangefind-gen-geovec-full-"));
   const deltaRoot = await mkdtemp(join(tmpdir(), "rangefind-gen-geovec-delta-"));
   const baseDocs = Array.from({ length: 150 }, (_, i) => makeGeoVectorDoc(i));
   const addedDocs = Array.from({ length: 60 }, (_, i) => makeGeoVectorDoc(150 + i));
 
-  await buildAt(fullRoot, [...baseDocs, ...addedDocs], GEO_VECTOR_CONFIG);
+  await buildAt(fullRoot, [...baseDocs, ...addedDocs], GEO_VECTOR_CAPSULE_CONFIG);
+  // Deliberately mix a legacy base generation with a capsule-enabled delta.
+  // The merged runtime must use the fast rows where available and hydrate
+  // only legacy misses without changing result identity or ordering.
   await buildAt(deltaRoot, baseDocs, GEO_VECTOR_CONFIG);
-  await buildAt(deltaRoot, addedDocs, GEO_VECTOR_CONFIG, { update: true });
+  await buildAt(deltaRoot, addedDocs, GEO_VECTOR_CAPSULE_CONFIG, { update: true });
 
   const fullServer = await serveStatic(join(fullRoot, "public"));
   const deltaServer = await serveStatic(join(deltaRoot, "public"));
@@ -241,6 +258,9 @@ test("geo and vector lanes merge across generations", async () => {
     const fullEngine = await createSearch({ baseUrl: fullServer.baseUrl });
     const deltaEngine = await createSearch({ baseUrl: deltaServer.baseUrl });
     const center = { lat: 45.6, lon: -73.6 };
+    assert.equal(fullEngine.manifest.features.geoCapsules, true);
+    assert.equal(fullEngine.manifest.features.geoCategoryCells, true);
+    assert.equal(deltaEngine.manifest.generations.length, 2);
 
     // Geo box browse: same match set, both generations represented.
     const box = { minLat: 45.45, maxLat: 45.75, minLon: -73.75, maxLon: -73.45 };
@@ -252,6 +272,26 @@ test("geo and vector lanes merge across generations", async () => {
     );
     assert.ok(deltaBox.results.some(item => item.generation === 0));
     assert.ok(deltaBox.results.some(item => item.generation === 1));
+
+    // A capsule/cell-enabled full rebuild agrees with a mixed legacy base +
+    // cell-enabled delta. Each generation independently selects its fast path
+    // or exact tree fallback before the normal federated merge.
+    const filteredGeo = {
+      q: "",
+      filters: { facets: { topic: ["glacier"] } },
+      geo: {
+        box: { minLat: 45.45, maxLat: 45.75, minLon: -73.75, maxLon: -73.45 },
+        near: center,
+        sort: "distance"
+      },
+      size: 30
+    };
+    const fullFilteredGeo = await fullEngine.search(filteredGeo);
+    const deltaFilteredGeo = await deltaEngine.search(filteredGeo);
+    assert.deepEqual(
+      deltaFilteredGeo.results.map(item => item.id),
+      fullFilteredGeo.results.map(item => item.id)
+    );
 
     // Nearest-first: merged distance order matches the full rebuild (ids at
     // equal rounded distances may tie-break differently, so compare grouped

@@ -9,12 +9,15 @@ import {
   writeFixedInt
 } from "./binary.js";
 import { assertMagic, pushUtf8, readBlockFilterSummary, readUtf8, writeBlockFilterSummary } from "./codec.js";
+import { decodeDocPageColumns, encodeDocPageColumns } from "./doc_pages.js";
 
 export const GEO_TREE_ROOT_FORMAT = "rfgeotreeroot-v1";
 export const GEO_BRANCH_PAGE_FORMAT = "rfgeobranchpage-v1";
 export const GEO_LEAF_PAGE_FORMAT = "rfgeoleafpage-v1";
+export const GEO_LEAF_CAPSULE_PAGE_FORMAT = "rfgeoleafpage-v2";
 
 const FORMAT_VERSION = 1;
+const GEO_LEAF_CAPSULE_VERSION = 2;
 
 export const LAT_E7_MIN = -900000000;
 export const LAT_E7_MAX = 900000000;
@@ -275,10 +278,21 @@ export function buildGeoTreeLeaves(latsE7, lonsE7, docs, leafSize) {
   return leaves;
 }
 
-export function encodeGeoLeafPage(fieldName, latsE7, lonsE7, docs, leaf) {
+export function encodeGeoLeafPage(fieldName, latsE7, lonsE7, docs, leaf, options = {}) {
+  const capsuleFields = Array.isArray(options.capsuleFields)
+    ? options.capsuleFields.map(String).filter(Boolean)
+    : [];
+  const capsules = Array.isArray(options.capsules) ? options.capsules : null;
+  if ((capsules && !capsuleFields.length) || (!capsules && capsuleFields.length)) {
+    throw new Error("Rangefind geo leaf capsules need both capsules and capsuleFields.");
+  }
   const count = leaf.count;
+  if (capsules && capsules.length !== count) {
+    throw new Error(`Rangefind geo leaf capsule row count ${capsules.length} does not match point count ${count}.`);
+  }
+  const version = capsules ? GEO_LEAF_CAPSULE_VERSION : FORMAT_VERSION;
   const header = [...GEO_LEAF_PAGE_MAGIC];
-  pushVarint(header, FORMAT_VERSION);
+  pushVarint(header, version);
   pushUtf8(header, fieldName);
   pushVarint(header, count);
   pushZigzag(header, leaf.minLatE7);
@@ -299,6 +313,10 @@ export function encodeGeoLeafPage(fieldName, latsE7, lonsE7, docs, leaf) {
   const lonWidth = fixedWidth([maxLonDelta]);
   const docWidth = fixedWidth([maxDoc]);
   header.push(latWidth, lonWidth, docWidth);
+  if (capsules) {
+    pushVarint(header, capsuleFields.length);
+    for (const field of capsuleFields) pushUtf8(header, field);
+  }
   const body = Buffer.alloc(count * (latWidth + lonWidth + docWidth));
   let pos = 0;
   for (let i = leaf.start; i < leaf.end; i++, pos += latWidth) {
@@ -310,7 +328,12 @@ export function encodeGeoLeafPage(fieldName, latsE7, lonsE7, docs, leaf) {
   for (let i = leaf.start; i < leaf.end; i++, pos += docWidth) {
     writeFixedInt(body, pos, docWidth, docs[i]);
   }
-  return Buffer.concat([Buffer.from(Uint8Array.from(header)), body]);
+  const capsuleBody = capsules
+    ? Buffer.from(encodeDocPageColumns(capsules, capsuleFields))
+    : null;
+  return capsuleBody
+    ? Buffer.concat([Buffer.from(Uint8Array.from(header)), body, capsuleBody])
+    : Buffer.concat([Buffer.from(Uint8Array.from(header)), body]);
 }
 
 export function decodeGeoLeafPage(buffer, expected = {}) {
@@ -318,7 +341,9 @@ export function decodeGeoLeafPage(buffer, expected = {}) {
   assertMagic(bytes, GEO_LEAF_PAGE_MAGIC, "Unsupported Rangefind geo leaf page");
   const state = { pos: GEO_LEAF_PAGE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION) throw new Error(`Unsupported Rangefind geo leaf page version ${version}`);
+  if (version !== FORMAT_VERSION && version !== GEO_LEAF_CAPSULE_VERSION) {
+    throw new Error(`Unsupported Rangefind geo leaf page version ${version}`);
+  }
   const field = readUtf8(bytes, state);
   if (expected.name && expected.name !== field) throw new Error(`Rangefind geo leaf page field mismatch: ${field}`);
   const count = readVarint(bytes, state);
@@ -329,6 +354,9 @@ export function decodeGeoLeafPage(buffer, expected = {}) {
   const latWidth = bytes[state.pos++];
   const lonWidth = bytes[state.pos++];
   const docWidth = bytes[state.pos++];
+  const capsuleFields = version >= GEO_LEAF_CAPSULE_VERSION
+    ? Array.from({ length: readVarint(bytes, state) }, () => readUtf8(bytes, state))
+    : [];
   const latsE7 = new Int32Array(count);
   const lonsE7 = new Int32Array(count);
   const docs = new Uint32Array(count);
@@ -336,8 +364,29 @@ export function decodeGeoLeafPage(buffer, expected = {}) {
   for (let i = 0; i < count; i++, pos += latWidth) latsE7[i] = minLatE7 + readFixedInt(bytes, pos, latWidth);
   for (let i = 0; i < count; i++, pos += lonWidth) lonsE7[i] = minLonE7 + readFixedInt(bytes, pos, lonWidth);
   for (let i = 0; i < count; i++, pos += docWidth) docs[i] = readFixedInt(bytes, pos, docWidth);
+  let capsules = null;
+  if (version >= GEO_LEAF_CAPSULE_VERSION) {
+    capsules = decodeDocPageColumns(bytes.subarray(pos), capsuleFields, 0);
+    if (capsules.length !== count) {
+      throw new Error(`Rangefind geo leaf capsule row count ${capsules.length} does not match point count ${count}.`);
+    }
+    for (const capsule of capsules) delete capsule.index;
+    pos = bytes.length;
+  }
   if (pos !== bytes.length) throw new Error("Rangefind geo leaf page has trailing bytes.");
-  return { field, count, minLatE7, maxLatE7, minLonE7, maxLonE7, latsE7, lonsE7, docs };
+  return {
+    field,
+    count,
+    minLatE7,
+    maxLatE7,
+    minLonE7,
+    maxLonE7,
+    latsE7,
+    lonsE7,
+    docs,
+    capsuleFields,
+    capsules
+  };
 }
 
 function pushObjectPointer(out, entry, packIndexes) {

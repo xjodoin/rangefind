@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.3.22 — 2026-07-29
+
+### Added
+
+- Geo indexes can embed compact display capsules in their leaf pages, allowing
+  viewport and nearest-result lanes to return complete map rows without
+  opening document payload packs.
+- Configurable multi-resolution category-cell indexes route a geo field and
+  facet directly to exact matching point ordinals. The builder uses a bounded
+  external sort and publishes range-addressed cell blocks and directory pages.
+
+### Performance
+
+- Category-cell geo queries select the finest safe grid level for the current
+  viewport or radius, avoid global facet bitmap and doc-value reads, and fetch
+  fewer point-pack ranges than ordinary geo-tree traversal.
+- Cold category-cell and geo-tree root reads start concurrently instead of
+  forming a serial network waterfall.
+- OSM map intents use bounded locality/category probes, and grouped immutable
+  object reads share the generic multipart range-request path.
+
+### Fixed
+
+- Address interpolation remains available across mixed index generations,
+  including when the newest generation has no interpolation sidecar.
+
 ## 0.3.21 — 2026-07-27
 
 ### Added
