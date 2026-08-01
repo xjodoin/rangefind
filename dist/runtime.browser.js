@@ -5535,6 +5535,7 @@ async function createSearch(options = {}) {
   }
   function geoCellIndexForPlan(geoPlan, filterPlan) {
     if (options.geoCellIndexes === false || !geoPlan?.boxes?.length || !filterPlan?.facets?.length) return null;
+    if (Number(geoPlan.meta?.levels || 0) <= 1) return null;
     const indexes = geoPlan.meta?.category_cells || [];
     for (const index of indexes) {
       const facet = filterPlan.facets.find(([field]) => field === index.facet);

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.3.23 — 2026-07-31
+
+### Performance
+
+- Mixed sharded roots use child-level facet capabilities for anchored and
+  viewport category queries, so rebuilt regions immediately get exact
+  category pruning without waiting for every sibling shard to upgrade.
+- Single-level geo trees skip category-cell directory reads because their
+  cached root already carries every leaf summary; multi-level trees retain
+  the category-cell lane where it can bypass branch fan-out.
+- Category-like named destinations on legacy shards use one bounded local
+  relevance page after exact authority misses, avoiding global fan-out and
+  province-wide coordinate reads for searches such as airports and typoed
+  universities.
+
+### Fixed
+
+- Intersection queries prefer an existing OSM intersection document and add
+  the resolved locality to street fallback searches, improving both exact
+  crossing quality and regional routing.
+
 ## 0.3.22 — 2026-07-29
 
 ### Added

@@ -132,9 +132,9 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     assert.equal(nearbyCinema.results[0]?.id, "node/2");
     assert.equal(nearbyCinema.stats.docPayloadLane, "geoCapsules");
     assert.equal(nearbyCinema.stats.geoCapsuleHits, 1);
-    assert.match(nearbyCinema.stats.geoLane, /CategoryCells$/u);
-    assert.ok(nearbyCinema.stats.geoCategoryCellBlocksFetched >= 1);
-    assert.ok(!nearbyCinema.stats.trace.spans.some(span => span.name === "filterBitmaps.fetch"));
+    assert.doesNotMatch(nearbyCinema.stats.geoLane, /CategoryCells$/u);
+    assert.equal(nearbyCinema.stats.geoCategoryCellBlocksFetched, 0);
+    assert.ok(nearbyCinema.stats.trace.spans.some(span => span.name === "filterBitmaps.fetch"));
     assert.ok(!nearbyCinema.stats.trace.spans.some(span => span.name === "docValues.fetch"));
     assert.equal(
       nearbyCinema.stats.trace.spans.find(span => span.name === "manifest.fetch")?.count,
@@ -209,6 +209,9 @@ test("Sharded OSM build embeds the category lexicon and keeps categories local",
     });
     assert.equal(near.stats.plannerLane, "osmCategoryNearby");
     assert.equal(near.results[0]?.name, "Cinéma Beaubien");
+    assert.equal(near.stats.osmIntentCategoryFacet, true);
+    assert.equal(near.stats.shardsQueried, 1);
+    assert.deepEqual(near.stats.osmIntentCoverageShards, ["quebec"]);
     // The French alias resolves through the embedded lexicon too.
     const french = await searchOsmQuery(engine, {
       q: "cinéma près de moi", size: 5, near: { lat: 45.5, lon: -73.57 }

@@ -1120,7 +1120,7 @@ test("OSM anchored exact and one-edit landmark names bypass locality parsing", a
   });
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1].shards, ["quebec"]);
-  assert.equal(fuzzy.stats.plannerLane, "osmNearFuzzyText");
+  assert.equal(fuzzy.stats.plannerLane, "osmNearIntentText");
   assert.equal(fuzzy.results[0].name, "McGill University");
 });
 

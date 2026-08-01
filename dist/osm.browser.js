@@ -659,6 +659,51 @@ function bboxContainsPoint(bbox, lat, lon) {
 function anchorCoverageShards(engine, anchor) {
   return (engine.manifest?.shards || []).filter((shard) => bboxContainsPoint(shard.bbox, anchor.lat, anchor.lon)).map((shard) => String(shard.id)).sort();
 }
+function explicitShardScope(params) {
+  if (params?.shards == null) return [];
+  return (Array.isArray(params.shards) ? params.shards : [params.shards]).map(String);
+}
+function shardScopeSupportsFeature(engine, shards, feature) {
+  if (engine.manifest?.features?.[feature] === true) return true;
+  if (!shards?.length) return false;
+  const descriptors = engine.manifest?.shards || [];
+  const selected = /* @__PURE__ */ new Set();
+  let resolvedScopes = 0;
+  for (const scope of shards.map(String)) {
+    const direct = descriptors.find((shard) => String(shard.id) === scope);
+    if (direct) {
+      selected.add(direct);
+      resolvedScopes++;
+      continue;
+    }
+    let matchedGroup = false;
+    for (const shard of descriptors) {
+      if ((shard.groups || []).map(String).includes(scope)) {
+        selected.add(shard);
+        matchedGroup = true;
+      }
+    }
+    if (matchedGroup) resolvedScopes++;
+  }
+  return resolvedScopes === shards.length && selected.size > 0 && [...selected].every((shard) => shard.features?.[feature] === true);
+}
+function viewportCoverageShards(engine, box) {
+  if (!box) return [];
+  const minLat = Number(box.minLat);
+  const maxLat = Number(box.maxLat);
+  const minLon = Number(box.minLon);
+  const maxLon = Number(box.maxLon);
+  if (![minLat, maxLat, minLon, maxLon].every(Number.isFinite) || minLat > maxLat) return [];
+  const lonIntervals = (left, right) => left <= right ? [[left, right]] : [[left, 180], [-180, right]];
+  const requestedLon = lonIntervals(minLon, maxLon);
+  return (engine.manifest?.shards || []).filter((shard) => {
+    if (!Array.isArray(shard.bbox) || shard.bbox.length !== 4) return false;
+    const [shardMinLat, shardMinLon, shardMaxLat, shardMaxLon] = shard.bbox.map(Number);
+    if (![shardMinLat, shardMinLon, shardMaxLat, shardMaxLon].every(Number.isFinite)) return false;
+    if (shardMaxLat < minLat || shardMinLat > maxLat) return false;
+    return requestedLon.some(([left, right]) => lonIntervals(shardMinLon, shardMaxLon).some(([shardLeft, shardRight]) => shardRight >= left && shardLeft <= right));
+  }).map((shard) => String(shard.id)).sort();
+}
 function anchorRadiusCoverageShards(engine, anchor, radiusMeters) {
   const angularDistance = (left, right) => {
     const distance = Math.abs(left - right) % 360;
@@ -704,7 +749,7 @@ async function anchoredExactText(engine, q, params, anchor, {
   intent = null
 } = {}) {
   const coverage = anchorCoverageShards(engine, anchor);
-  const explicitScope = params.shards == null ? [] : (Array.isArray(params.shards) ? params.shards : [params.shards]).map(String);
+  const explicitScope = explicitShardScope(params);
   const directScope = explicitScope.length ? explicitScope : coverage;
   const compoundName = fold(q).split(/[^\p{L}\p{N}]+/u).filter(Boolean).length >= 2;
   if (!intent && compoundName && directScope.length) {
@@ -752,14 +797,67 @@ async function anchoredExactText(engine, q, params, anchor, {
       if (!isGeoTextSortBudgetError(error)) throw error;
     }
   }
-  const authority = await exactAuthorityScope(engine, q);
+  let intentAuthority;
+  if (intent && allowUngatedFuzzy) intentAuthority = await exactAuthorityScope(engine, q);
+  if (intent && allowUngatedFuzzy && !intentAuthority && directScope.length && !shardScopeSupportsFeature(engine, directScope, "facetSummaryUint32")) {
+    const requestedSize2 = Math.max(1, Number(params.size || 10));
+    const localText = await engine.search({
+      ...params,
+      q,
+      shards: directScope,
+      geo: void 0,
+      size: Math.min(64, Math.max(32, requestedSize2 * 2))
+    });
+    const intentTokens = fold(intent.locality).split(/[^\p{L}\p{N}]+/u).filter((token) => token.length >= 3);
+    const viewport = params.geo?.box;
+    const candidateRows = (localText.results || []).map((result, rank) => {
+      const lat = Number(result.lat);
+      const lon = Number(result.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+      if (viewport && !bboxContainsPoint([
+        Number(viewport.minLat),
+        Number(viewport.minLon),
+        Number(viewport.maxLat),
+        Number(viewport.maxLon)
+      ], lat, lon)) return null;
+      const distanceMeters = haversineMeters(anchor.lat, anchor.lon, lat, lon);
+      if (!viewport && distanceMeters > NEAR_TEXT_RADIUS_METERS) return null;
+      const words = fold(result.name || result.title).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+      const matchesIntent = intentTokens.every((token) => words.some((word) => word.includes(token) || token.includes(word) || withinOneEdit(word, token)));
+      if (!matchesIntent) return null;
+      return {
+        result: { ...result, distanceMeters },
+        rank,
+        categoryMatch: String(result.type || "") === String(intent.category.type || "")
+      };
+    }).filter(Boolean);
+    candidateRows.sort((left, right) => Number(right.categoryMatch) - Number(left.categoryMatch) || left.rank - right.rank || left.result.distanceMeters - right.result.distanceMeters);
+    if (candidateRows.length) {
+      const results = candidateRows.slice(0, requestedSize2).map((row) => row.result);
+      return collapseCivicDuplicates({
+        ...localText,
+        total: candidateRows.length,
+        size: requestedSize2,
+        approximate: localText.total > localText.results.length,
+        results,
+        stats: {
+          ...localText.stats || {},
+          plannerLane: viewport ? "osmViewportIntentText" : "osmNearIntentText",
+          osmIntentRadiusMeters: viewport ? 0 : NEAR_TEXT_RADIUS_METERS,
+          osmIntentCategoryHint: intent.category.type,
+          osmIntentCoverageShards: directScope
+        }
+      });
+    }
+  }
+  const authority = intentAuthority === void 0 ? await exactAuthorityScope(engine, q) : intentAuthority;
   if (!authority && !allowUngatedFuzzy) return null;
-  const authorityCoverage = authority?.shards?.length ? coverage.filter((shard) => authority.shards.includes(shard)) : [];
-  const scope = authorityCoverage.length ? authorityCoverage : coverage;
+  const authorityCoverage = authority?.shards?.length ? directScope.filter((shard) => authority.shards.includes(shard)) : [];
+  const scope = authorityCoverage.length ? authorityCoverage : directScope;
   const requestedSize = Math.max(1, Number(params.size || 10));
   const intentNameTokens = !authority && allowUngatedFuzzy && intent && !intent.connector ? fold(intent.locality).split(" ").filter((token) => token.length >= 3) : [];
   const distinctiveIntentToken = intentNameTokens.at(-1);
-  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true;
+  const categoryFacetSafe = shardScopeSupportsFeature(engine, scope, "facetSummaryUint32");
   const probeParams = distinctiveIntentToken ? {
     ...params,
     q: distinctiveIntentToken,
@@ -1188,9 +1286,15 @@ async function resolveIntersectionLocality(engine, surface, params, anchor = nul
     const split = rightTokens.length - localityLength;
     const candidateStreet = parsedStreetSurface(rightTokens.slice(0, split).join(" "));
     if (!candidateStreet) continue;
-    const candidateLocality = await resolveLocality(
+    const localitySurface = rightTokens.slice(split).join(" ");
+    const authority = await exactAuthorityScope(engine, localitySurface);
+    const candidateLocality = authority?.shards?.length ? {
+      name: authority.text || localitySurface,
+      type: "authority",
+      shard: authority.shards[0]
+    } : await resolveLocality(
       engine,
-      rightTokens.slice(split).join(" "),
+      localitySurface,
       routedParams,
       { authorityMissIsFinal: true }
     );
@@ -1213,6 +1317,63 @@ async function resolveIntersectionLocality(engine, surface, params, anchor = nul
     };
   }
   const localityShard = String(locality.shard || "").split("/")[0];
+  const localityName = locality.name || rightTokens.at(-1) || "";
+  const intersectionScope = localityShard ? [localityShard] : coverage;
+  const directIntersection = await engine.search({
+    ...params,
+    q: `${parsed.left.core} ${rightStreet.core} ${localityName}`.trim(),
+    typo: false,
+    size: Math.max(20, Number(params.size || 10)),
+    geo: void 0,
+    ...intersectionScope.length ? { shards: intersectionScope } : {}
+  });
+  const streetTokensMatch = (name2, street) => {
+    const haystack = fold(name2).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const needles = fold(street.core).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    return needles.length > 0 && needles.every((token) => haystack.includes(token));
+  };
+  const explicitIntersection = (directIntersection.results || []).find((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && streetTokensMatch(result.name || result.title, parsed.left) && streetTokensMatch(result.name || result.title, rightStreet) && (fold(result.city) === fold(localityName) || haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= localityRadiusMeters(locality.type)));
+  if (explicitIntersection) {
+    const name2 = explicitIntersection.name || explicitIntersection.title;
+    const trace2 = mergeRuntimeTraces(
+      locality[LOCALITY_SEARCH_STATS]?.trace,
+      directIntersection.stats?.trace
+    );
+    return {
+      ...directIntersection,
+      total: 1,
+      size: Number(params.size || 10),
+      approximate: false,
+      results: [{
+        ...explicitIntersection,
+        name: name2,
+        title: name2,
+        type: explicitIntersection.type || "intersection",
+        category: explicitIntersection.category || "highway",
+        ...anchor ? {
+          distanceMeters: haversineMeters(anchor.lat, anchor.lon, explicitIntersection.lat, explicitIntersection.lon)
+        } : {}
+      }],
+      resolvedQuery: `${name2}, ${localityName}`,
+      stats: {
+        ...directIntersection.stats || {},
+        ...trace2 ? { trace: trace2 } : {},
+        plannerLane: "osmIntersectionDocument",
+        osmIntentLocality: localityName,
+        osmIntentStreets: [parsed.left.text, rightStreet.text],
+        ...intersectionScope.length ? { osmIntentCoverageShards: intersectionScope } : {}
+      }
+    };
+  }
+  if (!Number.isFinite(locality.lat) || !Number.isFinite(locality.lon)) {
+    const resolvedLocality = await resolveLocality(
+      engine,
+      localityName,
+      routedParams,
+      { authorityMissIsFinal: true }
+    );
+    if (resolvedLocality) locality = resolvedLocality;
+  }
   const searchStreet = async (street) => {
     const scoped = {
       ...params,
@@ -1221,6 +1382,8 @@ async function resolveIntersectionLocality(engine, surface, params, anchor = nul
       geo: void 0,
       ...localityShard ? { shards: [localityShard] } : coverage.length ? { shards: coverage } : {}
     };
+    const local = await engine.search({ ...scoped, q: `${street.core} ${localityName}`.trim() });
+    if (local.total > 0) return local;
     const primary = await engine.search({ ...scoped, q: street.core });
     if (primary.total > 0) return primary;
     const fallbackTerm = street.core.split(/[^\p{L}\p{N}]+/u).filter((token) => Array.from(token).length >= 3).sort((left, right) => Array.from(right).length - Array.from(left).length)[0];
@@ -1241,7 +1404,7 @@ async function resolveIntersectionLocality(engine, surface, params, anchor = nul
     searchStreet(rightStreet)
   ]);
   const radiusMeters = localityRadiusMeters(locality.type);
-  const streetPoints = (response, street) => (response.results || []).filter((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters && (fold(result.name || result.title) === street.key || fold(result.street) === street.key || fold(result.street).startsWith(`${street.key} `)));
+  const streetPoints = (response, street) => (response.results || []).filter((result) => Number.isFinite(result.lat) && Number.isFinite(result.lon) && (fold(result.city) === fold(localityName) || haversineMeters(locality.lat, locality.lon, result.lat, result.lon) <= radiusMeters) && (fold(result.name || result.title) === street.key || fold(result.street) === street.key || fold(result.street).startsWith(`${street.key} `)));
   const leftPoints = streetPoints(leftResponse, parsed.left);
   const rightPoints = streetPoints(rightResponse, rightStreet);
   let nearest = null;
@@ -1480,11 +1643,16 @@ async function searchOsmQuery(engine, rawParams = {}) {
     if (nearbyCategory && anchor) {
       let response2 = null;
       let radiusMeters = 0;
-      const categoryFacetSafe2 = engine.manifest?.features?.facetSummaryUint32 === true;
+      let categoryFacetSafe2 = false;
+      let categoryScope = [];
+      const explicitScope2 = explicitShardScope(params);
       for (const radius of NEARBY_CATEGORY_RADII_METERS) {
         radiusMeters = radius;
+        categoryScope = explicitScope2.length ? explicitScope2 : anchorRadiusCoverageShards(engine, anchor, radius);
+        categoryFacetSafe2 = shardScopeSupportsFeature(engine, categoryScope, "facetSummaryUint32");
         response2 = await searchNearestWithBudgetFallback(engine, {
           ...params,
+          ...params.shards == null && categoryScope.length ? { shards: categoryScope } : {},
           q: nearbyCategory.query,
           // The category lexicon already resolved the user's wording to the
           // exact OSM type. Safe unsigned facet summaries let the geo tree
@@ -1513,14 +1681,18 @@ async function searchOsmQuery(engine, rawParams = {}) {
           plannerLane: "osmCategoryNearby",
           osmIntentCategory: nearbyCategory.query,
           osmIntentRadiusMeters: radiusMeters,
+          ...categoryScope.length ? { osmIntentCoverageShards: categoryScope } : {},
           ...categoryFacetSafe2 ? { osmIntentCategoryFacet: true } : {}
         }
       };
     }
     if (nearbyCategory) {
-      const categoryFacetSafe2 = engine.manifest?.features?.facetSummaryUint32 === true;
+      const explicitScope2 = explicitShardScope(params);
+      const viewportScope = explicitScope2.length ? explicitScope2 : viewportCoverageShards(engine, params.geo?.box);
+      const categoryFacetSafe2 = shardScopeSupportsFeature(engine, viewportScope, "facetSummaryUint32");
       const response2 = await searchNearestWithBudgetFallback(engine, {
         ...params,
+        ...params.shards == null && viewportScope.length ? { shards: viewportScope } : {},
         // Inside an explicit viewport the exact type facet is the predicate;
         // repeating the category as text forces the engine to materialize the
         // whole spatial doc set before ranking identical category labels.
@@ -1621,10 +1793,11 @@ async function searchOsmQuery(engine, rawParams = {}) {
     locality = await resolveLocality(engine, intent.locality, routedParams);
   }
   if (!locality && mapAnchor && q) {
-    const localScope = params.shards == null ? anchorRadiusCoverageShards(engine, mapAnchor, NEAR_TEXT_RADIUS_METERS) : [];
+    const explicitScope2 = explicitShardScope(params);
+    const localScope = explicitScope2.length ? explicitScope2 : anchorRadiusCoverageShards(engine, mapAnchor, NEAR_TEXT_RADIUS_METERS);
     const intentNameTokens = !intent.connector ? fold(intent.locality).split(" ").filter((token) => token.length >= 3) : [];
     const distinctiveIntentToken = intentNameTokens.at(-1);
-    const categoryFacetSafe2 = engine.manifest?.features?.facetSummaryUint32 === true;
+    const categoryFacetSafe2 = shardScopeSupportsFeature(engine, localScope, "facetSummaryUint32");
     const local = await engine.search({
       ...params,
       ...localScope.length ? { shards: localScope } : {},
@@ -1718,8 +1891,9 @@ async function searchOsmQuery(engine, rawParams = {}) {
     }
   }
   const localityShard = String(locality.shard || "").split("/")[0];
-  const localityShardDescriptor = localityShard ? engine.manifest?.shards?.find((shard) => String(shard.id) === localityShard) : null;
-  const categoryFacetSafe = engine.manifest?.features?.facetSummaryUint32 === true || localityShardDescriptor?.features?.facetSummaryUint32 === true;
+  const explicitScope = explicitShardScope(params);
+  const localityScope = explicitScope.length ? explicitScope : localityShard ? [localityShard] : [];
+  const categoryFacetSafe = shardScopeSupportsFeature(engine, localityScope, "facetSummaryUint32");
   const response = await searchNearestWithBudgetFallback(engine, {
     ...params,
     ...params.shards == null && localityShard ? { shards: [localityShard] } : {},

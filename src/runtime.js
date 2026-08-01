@@ -1255,6 +1255,12 @@ export async function createSearch(options = {}) {
 
   function geoCellIndexForPlan(geoPlan, filterPlan) {
     if (options.geoCellIndexes === false || !geoPlan?.boxes?.length || !filterPlan?.facets?.length) return null;
+    // A single-level tree already exposes every leaf and its unsigned facet
+    // summary in the cached root. Category cells cannot eliminate a branch
+    // read there; they only add their own directory/block round trips before
+    // reaching the same leaf pages. Reserve the side index for multi-level
+    // trees where it can bypass branch fan-out.
+    if (Number(geoPlan.meta?.levels || 0) <= 1) return null;
     const indexes = geoPlan.meta?.category_cells || [];
     for (const index of indexes) {
       const facet = filterPlan.facets.find(([field]) => field === index.facet);
