@@ -16,16 +16,17 @@ ordering in addition to transport cost.
 Autocomplete cases carry the current map center, matching an interactive maps
 session rather than an unscoped global typeahead. Category-plus-locality input
 is evaluated as a composed suggestion, while civic addresses, brands, and
-localities remain direct authority lookups. Decimal coordinates are handled as
-navigation intents, and intersections are validated as locality-scoped street
-pairs instead of broad text matches.
+localities remain direct authority lookups. Decimal coordinates invoke the
+same bounded reverse-geocoding API available to applications, and intersections
+are validated as locality-scoped street pairs instead of broad text matches.
 
 The production profile models the client-side replacement contract for the
 Google Maps search APIs. It adds multi-step autocomplete selection, global and
 city-qualified landmarks, native-script suggestions, explicit category-in-city
 queries, exact and interpolated forward geocoding, hard-radius nearby search,
 viewport restriction, discovery around a selected result, location-biased text,
-unanchored typo recovery, empty results, and inline place-detail fields.
+unanchored typo recovery, empty results, inline place-detail fields, and urban,
+interpolated, international, rural, and uncovered reverse-geocoding probes.
 
 ## API replacement coverage
 
@@ -36,13 +37,29 @@ unanchored typo recovery, empty results, and inline place-detail fields.
 | Nearby Search | Nearest, hard radius, dense/sparse categories, and selected-place discovery orbit | Covered |
 | Forward Geocoding | Civic, street, postal, intersection, and interpolated addresses | Covered |
 | Place Details | Stable id, coordinates, address/locality, type, and shard provenance returned inline | Covered for indexed OSM fields |
-| Reverse Geocoding | Coordinate input currently opens the coordinate; it does not resolve a human-readable address | Gap |
+| Reverse Geocoding | Address-first coordinate lookup with a hard radius, covering-shard routing, interpolation ranges, international/rural results, and bounded zero results | Covered |
 | Photos, reviews, live hours, traffic, and directions | Not present in the static OSM search index | Out of scope |
 
-The benchmark must not be presented as complete Google Maps API parity while
-reverse geocoding remains a gap. The production score measures the supported
-search and geocoding contract, while the full profile also retains lower-volume
-and pathological routing probes.
+This is still not complete Google Maps API parity: dynamic place content,
+photos, reviews, live hours, traffic, and directions remain out of scope. The
+production score measures the supported static search and geocoding contract,
+while the full profile also retains lower-volume and pathological routing
+probes.
+
+Applications can call reverse geocoding directly. Coordinate text passed to
+`searchOsmQuery` uses this same implementation by default; pass
+`reverseGeocode: false` only when a raw coordinate marker is desired.
+
+```js
+import { reverseGeocodeOsm } from "rangefind/osm";
+
+const response = await reverseGeocodeOsm(engine, {
+  lat: 45.5019,
+  lon: -73.5674,
+  radiusMeters: 5000,
+  size: 8
+});
+```
 
 ## Commands
 
@@ -50,12 +67,16 @@ and pathological routing probes.
 # Weighted 21-case workload representing frequent phone searches.
 npm run bench:osm-maps
 
-# Strict 36-case Google Maps search/geocoding replacement workload.
+# Strict 41-case Google Maps search/geocoding replacement workload.
 npm run bench:osm-maps:production
 
-# All 52 cases, including lower-frequency transit, postal-code, native-script,
-# empty-viewport, brand-variant, coordinate, and routing edge probes.
+# All 56 cases, including lower-frequency transit, postal-code, native-script,
+# empty-viewport, brand-variant, reverse-geocoding, and routing edge probes.
 npm run bench:osm-maps:full
+
+# Five strict urban, interpolation, international, rural, and uncovered
+# reverse-geocoding cases.
+npm run bench:osm-maps:reverse
 
 # Seven ambiguity and locality-boundary cases used to stress routing shortcuts.
 npm run bench:osm-maps:edge

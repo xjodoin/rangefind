@@ -4,6 +4,7 @@ import {
   parseCoordinateIntent,
   parseNearbyCategoryIntent,
   parseOsmQueryIntent,
+  reverseGeocodeOsm,
   searchOsmQuery,
   suggestOsmQuery
 } from "../src/integrations/osm/query.js";
@@ -13,7 +14,7 @@ import {
   lookupCategory
 } from "../src/integrations/osm/category_lexicon.js";
 
-test("OSM coordinate intents open decimal latitude and longitude without an index fan-out", async () => {
+test("OSM coordinate intents can open a raw marker without an index fan-out", async () => {
   assert.deepEqual(parseCoordinateIntent("45.5019, -73.5674"), { lat: 45.5019, lon: -73.5674 });
   assert.deepEqual(parseCoordinateIntent("45.5019 -73.5674"), { lat: 45.5019, lon: -73.5674 });
   assert.equal(parseCoordinateIntent("91, -73"), null);
@@ -25,12 +26,137 @@ test("OSM coordinate intents open decimal latitude and longitude without an inde
       throw new Error("coordinate intent must not query the index");
     }
   };
-  const response = await searchOsmQuery(engine, { q: "45.5019, -73.5674", size: 18 });
+  const response = await searchOsmQuery(engine, {
+    q: "45.5019, -73.5674",
+    size: 18,
+    reverseGeocode: false
+  });
   assert.equal(response.stats.plannerLane, "osmCoordinates");
   assert.equal(response.stats.shardsQueried, 0);
   assert.equal(response.results[0].type, "coordinate");
   assert.equal(response.results[0].lat, 45.5019);
   assert.equal(response.results[0].lon, -73.5674);
+});
+
+test("OSM reverse geocoding reads only address points in covering shards", async () => {
+  const calls = [];
+  const engine = {
+    manifest: {
+      shards: [
+        { id: "ontario", bbox: [41.6, -95.2, 56.9, -74.3] },
+        { id: "quebec", bbox: [45, -79.9, 62.7, -57] }
+      ]
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 2,
+        page: 1,
+        size: params.size,
+        results: [
+          {
+            id: "way/1291502160/address-range/0",
+            name: "215–243 Rue Libersan, Sainte-Thérèse",
+            address: "",
+            category: "address",
+            type: "interpolated_address_range",
+            city: "Sainte-Thérèse",
+            shard: "quebec",
+            lat: 45.6476,
+            lon: -73.8312,
+            distanceMeters: 33.1
+          },
+          {
+            id: "node/duplicate-address",
+            name: "215–243 Rue Libersan, Sainte-Thérèse",
+            address: "215–243 Rue Libersan, Sainte-Thérèse",
+            category: "address",
+            type: "address",
+            city: "Sainte-Thérèse",
+            shard: "quebec",
+            lat: 45.6477,
+            lon: -73.8313,
+            distanceMeters: 40
+          }
+        ],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+
+  const response = await reverseGeocodeOsm(engine, {
+    lat: 45.647554,
+    lon: -73.8311837,
+    radiusMeters: 250,
+    size: 8,
+    trace: true
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "");
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.deepEqual(calls[0].filters.facets.category, ["address"]);
+  assert.deepEqual(calls[0].geo, {
+    near: { lat: 45.647554, lon: -73.8311837, radiusMeters: 250 },
+    sort: "distance"
+  });
+  assert.equal(response.results[0].address, "215–243 Rue Libersan, Sainte-Thérèse");
+  assert.equal(response.results[0].reverseGeocodeAccuracy, "range");
+  assert.equal(response.results.length, 1, "duplicate civic labels should collapse to the nearest row");
+  assert.equal(response.stats.plannerLane, "osmReverseGeocode");
+  assert.deepEqual(response.stats.osmIntentCoverageShards, ["quebec"]);
+});
+
+test("OSM coordinate search reverse-geocodes by default and preserves a marker on bounded misses", async () => {
+  let searches = 0;
+  const engine = {
+    manifest: {
+      shards: [{ id: "quebec", bbox: [45, -79.9, 62.7, -57] }]
+    },
+    async search(params) {
+      searches++;
+      return {
+        total: 1,
+        page: 1,
+        size: params.size,
+        results: [{
+          id: "way/339714920",
+          name: "1155 Boulevard Robert-Bourassa, Montréal",
+          address: "1155 Boulevard Robert-Bourassa, Montréal",
+          house_number: "1155",
+          type: "address",
+          category: "address",
+          city: "Montréal",
+          lat: 45.5018,
+          lon: -73.5673,
+          distanceMeters: 24
+        }],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "45.5019, -73.5674", size: 8 });
+  assert.equal(searches, 1);
+  assert.equal(response.results[0].house_number, "1155");
+  assert.equal(response.results[0].reverseGeocodeAccuracy, "address-point");
+  assert.equal(response.stats.plannerLane, "osmReverseGeocode");
+
+  const ocean = await searchOsmQuery(engine, { q: "0, -140", size: 8 });
+  assert.equal(searches, 1, "an uncovered coordinate must not fan out to every shard");
+  assert.equal(ocean.results[0].type, "coordinate");
+  assert.equal(ocean.stats.plannerLane, "osmReverseGeocodeFallback");
+  assert.equal(ocean.stats.shardsQueried, 0);
+});
+
+test("OSM reverse geocoding validates coordinates and positive radii", async () => {
+  const engine = { async search() { return { total: 0, results: [] }; } };
+  await assert.rejects(
+    reverseGeocodeOsm(engine, { lat: 91, lon: 0 }),
+    /latitude/
+  );
+  await assert.rejects(
+    reverseGeocodeOsm(engine, { lat: 45, lon: -73, radiusMeters: 0 }),
+    /positive/
+  );
 });
 
 test("OSM autocomplete routes through the shard covering the current map", async () => {

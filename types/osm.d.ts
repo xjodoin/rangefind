@@ -2,6 +2,8 @@
 // Typings cover the primary surface; the module re-exports further
 // document/query helpers from documents.js, query.js, and schema.js.
 
+import type { SearchEngine, SearchParams, SearchResponse, SuggestResponse } from "./runtime.js";
+
 export const OSM_INTEGRATION_SCHEMA_VERSION: number;
 export const OSM_DISPLAY_FIELDS: readonly string[];
 
@@ -47,3 +49,33 @@ export function lookupCategory(
   surface: unknown
 ): { type: string; query: string; label: string } | null;
 export function defaultCategoryLexicon(): OsmCategoryLexicon;
+
+export interface OsmReverseGeocodeParams {
+  lat: number;
+  lon: number;
+  /** Hard lookup radius; defaults to 5 km. */
+  radiusMeters?: number;
+  /** Maximum address candidates, capped at 25. */
+  size?: number;
+  shards?: string | string[];
+  trace?: boolean;
+  filters?: SearchParams["filters"];
+  [key: string]: unknown;
+}
+
+export interface OsmQueryParams extends SearchParams {
+  /** Advisory device/map anchor used by OSM intent routing. */
+  near?: { lat: number; lon: number };
+  /** Set false to retain a coordinate marker without reverse geocoding. */
+  reverseGeocode?: boolean | Omit<OsmReverseGeocodeParams, "lat" | "lon">;
+}
+
+export function reverseGeocodeOsm(
+  engine: SearchEngine,
+  params: OsmReverseGeocodeParams
+): Promise<SearchResponse>;
+export function searchOsmQuery(engine: SearchEngine, params?: OsmQueryParams): Promise<SearchResponse>;
+export function suggestOsmQuery(
+  engine: SearchEngine,
+  params?: OsmQueryParams
+): Promise<SuggestResponse>;

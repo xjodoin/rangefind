@@ -25,6 +25,8 @@ const DECIMAL_COORDINATES = new RegExp(
   "u"
 );
 const INTERSECTION_CONNECTOR = /\s+(?:&|and|at|et|x)\s+|\s*\/\s*/iu;
+const DEFAULT_REVERSE_GEOCODE_RADIUS_METERS = 5000;
+const MAX_REVERSE_GEOCODE_RESULTS = 25;
 
 export function parseCoordinateIntent(value) {
   const match = String(value || "").match(DECIMAL_COORDINATES);
@@ -37,7 +39,7 @@ export function parseCoordinateIntent(value) {
   return { lat, lon };
 }
 
-function coordinateResponse(coordinate, params) {
+function coordinateResponse(coordinate, params, stats = {}, lane = "osmCoordinates") {
   const label = `${coordinate.lat.toFixed(6)}, ${coordinate.lon.toFixed(6)}`;
   return {
     total: 1,
@@ -57,8 +59,137 @@ function coordinateResponse(coordinate, params) {
     }],
     resolvedQuery: label,
     stats: {
-      plannerLane: "osmCoordinates",
-      shardsQueried: 0
+      ...stats,
+      plannerLane: lane,
+      shardsQueried: Number(stats.shardsQueried || 0)
+    }
+  };
+}
+
+function reverseCoordinate(params) {
+  const value = params?.coordinate || params;
+  const lat = Number(value?.lat);
+  const lon = Number(value?.lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    throw new RangeError("reverse geocoding requires latitude in [-90, 90] and longitude in [-180, 180]");
+  }
+  return { lat, lon };
+}
+
+function reverseAddressResult(result) {
+  const address = String(result?.address || result?.name || result?.title || "").trim();
+  return {
+    ...result,
+    ...(address ? { address } : {}),
+    reverseGeocodeAccuracy: result?.type === "interpolated_address_range"
+      ? "range"
+      : result?.house_number ? "address-point" : "address"
+  };
+}
+
+function uniqueReverseAddressResults(results) {
+  const seen = new Set();
+  return results.filter(result => {
+    // OSM can represent one civic address as a building, an entrance, and a
+    // named POI. Reverse geocoding returns addresses rather than POI details,
+    // so keep the nearest row for each complete display address.
+    const key = fold(result.address);
+    if (!key || !seen.has(key)) {
+      if (key) seen.add(key);
+      return true;
+    }
+    return false;
+  });
+}
+
+/**
+ * Resolve a coordinate to nearby indexed OSM addresses without a server-side
+ * geocoder. The hard radius prevents coordinates in oceans or sparse regions
+ * from silently returning an address hundreds of kilometres away.
+ */
+export async function reverseGeocodeOsm(engine, rawParams = {}) {
+  if (typeof engine?.search !== "function") throw new TypeError("reverse geocoding requires a Rangefind search engine");
+  const coordinate = reverseCoordinate(rawParams);
+  const requestedRadius = rawParams.radiusMeters == null
+    ? DEFAULT_REVERSE_GEOCODE_RADIUS_METERS
+    : Number(rawParams.radiusMeters);
+  if (!Number.isFinite(requestedRadius) || requestedRadius <= 0) {
+    throw new RangeError("reverse geocoding radiusMeters must be a positive number");
+  }
+  const requestedSize = Number(rawParams.size ?? 10);
+  const size = Number.isFinite(requestedSize) && requestedSize > 0
+    ? Math.min(MAX_REVERSE_GEOCODE_RESULTS, Math.max(1, Math.floor(requestedSize)))
+    : 10;
+  const explicitScope = explicitShardScope(rawParams);
+  const coverage = explicitScope.length
+    ? explicitScope
+    : anchorRadiusCoverageShards(engine, coordinate, requestedRadius);
+  const sharded = Array.isArray(engine.manifest?.shards) && engine.manifest.shards.length > 0;
+  const baseStats = {
+    plannerLane: "osmReverseGeocode",
+    osmIntentCoordinate: coordinate,
+    osmIntentRadiusMeters: requestedRadius,
+    ...(coverage.length ? { osmIntentCoverageShards: coverage } : {})
+  };
+
+  // A sharded root can prove that the radius touches no published region.
+  // Return ZERO_RESULTS without opening all children.
+  if (sharded && !coverage.length) {
+    return {
+      total: 0,
+      page: 1,
+      size,
+      approximate: false,
+      results: [],
+      resolvedQuery: `${coordinate.lat.toFixed(6)}, ${coordinate.lon.toFixed(6)}`,
+      stats: { ...baseStats, shardsQueried: 0 }
+    };
+  }
+
+  const {
+    coordinate: _coordinate,
+    lat: _lat,
+    lon: _lon,
+    radiusMeters: _radiusMeters,
+    reverseGeocode: _reverseGeocode,
+    q: _q,
+    near: _near,
+    geo: _geo,
+    filters,
+    shards: _shards,
+    page: _page,
+    size: _size,
+    ...engineOptions
+  } = rawParams;
+  const response = await engine.search({
+    ...engineOptions,
+    q: "",
+    ...(coverage.length ? { shards: coverage } : {}),
+    filters: {
+      ...(filters || {}),
+      facets: {
+        ...(filters?.facets || {}),
+        category: ["address"]
+      }
+    },
+    geo: {
+      near: { ...coordinate, radiusMeters: requestedRadius },
+      sort: "distance"
+    },
+    page: 1,
+    size
+  });
+  const results = uniqueReverseAddressResults((response.results || []).map(reverseAddressResult));
+  return {
+    ...response,
+    total: results.length,
+    page: 1,
+    size,
+    results,
+    resolvedQuery: results[0]?.address || `${coordinate.lat.toFixed(6)}, ${coordinate.lon.toFixed(6)}`,
+    stats: {
+      ...(response.stats || {}),
+      ...baseStats
     }
   };
 }
@@ -1834,7 +1965,19 @@ export async function searchOsmQuery(engine, rawParams = {}) {
   const params = engineParams(rawParams);
   const q = String(params.q || "").trim();
   const coordinate = parseCoordinateIntent(q);
-  if (coordinate) return coordinateResponse(coordinate, params);
+  if (coordinate) {
+    if (rawParams.reverseGeocode === false) return coordinateResponse(coordinate, params);
+    const reversed = await reverseGeocodeOsm(engine, {
+      ...params,
+      ...(rawParams.reverseGeocode && typeof rawParams.reverseGeocode === "object"
+        ? rawParams.reverseGeocode
+        : {}),
+      ...coordinate
+    });
+    return reversed.results.length
+      ? reversed
+      : coordinateResponse(coordinate, params, reversed.stats, "osmReverseGeocodeFallback");
+  }
   const lexicon = await engineCategoryLexicon(engine);
   // "pharmacy near me" parses before category-locality — otherwise "me"
   // would be treated as a locality name and resolved against the planet.

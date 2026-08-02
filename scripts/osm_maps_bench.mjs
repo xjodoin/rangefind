@@ -16,7 +16,7 @@ import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { createSearch } from "../src/runtime.js";
-import { searchOsmQuery, suggestOsmQuery } from "../src/integrations/osm/query.js";
+import { reverseGeocodeOsm, searchOsmQuery, suggestOsmQuery } from "../src/integrations/osm/query.js";
 import { evaluateBudgets, evaluateExpectations, summarizeCases } from "./osm_maps_bench_lib.mjs";
 
 const MONTREAL = { lat: 45.5019, lon: -73.5674 };
@@ -56,7 +56,8 @@ const BUDGETS = {
   direct: { coldMs: 4000, coldRequests: 60, coldBytes: 4 * MIB, warmMs: 100, warmRequests: 0 },
   discovery: { coldMs: 6000, coldRequests: 100, coldBytes: 5 * MIB, warmMs: 100, warmRequests: 0 },
   recovery: { coldMs: 7000, coldRequests: 130, coldBytes: 6 * MIB, warmMs: 150, warmRequests: 0 },
-  journey: { coldMs: 5000, coldRequests: 75, coldBytes: 5 * MIB, warmMs: 150, warmRequests: 0 }
+  journey: { coldMs: 5000, coldRequests: 75, coldBytes: 5 * MIB, warmMs: 150, warmRequests: 0 },
+  reverseGeocode: { coldMs: 4000, coldRequests: 65, coldBytes: 4 * MIB, warmMs: 100, warmRequests: 0 }
 };
 
 const CASES = [
@@ -806,13 +807,115 @@ const CASES = [
   },
   {
     id: "coordinates",
-    family: "international",
-    scenario: "Open decimal latitude and longitude",
+    family: "reverse-geocode",
+    scenario: "Reverse-geocode decimal coordinates typed into map search",
+    weight: 5,
+    common: false,
+    production: true,
+    budget: BUDGETS.reverseGeocode,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Robert-Bourassa", "René-Lévesque"],
+      topTypes: ["address", "interpolated_address_range"],
+      topLocalityAny: ["Montréal", "Montreal"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      firstDistanceMax: 100,
+      lanes: ["osmReverseGeocode"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "45.5019, -73.5674", size: 8 })
+  },
+  {
+    id: "production-reverse-interpolated",
+    family: "reverse-geocode",
+    scenario: "Reverse-geocode a point represented by an address interpolation range",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: BUDGETS.reverseGeocode,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Libersan"],
+      topTypes: ["address", "interpolated_address_range"],
+      topLocalityAny: ["Sainte-Thérèse", "Sainte-Therese"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      firstDistanceMax: 100,
+      lanes: ["osmReverseGeocode"],
+      maxShardsQueried: 1
+    },
+    run: engine => reverseGeocodeOsm(engine, {
+      lat: 45.647554,
+      lon: -73.8311837,
+      radiusMeters: 500,
+      size: 8
+    })
+  },
+  {
+    id: "production-reverse-international",
+    family: "reverse-geocode",
+    scenario: "Reverse-geocode an international city coordinate",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: BUDGETS.reverseGeocode,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Spandauer Straße", "Spandauer Strasse"],
+      topTypes: ["address", "interpolated_address_range"],
+      topLocalityAny: ["Berlin"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      firstDistanceMax: 100,
+      lanes: ["osmReverseGeocode"],
+      maxShardsQueried: 3
+    },
+    run: engine => reverseGeocodeOsm(engine, { ...BERLIN, radiusMeters: 1000, size: 8 })
+  },
+  {
+    id: "production-reverse-rural",
+    family: "reverse-geocode",
+    scenario: "Return the closest bounded address in a sparse rural area",
     weight: 2,
     common: false,
-    budget: BUDGETS.direct,
-    expect: { minResults: 1, firstDistanceMax: 1000 },
-    run: engine => searchOsmQuery(engine, { q: "45.5019, -73.5674", size: 18 })
+    production: true,
+    budget: BUDGETS.reverseGeocode,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Chemin d'Entrelacs"],
+      topTypes: ["address", "interpolated_address_range"],
+      topLocalityAny: ["Sainte-Marguerite-du-lac-Masson", "Sainte-Marguerite-du-Lac-Masson"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      firstDistanceMax: 2500,
+      lanes: ["osmReverseGeocode"],
+      maxShardsQueried: 1
+    },
+    run: engine => reverseGeocodeOsm(engine, {
+      lat: 46.0737,
+      lon: -74.0687,
+      size: 8
+    })
+  },
+  {
+    id: "production-reverse-uncovered",
+    family: "reverse-geocode",
+    scenario: "Return bounded zero results for an uncovered ocean coordinate",
+    weight: 2,
+    common: false,
+    production: true,
+    budget: BUDGETS.reverseGeocode,
+    expect: {
+      maxResults: 0,
+      lanes: ["osmReverseGeocode"],
+      maxShardsQueried: 0
+    },
+    run: engine => reverseGeocodeOsm(engine, { lat: 0, lon: -140, size: 8 })
   }
 ];
 

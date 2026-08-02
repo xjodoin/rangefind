@@ -93,9 +93,10 @@ a large thesis corpus.
   global counts, exact counts over budgeted match sets, and bounded
   chunk-sampled estimates for very large result sets.
 - OpenStreetMap place and address fixture with canonical zero-posting address
-  lookup, compact `addr:interpolation` ranges, structured address results,
-  bounded Québec RQA civic/postal augmentation, reusable `rangefind/osm` and
-  `rangefind/osm/node` integration APIs, and exhaustive geo oracles.
+  lookup, compact `addr:interpolation` ranges, structured forward and reverse
+  geocoding, bounded Québec RQA civic/postal augmentation, reusable
+  `rangefind/osm` and `rangefind/osm/node` integration APIs, and exhaustive geo
+  oracles.
 - Geographic index sharding for planet-scale corpora: independently built and
   updated per-region shards sharing one frozen scoring-stats artifact
   (`scoringStats` config + `rangefind/scoring-stats`), a tiny sharded root

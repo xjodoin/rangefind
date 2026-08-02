@@ -15,6 +15,7 @@ exported from `rangefind/osm`; bounded PBF/RQA build helpers are exported from
 ```js
 import {
   createOsmIndexConfig,
+  reverseGeocodeOsm,
   searchOsmQuery,
   suggestOsmQuery
 } from "rangefind/osm";
@@ -25,6 +26,11 @@ Both APIs produce and query the normal Rangefind pack format. There is no OSM
 sidecar or parallel runtime. `scripts/osm_fixture.mjs` remains a resumable CLI
 for PBF extraction and delegates document shaping, RQA ingestion, schema
 generation, and index publication to these modules.
+
+`reverseGeocodeOsm(engine, { lat, lon, radiusMeters, size })` resolves nearest
+indexed addresses inside a hard radius and routes only through shards whose
+bounding boxes intersect that radius. Coordinate text passed to
+`searchOsmQuery` uses the same address-first path automatically.
 
 The hosted map client queries the rolling sharded index published by the
 sibling [`osm-rangefind-index`](https://github.com/xjodoin/osm-rangefind-index)

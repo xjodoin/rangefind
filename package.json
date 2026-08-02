@@ -147,6 +147,7 @@
     "bench:osm-maps:edge": "node scripts/osm_maps_bench.mjs --profile=edge --strict",
     "bench:osm-maps:full": "node scripts/osm_maps_bench.mjs --profile=full",
     "bench:osm-maps:production": "node scripts/osm_maps_bench.mjs --profile=production --strict",
+    "bench:osm-maps:reverse": "node scripts/osm_maps_bench.mjs --profile=reverse-geocode --strict",
     "bench:osm-maps:list": "node scripts/osm_maps_bench.mjs --list",
     "bench:suggest": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/suggest_bench.mjs --root=examples/osm-geo",
     "bench:vectors": "node scripts/vector_bench.mjs",

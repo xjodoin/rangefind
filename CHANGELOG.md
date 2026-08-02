@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- `reverseGeocodeOsm` provides bounded, address-first reverse geocoding over
+  the existing client-side geo index. Decimal-coordinate map searches reuse
+  the same path, while callers can still request a raw coordinate marker.
+- The strict production Maps benchmark now covers urban address points,
+  interpolation ranges, international and sparse rural coordinates, and an
+  uncovered-ocean zero-result guard.
+
+### Performance
+
+- Reverse geocoding derives the intersecting shard scope from root bounding
+  boxes and applies the address facet before nearest-neighbor traversal, so it
+  never opens every regional shard or returns a globally distant address.
+
 ## 0.3.24 — 2026-08-02
 
 ### Performance
