@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.24 — 2026-08-02
+
+### Performance
+
+- Category-cell geo searches defer bitmap and doc-value selection until after
+  exact cell membership removes covered facets. Repeated nearby and viewport
+  queries therefore stay fully memory-resident instead of discovering a lazy
+  filter-manifest dependency on their second execution.
+
 ## 0.3.23 — 2026-07-31
 
 ### Performance

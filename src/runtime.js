@@ -7253,13 +7253,13 @@ export async function createSearch(options = {}) {
       if (sortPlan) await ensureDocValueSortedManifest();
       await ensureFacetDictionaries(filters);
       if (geoPlan && !sortPlan) {
-        // The tree lane verifies geo constraints from leaf pages directly, so
-        // doc values are only needed for user-supplied filters.
+        // The tree lane resolves category-cell membership before materializing
+        // residual filters. Let it choose bitmaps or doc values leaf-by-leaf:
+        // preflighting here would fetch lazy filter metadata even when the geo
+        // cell itself proves the only user-supplied facet.
         const hasUserFilters = Object.keys(userFilters.facets || {}).length
           || Object.keys(userFilters.numbers || {}).length
           || Object.keys(userFilters.booleans || {}).length;
-        const userFilterPlan = hasUserFilters ? makeDocFilterPlan(userFilters) : null;
-        if (await docFilterPlanNeedsDocValues(userFilterPlan)) await ensureDocValuesManifest();
         const geoResponse = await runGeoBrowse({ page, size, filters: userFilters, geoPlan, hasFilters: hasUserFilters });
         if (geoResponse) return geoResponse;
       }
@@ -7349,8 +7349,9 @@ export async function createSearch(options = {}) {
       const hasUserFilters = Object.keys(userFilters.facets || {}).length
         || Object.keys(userFilters.numbers || {}).length
         || Object.keys(userFilters.booleans || {}).length;
-      const userFilterPlan = hasUserFilters ? makeDocFilterPlan(userFilters) : null;
-      if (await docFilterPlanNeedsDocValues(userFilterPlan)) await ensureDocValuesManifest();
+      // Category-cell membership may discharge the facet completely. Defer
+      // bitmap/doc-value selection to runGeoBrowse so a repeated map query
+      // does not pay a one-time lazy-manifest fetch after its first result.
       await ensureFacetDictionaries(userFilters);
       const geoResponse = await runGeoBrowse({
         page,

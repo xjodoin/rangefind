@@ -10887,8 +10887,6 @@ async function createSearch(options = {}) {
       await ensureFacetDictionaries(filters);
       if (geoPlan && !sortPlan) {
         const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
-        const userFilterPlan = hasUserFilters ? makeDocFilterPlan(userFilters) : null;
-        if (await docFilterPlanNeedsDocValues(userFilterPlan)) await ensureDocValuesManifest();
         const geoResponse = await runGeoBrowse({ page, size, filters: userFilters, geoPlan, hasFilters: hasUserFilters });
         if (geoResponse) return geoResponse;
       }
@@ -10970,8 +10968,6 @@ async function createSearch(options = {}) {
         throw budgetError;
       }
       const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
-      const userFilterPlan = hasUserFilters ? makeDocFilterPlan(userFilters) : null;
-      if (await docFilterPlanNeedsDocValues(userFilterPlan)) await ensureDocValuesManifest();
       await ensureFacetDictionaries(userFilters);
       const geoResponse = await runGeoBrowse({
         page,

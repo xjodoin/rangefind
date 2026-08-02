@@ -543,6 +543,48 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
       assert.ok(categoryCells.stats.geoCategoryCellLevel > 0);
       assert.ok(categoryCells.stats.geoCategoryCellBlocksFetched > 0);
       assert.ok(cellRequests.some(request => request.pathname.includes("/geo/category-cells/")));
+      assert.equal(
+        cellRequests.some(request => request.pathname.endsWith("/filter-bitmaps/manifest.json.gz")),
+        false,
+        "category-cell membership should not preload residual filter metadata"
+      );
+
+      const textCellRequestStart = server.requests.length;
+      const textCategoryCells = await engine.search({
+        q: "bakery",
+        filters: { facets: { category: ["bakery"] } },
+        geo: { box, near: center, sort: "distance" },
+        size: 20
+      });
+      const textCellRequests = server.requests.slice(textCellRequestStart);
+      assert.deepEqual(
+        textCategoryCells.results.map(result => result.title),
+        expected.map(item => item.title)
+      );
+      assert.match(textCategoryCells.stats.geoLane, /TextCategoryCells$/u);
+      assert.equal(
+        textCellRequests.some(request => request.pathname.endsWith("/filter-bitmaps/manifest.json.gz")),
+        false,
+        "text plus category cells should leave the lazy bitmap manifest untouched"
+      );
+
+      const repeatedTextCellRequestStart = server.requests.length;
+      const repeatedTextCategoryCells = await engine.search({
+        q: "bakery",
+        filters: { facets: { category: ["bakery"] } },
+        geo: { box, near: center, sort: "distance" },
+        size: 20
+      });
+      const repeatedTextCellRequests = server.requests.slice(repeatedTextCellRequestStart);
+      assert.deepEqual(
+        repeatedTextCategoryCells.results.map(result => result.title),
+        expected.map(item => item.title)
+      );
+      assert.equal(
+        repeatedTextCellRequests.some(request => request.pathname.endsWith("/filter-bitmaps/manifest.json.gz")),
+        false,
+        "a repeated category-cell search should not discover new metadata dependencies"
+      );
 
       const multiCategory = await engine.search({
         q: "",
