@@ -9574,12 +9574,34 @@ async function createShardedSearch(root, options, baseUrl) {
     // Plain geo browse keeps shard order — the single engine makes no
     // ordering promise there either.
 
-    const results = rows.slice(offset, need).map(row => stampShard(row.result, row.shardIndex));
+    // Geographic shard bboxes may deliberately overlap so boundary results
+    // remain discoverable from either side. Builders can therefore place the
+    // same logical document in more than one child shard. Merge by the stable
+    // public id after ranking so clients never receive duplicate Places rows.
+    const seenResultIds = new Set();
+    const uniqueRows = [];
+    let federationDuplicatesCollapsed = 0;
+    for (const row of rows) {
+      const id = row.result?.id == null ? "" : String(row.result.id);
+      if (id && seenResultIds.has(id)) {
+        federationDuplicatesCollapsed++;
+        continue;
+      }
+      if (id) seenResultIds.add(id);
+      uniqueRows.push(row);
+    }
+    const results = uniqueRows.slice(offset, need).map(row => stampShard(row.result, row.shardIndex));
     const responses = queried.map(item => item.response);
     const response = shardResponseShell(responses, results, page, size, {
       partial,
-      ...(routed.stats ? { stats: { textRouting: routed.stats } } : {})
+      ...((routed.stats || federationDuplicatesCollapsed) ? {
+        stats: {
+          ...(routed.stats ? { textRouting: routed.stats } : {}),
+          ...(federationDuplicatesCollapsed ? { federationDuplicatesCollapsed } : {})
+        }
+      } : {})
     });
+    if (federationDuplicatesCollapsed) response.approximate = true;
     // Each shard applies the authority prior to its own (disjoint) candidates
     // before the merge; reflect that in the merged stats.
     if (responses.some(r => r?.stats?.linkRankBoost)) {

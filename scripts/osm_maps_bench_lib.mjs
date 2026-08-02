@@ -25,6 +25,9 @@ export function evaluateExpectations(response, expect = {}) {
   if (expect.minResults != null) {
     addCheck(checks, "minResults", rows.length >= expect.minResults, rows.length);
   }
+  if (expect.maxResults != null) {
+    addCheck(checks, "maxResults", rows.length <= expect.maxResults, rows.length);
+  }
   if (expect.topTextAny?.length) {
     const actual = resultText(top);
     const folded = fold(actual);
@@ -43,8 +46,38 @@ export function evaluateExpectations(response, expect = {}) {
     const actual = top?.type || top?.category || "";
     addCheck(checks, "topTypes", expect.topTypes.map(fold).includes(fold(actual)), actual);
   }
+  if (expect.topHasCoordinates) {
+    const actual = { lat: top?.lat, lon: top?.lon };
+    addCheck(
+      checks,
+      "topHasCoordinates",
+      Number.isFinite(Number(top?.lat)) && Number.isFinite(Number(top?.lon)),
+      actual
+    );
+  }
+  if (expect.topHasAddress) {
+    const actual = top?.address || "";
+    addCheck(checks, "topHasAddress", Boolean(String(actual).trim()), actual);
+  }
+  if (expect.topHasId) {
+    const actual = top?.id || "";
+    addCheck(checks, "topHasId", Boolean(String(actual).trim()), actual);
+  }
+  if (expect.topPostcodeAny?.length) {
+    const actual = top?.postcode || "";
+    addCheck(checks, "topPostcodeAny", expect.topPostcodeAny.map(fold).includes(fold(actual)), actual);
+  }
   if (expect.topShard) {
     addCheck(checks, "topShard", top?.shard === expect.topShard, top?.shard || "");
+  }
+  if (expect.topLocalityAny?.length) {
+    const actual = [top?.city, top?.district, top?.suburb, top?.county, top?.state].filter(Boolean);
+    addCheck(
+      checks,
+      "topLocalityAny",
+      actual.some(value => expect.topLocalityAny.some(expected => fold(value) === fold(expected))),
+      actual
+    );
   }
   if (expect.allTopShards?.length) {
     const actual = rows.slice(0, expect.checkTop || 8).map(row => row.shard || "");
@@ -60,6 +93,26 @@ export function evaluateExpectations(response, expect = {}) {
       .filter(Number.isFinite);
     const ordered = actual.length >= 2 && actual.every((value, index) => index === 0 || value >= actual[index - 1]);
     addCheck(checks, "distanceAscending", ordered, actual);
+  }
+  if (expect.allDistancesMax != null) {
+    const actual = rows.slice(0, expect.checkTop || 18)
+      .map(row => Number(row.distanceMeters))
+      .filter(Number.isFinite);
+    addCheck(
+      checks,
+      "allDistancesMax",
+      actual.length > 0 && actual.every(value => value <= expect.allDistancesMax),
+      actual
+    );
+  }
+  if (expect.uniqueIds) {
+    const actual = rows.slice(0, expect.checkTop || 18).map(row => row.id).filter(Boolean);
+    addCheck(
+      checks,
+      "uniqueIds",
+      actual.length === Math.min(rows.length, expect.checkTop || 18) && new Set(actual).size === actual.length,
+      actual
+    );
   }
   if (expect.viewportBox) {
     const box = expect.viewportBox;

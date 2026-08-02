@@ -252,6 +252,161 @@ test("OSM query intents recognize common categories and natural locality phrasin
   assert.equal(parseOsmQueryIntent("xyz laval"), null);
 });
 
+test("OSM named category plus locality uses one authority-proven shard", async () => {
+  const calls = [];
+  const lookups = [];
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      shards: [
+        { id: "ile-de-france", features: { facetSummaryUint32: true } },
+        { id: "ontario", features: { facetSummaryUint32: true } },
+        { id: "quebec", features: { facetSummaryUint32: true } }
+      ]
+    },
+    async authorityLookup(surface) {
+      lookups.push(surface);
+      if (String(surface).toLowerCase() === "repentigny") {
+        return { matches: [{ text: "Repentigny", weight: 1000, count: 1, shards: ["quebec"] }] };
+      }
+      return { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 3,
+        results: [
+          { name: "Parc Larochelle", type: "park", city: "Repentigny", shard: "quebec" },
+          { name: "Parc Larochelle", type: "park", city: "Terrebonne", shard: "quebec" },
+          { name: "Parc Israel-Larochelle", type: "park", city: "Farnham", shard: "quebec" }
+        ],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, {
+    q: "parc larochelle repentigny",
+    size: 18
+  });
+
+  assert.deepEqual(lookups.sort(), ["larochelle repentigny", "repentigny"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "larochelle");
+  assert.equal(calls[0].typo, false);
+  assert.deepEqual(calls[0].shards, ["quebec"]);
+  assert.deepEqual(calls[0].filters.facets.type, ["park"]);
+  assert.equal(calls[0].geo, undefined);
+  assert.deepEqual(response.results.map(result => result.city), ["Repentigny"]);
+  assert.equal(response.total, 1);
+  assert.equal(response.stats.plannerLane, "osmNamedCategoryLocality");
+  assert.deepEqual(response.stats.osmIntentCoverageShards, ["quebec"]);
+});
+
+test("OSM named category locality tolerates name spacing and keeps proven misses scoped", async () => {
+  const searches = [];
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      shards: [
+        { id: "ontario", features: { facetSummaryUint32: true } },
+        { id: "quebec", features: { facetSummaryUint32: true } }
+      ]
+    },
+    async authorityLookup(surface) {
+      const normalized = String(surface).toLowerCase();
+      if (normalized === "montréal") {
+        return { matches: [{ text: "Montréal", count: 1, shards: ["quebec"] }] };
+      }
+      if (normalized === "toronto") {
+        return { matches: [{ text: "Toronto", count: 1, shards: ["ontario"] }] };
+      }
+      return { matches: [] };
+    },
+    async search(params) {
+      searches.push(params);
+      if (params.shards[0] === "quebec") {
+        return {
+          total: 1,
+          results: [{ name: "Parc La Fontaine", type: "park", city: "Montréal", shard: "quebec" }],
+          stats: { shardsQueried: 1 }
+        };
+      }
+      return { total: 0, results: [], stats: { shardsQueried: 1 } };
+    }
+  };
+
+  const spaced = await searchOsmQuery(engine, { q: "parc lafontaine montréal", size: 8 });
+  assert.deepEqual(spaced.results.map(result => result.name), ["Parc La Fontaine"]);
+  assert.equal(spaced.stats.plannerLane, "osmNamedCategoryLocality");
+
+  const miss = await searchOsmQuery(engine, { q: "parc larochelle toronto", size: 8 });
+  assert.deepEqual(miss.results, []);
+  assert.equal(miss.total, 0);
+  assert.equal(miss.stats.plannerLane, "osmNamedCategoryLocality");
+  assert.deepEqual(miss.stats.osmIntentCoverageShards, ["ontario"]);
+  assert.equal(searches.length, 2);
+});
+
+test("OSM global exact landmarks use their authority shard", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      if (String(surface).toLowerCase() === "calgary tower") {
+        return { matches: [{ text: "Calgary Tower", weight: 1, shards: ["alberta"] }] };
+      }
+      return { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 1,
+        results: [{ id: "way/1", name: "Calgary Tower", type: "attraction", city: "Calgary", shard: "alberta" }],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, { q: "Calgary Tower", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmGlobalExactText");
+  assert.equal(response.results[0].name, "Calgary Tower");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].shards, ["alberta"]);
+  assert.equal(calls[0].typo, false);
+});
+
+test("OSM unanchored typo plus locality stays inside the locality authority shard", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      if (String(surface).toLowerCase() === "berlin") {
+        return { matches: [{ text: "Berlin", weight: 1, shards: ["berlin"] }] };
+      }
+      return { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 1,
+        results: [{
+          id: "node/1",
+          name: "Berlin Hauptbahnhof",
+          type: "station",
+          city: "Berlin",
+          shard: "berlin"
+        }],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, { q: "hauptbanhof berlin", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmNamedTextLocality");
+  assert.equal(response.results[0].name, "Berlin Hauptbahnhof");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].shards, ["berlin"]);
+});
+
 test("OSM autocomplete collapses civic matches into street-locality suggestions", async () => {
   const calls = [];
   const engine = {
@@ -532,6 +687,65 @@ test("OSM street-locality search returns a matching civic address directly", asy
   assert.equal(response.results[0].address, "101 9 Avenue SW, Calgary");
   assert.equal(response.stats.plannerLane, "osmStreetLocality");
   assert.equal(response.stats.osmIntentCivicAddress, true);
+});
+
+test("OSM civic address routing continues past a valid shorter locality suffix", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      const key = String(surface).toLowerCase();
+      if (key === "york") {
+        return { matches: [{ text: "York", weight: 150000, shards: ["great-britain"] }] };
+      }
+      if (key === "new york") {
+        return { matches: [{ text: "New York", weight: 19000000, shards: ["new-york"] }] };
+      }
+      return { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.q === "350 5th Avenue" && params.shards?.[0] === "new-york") {
+        return {
+          total: 1,
+          results: [{
+            id: "node/350",
+            name: "Empire State Building",
+            type: "attraction",
+            house_number: "350",
+            street: "5th Avenue",
+            city: "New York",
+            lat: 40.7484,
+            lon: -73.9857,
+            shard: "new-york"
+          }],
+          stats: { shardsQueried: 1 }
+        };
+      }
+      if (params.filters?.facets?.category?.includes("place")) {
+        const york = params.shards?.[0] === "great-britain";
+        return {
+          total: 1,
+          results: [{
+            name: york ? "York" : "New York",
+            category: "place",
+            type: "city",
+            lat: york ? 53.96 : 40.71,
+            lon: york ? -1.08 : -74,
+            shard: york ? "great-britain" : "new-york"
+          }],
+          stats: { shardsQueried: 1 }
+        };
+      }
+      return { total: 0, results: [], stats: { shardsQueried: 1 } };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, { q: "350 5th Avenue New York", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmStreetLocality");
+  assert.equal(response.results[0].city, "New York");
+  assert.deepEqual(response.results[0].address, "350 5th Avenue, New York");
+  assert.ok(calls.some(call => call.shards?.[0] === "great-britain"));
+  assert.ok(calls.some(call => call.shards?.[0] === "new-york"));
 });
 
 test("OSM street-locality search anchors a street through its civic addresses", async () => {
@@ -907,6 +1121,33 @@ test("OSM category-first place names still resolve as localities", async () => {
   assert.equal(response.stats.plannerLane, "osmLocalityExact");
   assert.equal(response.results[0].name, "Bar Harbor");
   assert.equal(response.results[0].type, "town");
+});
+
+test("OSM authority-proven category-first localities never start the split search", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      if (String(surface).toLowerCase() === "park city") {
+        return { matches: [{ text: "Park City", weight: 8396, count: 25, shards: ["utah"] }] };
+      }
+      return { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      return {
+        total: 1,
+        results: [{ name: "Park City", category: "place", type: "town", population: 8396, shard: "utah", lat: 40.65, lon: -111.5 }],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, { q: "Park City", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmLocalityExact");
+  assert.equal(response.results[0].name, "Park City");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].q, "Park City");
+  assert.deepEqual(calls[0].shards, ["utah"]);
 });
 
 test("OSM category-last place names still resolve as localities", async () => {

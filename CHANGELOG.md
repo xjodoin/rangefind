@@ -10,6 +10,23 @@
   exact cell membership removes covered facets. Repeated nearby and viewport
   queries therefore stay fully memory-resident instead of discovering a lazy
   filter-manifest dependency on their second execution.
+- Category-plus-name-plus-locality searches prove a trailing locality through
+  root authority, search only its shard for the distinctive venue name, and
+  verify the result's structured locality. Queries such as `parc larochelle
+  repentigny` no longer fall back to multi-region text fan-out.
+- Category-looking locality names such as `Park City` and `Bar Harbor` prove
+  the whole authority interpretation before starting the split locality
+  search, preventing an already-losing probe from fanning out globally.
+- The Maps benchmark adds a strict edge profile for ambiguity, multi-word and
+  hyphenated localities, joined/spaced venue names, same-name disambiguation,
+  and authority-proven empty results.
+- A strict production Maps profile now exercises autocomplete-selection
+  journeys, text and nearby search, forward geocoding, inline place fields,
+  viewport restrictions, native script, typos, and bounded empty results.
+- Unanchored exact landmarks and name-plus-locality queries use root authority
+  to stay inside the relevant shards, including one-edit venue typos.
+- Federated search collapses duplicate stable ids emitted by overlapping geo
+  shards, and civic routing continues past valid-but-wrong locality suffixes.
 
 ## 0.3.23 — 2026-07-31
 

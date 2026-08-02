@@ -12805,12 +12805,30 @@ async function createShardedSearch(root, options, baseUrl) {
     } else if (q) {
       rows.sort(compareByScore);
     }
-    const results = rows.slice(offset, need).map((row) => stampShard(row.result, row.shardIndex));
+    const seenResultIds = /* @__PURE__ */ new Set();
+    const uniqueRows = [];
+    let federationDuplicatesCollapsed = 0;
+    for (const row of rows) {
+      const id = row.result?.id == null ? "" : String(row.result.id);
+      if (id && seenResultIds.has(id)) {
+        federationDuplicatesCollapsed++;
+        continue;
+      }
+      if (id) seenResultIds.add(id);
+      uniqueRows.push(row);
+    }
+    const results = uniqueRows.slice(offset, need).map((row) => stampShard(row.result, row.shardIndex));
     const responses = queried.map((item) => item.response);
     const response = shardResponseShell(responses, results, page, size, {
       partial,
-      ...routed.stats ? { stats: { textRouting: routed.stats } } : {}
+      ...routed.stats || federationDuplicatesCollapsed ? {
+        stats: {
+          ...routed.stats ? { textRouting: routed.stats } : {},
+          ...federationDuplicatesCollapsed ? { federationDuplicatesCollapsed } : {}
+        }
+      } : {}
     });
+    if (federationDuplicatesCollapsed) response.approximate = true;
     if (responses.some((r) => r?.stats?.linkRankBoost)) {
       response.stats.linkRankBoost = true;
       response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);

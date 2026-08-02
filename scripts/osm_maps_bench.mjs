@@ -21,6 +21,8 @@ import { evaluateBudgets, evaluateExpectations, summarizeCases } from "./osm_map
 
 const MONTREAL = { lat: 45.5019, lon: -73.5674 };
 const LAVAL = { lat: 45.6066, lon: -73.7124 };
+const CALGARY = { lat: 51.0447, lon: -114.0719 };
+const BERLIN = { lat: 52.52, lon: 13.405 };
 const TOKYO = { lat: 35.6812, lon: 139.7671 };
 const MONTREAL_BOX = {
   minLat: 45.45,
@@ -40,6 +42,12 @@ const OLD_MONTREAL_BOX = {
   minLon: -73.565,
   maxLon: -73.535
 };
+const BERLIN_BOX = {
+  minLat: 52.49,
+  maxLat: 52.55,
+  minLon: 13.35,
+  maxLon: 13.46
+};
 
 const MIB = 1024 * 1024;
 const BUDGETS = {
@@ -47,7 +55,8 @@ const BUDGETS = {
   addressAutocomplete: { coldMs: 2500, coldRequests: 35, coldBytes: 2 * MIB, warmMs: 100, warmRequests: 0 },
   direct: { coldMs: 4000, coldRequests: 60, coldBytes: 4 * MIB, warmMs: 100, warmRequests: 0 },
   discovery: { coldMs: 6000, coldRequests: 100, coldBytes: 5 * MIB, warmMs: 100, warmRequests: 0 },
-  recovery: { coldMs: 7000, coldRequests: 130, coldBytes: 6 * MIB, warmMs: 150, warmRequests: 0 }
+  recovery: { coldMs: 7000, coldRequests: 130, coldBytes: 6 * MIB, warmMs: 150, warmRequests: 0 },
+  journey: { coldMs: 5000, coldRequests: 75, coldBytes: 5 * MIB, warmMs: 150, warmRequests: 0 }
 };
 
 const CASES = [
@@ -98,6 +107,42 @@ const CASES = [
     run: engine => searchOsmQuery(engine, { q: "Laval", size: 18 })
   },
   {
+    id: "edge-category-word-locality-park-city",
+    family: "locality",
+    scenario: "Do not parse a category-looking city name as a category query",
+    weight: 2,
+    common: false,
+    edge: true,
+    budget: BUDGETS.recovery,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Park City"],
+      topTypes: ["town"],
+      topShard: "utah",
+      lanes: ["osmLocalityExact"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "Park City", size: 18 })
+  },
+  {
+    id: "edge-category-word-locality-bar-harbor",
+    family: "locality",
+    scenario: "Keep a category-looking multi-word locality intact",
+    weight: 2,
+    common: false,
+    edge: true,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Bar Harbor"],
+      topTypes: ["town"],
+      topShard: "maine",
+      lanes: ["osmLocalityExact"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "Bar Harbor", size: 18 })
+  },
+  {
     id: "landmark",
     family: "poi",
     scenario: "Find a named landmark near the map",
@@ -105,6 +150,76 @@ const CASES = [
     budget: BUDGETS.direct,
     expect: { minResults: 1, topTextAny: ["McGill University"], topShard: "quebec", firstDistanceMax: 5000 },
     run: engine => searchOsmQuery(engine, { q: "McGill University", near: MONTREAL, size: 18 })
+  },
+  {
+    id: "named-category-locality",
+    family: "poi",
+    scenario: "Find a named venue by category and locality",
+    weight: 8,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Parc Larochelle"],
+      topTypes: ["park"],
+      topLocalityAny: ["Repentigny"],
+      topShard: "quebec",
+      lanes: ["osmNamedCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "parc larochelle repentigny", size: 18 })
+  },
+  {
+    id: "edge-named-category-spacing",
+    family: "poi",
+    scenario: "Match a joined query token to a spaced venue name",
+    weight: 2,
+    common: false,
+    edge: true,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Parc La Fontaine"],
+      topTypes: ["park"],
+      topLocalityAny: ["Montréal", "Montreal"],
+      topShard: "quebec",
+      lanes: ["osmNamedCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "parc lafontaine montréal", size: 18 })
+  },
+  {
+    id: "edge-named-category-same-name",
+    family: "poi",
+    scenario: "Disambiguate the same venue name by structured locality",
+    weight: 2,
+    common: false,
+    edge: true,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Parc Larochelle"],
+      topTypes: ["park"],
+      topLocalityAny: ["Terrebonne"],
+      topShard: "quebec",
+      lanes: ["osmNamedCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "parc larochelle terrebonne", size: 18 })
+  },
+  {
+    id: "edge-named-category-proven-miss",
+    family: "poi",
+    scenario: "Keep an authority-proven venue miss from reopening global search",
+    weight: 2,
+    common: false,
+    edge: true,
+    budget: BUDGETS.direct,
+    expect: {
+      maxResults: 0,
+      lanes: ["osmNamedCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "parc larochelle toronto", size: 18 })
   },
   {
     id: "airport",
@@ -157,6 +272,44 @@ const CASES = [
     budget: BUDGETS.discovery,
     expect: { minResults: 3, topTypes: ["cinema"], allTopShards: ["quebec"], distanceAscending: true },
     run: engine => searchOsmQuery(engine, { q: "cinéma laval", size: 18 })
+  },
+  {
+    id: "edge-category-multiword-locality",
+    family: "category",
+    scenario: "Preserve a genuine multi-word locality after a category",
+    weight: 2,
+    common: false,
+    edge: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 3,
+      topTypes: ["cinema"],
+      topLocalityAny: ["New York", "Manhattan"],
+      allTopShards: ["new-york"],
+      lanes: ["osmCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "cinema new york", size: 18 })
+  },
+  {
+    id: "edge-category-hyphenated-locality",
+    family: "category",
+    scenario: "Resolve an unhyphenated query to a hyphenated locality",
+    weight: 2,
+    common: false,
+    edge: true,
+    // The four-word authority surface legitimately reads one extra term pack;
+    // retain the discovery latency/request limits with a narrowly larger byte cap.
+    budget: { ...BUDGETS.discovery, coldBytes: 5.5 * MIB },
+    expect: {
+      minResults: 3,
+      topTypes: ["restaurant"],
+      topLocalityAny: ["Saint-Jean-sur-Richelieu"],
+      allTopShards: ["quebec"],
+      lanes: ["osmCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "restaurant saint jean sur richelieu", size: 18 })
   },
   {
     id: "category-near-sparse",
@@ -360,6 +513,298 @@ const CASES = [
     run: engine => searchOsmQuery(engine, { q: "東京駅", near: TOKYO, size: 18 })
   },
   {
+    id: "production-suggest-select",
+    family: "journey",
+    scenario: "Autocomplete a locality and search the selected prediction",
+    weight: 5,
+    common: false,
+    production: true,
+    budget: { ...BUDGETS.journey, coldRequests: 90 },
+    expect: {
+      minResults: 1,
+      topTextAny: ["Berlin"],
+      topShard: "berlin",
+      topHasCoordinates: true,
+      topHasId: true,
+      lanes: ["osmLocalityExact"],
+      maxShardsQueried: 2
+    },
+    run: async engine => {
+      const suggested = await suggestOsmQuery(engine, { q: "berl", size: 8 });
+      const item = suggested.suggestions.find(candidate => candidate.text === "Berlin")
+        || suggested.suggestions[0];
+      return searchOsmQuery(engine, {
+        q: item?.text || "Berlin",
+        size: 18,
+        ...(item?.shards?.length ? { shards: item.shards } : {})
+      });
+    }
+  },
+  {
+    id: "production-suggest-native-script",
+    family: "autocomplete",
+    scenario: "Autocomplete a place using native-script input",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: BUDGETS.autocomplete,
+    expect: { minResults: 1, anyTextAny: ["東京"] },
+    run: engine => suggestOsmQuery(engine, { q: "東京", near: TOKYO, size: 8 })
+  },
+  {
+    id: "production-global-landmark",
+    family: "poi",
+    scenario: "Find a globally unique landmark without map context",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topTextAny: ["Calgary Tower"],
+      topShard: "alberta",
+      topHasCoordinates: true,
+      topHasId: true,
+      lanes: ["osmGlobalExactText"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "Calgary Tower", size: 18 })
+  },
+  {
+    id: "production-city-landmark",
+    family: "poi",
+    scenario: "Find a named transit landmark with its city in the query",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: { ...BUDGETS.direct, coldBytes: 6.25 * MIB },
+    expect: {
+      minResults: 1,
+      topTextAny: ["Berlin Hauptbahnhof", "Berlin Central Station", "Hauptbahnhof"],
+      topShard: "berlin",
+      topHasCoordinates: true,
+      topHasId: true,
+      lanes: ["osmGlobalExactText", "osmNamedTextLocality"],
+      maxShardsQueried: 2
+    },
+    run: engine => searchOsmQuery(engine, { q: "Berlin Hauptbahnhof", size: 18 })
+  },
+  {
+    id: "production-category-connector-locality",
+    family: "category",
+    scenario: "Resolve an explicit category-in-locality request",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 3,
+      topTypes: ["pharmacy"],
+      topLocalityAny: ["Birmingham"],
+      allTopShards: ["great-britain"],
+      distanceAscending: true,
+      lanes: ["osmCategoryLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "pharmacy in Birmingham", size: 18 })
+  },
+  {
+    id: "production-interpolated-address",
+    family: "address",
+    scenario: "Forward-geocode a house number through street interpolation",
+    weight: 5,
+    common: false,
+    production: true,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topTextAny: ["214 Rue Libersan"],
+      topTypes: ["interpolated_address"],
+      topLocalityAny: ["Sainte-Thérèse", "Sainte-Therese"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      topShard: "quebec",
+      lanes: ["osmStreetLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "214 rue Libersan Sainte-Thérèse", size: 18 })
+  },
+  {
+    id: "production-calgary-address",
+    family: "address",
+    scenario: "Forward-geocode a directional North American civic address",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.direct,
+    expect: {
+      minResults: 1,
+      topLocalityAny: ["Calgary"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      topShard: "alberta",
+      lanes: ["osmStreetLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "101 9 avenue sw, calgary", size: 18 })
+  },
+  {
+    id: "production-multiword-locality-address",
+    family: "address",
+    scenario: "Forward-geocode an address whose locality has a valid suffix city",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.recovery,
+    expect: {
+      minResults: 1,
+      topLocalityAny: ["New York"],
+      topHasCoordinates: true,
+      topHasAddress: true,
+      topHasId: true,
+      topPostcodeAny: ["10118"],
+      topShard: "new-york",
+      lanes: ["osmStreetLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "350 5th Avenue New York", size: 18 })
+  },
+  {
+    id: "production-nearest",
+    family: "nearby",
+    scenario: "Return the nearest places around a device location",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 10,
+      allTopShards: ["alberta"],
+      distanceAscending: true,
+      firstDistanceMax: 1000,
+      topHasCoordinates: true,
+      topHasId: true,
+      uniqueIds: true,
+      maxShardsQueried: 4
+    },
+    run: engine => engine.search({ q: "", geo: { near: CALGARY, sort: "distance" }, size: 18 })
+  },
+  {
+    id: "production-nearest-radius",
+    family: "nearby",
+    scenario: "Apply a hard radius restriction to nearby discovery",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 10,
+      allTopShards: ["alberta"],
+      distanceAscending: true,
+      allDistancesMax: 2000,
+      topHasCoordinates: true,
+      uniqueIds: true,
+      maxShardsQueried: 3
+    },
+    run: engine => engine.search({
+      q: "",
+      geo: { near: { ...CALGARY, radiusMeters: 2000 }, sort: "distance" },
+      size: 18
+    })
+  },
+  {
+    id: "production-international-viewport",
+    family: "viewport",
+    scenario: "Search a category inside a non-Canadian map viewport",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 10,
+      viewportBox: BERLIN_BOX,
+      allTopShards: ["berlin", "brandenburg"],
+      topHasCoordinates: true,
+      uniqueIds: true,
+      maxShardsQueried: 2
+    },
+    run: engine => searchOsmQuery(engine, { q: "cafe", geo: { box: BERLIN_BOX }, size: 18 })
+  },
+  {
+    id: "production-discovery-orbit",
+    family: "nearby",
+    scenario: "Discover related places around a selected result",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 10,
+      allTopShards: ["berlin"],
+      distanceAscending: true,
+      allDistancesMax: 2500,
+      topHasCoordinates: true,
+      uniqueIds: true,
+      maxShardsQueried: 1
+    },
+    run: engine => engine.search({
+      q: "cafe",
+      geo: { near: { ...BERLIN, radiusMeters: 2500 }, sort: "distance" },
+      shards: ["berlin"],
+      size: 18
+    })
+  },
+  {
+    id: "production-near-boost",
+    family: "nearby",
+    scenario: "Bias text search toward the map without hard restricting it",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 10,
+      allTopShards: ["berlin", "brandenburg"],
+      firstDistanceMax: 5000,
+      topHasCoordinates: true,
+      uniqueIds: true,
+      maxShardsQueried: 3
+    },
+    run: engine => searchOsmQuery(engine, { q: "coffee", near: BERLIN, size: 18 })
+  },
+  {
+    id: "production-global-typo",
+    family: "typo",
+    scenario: "Recover a zero-hit typo without a location anchor",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: BUDGETS.recovery,
+    expect: {
+      minResults: 1,
+      anyTextAny: ["Hauptbahnhof"],
+      allTopShards: ["berlin"],
+      checkTop: 5,
+      topHasCoordinates: true,
+      lanes: ["osmNamedTextLocality"],
+      maxShardsQueried: 2
+    },
+    run: engine => searchOsmQuery(engine, { q: "hauptbanhof berlin", size: 18 })
+  },
+  {
+    id: "production-empty-result",
+    family: "negative",
+    scenario: "Return a bounded empty result for an unknown place",
+    weight: 2,
+    common: false,
+    production: true,
+    budget: BUDGETS.direct,
+    expect: { maxResults: 0, maxShardsQueried: 1 },
+    run: engine => searchOsmQuery(engine, { q: "zzqxjkv nowhere", shards: ["alberta"], size: 18 })
+  },
+  {
     id: "coordinates",
     family: "international",
     scenario: "Open decimal latitude and longitude",
@@ -495,8 +940,11 @@ function resultSummary(response) {
     lane: response.stats?.plannerLane || response.stats?.suggestLane || response.stats?.geoLane || null,
     shardsQueried: response.stats?.shardsQueried ?? null,
     items: rows.slice(0, 5).map(item => ({
+      id: item.id || "",
       text: item.name || item.title || item.text || "",
       type: item.type || item.category || "",
+      city: item.city || "",
+      address: item.address || "",
       shard: item.shard || "",
       distanceMeters: Number.isFinite(item.distanceMeters) ? item.distanceMeters : null
     }))
@@ -585,7 +1033,7 @@ if (workerCase) {
   process.stdout.write(JSON.stringify(result));
 } else {
   const args = parseArgs(process.argv.slice(2));
-  const knownProfiles = new Set(["common", "full", ...CASES.map(item => item.family)]);
+  const knownProfiles = new Set(["common", "production", "full", "edge", ...CASES.map(item => item.family)]);
   if (!knownProfiles.has(args.profile)) {
     throw new Error(`Unknown Maps benchmark profile ${args.profile}; expected common, full, or a case family.`);
   }
@@ -593,6 +1041,8 @@ if (workerCase) {
     if (args.cases) return args.cases.has(item.id);
     if (args.profile === "full") return true;
     if (args.profile === "common") return item.common !== false;
+    if (args.profile === "production") return item.common !== false || item.production === true;
+    if (args.profile === "edge") return item.edge === true;
     return item.family === args.profile;
   });
   if (args.list) {
@@ -601,7 +1051,9 @@ if (workerCase) {
       family: item.family,
       scenario: item.scenario,
       weight: item.weight,
-      common: item.common !== false
+      common: item.common !== false,
+      production: item.common !== false || item.production === true,
+      edge: item.edge === true
     })), null, 2));
     process.exit(0);
   }

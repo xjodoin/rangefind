@@ -10,12 +10,13 @@ import {
 const LOCALITY_CONNECTORS = new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
 const LOCALITY_CACHE = new WeakMap();
 const AUTHORITY_EXACT_CACHE = new WeakMap();
+const AUTHORITY_LOOKUP_CACHE = new WeakMap();
 const LOCALITY_SEARCH_STATS = Symbol("rangefind.localitySearchStats");
 const CANADIAN_POSTAL_CODE = /^\s*([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\s*$/iu;
 const LOCALITY_TYPES = new Set(["city", "town", "municipality", "village", "hamlet"]);
 const STREET_DESIGNATORS = new Set([
   "allee", "avenue", "boulevard", "chemin", "cote", "cour", "impasse",
-  "montee", "place", "rang", "route", "rue", "terrasse",
+  "montee", "parkway", "place", "rang", "route", "rue", "terrasse",
   "court", "drive", "highway", "lane", "road", "street"
 ]);
 const COORDINATE_NUMBER = "[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)";
@@ -201,20 +202,8 @@ async function exactAuthorityScope(engine, surface) {
   if (!cache.has(key)) {
     const promise = (async () => {
       try {
-        const lookup = await engine.authorityLookup(surface, { size: 32 });
-        const matches = (lookup?.matches || []).filter(match => fold(match.text) === key);
-        if (!matches.length) return null;
-        const bestWeight = Math.max(...matches.map(match => Number(match.weight || 0)));
-        const best = matches.filter(match => Number(match.weight || 0) === bestWeight);
-        const shards = [...new Set(best.flatMap(match => Array.isArray(match.shards) ? match.shards : []))]
-          .map(String)
-          .sort()
-          .slice(0, 8);
-        return {
-          shards,
-          text: best[0].text,
-          count: Math.max(...best.map(match => Number(match.count || 0)))
-        };
+        const lookup = await authorityLookupCached(engine, surface);
+        return exactAuthorityFromLookup(lookup, key);
       } catch {
         return null;
       }
@@ -223,6 +212,36 @@ async function exactAuthorityScope(engine, surface) {
     cache.set(key, promise);
   }
   return cache.get(key);
+}
+
+async function authorityLookupCached(engine, surface) {
+  if (typeof engine?.authorityLookup !== "function") return null;
+  if (!AUTHORITY_LOOKUP_CACHE.has(engine)) AUTHORITY_LOOKUP_CACHE.set(engine, new Map());
+  const cache = AUTHORITY_LOOKUP_CACHE.get(engine);
+  const key = fold(surface);
+  if (!cache.has(key)) {
+    const promise = engine.authorityLookup(surface, { size: 32 });
+    promise.catch(() => cache.delete(key));
+    cache.set(key, promise);
+  }
+  return cache.get(key);
+}
+
+function exactAuthorityFromLookup(lookup, surface) {
+  const key = fold(surface);
+  const matches = (lookup?.matches || []).filter(match => fold(match.text) === key);
+  if (!matches.length) return null;
+  const bestWeight = Math.max(...matches.map(match => Number(match.weight || 0)));
+  const best = matches.filter(match => Number(match.weight || 0) === bestWeight);
+  const shards = [...new Set(best.flatMap(match => Array.isArray(match.shards) ? match.shards : []))]
+    .map(String)
+    .sort()
+    .slice(0, 8);
+  return {
+    shards,
+    text: best[0].text,
+    count: Math.max(...best.map(match => Number(match.count || 0)))
+  };
 }
 
 function bboxContainsPoint(bbox, lat, lon) {
@@ -276,6 +295,312 @@ function shardScopeSupportsFeature(engine, shards, feature) {
   return resolvedScopes === shards.length
     && selected.size > 0
     && [...selected].every(shard => shard.features?.[feature] === true);
+}
+
+function resultMatchesLocality(result, surface) {
+  const expected = fold(surface);
+  if (!expected) return false;
+  return [
+    result?.city,
+    result?.district,
+    result?.suburb,
+    result?.county,
+    result?.state
+  ].some(value => fold(value) === expected);
+}
+
+function compactFold(value) {
+  return fold(value).replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+// "Parc Larochelle Repentigny", "Hotel Bonaventure Montreal", and similar
+// map queries contain both a category and a venue name before the locality.
+// The ordinary category-locality parser initially treats the whole tail as a
+// locality; when that misses, an unrestricted text fallback can reopen every
+// shard containing the terms. Prove a short trailing locality through root
+// authority, search only its shard, and verify the structured locality field
+// before accepting the shortcut. Exact full-tail authority wins first so
+// genuine multi-token localities such as "New York" keep the normal lane.
+async function resolveNamedCategoryLocality(engine, intent, params) {
+  if (intent?.connector || intent?.order !== "category-locality") return null;
+  const tokens = String(intent.locality || "").split(/\s+/u).filter(Boolean);
+  if (tokens.length < 2) return null;
+  const maxLocalityTokens = Math.min(4, tokens.length - 1);
+  const candidates = [];
+  // Prefer the longest authority suffix. For "Hotel Plaza New York", New York
+  // is more specific than the independently valid authority York.
+  for (let localityLength = maxLocalityTokens; localityLength >= 1; localityLength--) {
+    const split = tokens.length - localityLength;
+    const nameTokens = tokens.slice(0, split);
+    const distinctiveNameTokens = nameTokens.map(fold).filter(token => token.length >= 3);
+    if (!distinctiveNameTokens.length) continue;
+    candidates.push({
+      localitySurface: tokens.slice(split).join(" "),
+      nameSurface: nameTokens.join(" "),
+      query: nameTokens.join(" "),
+      distinctiveNameTokens
+    });
+  }
+  if (!candidates.length) return null;
+
+  // The whole tail is the overwhelmingly common category + locality form.
+  // Prove it first so "restaurant saint jean sur richelieu" does not also
+  // download authority blocks for Richelieu, Sur Richelieu, and Jean Sur
+  // Richelieu. A miss then unlocks the bounded named-venue suffix probes.
+  const fullLocality = await exactAuthorityScope(engine, intent.locality);
+  if (fullLocality?.shards?.length) return null;
+  const authorities = await Promise.all(
+    candidates.map(candidate => exactAuthorityScope(engine, candidate.localitySurface))
+  );
+
+  const requestedSize = Number(params.size || 10);
+  const explicitScope = explicitShardScope(params);
+  let provenMiss = null;
+  for (let index = 0; index < candidates.length; index++) {
+    const authority = authorities[index];
+    if (!authority?.shards?.length) continue;
+    const candidate = candidates[index];
+    const scope = explicitScope.length ? explicitScope : authority.shards;
+    const categoryFacetSafe = shardScopeSupportsFeature(engine, scope, "facetSummaryUint32");
+    const response = await engine.search({
+      ...params,
+      q: candidate.query,
+      typo: false,
+      geo: undefined,
+      shards: scope,
+      size: Math.min(100, Math.max(32, requestedSize * 2)),
+      ...(categoryFacetSafe ? {
+        filters: {
+          ...(params.filters || {}),
+          facets: {
+            ...(params.filters?.facets || {}),
+            type: [intent.category.type]
+          }
+        }
+      } : {})
+    });
+    const results = (response.results || []).filter(result => {
+      const name = fold(result.name || result.title);
+      const compactName = compactFold(result.name || result.title);
+      const categoryMatches = categoryFacetSafe
+        || fold(result.type || result.category) === fold(intent.category.type);
+      return categoryMatches
+        && candidate.distinctiveNameTokens.every(token => (
+          name.includes(token) || compactName.includes(compactFold(token))
+        ))
+        && resultMatchesLocality(result, candidate.localitySurface);
+    });
+    const resolved = {
+      ...response,
+      total: results.length,
+      size: requestedSize,
+      results: results.slice(0, requestedSize),
+      resolvedQuery: `${intent.category.label} ${candidate.nameSurface} ${authority.text || candidate.localitySurface}`,
+      stats: {
+        ...(response.stats || {}),
+        plannerLane: "osmNamedCategoryLocality",
+        osmIntentCategory: intent.category.query,
+        osmIntentCategoryType: intent.category.type,
+        ...(categoryFacetSafe ? { osmIntentCategoryFacet: true } : {}),
+        osmIntentLocality: authority.text || candidate.localitySurface,
+        osmIntentLocalityType: "authority",
+        osmIntentLocalityAuthority: true,
+        osmIntentNameTokens: candidate.distinctiveNameTokens,
+        osmIntentCoverageShards: scope
+      }
+    };
+    if (results.length) return resolved;
+    // Once an explicit trailing locality is authority-proven, a scoped miss is
+    // trustworthy. Keep trying other (more compact) authority suffixes, but do
+    // not reopen an unbounded global text search if all of them miss.
+    if (!provenMiss) provenMiss = resolved;
+  }
+  return provenMiss;
+}
+
+async function resolveAmbiguousCategoryLocality(engine, wholeSurface, localitySurface, params) {
+  // When the root has authority routing, prove both interpretations before
+  // starting either place search. Running the searches concurrently is unsafe:
+  // "Park City" resolves quickly in Utah, but its split tail "City" can still
+  // launch a planet-wide search that cannot be cancelled after the winner is
+  // known. Authority reads are small, cacheable, and safe to parallelize.
+  if (params.shards == null && typeof engine?.authorityLookup === "function") {
+    let wholeLookup;
+    let localityLookup;
+    try {
+      [wholeLookup, localityLookup] = await Promise.all([
+        authorityLookupCached(engine, wholeSurface),
+        authorityLookupCached(engine, localitySurface)
+      ]);
+    } catch {
+      wholeLookup = null;
+      localityLookup = null;
+    }
+    // A null artifact (as opposed to an empty match list) is not authoritative;
+    // preserve the legacy fail-open probes when routing data is unavailable.
+    if (wholeLookup == null || localityLookup == null) {
+      const [wholePlace, locality] = await Promise.all([
+        resolveLocality(engine, wholeSurface, params, { authorityMissIsFinal: true }),
+        resolveLocality(engine, localitySurface, params)
+      ]);
+      return { wholePlace, locality };
+    }
+    const wholeAuthority = exactAuthorityFromLookup(wholeLookup, wholeSurface);
+    if (wholeAuthority && !wholeAuthority.shards.length) {
+      const [wholePlace, locality] = await Promise.all([
+        resolveLocality(engine, wholeSurface, params, { authorityMissIsFinal: true, authorityLookup: wholeLookup }),
+        resolveLocality(engine, localitySurface, params, { authorityLookup: localityLookup })
+      ]);
+      return { wholePlace, locality };
+    }
+    if (wholeAuthority?.shards?.length) {
+      const wholePlace = await resolveLocality(
+        engine,
+        wholeSurface,
+        params,
+        { authorityMissIsFinal: true, authorityLookup: wholeLookup }
+      );
+      if (wholePlace) return { wholePlace, locality: null };
+    }
+    return {
+      wholePlace: null,
+      locality: await resolveLocality(engine, localitySurface, params, { authorityLookup: localityLookup })
+    };
+  }
+
+  // Explicit shard scopes bound both probes, and legacy engines without an
+  // authority artifact retain their previous fail-open behavior.
+  const [wholePlace, locality] = await Promise.all([
+    resolveLocality(engine, wholeSurface, params, { authorityMissIsFinal: true }),
+    resolveLocality(engine, localitySurface, params)
+  ]);
+  return { wholePlace, locality };
+}
+
+function resultNameMatchesSurface(result, surface, allowTypo = false) {
+  const expected = fold(surface).split(/[^\p{L}\p{N}]+/u).filter(token => token.length >= 3);
+  if (!expected.length) return false;
+  const actual = fold(result?.name || result?.title)
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+  return expected.every(token => actual.some(word => (
+    word.includes(token)
+    || token.includes(word)
+    || (allowTypo && withinOneEdit(word, token))
+  )));
+}
+
+// Unanchored Google-style text queries commonly include either an exact
+// landmark name ("Calgary Tower") or a landmark plus a leading/trailing city
+// ("Berlin Hauptbahnhof", "hauptbanhof berlin"). Root authority can bound
+// both forms before the generic text federation opens unrelated shards.
+async function resolveGlobalNamedText(engine, surface, params, { exactOnly = false } = {}) {
+  if (params.shards != null || params.geo != null) return null;
+  const tokens = String(surface || "").trim().split(/\s+/u).filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 9 || tokens.some(token => /\d/u.test(token))) return null;
+
+  const requestedSize = Math.max(1, Number(params.size || 10));
+  const wholeAuthority = await exactAuthorityScope(engine, surface);
+  if (wholeAuthority?.shards?.length) {
+    const response = await engine.search({
+      ...params,
+      q: surface,
+      typo: false,
+      shards: wholeAuthority.shards,
+      size: Math.min(64, Math.max(24, requestedSize * 2))
+    });
+    const exactResults = (response.results || []).filter(
+      result => fold(result.name || result.title) === fold(surface)
+    );
+    const exactLocality = exactResults.find(result => LOCALITY_TYPES.has(result.type));
+    if (exactLocality) {
+      return {
+        ...localityExactResponse(exactLocality, params, surface),
+        stats: {
+          ...(response.stats || {}),
+          plannerLane: "osmLocalityExact",
+          osmIntentLocality: exactLocality.name || surface,
+          osmIntentLocalityType: exactLocality.type || "",
+          osmIntentCoverageShards: wholeAuthority.shards
+        }
+      };
+    }
+    const results = exactResults.filter(result => !LOCALITY_TYPES.has(result.type));
+    if (results.length) {
+      return {
+        ...response,
+        total: results.length,
+        size: requestedSize,
+        results: results.slice(0, requestedSize),
+        stats: {
+          ...(response.stats || {}),
+          plannerLane: "osmGlobalExactText",
+          osmIntentCoverageShards: wholeAuthority.shards,
+          osmIntentAuthorityName: wholeAuthority.text || surface
+        }
+      };
+    }
+  }
+  if (exactOnly) return null;
+
+  const candidates = [];
+  const seen = new Set();
+  const maxLocalityTokens = Math.min(4, tokens.length - 1);
+  for (let localityLength = maxLocalityTokens; localityLength >= 1; localityLength--) {
+    for (const side of ["trailing", "leading"]) {
+      const localityTokens = side === "trailing"
+        ? tokens.slice(tokens.length - localityLength)
+        : tokens.slice(0, localityLength);
+      const nameTokens = side === "trailing"
+        ? tokens.slice(0, tokens.length - localityLength)
+        : tokens.slice(localityLength);
+      const localitySurface = localityTokens.join(" ");
+      const nameSurface = nameTokens.join(" ");
+      const key = `${fold(localitySurface)}\0${fold(nameSurface)}`;
+      if (!nameSurface || seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ localitySurface, nameSurface });
+    }
+  }
+
+  const authorities = await Promise.all(
+    candidates.map(candidate => exactAuthorityScope(engine, candidate.localitySurface))
+  );
+  let provenMiss = null;
+  for (let index = 0; index < candidates.length; index++) {
+    const authority = authorities[index];
+    if (!authority?.shards?.length) continue;
+    const candidate = candidates[index];
+    const response = await engine.search({
+      ...params,
+      q: candidate.nameSurface,
+      shards: authority.shards,
+      size: Math.min(64, Math.max(24, requestedSize * 2))
+    });
+    const localitySurface = authority.text || candidate.localitySurface;
+    const results = (response.results || []).filter(result => (
+      resultNameMatchesSurface(result, candidate.nameSurface, true)
+      && resultMatchesLocality(result, localitySurface)
+    ));
+    const resolved = {
+      ...response,
+      total: results.length,
+      size: requestedSize,
+      results: results.slice(0, requestedSize),
+      resolvedQuery: `${candidate.nameSurface}, ${localitySurface}`,
+      stats: {
+        ...(response.stats || {}),
+        plannerLane: "osmNamedTextLocality",
+        osmIntentLocality: localitySurface,
+        osmIntentLocalityAuthority: true,
+        osmIntentName: candidate.nameSurface,
+        osmIntentCoverageShards: authority.shards
+      }
+    };
+    if (results.length) return resolved;
+    if (!provenMiss) provenMiss = resolved;
+  }
+  return provenMiss;
 }
 
 function viewportCoverageShards(engine, box) {
@@ -924,7 +1249,9 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
   let authoritativeMiss = false;
   if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
     try {
-      const lookup = await engine.authorityLookup(surface, { size: 8 });
+      const lookup = Object.hasOwn(options, "authorityLookup")
+        ? options.authorityLookup
+        : await authorityLookupCached(engine, surface);
       const scoped = [];
       let exactMatchWithoutShard = false;
       const exactMatches = (lookup?.matches || [])
@@ -1446,7 +1773,10 @@ async function resolveStreetLocality(engine, surface, params) {
       };
     }
     const anchor = street || streetAnchor;
-    if (!anchor) return null;
+    // A short suffix can itself be a valid but wrong locality ("York" in
+    // "350 5th Avenue New York"). Keep trying the bounded longer suffixes
+    // before allowing the surrounding global fallback.
+    if (!anchor) continue;
     const trace = mergeRuntimeTraces(locality[LOCALITY_SEARCH_STATS]?.trace, response.stats?.trace);
     return {
       total: 1,
@@ -1625,6 +1955,8 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     if (intersection) return intersection;
     const street = await resolveStreetLocality(engine, q, params);
     if (street) return street;
+    const namedText = !mapAnchor ? await resolveGlobalNamedText(engine, q, params) : null;
+    if (namedText) return collapseCivicDuplicates(namedText);
     // Local-first text: scoped to the anchor's radius, geo routing opens the
     // one or two shards whose coverage contains the caller instead of every
     // shard holding the terms, and proximity boosts break BM25 ties toward
@@ -1685,6 +2017,14 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     }
     return collapseCivicDuplicates(await searchNearestWithBudgetFallback(engine, params));
   }
+  const exactIntentCandidate = intent.order === "locality-category"
+    || String(intent.locality || "").trim().split(/\s+/u).filter(Boolean).length < 2;
+  const exactIntentText = !mapAnchor && !intent.connector && exactIntentCandidate
+    ? await resolveGlobalNamedText(engine, q, params, { exactOnly: true })
+    : null;
+  if (exactIntentText) return collapseCivicDuplicates(exactIntentText);
+  const namedCategoryLocality = await resolveNamedCategoryLocality(engine, intent, params);
+  if (namedCategoryLocality) return collapseCivicDuplicates(namedCategoryLocality);
   // "Bar Harbor", "Park City", "Miami Beach", "Market Harborough": place
   // names that open or close with a category word. Before splitting a
   // connectorless query, the whole surface gets one shot at resolving as a
@@ -1700,10 +2040,12 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     : [];
   const routedParams = anchorScope.length ? { ...params, shards: anchorScope } : params;
   if (!intent.connector) {
-    const [wholePlace, split] = await Promise.all([
-      resolveLocality(engine, q, routedParams, { authorityMissIsFinal: true }),
-      resolveLocality(engine, intent.locality, routedParams)
-    ]);
+    const { wholePlace, locality: split } = await resolveAmbiguousCategoryLocality(
+      engine,
+      q,
+      intent.locality,
+      routedParams
+    );
     if (wholePlace) return localityExactResponse(wholePlace, params, q);
     locality = split;
   } else {
@@ -1772,10 +2114,12 @@ export async function searchOsmQuery(engine, rawParams = {}) {
     // misses, resolve the named place globally so an explicit query such as
     // "restaurants New York" still travels away from the current viewport.
     if (!intent.connector) {
-      const [wholePlace, split] = await Promise.all([
-        resolveLocality(engine, q, params, { authorityMissIsFinal: true }),
-        resolveLocality(engine, intent.locality, params)
-      ]);
+      const { wholePlace, locality: split } = await resolveAmbiguousCategoryLocality(
+        engine,
+        q,
+        intent.locality,
+        params
+      );
       if (wholePlace) return localityExactResponse(wholePlace, params, q);
       locality = split;
     } else {
