@@ -26,6 +26,7 @@ const DECIMAL_COORDINATES = new RegExp(
 );
 const INTERSECTION_CONNECTOR = /\s+(?:&|and|at|et|x)\s+|\s*\/\s*/iu;
 const DEFAULT_REVERSE_GEOCODE_RADIUS_METERS = 5000;
+const DEFAULT_REVERSE_LOCALITY_RADIUS_METERS = 30000;
 const MAX_REVERSE_GEOCODE_RESULTS = 25;
 
 export function parseCoordinateIntent(value) {
@@ -76,15 +77,64 @@ function reverseCoordinate(params) {
   return { lat, lon };
 }
 
+function reverseAddressComponents(result) {
+  return [
+    ["house_number", "street_number"],
+    ["street", "route"],
+    ["unit", "subpremise"],
+    ["suburb", "sublocality"],
+    ["city", "locality"],
+    ["district", "administrative_area_level_2"],
+    ["state", "administrative_area_level_1"],
+    ["postcode", "postal_code"],
+    ["country", "country"]
+  ].flatMap(([field, type]) => {
+    const value = String(result?.[field] || "").trim();
+    return value ? [{ longText: value, shortText: value, types: [type] }] : [];
+  });
+}
+
 function reverseAddressResult(result) {
   const address = String(result?.address || result?.name || result?.title || "").trim();
+  const ranged = result?.type === "interpolated_address_range";
+  const precise = Boolean(result?.house_number);
   return {
     ...result,
     ...(address ? { address } : {}),
-    reverseGeocodeAccuracy: result?.type === "interpolated_address_range"
-      ? "range"
-      : result?.house_number ? "address-point" : "address"
+    ...(address ? { formattedAddress: address } : {}),
+    addressComponents: reverseAddressComponents(result),
+    reverseGeocodeAccuracy: ranged ? "range" : precise ? "address-point" : "address",
+    locationType: ranged ? "RANGE_INTERPOLATED" : precise ? "ROOFTOP" : "GEOMETRIC_CENTER",
+    types: [ranged || precise ? "street_address" : "route"]
   };
+}
+
+function reverseLocalityResult(result) {
+  const address = String(result?.name || result?.title || "").trim();
+  const localityType = LOCALITY_TYPES.has(result?.type) ? result.type : "locality";
+  return {
+    ...result,
+    ...(address ? { address, formattedAddress: address } : {}),
+    addressComponents: reverseAddressComponents({ ...result, city: result.city || address }),
+    reverseGeocodeAccuracy: "locality",
+    locationType: "APPROXIMATE",
+    types: [localityType]
+  };
+}
+
+function requestedReverseTypes(rawParams) {
+  const values = rawParams.resultTypes || rawParams.resultType;
+  return new Set((Array.isArray(values) ? values : values ? [values] : []).map(String));
+}
+
+function requestedLocationTypes(rawParams) {
+  const values = rawParams.locationTypes || rawParams.locationType;
+  return new Set((Array.isArray(values) ? values : values ? [values] : []).map(value => String(value).toUpperCase()));
+}
+
+function matchesReverseFilters(result, resultTypes, locationTypes) {
+  return (!resultTypes.size || result.types?.some(type => resultTypes.has(type)))
+    && (!locationTypes.size || locationTypes.has(result.locationType));
 }
 
 function uniqueReverseAddressResults(results) {
@@ -131,6 +181,14 @@ export async function reverseGeocodeOsm(engine, rawParams = {}) {
     osmIntentRadiusMeters: requestedRadius,
     ...(coverage.length ? { osmIntentCoverageShards: coverage } : {})
   };
+  const resultTypes = requestedReverseTypes(rawParams);
+  const locationTypes = requestedLocationTypes(rawParams);
+  if (rawParams.localityRadiusMeters != null) {
+    const value = Number(rawParams.localityRadiusMeters);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new RangeError("reverse geocoding localityRadiusMeters must be a positive number");
+    }
+  }
 
   // A sharded root can prove that the radius touches no published region.
   // Return ZERO_RESULTS without opening all children.
@@ -152,6 +210,11 @@ export async function reverseGeocodeOsm(engine, rawParams = {}) {
     lon: _lon,
     radiusMeters: _radiusMeters,
     reverseGeocode: _reverseGeocode,
+    resultTypes: _resultTypes,
+    resultType: _resultType,
+    locationTypes: _locationTypes,
+    locationType: _locationType,
+    localityRadiusMeters: _localityRadiusMeters,
     q: _q,
     near: _near,
     geo: _geo,
@@ -179,7 +242,58 @@ export async function reverseGeocodeOsm(engine, rawParams = {}) {
     page: 1,
     size
   });
-  const results = uniqueReverseAddressResults((response.results || []).map(reverseAddressResult));
+  const results = uniqueReverseAddressResults((response.results || [])
+    .map(reverseAddressResult)
+    .filter(result => matchesReverseFilters(result, resultTypes, locationTypes)));
+  const localityRequested = (!resultTypes.size
+    || [...resultTypes].some(type => LOCALITY_TYPES.has(type) || type === "locality"))
+    && (!locationTypes.size || locationTypes.has("APPROXIMATE"));
+  if (!results.length && localityRequested) {
+    const localityRadius = Math.max(
+      requestedRadius,
+      Number(rawParams.localityRadiusMeters || DEFAULT_REVERSE_LOCALITY_RADIUS_METERS)
+    );
+    const localityCoverage = explicitScope.length
+      ? explicitScope
+      : anchorRadiusCoverageShards(engine, coordinate, localityRadius);
+    // The closest OSM `place` points are often suburbs, neighbourhoods,
+    // squares, islands, and named localities. Read a bounded wider candidate
+    // page before applying the requested administrative types so a city centre
+    // a few kilometres away is not hidden behind those denser micro-features.
+    const localityCandidateSize = Math.min(64, Math.max(32, size * 4));
+    const localityResponse = await engine.search({
+      ...engineOptions,
+      q: "",
+      ...(localityCoverage.length ? { shards: localityCoverage } : {}),
+      filters: { facets: { category: ["place"] } },
+      geo: {
+        near: { ...coordinate, radiusMeters: localityRadius },
+        sort: "distance"
+      },
+      page: 1,
+      size: localityCandidateSize
+    });
+    const localityCandidates = uniqueReverseAddressResults((localityResponse.results || [])
+      .filter(result => LOCALITY_TYPES.has(result.type))
+      .map(reverseLocalityResult)
+      .filter(result => matchesReverseFilters(result, resultTypes, locationTypes)));
+    const localities = localityCandidates.slice(0, size);
+    return {
+      ...localityResponse,
+      total: localityCandidates.length,
+      page: 1,
+      size,
+      results: localities,
+      resolvedQuery: localities[0]?.address || `${coordinate.lat.toFixed(6)}, ${coordinate.lon.toFixed(6)}`,
+      stats: {
+        ...(localityResponse.stats || {}),
+        ...baseStats,
+        plannerLane: "osmReverseGeocodeLocality",
+        osmIntentLocalityRadiusMeters: localityRadius,
+        ...(localityCoverage.length ? { osmIntentCoverageShards: localityCoverage } : {})
+      }
+    };
+  }
   return {
     ...response,
     total: results.length,
@@ -1252,8 +1366,80 @@ export function collapseStreetSuggestions(response, params = {}) {
   };
 }
 
+function foldedTextWithOffsets(value) {
+  let text = "";
+  const starts = [];
+  const ends = [];
+  let offset = 0;
+  for (const character of String(value || "")) {
+    const folded = fold(character);
+    for (const unit of folded) {
+      text += unit;
+      starts.push(offset);
+      ends.push(offset + character.length);
+    }
+    offset += character.length;
+  }
+  return { text, starts, ends };
+}
+
+function suggestionMatchRanges(text, input) {
+  const haystack = foldedTextWithOffsets(text);
+  const tokens = fold(input).split(/\s+/u).filter(token => token.length >= 1);
+  const ranges = [];
+  for (const token of tokens) {
+    const start = haystack.text.indexOf(token);
+    if (start < 0) continue;
+    ranges.push({ start: haystack.starts[start], end: haystack.ends[start + token.length - 1] });
+  }
+  return ranges
+    .filter((range, index, all) => !all.some((other, otherIndex) => (
+      otherIndex < index && other.start === range.start && other.end === range.end
+    )))
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+}
+
+function structuredSuggestion(item, input) {
+  const text = String(item.text || "").trim();
+  const comma = text.indexOf(",");
+  const mainText = item.type === "category-locality"
+    ? String(item.category || text).replaceAll("_", " ")
+    : comma > 0 ? text.slice(0, comma).trim() : text;
+  const secondaryText = item.type === "category-locality"
+    ? String(item.locality || "")
+    : comma > 0 ? text.slice(comma + 1).trim() : "";
+  const kind = item.type || "place";
+  return {
+    ...item,
+    description: text,
+    mainText,
+    secondaryText,
+    matchedRanges: suggestionMatchRanges(text, input),
+    kind,
+    types: item.category ? [item.category] : kind === "street" ? ["route"] : [kind],
+    selection: {
+      query: text,
+      ...(item.shards?.length ? { shards: item.shards } : {})
+    }
+  };
+}
+
+function structuredSuggestions(response, input) {
+  return {
+    ...response,
+    suggestions: (response.suggestions || []).map(item => structuredSuggestion(item, input))
+  };
+}
+
 export async function suggestOsmQuery(engine, rawParams = {}) {
-  const params = engineParams(rawParams);
+  const { inputOffset: rawInputOffset, ...rawEngineParams } = rawParams;
+  const originalQ = String(rawParams.q || "");
+  const parsedOffset = Number(rawInputOffset);
+  const inputOffset = Number.isFinite(parsedOffset)
+    ? Math.max(0, Math.min(originalQ.length, Math.floor(parsedOffset)))
+    : originalQ.length;
+  const input = originalQ.slice(0, inputOffset);
+  const params = { ...engineParams(rawEngineParams), q: input };
   const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
   const anchor = nearAnchor(rawParams) || viewportAnchor(rawParams.geo?.box);
   const coverage = anchor && params.shards == null ? anchorCoverageShards(engine, anchor) : [];
@@ -1278,9 +1464,10 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
         locality: item.text
       }))
       .slice(0, requestedSize);
-    return {
+    return structuredSuggestions({
       ...localityResponse,
-      q,
+      q: originalQ,
+      inputOffset,
       suggestions,
       stats: {
         ...(localityResponse.stats || {}),
@@ -1288,7 +1475,7 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
         osmIntentCategory: intent.category.query,
         ...(coverage.length ? { osmSuggestCoverageShards: coverage } : {})
       }
-    };
+    }, input);
   }
   const response = await engine.suggest({
     ...params,
@@ -1296,13 +1483,15 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
     size: hasHouseNumber(params.q) ? requestedSize : Math.max(32, requestedSize)
   });
   const collapsed = collapseStreetSuggestions(response, { ...params, size: requestedSize });
-  return coverage.length ? {
+  return structuredSuggestions(coverage.length ? {
     ...collapsed,
+    q: originalQ,
+    inputOffset,
     stats: {
       ...(collapsed.stats || {}),
       osmSuggestCoverageShards: coverage
     }
-  } : collapsed;
+  } : { ...collapsed, q: originalQ, inputOffset }, input);
 }
 
 function collapseCivicDuplicates(response) {

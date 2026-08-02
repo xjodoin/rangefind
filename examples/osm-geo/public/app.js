@@ -26,9 +26,14 @@ const queryReceiptSummary = document.querySelector("#queryReceiptSummary");
 const queryReceiptRoute = document.querySelector("#queryReceiptRoute");
 const queryReceiptBars = document.querySelector("#queryReceiptBars");
 const placeLens = document.querySelector("#placeLens");
+const placeLensEyebrow = document.querySelector("#placeLensEyebrow");
 const placeLensTitle = document.querySelector("#placeLensTitle");
 const placeLensCopy = document.querySelector("#placeLensCopy");
+const placeLensBadges = document.querySelector("#placeLensBadges");
+const placeLensFacts = document.querySelector("#placeLensFacts");
+const placeLensLinks = document.querySelector("#placeLensLinks");
 const placeLensClose = document.querySelector("#placeLensClose");
+const mapPickButton = document.querySelector("#mapPickButton");
 
 // The client ships with Rangefind; ../osm-rangefind-index independently
 // publishes the rolling regional shards. Every root-manifest update is picked
@@ -57,7 +62,45 @@ let activeQueryOverride = null;
 // or text query, not a resolved locality/address). Such results change with
 // the viewport, so panning the map re-runs them.
 let anchoredQueryActive = false;
+let mapPickActive = false;
 const suggestionCache = new Map();
+
+const RESOLVED_LOCATION_LANES = new Set([
+  "osmCategoryLocality",
+  "osmGlobalExactText",
+  "osmIntersectionDocument",
+  "osmIntersectionLocality",
+  "osmLocalityExact",
+  "osmNamedCategoryLocality",
+  "osmNamedTextLocality",
+  "osmReverseGeocode",
+  "osmReverseGeocodeFallback",
+  "osmReverseGeocodeLocality",
+  "osmStreetLocality",
+  "osmCoordinates"
+]);
+
+const LOCATION_TYPE_LABELS = new Map([
+  ["ROOFTOP", "Exact address"],
+  ["RANGE_INTERPOLATED", "Interpolated address"],
+  ["GEOMETRIC_CENTER", "Address area"],
+  ["APPROXIMATE", "Nearby locality"]
+]);
+
+const PLANNER_LABELS = new Map([
+  ["osmCategoryLocality", "category + locality"],
+  ["osmGlobalExactText", "exact place"],
+  ["osmIntersectionDocument", "exact intersection"],
+  ["osmIntersectionLocality", "intersection + locality"],
+  ["osmLocalityExact", "exact locality"],
+  ["osmNamedCategoryLocality", "named place + locality"],
+  ["osmNamedTextLocality", "place + locality"],
+  ["osmReverseGeocode", "reverse geocode"],
+  ["osmReverseGeocodeFallback", "coordinate"],
+  ["osmReverseGeocodeLocality", "nearby locality"],
+  ["osmStreetLocality", "street authority"],
+  ["osmCoordinates", "coordinate"]
+]);
 
 const TRACE_LABELS = new Map([
   ["manifest", "Route manifests"],
@@ -190,8 +233,85 @@ function humanize(value) {
     .replaceAll(/\b\p{L}/gu, letter => letter.toLocaleUpperCase());
 }
 
+function detailText(value) {
+  return String(value || "")
+    .split(";")
+    .map(part => humanize(part.trim()))
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function semanticLabel(item) {
+  return LOCATION_TYPE_LABELS.get(String(item?.locationType || "").toUpperCase())
+    || humanize(item?.type || item?.category || item?.types?.[0] || "place");
+}
+
+function safeWebUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(/^https?:\/\//iu.test(raw) ? raw : `https://${raw}`);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function wikipediaUrl(value) {
+  const raw = String(value || "").trim();
+  const separator = raw.indexOf(":");
+  if (separator < 1) return "";
+  const language = raw.slice(0, separator).toLowerCase();
+  const title = raw.slice(separator + 1).trim();
+  if (!/^[a-z][a-z0-9-]{0,11}$/u.test(language) || !title) return "";
+  return `https://${language}.wikipedia.org/wiki/${encodeURIComponent(title.replaceAll(" ", "_"))}`;
+}
+
+function wikidataUrl(value) {
+  const id = String(value || "").trim().toUpperCase();
+  return /^Q\d+$/u.test(id) ? `https://www.wikidata.org/wiki/${id}` : "";
+}
+
+function appendBadge(container, label, tone = "") {
+  if (!label) return;
+  const badge = document.createElement("span");
+  badge.className = `place-badge${tone ? ` place-badge--${tone}` : ""}`;
+  badge.textContent = label;
+  container.append(badge);
+}
+
+function appendFact(label, value) {
+  if (!value) return;
+  const term = document.createElement("dt");
+  term.textContent = label;
+  const description = document.createElement("dd");
+  description.textContent = value;
+  placeLensFacts.append(term, description);
+}
+
+function appendPlaceLink(label, href, className = "") {
+  if (!href) return;
+  const link = document.createElement("a");
+  link.href = href;
+  link.className = className;
+  link.textContent = label;
+  if (/^https?:/u.test(href)) {
+    link.target = "_blank";
+    link.rel = "noreferrer";
+  }
+  placeLensLinks.append(link);
+}
+
+function yesNoDetail(value, yesLabel, noLabel = "") {
+  const normalized = String(value || "").toLowerCase();
+  if (["yes", "designated", "permissive", "customers"].includes(normalized)) return yesLabel;
+  if (normalized === "no") return noLabel;
+  return value ? detailText(value) : "";
+}
+
 function resultLocation(item) {
   const name = item.name || item.title || item.id;
+  if (item.formattedAddress && item.formattedAddress !== name) return item.formattedAddress;
   if (item.address && item.address !== name) return item.address;
   const parts = [item.suburb, item.city, item.district, item.state, item.postcode, item.country]
     .map(value => String(value || "").trim())
@@ -330,15 +450,78 @@ function hidePlaceLens() {
   selectedPlace = null;
 }
 
+function setMapPickActive(active) {
+  mapPickActive = Boolean(active);
+  mapPickButton.setAttribute("aria-pressed", String(mapPickActive));
+  mapPickButton.classList.toggle("active", mapPickActive);
+  map.getCanvas().classList.toggle("is-picking", mapPickActive);
+  if (mapPickActive) {
+    hideSuggestions();
+    setPanelCollapsed(false);
+    setStatus("Choose any point on the map…", "ready");
+    mapHudText.textContent = "Tap the map to reverse geocode";
+  }
+}
+
 function openPlaceLens(item) {
   if (!Number.isFinite(item?.lat) || !Number.isFinite(item?.lon)) return;
   selectedPlace = item;
   const title = item.name || item.title || item.id;
   const location = resultLocation(item);
-  const kind = humanize(item.type || item.category || "place");
+  const kind = semanticLabel(item);
+  const details = item.details && typeof item.details === "object" ? item.details : {};
+  const services = [
+    yesNoDetail(details.delivery, "Delivery"),
+    yesNoDetail(details.takeaway, "Takeaway"),
+    yesNoDetail(details.drive_through, "Drive-through"),
+    yesNoDetail(details.reservation, "Reservations")
+  ].filter(Boolean).join(" · ");
+  const payments = [
+    yesNoDetail(details.payment_cash, "Cash"),
+    yesNoDetail(details.payment_cards, "Cards"),
+    yesNoDetail(details.payment_contactless, "Contactless")
+  ].filter(Boolean).join(" · ");
   placeLensTitle.textContent = title;
-  placeLensCopy.textContent = `${kind}${location ? ` · ${location}` : ""}. Search within a 2.5 km orbit.`;
+  placeLensEyebrow.textContent = item.locationType ? "Reverse geocode" : "OpenStreetMap place";
+  placeLensCopy.textContent = location || `${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}`;
+  placeLensBadges.replaceChildren();
+  appendBadge(placeLensBadges, kind, item.locationType ? "accuracy" : "");
+  appendBadge(placeLensBadges, formatDistance(item.distanceMeters));
+  appendBadge(placeLensBadges, details.brand);
+  appendBadge(placeLensBadges, details.cuisine ? detailText(details.cuisine) : "");
+  appendBadge(placeLensBadges, yesNoDetail(details.wheelchair, "Wheelchair accessible"), "accessible");
+
+  placeLensFacts.replaceChildren();
+  appendFact("Hours", details.opening_hours);
+  appendFact("Kitchen", details.kitchen_hours);
+  appendFact("Brand", details.brand);
+  appendFact("Operator", details.operator);
+  appendFact("Cuisine", detailText(details.cuisine));
+  appendFact("Wheelchair", yesNoDetail(details.wheelchair, "Accessible", "Not accessible"));
+  appendFact("Accessible toilets", yesNoDetail(details.toilets_wheelchair, "Available", "Not available"));
+  appendFact("Internet", yesNoDetail(details.internet_access, "Available", "Not available"));
+  appendFact("Outdoor seating", yesNoDetail(details.outdoor_seating, "Available", "Not available"));
+  appendFact("Services", services);
+  appendFact("Payments", payments);
+  appendFact("Capacity", details.capacity);
+  appendFact("Stars", details.stars);
+  appendFact("Access", detailText(details.access));
+  appendFact("Fee", yesNoDetail(details.fee, "Required", "Free"));
+  appendFact("Smoking", detailText(details.smoking));
+  appendFact("Entrance", detailText(details.entrance));
+  appendFact("Level", details.level);
+
+  placeLensLinks.replaceChildren();
+  appendPlaceLink("Website", safeWebUrl(details.website), "place-link--primary");
+  const phone = String(details.phone || "").trim();
+  if (phone && /^[+\d*#(),;.\s-]+$/u.test(phone)) appendPlaceLink("Call", `tel:${phone}`);
+  const email = String(details.email || "").trim();
+  if (email && /^[^\s@]+@[^\s@]+$/u.test(email)) appendPlaceLink("Email", `mailto:${email}`);
+  appendPlaceLink("Wikipedia", wikipediaUrl(details.wikipedia));
+  appendPlaceLink("Wikidata", wikidataUrl(details.wikidata));
+  appendPlaceLink("View on OSM", safeWebUrl(item.url));
   placeLens.hidden = false;
+  placeLens.focus({ preventScroll: true });
 }
 
 function runDiscoveryOrbit(query, label) {
@@ -384,9 +567,22 @@ function markerFor(item, index) {
   const label = document.createElement("span");
   label.textContent = index + 1;
   element.append(label);
+  const popup = document.createElement("div");
+  popup.className = "map-popup";
+  const popupTitle = document.createElement("strong");
+  popupTitle.textContent = title;
+  popup.append(popupTitle);
+  if (location) {
+    const popupLocation = document.createElement("span");
+    popupLocation.textContent = location;
+    popup.append(popupLocation);
+  }
+  const popupKind = document.createElement("small");
+  popupKind.textContent = semanticLabel(item);
+  popup.append(popupKind);
   const marker = new maplibregl.Marker({ element, anchor: "bottom" })
     .setLngLat([item.lon, item.lat])
-    .setPopup(new maplibregl.Popup({ closeButton: false, offset: 18 }).setText(accessibleLabel))
+    .setPopup(new maplibregl.Popup({ closeButton: false, offset: 18 }).setDOMContent(popup))
     .addTo(map);
   element.addEventListener("click", () => {
     mapHudText.textContent = `Selected ${title}`;
@@ -443,7 +639,7 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     meta.className = "meta";
     const addressCount = Number(item.address_count);
     const parts = [
-      item.type ? String(item.type).replaceAll("_", " ") : item.category,
+      semanticLabel(item),
       Number.isFinite(addressCount) && addressCount > 0
         ? `${formatCompact(addressCount)} civic ${addressCount === 1 ? "address" : "addresses"}`
         : "",
@@ -456,6 +652,25 @@ function renderResults(results, { fit = false, query = "" } = {}) {
       meta.append(span);
     }
     body.append(meta);
+
+    const details = item.details && typeof item.details === "object" ? item.details : {};
+    const chipValues = [
+      details.opening_hours ? "Hours" : "",
+      details.brand,
+      details.cuisine ? detailText(details.cuisine) : "",
+      yesNoDetail(details.wheelchair, "Accessible"),
+      yesNoDetail(details.delivery, "Delivery")
+    ].filter(Boolean).slice(0, 3);
+    if (chipValues.length) {
+      const chips = document.createElement("span");
+      chips.className = "result-card__chips";
+      for (const value of chipValues) {
+        const chip = document.createElement("span");
+        chip.textContent = value;
+        chips.append(chip);
+      }
+      body.append(chips);
+    }
 
     const arrow = document.createElement("span");
     arrow.className = "result-card__arrow";
@@ -500,6 +715,7 @@ function renderResults(results, { fit = false, query = "" } = {}) {
 
 async function runSearch({ fit = false } = {}) {
   if (!engine) return;
+  if (mapPickActive) setMapPickActive(false);
   const token = ++searchToken;
   const q = queryInput.value.trim();
   const queryOverride = activeQueryOverride?.displayQuery === q ? activeQueryOverride : null;
@@ -551,11 +767,8 @@ async function runSearch({ fit = false } = {}) {
   try {
     const response = await searchOsmQuery(engine, params);
     if (token !== searchToken) return;
-    const resolvedLocation = response.stats?.plannerLane === "osmCategoryLocality"
-      || response.stats?.plannerLane === "osmLocalityExact"
-      || response.stats?.plannerLane === "osmStreetLocality"
-      || response.stats?.plannerLane === "osmIntersectionLocality"
-      || response.stats?.plannerLane === "osmCoordinates";
+    const plannerLane = response.stats?.plannerLane;
+    const resolvedLocation = RESOLVED_LOCATION_LANES.has(plannerLane);
     if (resolvedLocation) areaToggle.checked = false;
     // A view-anchored result (not a named place): panning re-runs it.
     anchoredQueryActive = Boolean(anchor) && !resolvedLocation;
@@ -578,11 +791,12 @@ async function runSearch({ fit = false } = {}) {
       || response.stats?.plannerLane === "osmNearFuzzyGeo";
     const nearText = nearLane && anchor ? ` · near ${anchor.source}` : "";
     const modeText = queryOverride?.mode ? ` · ${queryOverride.mode}` : "";
+    const plannerText = PLANNER_LABELS.has(plannerLane) ? ` · ${PLANNER_LABELS.get(plannerLane)}` : "";
     const shown = Math.min(response.results.length, resultLimit());
     const timing = `${(ms / 1000).toFixed(1)}s${shardText}`;
     setStatus(response.total
-      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${nearText}${modeText}`
-      : `No matches · ${timing}${directText}${nearText}${modeText}`);
+      ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${nearText}${modeText}${plannerText}`
+      : `No matches · ${timing}${directText}${nearText}${modeText}${plannerText}`);
     renderQueryReceipt(response, shown);
     const scopeText = useArea
       ? "this map area"
@@ -627,10 +841,13 @@ function setActiveSuggestion(index) {
 
 function chooseSuggestion(suggestion) {
   const item = typeof suggestion === "string" ? { text: suggestion } : suggestion;
-  queryInput.value = item.text;
+  const query = String(item.selection?.query || item.text || "").trim();
+  const shards = item.selection?.shards || item.shards || [];
+  if (!query) return;
+  queryInput.value = query;
   activeQueryOverride = null;
-  selectedSuggestionHint = item.shards?.length
-    ? { query: item.text.trim(), shards: [...item.shards] }
+  selectedSuggestionHint = shards.length
+    ? { query, shards: [...shards] }
     : null;
   clearButton.hidden = false;
   hideSuggestions();
@@ -656,14 +873,19 @@ function cancelSuggestions() {
 }
 
 async function showSuggestions() {
-  const q = queryInput.value.trim();
+  const rawQuery = queryInput.value;
+  const q = rawQuery.trim();
+  const leadingWhitespace = rawQuery.length - rawQuery.trimStart().length;
+  const cursor = Number.isFinite(queryInput.selectionStart)
+    ? Math.max(0, Math.min(q.length, queryInput.selectionStart - leadingWhitespace))
+    : q.length;
   const token = ++suggestToken;
   if (!engine || Array.from(q).length < SUGGEST_MIN_CHARACTERS || suggestionsSuppressed) {
     hideSuggestions();
     return;
   }
   const anchor = searchAnchor();
-  const cacheKey = `${q.toLocaleLowerCase()}\0${anchor
+  const cacheKey = `${q.toLocaleLowerCase()}\0${cursor}\0${anchor
     ? `${anchor.lat.toFixed(1)},${anchor.lon.toFixed(1)}`
     : ""}`;
   const cached = suggestionCache.get(cacheKey);
@@ -681,6 +903,7 @@ async function showSuggestions() {
   try {
     const response = await suggestOsmQuery(engine, {
       q,
+      inputOffset: cursor,
       size: 8,
       ...(anchor ? { near: { lat: anchor.lat, lon: anchor.lon } } : {})
     });
@@ -701,29 +924,80 @@ async function showSuggestions() {
   }
 }
 
+function appendMatchedText(node, text, ranges, sourceOffset = 0) {
+  const value = String(text || "");
+  const endOffset = sourceOffset + value.length;
+  const relevant = (Array.isArray(ranges) ? ranges : [])
+    .map(range => ({
+      start: Math.max(sourceOffset, Number(range?.start)),
+      end: Math.min(endOffset, Number(range?.end))
+    }))
+    .filter(range => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  let cursor = 0;
+  for (const range of relevant) {
+    const start = Math.max(cursor, range.start - sourceOffset);
+    const end = Math.max(start, range.end - sourceOffset);
+    if (start > cursor) node.append(document.createTextNode(value.slice(cursor, start)));
+    if (end > cursor) {
+      const mark = document.createElement("mark");
+      mark.textContent = value.slice(start, end);
+      node.append(mark);
+    }
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < value.length) node.append(document.createTextNode(value.slice(cursor)));
+}
+
 function renderSuggestions(response) {
-  if (!response.suggestions.length) {
+  const suggestions = response.suggestions || [];
+  if (!suggestions.length) {
     hideSuggestions();
     return;
   }
-  visibleSuggestions = response.suggestions;
-  suggestList.replaceChildren(...response.suggestions.map((item, index) => {
+  visibleSuggestions = suggestions;
+  suggestList.replaceChildren(...suggestions.map((item, index) => {
     const option = document.createElement("li");
     option.id = `suggestion-${index}`;
     option.setAttribute("role", "option");
     option.setAttribute("aria-selected", "false");
-    const text = document.createElement("span");
-    text.textContent = item.text;
+    const description = String(item.description || item.text || "");
+    const mainText = String(item.mainText || description);
+    const secondaryText = String(item.secondaryText || "");
+    const mainIndex = description.indexOf(mainText);
+    const mainOffset = mainIndex >= 0 ? mainIndex : description.length + 1;
+    const secondaryIndex = secondaryText ? description.indexOf(secondaryText, Math.max(0, mainIndex) + mainText.length) : -1;
+    const secondaryOffset = secondaryIndex >= 0 ? secondaryIndex : description.length + 1;
+    const icon = document.createElement("span");
+    icon.className = "suggestion-icon";
+    icon.dataset.kind = item.kind || item.type || "place";
+    icon.setAttribute("aria-hidden", "true");
+    const body = document.createElement("span");
+    body.className = "suggestion-body";
+    const primary = document.createElement("span");
+    primary.className = "suggestion-primary";
+    appendMatchedText(primary, mainText, item.matchedRanges, mainOffset);
+    body.append(primary);
+    if (secondaryText) {
+      const secondary = document.createElement("span");
+      secondary.className = "suggestion-secondary";
+      appendMatchedText(secondary, secondaryText, item.matchedRanges, secondaryOffset);
+      body.append(secondary);
+    }
     const count = document.createElement("span");
     count.className = "count";
-    count.textContent = item.type === "street"
+    const shards = item.selection?.shards || item.shards;
+    count.textContent = item.kind === "category-locality"
+      ? "nearby"
+      : item.type === "street" || item.kind === "street"
       ? "street"
       : item.interpolated
         ? "interpolated"
-        : item.shards?.length
-          ? suggestionRegionLabel(item.shards)
+        : shards?.length
+          ? suggestionRegionLabel(shards)
           : item.count > 1 ? `×${formatNumber(item.count)}` : "place";
-    option.append(text, count);
+    option.setAttribute("aria-label", `${description}${count.textContent ? `, ${count.textContent}` : ""}`);
+    option.append(icon, body, count);
     option.addEventListener("pointerdown", event => {
       event.preventDefault();
       chooseSuggestion(item);
@@ -756,6 +1030,7 @@ async function loadIndexStatus() {
 }
 
 queryInput.addEventListener("input", () => {
+  if (mapPickActive) setMapPickActive(false);
   activeQueryOverride = null;
   clearButton.hidden = !queryInput.value;
   if (selectedSuggestionHint?.query !== queryInput.value.trim()) selectedSuggestionHint = null;
@@ -814,7 +1089,19 @@ panelToggle.addEventListener("click", () => {
   setPanelCollapsed(!searchPanel.classList.contains("is-collapsed"));
 });
 
-placeLensClose.addEventListener("click", hidePlaceLens);
+placeLensClose.addEventListener("click", () => {
+  hidePlaceLens();
+  setPanelCollapsed(false);
+});
+
+mapPickButton.addEventListener("click", () => {
+  const active = !mapPickActive;
+  setMapPickActive(active);
+  if (!active) {
+    setStatus("Map selection cancelled", "ready");
+    mapHudText.textContent = "Search anywhere in the published index";
+  }
+});
 
 for (const action of document.querySelectorAll("[data-orbit-query]")) {
   action.addEventListener("click", () => runDiscoveryOrbit(
@@ -840,6 +1127,16 @@ areaToggle.addEventListener("change", () => {
 });
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && mapPickActive) {
+    setMapPickActive(false);
+    setStatus("Map selection cancelled", "ready");
+    return;
+  }
+  if (event.key === "Escape" && !placeLens.hidden && document.activeElement !== queryInput) {
+    hidePlaceLens();
+    setPanelCollapsed(false);
+    return;
+  }
   const shortcut = event.key === "/" && document.activeElement !== queryInput;
   const command = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k";
   if (!shortcut && !command) return;
@@ -847,6 +1144,25 @@ document.addEventListener("keydown", event => {
   setPanelCollapsed(false);
   queryInput.focus();
   queryInput.select();
+});
+
+map.on("click", event => {
+  if (!mapPickActive) return;
+  const lat = Number(event.lngLat?.lat);
+  const lon = Number(event.lngLat?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const coordinateQuery = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+  setMapPickActive(false);
+  activeQueryOverride = {
+    displayQuery: coordinateQuery,
+    mode: "map point",
+    params: { q: coordinateQuery, reverseGeocode: true }
+  };
+  queryInput.value = coordinateQuery;
+  selectedSuggestionHint = null;
+  clearButton.hidden = false;
+  areaToggle.checked = false;
+  runSearch({ fit: true });
 });
 
 map.on("movestart", event => {

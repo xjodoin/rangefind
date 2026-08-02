@@ -21,11 +21,15 @@
       <span id="mapHudText">Connecting to the atlas</span>
     </div>
 
-    <section id="placeLens" class="place-lens" aria-label="Explore around the selected place" hidden>
-      <button id="placeLensClose" class="place-lens__close" type="button" aria-label="Close discovery orbit">×</button>
-      <p class="place-lens__eyebrow"><span aria-hidden="true"></span> Discovery orbit</p>
+    <section id="placeLens" class="place-lens" role="dialog" aria-labelledby="placeLensTitle" tabindex="-1" hidden>
+      <button id="placeLensClose" class="place-lens__close" type="button" aria-label="Close place details">×</button>
+      <p class="place-lens__eyebrow"><span aria-hidden="true"></span> <b id="placeLensEyebrow">Place details</b></p>
       <h2 id="placeLensTitle">Explore this place</h2>
-      <p id="placeLensCopy">Search nearby without opening a search server.</p>
+      <p id="placeLensCopy">Place information loaded directly from OpenStreetMap.</p>
+      <div id="placeLensBadges" class="place-lens__badges" aria-label="Place summary"></div>
+      <dl id="placeLensFacts" class="place-lens__facts"></dl>
+      <div id="placeLensLinks" class="place-lens__links" aria-label="Place actions"></div>
+      <p class="place-lens__orbit-label">Search within 2.5 km</p>
       <div class="place-lens__actions" aria-label="Nearby searches">
         <button type="button" data-orbit-query="cafe" data-orbit-label="Cafés">Cafés</button>
         <button type="button" data-orbit-query="restaurant" data-orbit-label="Restaurants">Restaurants</button>
@@ -115,7 +119,12 @@
               <small>Best for nearby shops and places</small>
             </span>
           </label>
-          <button id="clearButton" class="clear-button" type="button" hidden>Clear</button>
+          <span class="search-toolbar__actions">
+            <button id="mapPickButton" class="map-pick-button" type="button" aria-pressed="false" title="Choose a point on the map">
+              <span aria-hidden="true"></span> Pick map
+            </button>
+            <button id="clearButton" class="clear-button" type="button" hidden>Clear</button>
+          </span>
         </div>
       </section>
 

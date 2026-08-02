@@ -21,7 +21,10 @@ import { authorityAddressRangeKey } from "../src/authority_codec.js";
 import { createNodeSearch } from "../src/runtime.node.js";
 import {
   addressFromTags,
+  enrichDocLocality,
   interpolationRangeDocs,
+  osmProminence,
+  placeDetails,
   placeDoc
 } from "../src/integrations/osm/documents.js";
 
@@ -47,6 +50,16 @@ test("address keys normalize directions, suffixes, punctuation, and ordinal word
   assert.equal(normalizePostalCodeSpacing("h4r 1p8"), "h4r 1p8");
   assert.equal(normalizePostalCodePrefixSpacing("J7A1V"), "J7A 1V");
   assert.equal(normalizePostalCodePrefixSpacing("pharmacy J7A1"), "pharmacy J7A 1");
+});
+
+test("named OSM roads publish locality-qualified street authority", () => {
+  const tags = new Map([["name", "Rue Saint-Denis"], ["highway", "primary"]]);
+  const doc = placeDoc("way", 101, 45.52, -73.57, tags);
+  assert.equal(doc.category, "highway");
+  assert.equal(doc.type, "primary");
+  assert.equal(doc.street, "Rue Saint-Denis");
+  assert.equal(enrichDocLocality(doc, "Montréal"), true);
+  assert.equal(doc.street_authority, "Rue Saint-Denis, Montréal");
 });
 
 test("OSM address extraction retains structured and address-only features", () => {
@@ -97,6 +110,41 @@ test("named OSM places expose their address without replacing their identity", (
   assert.equal(doc.address, "350 5th Avenue, New York");
   assert.equal(doc.body, "fast food amenity mexican");
   assert.equal(doc.category, "amenity");
+});
+
+test("OSM place documents retain compact useful details and a prominence prior", () => {
+  const tags = new Map([
+    ["name", "Accessible Café"],
+    ["amenity", "cafe"],
+    ["brand", "Example Coffee"],
+    ["cuisine", "coffee_shop"],
+    ["opening_hours", "Mo-Su 07:00-21:00"],
+    ["contact:phone", "+1-555-0100"],
+    ["contact:website", "https://example.test"],
+    ["wheelchair", "yes"],
+    ["outdoor_seating", "yes"],
+    ["payment:contactless", "yes"],
+    ["wikidata", "Q123"]
+  ]);
+  assert.deepEqual(placeDetails(tags), {
+    brand: "Example Coffee",
+    cuisine: "coffee_shop",
+    opening_hours: "Mo-Su 07:00-21:00",
+    phone: "+1-555-0100",
+    website: "https://example.test",
+    wheelchair: "yes",
+    outdoor_seating: "yes",
+    payment_contactless: "yes",
+    wikidata: "Q123"
+  });
+  const doc = placeDoc("node", 100, 45.5, -73.5, tags);
+  assert.equal(doc.details.opening_hours, "Mo-Su 07:00-21:00");
+  assert.equal(doc.details.wheelchair, "yes");
+  assert.match(doc.body, /Example Coffee/u);
+  assert.ok(doc.prominence > 0 && doc.prominence <= 1);
+
+  const city = new Map([["name", "Montréal"], ["place", "city"], ["population", "1704694"], ["capital", "yes"]]);
+  assert.ok(osmProminence(city) > doc.prominence, "a populous capital should outrank an ordinary POI");
 });
 
 test("address interpolation uses compact buckets and follows polyline distance", () => {

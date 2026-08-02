@@ -22,6 +22,7 @@ export function evaluateExpectations(response, expect = {}) {
   const top = rows[0] || null;
   const lane = response?.stats?.plannerLane || response?.stats?.suggestLane || response?.stats?.geoLane || null;
   const checks = [];
+  const metrics = {};
   if (expect.minResults != null) {
     addCheck(checks, "minResults", rows.length >= expect.minResults, rows.length);
   }
@@ -41,6 +42,13 @@ export function evaluateExpectations(response, expect = {}) {
       actual.some(text => expect.anyTextAny.some(value => fold(text).includes(fold(value)))),
       actual
     );
+  }
+  if (expect.targetTextAny?.length) {
+    const rank = rows.findIndex(row => expect.targetTextAny.some(value => fold(resultText(row)).includes(fold(value)))) + 1;
+    const maxRank = Math.max(1, Number(expect.targetMaxRank || rows.length || 1));
+    addCheck(checks, "targetRank", rank > 0 && rank <= maxRank, rank || null);
+    metrics.targetRank = rank || null;
+    metrics.reciprocalRank = rank > 0 ? 1 / rank : 0;
   }
   if (expect.topTypes?.length) {
     const actual = top?.type || top?.category || "";
@@ -62,6 +70,66 @@ export function evaluateExpectations(response, expect = {}) {
   if (expect.topHasId) {
     const actual = top?.id || "";
     addCheck(checks, "topHasId", Boolean(String(actual).trim()), actual);
+  }
+  if (expect.structuredSuggestion) {
+    const actual = top ? {
+      mainText: top.mainText,
+      secondaryText: top.secondaryText,
+      matchedRanges: top.matchedRanges,
+      selection: top.selection
+    } : null;
+    addCheck(
+      checks,
+      "structuredSuggestion",
+      Boolean(top?.mainText && Array.isArray(top?.matchedRanges) && top?.selection?.query),
+      actual
+    );
+  }
+  if (expect.topLocationTypes?.length) {
+    addCheck(checks, "topLocationTypes", expect.topLocationTypes.includes(top?.locationType), top?.locationType || "");
+  }
+  if (expect.topReverseAccuracy?.length) {
+    addCheck(
+      checks,
+      "topReverseAccuracy",
+      expect.topReverseAccuracy.includes(top?.reverseGeocodeAccuracy),
+      top?.reverseGeocodeAccuracy || ""
+    );
+  }
+  if (expect.topAddressComponentTypes?.length) {
+    const actual = (top?.addressComponents || []).flatMap(component => component.types || []);
+    addCheck(
+      checks,
+      "topAddressComponentTypes",
+      expect.topAddressComponentTypes.every(type => actual.includes(type)),
+      actual
+    );
+  }
+  if (expect.topDetailFields?.length) {
+    const actual = Object.keys(top?.details || {});
+    addCheck(
+      checks,
+      "topDetailFields",
+      expect.topDetailFields.every(field => top?.details?.[field] != null),
+      actual
+    );
+  }
+  if (expect.anyDetailFields?.length) {
+    const actual = rows.slice(0, expect.checkTop || 18)
+      .flatMap(row => Object.keys(row?.details || {}));
+    addCheck(
+      checks,
+      "anyDetailFields",
+      expect.anyDetailFields.some(field => actual.includes(field)),
+      [...new Set(actual)].sort()
+    );
+  }
+  if (expect.detailCoverageMin != null) {
+    const sample = rows.slice(0, expect.checkTop || 18);
+    const covered = sample.filter(row => row?.details && Object.keys(row.details).length).length;
+    const ratio = sample.length ? covered / sample.length : 0;
+    addCheck(checks, "detailCoverageMin", ratio >= expect.detailCoverageMin, ratio);
+    metrics.detailCoverage = ratio;
   }
   if (expect.topPostcodeAny?.length) {
     const actual = top?.postcode || "";
@@ -114,6 +182,10 @@ export function evaluateExpectations(response, expect = {}) {
       actual
     );
   }
+  if (expect.uniqueTexts) {
+    const actual = rows.slice(0, expect.checkTop || 18).map(resultText).map(fold).filter(Boolean);
+    addCheck(checks, "uniqueTexts", new Set(actual).size === actual.length, actual);
+  }
   if (expect.viewportBox) {
     const box = expect.viewportBox;
     const positioned = rows.slice(0, expect.checkTop || 18)
@@ -136,7 +208,8 @@ export function evaluateExpectations(response, expect = {}) {
   }
   return {
     passed: checks.every(check => check.pass),
-    checks
+    checks,
+    metrics
   };
 }
 
@@ -178,6 +251,10 @@ function aggregate(rows) {
     weight: totalWeight,
     qualityPassRate: totalWeight ? qualityWeight / totalWeight : null,
     budgetPassRate: totalWeight ? budgetWeight / totalWeight : null,
+    meanReciprocalRank: weightedAverage(
+      usable.filter(row => row.quality?.metrics?.reciprocalRank != null),
+      row => row.quality.metrics.reciprocalRank
+    ),
     cold: {
       weightedMeanMs: weightedAverage(usable, row => row.cold.ms),
       p50Ms: percentile(usable.map(row => row.cold.ms), 0.5),

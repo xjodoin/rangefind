@@ -6,6 +6,8 @@ export interface RangefindConfig {
   fields: Array<Record<string, unknown>>;
   facets: Array<Record<string, unknown>>;
   numbers: Array<Record<string, unknown>>;
+  /** Optional normalized numeric relevance prior applied to text-score ties. */
+  rankPrior?: { field: string; boost?: number; overfetch?: number } | null;
   booleans: Array<Record<string, unknown>>;
   geo: Array<{ name: string; latPath: string; lonPath: string }>;
   /** Embed compact display rows in geo leaves for one-range map results. */

@@ -67,7 +67,13 @@ const CASES = [
     scenario: "Type a city name",
     weight: 9,
     budget: BUDGETS.autocomplete,
-    expect: { minResults: 1, anyTextAny: ["Montréal", "Montreal"] },
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Montréal", "Montreal"],
+      targetMaxRank: 3,
+      structuredSuggestion: true,
+      uniqueTexts: true
+    },
     run: engine => suggestOsmQuery(engine, { q: "mont", near: MONTREAL, size: 8 })
   },
   {
@@ -76,7 +82,13 @@ const CASES = [
     scenario: "Type a category and locality",
     weight: 9,
     budget: BUDGETS.autocomplete,
-    expect: { minResults: 1, anyTextAny: ["cinema", "cinéma", "Laval"] },
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Cinema Laval", "Cinéma Laval"],
+      targetMaxRank: 3,
+      structuredSuggestion: true,
+      uniqueTexts: true
+    },
     run: engine => suggestOsmQuery(engine, { q: "cinema lav", near: MONTREAL, size: 8 })
   },
   {
@@ -85,7 +97,13 @@ const CASES = [
     scenario: "Type a partial civic address",
     weight: 8,
     budget: BUDGETS.addressAutocomplete,
-    expect: { minResults: 1, anyTextAny: ["Sherbrooke"] },
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Sherbrooke"],
+      targetMaxRank: 5,
+      structuredSuggestion: true,
+      uniqueTexts: true
+    },
     run: engine => suggestOsmQuery(engine, { q: "845 sher", near: MONTREAL, size: 8 })
   },
   {
@@ -95,8 +113,31 @@ const CASES = [
     weight: 7,
     common: false,
     budget: BUDGETS.autocomplete,
-    expect: { minResults: 1, anyTextAny: ["Tim Horton"] },
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Tim Horton"],
+      targetMaxRank: 5,
+      structuredSuggestion: true,
+      uniqueTexts: true
+    },
     run: engine => suggestOsmQuery(engine, { q: "tim hor", near: LAVAL, size: 8 })
+  },
+  {
+    id: "suggest-cursor-edit",
+    family: "autocomplete",
+    scenario: "Autocomplete from text before the cursor while editing a query",
+    weight: 4,
+    common: false,
+    production: true,
+    budget: BUDGETS.autocomplete,
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Montréal", "Montreal"],
+      targetMaxRank: 3,
+      structuredSuggestion: true,
+      uniqueTexts: true
+    },
+    run: engine => suggestOsmQuery(engine, { q: "montxreal", inputOffset: 4, near: MONTREAL, size: 8 })
   },
   {
     id: "locality-exact",
@@ -806,6 +847,43 @@ const CASES = [
     run: engine => searchOsmQuery(engine, { q: "zzqxjkv nowhere", shards: ["alberta"], size: 18 })
   },
   {
+    id: "next-index-place-details",
+    family: "place-details",
+    scenario: "Return useful OSM place details directly in nearby results",
+    weight: 5,
+    common: false,
+    nextIndex: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 10,
+      anyDetailFields: ["opening_hours", "cuisine", "website", "phone", "wheelchair"],
+      detailCoverageMin: 0.2,
+      topHasCoordinates: true,
+      allTopShards: ["quebec"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "restaurant", near: MONTREAL, size: 18 })
+  },
+  {
+    id: "next-index-street-authority",
+    family: "address",
+    scenario: "Resolve a locality-qualified named OSM road through exact street authority",
+    weight: 5,
+    common: false,
+    nextIndex: true,
+    budget: { ...BUDGETS.direct, coldRequests: 45, coldBytes: 3 * MIB },
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Saint-Denis", "Saint Denis"],
+      targetMaxRank: 3,
+      topLocalityAny: ["Montréal", "Montreal"],
+      topShard: "quebec",
+      lanes: ["osmStreetLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, { q: "rue saint denis montreal", size: 18 })
+  },
+  {
     id: "coordinates",
     family: "reverse-geocode",
     scenario: "Reverse-geocode decimal coordinates typed into map search",
@@ -821,6 +899,9 @@ const CASES = [
       topHasCoordinates: true,
       topHasAddress: true,
       topHasId: true,
+      topLocationTypes: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER"],
+      topReverseAccuracy: ["address-point", "range", "address"],
+      topAddressComponentTypes: ["route", "locality"],
       firstDistanceMax: 100,
       lanes: ["osmReverseGeocode"],
       maxShardsQueried: 1
@@ -843,6 +924,9 @@ const CASES = [
       topHasCoordinates: true,
       topHasAddress: true,
       topHasId: true,
+      topLocationTypes: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER"],
+      topReverseAccuracy: ["address-point", "range", "address"],
+      topAddressComponentTypes: ["route", "locality"],
       firstDistanceMax: 100,
       lanes: ["osmReverseGeocode"],
       maxShardsQueried: 1
@@ -870,6 +954,9 @@ const CASES = [
       topHasCoordinates: true,
       topHasAddress: true,
       topHasId: true,
+      topLocationTypes: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER"],
+      topReverseAccuracy: ["address-point", "range", "address"],
+      topAddressComponentTypes: ["route", "locality"],
       firstDistanceMax: 100,
       lanes: ["osmReverseGeocode"],
       maxShardsQueried: 3
@@ -892,6 +979,9 @@ const CASES = [
       topHasCoordinates: true,
       topHasAddress: true,
       topHasId: true,
+      topLocationTypes: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER"],
+      topReverseAccuracy: ["address-point", "range", "address"],
+      topAddressComponentTypes: ["route", "locality"],
       firstDistanceMax: 2500,
       lanes: ["osmReverseGeocode"],
       maxShardsQueried: 1
@@ -916,6 +1006,31 @@ const CASES = [
       maxShardsQueried: 0
     },
     run: engine => reverseGeocodeOsm(engine, { lat: 0, lon: -140, size: 8 })
+  },
+  {
+    id: "production-reverse-locality-filter",
+    family: "reverse-geocode",
+    scenario: "Resolve a coordinate to its locality when address results are filtered out",
+    weight: 3,
+    common: false,
+    production: true,
+    budget: { ...BUDGETS.reverseGeocode, coldRequests: 100, coldBytes: 6 * MIB },
+    expect: {
+      minResults: 1,
+      targetTextAny: ["Laval"],
+      targetMaxRank: 3,
+      topTypes: ["city", "town", "municipality", "village"],
+      topLocationTypes: ["APPROXIMATE"],
+      topReverseAccuracy: ["locality"],
+      topHasCoordinates: true,
+      lanes: ["osmReverseGeocodeLocality"],
+      maxShardsQueried: 1
+    },
+    run: engine => reverseGeocodeOsm(engine, {
+      ...LAVAL,
+      resultTypes: ["city", "town", "municipality", "village"],
+      size: 8
+    })
   }
 ];
 
@@ -1049,7 +1164,12 @@ function resultSummary(response) {
       city: item.city || "",
       address: item.address || "",
       shard: item.shard || "",
-      distanceMeters: Number.isFinite(item.distanceMeters) ? item.distanceMeters : null
+      distanceMeters: Number.isFinite(item.distanceMeters) ? item.distanceMeters : null,
+      locationType: item.locationType || "",
+      reverseGeocodeAccuracy: item.reverseGeocodeAccuracy || "",
+      details: item.details || null,
+      mainText: item.mainText || "",
+      secondaryText: item.secondaryText || ""
     }))
   };
 }
@@ -1136,16 +1256,17 @@ if (workerCase) {
   process.stdout.write(JSON.stringify(result));
 } else {
   const args = parseArgs(process.argv.slice(2));
-  const knownProfiles = new Set(["common", "production", "full", "edge", ...CASES.map(item => item.family)]);
+  const knownProfiles = new Set(["common", "production", "full", "edge", "next-index", ...CASES.map(item => item.family)]);
   if (!knownProfiles.has(args.profile)) {
     throw new Error(`Unknown Maps benchmark profile ${args.profile}; expected common, full, or a case family.`);
   }
   const selected = CASES.filter(item => {
     if (args.cases) return args.cases.has(item.id);
-    if (args.profile === "full") return true;
+    if (args.profile === "full") return item.nextIndex !== true;
     if (args.profile === "common") return item.common !== false;
     if (args.profile === "production") return item.common !== false || item.production === true;
     if (args.profile === "edge") return item.edge === true;
+    if (args.profile === "next-index") return item.nextIndex === true || item.common !== false || item.production === true;
     return item.family === args.profile;
   });
   if (args.list) {
@@ -1156,6 +1277,7 @@ if (workerCase) {
       weight: item.weight,
       common: item.common !== false,
       production: item.common !== false || item.production === true,
+      nextIndex: item.nextIndex === true,
       edge: item.edge === true
     })), null, 2));
     process.exit(0);

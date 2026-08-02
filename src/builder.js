@@ -4043,6 +4043,7 @@ function minimalManifest(manifest) {
     sorts: manifest.sorts,
     geo: manifest.geo,
     linkGraph: manifest.linkGraph,
+    rankPrior: manifest.rankPrior,
     vectors: manifest.vectors,
     block_filters: manifest.block_filters,
     directory: manifest.directory,
@@ -4675,6 +4676,7 @@ export async function build({ configPath, update = false, compact = false }) {
         }
       : null,
     linkGraph: config.linkGraph || null,
+    rankPrior: config.rankPrior || null,
     vectors: vectors
       ? {
           storage: vectors.storage,

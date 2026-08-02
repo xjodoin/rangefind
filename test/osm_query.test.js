@@ -157,6 +157,63 @@ test("OSM reverse geocoding validates coordinates and positive radii", async () 
     reverseGeocodeOsm(engine, { lat: 45, lon: -73, radiusMeters: 0 }),
     /positive/
   );
+  await assert.rejects(
+    reverseGeocodeOsm(engine, { lat: 45, lon: -73, localityRadiusMeters: Number.NaN }),
+    /localityRadiusMeters/u
+  );
+});
+
+test("OSM reverse geocoding can filter to a bounded locality fallback", async () => {
+  const calls = [];
+  const engine = {
+    manifest: { shards: [{ id: "quebec", bbox: [45, -79.9, 62.7, -57] }] },
+    async search(params) {
+      calls.push(params);
+      if (params.filters.facets.category.includes("address")) {
+        return {
+          total: 1,
+          results: [{
+            name: "1 Rue Exemple, Laval",
+            address: "1 Rue Exemple, Laval",
+            house_number: "1",
+            street: "Rue Exemple",
+            city: "Laval",
+            category: "address",
+            type: "address",
+            lat: 45.6,
+            lon: -73.7
+          }],
+          stats: { shardsQueried: 1 }
+        };
+      }
+      return {
+        total: 1,
+        results: [{
+          id: "relation/laval",
+          name: "Laval",
+          category: "place",
+          type: "city",
+          lat: 45.6066,
+          lon: -73.7124,
+          distanceMeters: 0
+        }],
+        stats: { shardsQueried: 1 }
+      };
+    }
+  };
+  const response = await reverseGeocodeOsm(engine, {
+    lat: 45.6066,
+    lon: -73.7124,
+    resultTypes: ["city"],
+    size: 5
+  });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].filters.facets.category, ["place"]);
+  assert.equal(response.results[0].name, "Laval");
+  assert.equal(response.results[0].locationType, "APPROXIMATE");
+  assert.equal(response.results[0].reverseGeocodeAccuracy, "locality");
+  assert.deepEqual(response.results[0].types, ["city"]);
+  assert.equal(response.stats.plannerLane, "osmReverseGeocodeLocality");
 });
 
 test("OSM autocomplete routes through the shard covering the current map", async () => {
@@ -180,6 +237,28 @@ test("OSM autocomplete routes through the shard covering the current map", async
   });
   assert.deepEqual(calls[0].shards, ["quebec"]);
   assert.deepEqual(response.stats.osmSuggestCoverageShards, ["quebec"]);
+  assert.equal(response.suggestions[0].mainText, "845 Rue Sherbrooke Ouest");
+  assert.equal(response.suggestions[0].secondaryText, "Montréal");
+  assert.deepEqual(response.suggestions[0].selection, {
+    query: "845 Rue Sherbrooke Ouest, Montréal"
+  });
+  assert.ok(response.suggestions[0].matchedRanges.length >= 1);
+});
+
+test("OSM autocomplete honors the cursor offset and returns selection metadata", async () => {
+  const calls = [];
+  const engine = {
+    async suggest(params) {
+      calls.push(params);
+      return { suggestions: [{ text: "Montréal", shards: ["quebec"] }], stats: {} };
+    }
+  };
+  const response = await suggestOsmQuery(engine, { q: "montxreal", inputOffset: 4, size: 8 });
+  assert.equal(calls[0].q, "mont");
+  assert.equal(response.q, "montxreal");
+  assert.equal(response.inputOffset, 4);
+  assert.deepEqual(response.suggestions[0].selection, { query: "Montréal", shards: ["quebec"] });
+  assert.deepEqual(response.suggestions[0].matchedRanges, [{ start: 0, end: 4 }]);
 });
 
 test("OSM autocomplete composes a category with matching locality suggestions", async () => {

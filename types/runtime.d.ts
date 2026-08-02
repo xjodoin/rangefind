@@ -49,6 +49,10 @@ export interface SearchParams {
   highlight?: boolean | Record<string, unknown>;
   includeResults?: boolean;
   trace?: boolean;
+  /** Disable or override a manifest-configured numeric relevance prior. */
+  rankPrior?: boolean;
+  rankPriorBoost?: number;
+  rankPriorOverfetch?: number;
   [key: string]: unknown;
 }
 
@@ -90,6 +94,14 @@ export interface Suggestion {
   text: string;
   count: number;
   weight: number;
+  /** OSM integration: structured prediction fields. */
+  description?: string;
+  mainText?: string;
+  secondaryText?: string;
+  matchedRanges?: Array<{ start: number; end: number }>;
+  kind?: string;
+  types?: string[];
+  selection?: { query: string; shards?: string[] };
   [key: string]: unknown;
 }
 
@@ -116,6 +128,7 @@ export interface RangefindManifest {
   meta?: Record<string, unknown> | null;
   shards?: Array<Record<string, unknown>>;
   generations?: Array<Record<string, unknown>>;
+  rankPrior?: { field: string; boost: number; overfetch?: number } | null;
   [key: string]: unknown;
 }
 

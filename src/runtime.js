@@ -8248,40 +8248,66 @@ export async function createSearch(options = {}) {
     return runCountSearch({ q, baseTerms });
   }
 
-  // Link-graph authority prior. A build-time PageRank score (manifest.linkGraph,
-  // field values in [0, 1]) applied as a multiplicative document boost over the
+  // Numeric relevance prior. A build-time score (manifest.rankPrior, or the
+  // backwards-compatible manifest.linkGraph block), with field values in
+  // [0, 1], is applied as a multiplicative document boost over the
   // returned result window: score *= 1 + weight * linkRank. This mirrors the
   // geo-boost window rerank — it reorders the current page rather than pulling
   // in new candidates, so it stays a bounded, cheap post-pass with no change to
   // the block-max scoring loop. Skipped entirely (no doc-value fetch) unless the
-  // index carries a linkGraph block and the boost weight is positive.
+  // index carries either prior block and the boost weight is positive.
   // Resolve the active link-graph boost weight for a query, or 0 when the prior
   // must not apply. The prior is a *relevance* prior: it only makes sense on a
   // text query ranked by score. A browse (no query) or an explicit sort has
   // zero/degenerate scores that multiplying-then-resorting would destroy, so
   // those are excluded outright.
-  function linkRankBoostWeight(params) {
-    const cfg = manifest.linkGraph;
+  function activeRankPrior() {
+    return manifest.rankPrior || manifest.linkGraph || null;
+  }
+
+  function rankPriorBoostWeight(params) {
+    const cfg = activeRankPrior();
     if (!cfg || !cfg.field) return 0;
     if (!params.q || params.sort || params.geo?.sort) return 0;
-    if (params.linkRank === false || params.linkRankBoost === 0) return 0;
-    const weight = Number(params.linkRankBoost ?? cfg.boost ?? 0);
+    if (params.rankPrior === false || params.rankPriorBoost === 0) return 0;
+    // Keep the public crawler controls working for existing indexes and apps.
+    if (!manifest.rankPrior && (params.linkRank === false || params.linkRankBoost === 0)) return 0;
+    const weight = Number(
+      params.rankPriorBoost
+      ?? (!manifest.rankPrior ? params.linkRankBoost : undefined)
+      ?? cfg.boost
+      ?? 0
+    );
     return weight > 0 ? weight : 0;
   }
 
   // Multiply each result's score by its authority prior (1 + weight*linkRank)
   // and resort. Mutates `results` in place; returns whether any score changed.
-  async function applyLinkRankBoostToResults(results, weight) {
-    const field = manifest.linkGraph?.field;
+  async function applyRankPriorToResults(results, weight) {
+    const field = activeRankPrior()?.field;
     if (!field || !results?.length) return false;
-    const indexes = results.map(result => result.index).filter(Number.isInteger);
-    if (!indexes.length) return false;
-    await ensureDocValuesManifest();
-    const store = await valueStoreForDocs([field], indexes);
+    // A hydrated page declares every payload column in the manifest. When the
+    // prior field is one of those columns, an absent property is the encoded
+    // null/missing value and therefore rank zero; do not reopen doc-values to
+    // rediscover that fact. This matters for sparse place corpora where civic
+    // addresses intentionally carry no prominence score.
+    const payloadCarriesField = (manifest.docs?.pages?.fields || []).includes(field);
+    const missing = results.filter(result => (
+      !(typeof result[field] === "number" && Number.isFinite(result[field]))
+      && !payloadCarriesField
+      && Number.isInteger(result.index)
+    ));
+    let store = null;
+    if (missing.length) {
+      await ensureDocValuesManifest();
+      store = await valueStoreForDocs([field], missing.map(result => result.index));
+    }
     let touched = false;
     for (const result of results) {
-      if (!Number.isInteger(result.index)) continue;
-      const rank = valueForDoc(store, field, result.index);
+      const embedded = result[field];
+      const rank = typeof embedded === "number" && Number.isFinite(embedded)
+        ? embedded
+        : Number.isInteger(result.index) && store ? valueForDoc(store, field, result.index) : null;
       if (typeof rank === "number" && Number.isFinite(rank) && rank > 0) {
         result.score *= 1 + weight * rank;
         touched = true;
@@ -8301,13 +8327,18 @@ export async function createSearch(options = {}) {
   const LINKRANK_OVERFETCH = 4;
   const LINKRANK_MAX_POOL = 100;
   async function executeBoostedSearch(params, weight) {
-    const cfg = manifest.linkGraph;
+    const cfg = activeRankPrior();
     const size = Math.max(1, Math.floor(Number(params.size ?? 10)));
     const page = Math.max(1, Math.floor(Number(params.page ?? 1)));
-    const factor = Math.max(1, Number(params.linkRankOverfetch ?? cfg.overfetch ?? LINKRANK_OVERFETCH));
+    const factor = Math.max(1, Number(
+      params.rankPriorOverfetch
+      ?? (!manifest.rankPrior ? params.linkRankOverfetch : undefined)
+      ?? cfg.overfetch
+      ?? LINKRANK_OVERFETCH
+    ));
     const windowSize = Math.min(LINKRANK_MAX_POOL, Math.max(size * page, Math.ceil(size * page * factor)));
     const wide = await executeSearch({ ...params, size: windowSize, page: 1 });
-    const boosted = await applyLinkRankBoostToResults(wide.results, weight);
+    const boosted = await applyRankPriorToResults(wide.results, weight);
     const offset = (page - 1) * size;
     const results = (wide.results || []).slice(offset, offset + size);
     const response = {
@@ -8317,9 +8348,15 @@ export async function createSearch(options = {}) {
       size,
       stats: {
         ...(wide.stats || {}),
-        linkRankBoost: boosted,
-        linkRankBoostPool: wide.results?.length || 0,
-        linkRankBoostWindow: results.length
+        rankPriorBoost: boosted,
+        rankPriorField: cfg.field,
+        rankPriorBoostPool: wide.results?.length || 0,
+        rankPriorBoostWindow: results.length,
+        ...(!manifest.rankPrior ? {
+          linkRankBoost: boosted,
+          linkRankBoostPool: wide.results?.length || 0,
+          linkRankBoostWindow: results.length
+        } : {})
       }
     };
     if (params.facets) await traceSpan("facets.count", () => computeFacetCounts(params, response));
@@ -8332,9 +8369,9 @@ export async function createSearch(options = {}) {
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const trace = activeParams.trace || options.trace ? createRuntimeTrace() : null;
     const response = await withRuntimeTrace(trace, () => traceSpan("search.total", async () => {
-      const boostWeight = linkRankBoostWeight(activeParams);
+      const boostWeight = rankPriorBoostWeight(activeParams);
       if (boostWeight > 0) {
-        return traceSpan("linkRank.boost", () => executeBoostedSearch(activeParams, boostWeight));
+        return traceSpan("rankPrior.boost", () => executeBoostedSearch(activeParams, boostWeight));
       }
       const searchResponse = await executeSearch(activeParams);
       if (activeParams.facets) await traceSpan("facets.count", () => computeFacetCounts(activeParams, searchResponse));
@@ -8704,6 +8741,11 @@ async function createGenerationalSearch(root, options, baseUrl) {
     if (responses.some(r => r?.stats?.linkRankBoost)) {
       response.stats.linkRankBoost = true;
       response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);
+    }
+    if (responses.some(r => r?.stats?.rankPriorBoost)) {
+      response.stats.rankPriorBoost = true;
+      response.stats.rankPriorBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.rankPriorBoostPool || 0), 0);
+      response.stats.rankPriorField = responses.find(r => r?.stats?.rankPriorField)?.stats?.rankPriorField;
     }
     applyMergedHighlights(activeParams, q, results, response.correctedQuery);
     if (activeParams.facets) response.facets = mergeFacetResponses(responses);
@@ -9607,6 +9649,11 @@ async function createShardedSearch(root, options, baseUrl) {
     if (responses.some(r => r?.stats?.linkRankBoost)) {
       response.stats.linkRankBoost = true;
       response.stats.linkRankBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.linkRankBoostPool || 0), 0);
+    }
+    if (responses.some(r => r?.stats?.rankPriorBoost)) {
+      response.stats.rankPriorBoost = true;
+      response.stats.rankPriorBoostPool = responses.reduce((sum, r) => sum + (r?.stats?.rankPriorBoostPool || 0), 0);
+      response.stats.rankPriorField = responses.find(r => r?.stats?.rankPriorField)?.stats?.rankPriorField;
     }
     if (activeParams.facets) {
       response.facets = mergeFederatedFacets(responses);

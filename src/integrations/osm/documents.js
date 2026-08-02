@@ -35,7 +35,54 @@ const ADDRESS_TAG_KEYS = [
 
 const WAY_DOC_KEYS = new Set([
   "name", ...CATEGORY_KEYS, ...ALIAS_KEYS, ...ADDRESS_TAG_KEYS,
-  "addr:interpolation", "addr:inclusion", "cuisine", "population"
+  "addr:interpolation", "addr:inclusion", "cuisine", "population",
+  "highway",
+  "capital", "admin_level", "importance", "wikidata", "wikipedia",
+  "opening_hours", "opening_hours:kitchen", "phone", "contact:phone",
+  "website", "contact:website", "email", "contact:email", "wheelchair",
+  "toilets:wheelchair", "internet_access", "outdoor_seating", "takeaway",
+  "delivery", "drive_through", "reservation", "payment:cash",
+  "payment:credit_cards", "payment:contactless", "capacity", "stars",
+  "fee", "access", "smoking", "entrance", "level"
+]);
+
+const DETAIL_TAGS = Object.freeze({
+  brand: ["brand"],
+  operator: ["operator"],
+  cuisine: ["cuisine"],
+  opening_hours: ["opening_hours"],
+  kitchen_hours: ["opening_hours:kitchen"],
+  phone: ["contact:phone", "phone"],
+  website: ["contact:website", "website"],
+  email: ["contact:email", "email"],
+  wheelchair: ["wheelchair"],
+  toilets_wheelchair: ["toilets:wheelchair"],
+  internet_access: ["internet_access"],
+  outdoor_seating: ["outdoor_seating"],
+  takeaway: ["takeaway"],
+  delivery: ["delivery"],
+  drive_through: ["drive_through"],
+  reservation: ["reservation"],
+  payment_cash: ["payment:cash"],
+  payment_cards: ["payment:credit_cards"],
+  payment_contactless: ["payment:contactless"],
+  capacity: ["capacity"],
+  stars: ["stars"],
+  fee: ["fee"],
+  access: ["access"],
+  smoking: ["smoking"],
+  wikidata: ["wikidata"],
+  wikipedia: ["wikipedia"],
+  entrance: ["entrance"],
+  level: ["level"]
+});
+
+const PLACE_PROMINENCE = new Map([
+  ["country", 0.98], ["state", 0.9], ["province", 0.88],
+  ["region", 0.82], ["city", 0.72], ["town", 0.55],
+  ["municipality", 0.5], ["village", 0.38], ["suburb", 0.28],
+  ["quarter", 0.23], ["neighbourhood", 0.18], ["hamlet", 0.14],
+  ["locality", 0.1]
 ]);
 
 // OSM tag values can contain raw newlines and U+2028/U+2029 line separators,
@@ -79,6 +126,51 @@ function uniqueText(parts) {
     out.push(value);
   }
   return out;
+}
+
+function firstCleanTag(tags, keys) {
+  for (const key of keys) {
+    const value = cleanText(tags.get(key));
+    if (value) return value;
+  }
+  return "";
+}
+
+export function placeDetails(tags) {
+  const details = {};
+  for (const [field, keys] of Object.entries(DETAIL_TAGS)) {
+    const value = firstCleanTag(tags, keys);
+    if (value) details[field] = value;
+  }
+  return Object.keys(details).length ? details : null;
+}
+
+// A compact, deterministic popularity prior derived entirely from OSM. It is
+// deliberately conservative: population and place hierarchy carry most of the
+// signal, while capital/reference/contact tags only break otherwise-close
+// textual ties. The normalized result can be reused by Rangefind's generic
+// rankPrior post-pass without introducing an OSM-only index format.
+export function osmProminence(tags, category = firstCategory(tags)) {
+  const population = Number(tags.get("population"));
+  const populationScore = Number.isFinite(population) && population > 0
+    ? Math.min(0.96, Math.log10(population + 1) / 7.4)
+    : 0;
+  const explicitImportance = Number(tags.get("importance"));
+  const importanceScore = Number.isFinite(explicitImportance)
+    ? Math.max(0, Math.min(1, explicitImportance))
+    : 0;
+  let score = Math.max(
+    populationScore,
+    importanceScore,
+    category?.category === "place" ? (PLACE_PROMINENCE.get(category.type) || 0.08) : 0.05
+  );
+  const capital = cleanText(tags.get("capital")).toLowerCase();
+  if (capital && capital !== "no") score += capital === "yes" ? 0.12 : 0.08;
+  if (tags.get("wikipedia")) score += 0.08;
+  if (tags.get("wikidata")) score += 0.05;
+  if (tags.get("website") || tags.get("contact:website")) score += 0.025;
+  if (tags.get("brand") || tags.get("operator")) score += 0.025;
+  return Math.round(Math.max(0, Math.min(1, score)) * 1e6) / 1e6;
 }
 
 export function wayDocTagEntries(tags) {
@@ -147,14 +239,27 @@ export function addressFromTags(tags) {
 
 export function placeDoc(osmType, osmId, lat, lon, tags) {
   const name = cleanText(tags.get("name"));
-  const category = firstCategory(tags);
+  const primaryCategory = firstCategory(tags);
+  // Named road ways were already retained as searchable documents. Preserve
+  // their OSM road class explicitly so street/locality authority can serve
+  // forward geocoding and intersection fallbacks without broad postings.
+  const category = primaryCategory || (name && tags.get("highway")
+    ? { category: "highway", type: cleanText(tags.get("highway")) }
+    : null);
   const address = addressFromTags(tags);
   if (!name && !category && !address?.complete) return null;
   const label = typeLabel(category?.type || (address ? "address" : ""));
   const displayName = name || address?.formatted || label;
   const aliases = name ? collectAliases(tags, name) : [];
   const cuisine = typeLabel(tags.get("cuisine"));
-  const bodyParts = [label, category ? category.category : address ? "address" : "", cuisine];
+  const details = placeDetails(tags);
+  const bodyParts = [
+    label,
+    category ? category.category : address ? "address" : "",
+    cuisine,
+    details?.brand,
+    details?.operator
+  ];
   const doc = {
     id: `${osmType}/${osmId}`,
     url: `https://www.openstreetmap.org/${osmType}/${osmId}`,
@@ -164,8 +269,10 @@ export function placeDoc(osmType, osmId, lat, lon, tags) {
     lat: Number(lat.toFixed(7)),
     lon: Number(lon.toFixed(7)),
     geo_lat: Number(lat.toFixed(7)),
-    geo_lon: Number(lon.toFixed(7))
+    geo_lon: Number(lon.toFixed(7)),
+    prominence: osmProminence(tags, category)
   };
+  if (details) doc.details = details;
   if (aliases.length) doc.aliases = aliases;
   if (address) {
     doc.address = address.formatted;
@@ -186,6 +293,10 @@ export function placeDoc(osmType, osmId, lat, lon, tags) {
   } else if (address) {
     doc.category = "address";
     doc.type = "address";
+  }
+  if (category?.category === "highway" && name) {
+    doc.street = doc.street || name;
+    if (doc.city) doc.street_authority = `${name}, ${doc.city}`;
   }
   if (tags.get("place")) {
     const population = Number(tags.get("population"));
@@ -214,6 +325,10 @@ export function enrichDocLocality(doc, city) {
     doc.address_search = cityText;
   } else if (!search.toLocaleLowerCase("en-US").includes(key)) {
     doc.address_search = `${search}, ${cityText}`;
+  }
+  if (doc.category === "highway" && doc.name) {
+    doc.street = doc.street || doc.name;
+    doc.street_authority = `${doc.name}, ${cityText}`;
   }
   return true;
 }

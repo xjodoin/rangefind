@@ -29,14 +29,25 @@ generation, and index publication to these modules.
 
 `reverseGeocodeOsm(engine, { lat, lon, radiusMeters, size })` resolves nearest
 indexed addresses inside a hard radius and routes only through shards whose
-bounding boxes intersect that radius. Coordinate text passed to
-`searchOsmQuery` uses the same address-first path automatically.
+bounding boxes intersect that radius. Results include `formattedAddress`,
+structured `addressComponents`, `locationType`, and `reverseGeocodeAccuracy`.
+`resultTypes` / `locationTypes` can filter the response; a locality-only request
+uses a bounded place fallback. Coordinate text passed to `searchOsmQuery` uses
+the same address-first path automatically.
+
+`suggestOsmQuery` returns the legacy `text`, `weight`, and `shards` plus
+structured `mainText`, `secondaryText`, `matchedRanges`, `types`, and a
+`selection` object that can be passed into the selected search. `inputOffset`
+supports mid-query cursor edits without introducing a session service.
 
 The hosted map client queries the rolling sharded index published by the
 sibling [`osm-rangefind-index`](https://github.com/xjodoin/osm-rangefind-index)
 project at `https://osm.rangefind.dev/`. The fixture commands below remain
 available for local builds, benchmarks, and development against one regional
-extract.
+extract. Its UI consumes structured autocomplete and selection shard hints,
+supports click-to-reverse-geocode through **Pick map**, distinguishes exact,
+interpolated, and approximate locations, and progressively displays the compact
+OSM `details` fields as rebuilt shards publish them.
 
 ## Build
 
@@ -98,7 +109,12 @@ The fixture converts named places and complete `addr:housenumber` +
 `addr:street`/`addr:place` nodes and ways (anchored at their first node) into
 documents. Address results expose `address`, `house_number`, `street`, `unit`,
 `city`, `state`, `postcode`, and `country` alongside `name`, `category`,
-`type`, and `lat`/`lon`.
+`type`, and `lat`/`lon`. Useful OSM metadata is retained in one compact `details`
+object (hours, contact, brand/operator, cuisine, wheelchair/accessibility,
+internet, seating, takeaway/delivery/drive-through, payment, capacity, access,
+and OSM knowledge references). A normalized OSM-derived `prominence` value
+feeds Rangefind's generic static `rankPrior`, improving ambiguous text ranking
+without a network service or a separate place database.
 
 OSM `addr:interpolation=all|odd|even|N` ways are retained as compact range
 documents. The extractor keeps their geometry and numeric address anchors,

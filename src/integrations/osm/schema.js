@@ -1,11 +1,12 @@
 import { OSM_CANONICAL_TYPES } from "./category_lexicon.js";
 
-export const OSM_INTEGRATION_SCHEMA_VERSION = 1;
+export const OSM_INTEGRATION_SCHEMA_VERSION = 2;
 
 export const OSM_DISPLAY_FIELDS = Object.freeze([
   "name", "address", "house_number", "street", "unit", "suburb",
   "city", "district", "state", "postcode", "country",
   "url", "category", "type", "lat", "lon", "address_count",
+  "prominence", "details",
   "_address_range_start", "_address_range_end", "_address_range_step",
   "_address_range_geometry", "_address_range_kind", "_address_range_inclusion"
 ]);
@@ -72,18 +73,35 @@ export function createOsmIndexConfig(options = {}) {
         exact: false,
         tokens: false,
         normalizer: "address"
+      },
+      {
+        name: "street",
+        path: "street_authority",
+        weight: 2000000,
+        surface: true,
+        exact: true,
+        tokens: false,
+        normalizer: "address"
       }
     ],
     authorityMaxRowsPerKey: 64,
     facets: [
       { name: "category", path: "category" },
-      { name: "type", path: "type" }
+      { name: "type", path: "type" },
+      { name: "brand", path: "details.brand" },
+      { name: "cuisine", path: "details.cuisine" },
+      { name: "wheelchair", path: "details.wheelchair" },
+      { name: "access", path: "details.access" }
     ],
     // Keep curated type bitmaps for broad/text lanes that cannot use spatial
     // category routing. Category-cell geo queries prove their type from the
     // cell's point ordinals and do not fetch this global bitmap.
     filterBitmapFacetValues: { type: [...OSM_CANONICAL_TYPES] },
-    numbers: [{ name: "population", path: "population", type: "int" }],
+    numbers: [
+      { name: "population", path: "population", type: "int" },
+      { name: "prominence", path: "prominence", type: "double" }
+    ],
+    rankPrior: { field: "prominence", boost: 0.45, overfetch: 4 },
     geo: [{ name: "location", latPath: "geo_lat", lonPath: "geo_lon" }],
     // Route common category + viewport/radius queries directly to the small
     // set of geo leaves that contain that category. Three exact grid levels
@@ -104,7 +122,7 @@ export function createOsmIndexConfig(options = {}) {
     geoCapsuleFields: [
       "id", "name", "address", "house_number", "street", "unit", "suburb",
       "city", "district", "state", "postcode", "country", "url", "category",
-      "type", "lat", "lon", "address_count"
+      "type", "lat", "lon", "address_count", "prominence", "details"
     ],
     suggest: [
       { path: "search_name", weightPath: "population" },

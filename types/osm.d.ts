@@ -60,6 +60,12 @@ export interface OsmReverseGeocodeParams {
   shards?: string | string[];
   trace?: boolean;
   filters?: SearchParams["filters"];
+  /** Restrict returned semantic result types, e.g. street_address or city. */
+  resultTypes?: string[];
+  /** Restrict accuracy classes: ROOFTOP, RANGE_INTERPOLATED, GEOMETRIC_CENTER, APPROXIMATE. */
+  locationTypes?: string[];
+  /** Radius used only by the locality fallback; defaults to 30 km. */
+  localityRadiusMeters?: number;
   [key: string]: unknown;
 }
 
@@ -68,6 +74,8 @@ export interface OsmQueryParams extends SearchParams {
   near?: { lat: number; lon: number };
   /** Set false to retain a coordinate marker without reverse geocoding. */
   reverseGeocode?: boolean | Omit<OsmReverseGeocodeParams, "lat" | "lon">;
+  /** Autocomplete cursor offset; only text before the cursor is predicted. */
+  inputOffset?: number;
 }
 
 export function reverseGeocodeOsm(

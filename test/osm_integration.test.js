@@ -20,14 +20,17 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
     workerCount: 6,
     buildProgressLogMs: 0
   });
-  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 1);
+  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 2);
   assert.equal(config.input, "data/osm-rqa-places.jsonl");
   assert.equal(config.output, "public/rangefind");
   assert.equal(config.scanWorkers, 6);
   assert.equal(config.builderWorkerCount, 6);
   assert.deepEqual(config.geo, [{ name: "location", latPath: "geo_lat", lonPath: "geo_lon" }]);
   assert.deepEqual(config.display, [...OSM_DISPLAY_FIELDS]);
-  assert.deepEqual(config.authority.map(field => field.name), ["address", "address_interpolation", "postcode"]);
+  assert.deepEqual(config.authority.map(field => field.name), ["address", "address_interpolation", "postcode", "street"]);
+  assert.deepEqual(config.rankPrior, { field: "prominence", boost: 0.45, overfetch: 4 });
+  assert.ok(config.geoCapsuleFields.includes("details"));
+  assert.ok(config.facets.some(field => field.name === "wheelchair"));
   assert.ok(config.filterBitmapFacetValues.type.includes("cinema"));
   assert.equal(config.buildProgressLogMs, 0);
 });
@@ -95,6 +98,36 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       lon: -73.61,
       geo_lat: 45.51,
       geo_lon: -73.61
+    }, {
+      id: "way/3",
+      name: "Test Road",
+      search_name: "Test Road",
+      body: "primary highway",
+      category: "highway",
+      type: "primary",
+      street: "Test Road",
+      city: "Testville",
+      street_authority: "Test Road, Testville",
+      prominence: 0.05,
+      lat: 45.505,
+      lon: -73.605,
+      geo_lat: 45.505,
+      geo_lon: -73.605
+    }, {
+      id: "way/4",
+      name: "Second Road",
+      search_name: "Second Road",
+      body: "secondary highway",
+      category: "highway",
+      type: "secondary",
+      street: "Second Road",
+      city: "Testville",
+      street_authority: "Second Road, Testville",
+      prominence: 0.05,
+      lat: 45.5051,
+      lon: -73.6051,
+      geo_lat: 45.5051,
+      geo_lon: -73.6051
     }].map(doc => JSON.stringify(doc)).join("\n"));
     const built = await buildOsmIndex({
       root,
@@ -110,7 +143,7 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     const filterBitmaps = JSON.parse(gunzipSync(
       await readFile(join(root, "public", "rangefind", "filter-bitmaps", "manifest.json.gz"))
     ));
-    assert.equal(manifest.total, 2);
+    assert.equal(manifest.total, 4);
     assert.equal(manifest.features.geo, true);
     assert.equal(manifest.features.geoCapsules, true);
     assert.equal(manifest.features.geoCategoryCells, true);
@@ -140,6 +173,18 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       nearbyCinema.stats.trace.spans.find(span => span.name === "manifest.fetch")?.count,
       2
     );
+    const street = await engine.search({ q: "Test Road Testville", size: 5, trace: true });
+    assert.equal(street.results[0]?.id, "way/3");
+    assert.equal(street.results[0]?.category, "highway");
+    assert.ok(!street.stats.trace.spans.some(span => span.name === "postings.fetch"));
+    const intersection = await searchOsmQuery(engine, {
+      q: "Test Road & Second Road Testville",
+      size: 5,
+      trace: true
+    });
+    assert.equal(intersection.results[0]?.type, "intersection");
+    assert.equal(intersection.results[0]?.city, "Testville");
+    assert.equal(intersection.stats.plannerLane, "osmIntersectionLocality");
     assert.equal(built.config.output, "public/rangefind");
     assert.equal(built.seconds >= 0, true);
   } finally {

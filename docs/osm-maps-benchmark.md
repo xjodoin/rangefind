@@ -16,7 +16,9 @@ ordering in addition to transport cost.
 Autocomplete cases carry the current map center, matching an interactive maps
 session rather than an unscoped global typeahead. Category-plus-locality input
 is evaluated as a composed suggestion, while civic addresses, brands, and
-localities remain direct authority lookups. Decimal coordinates invoke the
+localities remain direct authority lookups. Predictions are checked for target
+rank, uniqueness, structured primary/secondary text, match ranges, cursor-edit
+behavior, and a reusable selection payload. Decimal coordinates invoke the
 same bounded reverse-geocoding API available to applications, and intersections
 are validated as locality-scoped street pairs instead of broad text matches.
 
@@ -26,18 +28,21 @@ city-qualified landmarks, native-script suggestions, explicit category-in-city
 queries, exact and interpolated forward geocoding, hard-radius nearby search,
 viewport restriction, discovery around a selected result, location-biased text,
 unanchored typo recovery, empty results, inline place-detail fields, and urban,
-interpolated, international, rural, and uncovered reverse-geocoding probes.
+interpolated, international, rural, locality-filtered, and uncovered
+reverse-geocoding probes. The next-index profile adds strict checks for compact
+OSM place details and exact named-road authority once those build-time fields
+have been published.
 
 ## API replacement coverage
 
 | Google Maps surface | Rangefind benchmark contract | Status |
 | --- | --- | --- |
-| Places Autocomplete | Locality, category, brand, address, native script, and suggestion-selection journey | Covered |
+| Places Autocomplete | Locality, category, brand, address, native script, cursor edits, structured predictions, and suggestion-selection journey | Covered |
 | Text Search | Named landmarks, category/locality, typo recovery, language variants, and bounded misses | Covered |
 | Nearby Search | Nearest, hard radius, dense/sparse categories, and selected-place discovery orbit | Covered |
 | Forward Geocoding | Civic, street, postal, intersection, and interpolated addresses | Covered |
-| Place Details | Stable id, coordinates, address/locality, type, and shard provenance returned inline | Covered for indexed OSM fields |
-| Reverse Geocoding | Address-first coordinate lookup with a hard radius, covering-shard routing, interpolation ranges, international/rural results, and bounded zero results | Covered |
+| Place Details | Stable id, coordinates, address/locality, type, hours, contact, brand/operator, cuisine, accessibility, service/payment capabilities, and OSM references returned inline | Covered for indexed OSM fields |
+| Reverse Geocoding | Address-first coordinate lookup with a hard radius, covering-shard routing, structured components, result/accuracy filters, locality fallback, interpolation ranges, international/rural results, and bounded zero results | Covered |
 | Photos, reviews, live hours, traffic, and directions | Not present in the static OSM search index | Out of scope |
 
 This is still not complete Google Maps API parity: dynamic place content,
@@ -67,14 +72,17 @@ const response = await reverseGeocodeOsm(engine, {
 # Weighted 21-case workload representing frequent phone searches.
 npm run bench:osm-maps
 
-# Strict 41-case Google Maps search/geocoding replacement workload.
+# Strict 43-case Google Maps search/geocoding replacement workload.
 npm run bench:osm-maps:production
+
+# Strict 45-case promotion gate for a freshly rebuilt schema-v2 OSM index.
+npm run bench:osm-maps:next-index
 
 # All 56 cases, including lower-frequency transit, postal-code, native-script,
 # empty-viewport, brand-variant, reverse-geocoding, and routing edge probes.
 npm run bench:osm-maps:full
 
-# Five strict urban, interpolation, international, rural, and uncovered
+# Six strict urban, interpolation, international, rural, locality, and uncovered
 # reverse-geocoding cases.
 npm run bench:osm-maps:reverse
 
@@ -101,11 +109,12 @@ Every case includes:
 - a scenario name, family, and workload weight;
 - cold and warm latency, requests, bytes, fetch buckets, and opened shards;
 - declarative quality checks for expected text/type, locality, viewport,
-  distance ordering, routing lane, and shard fan-out;
+  distance ordering, routing lane, shard fan-out, target rank, structured
+  predictions, reverse semantics, and OSM detail coverage;
 - a phone-oriented latency, request, and transfer budget.
 
 The summary reports weighted quality and budget pass rates, weighted mean cold
-cost, p50/p95 latency, family-level rollups, and exact failed checks. Budget
+cost, p50/p95 latency, mean reciprocal rank, family-level rollups, and exact failed checks. Budget
 misses do not stop exploratory runs; use `--strict` in promotion or CI gates.
 
 Current workload sources:

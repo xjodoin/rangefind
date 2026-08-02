@@ -2,25 +2,34 @@
 
 ## Unreleased
 
+## 0.3.24 — 2026-08-02
+
 ### Added
 
+- OSM documents retain useful place metadata in a compact `details` object,
+  including opening hours, contact, brand/operator, cuisine, accessibility,
+  service, payment, capacity, access, and knowledge-reference fields.
+- `rankPrior` generalizes the crawler's numeric relevance prior for any static
+  corpus. OSM indexes derive a conservative normalized `prominence` signal
+  from population, place hierarchy, capital status, and reference metadata.
+- OSM autocomplete returns structured, cursor-aware predictions with matched
+  ranges and a reusable selection/shard payload.
 - `reverseGeocodeOsm` provides bounded, address-first reverse geocoding over
   the existing client-side geo index. Decimal-coordinate map searches reuse
   the same path, while callers can still request a raw coordinate marker.
+  Results expose formatted address components and accuracy/location types,
+  support result filters, and fall back to a bounded locality lookup on demand.
 - The strict production Maps benchmark now covers urban address points,
   interpolation ranges, international and sparse rural coordinates, and an
-  uncovered-ocean zero-result guard.
+  uncovered-ocean zero-result guard. It also measures target rank/mean
+  reciprocal rank, structured autocomplete, reverse result semantics, result
+  uniqueness, and cursor-edit behavior.
 
 ### Performance
 
 - Reverse geocoding derives the intersecting shard scope from root bounding
   boxes and applies the address facet before nearest-neighbor traversal, so it
   never opens every regional shard or returns a globally distant address.
-
-## 0.3.24 — 2026-08-02
-
-### Performance
-
 - Category-cell geo searches defer bitmap and doc-value selection until after
   exact cell membership removes covered facets. Repeated nearby and viewport
   queries therefore stay fully memory-resident instead of discovering a lazy

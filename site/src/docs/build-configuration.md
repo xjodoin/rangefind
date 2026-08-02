@@ -26,12 +26,16 @@ example, annotated below:
   ],
   "alwaysIndexFields": ["title", "address"],
   "facets": [{ "name": "category", "path": "category" }],
-  "numbers": [{ "name": "population", "path": "population", "type": "int" }],
+  "numbers": [
+    { "name": "population", "path": "population", "type": "int" },
+    { "name": "prominence", "path": "prominence", "type": "float" }
+  ],
+  "rankPrior": { "field": "prominence", "boost": 0.45, "overfetch": 4 },
   "booleans": [{ "name": "open_now", "path": "open" }],
   "geo": [{ "name": "location", "latPath": "lat", "lonPath": "lon" }],
   "suggest": [{ "path": "name", "weightPath": "population" }],
   "vectors": [{ "name": "embedding", "path": "embedding", "dims": 384 }],
-  "display": ["name", "category", "lat", "lon", "url"],
+  "display": ["name", "category", "prominence", "lat", "lon", "url"],
   "meta": { "attribution": "© Your Data Source", "license": "CC-BY-4.0" }
 }
 ```
@@ -64,6 +68,13 @@ bloating the index while short titles stay fully searchable.
 
 These become compact doc-value columns and filter bitmaps, range-read only
 when a query filters or sorts.
+
+`rankPrior` can use a numeric field normalized to `[0, 1]` as a conservative
+relevance tie-breaker. Rangefind reranks a bounded overfetch window with
+`score *= 1 + boost * prior`; it does not run on empty queries, explicit sorts,
+or distance sorts. Include the prior field in `display` when practical so the
+rerank reuses the hydrated result payload and needs no doc-value read. Queries
+can override `rankPriorBoost` or set it to `0` for an A/B baseline.
 
 ## Geo fields
 

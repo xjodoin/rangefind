@@ -10,6 +10,11 @@ export const DEFAULTS = {
   // populates it automatically), `field` names a numeric doc-value in [0, 1]
   // and `boost` is the default query-time multiplier: score *= 1 + boost*rank.
   linkGraph: null,
+  // Generic numeric relevance prior. The field must be a numeric doc-value
+  // normalized to [0, 1]. This is the reusable form of the crawler's historic
+  // linkGraph prior and is useful for static corpora with an intrinsic
+  // prominence/quality signal (places, products, documentation, ...).
+  rankPrior: null,
   geoLeafSize: 512,
   geoPackBytes: 4 * 1024 * 1024,
   // Optional spatial result capsules. When enabled, every geo leaf carries
@@ -163,6 +168,22 @@ function applyIndexProfile(config, raw) {
   config.alwaysIndexFields = Array.isArray(config.alwaysIndexFields)
     ? config.alwaysIndexFields.map(String).filter(Boolean)
     : DEFAULTS.alwaysIndexFields.slice();
+  if (config.rankPrior != null) {
+    const field = String(config.rankPrior?.field || "").trim();
+    if (!field) throw new Error("Rangefind rankPrior needs a numeric field.");
+    if (!(config.numbers || []).some(number => number.name === field)) {
+      throw new Error(`Rangefind rankPrior references unknown numeric field "${field}".`);
+    }
+    const boost = Number(config.rankPrior.boost ?? 0);
+    if (!Number.isFinite(boost) || boost < 0) {
+      throw new Error("Rangefind rankPrior boost must be a non-negative number.");
+    }
+    config.rankPrior = {
+      field,
+      boost,
+      overfetch: clampInt(config.rankPrior.overfetch, 4, 1, 20)
+    };
+  }
   if (raw.resumeBuild == null) config.resumeBuild = config.indexProfile === "static-large";
   config.resumeDir = String(config.resumeDir || DEFAULTS.resumeDir);
   config.typoMode = String(config.typoMode || DEFAULTS.typoMode).toLowerCase();

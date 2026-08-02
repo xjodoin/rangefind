@@ -68,6 +68,42 @@ test("Maps benchmark expectations catch locality and viewport regressions", () =
   });
   assert.equal(apiShape.passed, true);
 
+  const rankedStructured = evaluateExpectations({
+    suggestions: [{
+      text: "Montréal",
+      mainText: "Montréal",
+      secondaryText: "Québec",
+      matchedRanges: [{ start: 0, end: 4 }],
+      selection: { query: "Montréal", shards: ["quebec"] }
+    }]
+  }, {
+    targetTextAny: ["Montreal"],
+    targetMaxRank: 3,
+    structuredSuggestion: true,
+    uniqueTexts: true
+  });
+  assert.equal(rankedStructured.passed, true);
+  assert.equal(rankedStructured.metrics.reciprocalRank, 1);
+
+  const reverseShape = evaluateExpectations({
+    results: [{
+      name: "1 Main Street",
+      locationType: "ROOFTOP",
+      reverseGeocodeAccuracy: "address-point",
+      addressComponents: [
+        { longText: "Main Street", types: ["route"] },
+        { longText: "Montréal", types: ["locality"] }
+      ],
+      details: { wheelchair: "yes", opening_hours: "24/7" }
+    }]
+  }, {
+    topLocationTypes: ["ROOFTOP"],
+    topReverseAccuracy: ["address-point"],
+    topAddressComponentTypes: ["route", "locality"],
+    topDetailFields: ["wheelchair", "opening_hours"]
+  });
+  assert.equal(reverseShape.passed, true);
+
   const foreign = evaluateExpectations({
     ...response,
     results: [{ ...response.results[0], shard: "ontario", lat: 43.65, lon: -79.38 }]
