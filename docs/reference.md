@@ -920,11 +920,17 @@ and [OSM example](../examples/osm-geo/README.md) for the supported map journeys.
 
 ```js
 import { createOsmIndexConfig } from "rangefind/osm";
-import { buildOsmIndex, buildOsmShardedIndex, augmentOsmWithRqa } from "rangefind/osm/node";
+import {
+  augmentOsmWithAddressSources,
+  augmentOsmWithRqa,
+  buildOsmIndex,
+  buildOsmShardedIndex,
+  createDelimitedAddressSource
+} from "rangefind/osm/node";
 import { extractOsmPlaces } from "rangefind/osm/extract";
 ```
 
-- `createOsmIndexConfig(options)` — returns the schema-v3 generic Rangefind
+- `createOsmIndexConfig(options)` — returns the schema-v4 generic Rangefind
   config, including display/details, typed constraint facets, geo capsules,
   category cells, wildcard occupancy, authority, suggestion, and prominence.
 - `extractOsmPlaces(options)` — bounded, resumable PBF extraction into normalized
@@ -934,7 +940,44 @@ import { extractOsmPlaces } from "rangefind/osm/extract";
 - `buildOsmShardedIndex({ shards, output, ... })` — independently build regions
   with frozen scoring stats and publish a federated root.
 - `augmentOsmWithRqa(options)` — stream Québec RQA civic/postal data into an OSM
-  corpus while suppressing only canonical duplicates.
+  corpus through the generic enrichment engine.
+- `augmentOsmWithAddressSources(options)` — merge any number of normalized
+  civic/postal authorities in source-priority order. It suppresses canonical
+  duplicates against OSM and earlier providers, and emits one country-scoped
+  postal aggregate with centroid, bounds, aliases, source list, sample count,
+  and civic-address count.
+- `createDelimitedAddressSource(options)` — adapt streaming CSV/TSV input,
+  including plain, gzip, and ZIP sources, to the generic record contract. A
+  provider can instead use `createJsonlAddressSource(options)`, or expose an
+  async `records()` iterator and `normalize()` callback for JSON, GeoJSON,
+  database, or API inputs.
+
+```js
+const postalSource = createDelimitedAddressSource({
+  id: "country-postcodes",
+  name: "National postal authority",
+  path: "country-postcodes.tsv.gz",
+  delimiter: "\t",
+  header: false,
+  defaults: { kind: "postal_code", country: "CA" },
+  mapping: { postcode: 1, city: 2, state: 4, lat: 9, lon: 10 },
+  includeAddresses: false,
+  license: "CC-BY-4.0",
+  attribution: "Postal authority"
+});
+
+await augmentOsmWithAddressSources({
+  root: "work/quebec",
+  osmPath: "work/quebec/data/osm-places.jsonl",
+  outputPath: "work/quebec/data/osm-enriched-places.jsonl",
+  sources: [postalSource]
+});
+```
+
+Country-specific lifecycle rules, column names, postcode formatting, and
+region filters belong to the adapter. The shared layer owns bounded
+streaming, deterministic IDs, on-disk deduplication, aggregation, provenance,
+and atomic output.
 
 ### Search, autocomplete, and reverse geocoding
 
@@ -1103,7 +1146,7 @@ small result capsule rather than a general-purpose vector-tile replacement.
 Runtime intent code degrades to generic text/geo routing when optional
 artifacts are missing, but indexed data cannot be invented. Typed details,
 constraint verification, wildcard brand-route cells, and result geometry need
-an OSM schema-v3 rebuild. Use `npm run bench:osm-maps:next-index` before
+an OSM schema-v4 rebuild. Use `npm run bench:osm-maps:next-index` before
 promoting a rebuilt index.
 
 ---

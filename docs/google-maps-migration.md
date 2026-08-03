@@ -703,10 +703,10 @@ keep separately licensed datasets separate.
 | --- | --- | --- |
 | Correct warm search, slow cold search | CDN bypass or broad shard/range fan-out | Inspect `CF-Cache-Status`, `stats.trace`, opened shards, requests, and bytes. |
 | Range request returns the whole file | CDN/origin ignored Range or omitted `Content-Length` | Require cached `206` plus exact `Content-Range`. |
-| Brand route search opens many geo leaves | Index lacks schema-v3 wildcard occupancy cells | Rebuild and run `bench:osm-maps:next-index`. |
+| Brand route search opens many geo leaves | Index lacks schema-v4 wildcard occupancy cells | Rebuild and run `bench:osm-maps:next-index`. |
 | Constraints always return zero | Older index lacks typed details/facets | Inspect manifest/schema and rebuild; do not weaken verification silently. |
 | Open-now place disappears | Missing/unsupported schedule is `unknown` | Show unknown separately or opt into `includeUnknownOpenNow`. |
-| No polygon appears | Result/index has no schema-v3 geometry | Keep marker fallback; verify geometry coverage benchmark. |
+| No polygon appears | Result/index has no schema-v4 geometry | Keep marker fallback; verify geometry coverage benchmark. |
 | Autocomplete probes every shard | Root suggest routing was not published/rebuilt | Rebuild suggest-set sidecars and root suggest routing. |
 | Text query probes every shard | Root text routing is absent/stale | Rebuild term-set sidecars and root text routing. |
 | Search result differs from Google | Different source data/ranking/type taxonomy | Decide whether OSM is sufficient, add a licensed source, or keep that Google surface. |

@@ -163,7 +163,7 @@ export function toMigrationPlace(result) {
     ...(result.geometry ? { geometry: result.geometry } : {}),
     details,
     source: {
-      dataset: "OpenStreetMap",
+      dataset: String(result.source || "OpenStreetMap"),
       osmType: result.osm_type || null,
       osmId: result.osm_id ?? null
     },

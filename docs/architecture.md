@@ -438,7 +438,7 @@ pruning and containment proofs never drop a matching document.
 
 ### OSM result geometry
 
-OSM schema-v3 geo capsules may contain simplified encoded geometry for useful
+OSM schema-v4 geo capsules may contain simplified encoded geometry for useful
 closed ways. This is display geometry, not a second spatial relation index:
 point/radius/route search still uses the document's centroid and the point
 tree, while the client decodes the selected result's polygon or line for map

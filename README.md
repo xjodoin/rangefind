@@ -104,7 +104,8 @@ combination, fallback, and deliberate boundary with runnable examples.
   chunk-sampled estimates for very large result sets.
 - OpenStreetMap place and address fixture with canonical zero-posting address
   lookup, compact `addr:interpolation` ranges, structured forward and reverse
-  geocoding, bounded Québec RQA civic/postal augmentation, reusable
+  geocoding, bounded multi-provider civic/postal augmentation (including the
+  Québec RQA adapter), reusable
   `rangefind/osm` and `rangefind/osm/node` integration APIs, and exhaustive geo
   oracles.
 - OSM typed and natural-language constraints for accessibility, services,

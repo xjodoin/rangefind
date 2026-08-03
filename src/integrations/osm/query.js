@@ -20,6 +20,7 @@ const AUTHORITY_EXACT_CACHE = new WeakMap();
 const AUTHORITY_LOOKUP_CACHE = new WeakMap();
 const LOCALITY_SEARCH_STATS = Symbol("rangefind.localitySearchStats");
 const CANADIAN_POSTAL_CODE = /^\s*([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\s*$/iu;
+const POSTCODE_AUTHORITY_WEIGHT = 5_000_000;
 const LOCALITY_TYPES = new Set(["city", "town", "municipality", "village", "hamlet"]);
 const STREET_DESIGNATORS = new Set([
   "allee", "avenue", "boulevard", "chemin", "cote", "cour", "impasse",
@@ -1550,13 +1551,61 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
     }
     return resolved;
   }
-  const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
+  let authorityLookup = Object.hasOwn(options, "authorityLookup") ? options.authorityLookup : null;
+  if (!authorityLookup && !shardScope.length && typeof engine.authorityLookup === "function") {
+    try {
+      authorityLookup = await authorityLookupCached(engine, surface);
+    } catch {
+      // Authority is an accelerator. Local search remains the fail-open path.
+    }
+  }
+  let exactAuthorityMatches = (authorityLookup?.matches || [])
+    .filter(match => fold(match.text) === normalizedLocality);
+  let postalAuthority = exactAuthorityMatches.some(
+    // Postcode authority entries use the schema's fixed field weight. Do not
+    // use a lower bound here: populous localities can legitimately carry a
+    // larger authority weight and must keep the locality search lane.
+    match => Number(match.weight || 0) === POSTCODE_AUTHORITY_WEIGHT
+  );
+  const canadianPostalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE);
+  let postalSearchSurface = String(surface || "").trim();
+  // Some open authorities publish a routing/sector prefix rather than the
+  // full delivery code. Resolve the longest authority-proven leading prefix
+  // generically (for example SW1A from SW1A 1AA) instead of baking another
+  // country's postcode grammar into the client.
+  if (!canadianPostalMatch && !postalAuthority && !shardScope.length
+      && /\d/u.test(postalSearchSurface) && typeof engine.authorityLookup === "function") {
+    const tokens = postalSearchSurface.split(/\s+/u).filter(Boolean);
+    for (let length = tokens.length - 1; length >= 1; length--) {
+      const prefix = tokens.slice(0, length).join(" ");
+      let prefixLookup = null;
+      try {
+        prefixLookup = await authorityLookupCached(engine, prefix);
+      } catch {
+        break;
+      }
+      const prefixMatches = (prefixLookup?.matches || []).filter(match => (
+        fold(match.text) === fold(prefix)
+        && Number(match.weight || 0) === POSTCODE_AUTHORITY_WEIGHT
+      ));
+      if (!prefixMatches.length) continue;
+      authorityLookup = prefixLookup;
+      exactAuthorityMatches = prefixMatches;
+      postalAuthority = true;
+      postalSearchSurface = prefix;
+      break;
+    }
+  }
+  const postalIntent = Boolean(canadianPostalMatch || postalAuthority);
+  const expectedPostal = fold(canadianPostalMatch
+    ? `${canadianPostalMatch[1]} ${canadianPostalMatch[2]}`
+    : postalSearchSurface).replaceAll(/[^\p{L}\p{N}]+/gu, "");
   const bestMatch = results => {
     const matches = (results || []).filter(result => {
       if (!Number.isFinite(result.lat) || !Number.isFinite(result.lon)) return false;
-      if (postalMatch) {
-        const expected = `${postalMatch[1]} ${postalMatch[2]}`.toUpperCase();
-        return result.type === "postal_code" && String(result.postcode || "").toUpperCase() === expected;
+      if (postalIntent) {
+        const actual = fold(result.postcode).replaceAll(/[^\p{L}\p{N}]+/gu, "");
+        return result.type === "postal_code" && actual === expectedPostal;
       }
       return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === normalizedLocality;
     });
@@ -1574,15 +1623,11 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
   // lookup is advisory: a scoped miss retries unscoped.
   let authorityShards = null;
   let authoritativeMiss = false;
-  if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
+  if (!shardScope.length && authorityLookup) {
     try {
-      const lookup = Object.hasOwn(options, "authorityLookup")
-        ? options.authorityLookup
-        : await authorityLookupCached(engine, surface);
       const scoped = [];
       let exactMatchWithoutShard = false;
-      const exactMatches = (lookup?.matches || [])
-        .filter(match => fold(match.text) === normalizedLocality);
+      const exactMatches = exactAuthorityMatches;
       const bestWeight = exactMatches.length
         ? Math.max(...exactMatches.map(match => Number(match.weight || 0)))
         : null;
@@ -1603,7 +1648,7 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
       // absence there is decisive: do not turn "cinema laval" into a
       // federation-wide place search merely to prove it is not a city.
       // An exact legacy row without shard provenance remains fail-open.
-      authoritativeMiss = lookup != null && !authorityShards && !exactMatchWithoutShard;
+      authoritativeMiss = authorityLookup != null && !authorityShards && !exactMatchWithoutShard;
     } catch {
       // The lexicon is an accelerator, never a gate.
     }
@@ -1617,8 +1662,8 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
   // actual locality; a too-small page here silently degrades the whole
   // query into an unscoped global fan-out.
   const attemptResolve = async scope => {
-    const localityResponse = await engine.search(postalMatch ? {
-      q: surface,
+    const localityResponse = await engine.search(postalIntent ? {
+      q: postalSearchSurface,
       size: 8,
       ...(params.trace ? { trace: params.trace } : {}),
       ...(scope ? { shards: scope } : {})
@@ -1639,7 +1684,7 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
     // even where the type facet cannot be used for filtering.
     // A zero-hit first page proves the retry hopeless: the populous query
     // selects a strict subset of the same place-filtered docs.
-    if (!postalMatch && localityResponse.total > 0 && typePriority(resolved?.type) <= 2) {
+    if (!postalIntent && localityResponse.total > 0 && typePriority(resolved?.type) <= 2) {
       const populousResponse = await engine.search({
         q: surface,
         filters: { facets: { category: ["place"] }, numbers: { population: { min: 25000 } } },

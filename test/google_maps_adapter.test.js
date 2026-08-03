@@ -33,6 +33,21 @@ test("Google Maps migration adapter shapes OSM results without hiding Rangefind 
   assert.equal(place.source.dataset, "OpenStreetMap");
 });
 
+test("Google Maps migration adapter preserves non-OSM dataset provenance", () => {
+  const place = toMigrationPlace({
+    id: "postal/CA/J7A1V6",
+    name: "J7A 1V6, Rosemère",
+    type: "postal_code",
+    postcode: "J7A 1V6",
+    source: "GeoNames",
+    lat: 45.64,
+    lon: -73.7971
+  });
+  assert.equal(place.source.dataset, "GeoNames");
+  assert.equal(place.source.osmType, null);
+  assert.equal(place.source.osmId, null);
+});
+
 test("Google Maps migration adapter translates common request surfaces", async () => {
   const calls = [];
   const result = {

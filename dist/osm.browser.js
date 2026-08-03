@@ -1807,6 +1807,7 @@ var AUTHORITY_EXACT_CACHE = /* @__PURE__ */ new WeakMap();
 var AUTHORITY_LOOKUP_CACHE = /* @__PURE__ */ new WeakMap();
 var LOCALITY_SEARCH_STATS = Symbol("rangefind.localitySearchStats");
 var CANADIAN_POSTAL_CODE2 = /^\s*([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\s*$/iu;
+var POSTCODE_AUTHORITY_WEIGHT = 5e6;
 var LOCALITY_TYPES = /* @__PURE__ */ new Set(["city", "town", "municipality", "village", "hamlet"]);
 var STREET_DESIGNATORS = /* @__PURE__ */ new Set([
   "allee",
@@ -3063,13 +3064,49 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
     }
     return resolved2;
   }
-  const postalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE2);
+  let authorityLookup = Object.hasOwn(options, "authorityLookup") ? options.authorityLookup : null;
+  if (!authorityLookup && !shardScope.length && typeof engine.authorityLookup === "function") {
+    try {
+      authorityLookup = await authorityLookupCached(engine, surface);
+    } catch {
+    }
+  }
+  let exactAuthorityMatches = (authorityLookup?.matches || []).filter((match) => fold(match.text) === normalizedLocality);
+  let postalAuthority = exactAuthorityMatches.some(
+    // Postcode authority entries use the schema's fixed field weight. Do not
+    // use a lower bound here: populous localities can legitimately carry a
+    // larger authority weight and must keep the locality search lane.
+    (match) => Number(match.weight || 0) === POSTCODE_AUTHORITY_WEIGHT
+  );
+  const canadianPostalMatch = String(surface || "").match(CANADIAN_POSTAL_CODE2);
+  let postalSearchSurface = String(surface || "").trim();
+  if (!canadianPostalMatch && !postalAuthority && !shardScope.length && /\d/u.test(postalSearchSurface) && typeof engine.authorityLookup === "function") {
+    const tokens = postalSearchSurface.split(/\s+/u).filter(Boolean);
+    for (let length = tokens.length - 1; length >= 1; length--) {
+      const prefix = tokens.slice(0, length).join(" ");
+      let prefixLookup = null;
+      try {
+        prefixLookup = await authorityLookupCached(engine, prefix);
+      } catch {
+        break;
+      }
+      const prefixMatches = (prefixLookup?.matches || []).filter((match) => fold(match.text) === fold(prefix) && Number(match.weight || 0) === POSTCODE_AUTHORITY_WEIGHT);
+      if (!prefixMatches.length) continue;
+      authorityLookup = prefixLookup;
+      exactAuthorityMatches = prefixMatches;
+      postalAuthority = true;
+      postalSearchSurface = prefix;
+      break;
+    }
+  }
+  const postalIntent = Boolean(canadianPostalMatch || postalAuthority);
+  const expectedPostal = fold(canadianPostalMatch ? `${canadianPostalMatch[1]} ${canadianPostalMatch[2]}` : postalSearchSurface).replaceAll(/[^\p{L}\p{N}]+/gu, "");
   const bestMatch = (results) => {
     const matches = (results || []).filter((result) => {
       if (!Number.isFinite(result.lat) || !Number.isFinite(result.lon)) return false;
-      if (postalMatch) {
-        const expected = `${postalMatch[1]} ${postalMatch[2]}`.toUpperCase();
-        return result.type === "postal_code" && String(result.postcode || "").toUpperCase() === expected;
+      if (postalIntent) {
+        const actual = fold(result.postcode).replaceAll(/[^\p{L}\p{N}]+/gu, "");
+        return result.type === "postal_code" && actual === expectedPostal;
       }
       return LOCALITY_TYPES.has(result.type) && fold(result.name || result.title) === normalizedLocality;
     });
@@ -3078,12 +3115,11 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
   };
   let authorityShards = null;
   let authoritativeMiss = false;
-  if (!postalMatch && !shardScope.length && typeof engine.authorityLookup === "function") {
+  if (!shardScope.length && authorityLookup) {
     try {
-      const lookup = Object.hasOwn(options, "authorityLookup") ? options.authorityLookup : await authorityLookupCached(engine, surface);
       const scoped = [];
       let exactMatchWithoutShard = false;
-      const exactMatches = (lookup?.matches || []).filter((match) => fold(match.text) === normalizedLocality);
+      const exactMatches = exactAuthorityMatches;
       const bestWeight = exactMatches.length ? Math.max(...exactMatches.map((match) => Number(match.weight || 0))) : null;
       for (const match of exactMatches) {
         if (Number(match.weight || 0) !== bestWeight) continue;
@@ -3097,14 +3133,14 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
         if (scoped.length >= 4) break;
       }
       if (scoped.length) authorityShards = scoped.slice(0, 4).sort();
-      authoritativeMiss = lookup != null && !authorityShards && !exactMatchWithoutShard;
+      authoritativeMiss = authorityLookup != null && !authorityShards && !exactMatchWithoutShard;
     } catch {
     }
   }
   if (options.authorityMissIsFinal && authoritativeMiss) return null;
   const attemptResolve = async (scope) => {
-    const localityResponse = await engine.search(postalMatch ? {
-      q: surface,
+    const localityResponse = await engine.search(postalIntent ? {
+      q: postalSearchSurface,
       size: 8,
       ...params.trace ? { trace: params.trace } : {},
       ...scope ? { shards: scope } : {}
@@ -3117,7 +3153,7 @@ async function resolveLocality(engine, surface, params = {}, options = {}) {
     });
     let resolved2 = bestMatch(localityResponse.results);
     let resolvedStats2 = localityResponse.stats || {};
-    if (!postalMatch && localityResponse.total > 0 && typePriority(resolved2?.type) <= 2) {
+    if (!postalIntent && localityResponse.total > 0 && typePriority(resolved2?.type) <= 2) {
       const populousResponse = await engine.search({
         q: surface,
         filters: { facets: { category: ["place"] }, numbers: { population: { min: 25e3 } } },
@@ -4124,7 +4160,7 @@ function toMigrationPlace(result) {
     ...result.geometry ? { geometry: result.geometry } : {},
     details,
     source: {
-      dataset: "OpenStreetMap",
+      dataset: String(result.source || "OpenStreetMap"),
       osmType: result.osm_type || null,
       osmId: result.osm_id ?? null
     },
@@ -4345,7 +4381,7 @@ function createRangefindMapsAdapter(engine, options = {}) {
 }
 
 // src/integrations/osm/schema.js
-var OSM_INTEGRATION_SCHEMA_VERSION = 3;
+var OSM_INTEGRATION_SCHEMA_VERSION = 4;
 var OSM_DISPLAY_FIELDS = Object.freeze([
   "name",
   "address",
@@ -4359,11 +4395,14 @@ var OSM_DISPLAY_FIELDS = Object.freeze([
   "postcode",
   "country",
   "url",
+  "source",
   "category",
   "type",
   "lat",
   "lon",
+  "bbox",
   "address_count",
+  "sample_count",
   "prominence",
   "details",
   "geometry",
@@ -4376,6 +4415,11 @@ var OSM_DISPLAY_FIELDS = Object.freeze([
 ]);
 function createOsmIndexConfig(options = {}) {
   const workerCount = Math.max(1, Math.floor(Number(options.workerCount || 1)));
+  const additionalSources = Array.isArray(options.additionalSources) ? options.additionalSources.filter(Boolean) : options.rqa ? [{
+    source: "R\xE9f\xE9rentiel qu\xE9b\xE9cois des adresses (RQA)",
+    attribution: "Gouvernement du Qu\xE9bec",
+    license: "CC-BY-4.0"
+  }] : [];
   const config = {
     // Provenance published in the manifest. OSM's ODbL requires attribution
     // wherever the data is used; options.meta merges extra fields (generator,
@@ -4385,13 +4429,7 @@ function createOsmIndexConfig(options = {}) {
       attribution: "\xA9 OpenStreetMap contributors",
       license: "ODbL-1.0",
       license_url: "https://www.openstreetmap.org/copyright",
-      ...options.rqa ? {
-        additional_sources: [{
-          source: "R\xE9f\xE9rentiel qu\xE9b\xE9cois des adresses (RQA)",
-          attribution: "Gouvernement du Qu\xE9bec",
-          license: "CC-BY-4.0"
-        }]
-      } : {},
+      ...additionalSources.length ? { additional_sources: additionalSources } : {},
       ...options.meta || {}
     },
     input: options.input || (options.rqa ? "data/osm-rqa-places.jsonl" : "data/osm-places.jsonl"),
@@ -4508,10 +4546,13 @@ function createOsmIndexConfig(options = {}) {
       "country",
       "url",
       "category",
+      "source",
       "type",
       "lat",
       "lon",
+      "bbox",
       "address_count",
+      "sample_count",
       "prominence",
       "details",
       "geometry"

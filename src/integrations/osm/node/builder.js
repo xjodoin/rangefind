@@ -8,6 +8,7 @@ import { createOsmIndexConfig } from "../schema.js";
 export * from "../category_lexicon.js";
 export * from "../documents.js";
 export * from "../schema.js";
+export * from "./address_enrichment.js";
 export * from "./rqa.js";
 export * from "./shards.js";
 

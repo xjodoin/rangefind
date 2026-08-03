@@ -1008,6 +1008,62 @@ test("OSM category search resolves a compact postal area before geo ranking", as
   assert.equal(response.stats.osmIntentLocalityType, "postal_code");
 });
 
+test("OSM category search recognizes provider-backed international postcodes generically", async () => {
+  const calls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      return String(surface).trim().toLowerCase() === "sw1a 1aa" ? {
+        matches: [{ text: "SW1A 1AA", weight: 5_000_000, count: 1, shards: ["great-britain"] }]
+      } : { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.q === "SW1A 1AA") {
+        return {
+          total: 1,
+          results: [{ name: "SW1A 1AA, London", postcode: "SW1A 1AA", type: "postal_code", lat: 51.501, lon: -0.1416 }]
+        };
+      }
+      return { total: 1, results: [{ name: "Cinema", type: "cinema" }], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "cinema SW1A 1AA", size: 10 });
+  const postalCall = calls.find(params => params.q === "SW1A 1AA");
+  assert.deepEqual(postalCall.shards, ["great-britain"]);
+  assert.equal(postalCall.filters, undefined);
+  assert.equal(calls.at(-1).q, "cinema");
+  assert.equal(response.stats.osmIntentLocalityType, "postal_code");
+});
+
+test("OSM category search falls back to an authority-proven postal prefix", async () => {
+  const calls = [];
+  const authorityCalls = [];
+  const engine = {
+    async authorityLookup(surface) {
+      authorityCalls.push(surface);
+      return String(surface).trim().toLowerCase() === "sw1a" ? {
+        matches: [{ text: "SW1A", weight: 5_000_000, count: 1, shards: ["great-britain"] }]
+      } : { matches: [] };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.q === "SW1A") {
+        return {
+          total: 1,
+          results: [{ name: "SW1A, Westminster", postcode: "SW1A", type: "postal_code", lat: 51.5018, lon: -0.1328 }]
+        };
+      }
+      return { total: 1, results: [{ name: "Cinema", type: "cinema" }], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "cinema SW1A 1AA", size: 10 });
+  assert.ok(authorityCalls.includes("SW1A"));
+  const postalCall = calls.find(params => params.q === "SW1A");
+  assert.deepEqual(postalCall.shards, ["great-britain"]);
+  assert.equal(calls.at(-1).q, "cinema");
+  assert.equal(response.stats.osmIntentLocalityType, "postal_code");
+});
+
 test("OSM query display collapses an RQA civic duplicate behind a named place", async () => {
   const engine = {
     async search() {

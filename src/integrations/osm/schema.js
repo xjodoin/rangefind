@@ -1,11 +1,12 @@
 import { OSM_CANONICAL_TYPES } from "./category_lexicon.js";
 
-export const OSM_INTEGRATION_SCHEMA_VERSION = 3;
+export const OSM_INTEGRATION_SCHEMA_VERSION = 4;
 
 export const OSM_DISPLAY_FIELDS = Object.freeze([
   "name", "address", "house_number", "street", "unit", "suburb",
   "city", "district", "state", "postcode", "country",
-  "url", "category", "type", "lat", "lon", "address_count",
+  "url", "source", "category", "type", "lat", "lon", "bbox",
+  "address_count", "sample_count",
   "prominence", "details", "geometry",
   "_address_range_start", "_address_range_end", "_address_range_step",
   "_address_range_geometry", "_address_range_kind", "_address_range_inclusion"
@@ -16,6 +17,13 @@ export const OSM_DISPLAY_FIELDS = Object.freeze([
 // not a second index format or query sidecar.
 export function createOsmIndexConfig(options = {}) {
   const workerCount = Math.max(1, Math.floor(Number(options.workerCount || 1)));
+  const additionalSources = Array.isArray(options.additionalSources)
+    ? options.additionalSources.filter(Boolean)
+    : (options.rqa ? [{
+      source: "Référentiel québécois des adresses (RQA)",
+      attribution: "Gouvernement du Québec",
+      license: "CC-BY-4.0"
+    }] : []);
   const config = {
     // Provenance published in the manifest. OSM's ODbL requires attribution
     // wherever the data is used; options.meta merges extra fields (generator,
@@ -25,13 +33,7 @@ export function createOsmIndexConfig(options = {}) {
       attribution: "© OpenStreetMap contributors",
       license: "ODbL-1.0",
       license_url: "https://www.openstreetmap.org/copyright",
-      ...(options.rqa ? {
-        additional_sources: [{
-          source: "Référentiel québécois des adresses (RQA)",
-          attribution: "Gouvernement du Québec",
-          license: "CC-BY-4.0"
-        }]
-      } : {}),
+      ...(additionalSources.length ? { additional_sources: additionalSources } : {}),
       ...(options.meta || {})
     },
     input: options.input || (options.rqa ? "data/osm-rqa-places.jsonl" : "data/osm-places.jsonl"),
@@ -136,7 +138,8 @@ export function createOsmIndexConfig(options = {}) {
     geoCapsuleFields: [
       "id", "name", "address", "house_number", "street", "unit", "suburb",
       "city", "district", "state", "postcode", "country", "url", "category",
-      "type", "lat", "lon", "address_count", "prominence", "details", "geometry"
+      "source", "type", "lat", "lon", "bbox", "address_count", "sample_count",
+      "prominence", "details", "geometry"
     ],
     suggest: [
       { path: "search_name", weightPath: "population" },

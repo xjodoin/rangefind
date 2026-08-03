@@ -20,7 +20,7 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
     workerCount: 6,
     buildProgressLogMs: 0
   });
-  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 3);
+  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 4);
   assert.equal(config.input, "data/osm-rqa-places.jsonl");
   assert.equal(config.output, "public/rangefind");
   assert.equal(config.scanWorkers, 6);
@@ -32,7 +32,27 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
   assert.ok(config.geoCapsuleFields.includes("details"));
   assert.ok(config.facets.some(field => field.name === "wheelchair"));
   assert.ok(config.filterBitmapFacetValues.type.includes("cinema"));
+  assert.deepEqual(config.meta.additional_sources, [{
+    source: "Référentiel québécois des adresses (RQA)",
+    attribution: "Gouvernement du Québec",
+    license: "CC-BY-4.0"
+  }]);
   assert.equal(config.buildProgressLogMs, 0);
+});
+
+test("OSM integration publishes arbitrary additional-source attribution", () => {
+  const config = createOsmIndexConfig({
+    additionalSources: [{
+      source: "OpenAddresses",
+      attribution: "Adapted from Statistics Canada",
+      license: "Statistics Canada Open Licence"
+    }]
+  });
+  assert.deepEqual(config.meta.additional_sources, [{
+    source: "OpenAddresses",
+    attribution: "Adapted from Statistics Canada",
+    license: "Statistics Canada Open Licence"
+  }]);
 });
 
 test("OSM integration applies national-scale builder tuning without another index format", () => {

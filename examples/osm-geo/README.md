@@ -130,8 +130,18 @@ comparison. Ingestion streams the zipped CSV, collapses apartment/unit rows to
 one civic point, and uses an indexed on-disk canonical set to suppress only
 full addresses already represented identically by OSM. Spatially nearby OSM
 points are retained alongside the RQA authority record when their published
-components differ, ensuring the official full address remains searchable. It
-emits one additional aggregate record per postal-code/municipality pair.
+components differ, ensuring the official full address remains searchable.
+The RQA adapter delegates to Rangefind's generic address-enrichment engine,
+which emits one country-scoped aggregate per postal code with a centroid,
+coordinate bounds, primary locality, aliases, sample count, civic-address
+count, and provider provenance.
+
+The same engine accepts OpenAddresses, national address registers, GeoNames,
+or another licensed provider through an async normalized-record iterator.
+CSV/TSV sources can use `createDelimitedAddressSource`; provider adapters own
+their mappings, filters, lifecycle rules, and country-specific postcode
+normalization. Multiple providers merge in priority order and do not produce
+duplicate postal results.
 
 RQA civic records intentionally have no BM25 title/body terms, geo-browse
 point, or autocomplete surface. They contribute only compressed display data
@@ -141,15 +151,10 @@ autocomplete proportional to the residential corpus. Postal aggregates are
 searchable and suggestible; a postal-only query returns the public area
 centroid and civic-address count rather than enumerating private residences.
 
-The July 2026 full Québec run read 5,307,418 RQA rows and emitted 3,635,146
-unique civic records plus 221,677 postal-area aggregates; 12,863 addresses
-already represented identically by OSM were suppressed. The merged corpus has
-9,952,563 documents. RQA merge took 116.5 seconds and the complete resumable
-index build took 925.1 seconds (15m25s). The published index is 8.39 GiB,
-versus 5.52 GiB for the prior OSM-only/interpolation index. Despite adding
-3.86M authority/display records, posting reduction remained 37.9 seconds with
-the same 13,433 posting segments, and geo construction remained 5.4 seconds,
-because residential civic points do not enter either structure.
+Enrichment is streaming and uses temporary SQLite key/aggregate tables, so
+heap use does not scale with the address corpus. Residential civic points do
+not enter BM25, autocomplete, or geo-browse structures; the added index cost
+is limited to compressed display documents and canonical authority rows.
 
 The fixture converts named places and complete `addr:housenumber` +
 `addr:street`/`addr:place` nodes and ways (anchored at their first node) into

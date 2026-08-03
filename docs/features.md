@@ -92,7 +92,10 @@ bounded relevance prior or explicit sort field. See [link-graph authority](link-
 Rangefind index; `rangefind/osm/extract` provides bounded PBF extraction. The
 extractor supports named nodes and ways, addresses, streets, useful closed-way
 geometry, compact address interpolation ranges, locality enrichment, and
-optional Québec RQA civic/postal augmentation.
+optional multi-provider civic/postal augmentation. The bundled RQA adapter is
+one provider; the shared engine also accepts OpenAddresses, national address
+registers, postal gazetteers, or application-owned authorities without
+changing the index format or runtime.
 
 ```js
 import { extractOsmPlaces } from "rangefind/osm/extract";
@@ -691,7 +694,7 @@ cannot appear until the corpus is rebuilt:
 | Multi-resolution category cells | Correct geo-tree fallback with more reads. |
 | Wildcard route occupancy | Correct route search through fallback geo traversal; potentially more cold I/O. |
 | OSM typed constraints/details | No matching detail can be verified; rebuild with OSM schema v3. |
-| OSM geometry | Markers still work; polygons/lines require schema-v3 capsules. |
+| OSM geometry | Markers still work; polygons/lines require schema-v4 capsules. |
 | Root text/suggest routing | Query falls back to broader shard probing. |
 
 This fallback policy preserves correctness where the old index contains enough

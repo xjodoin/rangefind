@@ -10,6 +10,13 @@ export const OSM_DISPLAY_FIELDS: readonly string[];
 export interface OsmIndexConfigOptions {
   region?: string;
   rqa?: boolean;
+  additionalSources?: Array<{
+    source: string;
+    attribution?: string;
+    license?: string;
+    license_url?: string;
+    url?: string;
+  }>;
   workerCount?: number;
   buildProgressLogMs?: number;
   input?: string;
@@ -134,7 +141,7 @@ export interface MigrationPlace {
   websiteUri?: string;
   geometry?: Record<string, unknown>;
   details: Record<string, unknown>;
-  source: { dataset: "OpenStreetMap"; osmType: string | null; osmId: unknown };
+  source: { dataset: string; osmType: string | null; osmId: unknown };
   rangefind: {
     score: number | null;
     shard: string | null;
