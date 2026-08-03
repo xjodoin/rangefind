@@ -29,8 +29,12 @@
   by penalized re-search over already-fetched objects, and `liveWeights`
   re-ranks candidates and adjusts ETAs with per-edge factors keyed by
   stable `leaf/edgeIndex` ids tied to the build epoch — the consumption
-  path for CDN-published or peer-to-peer traffic deltas. See
-  `docs/route-graph.md`.
+  path for CDN-published or peer-to-peer traffic deltas. Turn-angle costs
+  ship via full junction expansion into an edge-based graph (per-approach
+  junction copies with bearing-priced turns, left costlier than right,
+  u-turns penalized), with via-node restrictions as exact per-approach
+  filters; multi-via-way restrictions resolve through the union of their
+  via ways. See `docs/route-graph.md`.
 
 ## 0.4.6 — 2026-08-04
 

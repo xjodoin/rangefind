@@ -33,12 +33,26 @@ adapted to range-addressed static objects:
    the topology by via-node expansion: each restricted approach is
    redirected to a copy of the junction whose outgoing edges honor the
    restriction, so restrictions cost nothing at query time and every later
-   stage sees plain edges. Single-via-way restrictions (dual-carriageway
-   u-turn bans and their kin) expand the whole via chain with path memory:
+   stage sees plain edges. Via-way restrictions (dual-carriageway u-turn
+   bans and their kin, including multi-via-way chains resolved through the
+   union of the via ways) expand the whole via chain with path memory:
    only traffic that entered from the from-way sees the restricted exit,
    while side exits and other approaches stay untouched. Only the largest
    strongly connected component is kept. Per-edge polyline geometry and
    street names survive.
+
+   **Turn costs** (car and bike by default; `--no-turn-costs` to disable):
+   the graph is fully junction-expanded into an edge-based graph — every
+   junction splits into one copy per incoming edge, and every outgoing
+   edge is re-emitted per approach with a bearing-derived cost added
+   (straight free; slight/full left and right turns priced separately,
+   left higher under right-hand driving; u-turns heavily penalized but
+   never forbidden, so dead ends stay reachable). In this mode via-node
+   restrictions become exact per-approach turn filters, which also makes
+   chained restrictions exact. The construction is the standard line graph
+   expressed as node splitting, so edges keep their geometry, names, and
+   distances and the partition/clique/query pipeline is untouched — the
+   graph is ~2.3× larger and everything downstream just works.
 2. **Partition** (`rangefind/route/build`): nodes are KD-partitioned into
    contiguous leaf cells (default ≤1280 nodes) over a locality-preserving
    order, then grouped by fanout into nested parent cells until the top
@@ -144,25 +158,29 @@ node scripts/route_bench.mjs build quebec.graph.bin ./route-graph --shards 4
 full-graph Dijkstra (identical snap seeds) and measures fetch budgets per
 distance bucket; `compare` proves sharded == monolithic.
 
-Quebec extract (2026-07 PBF): 654,303 nodes / 1,525,005 directed edges after
-turn-restriction expansion (12,072 via-node + 2,375 via-way restrictions
-applied) and largest-SCC filtering; extraction 44 s, index build 4 s, 44 MB
-on disk (512 leaf cells, two overlay levels at fanout 8, 8 top cells, 35 KB
-root). Measured on an M-series laptop with a simulated 25 ms per-request
-RTT for cold queries:
+Quebec extract (2026-07 PBF), with full turn-cost junction expansion:
+1,507,941 expanded nodes / 4,063,393 turn-priced edges for the car profile
+(from 654 k junctions / 1.5 M road edges; 11,439 restricted turns filtered
+exactly), extraction 46 s, index build 29 s, 90 MB on disk with two time
+buckets (2,048 leaf cells, two overlay levels, 151 KB root). Measured on an
+M-series laptop with a simulated 25 ms per-request RTT for cold queries:
 
 | Bucket | Cold | Requests | Fetched | +Geometry | Warm |
 | --- | --- | --- | --- | --- | --- |
-| local <10 km | 77 ms | 12 | 1.3 MB | +64 ms | 11 ms |
-| regional 10–100 km | 81 ms | 13 | 1.4 MB | +123 ms | 13 ms |
-| long >100 km | 82 ms | 12 | 1.4 MB | +143 ms | 13 ms |
+| local <10 km | 110 ms | 16 | 4.7 MB | +67 ms | 20 ms |
+| regional 10–100 km | 112 ms | 14 | 4.5 MB | +140 ms | 30 ms |
+| long >100 km | 126 ms | 13 | 4.4 MB | +182 ms | 43 ms |
+
+The exact turn-aware metric costs roughly 3× the transfer of the
+turn-naive build (~1.4 MB per query, 44 MB index — still available via
+`--no-turn-costs`); request counts stay in the same 13–16 band.
 
 - Correctness: 40/40 random pairs exactly equal to reference Dijkstra on
   the base metric and 15/15 on the peak bucket (scaled reference), with the
-  unpack path's per-clique weight assertions on — turn restrictions and
-  junction penalties included, since they are plain topology by build time.
-  Bike (885 k nodes, 68 MB) and foot (1.26 M nodes, 91 MB) profile indexes
-  verify 15/15 exact each.
+  unpack path's per-clique weight assertions on — turn restrictions,
+  junction penalties, and turn costs included, since they are plain
+  topology by build time. The bike profile (2.14 M expanded nodes, 119 MB)
+  verifies 15/15 exact; foot (1.26 M nodes, unexpanded) likewise.
 - Sharded (4 shards) vs monolithic: 60/60 identical routes; a query opens
   only the source/target shards plus the shared top overlay.
 - Geometry unpack is breadth-batched: each hierarchy depth is one parallel
@@ -213,17 +231,19 @@ metric-exact rerouting remains a hosted-service capability.
 
 - Profiles are separate builds (car/bike/foot each get their own index
   directory); there is no multi-profile object sharing.
-- Single-via-node and single-via-way restrictions are enforced exactly
-  (~93% of restriction relations in the Quebec extract). Multi-via-way
-  restrictions are skipped (60 in Quebec), via-way restrictions whose
-  entry/exit junctions are ambiguous fall back unenforced (359 in Quebec),
-  and via-node restriction chains deeper than 3 consecutive restricted
-  junctions are truncated (272 in Quebec) — all counted in the extraction
-  log. Turn restrictions apply to the car profile.
-- Junction penalties are fixed per node type; turn-*angle* costs (slow
-  left turns) would need an edge-based graph and are not modeled.
+- Via-node and via-way restrictions (single or multi-via-way) are enforced
+  exactly; the only fallbacks are via-way relations whose entry/exit
+  junctions cannot be identified unambiguously and relations with more
+  than four via ways, both counted in the extraction log. With turn costs
+  enabled, via-node restrictions are exact per-approach filters (no chain
+  depth limit); without them, chains deeper than 3 restricted junctions
+  are truncated. Turn restrictions apply to the car profile.
+- Turn costs are heuristic bands by turn geometry, not measured
+  per-junction delays; junction penalties are fixed per node type. At
+  snapped endpoints the turn-cost share of a partial edge is
+  ratio-scaled with the rest of its weight.
 - Bucket factors scale whole edge weights, including the folded junction
-  penalty portion.
+  penalty and turn-cost portions.
 - `liveWeights` re-ranks computed candidates; it does not re-run the
   search under the adjusted metric.
 - Distances inside cliques are exact in deciseconds; displayed seconds are

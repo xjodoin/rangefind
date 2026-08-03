@@ -91,11 +91,19 @@ function nodePenaltyDs(profile, tags) {
   return 0;
 }
 
+// Turn costs in deciseconds by geometric turn kind. Left turns cross
+// oncoming traffic under right-hand driving, so they cost more than right
+// turns; u-turns are heavily penalized (never forbidden — dead ends need
+// them) unless an explicit restriction forbids the movement.
+const CAR_TURN_COSTS = { uturn: 150, left: 40, right: 15, slightLeft: 20, slightRight: 8 };
+const BIKE_TURN_COSTS = { uturn: 40, left: 15, right: 8, slightLeft: 8, slightRight: 4 };
+
 export const PROFILES = {
   car: {
     name: "car",
     speeds: CAR_SPEEDS,
     nodePenalties: CAR_NODE_PENALTIES,
+    turnCosts: CAR_TURN_COSTS,
     maxSpeedKmh: 130,
     allowed(tags) {
       return carAllowed(tags);
@@ -109,6 +117,7 @@ export const PROFILES = {
     name: "bike",
     speeds: BIKE_SPEEDS,
     nodePenalties: BIKE_NODE_PENALTIES,
+    turnCosts: BIKE_TURN_COSTS,
     maxSpeedKmh: 30,
     allowed(tags) {
       const highway = tags.get("highway");
@@ -133,6 +142,8 @@ export const PROFILES = {
     name: "foot",
     speeds: FOOT_SPEEDS,
     nodePenalties: FOOT_NODE_PENALTIES,
+    // Pedestrians turn freely; no edge-based expansion for foot.
+    turnCosts: null,
     maxSpeedKmh: 6,
     allowed(tags) {
       const highway = tags.get("highway");
@@ -236,8 +247,10 @@ function parseRestriction(tags, members) {
   if (viaNode != null && !viaWays.length) {
     return { kind, fromWay, toWay, viaNode, only: kind.startsWith("only_") };
   }
-  if (viaWays.length === 1 && viaNode == null) {
-    return { kind, fromWay, toWay, viaWay: viaWays[0], only: kind.startsWith("only_") };
+  // Via ways (possibly several, possibly with a via node on the chain that
+  // we can ignore): the union of their edges defines the restricted path.
+  if (viaWays.length >= 1 && viaWays.length <= 4) {
+    return { kind, fromWay, toWay, viaWays, only: kind.startsWith("only_") };
   }
   return viaWays.length ? { unsupportedVia: true } : null;
 }
@@ -341,7 +354,9 @@ function binarySearch(sorted, value) {
   return -1;
 }
 
-export function extractRoadGraph(pbfPath, { log = () => {}, profile: profileName = "car" } = {}) {
+export function extractRoadGraph(pbfPath, options = {}) {
+  const log = options.log || (() => {});
+  const profileName = options.profile || "car";
   const profile = PROFILES[profileName];
   if (!profile) throw new Error(`Unknown routing profile "${profileName}" (car, bike, foot).`);
   const classTable = Object.keys(profile.speeds);
@@ -413,9 +428,9 @@ export function extractRoadGraph(pbfPath, { log = () => {}, profile: profileName
       }
     }
   });
-  const viaWayKept = restrictions.filter(restriction => restriction.viaWay != null).length;
+  const viaWayKept = restrictions.filter(restriction => restriction.viaWays != null).length;
   log(`ways: kept ${ways.length} of ${wayCount}`);
-  log(`restrictions: ${restrictions.length - viaWayKept} via-node + ${viaWayKept} single-via-way kept, ${viaWayRestrictions} multi/mixed-via skipped`);
+  log(`restrictions: ${restrictions.length - viaWayKept} via-node + ${viaWayKept} via-way kept, ${viaWayRestrictions} oversized-via skipped`);
 
   // Junctions: any ref appearing more than once across the kept ways.
   const allRefs = refSpool.view();
@@ -548,13 +563,16 @@ export function extractRoadGraph(pbfPath, { log = () => {}, profile: profileName
   }
   log(`edges: ${edgeFrom.length} directed`);
 
-  // Turn restrictions by via-node expansion: for every restricted approach
-  // (via graph node + from way), the incoming edge is redirected to a copy
-  // of the via node whose outgoing edges honor the restriction. The rest of
-  // the pipeline (partition, cliques, query) sees plain topology, so
-  // restrictions cost nothing at query time.
-  applyTurnRestrictions({
-    restrictions,
+  // Turn handling. With turn costs enabled (car and bike by default), the
+  // graph is fully junction-expanded into an edge-based graph: via-way
+  // restrictions are compiled as chain copies first, then every junction
+  // splits per approach with bearing-derived turn costs, and via-node
+  // restrictions become exact per-approach filters inside the expansion.
+  // Without turn costs, via-node restrictions fall back to targeted
+  // via-node expansion.
+  const useTurnCosts = Boolean(profile.turnCosts) && options.turnCosts !== false;
+  const context = {
+    restrictions: useTurnCosts ? restrictions.filter(restriction => restriction.viaWays != null) : restrictions,
     nodeIndex,
     nodeLat,
     nodeLon,
@@ -568,7 +586,27 @@ export function extractRoadGraph(pbfPath, { log = () => {}, profile: profileName
     geomOffsets,
     geomBytes,
     log
-  });
+  };
+  applyTurnRestrictions(context);
+
+  if (useTurnCosts) {
+    const expanded = expandTurnCosts({ ...context, restrictions }, profile.turnCosts);
+    return filterLargestScc({
+      nodeLat: expanded.nodeLat,
+      nodeLon: expanded.nodeLon,
+      edgeFrom: Uint32Array.from(expanded.edgeFrom),
+      edgeTo: Uint32Array.from(expanded.edgeTo),
+      edgeWeightDs: Uint32Array.from(expanded.edgeWeightDs),
+      edgeDistDm: Uint32Array.from(expanded.edgeDistDm),
+      edgeName: Uint32Array.from(expanded.edgeName),
+      edgeClass: Uint8Array.from(expanded.edgeClass),
+      geomOffsets: Uint32Array.from(expanded.geomOffsets),
+      geomBytes: Uint8Array.from(expanded.geomBytes.view()),
+      names,
+      profile: profile.name,
+      classes: classTable
+    }, log);
+  }
 
   return filterLargestScc({
     nodeLat: Int32Array.from(nodeLat),
@@ -615,14 +653,14 @@ export function applyTurnRestrictions(context) {
 
   // --- Single-via-way restrictions: expand the via chain with path memory
   // so only traffic that entered from the from-way sees the restricted exit.
-  const viaWayRestrictions = restrictions.filter(restriction => restriction.viaWay != null);
+  const viaWayRestrictions = restrictions.filter(restriction => restriction.viaWays != null);
   let viaWayApplied = 0;
   let viaWayUnresolved = 0;
   if (viaWayRestrictions.length) {
     const involvedWays = new Set();
     for (const restriction of viaWayRestrictions) {
       involvedWays.add(restriction.fromWay);
-      involvedWays.add(restriction.viaWay);
+      for (const way of restriction.viaWays) involvedWays.add(way);
       involvedWays.add(restriction.toWay);
     }
     const wayEdges = new Map();
@@ -642,7 +680,14 @@ export function applyTurnRestrictions(context) {
       return set;
     };
     for (const restriction of viaWayRestrictions) {
-      const viaNodes = nodesOf(restriction.viaWay);
+      // Union of all via ways: member order in the relation stops mattering
+      // and multi-via-way chains resolve exactly like single ones.
+      const viaNodes = new Set();
+      const viaEdges = [];
+      for (const way of restriction.viaWays) {
+        for (const node of nodesOf(way)) viaNodes.add(node);
+        for (const e of wayEdges.get(way) || []) viaEdges.push(e);
+      }
       const entries = [...nodesOf(restriction.fromWay)].filter(node => viaNodes.has(node));
       const exits = [...nodesOf(restriction.toWay)].filter(node => viaNodes.has(node));
       if (entries.length !== 1 || exits.length !== 1 || entries[0] === exits[0]) {
@@ -651,14 +696,14 @@ export function applyTurnRestrictions(context) {
       }
       const entry = entries[0];
       const exit = exits[0];
-      // Directed BFS along the via way from entry to exit, capped.
+      // Directed BFS along the via-way union from entry to exit, capped.
       const parentEdge = new Map([[entry, -1]]);
       let frontier = [entry];
       let found = false;
-      for (let depth = 0; depth < 8 && frontier.length && !found; depth++) {
+      for (let depth = 0; depth < 12 && frontier.length && !found; depth++) {
         const next = [];
         for (const node of frontier) {
-          for (const e of wayEdges.get(restriction.viaWay) || []) {
+          for (const e of viaEdges) {
             if (edgeFrom[e] !== node || parentEdge.has(edgeTo[e])) continue;
             parentEdge.set(edgeTo[e], e);
             if (edgeTo[e] === exit) {
@@ -727,7 +772,7 @@ export function applyTurnRestrictions(context) {
   const byVia = new Map();
   let mapped = 0;
   for (const restriction of restrictions) {
-    if (restriction.viaWay != null) continue;
+    if (restriction.viaWays != null) continue;
     const via = nodeIndex.get(restriction.viaNode);
     if (via == null) continue;
     mapped++;
@@ -814,6 +859,176 @@ export function applyTurnRestrictions(context) {
     }
   }
   log(`restrictions: ${mapped} via-node mapped (${copies} copies, ${copyEdges} copied edges${depthLimited ? `, ${depthLimited} depth-limited` : ""}), ${viaWayApplied} via-way applied, ${viaWayUnresolved} via-way unresolved`);
+}
+
+// Edge-based graph by full junction expansion: every junction J splits into
+// one copy per incoming edge, and every outgoing edge is re-emitted per
+// approach with a bearing-derived turn cost added — the standard line-graph
+// construction expressed as node splitting, so edges keep their geometry,
+// names, and distances and the whole downstream pipeline (partition,
+// cliques, multilevel query, snapping) is untouched. Via-node restrictions
+// become exact (approach, exit) filters here, which also makes chained
+// restrictions exact (the old depth-limited queue only applies to the
+// non-turn-cost mode).
+export function expandTurnCosts(context, turnCosts) {
+  const {
+    restrictions, nodeIndex, nodeLat, nodeLon,
+    edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass,
+    geomOffsets, geomBytes, log
+  } = context;
+  const edgeCount = edgeFrom.length;
+  const nodeCount = nodeLat.length;
+  const geomData = geomBytes.data;
+
+  // Departure and arrival bearings per edge from its polyline endpoints.
+  const depBearing = new Float32Array(edgeCount);
+  const arrBearing = new Float32Array(edgeCount);
+  const readState = { pos: 0 };
+  const readVarint = () => {
+    let value = 0;
+    let multiplier = 1;
+    for (;;) {
+      const byte = geomData[readState.pos++];
+      value += (byte & 0x7f) * multiplier;
+      if ((byte & 0x80) === 0) return value;
+      multiplier *= 0x80;
+    }
+  };
+  const readZigzag = () => {
+    const raw = readVarint();
+    return raw % 2 === 1 ? -(raw + 1) / 2 : raw / 2;
+  };
+  const bearing = (aLat, aLon, bLat, bLon, cosLat) => {
+    const dx = (bLon - aLon) * cosLat;
+    const dy = bLat - aLat;
+    return (Math.atan2(dx, dy) * 180) / Math.PI;
+  };
+  for (let e = 0; e < edgeCount; e++) {
+    const fromLat = nodeLat[edgeFrom[e]];
+    const fromLon = nodeLon[edgeFrom[e]];
+    const toLat = nodeLat[edgeTo[e]];
+    const toLon = nodeLon[edgeTo[e]];
+    const cosLat = Math.max(0.05, Math.cos(fromLat * 1e-7 * (Math.PI / 180)));
+    readState.pos = geomOffsets[e];
+    const interior = readVarint();
+    let firstLat = toLat;
+    let firstLon = toLon;
+    let lastLat = fromLat;
+    let lastLon = fromLon;
+    let lat = fromLat;
+    let lon = fromLon;
+    for (let i = 0; i < interior; i++) {
+      lat += readZigzag();
+      lon += readZigzag();
+      if (i === 0) {
+        firstLat = lat;
+        firstLon = lon;
+      }
+      lastLat = lat;
+      lastLon = lon;
+    }
+    depBearing[e] = bearing(fromLat, fromLon, firstLat, firstLon, cosLat);
+    arrBearing[e] = bearing(lastLat, lastLon, toLat, toLon, cosLat);
+  }
+
+  const turnCostFor = (inEdge, outEdge) => {
+    const isTwin = edgeTo[outEdge] === edgeFrom[inEdge];
+    let delta = depBearing[outEdge] - arrBearing[inEdge];
+    while (delta > 180) delta -= 360;
+    while (delta <= -180) delta += 360;
+    const magnitude = Math.abs(delta);
+    if (isTwin || magnitude >= 150) return turnCosts.uturn;
+    if (magnitude < 30) return 0;
+    const left = delta < 0;
+    if (magnitude < 60) return left ? turnCosts.slightLeft : turnCosts.slightRight;
+    return left ? turnCosts.left : turnCosts.right;
+  };
+
+  // Via-node restrictions grouped by (junction, approach way).
+  const byVia = new Map();
+  for (const restriction of restrictions) {
+    if (restriction.viaWays != null || restriction.viaNode == null) continue;
+    const via = nodeIndex.get(restriction.viaNode);
+    if (via == null) continue;
+    const key = `${via}:${restriction.fromWay}`;
+    let group = byVia.get(key);
+    if (!group) byVia.set(key, (group = { onlys: [], nos: [] }));
+    (restriction.only ? group.onlys : group.nos).push(restriction);
+  }
+  const allowed = (inEdge, outEdge) => {
+    const group = byVia.get(`${edgeFrom[outEdge]}:${edgeWay[inEdge]}`);
+    if (!group) return true;
+    const way = edgeWay[outEdge];
+    if (group.onlys.length) return group.onlys.some(only => way === only.toWay);
+    for (const no of group.nos) {
+      if (way !== no.toWay) continue;
+      if (no.toWay === no.fromWay && edgeTo[outEdge] !== edgeFrom[inEdge]) continue;
+      return false;
+    }
+    return true;
+  };
+
+  // Incoming-edge CSR.
+  const inStart = new Uint32Array(nodeCount + 1);
+  for (let e = 0; e < edgeCount; e++) inStart[edgeTo[e] + 1]++;
+  for (let i = 0; i < nodeCount; i++) inStart[i + 1] += inStart[i];
+  const inEdges = new Uint32Array(edgeCount);
+  {
+    const cursor = Uint32Array.from(inStart.subarray(0, nodeCount));
+    for (let e = 0; e < edgeCount; e++) inEdges[cursor[edgeTo[e]]++] = e;
+  }
+
+  // One expanded node per original edge: the copy of to(e) reached via e.
+  const newLat = new Int32Array(edgeCount);
+  const newLon = new Int32Array(edgeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    newLat[e] = nodeLat[edgeTo[e]];
+    newLon[e] = nodeLon[edgeTo[e]];
+  }
+  const newFrom = [];
+  const newTo = [];
+  const newWeight = [];
+  const newDist = [];
+  const newName = [];
+  const newClass = [];
+  const newGeomOffsets = [0];
+  const newGeomBytes = new GrowUint8();
+  let filteredTurns = 0;
+  for (let out = 0; out < edgeCount; out++) {
+    const junction = edgeFrom[out];
+    for (let slot = inStart[junction]; slot < inStart[junction + 1]; slot++) {
+      const inEdge = inEdges[slot];
+      if (!allowed(inEdge, out)) {
+        filteredTurns++;
+        continue;
+      }
+      newFrom.push(inEdge);
+      newTo.push(out);
+      newWeight.push(edgeWeightDs[out] + turnCostFor(inEdge, out));
+      newDist.push(edgeDistDm[out]);
+      newName.push(edgeName[out]);
+      newClass.push(edgeClass[out]);
+      const start = geomOffsets[out];
+      const end = geomOffsets[out + 1];
+      newGeomBytes.ensure(end - start);
+      newGeomBytes.data.set(geomData.subarray(start, end), newGeomBytes.length);
+      newGeomBytes.length += end - start;
+      newGeomOffsets.push(newGeomBytes.length);
+    }
+  }
+  log(`turn costs: ${edgeCount} junction copies, ${newFrom.length} expanded edges, ${filteredTurns} restricted turns filtered, ${byVia.size} restricted approaches`);
+  return {
+    nodeLat: newLat,
+    nodeLon: newLon,
+    edgeFrom: newFrom,
+    edgeTo: newTo,
+    edgeWeightDs: newWeight,
+    edgeDistDm: newDist,
+    edgeName: newName,
+    edgeClass: newClass,
+    geomOffsets: newGeomOffsets,
+    geomBytes: newGeomBytes
+  };
 }
 
 function buildCsr(nodeCount, from, to) {
@@ -1020,7 +1235,11 @@ if (invokedAsScript && process.argv[2] && process.argv[3]) {
   const started = Date.now();
   const profileFlag = process.argv.indexOf("--profile");
   const profileName = profileFlag > 0 ? process.argv[profileFlag + 1] : "car";
-  const graph = extractRoadGraph(process.argv[2], { log: message => console.log(message), profile: profileName });
+  const graph = extractRoadGraph(process.argv[2], {
+    log: message => console.log(message),
+    profile: profileName,
+    turnCosts: !process.argv.includes("--no-turn-costs")
+  });
   writeRoadGraph(process.argv[3], graph);
   console.log(`graph (${graph.profile}): ${graph.nodeLat.length} nodes, ${graph.edgeFrom.length} edges, ${graph.names.length} names`);
   console.log(`wrote ${process.argv[3]} in ${((Date.now() - started) / 1000).toFixed(1)}s`);

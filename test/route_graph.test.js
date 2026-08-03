@@ -268,7 +268,7 @@ test("via-way restrictions keep path memory through the via chain", async () => 
   ];
   const context = {
     restrictions: [
-      { kind: "no_u_turn", fromWay: 100, viaWay: 300, toWay: 200, only: false }
+      { kind: "no_u_turn", fromWay: 100, viaWays: [300], toWay: 200, only: false }
     ],
     nodeIndex: new Map(),
     nodeLat: [0, 0, 0, 0, 0, 0, 0],
@@ -321,6 +321,114 @@ test("via-way restrictions keep path memory through the via chain", async () => 
   assert.equal(context.edgeTo[8], 1, "other approach still reaches the original entry");
   assert.equal(context.edgeTo[2], 2, "original via edge unchanged");
   assert.equal(context.edgeTo[4], 4, "original exit turn unchanged");
+});
+
+test("junction expansion prices turns by bearing and filters restrictions", async () => {
+  const { expandTurnCosts } = await import("../scripts/osm_road_graph.mjs");
+  // Cross at the equator: 4 = center, 0 = west, 1 = east, 2 = south, 3 = north.
+  const nodeLat = [0, 0, -100000, 100000, 0];
+  const nodeLon = [-100000, 100000, 0, 0, 0];
+  const edges = [
+    [0, 4, 100], [4, 0, 100], [4, 1, 100], [1, 4, 100],
+    [2, 4, 200], [4, 2, 200], [4, 3, 200], [3, 4, 200]
+  ];
+  const makeContext = (restrictions) => ({
+    restrictions,
+    nodeIndex: new Map([[9004, 4]]),
+    nodeLat,
+    nodeLon,
+    edgeFrom: edges.map(edge => edge[0]),
+    edgeTo: edges.map(edge => edge[1]),
+    edgeWeightDs: edges.map(() => 100),
+    edgeDistDm: edges.map(() => 1000),
+    edgeName: edges.map(() => 0),
+    edgeWay: edges.map(edge => edge[2]),
+    edgeClass: edges.map(() => 0),
+    geomOffsets: [0, ...edges.map((_, i) => i + 1)],
+    geomBytes: { data: new Uint8Array(edges.map(() => 0)), length: edges.length },
+    log: () => {}
+  });
+  const costs = { uturn: 150, left: 40, right: 15, slightLeft: 20, slightRight: 8 };
+  const expanded = expandTurnCosts(makeContext([]), costs);
+  // From the west approach (edge 0: 0->4), find each turn's added cost.
+  const added = new Map();
+  for (let i = 0; i < expanded.edgeFrom.length; i++) {
+    if (expanded.edgeFrom[i] !== 0) continue;
+    added.set(expanded.edgeTo[i], expanded.edgeWeightDs[i] - 100);
+  }
+  assert.equal(added.get(2), 0, "straight through (west->east) is free");
+  assert.equal(added.get(6), costs.left, "west->north is a left turn");
+  assert.equal(added.get(5), costs.right, "west->south is a right turn");
+  assert.equal(added.get(1), costs.uturn, "west->west back is a u-turn");
+
+  // A no-turn restriction removes the movement entirely in expansion mode.
+  const restricted = expandTurnCosts(makeContext([
+    { kind: "no_left_turn", fromWay: 100, toWay: 200, viaNode: 9004, only: false }
+  ]), costs);
+  for (let i = 0; i < restricted.edgeFrom.length; i++) {
+    if (restricted.edgeFrom[i] !== 0) continue;
+    assert.notEqual(restricted.edgeTo[i], 6, "restricted left turn filtered");
+    assert.notEqual(restricted.edgeTo[i], 5, "restricted way-200 turn filtered");
+  }
+});
+
+test("multi-via-way restrictions resolve through the way union", async () => {
+  const { applyTurnRestrictions } = await import("../scripts/osm_road_graph.mjs");
+  // 0 -(100)- 1 -(301)- 2 -(302)- 3 -(200)- 4: two via ways chained.
+  const edges = [
+    [0, 1, 100], [1, 0, 100],
+    [1, 2, 301], [2, 1, 301],
+    [2, 3, 302], [3, 2, 302],
+    [3, 4, 200], [4, 3, 200]
+  ];
+  const context = {
+    restrictions: [
+      { kind: "no_u_turn", fromWay: 100, viaWays: [302, 301], toWay: 200, only: false }
+    ],
+    nodeIndex: new Map(),
+    nodeLat: [0, 0, 0, 0, 0],
+    nodeLon: [0, 0, 0, 0, 0],
+    edgeFrom: edges.map(edge => edge[0]),
+    edgeTo: edges.map(edge => edge[1]),
+    edgeWeightDs: edges.map(() => 10),
+    edgeDistDm: edges.map(() => 100),
+    edgeName: edges.map(() => 0),
+    edgeWay: edges.map(edge => edge[2]),
+    geomOffsets: [0, ...edges.map((_, i) => i + 1)],
+    geomBytes: {
+      data: new Uint8Array(64),
+      length: edges.length,
+      ensure(extra) {
+        if (this.length + extra <= this.data.length) return;
+        const next = new Uint8Array((this.length + extra) * 2);
+        next.set(this.data.subarray(0, this.length));
+        this.data = next;
+      }
+    },
+    log: () => {}
+  };
+  applyTurnRestrictions(context);
+  // Approach 0->1 is redirected into a copy chain spanning both via ways.
+  const entryCopy = context.edgeTo[0];
+  assert.ok(entryCopy >= 5, "approach redirected despite shuffled via member order");
+  const outOf = (node) => {
+    const out = [];
+    for (let e = 0; e < context.edgeFrom.length; e++) {
+      if (context.edgeFrom[e] === node) out.push(e);
+    }
+    return out;
+  };
+  let current = entryCopy;
+  for (let hops = 0; hops < 2; hops++) {
+    const chain = outOf(current).filter(e => context.edgeWay[e] === 301 || context.edgeWay[e] === 302);
+    const forward = chain.filter(e => context.edgeTo[e] >= 5);
+    assert.equal(forward.length, 1, `chain hop ${hops} continues on a copy`);
+    current = context.edgeTo[forward[0]];
+  }
+  for (const e of outOf(current)) {
+    assert.notEqual(context.edgeWay[e], 200, "exit onto the to-way removed at chain end");
+  }
+  assert.equal(context.edgeTo[2], 2, "direct via traffic untouched");
 });
 
 test("route cell and overlay codecs round-trip", () => {
