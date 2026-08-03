@@ -141,7 +141,8 @@
   ],
   "scripts": {
     "build:browser": "node scripts/build_browser_bundle.mjs",
-    "build:osm-demo": "npm run build:browser && cp dist/runtime.browser.js dist/osm.browser.js examples/osm-geo/public/",
+    "build:osm-demo": "npm run build:browser && cp dist/runtime.browser.js dist/osm.browser.js dist/route.browser.js examples/osm-geo/public/",
+    "setup:osm-demo-route": "node scripts/osm_demo_route_setup.mjs",
     "build:element": "node scripts/build_element_bundle.mjs",
     "build:example": "node scripts/build_browser_bundle.mjs && node bin/rangefind.js build --config examples/basic/rangefind.config.json && cp dist/runtime.browser.js examples/basic/public/runtime.browser.js",
     "build:wiki-site": "npm run build:browser && node examples/wiki-search/scripts/build.mjs",

@@ -29,6 +29,8 @@ export interface RouteFetchStats {
   cellFetches: number;
   overlayFetches: number;
   unpackCellFetches: number;
+  /** Actual merged Range requests after same-file coalescing. */
+  httpRequests: number;
   shardsTouched: string[];
 }
 
@@ -67,6 +69,12 @@ export interface RouteResult {
   steps?: RouteStep[];
   /** Stable per-edge refs, present unless `geometry: false`. */
   edges?: RouteEdgeRef[];
+  /**
+   * Instant sketch polyline (snapped endpoints through traversed leaf-cell
+   * centers), available before path unpacking; render it immediately and
+   * replace with `geometry` when it arrives.
+   */
+  coarseGeometry?: Array<[number, number]>;
   /** ETA re-ranked with liveWeights, when provided. */
   adjustedSeconds?: number;
   /** Diverging candidate routes, when `alternatives` was requested. */
@@ -95,6 +103,8 @@ export interface RouteParams {
   alternatives?: number;
   /** Re-rank candidates and adjust ETAs with fresh per-edge factors. */
   liveWeights?: LiveWeights;
+  /** Called with the coarse route as soon as the search finishes. */
+  onCoarseRoute?: (coarse: { seconds: number; geometry: Array<[number, number]>; bucket: string }) => void;
 }
 
 export interface MatrixResult {
@@ -143,6 +153,8 @@ export interface RouteGraphEngine {
     points: RoutePoint[];
     bucket?: string;
     departureTime?: string | number | Date;
+    /** Force k^2 point-to-point routes instead of shared-context one-to-many searches. */
+    pairwise?: boolean;
   }): Promise<MatrixResult>;
   itinerary(params: {
     stops: RoutePoint[];

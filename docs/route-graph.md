@@ -161,19 +161,55 @@ distance bucket; `compare` proves sharded == monolithic.
 Quebec extract (2026-07 PBF), with full turn-cost junction expansion:
 1,507,941 expanded nodes / 4,063,393 turn-priced edges for the car profile
 (from 654 k junctions / 1.5 M road edges; 11,439 restricted turns filtered
-exactly), extraction 46 s, index build 29 s, 90 MB on disk with two time
-buckets (2,048 leaf cells, two overlay levels, 151 KB root). Measured on an
+exactly), extraction 46 s, index build 36 s, 82 MB on disk with two time
+buckets (2,048 leaf cells, three overlay levels, top of 4). Measured on an
 M-series laptop with a simulated 25 ms per-request RTT for cold queries:
 
 | Bucket | Cold | Requests | Fetched | +Geometry | Warm |
 | --- | --- | --- | --- | --- | --- |
-| local <10 km | 110 ms | 16 | 4.7 MB | +67 ms | 20 ms |
-| regional 10–100 km | 112 ms | 14 | 4.5 MB | +140 ms | 30 ms |
-| long >100 km | 126 ms | 13 | 4.4 MB | +182 ms | 43 ms |
+| local <10 km | 65 ms | 12 | 3.3 MB | +66 ms | 16 ms |
+| regional 10–100 km | 70 ms | 15 | 3.6 MB | +135 ms | 22 ms |
+| long >100 km | 76 ms | 14 | 3.6 MB | +202 ms | 29 ms |
 
-The exact turn-aware metric costs roughly 3× the transfer of the
-turn-naive build (~1.4 MB per query, 44 MB index — still available via
-`--no-turn-costs`); request counts stay in the same 13–16 band.
+The exact turn-aware metric costs roughly 2.5× the transfer of the
+turn-naive build (still available via `--no-turn-costs`). A 5-stop /
+525 km itinerary (matrix + Held-Karp + 4 unpacked legs) completes in
+~410 ms cold.
+
+### Performance engineering, with attribution
+
+Every optimization was A/B-benched on the same fixed-seed Quebec pair set
+and kept only if it measurably improved; exactness was re-verified against
+reference Dijkstra at every step. Starting point (turn-cost build, first
+cut): cold 110–126 ms, 4.4–4.7 MB, warm 20–43 ms, 90 MB index.
+
+1. **Correct bidirectional stop + membership caching** (engine): the
+   textbook `topF + topB ≥ μ` stop and a per-node fetched-object
+   resolution cache. Settled nodes −48–60 %, warm 43 → 29 ms (long).
+2. **Within-leaf coordinate sort** (builder): junction-expansion copies
+   share coordinates; making them byte-adjacent lets gzip collapse their
+   near-identical rows. Index 90 → 84 MB.
+3. **Geometry/topology split with canonical polyline dedup** (cell v3 +
+   RFRP geometry objects): approach copies and two-way twins share one
+   polyline; the search fetches topology only. Neutral alone — it exposed
+   that the top overlay was ~80 % of per-query bytes — and enabler for 4
+   and 6.
+4. **Deeper hierarchy** (default `topMaxCells 8` → three levels, top of
+   4 on Quebec): the always-fetched top overlay shrank 3.7 → 1.0 MB per
+   bucket. Per-query transfer 4.5 → 3.3–3.6 MB, cold ≈ −15 ms.
+5. **Speculative single-wave fetch**: snap candidate leaves are computable
+   from root bboxes before any I/O, so context overlays launch in the same
+   wave as snap cells (top-up only when a cross-cell seed escapes the
+   plan). Cold ≈ −25 ms at 25 ms RTT.
+6. **Same-file range coalescing**: reads issued in one microtask window
+   merge into gap-bounded Range requests (snap topology+geometry pairs are
+   byte-adjacent by construction). Requests 24 → 12–15.
+7. **Progressive coarse geometry**: `coarseGeometry` / `onCoarseRoute`
+   deliver a sketch polyline (snapped endpoints through traversed leaf
+   centers) the moment the search finishes, before any unpack fetch.
+8. **One-to-many matrices**: k stops fetch one shared context union and
+   run k multi-target forward searches instead of k² bidirectional routes
+   (equality with pairwise is unit-tested). 5-stop itinerary 747 → 408 ms.
 
 - Correctness: 40/40 random pairs exactly equal to reference Dijkstra on
   the base metric and 15/15 on the peak bucket (scaled reference), with the

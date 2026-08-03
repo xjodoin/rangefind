@@ -1,5 +1,6 @@
 import { createSearch } from "./runtime.browser.js";
-import { decodePolyline, searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
+import { decodePolyline, reverseGeocodeOsm, searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
+import { openRouteGraphUrl } from "./route.browser.js";
 import { geometryFeatureBounds, resultGeometryFeature } from "./result_geometry.js";
 
 const queryInput = document.querySelector("#queryInput");
@@ -1264,8 +1265,1140 @@ map.on("moveend", event => {
   }
 });
 
+// --- Directions (rfroutegraph-v1 static routing) ---------------------------
+//
+// The route graph is the same substrate as search: immutable content-addressed
+// objects behind HTTP range reads. The engine snaps, routes, and unpacks
+// geometry entirely in this browser; its output polyline feeds the existing
+// route-corridor search lane, closing the "coffee along my trip" loop.
+
+const modeSearchTab = document.querySelector("#modeSearchTab");
+const modeDirectionsTab = document.querySelector("#modeDirectionsTab");
+const searchControls = document.querySelector("#searchControls");
+const directionsControls = document.querySelector("#directionsControls");
+const directionsForm = document.querySelector("#directionsForm");
+const routeSetupHint = document.querySelector("#routeSetupHint");
+const stopListEl = document.querySelector("#stopList");
+const addStopButton = document.querySelector("#addStopButton");
+const swapStopsButton = document.querySelector("#swapStopsButton");
+const clearStopsButton = document.querySelector("#clearStopsButton");
+const departureRow = document.querySelector("#departureRow");
+const routeReceipt = document.querySelector("#routeReceipt");
+const routeReceiptSummary = document.querySelector("#routeReceiptSummary");
+const routeReceiptRoute = document.querySelector("#routeReceiptRoute");
+const routeReceiptBars = document.querySelector("#routeReceiptBars");
+const routeCard = document.querySelector("#routeCard");
+const routeEta = document.querySelector("#routeEta");
+const routeDistanceEl = document.querySelector("#routeDistance");
+const routeBucketEl = document.querySelector("#routeBucket");
+const routeOrderEl = document.querySelector("#routeOrder");
+const routeAlternativesEl = document.querySelector("#routeAlternatives");
+const routeStepsWrap = document.querySelector("#routeStepsWrap");
+const routeStepsEl = document.querySelector("#routeSteps");
+const toastEl = document.querySelector("#toast");
+
+const MAX_STOPS = 8;
+const ROUTE_COLORS = { active: "#ffc940", legAlt: "#35c2ac", casing: "#14161d", alt: "#8a92a0" };
+const SNAP_NOTE_MIN_METERS = 20;
+const COVERAGE_PAD_DEG = 0.12;
+
+let routeEngine = null;
+let routeAvailable = null; // null = probing, false = missing, true = ready
+let routeCoverage = null;
+let routeBucketNames = [];
+let directionsMode = false;
+let stops = [];
+let stopPickIndex = -1;
+let departureChoice = "now";
+let routePlan = null; // { kind: "pair", candidates, active } | { kind: "trip", trip }
+let routeToken = 0;
+let stopMarkers = [];
+let toastTimer = null;
+
+function showToast(message, tone = "info", duration = 4200) {
+  toastEl.textContent = message;
+  toastEl.dataset.tone = tone;
+  toastEl.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toastEl.hidden = true; }, duration);
+}
+
+function formatDuration(seconds) {
+  const minutes = Math.round(Math.max(0, Number(seconds) || 0) / 60);
+  if (minutes < 1) return "< 1 min";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} h ${String(rest).padStart(2, "0")}` : `${hours} h`;
+}
+
+function stopLetter(index) {
+  return String.fromCharCode(65 + (index % 26));
+}
+
+function bucketLabel(name) {
+  if (name === "peak") return "rush-hour metric";
+  if (name === "base") return routeBucketNames.length > 1 ? "free-flow metric" : "static metric";
+  return `${name} metric`;
+}
+
+function coverageCenter() {
+  if (!routeCoverage) return null;
+  return {
+    lat: (routeCoverage.minLat + routeCoverage.maxLat) / 2,
+    lon: (routeCoverage.minLon + routeCoverage.maxLon) / 2
+  };
+}
+
+// fitBounds silently no-ops (with a console warning) when the padding cannot
+// fit the canvas — e.g. a briefly mis-measured panel. Fall back to centering.
+function safeFitBounds(bounds, options) {
+  const camera = map.cameraForBounds(bounds, { padding: options.padding, maxZoom: options.maxZoom });
+  if (camera) map.fitBounds(bounds, options);
+  else {
+    const center = bounds instanceof maplibregl.LngLatBounds ? bounds.getCenter() : {
+      lng: (bounds[0][0] + bounds[1][0]) / 2,
+      lat: (bounds[0][1] + bounds[1][1]) / 2
+    };
+    map.flyTo({ center, zoom: Math.min(options.maxZoom ?? 11, 11), duration: options.duration });
+  }
+}
+
+function insideCoverage(point, pad = COVERAGE_PAD_DEG) {
+  if (!routeCoverage) return true;
+  return point.lat >= routeCoverage.minLat - pad && point.lat <= routeCoverage.maxLat + pad
+    && point.lon >= routeCoverage.minLon - pad && point.lon <= routeCoverage.maxLon + pad;
+}
+
+async function initRouteGraph() {
+  try {
+    const probe = await fetch("route-graph/manifest.json");
+    if (!probe.ok) throw new Error(`route-graph manifest ${probe.status}`);
+    routeEngine = await openRouteGraphUrl("route-graph/");
+    let minLat = Infinity;
+    let maxLat = -Infinity;
+    let minLon = Infinity;
+    let maxLon = -Infinity;
+    for (const leaf of routeEngine.root.leaves) {
+      if (leaf.bbox.minLat < minLat) minLat = leaf.bbox.minLat;
+      if (leaf.bbox.maxLat > maxLat) maxLat = leaf.bbox.maxLat;
+      if (leaf.bbox.minLon < minLon) minLon = leaf.bbox.minLon;
+      if (leaf.bbox.maxLon > maxLon) maxLon = leaf.bbox.maxLon;
+    }
+    routeCoverage = { minLat: minLat / 1e7, maxLat: maxLat / 1e7, minLon: minLon / 1e7, maxLon: maxLon / 1e7 };
+    routeBucketNames = routeEngine.root.buckets.map(bucket => bucket.name);
+    routeAvailable = true;
+    departureRow.hidden = routeBucketNames.length < 2;
+    modeDirectionsTab.title = "Turn-by-turn routing computed in this browser";
+  } catch {
+    routeAvailable = false;
+    modeDirectionsTab.setAttribute("aria-disabled", "true");
+    modeDirectionsTab.title = "No route graph published at route-graph/";
+    if (directionsMode) enterDirectionsUnavailable();
+  }
+}
+
+function newStop() {
+  return { text: "", place: null, snap: null, error: "", suggestToken: 0, resolveToken: 0 };
+}
+
+function resolvedStops() {
+  return stops.filter(stop => stop.place && !stop.error);
+}
+
+function directionsReady() {
+  return stops.length >= 2 && stops.every(stop => stop.place && !stop.error);
+}
+
+function updateDirectionsHud() {
+  if (!directionsMode || !routeAvailable) return;
+  if (routePlan) return;
+  const unresolved = stops.findIndex(stop => !stop.place);
+  if (unresolved === 0) mapHudText.textContent = "Click the map to set the start point";
+  else if (unresolved > 0) mapHudText.textContent = "Click the map to set the destination";
+}
+
+function directionsEmptyState() {
+  queryReceipt.hidden = true;
+  routeReceipt.hidden = true;
+  routeCard.hidden = true;
+  resultList.hidden = true;
+  resultList.replaceChildren();
+  showEmpty(
+    "Chart a route",
+    "Type a place in each field, or click the map — the first click sets the start, the next sets the destination. Routing runs in this browser from static byte ranges."
+  );
+}
+
+function enterDirectionsUnavailable() {
+  routeSetupHint.hidden = false;
+  directionsForm.hidden = true;
+  setStatus("Route graph not published", "error");
+  showEmpty("Directions needs a route index", "Publish a route graph at route-graph/ using the commands above, then reload.");
+}
+
+function setDirectionsMode(on) {
+  if (on === directionsMode) return;
+  directionsMode = on;
+  modeSearchTab.classList.toggle("active", !on);
+  modeSearchTab.setAttribute("aria-selected", String(!on));
+  modeDirectionsTab.classList.toggle("active", on);
+  modeDirectionsTab.setAttribute("aria-selected", String(on));
+  searchControls.hidden = on;
+  directionsControls.hidden = !on;
+  if (on) {
+    setMapPickActive(false);
+    cancelSuggestions();
+    suggestionsSuppressed = false;
+    suppressedQuery = "";
+    hidePlaceLens();
+    setPanelCollapsed(false);
+    searchPanel.classList.add("has-query");
+    clearMarkers();
+    if (routeAvailable === false) {
+      enterDirectionsUnavailable();
+      return;
+    }
+    routeSetupHint.hidden = true;
+    directionsForm.hidden = false;
+    while (stops.length < 2) stops.push(newStop());
+    renderStops();
+    if (routePlan) {
+      updateStopMarkers();
+      drawRoutePlan();
+      renderRouteCard();
+      fitRoutePlan();
+      const seconds = routePlan.kind === "pair"
+        ? routePlan.candidates[routePlan.active].seconds
+        : routePlan.trip.totalSeconds;
+      const meters = routePlan.kind === "pair"
+        ? routePlan.candidates[routePlan.active].distanceMeters
+        : routePlan.trip.totalMeters;
+      setStatus(`Route ready · ${formatDuration(seconds)} · ${formatDistance(meters)}`);
+      mapHudText.textContent = `${formatDuration(seconds)} drive · ${formatDistance(meters)}`;
+    } else {
+      directionsEmptyState();
+      setStatus("Plot a route", "ready");
+      const center = map.getCenter();
+      if (routeCoverage && !insideCoverage({ lat: center.lat, lon: center.lng }, 0.02)) {
+        safeFitBounds(
+          [[routeCoverage.minLon, routeCoverage.minLat], [routeCoverage.maxLon, routeCoverage.maxLat]],
+          { padding: resultFitPadding(), maxZoom: 12, duration: 900 }
+        );
+        mapHudText.textContent = "Directions cover the published route graph";
+      } else {
+        updateDirectionsHud();
+      }
+      stops[0]?.input?.focus();
+    }
+  } else {
+    cancelStopPick();
+    clearRouteLayers();
+    clearStopMarkers();
+    routeToken++;
+    routeCard.hidden = true;
+    routeReceipt.hidden = true;
+    clearMarkers();
+    resultList.hidden = true;
+    resultList.replaceChildren();
+    activeQueryOverride = null;
+    queryInput.value = "";
+    clearButton.hidden = true;
+    searchPanel.classList.remove("has-query");
+    setStatus("Ready to search", "ready");
+    mapHudText.textContent = "Search anywhere in the published index";
+    showEmpty("Find a place", "Search by name or address, try “pharmacy near me”, or a category with a place such as “pharmacy in Birmingham”.");
+  }
+}
+
+function cancelStopPick() {
+  stopPickIndex = -1;
+  map.getCanvas().classList.remove("is-picking");
+  for (const stop of stops) stop.pickButton?.classList.remove("active");
+}
+
+function setStopPick(index) {
+  const wasActive = stopPickIndex === index;
+  cancelStopPick();
+  if (wasActive) return;
+  stopPickIndex = index;
+  stops[index].pickButton?.classList.add("active");
+  map.getCanvas().classList.add("is-picking");
+  mapHudText.textContent = `Click the map to set point ${stopLetter(index)}`;
+}
+
+function hideStopSuggest(stop) {
+  if (!stop?.suggestEl) return;
+  stop.suggestEl.hidden = true;
+  stop.suggestEl.replaceChildren();
+  stop.suggestActive = -1;
+  stop.suggestItems = [];
+}
+
+function renderStopSuggest(stop, index, suggestions) {
+  stop.suggestItems = suggestions;
+  stop.suggestActive = -1;
+  stop.suggestEl.replaceChildren(...suggestions.map(item => {
+    const option = document.createElement("li");
+    option.setAttribute("role", "option");
+    const main = document.createElement("span");
+    main.textContent = String(item.mainText || item.description || item.text || "");
+    option.append(main);
+    const secondary = String(item.secondaryText || "");
+    if (secondary) {
+      const small = document.createElement("small");
+      small.textContent = secondary;
+      option.append(small);
+    }
+    option.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      chooseStopSuggestion(index, item);
+    });
+    return option;
+  }));
+  stop.suggestEl.hidden = !suggestions.length;
+}
+
+function chooseStopSuggestion(index, item) {
+  const stop = stops[index];
+  const query = String(item.selection?.query || item.text || item.description || "").trim();
+  if (!stop || !query) return;
+  stop.input.value = query;
+  hideStopSuggest(stop);
+  resolveStopText(index, query, item.selection?.shards || item.shards || []);
+}
+
+async function requestStopSuggest(index) {
+  const stop = stops[index];
+  if (!engine || !stop) return;
+  const q = stop.input.value.trim();
+  const token = ++stop.suggestToken;
+  if (Array.from(q).length < SUGGEST_MIN_CHARACTERS) {
+    hideStopSuggest(stop);
+    return;
+  }
+  try {
+    const anchor = coverageCenter() || searchAnchor();
+    const response = await suggestOsmQuery(engine, {
+      q,
+      size: 6,
+      ...(anchor ? { near: { lat: anchor.lat, lon: anchor.lon } } : {})
+    });
+    if (token !== stop.suggestToken || stop.input.value.trim() !== q) return;
+    renderStopSuggest(stop, index, response.suggestions || []);
+  } catch {
+    if (token === stop.suggestToken) hideStopSuggest(stop);
+  }
+}
+
+function setStopNote(stop, text, tone = "") {
+  stop.noteText = text || "";
+  stop.noteTone = tone;
+  stop.note.hidden = !text;
+  stop.note.textContent = text || "";
+  if (tone) stop.note.dataset.tone = tone;
+  else delete stop.note.dataset.tone;
+  stop.row.dataset.state = tone === "error" ? "invalid" : "";
+}
+
+async function setStopPlace(index, place) {
+  const stop = stops[index];
+  if (!stop) return;
+  const token = ++stop.resolveToken;
+  stop.place = place;
+  stop.snap = null;
+  stop.error = "";
+  if (routeCoverage && !insideCoverage(place)) {
+    stop.error = "coverage";
+    setStopNote(stop, "Outside the routable area", "error");
+    showToast("The route graph covers Luxembourg only — pick a point inside it.", "error");
+    updateStopMarkers();
+    maybeRoute();
+    return;
+  }
+  if (!routeEngine) {
+    setStopNote(stop, "Route graph still loading — try again in a moment", "error");
+    stop.error = "loading";
+    return;
+  }
+  setStopNote(stop, "Snapping to the road network…");
+  updateStopMarkers();
+  try {
+    const snapped = await routeEngine.snap({ lat: place.lat, lon: place.lon });
+    if (token !== stop.resolveToken) return;
+    const match = snapped.matches[0];
+    stop.snap = {
+      lat: match.snappedLatE7 / 1e7,
+      lon: match.snappedLonE7 / 1e7,
+      meters: match.distMeters
+    };
+    setStopNote(stop, stop.snap.meters >= SNAP_NOTE_MIN_METERS
+      ? `Snapped ${formatDistance(stop.snap.meters)} to the nearest road`
+      : "");
+  } catch (error) {
+    if (token !== stop.resolveToken) return;
+    if (error?.code === "RANGEFIND_ROUTE_SNAP_TOO_FAR") {
+      stop.error = "snap";
+      setStopNote(stop, "No road within 250 m of this point", "error");
+      showToast("No road near that point — try closer to a street.", "error");
+    } else {
+      stop.error = "snap";
+      setStopNote(stop, error?.message || "Snap failed", "error");
+    }
+  }
+  updateStopMarkers();
+  maybeRoute();
+}
+
+async function resolveStopText(index, text, shards = []) {
+  const stop = stops[index];
+  if (!stop || !engine) return;
+  const q = String(text || "").trim();
+  stop.text = q;
+  stop.place = null;
+  stop.snap = null;
+  stop.error = "";
+  const token = ++stop.resolveToken;
+  if (!q) {
+    setStopNote(stop, "");
+    updateStopMarkers();
+    maybeRoute();
+    return;
+  }
+  setStopNote(stop, "Locating…");
+  try {
+    const anchor = coverageCenter() || searchAnchor();
+    const params = { q, size: 1 };
+    if (shards?.length) params.shards = [...shards];
+    else if (anchor) params.near = { lat: anchor.lat, lon: anchor.lon };
+    const response = await searchOsmQuery(engine, params);
+    if (token !== stop.resolveToken) return;
+    const hit = (response.results || []).find(item => Number.isFinite(item.lat) && Number.isFinite(item.lon));
+    if (!hit) {
+      stop.error = "match";
+      setStopNote(stop, `No indexed place matched “${q}”`, "error");
+      maybeRoute();
+      return;
+    }
+    const label = hit.name || hit.title || hit.formattedAddress || q;
+    stop.text = label;
+    stop.input.value = label;
+    setStopPlace(index, { lat: hit.lat, lon: hit.lon, label });
+  } catch (error) {
+    if (token !== stop.resolveToken) return;
+    stop.error = "match";
+    setStopNote(stop, error?.message || "Lookup failed", "error");
+    maybeRoute();
+  }
+}
+
+function setStopFromMap(index, lat, lon) {
+  const stop = stops[index];
+  if (!stop) return;
+  const coordinateLabel = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  stop.text = coordinateLabel;
+  stop.input.value = coordinateLabel;
+  setStopNote(stop, "");
+  setStopPlace(index, { lat, lon, label: coordinateLabel });
+  // Best-effort pretty label via the search index's reverse geocoder.
+  if (!engine) return;
+  reverseGeocodeOsm(engine, { lat, lon, size: 1 })
+    .then(response => {
+      const hit = (response.results || [])[0];
+      const label = hit?.formattedAddress || hit?.name;
+      if (!label || stops[index] !== stop) return;
+      if (stop.place && stop.place.label === coordinateLabel) {
+        stop.place.label = label;
+        stop.text = label;
+        stop.input.value = label;
+        updateStopMarkers();
+        if (routePlan) renderRouteCard();
+      }
+    })
+    .catch(() => {});
+}
+
+function renderStops() {
+  stopListEl.replaceChildren(...stops.map((stop, index) => {
+    const row = document.createElement("li");
+    row.className = "stop-row";
+    row.dataset.role = index === 0 ? "origin" : index === stops.length - 1 ? "end" : "via";
+    const badge = document.createElement("span");
+    badge.className = "stop-row__badge";
+    badge.textContent = stopLetter(index);
+    const field = document.createElement("span");
+    field.className = "stop-row__field";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = index === 0
+      ? "Start — place, address, or map click"
+      : index === stops.length - 1 ? "Destination" : `Stop ${stopLetter(index)}`;
+    input.setAttribute("aria-label", `Route point ${stopLetter(index)}`);
+    input.value = stop.text;
+    const tools = document.createElement("span");
+    tools.className = "stop-row__tools";
+    const pick = document.createElement("button");
+    pick.type = "button";
+    pick.className = "stop-pick";
+    pick.title = `Pick point ${stopLetter(index)} on the map`;
+    pick.append(document.createElement("i"));
+    tools.append(pick);
+    if (stops.length > 2) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "stop-remove";
+      remove.title = "Remove this stop";
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        stops.splice(index, 1);
+        renderStops();
+        updateStopMarkers();
+        maybeRoute();
+      });
+      tools.append(remove);
+    }
+    const suggest = document.createElement("ul");
+    suggest.className = "stop-suggest";
+    suggest.setAttribute("role", "listbox");
+    suggest.hidden = true;
+    field.append(input, tools, suggest);
+    const note = document.createElement("small");
+    note.className = "stop-row__note";
+    note.hidden = true;
+    row.append(badge, field, note);
+
+    stop.row = row;
+    stop.input = input;
+    stop.note = note;
+    stop.pickButton = pick;
+    stop.suggestEl = suggest;
+    stop.suggestActive = -1;
+    stop.suggestItems = [];
+    if (stop.noteText) setStopNote(stop, stop.noteText, stop.noteTone || "");
+
+    let debounce = null;
+    input.addEventListener("input", () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => requestStopSuggest(index), SUGGEST_DEBOUNCE_MS);
+    });
+    input.addEventListener("keydown", event => {
+      const items = stop.suggestItems || [];
+      if (event.key === "ArrowDown" && items.length) {
+        event.preventDefault();
+        stop.suggestActive = (stop.suggestActive + 1) % items.length;
+        highlightStopSuggest(stop);
+        return;
+      }
+      if (event.key === "ArrowUp" && items.length) {
+        event.preventDefault();
+        stop.suggestActive = (stop.suggestActive - 1 + items.length) % items.length;
+        highlightStopSuggest(stop);
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (stop.suggestActive >= 0 && items[stop.suggestActive]) {
+          chooseStopSuggestion(index, items[stop.suggestActive]);
+        } else {
+          hideStopSuggest(stop);
+          resolveStopText(index, input.value);
+        }
+        return;
+      }
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        if (!stop.suggestEl.hidden) hideStopSuggest(stop);
+        else input.blur();
+      }
+    });
+    input.addEventListener("blur", () => setTimeout(() => hideStopSuggest(stop), 150));
+    pick.addEventListener("click", () => setStopPick(index));
+    return row;
+  }));
+  addStopButton.disabled = stops.length >= MAX_STOPS;
+  updateDirectionsHud();
+}
+
+function highlightStopSuggest(stop) {
+  const options = [...stop.suggestEl.children];
+  for (const [optionIndex, option] of options.entries()) {
+    option.classList.toggle("active", optionIndex === stop.suggestActive);
+    if (optionIndex === stop.suggestActive) option.scrollIntoView({ block: "nearest" });
+  }
+}
+
+// --- Route rendering -------------------------------------------------------
+
+function ensureRouteLayers() {
+  if (map.getSource("routeLines")) return;
+  map.addSource("routeLines", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+  map.addLayer({
+    id: "route-alt",
+    type: "line",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "alt"],
+    layout: { "line-join": "round" },
+    paint: {
+      "line-color": ROUTE_COLORS.alt,
+      "line-width": 4,
+      "line-opacity": 0.8,
+      "line-dasharray": [1.8, 1.6]
+    }
+  });
+  map.addLayer({
+    id: "route-casing",
+    type: "line",
+    source: "routeLines",
+    filter: ["match", ["get", "kind"], ["active", "leg"], true, false],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: { "line-color": ROUTE_COLORS.casing, "line-width": 8, "line-opacity": 0.85 }
+  });
+  map.addLayer({
+    id: "route-line",
+    type: "line",
+    source: "routeLines",
+    filter: ["match", ["get", "kind"], ["active", "leg"], true, false],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: { "line-color": ["get", "color"], "line-width": 4.5, "line-opacity": 0.96 }
+  });
+  map.addLayer({
+    id: "route-snap-line",
+    type: "line",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "snapline"],
+    paint: { "line-color": "#3f444d", "line-width": 2, "line-dasharray": [1, 1.6] }
+  });
+  map.addLayer({
+    id: "route-snap-dot",
+    type: "circle",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "snapdot"],
+    paint: {
+      "circle-radius": 4,
+      "circle-color": "#faf9f2",
+      "circle-stroke-width": 2,
+      "circle-stroke-color": ROUTE_COLORS.casing
+    }
+  });
+  map.on("click", "route-alt", event => {
+    const candidate = Number(event.features?.[0]?.properties?.candidate);
+    if (Number.isFinite(candidate)) promoteCandidate(candidate);
+  });
+  map.on("mouseenter", "route-alt", () => { map.getCanvas().style.cursor = "pointer"; });
+  map.on("mouseleave", "route-alt", () => { map.getCanvas().style.cursor = ""; });
+}
+
+function lineFeature(geometry, properties) {
+  return {
+    type: "Feature",
+    properties,
+    geometry: { type: "LineString", coordinates: geometry.map(([lat, lon]) => [lon, lat]) }
+  };
+}
+
+function snapFeatures() {
+  const features = [];
+  for (const stop of stops) {
+    if (!stop.place || !stop.snap) continue;
+    features.push({
+      type: "Feature",
+      properties: { kind: "snapdot" },
+      geometry: { type: "Point", coordinates: [stop.snap.lon, stop.snap.lat] }
+    });
+    if (stop.snap.meters >= SNAP_NOTE_MIN_METERS) {
+      features.push({
+        type: "Feature",
+        properties: { kind: "snapline" },
+        geometry: {
+          type: "LineString",
+          coordinates: [[stop.place.lon, stop.place.lat], [stop.snap.lon, stop.snap.lat]]
+        }
+      });
+    }
+  }
+  return features;
+}
+
+function drawRoutePlan() {
+  ensureRouteLayers();
+  const features = [];
+  if (routePlan?.kind === "pair") {
+    for (const [index, candidate] of routePlan.candidates.entries()) {
+      if (index === routePlan.active || !candidate.geometry) continue;
+      features.push(lineFeature(candidate.geometry, { kind: "alt", candidate: index }));
+    }
+    const active = routePlan.candidates[routePlan.active];
+    if (active?.geometry) features.push(lineFeature(active.geometry, { kind: "active", color: ROUTE_COLORS.active }));
+  } else if (routePlan?.kind === "trip") {
+    for (const [index, leg] of routePlan.trip.legs.entries()) {
+      if (!leg.geometry) continue;
+      features.push(lineFeature(leg.geometry, {
+        kind: "leg",
+        color: index % 2 ? ROUTE_COLORS.legAlt : ROUTE_COLORS.active
+      }));
+    }
+  }
+  features.push(...snapFeatures());
+  map.getSource("routeLines")?.setData({ type: "FeatureCollection", features });
+}
+
+function clearRouteLayers() {
+  map.getSource("routeLines")?.setData({ type: "FeatureCollection", features: [] });
+}
+
+function clearStopMarkers() {
+  for (const marker of stopMarkers) marker.remove();
+  stopMarkers = [];
+}
+
+function updateStopMarkers() {
+  clearStopMarkers();
+  const visitOrder = routePlan?.kind === "trip" ? routePlan.trip.order : null;
+  for (const [index, stop] of stops.entries()) {
+    if (!stop.place) continue;
+    const element = document.createElement("div");
+    element.className = "stop-marker";
+    element.dataset.role = index === 0 ? "origin" : index === stops.length - 1 ? "end" : "via";
+    const visit = visitOrder ? visitOrder.indexOf(index) : -1;
+    element.textContent = visit >= 0 ? String(visit + 1) : stopLetter(index);
+    element.title = stop.place.label || stopLetter(index);
+    stopMarkers.push(new maplibregl.Marker({ element, anchor: "center" })
+      .setLngLat([stop.place.lon, stop.place.lat])
+      .addTo(map));
+  }
+  if (directionsMode && routeAvailable) drawRoutePlanIfAny();
+}
+
+function drawRoutePlanIfAny() {
+  if (routePlan) drawRoutePlan();
+  else if (map.getSource("routeLines")) {
+    map.getSource("routeLines").setData({ type: "FeatureCollection", features: snapFeatures() });
+    ensureRouteLayers();
+  } else if (snapFeatures().length) {
+    ensureRouteLayers();
+    map.getSource("routeLines").setData({ type: "FeatureCollection", features: snapFeatures() });
+  }
+}
+
+function activeRouteGeometry() {
+  if (routePlan?.kind === "pair") return routePlan.candidates[routePlan.active]?.geometry || null;
+  if (routePlan?.kind === "trip") {
+    const merged = [];
+    for (const leg of routePlan.trip.legs) {
+      for (const point of leg.geometry || []) {
+        const last = merged[merged.length - 1];
+        if (!last || last[0] !== point[0] || last[1] !== point[1]) merged.push(point);
+      }
+    }
+    return merged.length ? merged : null;
+  }
+  return null;
+}
+
+function fitRoutePlan() {
+  const bounds = new maplibregl.LngLatBounds();
+  const extendGeometry = geometry => {
+    for (const [lat, lon] of geometry || []) bounds.extend([lon, lat]);
+  };
+  if (routePlan?.kind === "pair") for (const candidate of routePlan.candidates) extendGeometry(candidate.geometry);
+  else if (routePlan?.kind === "trip") for (const leg of routePlan.trip.legs) extendGeometry(leg.geometry);
+  for (const stop of stops) if (stop.place) bounds.extend([stop.place.lon, stop.place.lat]);
+  if (!bounds.isEmpty()) safeFitBounds(bounds, { padding: resultFitPadding(), maxZoom: 15, duration: 700 });
+}
+
+// --- Route computation -----------------------------------------------------
+
+function departureParams() {
+  if (routeBucketNames.length < 2) return {};
+  if (departureChoice === "peak") return { bucket: routeBucketNames[1] };
+  if (departureChoice === "base") return { bucket: routeBucketNames[0] };
+  return { departureTime: new Date() };
+}
+
+function clearCorridorResults() {
+  clearMarkers();
+  resultList.hidden = true;
+  resultList.replaceChildren();
+  queryReceipt.hidden = true;
+  activeQueryOverride = null;
+  for (const chip of routeCard.querySelectorAll("[data-corridor]")) chip.classList.remove("active");
+}
+
+function maybeRoute() {
+  if (!directionsMode && !routePlan) return;
+  if (!directionsReady()) {
+    routeToken++;
+    routePlan = null;
+    clearRouteLayers();
+    updateStopMarkers();
+    if (directionsMode) {
+      directionsEmptyState();
+      setStatus("Plot a route", "ready");
+      updateDirectionsHud();
+    }
+    return;
+  }
+  computeRoute();
+}
+
+async function computeRoute() {
+  if (!routeEngine) return;
+  const token = ++routeToken;
+  const points = stops.map(stop => ({ lat: stop.place.lat, lon: stop.place.lon }));
+  routeCard.dataset.state = "loading";
+  routeReceipt.hidden = false;
+  routeReceipt.dataset.state = "loading";
+  routeReceiptSummary.textContent = "Tracing byte ranges…";
+  routeReceiptRoute.textContent = "Fetching the bounded object set for this route.";
+  routeReceiptBars.replaceChildren();
+  setStatus("Routing over static byte ranges…", "loading");
+  mapHudText.textContent = "Computing route in this browser";
+  routeEngine.resetStats();
+  const started = performance.now();
+  try {
+    if (points.length === 2) {
+      const result = await routeEngine.route({
+        from: points[0],
+        to: points[1],
+        alternatives: 2,
+        ...departureParams()
+      });
+      if (token !== routeToken) return;
+      routePlan = { kind: "pair", candidates: [result, ...(result.alternatives || [])], active: 0 };
+    } else {
+      const trip = await routeEngine.itinerary({ stops: points, roundTrip: false, ...departureParams() });
+      if (token !== routeToken) return;
+      routePlan = { kind: "trip", trip };
+    }
+    const ms = Math.round(performance.now() - started);
+    clearCorridorResults();
+    updateStopMarkers();
+    drawRoutePlan();
+    renderRouteCard();
+    renderRouteReceipt(ms);
+    fitRoutePlan();
+    const seconds = routePlan.kind === "pair"
+      ? routePlan.candidates[routePlan.active].seconds
+      : routePlan.trip.totalSeconds;
+    const meters = routePlan.kind === "pair"
+      ? routePlan.candidates[routePlan.active].distanceMeters
+      : routePlan.trip.totalMeters;
+    setStatus(`Route ready · ${formatDuration(seconds)} · ${formatDistance(meters)} · ${formatNumber(ms)} ms`);
+    mapHudText.textContent = `${formatDuration(seconds)} drive · ${formatDistance(meters)}`;
+  } catch (error) {
+    if (token !== routeToken) return;
+    routePlan = null;
+    clearRouteLayers();
+    routeCard.hidden = true;
+    routeReceipt.dataset.state = "error";
+    routeReceiptSummary.textContent = "Trace interrupted";
+    const friendly = error?.code === "RANGEFIND_ROUTE_SNAP_TOO_FAR"
+      ? "No road near one of your points."
+      : error?.code === "RANGEFIND_ROUTE_NO_PATH"
+        ? "No drivable path connects those points."
+        : error?.code === "RANGEFIND_ROUTE_BAD_POINT"
+          ? "Those coordinates are outside the valid range."
+          : error?.message || "Routing failed";
+    showToast(friendly, "error");
+    setStatus(friendly, "error");
+    mapHudText.textContent = "Routing interrupted";
+    showEmpty("No route", friendly);
+  } finally {
+    if (token === routeToken) routeCard.dataset.state = "";
+  }
+}
+
+function promoteCandidate(index) {
+  if (routePlan?.kind !== "pair" || index === routePlan.active || !routePlan.candidates[index]) return;
+  routePlan.active = index;
+  clearCorridorResults();
+  drawRoutePlan();
+  renderRouteCard();
+  fitRoutePlan();
+  const active = routePlan.candidates[index];
+  setStatus(`Alternative selected · ${formatDuration(active.seconds)} · ${formatDistance(active.distanceMeters)}`);
+  mapHudText.textContent = `${formatDuration(active.seconds)} drive · ${formatDistance(active.distanceMeters)}`;
+}
+
+// --- Route summary card ----------------------------------------------------
+
+function appendStep(name, meters, cumulativeSeconds, first) {
+  const step = document.createElement("li");
+  step.className = "route-step";
+  const dot = document.createElement("i");
+  dot.className = "route-step__dot";
+  const body = document.createElement("span");
+  body.className = "route-step__body";
+  const stepName = document.createElement("span");
+  stepName.className = "route-step__name";
+  if (!name) {
+    stepName.textContent = "Unnamed road";
+    stepName.classList.add("is-unnamed");
+  } else stepName.textContent = name;
+  const at = document.createElement("span");
+  at.className = "route-step__at";
+  at.textContent = first ? "start" : `at ${formatDuration(cumulativeSeconds)}`;
+  body.append(stepName, at);
+  const length = document.createElement("span");
+  length.className = "route-step__meters";
+  length.textContent = formatDistance(meters);
+  step.append(dot, body, length);
+  routeStepsEl.append(step);
+}
+
+function appendLegHeader(text, shade) {
+  const step = document.createElement("li");
+  step.className = "route-step route-step--leg";
+  if (shade) step.dataset.shade = "alt";
+  const dot = document.createElement("i");
+  dot.className = "route-step__dot";
+  const body = document.createElement("span");
+  body.className = "route-step__body";
+  const name = document.createElement("span");
+  name.className = "route-step__name";
+  name.textContent = text;
+  body.append(name);
+  step.append(dot, body, document.createElement("span"));
+  routeStepsEl.append(step);
+}
+
+function renderSteps() {
+  routeStepsEl.replaceChildren();
+  let cumulative = 0;
+  const renderLegSteps = steps => {
+    let pendingName = null;
+    let pendingMeters = 0;
+    let pendingStart = cumulative;
+    let first = cumulative === 0;
+    const flush = () => {
+      if (pendingName === null) return;
+      appendStep(pendingName, pendingMeters, pendingStart, first && pendingStart === 0);
+      first = false;
+      pendingName = null;
+    };
+    for (const step of steps || []) {
+      const name = step.name || "";
+      if (pendingName !== null && pendingName === name) {
+        pendingMeters += step.meters;
+      } else {
+        flush();
+        pendingName = name;
+        pendingMeters = step.meters;
+        pendingStart = cumulative;
+      }
+      cumulative += step.seconds;
+    }
+    flush();
+  };
+  if (routePlan.kind === "pair") {
+    renderLegSteps(routePlan.candidates[routePlan.active].steps);
+  } else {
+    for (const [index, leg] of routePlan.trip.legs.entries()) {
+      appendLegHeader(
+        `Leg ${index + 1} · ${stopLetter(leg.fromStop)} → ${stopLetter(leg.toStop)} · ${formatDuration(leg.seconds)} · ${formatDistance(leg.distanceMeters)}`,
+        index % 2 === 1
+      );
+      renderLegSteps(leg.steps);
+    }
+  }
+}
+
+function renderRouteCard() {
+  if (!routePlan) return;
+  emptyState.hidden = true;
+  routeCard.hidden = false;
+  if (routePlan.kind === "pair") {
+    const active = routePlan.candidates[routePlan.active];
+    routeEta.textContent = formatDuration(active.seconds);
+    routeDistanceEl.textContent = formatDistance(active.distanceMeters);
+    routeBucketEl.textContent = bucketLabel(active.bucket);
+    routeOrderEl.hidden = true;
+    const chips = routePlan.candidates.map((candidate, index) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.classList.toggle("active", index === routePlan.active);
+      chip.append(document.createTextNode(index === 0 ? "Fastest" : `Alt ${index}`));
+      const detail = document.createElement("small");
+      const delta = Math.round((candidate.seconds - routePlan.candidates[0].seconds) / 60);
+      detail.textContent = index === 0 ? formatDuration(candidate.seconds) : delta > 0 ? `+${delta} min` : "similar";
+      chip.append(detail);
+      chip.addEventListener("click", () => promoteCandidate(index));
+      return chip;
+    });
+    routeAlternativesEl.replaceChildren(...chips);
+    routeAlternativesEl.hidden = routePlan.candidates.length < 2;
+  } else {
+    const trip = routePlan.trip;
+    routeEta.textContent = formatDuration(trip.totalSeconds);
+    routeDistanceEl.textContent = formatDistance(trip.totalMeters);
+    routeBucketEl.textContent = bucketLabel(trip.legs[0]?.bucket || routeBucketNames[0] || "base");
+    routeOrderEl.hidden = false;
+    routeOrderEl.textContent = `Optimized order · ${trip.order.map(stopLetter).join(" → ")} · ${trip.legs.length} legs`;
+    routeAlternativesEl.hidden = true;
+    routeAlternativesEl.replaceChildren();
+  }
+  renderSteps();
+  routeStepsWrap.open = true;
+}
+
+function renderRouteReceipt(ms) {
+  if (!routeEngine) return;
+  const stats = routeEngine.stats();
+  routeReceipt.hidden = false;
+  routeReceipt.dataset.state = "ready";
+  const what = routePlan?.kind === "trip"
+    ? `${routePlan.trip.legs.length} routed legs`
+    : `${formatNumber(routePlan?.candidates.length || 1)} candidate ${routePlan?.candidates.length === 1 ? "route" : "routes"}`;
+  if (!stats.objectFetches) {
+    routeReceiptSummary.textContent = "0 network reads · memory hit";
+    routeReceiptRoute.textContent = `This browser → object cache → ${what} in ${formatNumber(ms)} ms`;
+    const warm = document.createElement("p");
+    warm.className = "query-receipt__warm";
+    warm.textContent = "Every graph object this route needed was already resident in this tab.";
+    routeReceiptBars.replaceChildren(warm);
+    return;
+  }
+  routeReceiptSummary.textContent = `${formatNumber(stats.objectFetches)} range ${stats.objectFetches === 1 ? "read" : "reads"} · ${formatBytes(stats.bytesFetched)}`;
+  const shardText = stats.shardsTouched.length
+    ? `${formatNumber(stats.shardsTouched.length)} route ${stats.shardsTouched.length === 1 ? "shard" : "shards"}`
+    : "route graph";
+  routeReceiptRoute.textContent = `This browser → ${shardText} → ${what} in ${formatNumber(ms)} ms`;
+  const rows = [
+    ["Snap + query cells", stats.cellFetches],
+    ["Overlay cliques", stats.overlayFetches],
+    ["Path unpack cells", stats.unpackCellFetches]
+  ].filter(([, count]) => count > 0);
+  const maxCount = Math.max(1, ...rows.map(([, count]) => count));
+  routeReceiptBars.replaceChildren(...rows.map(([label, count]) => {
+    const row = document.createElement("div");
+    row.className = "query-receipt__bar";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const rail = document.createElement("i");
+    const fill = document.createElement("b");
+    fill.style.width = `${Math.max(5, Math.round((count / maxCount) * 100))}%`;
+    rail.append(fill);
+    const value = document.createElement("strong");
+    value.textContent = `${formatNumber(count)} ${count === 1 ? "read" : "reads"}`;
+    row.append(name, rail, value);
+    return row;
+  }));
+}
+
+// --- Corridor search -------------------------------------------------------
+
+function runCorridorSearch(query, label, chip) {
+  const geometry = activeRouteGeometry();
+  if (!geometry || !engine) return;
+  for (const other of routeCard.querySelectorAll("[data-corridor]")) other.classList.toggle("active", other === chip);
+  const displayQuery = `${label} along the route`;
+  activeQueryOverride = {
+    displayQuery,
+    mode: "route corridor",
+    params: {
+      q: query,
+      route: geometry.map(([lat, lon]) => ({ lat, lon })),
+      corridorMeters: 1500
+    }
+  };
+  queryInput.value = displayQuery;
+  selectedSuggestionHint = null;
+  clearButton.hidden = false;
+  areaToggle.checked = false;
+  runSearch({ fit: false });
+  routeStepsWrap.open = false;
+}
+
+// --- Directions events -----------------------------------------------------
+
+modeSearchTab.addEventListener("click", () => setDirectionsMode(false));
+modeDirectionsTab.addEventListener("click", () => setDirectionsMode(true));
+
+addStopButton.addEventListener("click", () => {
+  if (stops.length >= MAX_STOPS) return;
+  stops.push(newStop());
+  renderStops();
+  updateStopMarkers();
+  stops[stops.length - 1].input.focus();
+});
+
+swapStopsButton.addEventListener("click", () => {
+  cancelStopPick();
+  stops.reverse();
+  for (const stop of stops) stop.resolveToken++;
+  renderStops();
+  updateStopMarkers();
+  maybeRoute();
+});
+
+clearStopsButton.addEventListener("click", () => {
+  cancelStopPick();
+  routeToken++;
+  stops = [newStop(), newStop()];
+  routePlan = null;
+  clearRouteLayers();
+  clearStopMarkers();
+  renderStops();
+  clearCorridorResults();
+  directionsEmptyState();
+  setStatus("Plot a route", "ready");
+  updateDirectionsHud();
+  stops[0].input.focus();
+});
+
+for (const option of departureRow.querySelectorAll("[data-departure]")) {
+  option.addEventListener("click", () => {
+    if (departureChoice === option.dataset.departure) return;
+    departureChoice = option.dataset.departure;
+    for (const other of departureRow.querySelectorAll("[data-departure]")) {
+      const active = other === option;
+      other.classList.toggle("active", active);
+      other.setAttribute("aria-pressed", String(active));
+    }
+    if (directionsReady()) computeRoute();
+  });
+}
+
+for (const chip of routeCard.querySelectorAll("[data-corridor]")) {
+  chip.addEventListener("click", () => runCorridorSearch(
+    chip.dataset.corridor,
+    chip.dataset.corridorLabel,
+    chip
+  ));
+}
+
+map.on("click", event => {
+  if (!directionsMode || !routeAvailable) return;
+  // Alternative polylines own their own click (promotion).
+  if (map.getLayer("route-alt")) {
+    if (map.queryRenderedFeatures(event.point, { layers: ["route-alt"] }).length) return;
+  }
+  const lat = Number(event.lngLat?.lat);
+  const lon = Number(event.lngLat?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const target = stopPickIndex >= 0 ? stopPickIndex : stops.findIndex(stop => !stop.place);
+  if (target < 0) return;
+  cancelStopPick();
+  setStopFromMap(target, lat, lon);
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key !== "Escape" || !directionsMode) return;
+  if (!placeLens.hidden) return; // the base handler closes the lens first
+  if (document.activeElement?.closest?.(".stop-row")) return; // input handles it
+  if (stopPickIndex >= 0) {
+    cancelStopPick();
+    updateDirectionsHud();
+    return;
+  }
+  setDirectionsMode(false);
+});
+
 async function boot() {
   loadIndexStatus();
+  initRouteGraph();
   engine = await createSearch({ baseUrl: OSM_INDEX_BASE_URL });
   const total = engine.manifest.total || 0;
   const shardCount = engine.shards?.length || 1;

@@ -14,10 +14,11 @@
 import {
   MinHeap,
   bucketWeight,
-  decodeEdgeGeometry,
   decodeRouteCell,
+  decodeRouteGeometry,
   decodeRouteOverlay,
-  decodeRouteRoot
+  decodeRouteRoot,
+  edgePolyline
 } from "./route_graph.js";
 
 const EARTH_RADIUS_METERS = 6371008.7714;
@@ -136,8 +137,58 @@ export async function openRouteGraph(options) {
     cellFetches: 0,
     overlayFetches: 0,
     unpackCellFetches: 0,
+    httpRequests: 0,
     shardsTouched: new Set()
   };
+
+  // Same-file reads issued within one microtask window coalesce into merged
+  // Range requests when the gap between them is small — snap topology +
+  // geometry pairs are byte-adjacent by construction, and each fetch wave
+  // issues all its reads synchronously, so this collapses request counts
+  // without changing any call site.
+  const COALESCE_GAP_BYTES = 16 * 1024;
+  const pendingReads = new Map();
+  let flushScheduled = false;
+  function coalescedRead(path, offset, length) {
+    return new Promise((resolve, reject) => {
+      let list = pendingReads.get(path);
+      if (!list) pendingReads.set(path, (list = []));
+      list.push({ offset, length, resolve, reject });
+      if (!flushScheduled) {
+        flushScheduled = true;
+        queueMicrotask(flushReads);
+      }
+    });
+  }
+  function flushReads() {
+    flushScheduled = false;
+    const batches = [...pendingReads.entries()];
+    pendingReads.clear();
+    for (const [path, items] of batches) {
+      items.sort((a, b) => a.offset - b.offset);
+      let group = null;
+      const groups = [];
+      for (const item of items) {
+        if (group && item.offset <= group.end + COALESCE_GAP_BYTES) {
+          group.end = Math.max(group.end, item.offset + item.length);
+          group.items.push(item);
+        } else {
+          group = { start: item.offset, end: item.offset + item.length, items: [item] };
+          groups.push(group);
+        }
+      }
+      for (const merged of groups) {
+        stats.httpRequests++;
+        io.readRange(path, merged.start, merged.end - merged.start).then(bytes => {
+          for (const item of merged.items) {
+            item.resolve(bytes.subarray(item.offset - merged.start, item.offset - merged.start + item.length));
+          }
+        }, error => {
+          for (const item of merged.items) item.reject(error);
+        });
+      }
+    }
+  }
 
   const objectCache = new Map();
   async function fetchObject(shardIndex, pointer, kind) {
@@ -147,7 +198,7 @@ export async function openRouteGraph(options) {
       promise = (async () => {
         const shard = root.shards[shardIndex];
         const path = `${shard.dir}/${shard.packs[pointer.packIndex]}`;
-        const compressed = await io.readRange(path, pointer.offset, pointer.length);
+        const compressed = await coalescedRead(path, pointer.offset, pointer.length);
         stats.objectFetches++;
         stats.bytesFetched += compressed.length;
         stats.shardsTouched.add(shard.id);
@@ -182,6 +233,18 @@ export async function openRouteGraph(options) {
       });
       cellCache.set(leaf, promise);
       promise.catch(() => cellCache.delete(leaf));
+    }
+    return promise;
+  }
+
+  const geometryCache = new Map();
+  function loadCellGeometry(leaf) {
+    let promise = geometryCache.get(leaf);
+    if (!promise) {
+      const entry = root.leaves[leaf];
+      promise = fetchObject(entry.shardIndex, entry.geometryPointer, "unpack").then(bytes => decodeRouteGeometry(bytes));
+      geometryCache.set(leaf, promise);
+      promise.catch(() => geometryCache.delete(leaf));
     }
     return promise;
   }
@@ -326,37 +389,35 @@ export async function openRouteGraph(options) {
     }
   }
 
-  async function snapUncached(point, maxCandidates, extraMeters) {
-    const latE7 = Math.round(point.lat * 1e7);
-    const lonE7 = Math.round((point.lon ?? point.lng) * 1e7);
-    const cosLat = Math.max(0.05, Math.cos(latE7 * E7_RAD));
+  // Candidate snap leaves for a point, from root bboxes alone: the nearest
+  // leaf plus any other leaf whose bbox could beat the best snap once padded
+  // for geometry that strays outside. Shared by snapping and by the
+  // speculative context planner, so their fetch sets coincide.
+  function candidateLeavesFor(latE7, lonE7) {
     const byDistance = root.leaves
       .map((leaf, index) => ({ index, meters: pointToBboxMeters(latE7, lonE7, leaf.bbox) }))
       .sort((a, b) => a.meters - b.meters);
-    // Fetch the nearest leaf plus any other leaf whose bbox could beat the
-    // current best snap once padded for geometry that strays outside.
     const candidates = [];
     for (const { index, meters } of byDistance) {
       if (candidates.length >= 4) break;
       if (candidates.length && meters > byDistance[0].meters + 2000) break;
       candidates.push(index);
     }
-    const cells = await Promise.all(candidates.map(leaf => loadCell(leaf)));
+    return candidates;
+  }
+
+  async function snapUncached(point, maxCandidates, extraMeters) {
+    const latE7 = Math.round(point.lat * 1e7);
+    const lonE7 = Math.round((point.lon ?? point.lng) * 1e7);
+    const cosLat = Math.max(0.05, Math.cos(latE7 * E7_RAD));
+    const candidates = candidateLeavesFor(latE7, lonE7);
+    const cells = await Promise.all(candidates.map(leaf => Promise.all([loadCell(leaf), loadCellGeometry(leaf)])));
     const matches = [];
-    for (const cell of cells) {
+    for (const [cell, geometryBlock] of cells) {
       for (let node = 0; node < cell.nodeCount; node++) {
         for (let e = cell.rowStart[node]; e < cell.rowStart[node + 1]; e++) {
           const target = cell.targets[e];
-          const inCell = target >= cell.firstNode && target < cell.firstNode + cell.nodeCount;
-          // Cross-cell edges carry their far endpoint inline (v2 cells), so
-          // every edge projects against its full polyline.
-          const points = decodeEdgeGeometry(
-            cell.geometry[e],
-            cell.latE7[node],
-            cell.lonE7[node],
-            inCell ? cell.latE7[target - cell.firstNode] : cell.extLat[e],
-            inCell ? cell.lonE7[target - cell.firstNode] : cell.extLon[e]
-          );
+          const points = edgePolyline(cell.geomRefs[e], geometryBlock);
           const projected = projectToEdge(latE7, lonE7, points, cosLat);
           if (projected.distMeters === Infinity) continue;
           matches.push({
@@ -490,6 +551,26 @@ export async function openRouteGraph(options) {
       const [levelText, cellText] = key === "top" ? [levelCount + 1, 0] : key.split(":");
       return { overlay, level: Number(levelText), cell: Number(cellText) };
     });
+    // Per-node membership resolution, computed once per node instead of
+    // scanning every fetched object on every relaxation.
+    const membership = new Map();
+    const membershipOf = (node) => {
+      let entry = membership.get(node);
+      if (entry) return entry;
+      entry = { cells: null, overlays: null };
+      for (const cell of cellList) {
+        if (node >= cell.firstNode && node < cell.firstNode + cell.nodeCount) {
+          (entry.cells ??= []).push(cell);
+        } else if (reverseCell(cell).external.has(node)) {
+          (entry.cells ??= []).push(cell);
+        }
+      }
+      for (const overlayEntry of overlayEntries) {
+        if (overlayEntry.overlay.index.has(node)) (entry.overlays ??= []).push(overlayEntry);
+      }
+      membership.set(node, entry);
+      return entry;
+    };
     const distF = new Map();
     const distB = new Map();
     const prevF = new Map();
@@ -520,7 +601,8 @@ export async function openRouteGraph(options) {
       }
     };
     const relaxForward = (node, weight) => {
-      for (const cell of cellList) {
+      const entry = membershipOf(node);
+      for (const cell of entry.cells || []) {
         if (node < cell.firstNode || node >= cell.firstNode + cell.nodeCount) continue;
         const local = node - cell.firstNode;
         for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
@@ -533,7 +615,7 @@ export async function openRouteGraph(options) {
           }
         }
       }
-      for (const { overlay, level, cell } of overlayEntries) {
+      for (const { overlay, level, cell } of entry.overlays || []) {
         const index = overlay.index.get(node);
         if (index == null) continue;
         for (let e = overlay.rowStart[index]; e < overlay.rowStart[index + 1]; e++) {
@@ -554,7 +636,8 @@ export async function openRouteGraph(options) {
       }
     };
     const relaxBackward = (node, weight) => {
-      for (const cell of cellList) {
+      const entry = membershipOf(node);
+      for (const cell of entry.cells || []) {
         const reverse = reverseCell(cell);
         if (node >= cell.firstNode && node < cell.firstNode + cell.nodeCount) {
           const local = node - cell.firstNode;
@@ -583,7 +666,7 @@ export async function openRouteGraph(options) {
           }
         }
       }
-      for (const { overlay, level, cell } of overlayEntries) {
+      for (const { overlay, level, cell } of entry.overlays || []) {
         const index = overlay.index.get(node);
         if (index == null) continue;
         const reverse = reverseOverlay(overlay);
@@ -610,7 +693,15 @@ export async function openRouteGraph(options) {
     while (heapF.size || heapB.size) {
       const topF = heapF.peekWeight();
       const topB = heapB.peekWeight();
-      if (Math.min(topF, topB) >= best) break;
+      // Standard bidirectional stop: no undiscovered path can beat
+      // topF + topB. When one direction is exhausted its distances are
+      // final, so the other only needs to run until its own top passes
+      // the best meeting.
+      if (heapF.size && heapB.size) {
+        if (topF + topB >= best) break;
+      } else if (Math.min(topF, topB) >= best) {
+        break;
+      }
       if (topF <= topB && heapF.size) {
         const weight = heapF.peekWeight();
         const node = heapF.pop();
@@ -839,7 +930,14 @@ export async function openRouteGraph(options) {
 
   async function finishRoute(response, chain, sameEdgeUsed, bucket, factors, wantNames) {
     const rawEdges = sameEdgeUsed ? [] : await unpackChain(chain.items, bucket, factors);
-    const names = wantNames ? await loadNames() : null;
+    // Geometry blocks for exactly the leaves the route passes through, in
+    // one parallel wave alongside the names sidecar.
+    const geometryLeaves = [...new Set(rawEdges.map(raw => raw.leaf))];
+    const [names, ...geometryBlocks] = await Promise.all([
+      wantNames ? loadNames() : null,
+      ...geometryLeaves.map(leaf => loadCellGeometry(leaf))
+    ]);
+    const geometryByLeaf = new Map(geometryLeaves.map((leaf, i) => [leaf, geometryBlocks[i]]));
     const geometry = [];
     let distanceMeters = 0;
     const steps = [];
@@ -853,24 +951,7 @@ export async function openRouteGraph(options) {
     for (const raw of rawEdges) {
       const cell = raw.cell;
       const edge = raw.edge;
-      // Locate the from-node of this CSR edge index.
-      let low = 0;
-      let high = cell.nodeCount;
-      while (low < high) {
-        const mid = (low + high) >> 1;
-        if (cell.rowStart[mid + 1] <= edge) low = mid + 1;
-        else high = mid;
-      }
-      const local = low;
-      const target = cell.targets[edge];
-      const inCell = target >= cell.firstNode && target < cell.firstNode + cell.nodeCount;
-      const points = decodeEdgeGeometry(
-        cell.geometry[edge],
-        cell.latE7[local],
-        cell.lonE7[local],
-        inCell ? cell.latE7[target - cell.firstNode] : cell.extLat[edge],
-        inCell ? cell.lonE7[target - cell.firstNode] : cell.extLon[edge]
-      );
+      const points = edgePolyline(cell.geomRefs[edge], geometryByLeaf.get(raw.leaf));
       for (let i = 0; i < points.length; i += 2) pushPoint(points[i], points[i + 1]);
       const meters = cell.distsDm[edge] / 10;
       const seconds = cellEdgeWeight(cell, edge, factors) / 10;
@@ -929,6 +1010,29 @@ export async function openRouteGraph(options) {
     if (liveWeights?.epoch && liveWeights.epoch !== root.sourceHash) {
       throw routeError("RANGEFIND_ROUTE_STALE_LIVE", "liveWeights epoch does not match this index build.");
     }
+    // Speculative single-wave fetch: the candidate snap leaves are known
+    // from root bboxes before any fetch, so the context objects (leaves,
+    // overlays, top) launch in the same wave as the snap cells. Extra
+    // speculative leaves share the snap fetches and almost always the same
+    // parent overlays, so the byte overhead is marginal; a top-up wave only
+    // happens when a cross-cell snap seed escapes the plan.
+    let speculative = null;
+    {
+      const fromLat = Number(params.from?.lat);
+      const fromLon = Number(params.from?.lon ?? params.from?.lng);
+      const toLat = Number(params.to?.lat);
+      const toLon = Number(params.to?.lon ?? params.to?.lng);
+      if (Number.isFinite(fromLat) && Number.isFinite(fromLon) && Number.isFinite(toLat) && Number.isFinite(toLon)) {
+        const leaves = new Set([
+          ...candidateLeavesFor(Math.round(fromLat * 1e7), Math.round(fromLon * 1e7)),
+          ...candidateLeavesFor(Math.round(toLat * 1e7), Math.round(toLon * 1e7))
+        ]);
+        const contexts = buildContexts([...leaves]);
+        const promise = fetchContexts(contexts, bucket);
+        promise.catch(() => {});
+        speculative = { leaves, contexts, promise };
+      }
+    }
     const [snapFrom, snapTo] = await Promise.all([snap(params.from), snap(params.to)]);
     const snapLeaves = new Set();
     for (const match of snapFrom.matches) {
@@ -941,8 +1045,16 @@ export async function openRouteGraph(options) {
       snapLeaves.add(match.leaf);
       snapLeaves.add(leafOfNode(match.fromNode));
     }
-    const contexts = buildContexts([...snapLeaves]);
-    const fetched = await fetchContexts(contexts, bucket);
+    let contexts;
+    let fetched;
+    if (speculative && [...snapLeaves].every(leaf => speculative.leaves.has(leaf))) {
+      contexts = speculative.contexts;
+      fetched = await speculative.promise;
+    } else {
+      const union = speculative ? new Set([...speculative.leaves, ...snapLeaves]) : snapLeaves;
+      contexts = buildContexts([...union]);
+      fetched = await fetchContexts(contexts, bucket);
+    }
 
     const effMatchWeight = (match) => bucketWeight(match.weight, match.classCode, factors);
     const forwardSeeds = snapFrom.matches.map(match => ({
@@ -984,6 +1096,36 @@ export async function openRouteGraph(options) {
       const chain = sameEdgeUsed
         ? { items: [], startMatch: sameEdge.from, endMatch: sameEdge.to }
         : reconstructChains(searchResult);
+      // Instant coarse polyline before any unpack fetch: snapped endpoints
+      // joined through the bbox centers of the leaf cells the path
+      // traverses. Render this immediately, then replace it with the exact
+      // geometry that follows.
+      if (!sameEdgeUsed) {
+        const coarse = [];
+        const pushCoarse = (lat, lon) => {
+          const last = coarse[coarse.length - 1];
+          if (last && last[0] === lat && last[1] === lon) return;
+          coarse.push([lat, lon]);
+        };
+        pushCoarse(snapFrom.matches[0].snappedLatE7 / 1e7, snapFrom.matches[0].snappedLonE7 / 1e7);
+        let previousLeaf = -1;
+        for (const item of chain.items) {
+          const leaf = leafOfNode(item.toNode);
+          if (leaf === previousLeaf) continue;
+          previousLeaf = leaf;
+          const bbox = root.leaves[leaf].bbox;
+          pushCoarse(((bbox.minLat + bbox.maxLat) / 2) / 1e7, ((bbox.minLon + bbox.maxLon) / 2) / 1e7);
+        }
+        pushCoarse(snapTo.matches[0].snappedLatE7 / 1e7, snapTo.matches[0].snappedLonE7 / 1e7);
+        response.coarseGeometry = coarse;
+        if (params.onCoarseRoute) {
+          try {
+            params.onCoarseRoute({ seconds: response.seconds, geometry: coarse, bucket: response.bucket });
+          } catch {
+            // Listener errors must not break routing.
+          }
+        }
+      }
       await finishRoute(response, chain, sameEdgeUsed, bucket, factors, params.names !== false);
       response.stats = statsSnapshot();
       return response;
@@ -1039,21 +1181,148 @@ export async function openRouteGraph(options) {
     return best;
   }
 
+  // Forward-only multi-target Dijkstra over the union query graph of all
+  // stops. Exact for every pair by the same argument as the bidirectional
+  // search: the union contains each pair's context, and every extra edge is
+  // a real path length.
+  function forwardToTargets(contexts, fetched, seeds, targetSeeds, factors) {
+    const INF = Infinity;
+    const cellList = [...fetched.cells.values()];
+    const overlayList = [...fetched.overlays.values()];
+    const membership = new Map();
+    const membershipOf = (node) => {
+      let entry = membership.get(node);
+      if (entry) return entry;
+      entry = { cells: null, overlays: null };
+      for (const cell of cellList) {
+        if (node >= cell.firstNode && node < cell.firstNode + cell.nodeCount) (entry.cells ??= []).push(cell);
+      }
+      for (const overlay of overlayList) {
+        if (overlay.index.has(node)) (entry.overlays ??= []).push(overlay);
+      }
+      membership.set(node, entry);
+      return entry;
+    };
+    const dist = new Map();
+    const heap = new MinHeap();
+    for (const seed of seeds) {
+      if (seed.weight < (dist.get(seed.node) ?? INF)) {
+        dist.set(seed.node, seed.weight);
+        heap.push(seed.weight, seed.node);
+      }
+    }
+    // best[j] improves as target seed nodes settle; stop once the heap top
+    // can no longer improve any unfinished target.
+    const best = targetSeeds.map(() => INF);
+    const settled = new Set();
+    while (heap.size) {
+      let unfinished = false;
+      for (let j = 0; j < best.length; j++) {
+        if (heap.peekWeight() < best[j]) {
+          unfinished = true;
+          break;
+        }
+      }
+      if (!unfinished) break;
+      const weight = heap.peekWeight();
+      const node = heap.pop();
+      if (weight !== dist.get(node) || settled.has(node)) continue;
+      settled.add(node);
+      for (let j = 0; j < targetSeeds.length; j++) {
+        for (const seed of targetSeeds[j]) {
+          if (seed.node === node && weight + seed.weight < best[j]) best[j] = weight + seed.weight;
+        }
+      }
+      const entry = membershipOf(node);
+      for (const cell of entry.cells || []) {
+        const local = node - cell.firstNode;
+        for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
+          const next = weight + cellEdgeWeight(cell, e, factors);
+          const target = cell.targets[e];
+          if (next < (dist.get(target) ?? INF)) {
+            dist.set(target, next);
+            heap.push(next, target);
+          }
+        }
+      }
+      for (const overlay of entry.overlays || []) {
+        const index = overlay.index.get(node);
+        for (let e = overlay.rowStart[index]; e < overlay.rowStart[index + 1]; e++) {
+          const next = weight + overlay.weights[e];
+          const target = overlay.nodes[overlay.targetIndex[e]];
+          if (next < (dist.get(target) ?? INF)) {
+            dist.set(target, next);
+            heap.push(next, target);
+          }
+        }
+      }
+    }
+    return best;
+  }
+
   async function matrix(params) {
     const points = params.points;
     const size = points.length;
     const seconds = Array.from({ length: size }, () => new Array(size).fill(0));
+    const bucket = bucketForParams(params);
+    const factors = root.buckets[bucket].factors;
+    if (params.pairwise === true || size <= 2) {
+      for (let i = 0; i < size; i++) {
+        for (let j = 0; j < size; j++) {
+          if (i === j) continue;
+          const result = await route({
+            from: points[i],
+            to: points[j],
+            geometry: false,
+            bucket: params.bucket,
+            departureTime: params.departureTime
+          });
+          seconds[i][j] = result.seconds;
+        }
+      }
+      return { seconds, stats: statsSnapshot() };
+    }
+    // One shared context fetch for every stop, then one forward multi-target
+    // search per stop.
+    const snaps = await Promise.all(points.map(point => snap(point)));
+    const allLeaves = new Set();
+    for (const snapped of snaps) {
+      for (const match of snapped.matches) {
+        allLeaves.add(match.leaf);
+        allLeaves.add(leafOfNode(match.toNode));
+        allLeaves.add(leafOfNode(match.fromNode));
+      }
+    }
+    const contexts = buildContexts([...allLeaves]);
+    const fetched = await fetchContexts(contexts, bucket);
+    const effMatchWeight = (match) => bucketWeight(match.weight, match.classCode, factors);
+    const forwardSeedsOf = (snapped) => snapped.matches.map(match => ({
+      node: match.toNode,
+      weight: Math.round(effMatchWeight(match) * (1 - match.ratio))
+    }));
+    const backwardSeedsOf = (snapped) => snapped.matches.map(match => ({
+      node: match.fromNode,
+      weight: Math.round(effMatchWeight(match) * match.ratio)
+    }));
+    const targetSeeds = snaps.map(backwardSeedsOf);
     for (let i = 0; i < size; i++) {
+      const best = forwardToTargets(contexts, fetched, forwardSeedsOf(snaps[i]), targetSeeds, factors);
       for (let j = 0; j < size; j++) {
         if (i === j) continue;
-        const result = await route({
-          from: points[i],
-          to: points[j],
-          geometry: false,
-          bucket: params.bucket,
-          departureTime: params.departureTime
-        });
-        seconds[i][j] = result.seconds;
+        let weight = best[j];
+        // Same-edge shortcut per pair.
+        for (const from of snaps[i].matches) {
+          for (const to of snaps[j].matches) {
+            if (from.leaf === to.leaf && from.edgeIndex === to.edgeIndex && to.ratio >= from.ratio) {
+              const direct = Math.round(effMatchWeight(from) * (to.ratio - from.ratio));
+              if (direct < weight) weight = direct;
+            }
+          }
+        }
+        if (weight === Infinity) {
+          throw routeError("RANGEFIND_ROUTE_NO_PATH", `No route between stops ${i} and ${j}.`);
+        }
+        seconds[i][j] = weight / 10;
       }
     }
     return { seconds, stats: statsSnapshot() };
@@ -1193,6 +1462,7 @@ export async function openRouteGraph(options) {
       cellFetches: stats.cellFetches,
       overlayFetches: stats.overlayFetches,
       unpackCellFetches: stats.unpackCellFetches,
+      httpRequests: stats.httpRequests,
       shardsTouched: [...stats.shardsTouched]
     };
   }

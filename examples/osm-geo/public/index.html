@@ -50,6 +50,7 @@
   <main class="atlas">
     <div id="map" aria-label="Interactive OpenStreetMap"></div>
     <div class="map-wash" aria-hidden="true"></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
     <div class="map-hud" aria-live="polite">
       <span class="map-hud__signal" aria-hidden="true"></span>
       <span id="mapHudText">Connecting to the atlas</span>
@@ -118,6 +119,14 @@
       </header>
 
       <section class="search-area" aria-label="Search controls">
+        <div class="mode-switch" role="tablist" aria-label="Panel mode">
+          <button id="modeSearchTab" type="button" role="tab" aria-selected="true" class="active">Search</button>
+          <button id="modeDirectionsTab" type="button" role="tab" aria-selected="false">
+            Directions
+            <span class="mode-switch__badge" aria-hidden="true">new</span>
+          </button>
+        </div>
+        <div id="searchControls">
         <label class="visually-hidden" for="queryInput">Search a place or address</label>
         <div class="search-box">
           <input
@@ -160,6 +169,37 @@
             <button id="clearButton" class="clear-button" type="button" hidden>Clear</button>
           </span>
         </div>
+        </div>
+
+        <div id="directionsControls" class="directions" hidden>
+          <p id="routeSetupHint" class="route-setup-hint" hidden>
+            No route graph is published at <code>route-graph/</code>. Build the static
+            routing index, then copy it into the demo:
+            <code>node scripts/osm_road_graph.mjs luxembourg-latest.osm.pbf luxembourg.graph.bin</code>
+            <code>node scripts/route_bench.mjs build luxembourg.graph.bin bench/route/luxembourg-index --peak</code>
+            <code>npm run setup:osm-demo-route</code>
+          </p>
+          <div id="directionsForm">
+            <ol id="stopList" class="stop-list" aria-label="Route stops"></ol>
+            <div class="directions-toolbar">
+              <button id="addStopButton" class="directions-add" type="button">
+                <span aria-hidden="true">+</span> Add stop
+              </button>
+              <span class="search-toolbar__actions">
+                <button id="swapStopsButton" class="clear-button" type="button" title="Reverse stop order">Swap</button>
+                <button id="clearStopsButton" class="clear-button" type="button">Clear</button>
+              </span>
+            </div>
+            <div id="departureRow" class="departure-row" hidden>
+              <span class="departure-row__label">Depart</span>
+              <div class="departure-options" role="radiogroup" aria-label="Departure time">
+                <button type="button" data-departure="now" class="active" aria-pressed="true">Now</button>
+                <button type="button" data-departure="peak" aria-pressed="false">Weekday rush</button>
+                <button type="button" data-departure="base" aria-pressed="false">Free flow</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <section class="results" aria-label="Search results">
@@ -176,6 +216,43 @@
             <p class="query-receipt__proof"><b>Zero-server proof.</b> These are immutable HTTP range reads performed by this browser—no search API or query database was contacted.</p>
           </div>
         </details>
+        <details id="routeReceipt" class="query-receipt query-receipt--route" hidden>
+          <summary>
+            <span class="query-receipt__label"><i aria-hidden="true"></i> Route X-Ray</span>
+            <strong id="routeReceiptSummary">Tracing byte ranges…</strong>
+            <span class="query-receipt__chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <div class="query-receipt__body">
+            <p id="routeReceiptRoute" class="query-receipt__route"></p>
+            <div id="routeReceiptBars" class="query-receipt__bars" aria-label="Route graph reads by data structure"></div>
+            <p class="query-receipt__proof"><b>Zero-server routing.</b> This route was computed in this browser with a multilevel Dijkstra over immutable HTTP range reads—no routing server was contacted.</p>
+          </div>
+        </details>
+        <section id="routeCard" class="route-card" aria-label="Route summary" hidden>
+          <header class="route-card__header">
+            <p class="route-card__eta"><strong id="routeEta">—</strong></p>
+            <p class="route-card__facts">
+              <b id="routeDistance"></b>
+              <span id="routeBucket" class="route-card__bucket"></span>
+            </p>
+          </header>
+          <p id="routeOrder" class="route-card__order" hidden></p>
+          <div id="routeAlternatives" class="route-alternatives" role="group" aria-label="Route alternatives" hidden></div>
+          <div class="route-corridor">
+            <p class="route-corridor__label">Search along this route</p>
+            <div class="route-corridor__chips">
+              <button type="button" data-corridor="cafe" data-corridor-label="Cafés">Cafés</button>
+              <button type="button" data-corridor="fuel" data-corridor-label="Fuel">Fuel</button>
+              <button type="button" data-corridor="restaurant" data-corridor-label="Restaurants">Restaurants</button>
+              <button type="button" data-corridor="supermarket" data-corridor-label="Groceries">Groceries</button>
+              <button type="button" data-corridor="pharmacy" data-corridor-label="Pharmacies">Pharmacies</button>
+            </div>
+          </div>
+          <details id="routeStepsWrap" class="route-steps-wrap" open>
+            <summary><span>Turn-by-turn</span><span class="query-receipt__chevron" aria-hidden="true">⌄</span></summary>
+            <ol id="routeSteps" class="route-steps"></ol>
+          </details>
+        </section>
         <div id="emptyState" class="empty-state">
           <span class="empty-state__graphic" aria-hidden="true"><i></i><i></i><i></i></span>
           <strong id="emptyTitle">Find a place</strong>

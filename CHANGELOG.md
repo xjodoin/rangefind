@@ -34,7 +34,19 @@
   junction copies with bearing-priced turns, left costlier than right,
   u-turns penalized), with via-node restrictions as exact per-approach
   filters; multi-via-way restrictions resolve through the union of their
-  via ways. See `docs/route-graph.md`.
+  via ways. An A/B-benched performance round (correct bidirectional stop,
+  membership caching, copy-contiguous node order, geometry/topology split
+  with canonical polyline dedup, a deeper default hierarchy, speculative
+  single-wave context fetch, same-file range coalescing, progressive
+  coarse geometry, and shared-context one-to-many matrices) cut Quebec
+  cold queries from ~110–126 ms to ~65–76 ms at 25 ms simulated RTT,
+  transfer from ~4.5 MB to ~3.3–3.6 MB, and 5-stop itineraries from
+  ~750 ms to ~410 ms, with exactness re-verified at every step. The OSM
+  map demo gains a full Directions experience (origin/destination
+  autocomplete and map picking, alternatives, time buckets, multi-stop
+  itineraries, search-along-route against the live planet index, and a
+  Route X-Ray fetch receipt), computed entirely in the browser from
+  static byte ranges. See `docs/route-graph.md`.
 
 ## 0.4.6 — 2026-08-04
 

@@ -21,6 +21,8 @@ examples/osm-geo/data/
 examples/osm-geo/public/rangefind
 examples/osm-geo/public/runtime.browser.js
 examples/osm-geo/public/osm.browser.js
+examples/osm-geo/public/route.browser.js
+examples/osm-geo/public/route-graph/
 examples/osm-geo/public/osm-demo.json
 examples/osm-geo/rangefind.config.json
 examples/osm-geo/*.json

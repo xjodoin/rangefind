@@ -199,7 +199,7 @@ async function commandBuild() {
     shards,
     leafNodes: flag("leaf-nodes", 1280),
     fanout: flag("fanout", 8),
-    topMaxCells: flag("top-max-cells", 32),
+    topMaxCells: flag("top-max-cells", 8),
     timeBuckets: process.argv.includes("--peak") ? [PEAK_BUCKET] : [],
     log: message => console.log(message)
   });

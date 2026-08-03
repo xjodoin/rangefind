@@ -431,7 +431,8 @@ test("multi-via-way restrictions resolve through the way union", async () => {
   assert.equal(context.edgeTo[2], 2, "direct via traffic untouched");
 });
 
-test("route cell and overlay codecs round-trip", () => {
+test("route cell, geometry, and overlay codecs round-trip", async () => {
+  const { encodeRouteGeometry, decodeRouteGeometry, edgePolyline } = await import("../src/route_graph.js");
   const cell = {
     cellId: 7,
     firstNode: 1000,
@@ -443,7 +444,10 @@ test("route cell and overlay codecs round-trip", () => {
     weights: Uint32Array.from([120, 999, 60]),
     distsDm: Uint32Array.from([800, 12000, 400]),
     nameIds: Uint32Array.from([1, 0, 2]),
-    geometry: [Uint8Array.from([0]), Uint8Array.from([1, 2, 2]), Uint8Array.from([0])]
+    classes: Uint8Array.from([0, 3, 1]),
+    extLat: Int32Array.from([0, 454900000, 0]),
+    extLon: Int32Array.from([0, -736100000, 0]),
+    geomRefs: Uint32Array.from([0, 3, 1])
   };
   const decoded = decodeRouteCell(encodeRouteCell(cell));
   assert.equal(decoded.cellId, 7);
@@ -451,7 +455,22 @@ test("route cell and overlay codecs round-trip", () => {
   assert.deepEqual([...decoded.latE7], [...cell.latE7]);
   assert.deepEqual([...decoded.targets], [...cell.targets]);
   assert.deepEqual([...decoded.weights], [...cell.weights]);
-  assert.deepEqual([...decoded.geometry[1]], [1, 2, 2]);
+  assert.deepEqual([...decoded.geomRefs], [0, 3, 1]);
+  assert.deepEqual([...decoded.classes], [0, 3, 1]);
+
+  const geometryBlock = decodeRouteGeometry(encodeRouteGeometry({
+    cellId: 7,
+    polylines: [
+      Int32Array.from([455000000, -736000000, 455000200, -735999800, 455000500, -735999000]),
+      Int32Array.from([454900000, -736100000, 455001000, -735998000])
+    ]
+  }));
+  assert.equal(geometryBlock.cellId, 7);
+  assert.deepEqual([...geometryBlock.polylines[0]], [455000000, -736000000, 455000200, -735999800, 455000500, -735999000]);
+  const forward = edgePolyline(0, geometryBlock);
+  const reversed = edgePolyline(1, geometryBlock);
+  assert.deepEqual([...forward], [...geometryBlock.polylines[0]]);
+  assert.deepEqual([...reversed], [455000500, -735999000, 455000200, -735999800, 455000000, -736000000]);
 
   const overlay = {
     level: 2,
@@ -698,6 +717,19 @@ test("http adapter routes identically over Range requests", async (t) => {
     assert.deepEqual(remoteResult.geometry, localResult.geometry, `pair ${i} geometry http vs file`);
   }
   assert.ok(remote.io.counters.requests > 0, "http adapter actually fetched");
+});
+
+test("one-to-many matrix equals pairwise routes", async (t) => {
+  const graph = syntheticGraph(18, 16, 44);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-matrix-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 40, fanout: 4, topMaxCells: 5 });
+  const engine = await openRouteGraphDir(dir);
+  const point = (node) => ({ lat: graph.nodeLat[node] / 1e7, lon: graph.nodeLon[node] / 1e7 });
+  const stops = [point(5), point(200), point(150), point(287), point(96)];
+  const fast = await engine.matrix({ points: stops });
+  const slow = await engine.matrix({ points: stops, pairwise: true });
+  assert.deepEqual(fast.seconds, slow.seconds, "shared-context matrix matches pairwise exactly");
 });
 
 test("itinerary orders stops and concatenates legs", async (t) => {

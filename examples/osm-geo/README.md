@@ -95,6 +95,47 @@ supports click-to-reverse-geocode through **Pick map**, distinguishes exact,
 interpolated, and approximate locations, and progressively displays the compact
 OSM `details` fields as rebuilt shards publish them.
 
+## Directions (static routing)
+
+The map client includes a Directions mode backed by the rfroutegraph-v1
+static routing lane (see [`docs/route-graph.md`](../../docs/route-graph.md)).
+Routing runs entirely in the browser: `openRouteGraphUrl("route-graph/")`
+fetches the bounded object set for each query over HTTP range reads and runs
+a multilevel bidirectional Dijkstra client-side. The demo bundles the
+dependency-free engine as `public/route.browser.js` (built by
+`npm run build:osm-demo` alongside the runtime and OSM bundles).
+
+The UI probes `route-graph/manifest.json` at startup. When absent, the
+Directions tab explains how to publish an index:
+
+```bash
+# Build a route graph (Luxembourg matches the demo fixture region)
+node scripts/osm_road_graph.mjs luxembourg-latest.osm.pbf luxembourg.graph.bin
+node scripts/route_bench.mjs build luxembourg.graph.bin bench/route/luxembourg-index --peak
+
+# Copy it into the demo (defaults to bench/route/luxembourg-index)
+npm run setup:osm-demo-route
+```
+
+The route bundle and index must come from the same source revision — the
+binary formats are versioned, so rebuild both together after engine changes.
+
+Directions features:
+
+- origin/destination/via fields with the same static autocomplete as search,
+  per-field map picking, swap, and up to 8 stops;
+- routes with two penalized-re-search alternatives (click a dashed line or a
+  chip to promote one), snapped-point dots and snap-distance notes;
+- a departure selector (`Now` / rush / free-flow) when the index was built
+  with time buckets;
+- 3+ stops switch to `itinerary()` — travel-time matrix, exact Held-Karp
+  ordering, per-leg rendering, and optimized visit order;
+- "Search along this route" feeds the computed geometry straight into the
+  existing route-corridor search lane (`searchAlongRouteOsm`) against the
+  public place index;
+- a Route X-Ray receipt showing the object fetches, bytes, and shards each
+  route touched — the routing analogue of the search Query X-Ray.
+
 ## Build
 
 ```bash

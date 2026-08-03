@@ -17,6 +17,7 @@ import {
   ROUTE_GRAPH_FORMAT,
   bucketWeight,
   encodeRouteCell,
+  encodeRouteGeometry,
   encodeRouteOverlay,
   encodeRouteRoot
 } from "./route_graph.js";
@@ -58,6 +59,15 @@ function kdPartition(latE7, lonE7, leafNodes) {
     stack.push([start, mid]);
   }
   leaves.sort((a, b) => a[0] - b[0]);
+  // Within each leaf, order nodes by coordinate (source id as tiebreak).
+  // Junction-expanded graphs have many copies sharing one coordinate; making
+  // them byte-adjacent lets gzip collapse their near-identical edge rows and
+  // clique rows, and keeps CSR deltas small for everyone else.
+  for (const [start, end] of leaves) {
+    const slice = Array.from(perm.subarray(start, end));
+    slice.sort((a, b) => latE7[a] - latE7[b] || lonE7[a] - lonE7[b] || a - b);
+    perm.set(slice, start);
+  }
   return { perm, leaves };
 }
 
@@ -98,6 +108,22 @@ function buildCsr(nodeCount, from, to) {
     edgeIds[slot] = i;
   }
   return { rowStart, targets, edgeIds };
+}
+
+function readGeomVarint(bytes, state) {
+  let value = 0;
+  let multiplier = 1;
+  for (;;) {
+    const byte = bytes[state.pos++];
+    value += (byte & 0x7f) * multiplier;
+    if ((byte & 0x80) === 0) return value;
+    multiplier *= 0x80;
+  }
+}
+
+function readGeomZigzag(bytes, state) {
+  const raw = readGeomVarint(bytes, state);
+  return raw % 2 === 1 ? -(raw + 1) / 2 : raw / 2;
 }
 
 // Drops clique edges that another boundary node realizes exactly:
@@ -157,7 +183,10 @@ function localDijkstra(nodeCount, rowStart, targets, weights, source, dist, heap
 export function buildRouteGraph(graph, outDir, options = {}) {
   const leafNodes = Math.max(64, Math.floor(options.leafNodes ?? 1280));
   const fanout = Math.max(2, Math.floor(options.fanout ?? 8));
-  const topMaxCells = Math.max(2, Math.floor(options.topMaxCells ?? 32));
+  // A small top keeps the always-fetched top overlay tiny; deeper levels
+  // cost two extra mid-level objects per query but benched strictly better
+  // on transfer and latency (see docs/route-graph.md).
+  const topMaxCells = Math.max(2, Math.floor(options.topMaxCells ?? 8));
   const shardCount = Math.max(1, Math.floor(options.shards ?? 1));
   const packBytes = Math.max(64 * 1024, Math.floor(options.packBytes ?? 2 * 1024 * 1024));
   const log = options.log || (() => {});
@@ -396,21 +425,60 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     const cellClasses = new Uint8Array(cellEdgeCount);
     const extLat = new Int32Array(cellEdgeCount);
     const extLon = new Int32Array(cellEdgeCount);
-    const geometry = new Array(cellEdgeCount);
+    const geomRefs = new Uint32Array(cellEdgeCount);
+    // Deduplicated full-chain polylines: approach copies and two-way twins
+    // of one physical road edge collapse into a single canonical entry.
+    const uniquePolylines = [];
+    const uniqueIndex = new Map();
     let cursor = 0;
     for (let node = start; node < end; node++) {
       for (let e = csr.rowStart[node]; e < csr.rowStart[node + 1]; e++) {
         const edgeId = csr.edgeIds[e];
-        targets[cursor] = csr.targets[e];
+        const target = csr.targets[e];
+        targets[cursor] = target;
         weights[cursor] = graph.edgeWeightDs[edgeId];
         distsDm[cursor] = graph.edgeDistDm[edgeId];
         nameIds[cursor] = graph.edgeName[edgeId];
         cellClasses[cursor] = edgeClassOf(edgeId);
-        if (csr.targets[e] < start || csr.targets[e] >= end) {
-          extLat[cursor] = latE7[csr.targets[e]];
-          extLon[cursor] = lonE7[csr.targets[e]];
+        if (target < start || target >= end) {
+          extLat[cursor] = latE7[target];
+          extLon[cursor] = lonE7[target];
         }
-        geometry[cursor] = graph.geomBytes.subarray(graph.geomOffsets[edgeId], graph.geomOffsets[edgeId + 1]);
+        // Full point chain in travel direction.
+        const geomState = { pos: graph.geomOffsets[edgeId] };
+        const interior = readGeomVarint(graph.geomBytes, geomState);
+        const points = new Int32Array((interior + 2) * 2);
+        points[0] = latE7[node];
+        points[1] = lonE7[node];
+        let pointLat = points[0];
+        let pointLon = points[1];
+        for (let p = 0; p < interior; p++) {
+          pointLat += readGeomZigzag(graph.geomBytes, geomState);
+          pointLon += readGeomZigzag(graph.geomBytes, geomState);
+          points[(p + 1) * 2] = pointLat;
+          points[(p + 1) * 2 + 1] = pointLon;
+        }
+        points[(interior + 1) * 2] = latE7[target];
+        points[(interior + 1) * 2 + 1] = lonE7[target];
+        // Canonical direction: lexicographically smaller endpoint first.
+        const last = points.length - 2;
+        const reversed = points[last] < points[0] || (points[last] === points[0] && points[last + 1] < points[1]);
+        let canonical = points;
+        if (reversed) {
+          canonical = new Int32Array(points.length);
+          for (let p = 0; p < points.length; p += 2) {
+            canonical[p] = points[points.length - 2 - p];
+            canonical[p + 1] = points[points.length - 1 - p];
+          }
+        }
+        const key = canonical.join(",");
+        let index = uniqueIndex.get(key);
+        if (index == null) {
+          index = uniquePolylines.length;
+          uniquePolylines.push(canonical);
+          uniqueIndex.set(key, index);
+        }
+        geomRefs[cursor] = index * 2 + (reversed ? 1 : 0);
         cursor++;
       }
     }
@@ -428,11 +496,14 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       classes: cellClasses,
       extLat,
       extLon,
-      geometry
+      geomRefs
     });
     const shardIndex = shardOfLeaf(leaf);
     const compressed = gzipSync(Buffer.from(encoded), { level: 6 });
     const written = writeShard(writers[shardIndex], `cell-${leaf}`, compressed, encoded.length);
+    const encodedGeometry = encodeRouteGeometry({ cellId: leaf, polylines: uniquePolylines });
+    const compressedGeometry = gzipSync(Buffer.from(encodedGeometry), { level: 6 });
+    const writtenGeometry = writeShard(writers[shardIndex], `geom-${leaf}`, compressedGeometry, encodedGeometry.length);
     let minLat = Infinity;
     let maxLat = -Infinity;
     let minLon = Infinity;
@@ -448,7 +519,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       nodeCount: size,
       bbox: { minLat, maxLat, minLon, maxLon },
       shardIndex,
-      entry: written
+      entry: written,
+      geometryEntry: writtenGeometry
     });
   }
 
@@ -547,7 +619,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       nodeCount: leaf.nodeCount,
       bbox: leaf.bbox,
       shardIndex: leaf.shardIndex,
-      pointer: pointerOf(writers[leaf.shardIndex], leaf.entry)
+      pointer: pointerOf(writers[leaf.shardIndex], leaf.entry),
+      geometryPointer: pointerOf(writers[leaf.shardIndex], leaf.geometryEntry)
     })),
     levels: levelEntries.map(level => level.map(cell => ({
       firstLeaf: cell.firstLeaf,

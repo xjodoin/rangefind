@@ -23,9 +23,11 @@ export const ROUTE_GRAPH_FORMAT = "rfroutegraph-v1";
 export const ROUTE_ROOT_MAGIC = [0x52, 0x46, 0x52, 0x54]; // RFRT
 export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
-const ROOT_VERSION = 2;
-const CELL_VERSION = 2;
+export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
+const ROOT_VERSION = 3;
+const CELL_VERSION = 3;
 const OVERLAY_VERSION = 1;
+const GEOMETRY_VERSION = 1;
 
 // Integer time-of-day metric: factors are time multipliers scaled by 1000,
 // applied identically at build (cliques) and query (raw edges) so bucketed
@@ -78,9 +80,11 @@ function readPointer(bytes, state) {
 // --- Cell block ---------------------------------------------------------
 //
 // `cell` is { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets,
-// weights, distsDm, nameIds, geometry } where geometry is an array of
-// Uint8Array varint polylines (interior points, zigzag E7 deltas from the
-// edge's from-node) aligned with the edge arrays.
+// weights, distsDm, nameIds, classes, extLat, extLon, geomRefs }. Since v3,
+// polylines live in a separate per-leaf geometry object (RFRP below) and
+// each edge stores a reference: uniqueIndex * 2 + reversedFlag. The search
+// phase fetches only these topology blocks; geometry objects are fetched
+// for snapping and for the final route corridor.
 
 export function encodeRouteCell(cell) {
   const out = [...ROUTE_CELL_MAGIC];
@@ -135,9 +139,7 @@ export function encodeRouteCell(cell) {
         pushZigzag(out, (cell.extLat ? cell.extLat[e] : 0) - cell.latE7[node]);
         pushZigzag(out, (cell.extLon ? cell.extLon[e] : 0) - cell.lonE7[node]);
       }
-      const geometry = cell.geometry[e];
-      pushVarint(out, geometry.length);
-      for (const byte of geometry) out.push(byte);
+      pushVarint(out, cell.geomRefs[e]);
     }
   }
   return Uint8Array.from(out);
@@ -171,7 +173,7 @@ export function decodeRouteCell(bytes) {
   const classes = new Uint8Array(edgeCount);
   const extLat = new Int32Array(edgeCount);
   const extLon = new Int32Array(edgeCount);
-  const geometry = new Array(edgeCount);
+  const geomRefs = new Uint32Array(edgeCount);
   let cursor = 0;
   for (let node = 0; node < nodeCount; node++) {
     const degree = readVarint(bytes, state);
@@ -188,34 +190,80 @@ export function decodeRouteCell(bytes) {
         extLat[cursor] = latE7[node] + readZigzag(bytes, state);
         extLon[cursor] = lonE7[node] + readZigzag(bytes, state);
       }
-      const geometryBytes = readVarint(bytes, state);
-      geometry[cursor] = bytes.subarray(state.pos, state.pos + geometryBytes);
-      state.pos += geometryBytes;
+      geomRefs[cursor] = readVarint(bytes, state);
       cursor++;
     }
   }
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
-  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, extLat, extLon, geometry };
+  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, extLat, extLon, geomRefs };
 }
 
-// Decodes one edge polyline into [latE7, lonE7, ...] pairs including both
-// endpoint nodes, given the endpoint coordinates.
-export function decodeEdgeGeometry(geometry, fromLatE7, fromLonE7, toLatE7, toLonE7) {
-  const state = { pos: 0 };
-  const interior = readVarint(geometry, state);
-  const points = new Int32Array((interior + 2) * 2);
-  points[0] = fromLatE7;
-  points[1] = fromLonE7;
-  let lat = fromLatE7;
-  let lon = fromLonE7;
-  for (let i = 0; i < interior; i++) {
-    lat += readZigzag(geometry, state);
-    lon += readZigzag(geometry, state);
-    points[(i + 1) * 2] = lat;
-    points[(i + 1) * 2 + 1] = lon;
+// --- Geometry object ----------------------------------------------------
+//
+// One per leaf cell: the deduplicated polylines its edges reference. Each
+// polyline is a full point chain (both endpoints included) stored in a
+// canonical direction — approach copies of one road edge and the two
+// directions of a two-way road all share a single entry. First points are
+// delta-encoded against the previous polyline's first point.
+
+export function encodeRouteGeometry(geometry) {
+  const out = [...ROUTE_GEOMETRY_MAGIC];
+  pushVarint(out, GEOMETRY_VERSION);
+  pushVarint(out, geometry.cellId);
+  pushVarint(out, geometry.polylines.length);
+  let prevLat = 0;
+  let prevLon = 0;
+  for (const points of geometry.polylines) {
+    const count = points.length / 2;
+    pushVarint(out, count);
+    pushZigzag(out, points[0] - prevLat);
+    pushZigzag(out, points[1] - prevLon);
+    for (let i = 1; i < count; i++) {
+      pushZigzag(out, points[i * 2] - points[(i - 1) * 2]);
+      pushZigzag(out, points[i * 2 + 1] - points[(i - 1) * 2 + 1]);
+    }
+    prevLat = points[0];
+    prevLon = points[1];
   }
-  points[(interior + 1) * 2] = toLatE7;
-  points[(interior + 1) * 2 + 1] = toLonE7;
+  return Uint8Array.from(out);
+}
+
+export function decodeRouteGeometry(bytes) {
+  assertMagic(bytes, ROUTE_GEOMETRY_MAGIC, "Invalid Rangefind route geometry block.");
+  const state = { pos: ROUTE_GEOMETRY_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== GEOMETRY_VERSION) throw new Error(`Unsupported route geometry version ${version}.`);
+  const cellId = readVarint(bytes, state);
+  const count = readVarint(bytes, state);
+  const polylines = new Array(count);
+  let prevLat = 0;
+  let prevLon = 0;
+  for (let p = 0; p < count; p++) {
+    const points = new Int32Array(readVarint(bytes, state) * 2);
+    points[0] = prevLat + readZigzag(bytes, state);
+    points[1] = prevLon + readZigzag(bytes, state);
+    for (let i = 2; i < points.length; i += 2) {
+      points[i] = points[i - 2] + readZigzag(bytes, state);
+      points[i + 1] = points[i - 1] + readZigzag(bytes, state);
+    }
+    prevLat = points[0];
+    prevLon = points[1];
+    polylines[p] = points;
+  }
+  if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route geometry block.");
+  return { cellId, polylines };
+}
+
+// Resolves an edge's geometry reference against its leaf's geometry block:
+// [latE7, lonE7, ...] pairs oriented in the edge's travel direction.
+export function edgePolyline(geomRef, geometryBlock) {
+  const canonical = geometryBlock.polylines[geomRef >>> 1];
+  if (!(geomRef & 1)) return canonical;
+  const points = new Int32Array(canonical.length);
+  for (let i = 0; i < canonical.length; i += 2) {
+    points[i] = canonical[canonical.length - 2 - i];
+    points[i + 1] = canonical[canonical.length - 1 - i];
+  }
   return points;
 }
 
@@ -395,6 +443,7 @@ export function encodeRouteRoot(root) {
     pushVarint(out, leaf.bbox.maxLon - leaf.bbox.minLon);
     pushVarint(out, leaf.shardIndex);
     pushPointer(out, leaf.pointer);
+    pushPointer(out, leaf.geometryPointer);
   }
   pushVarint(out, root.levels.length);
   for (const level of root.levels) {
@@ -465,7 +514,8 @@ export function decodeRouteRoot(bytes) {
     const maxLon = minLon + readVarint(bytes, state);
     const shardIndex = readVarint(bytes, state);
     const pointer = readPointer(bytes, state);
-    leaves.push({ firstNode, nodeCount: nodeCountLeaf, bbox: { minLat, maxLat, minLon, maxLon }, shardIndex, pointer });
+    const geometryPointer = readPointer(bytes, state);
+    leaves.push({ firstNode, nodeCount: nodeCountLeaf, bbox: { minLat, maxLat, minLon, maxLon }, shardIndex, pointer, geometryPointer });
   }
   const levelCount = readVarint(bytes, state);
   const levels = [];
