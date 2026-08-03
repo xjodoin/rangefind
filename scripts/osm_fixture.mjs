@@ -76,7 +76,8 @@ const REGIONS = {
 // document selection or normalized output changes so a large PBF can never
 // silently reuse an older corpus shape.
 // v10: compact render geometry and true area centroids for useful POI ways.
-const OSM_FIXTURE_SCHEMA_VERSION = 10;
+// v11: expanded, normalized alternate-name extraction and fallback identities.
+const OSM_FIXTURE_SCHEMA_VERSION = 11;
 
 function parseArgs(argv) {
   const args = {

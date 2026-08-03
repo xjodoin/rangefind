@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- OSM extraction now invalidates cached JSONL corpora when upgrading to the
+  expanded alternate-name schema, ensuring every rebuilt shard receives the
+  new aliases even when its source PBF is unchanged.
+
 ## 0.4.2 — 2026-08-03
 
 ### Added

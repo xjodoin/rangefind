@@ -332,6 +332,7 @@ test("extraction enriches documents from boundaries and place nodes end to end",
   await writeFile(pbf, encodePbf([encodeBlock(strings, { nodes, ways, relations })]));
 
   const meta = await extractOsmPlaces({ root, pbf, region: "testville" });
+  assert.equal(meta.schemaVersion, 11);
   assert.equal(meta.locality.boundaries, 1);
   assert.ok(meta.locality.enrichedFromBoundaries >= 1);
   assert.ok(meta.locality.enrichedFromPlaces >= 2);
