@@ -1,5 +1,6 @@
 import { createSearch } from "./runtime.browser.js";
 import { decodePolyline, searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
+import { geometryFeatureBounds, resultGeometryFeature } from "./result_geometry.js";
 
 const queryInput = document.querySelector("#queryInput");
 const searchButton = document.querySelector("#searchButton");
@@ -147,17 +148,37 @@ const map = new maplibregl.Map({
         }
       },
       {
+        id: "result-postal-areas-fill",
+        type: "fill",
+        source: "resultGeometries",
+        filter: ["==", ["get", "kind"], "postal-area"],
+        paint: { "fill-color": "#4285f4", "fill-opacity": 0.16 }
+      },
+      {
         id: "result-geometries-fill",
         type: "fill",
         source: "resultGeometries",
-        filter: ["==", ["geometry-type"], "Polygon"],
+        filter: ["all", ["==", ["geometry-type"], "Polygon"], ["!=", ["get", "kind"], "postal-area"]],
         paint: { "fill-color": "#16a085", "fill-opacity": 0.2 }
       },
       {
         id: "result-geometries-line",
         type: "line",
         source: "resultGeometries",
+        filter: ["!=", ["get", "kind"], "postal-area"],
         paint: { "line-color": "#0b7a69", "line-width": 3, "line-opacity": 0.85 }
+      },
+      {
+        id: "result-postal-areas-line",
+        type: "line",
+        source: "resultGeometries",
+        filter: ["==", ["get", "kind"], "postal-area"],
+        paint: {
+          "line-color": "#1a73e8",
+          "line-width": 3,
+          "line-opacity": 0.95,
+          "line-dasharray": [2, 1]
+        }
       }
     ]
   },
@@ -489,6 +510,7 @@ function openPlaceLens(item) {
   const location = resultLocation(item);
   const kind = semanticLabel(item);
   const details = item.details && typeof item.details === "object" ? item.details : {};
+  const postalArea = String(item.type || "").toLowerCase() === "postal_code";
   const services = [
     yesNoDetail(details.delivery, "Delivery"),
     yesNoDetail(details.takeaway, "Takeaway"),
@@ -501,16 +523,25 @@ function openPlaceLens(item) {
     yesNoDetail(details.payment_contactless, "Contactless")
   ].filter(Boolean).join(" · ");
   placeLensTitle.textContent = title;
-  placeLensEyebrow.textContent = item.locationType ? "Reverse geocode" : "OpenStreetMap place";
+  placeLensEyebrow.textContent = postalArea
+    ? "Postal code area"
+    : item.locationType ? "Reverse geocode" : "OpenStreetMap place";
   placeLensCopy.textContent = location || `${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}`;
   placeLensBadges.replaceChildren();
   appendBadge(placeLensBadges, kind, item.locationType ? "accuracy" : "");
+  if (postalArea) appendBadge(placeLensBadges, "Approximate coverage", "accuracy");
   appendBadge(placeLensBadges, formatDistance(item.distanceMeters));
   appendBadge(placeLensBadges, details.brand);
   appendBadge(placeLensBadges, details.cuisine ? detailText(details.cuisine) : "");
   appendBadge(placeLensBadges, yesNoDetail(details.wheelchair, "Wheelchair accessible"), "accessible");
 
   placeLensFacts.replaceChildren();
+  if (postalArea) {
+    appendFact("Postal code", item.postcode);
+    appendFact("Indexed addresses", Number(item.address_count) > 0 ? formatNumber(item.address_count) : "");
+    appendFact("Coverage samples", Number(item.sample_count) > 0 ? formatNumber(item.sample_count) : "");
+    appendFact("Area", "Approximate extent of indexed source points");
+  }
   appendFact("Hours", details.opening_hours);
   appendFact("Kitchen", details.kitchen_hours);
   appendFact("Brand", details.brand);
@@ -576,32 +607,13 @@ function clearMarkers() {
   map.getSource("resultGeometries")?.setData({ type: "FeatureCollection", features: [] });
 }
 
-function resultGeometryFeature(item) {
-  const geometry = item?.geometry;
-  if (geometry?.encoding !== "polyline" || !geometry.encoded) return null;
-  try {
-    const coordinates = decodePolyline(geometry.encoded, geometry.precision || 5)
-      .map(point => [point.lon, point.lat]);
-    if (coordinates.length < 2) return null;
-    return {
-      type: "Feature",
-      id: item.id,
-      properties: { id: item.id, name: item.name || item.title || item.id },
-      geometry: geometry.type === "Polygon"
-        ? { type: "Polygon", coordinates: [coordinates] }
-        : { type: "LineString", coordinates }
-    };
-  } catch {
-    return null;
-  }
-}
-
 function markerFor(item, index) {
   const title = item.name || item.title || item.id;
   const location = resultLocation(item);
   const accessibleLabel = location ? `${title}, ${location}` : title;
   const element = document.createElement("button");
   element.className = "result-marker";
+  element.classList.toggle("is-postal-area", String(item.type || "").toLowerCase() === "postal_code");
   element.type = "button";
   element.setAttribute("aria-label", accessibleLabel);
   const label = document.createElement("span");
@@ -640,9 +652,11 @@ function renderResults(results, { fit = false, query = "" } = {}) {
   resultList.replaceChildren();
   const bounds = new maplibregl.LngLatBounds();
   const visibleResults = results.slice(0, resultLimit());
+  const geometryFeatures = visibleResults.map(item => resultGeometryFeature(item, decodePolyline)).filter(Boolean);
+  const geometryById = new Map(geometryFeatures.map(feature => [String(feature.id), feature]));
   map.getSource("resultGeometries")?.setData({
     type: "FeatureCollection",
-    features: visibleResults.map(resultGeometryFeature).filter(Boolean)
+    features: geometryFeatures
   });
 
   for (const [index, item] of visibleResults.entries()) {
@@ -650,13 +664,18 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     const markerEntry = hasPoint ? markerFor(item, index) : null;
     if (markerEntry) {
       markers.push(markerEntry);
-      bounds.extend([item.lon, item.lat]);
     }
+    const featureBounds = geometryFeatureBounds(geometryById.get(String(item.id)));
+    if (featureBounds) {
+      bounds.extend(featureBounds[0]);
+      bounds.extend(featureBounds[1]);
+    } else if (hasPoint) bounds.extend([item.lon, item.lat]);
 
     const listItem = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
     button.className = "result-card";
+    button.classList.toggle("is-postal-area", String(item.type || "").toLowerCase() === "postal_code");
     const title = item.name || item.title || item.id;
     const location = resultLocation(item);
     button.setAttribute("aria-label", `${title}${location ? `, ${location}` : ""}`);
@@ -682,10 +701,14 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     const meta = document.createElement("span");
     meta.className = "meta";
     const addressCount = Number(item.address_count);
+    const sampleCount = Number(item.sample_count);
     const parts = [
       semanticLabel(item),
       Number.isFinite(addressCount) && addressCount > 0
         ? `${formatCompact(addressCount)} civic ${addressCount === 1 ? "address" : "addresses"}`
+        : "",
+      item.type === "postal_code" && Number.isFinite(sampleCount) && sampleCount > 0
+        ? `${formatCompact(sampleCount)} coverage ${sampleCount === 1 ? "sample" : "samples"}`
         : "",
       formatDistance(item.distanceMeters),
       item.shard ? String(item.shard).replaceAll("-", " ") : ""
@@ -723,10 +746,12 @@ function renderResults(results, { fit = false, query = "" } = {}) {
     button.append(number, body, arrow);
 
     const flyToResult = () => {
-      if (hasPoint) {
+      if (featureBounds) {
+        map.fitBounds(featureBounds, { padding: resultFitPadding(), maxZoom: 14, duration: 700 });
+      } else if (hasPoint) {
         map.flyTo({ center: [item.lon, item.lat], zoom: Math.max(map.getZoom(), 15), essential: true });
-        markerEntry.marker.togglePopup();
       }
+      markerEntry?.marker.togglePopup();
       mapHudText.textContent = `Selected ${title}`;
       openPlaceLens(item);
       setPanelCollapsed(true, title);
@@ -753,7 +778,8 @@ function renderResults(results, { fit = false, query = "" } = {}) {
   emptyState.hidden = true;
   resultList.hidden = false;
   if (fit && !bounds.isEmpty()) {
-    map.fitBounds(bounds, { padding: resultFitPadding(), maxZoom: 15, duration: 700 });
+    const hasAreaGeometry = geometryFeatures.some(feature => feature.geometry?.type === "Polygon");
+    map.fitBounds(bounds, { padding: resultFitPadding(), maxZoom: hasAreaGeometry ? 14 : 15, duration: 700 });
   }
 }
 
@@ -847,7 +873,12 @@ async function runSearch({ fit = false } = {}) {
       : anchoredQueryActive
         ? "drag to refresh"
         : "everywhere";
-    mapHudText.textContent = `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${scopeText}`;
+    const postalResult = shown === 1 && response.results[0]?.type === "postal_code"
+      ? response.results[0]
+      : null;
+    mapHudText.textContent = postalResult
+      ? `${postalResult.postcode || postalResult.name} · approximate postal coverage`
+      : `${formatNumber(shown)} ${shown === 1 ? "result" : "results"} · ${scopeText}`;
   } catch (error) {
     if (token !== searchToken) return;
     anchoredQueryActive = false;

@@ -1046,6 +1046,19 @@ a { color: inherit; }
 }
 .result-marker span { transform: rotate(45deg); }
 .result-marker:hover, .result-marker.active { background: #fff2c8; transform: rotate(-45deg) scale(1.15); }
+.result-marker.is-postal-area {
+  border-color: #0f4ea5;
+  border-radius: 50%;
+  background: #4285f4;
+  color: #fff;
+  transform: none;
+}
+.result-marker.is-postal-area span { transform: none; }
+.result-marker.is-postal-area:hover, .result-marker.is-postal-area.active {
+  background: #6ea2f7;
+  transform: scale(1.15);
+}
+.result-card.is-postal-area .result-card__number { border-color: #4285f4; color: #8ab4f8; }
 
 .panel-footer {
   flex: 0 0 auto;
