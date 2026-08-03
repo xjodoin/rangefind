@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.3 — 2026-08-03
+
 ### Fixed
 
 - OSM extraction now invalidates cached JSONL corpora when upgrading to the
