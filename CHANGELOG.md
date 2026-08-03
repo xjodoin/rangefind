@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Added
+
+- Static routing and itinerary planning (`rangefind/route`, `rangefind/route/node`,
+  `rangefind/route/build`): a CRP/MLD route graph (`rfroutegraph-v1`) built from
+  OSM road networks into range-addressed, content-addressed cell and overlay
+  objects. Point-to-point driving routes with geometry and named steps,
+  travel-time matrices, and multi-stop itinerary optimization (Held-Karp /
+  2-opt), all exactly equal to a full-graph Dijkstra and served from static
+  files with a bounded fetch set per query. The car profile honors directional
+  `maxspeed`, surface and smoothness degradation, access filters, and
+  single-via-node turn restrictions (compiled into the topology by via-node
+  expansion at build time). Sharded builds share one top overlay and route
+  identically to monolithic builds. Boundary-clique domination pruning and
+  breadth-wise batched path unpacking keep per-query transfer around 1.3 MB
+  and geometry unpacking to a handful of request waves on the Quebec extract.
+  Single-via-way restrictions expand their via chain with path memory, the
+  built-in HTTP adapter (`openRouteGraphUrl`) serves browsers with Range
+  requests and 200-fallback slicing, and TypeScript declarations ship at
+  `rangefind/route`. Car, bike, and foot profiles each build their own
+  index, with junction penalties (signals, stops, give-way, level
+  crossings) folded into edge weights. Time-of-day bucket metrics store one
+  exact overlay set per bucket (per-class time factors, day/hour rules,
+  `departureTime` selection) with per-bucket results equal to a reference
+  Dijkstra on the scaled graph. `alternatives: k` computes diverging routes
+  by penalized re-search over already-fetched objects, and `liveWeights`
+  re-ranks candidates and adjusts ETAs with per-edge factors keyed by
+  stable `leaf/edgeIndex` ids tied to the build epoch — the consumption
+  path for CDN-published or peer-to-peer traffic deltas. See
+  `docs/route-graph.md`.
+
 ## 0.4.6 — 2026-08-04
 
 ### Improved

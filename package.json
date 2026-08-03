@@ -79,6 +79,19 @@
       "node": "./src/index_shards.js",
       "default": "./src/node_only_entry.js"
     },
+    "./route": {
+      "types": "./types/route.d.ts",
+      "default": "./src/route_graph_query.js"
+    },
+    "./route/node": {
+      "types": "./types/route.d.ts",
+      "node": "./src/route_graph_node.js",
+      "default": "./src/node_only_entry.js"
+    },
+    "./route/build": {
+      "node": "./src/route_graph_build.js",
+      "default": "./src/node_only_entry.js"
+    },
     "./scoring-stats": {
       "types": "./types/scoring-stats.d.ts",
       "node": "./src/scoring_stats.js",

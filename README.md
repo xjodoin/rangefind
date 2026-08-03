@@ -75,6 +75,13 @@ combination, fallback, and deliberate boundary with runnable examples.
 - Generic route-corridor search over encoded polylines, coordinate arrays, or
   GeoJSON: exact point-to-route filtering, multi-resolution corridor cells,
   progress/direction/viewport ranking, and a rejoin point for every result.
+- Static routing and itinerary planning (`rangefind/route`): a CRP/MLD
+  route graph built from OSM road networks into range-addressed cell and
+  overlay objects — point-to-point driving routes with geometry and named
+  steps, travel-time matrices, and multi-stop itinerary optimization, all
+  exact versus a full-graph Dijkstra and served from static files with a
+  bounded fetch set per query; sharded builds share one top overlay and
+  route identically to monolithic ones — see `docs/route-graph.md`.
 - Search-as-you-type autocomplete inside the range-addressed authority index:
   diacritic-folded prefix and mid-label token matching, popularity or custom
   weights, exact best-first top-k with per-shard weight proofs, and
@@ -186,6 +193,7 @@ Start with the guide that matches the job:
 | **[Replace Google Maps APIs](https://rangefind.dev/google-maps-api-alternative/)** | Free public OSM index, migration adapter, API mapping, complete use cases, production checklist, attribution, and parity boundaries. |
 | **[Node](docs/node-runtime.md) / [mobile](docs/mobile.md)** | Local, remote, cached, embedded, and offline runtimes. |
 | **[Sharded OSM](docs/sharded-osm.md)** | Planet-scale regional builds, root routing, and exact score comparability. |
+| **[Route graph](docs/route-graph.md)** | Static routing, travel-time matrices, and itinerary planning over range-addressed road-network cells and overlays. |
 | **[Production maps benchmark](docs/osm-maps-benchmark.md)** | Google Maps-style workload coverage, quality assertions, and phone budgets. |
 
 ## Crawl A Static Site
