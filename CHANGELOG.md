@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.2 — 2026-08-03
+
+### Added
+
+- The OSM map demo renders postal-code coverage and generic bounded-result
+  geometry, fits selections to their full extent, and exposes postal coverage
+  metadata without changing the marker behavior for ordinary points.
+
 ### Improved
 
 - OSM search now splits multi-value alternate names, indexes documented name
