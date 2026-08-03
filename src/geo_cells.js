@@ -1,5 +1,6 @@
 import { pushVarint, readVarint } from "./binary.js";
 import { assertMagic } from "./codec.js";
+import { boxesForRadiusE7, latToE7, lonToE7 } from "./geo_tree.js";
 
 const GEO_CELL_BLOCK_MAGIC = [0x52, 0x46, 0x47, 0x43]; // RFGC
 const GEO_CELL_BLOCK_VERSION = 1;
@@ -66,6 +67,46 @@ export function geoCellsForBoxes(boxes, zoom, limit = Infinity) {
           if (cells.size > max) return null;
         }
       }
+    }
+  }
+  return [...cells.values()];
+}
+
+// Rasterize a buffered route directly at the candidate cell level. Using the
+// route rather than its overall bounding box is what keeps a Montreal–Quebec
+// City corridor thin: only cells touched by the line and its requested width
+// enter the category side-index lookup.
+export function geoCellsForRoute(route, zoom, limit = Infinity) {
+  const max = Math.max(1, Math.floor(Number(limit) || 1));
+  const cells = new Map();
+  const addBoxes = boxes => {
+    const next = geoCellsForBoxes(boxes, zoom, Math.max(1, max - cells.size));
+    if (!next) return false;
+    for (const cell of next) {
+      const key = `${cell.y}:${cell.x}`;
+      cells.set(key, cell);
+      if (cells.size > max) return false;
+    }
+    return true;
+  };
+  for (const segment of route?.segments || []) {
+    // At most half a tile between samples, further bounded by the corridor
+    // width. Radius boxes around the samples overlap, so no segment can fall
+    // through the raster even at coarse zoom levels.
+    const midLat = (segment.start.lat + segment.end.lat) / 2 * Math.PI / 180;
+    const tileMeters = 40075016.686 * Math.max(0.05, Math.cos(midLat)) / (2 ** zoom);
+    const stepMeters = Math.max(50, Math.min(route.corridorMeters, tileMeters / 2));
+    const steps = Math.max(1, Math.ceil(segment.lengthMeters / stepMeters));
+    let lonDelta = segment.end.lon - segment.start.lon;
+    if (lonDelta > 180) lonDelta -= 360;
+    if (lonDelta < -180) lonDelta += 360;
+    for (let step = 0; step <= steps; step++) {
+      const ratio = step / steps;
+      const lat = segment.start.lat + (segment.end.lat - segment.start.lat) * ratio;
+      let lon = segment.start.lon + lonDelta * ratio;
+      if (lon > 180) lon -= 360;
+      if (lon < -180) lon += 360;
+      if (!addBoxes(boxesForRadiusE7(latToE7(lat), lonToE7(lon), route.corridorMeters))) return null;
     }
   }
   return [...cells.values()];

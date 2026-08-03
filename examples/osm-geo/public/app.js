@@ -1,5 +1,5 @@
 import { createSearch } from "./runtime.browser.js";
-import { searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
+import { decodePolyline, searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
 
 const queryInput = document.querySelector("#queryInput");
 const searchButton = document.querySelector("#searchButton");
@@ -128,19 +128,38 @@ const map = new maplibregl.Map({
         tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
         tileSize: 256,
         attribution: "© OpenStreetMap contributors"
+      },
+      resultGeometries: {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] }
       }
     },
-    layers: [{
-      id: "osm",
-      type: "raster",
-      source: "osm",
-      paint: {
-        "raster-saturation": -0.62,
-        "raster-contrast": 0.12,
-        "raster-brightness-min": 0.22,
-        "raster-brightness-max": 0.9
+    layers: [
+      {
+        id: "osm",
+        type: "raster",
+        source: "osm",
+        paint: {
+          "raster-saturation": -0.62,
+          "raster-contrast": 0.12,
+          "raster-brightness-min": 0.22,
+          "raster-brightness-max": 0.9
+        }
+      },
+      {
+        id: "result-geometries-fill",
+        type: "fill",
+        source: "resultGeometries",
+        filter: ["==", ["geometry-type"], "Polygon"],
+        paint: { "fill-color": "#16a085", "fill-opacity": 0.2 }
+      },
+      {
+        id: "result-geometries-line",
+        type: "line",
+        source: "resultGeometries",
+        paint: { "line-color": "#0b7a69", "line-width": 3, "line-opacity": 0.85 }
       }
-    }]
+    ]
   },
   // Birmingham is already covered by the rolling public index and gives the
   // first visit a useful, searchable map instead of the midpoint of a global
@@ -554,6 +573,27 @@ function runDiscoveryOrbit(query, label) {
 function clearMarkers() {
   for (const { marker } of markers) marker.remove();
   markers = [];
+  map.getSource("resultGeometries")?.setData({ type: "FeatureCollection", features: [] });
+}
+
+function resultGeometryFeature(item) {
+  const geometry = item?.geometry;
+  if (geometry?.encoding !== "polyline" || !geometry.encoded) return null;
+  try {
+    const coordinates = decodePolyline(geometry.encoded, geometry.precision || 5)
+      .map(point => [point.lon, point.lat]);
+    if (coordinates.length < 2) return null;
+    return {
+      type: "Feature",
+      id: item.id,
+      properties: { id: item.id, name: item.name || item.title || item.id },
+      geometry: geometry.type === "Polygon"
+        ? { type: "Polygon", coordinates: [coordinates] }
+        : { type: "LineString", coordinates }
+    };
+  } catch {
+    return null;
+  }
 }
 
 function markerFor(item, index) {
@@ -600,6 +640,10 @@ function renderResults(results, { fit = false, query = "" } = {}) {
   resultList.replaceChildren();
   const bounds = new maplibregl.LngLatBounds();
   const visibleResults = results.slice(0, resultLimit());
+  map.getSource("resultGeometries")?.setData({
+    type: "FeatureCollection",
+    features: visibleResults.map(resultGeometryFeature).filter(Boolean)
+  });
 
   for (const [index, item] of visibleResults.entries()) {
     const hasPoint = Number.isFinite(item.lat) && Number.isFinite(item.lon);
@@ -655,7 +699,7 @@ function renderResults(results, { fit = false, query = "" } = {}) {
 
     const details = item.details && typeof item.details === "object" ? item.details : {};
     const chipValues = [
-      details.opening_hours ? "Hours" : "",
+      item.openNow === true ? "Open now" : item.openNow === false ? "Closed" : details.opening_hours ? "Hours" : "",
       details.brand,
       details.cuisine ? detailText(details.cuisine) : "",
       yesNoDetail(details.wheelchair, "Accessible"),

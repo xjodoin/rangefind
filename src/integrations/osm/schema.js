@@ -1,12 +1,12 @@
 import { OSM_CANONICAL_TYPES } from "./category_lexicon.js";
 
-export const OSM_INTEGRATION_SCHEMA_VERSION = 2;
+export const OSM_INTEGRATION_SCHEMA_VERSION = 3;
 
 export const OSM_DISPLAY_FIELDS = Object.freeze([
   "name", "address", "house_number", "street", "unit", "suburb",
   "city", "district", "state", "postcode", "country",
   "url", "category", "type", "lat", "lon", "address_count",
-  "prominence", "details",
+  "prominence", "details", "geometry",
   "_address_range_start", "_address_range_end", "_address_range_step",
   "_address_range_geometry", "_address_range_kind", "_address_range_inclusion"
 ]);
@@ -91,6 +91,17 @@ export function createOsmIndexConfig(options = {}) {
       { name: "brand", path: "details.brand" },
       { name: "cuisine", path: "details.cuisine" },
       { name: "wheelchair", path: "details.wheelchair" },
+      { name: "toilets_wheelchair", path: "details.toilets_wheelchair" },
+      { name: "internet_access", path: "details.internet_access" },
+      { name: "outdoor_seating", path: "details.outdoor_seating" },
+      { name: "takeaway", path: "details.takeaway" },
+      { name: "delivery", path: "details.delivery" },
+      { name: "drive_through", path: "details.drive_through" },
+      { name: "reservation", path: "details.reservation" },
+      { name: "payment_cash", path: "details.payment_cash" },
+      { name: "payment_cards", path: "details.payment_cards" },
+      { name: "payment_contactless", path: "details.payment_contactless" },
+      { name: "fee", path: "details.fee" },
       { name: "access", path: "details.access" }
     ],
     // Keep curated type bitmaps for broad/text lanes that cannot use spatial
@@ -113,6 +124,9 @@ export function createOsmIndexConfig(options = {}) {
       blockZoom: 9,
       codeGroupSize: 16,
       maxCellsPerQuery: 48,
+      // One extra code stores all point ordinals. It is the generic route
+      // lane for named brands/POIs that have no category predicate.
+      includeAll: true,
       values: [...OSM_CANONICAL_TYPES]
     }],
     // Geo leaf capsules turn the spatial range read into a self-contained
@@ -122,7 +136,7 @@ export function createOsmIndexConfig(options = {}) {
     geoCapsuleFields: [
       "id", "name", "address", "house_number", "street", "unit", "suburb",
       "city", "district", "state", "postcode", "country", "url", "category",
-      "type", "lat", "lon", "address_count", "prominence", "details"
+      "type", "lat", "lon", "address_count", "prominence", "details", "geometry"
     ],
     suggest: [
       { path: "search_name", weightPath: "population" },

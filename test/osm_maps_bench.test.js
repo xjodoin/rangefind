@@ -104,6 +104,39 @@ test("Maps benchmark expectations catch locality and viewport regressions", () =
   });
   assert.equal(reverseShape.passed, true);
 
+  const routeShape = evaluateExpectations({
+    results: [{
+      name: "Tim Hortons",
+      shard: "quebec",
+      routeDistanceMeters: 180,
+      routeProgressMeters: 1200,
+      routeRank: 200,
+      rejoinPoint: { lat: 45.51, lon: -73.59 },
+      openNow: true,
+      geometry: { type: "Polygon", encoded: "abc" }
+    }, {
+      name: "Tim Hortons",
+      shard: "quebec",
+      routeDistanceMeters: 320,
+      routeProgressMeters: 4500,
+      routeRank: 400,
+      rejoinPoint: { lat: 45.53, lon: -73.61 },
+      openNow: true
+    }],
+    stats: { plannerLane: "osmRouteCorridor", shardsQueried: 1 }
+  }, {
+    minResults: 1,
+    allRouteDistancesMax: 1500,
+    routeProgressAscending: true,
+    routeRankAscending: true,
+    topHasRejoinPoint: true,
+    allOpenNow: true,
+    geometryCoverageMin: 0.5,
+    lanes: ["osmRouteCorridor"],
+    maxShardsQueried: 1
+  });
+  assert.equal(routeShape.passed, true);
+
   const foreign = evaluateExpectations({
     ...response,
     results: [{ ...response.results[0], shard: "ontario", lat: 43.65, lon: -79.38 }]

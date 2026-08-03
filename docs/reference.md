@@ -3,7 +3,8 @@
 Complete reference for configuring, tuning, building, deploying, and querying
 a Rangefind index — configuration schema, build tuning, the runtime API, and
 deployment. For the conceptual overview and format internals see
-[`architecture.md`](architecture.md); for feature-specific benchmarks see the
+[`architecture.md`](architecture.md); for a capability-oriented overview see
+the [feature guide](features.md); for feature-specific benchmarks see the
 `*-benchmarks.md` docs.
 
 - [Mental model](#mental-model)
@@ -16,6 +17,7 @@ deployment. For the conceptual overview and format internals see
     [`sorts` / `sortReplicas`](#sorts-and-sortreplicas)
   - [`authority`](#authority) · [`geo`](#geo) · [`suggest`](#suggest) ·
     [`vectors`](#vectors)
+  - [`rankPrior`](#rankprior) · [geo capsules/cells](#geo-capsules-and-multi-resolution-cell-indexes)
   - [Typo correction](#typo-correction)
 - [Build tuning reference](#build-tuning-reference)
 - [Runtime API](#runtime-api)
@@ -23,6 +25,7 @@ deployment. For the conceptual overview and format internals see
   - [`engine.search(params)`](#enginesearchparams)
   - [`engine.count` / `suggest` / `vectorSearch`](#other-query-methods)
   - [Response `stats`](#response-stats)
+- [OpenStreetMap integration](#openstreetmap-integration)
 - [Static site generator adapters](#static-site-generator-adapters)
 - [Incremental publishing](#incremental-publishing)
 - [Deployment requirements](#deployment-requirements)
@@ -56,11 +59,23 @@ Package exports:
 
 | Import | Purpose |
 | --- | --- |
-| `rangefind` → `src/runtime.js` | `createSearch` (Node ESM source) |
-| `rangefind/browser` → `dist/runtime.browser.js` | bundled ESM runtime for the browser |
-| `rangefind/builder` → `src/builder.js` | `build({ configPath })` |
-| `rangefind/analysis` → `src/analysis.js` | `createAnalyzer`, `analyzerForConfig`, `analyzerFromManifest`, `normalizeAnalysisConfig`, `DEFAULT_ANALYZER` |
-| `rangefind/terms` → `src/terms.js` | term/query-bundle helpers (`expandedTermsFromBaseTerms`, `queryBundleKeysFromBaseTerms`, …) |
+| `rangefind` | Core `createSearch`, fetch/inflate injection, and the default ESM runtime. |
+| `rangefind/browser` | Bundled ESM runtime for browsers. |
+| `rangefind/node` | Local positional-read or cached remote Node runtime. |
+| `rangefind/mobile` | Injected-I/O runtime for React Native and embedded JavaScript hosts. |
+| `rangefind/element` / `rangefind/element.css` | Search Web Component and optional theme. |
+| `rangefind/builder` | Node index builder: `build({ configPath, update?, compact? })`. |
+| `rangefind/crawler` | Static HTML crawler used by `rangefind build ./dist`. |
+| `rangefind/osm` | Browser-safe OSM documents, schema, intents, constraints, hours, route, and geometry helpers. |
+| `rangefind/osm/node` | OSM/RQA build and sharded publication helpers. |
+| `rangefind/osm/extract` | Bounded PBF-to-JSONL extraction. |
+| `rangefind/shards` | Root manifests plus text/suggest routing and sidecar writers. |
+| `rangefind/scoring-stats` | Frozen corpus-wide statistics for independently built shards/generations. |
+| `rangefind/config` | Node config loading and normalization. |
+| `rangefind/analysis` | Analyzer construction and normalization. |
+| `rangefind/terms` | Term/query-bundle helpers. |
+| `rangefind/link-graph` | PageRank-style graph scoring helpers. |
+| `rangefind/package.json` | Package metadata. |
 | `rangefind` bin | the `rangefind build` CLI |
 
 In the browser, import the bundle so no source resolution is needed:
@@ -333,6 +348,24 @@ Accepts `true`/`false`/`1`/`0`/`"true"`/`"false"`.
   `{ "field": "year", "order": "desc" }`; the field must be a configured
   number or boolean.
 
+### `rankPrior`
+
+A generic normalized numeric relevance prior, useful for static prominence,
+quality, popularity, or authority signals:
+
+```json
+{ "rankPrior": { "field": "prominence", "boost": 0.35, "overfetch": 4 } }
+```
+
+- `field` — a configured numeric field whose values are normalized to `[0, 1]`.
+- `boost` — non-negative multiplier in `score *= 1 + boost * value`.
+- `overfetch` — bounded candidate-window multiplier, clamped to 1–20.
+
+The prior is applied outside the posting hot loop. Query parameters
+`rankPrior: false`, `rankPriorBoost`, and `rankPriorOverfetch` can disable or
+retune it. The static-site crawler's link graph is built on this mechanism; OSM
+uses it for place prominence.
+
 ### `authority`
 
 An exact title/entity/alias rescue index, layered over BM25 so canonical
@@ -366,6 +399,52 @@ text+geo). See [`osm-geo-benchmarks.md`](osm-geo-benchmarks.md).
   double doc-values (do not declare colliding number fields).
 
 Tuning: `geoLeafSize` (default `512` points/leaf), `geoPackBytes`.
+
+### Geo capsules and multi-resolution cell indexes
+
+Geo capsules keep a small map-result projection in each geo leaf so viewport
+and nearest queries can return display fields without opening document packs:
+
+```json
+{
+  "geoCapsules": true,
+  "geoCapsuleFields": ["id", "name", "type", "lat", "lon"],
+  "geoCapsuleDocPageCachePages": 256
+}
+```
+
+Multi-resolution cell indexes route a facet-constrained radius, viewport, or
+route query directly to intersecting point ordinals:
+
+```json
+{
+  "geoCellIndexes": [{
+    "field": "location",
+    "facet": "type",
+    "levels": [8, 10, 12, 14],
+    "blockZoom": 8,
+    "codeGroupSize": 16,
+    "maxCellsPerQuery": 48,
+    "maxFacetValues": 256,
+    "includeAll": true,
+    "values": []
+  }]
+}
+```
+
+- `levels` — grid zoom levels available to the query planner.
+- `blockZoom` — directory grouping zoom, from 0 through the lowest level.
+- `codeGroupSize` — facet codes grouped into one packed block.
+- `maxCellsPerQuery` — hard planning budget; the runtime chooses a coarser
+  configured level when needed.
+- `maxFacetValues` — maximum distinct facet values represented.
+- `values` — optional allowlist; empty means eligible dictionary values.
+- `includeAll` — add a reserved all-point occupancy lane. This lets arbitrary
+  names and brands use route/viewport cells even when no category facet is
+  known.
+
+Cell indexes contain routing ordinals, not duplicate result payloads. Without
+these optional structures the same query falls back to the geo tree.
 
 ### `suggest`
 
@@ -513,6 +592,8 @@ loadFacetValues }`.
 | `trace` | `false` | — | Attach a per-query fetch/latency trace to `stats`. |
 | `multiRangeRequests` | `true` in browsers | — | Batch separated grouped reads from the same immutable object; automatically falls back when unsupported. |
 | `multiRangeMaxRanges` | `32` | 2–64 | Maximum byte ranges in one multipart request. |
+| `geoCapsules` | manifest | — | Use compact result rows embedded in geo leaves; `false` forces ordinary document hydration. |
+| `geoCellIndexes` | manifest | — | Use multi-resolution facet/corridor routing; `false` forces geo-tree traversal. |
 | `rangePlans` | see below | — | Per-lane range-coalescing budgets. |
 | `topKProofMaxK` | `100` | 1–1000 | Max k eligible for the exact top-k proof. |
 | `postingBlockFrontier` | `4` | 1–16 | Posting blocks decoded per frontier batch. |
@@ -585,8 +666,12 @@ await engine.search({
   is `type: "date"`.
 - `sort` — `"field"`, `"-field"`, or `{ field, order: "asc"|"desc" }`. Field
   must be a sortable number/boolean.
-- `geo` — `{ field?, near: { lat, lon, radiusMeters? }, box: { minLat, maxLat,
-  minLon, maxLon }, boost: { weight, pivotMeters }, sort: "distance" }`. `near`
+- `geo` — `{ field?, near, box, route, corridorMeters, routePositionMeters,
+  routeDirection, viewport, boost, sort: "distance"|"route" }`. `route` accepts
+  an encoded polyline, GeoJSON LineString/MultiLineString, or coordinate array.
+  Route results gain cross-track distance, forward progress, bearing, and the
+  closest `rejoinPoint`; corridor/category lookup uses the same multi-resolution
+  cells and multipart range transport as box/radius search. `near`
   without `radiusMeters` plus `sort:"distance"` is exact nearest-neighbor; with
   `radiusMeters` it filters. `box` and `near` are mutually exclusive. `boost`
   applies `weight·pivot/(pivot+distance)` to the page window. Results gain
@@ -607,6 +692,10 @@ await engine.search({
 - `includeResults` — set `false` to get ranked `{ index, score }` rows without
   hydrating display payloads.
 - `trace` — attach a fetch/latency trace to `stats.trace`.
+- `shards` — on a sharded root, restrict the query to one or more shard ids or
+  hierarchy group labels.
+- `rankPrior`, `rankPriorBoost`, `rankPriorOverfetch` — disable or override a
+  manifest-configured numeric relevance prior.
 
 **Response:** `{ total, results, page, size, approximate?, correctedQuery?,
 corrections?, facets?, stats }`. Each result carries the `display` fields plus
@@ -628,8 +717,15 @@ early-stopped totals and sampled facet counts.
   64.
 - **`engine.loadFacetValues(field)`** — the full facet dictionary (all values
   with global document frequencies).
+- **`engine.authorityLookup(surface, { size })`** — normalized exact-surface
+  lookup in the authority autocomplete lexicon. Sharded-root matches include
+  owning `shards`; returns `null` when no suitable lexicon exists.
 - **`engine.hydrateRows(rows)`** — hydrate `[index, score]` rows into display
   results (used internally by the generational layer).
+- **`engine.loadBuildTelemetry()`**, **`loadIndexOptimizer()`**, and
+  **`loadSegmentManifest()`** — lazily load optional diagnostics. These are
+  available on a single/generational engine when the corresponding artifacts
+  exist and are primarily intended for tooling.
 
 ### Response `stats`
 
@@ -639,8 +735,9 @@ Notable fields:
 - Text: `plannerLane` (`tailProof` | `fullFallback` | `blockBudget`),
   `exact`, `blocksDecoded`, `postingsDecoded`, `skippedBlocks`.
 - Geo: `geoLane` (`browse` | `nearest` | `nearestText` | `textDocSet` |
-  `textDocValues`), `geoCandidateLeaves`, `geoLeavesVisited`,
-  `geoPointsScanned`, `geoPointsAccepted`.
+  `textDocValues` | route/cell variants), `geoCandidateLeaves`,
+  `geoLeavesVisited`, `geoPointsScanned`, `geoPointsAccepted`, plus route-cell
+  and route-ranking counters when applicable.
 - Suggest: `suggestLane` (`authority-hot` | `authority-lexicon` |
   `authority-title` for old indexes), `suggestShardsVisited`, and
   `suggestEntriesScanned`.
@@ -809,6 +906,205 @@ function Search() {
   return <rangefind-search ref={ref} src="/rangefind/" placeholder="Search…" />;
 }
 ```
+
+---
+
+## OpenStreetMap integration
+
+`rangefind/osm` is browser-safe and operates on the normal Rangefind runtime.
+`rangefind/osm/node` and `rangefind/osm/extract` are Node-only build surfaces.
+See the [complete feature guide](features.md#openstreetmap-application-features)
+and [OSM example](../examples/osm-geo/README.md) for the supported map journeys.
+
+### Build APIs
+
+```js
+import { createOsmIndexConfig } from "rangefind/osm";
+import { buildOsmIndex, buildOsmShardedIndex, augmentOsmWithRqa } from "rangefind/osm/node";
+import { extractOsmPlaces } from "rangefind/osm/extract";
+```
+
+- `createOsmIndexConfig(options)` — returns the schema-v3 generic Rangefind
+  config, including display/details, typed constraint facets, geo capsules,
+  category cells, wildcard occupancy, authority, suggestion, and prominence.
+- `extractOsmPlaces(options)` — bounded, resumable PBF extraction into normalized
+  place/address JSONL, including locality enrichment, interpolation, and useful
+  closed-way geometry.
+- `buildOsmIndex(options)` — build/publish one ordinary OSM index.
+- `buildOsmShardedIndex({ shards, output, ... })` — independently build regions
+  with frozen scoring stats and publish a federated root.
+- `augmentOsmWithRqa(options)` — stream Québec RQA civic/postal data into an OSM
+  corpus while suppressing only canonical duplicates.
+
+### Search, autocomplete, and reverse geocoding
+
+```js
+import {
+  reverseGeocodeOsm,
+  searchOsmQuery,
+  suggestOsmQuery
+} from "rangefind/osm";
+
+const found = await searchOsmQuery(engine, {
+  query: "pharmacie Rosemère",
+  near: { lat: 45.63, lon: -73.80 },
+  limit: 10,
+  trace: true
+});
+
+const predictions = await suggestOsmQuery(engine, {
+  query: "214 rue lib",
+  inputOffset: 11,
+  near: { lat: 45.64, lon: -73.83 },
+  limit: 8
+});
+
+const addresses = await reverseGeocodeOsm(engine, {
+  lat: 45.5019,
+  lon: -73.5674,
+  radiusMeters: 5000,
+  size: 8,
+  resultTypes: ["street_address"],
+  locationTypes: ["ROOFTOP", "RANGE_INTERPOLATED"]
+});
+```
+
+`searchOsmQuery` accepts the core `SearchParams` plus:
+
+| Parameter | Purpose |
+| --- | --- |
+| `query` / `q` | Natural map query. `query` is convenient for integration callers. |
+| `near` | Advisory device/map anchor used for intent resolution and location bias. |
+| `limit` / `size` | Requested result count. |
+| `reverseGeocode` | `false` keeps coordinate input as a raw marker; an object overrides reverse options. |
+| `inputOffset` | Cursor position used by autocomplete. |
+| `constraints` | Explicit typed OSM constraint object. |
+| `at`, `timeZone` | Clock and IANA timezone for deterministic open-now evaluation. |
+| `includeUnknownOpenNow` | Retain unsupported/missing schedules while marking them unknown. |
+| `route`, `corridorMeters`, `polylinePrecision` | Route geometry and corridor. |
+| `routePositionMeters`, `routeDirection`, `viewport` | Route-aware ranking context. |
+
+`suggestOsmQuery` returns legacy `text`/`weight` fields plus structured
+`mainText`, `secondaryText`, `matchedRanges`, `types`, and `selection`.
+`selection.shards` can scope the selected follow-up search.
+
+For existing Google Places/Geocoding clients, `rangefind/osm` also exports
+`createRangefindMapsAdapter(engine, options)`. It provides promise-based
+`autocomplete`, `textSearch`, `nearbySearch`, `geocode`, `reverseGeocode`,
+`searchAlongRoute`, and cached `placeDetails` methods with Google-like request
+names while preserving Rangefind metadata. It is a migration facade, not a
+byte-for-byte Google response clone. See the
+[Google Maps migration guide](google-maps-migration.md).
+
+Reverse-geocode `resultTypes` restrict semantic address/place types;
+`locationTypes` accepts `ROOFTOP`, `RANGE_INTERPOLATED`, `GEOMETRIC_CENTER`,
+and `APPROXIMATE`. The default hard search radius is 5 km, result size is
+capped at 25, and `localityRadiusMeters` controls only the bounded locality
+fallback.
+
+### Constraints and open-now
+
+```js
+const response = await searchOsmQuery(engine, {
+  query: "cafe",
+  constraints: {
+    openNow: true,
+    wheelchair: true,
+    toiletsWheelchair: true,
+    contactless: true,
+    delivery: true,
+    takeaway: true,
+    driveThrough: false,
+    outdoorSeating: true,
+    internet: true,
+    reservation: true,
+    free: false
+  },
+  at: new Date(),
+  timeZone: "America/Toronto"
+});
+```
+
+Only `true` predicates are required; `false` means “do not require,” not a
+negative filter. The same predicates can be extracted from supported English
+and French phrases. Static predicates are pushed into available facets and
+verified against `result.details` after hydration.
+
+```js
+import {
+  annotateConstraintResult,
+  compileOsmConstraintFilters,
+  evaluateOpeningHours,
+  evaluateOsmConstraints,
+  parseOsmConstraints
+} from "rangefind/osm";
+```
+
+Those lower-level helpers are exported for applications that want to reuse the
+parser/evaluator around a custom retrieval flow. `evaluateOpeningHours()`
+supports `24/7`, weekday lists/ranges, multiple and overnight intervals,
+closures, and later-rule overrides. Calendar/holiday and solar-time syntax is
+returned as `unknown` by design.
+
+### Route corridors
+
+```js
+import { searchAlongRouteOsm } from "rangefind/osm";
+
+const response = await searchAlongRouteOsm(engine, {
+  route: encodedPolylineOrGeoJSON,
+  query: "Tim Hortons open now with contactless",
+  corridorMeters: 1500,
+  routePositionMeters: 12_400,
+  routeDirection: "forward",
+  viewport: { lat: 45.56, lon: -73.66 },
+  timeZone: "America/Toronto",
+  limit: 20
+});
+```
+
+`route` accepts encoded polyline (precision 5 by default), GeoJSON
+LineString/MultiLineString/Feature/FeatureCollection, or coordinate arrays.
+Results include:
+
+| Field | Meaning |
+| --- | --- |
+| `routeDistanceMeters` | Perpendicular distance to the closest route segment. |
+| `routeProgressMeters` / `routeProgressRatio` | Position along the complete line. |
+| `routeBearingDegrees` | Bearing of the matched segment. |
+| `routeRank` | Combined corridor/progress/direction/viewport rank. |
+| `rejoinPoint` | Closest `{ lat, lon }` on the route. |
+| `routeMatch` | Full segment index, segment progress, distance, bearing, and rejoin details. |
+
+`decodePolyline`, `encodePolyline`, and the generic route helpers are also
+exported by `rangefind/osm`. Route search does not calculate driving detours or
+directions.
+
+### Geometry and result details
+
+Schema-v3 OSM builds can return a compact `details` object and useful area/line
+geometry. Geometry has the form:
+
+```js
+{
+  type: "Polygon",             // or "LineString"
+  encoded: "...",
+  precision: 5,
+  bbox: [minLon, minLat, maxLon, maxLat]
+}
+```
+
+Decode `encoded` with `decodePolyline`; polygon rings are closed. Extraction
+limits, simplifies, and caps the retained point sequence so geometry remains a
+small result capsule rather than a general-purpose vector-tile replacement.
+
+### OSM schema compatibility
+
+Runtime intent code degrades to generic text/geo routing when optional
+artifacts are missing, but indexed data cannot be invented. Typed details,
+constraint verification, wildcard brand-route cells, and result geometry need
+an OSM schema-v3 rebuild. Use `npm run bench:osm-maps:next-index` before
+promoting a rebuilt index.
 
 ---
 

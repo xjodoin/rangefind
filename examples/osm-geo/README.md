@@ -16,6 +16,7 @@ exported from `rangefind/osm`; bounded PBF/RQA build helpers are exported from
 import {
   createOsmIndexConfig,
   reverseGeocodeOsm,
+  searchAlongRouteOsm,
   searchOsmQuery,
   suggestOsmQuery
 } from "rangefind/osm";
@@ -26,6 +27,51 @@ Both APIs produce and query the normal Rangefind pack format. There is no OSM
 sidecar or parallel runtime. `scripts/osm_fixture.mjs` remains a resumable CLI
 for PBF extraction and delegates document shaping, RQA ingestion, schema
 generation, and index publication to these modules.
+
+Existing Google Places/Geocoding integrations can start with the supported
+`createRangefindMapsAdapter(engine)` facade exported by `rangefind/osm`. It
+maps common Autocomplete, Text Search, Nearby Search, Place Details, forward/
+reverse geocoding, and supplied-route search request shapes while retaining
+Rangefind/OSM metadata. The full migration walkthrough, production checklist,
+and parity boundaries are in
+[`docs/google-maps-migration.md`](../../docs/google-maps-migration.md).
+
+Route-corridor search accepts either an encoded polyline or GeoJSON and stays
+inside the same static range-request pipeline:
+
+```js
+const response = await searchAlongRouteOsm(engine, {
+  route: encodedPolylineOrGeoJSON,
+  query: "wheelchair-accessible Tim Hortons open now with contactless",
+  corridorMeters: 1500,
+  limit: 20,
+  routePositionMeters: 12_400,
+  routeDirection: "forward",
+  viewport: { lat: 45.56, lon: -73.66 },
+  timeZone: "America/Toronto"
+});
+```
+
+The route is rasterized directly into the existing multi-resolution category
+cells. Adjacent cell-directory, geo-leaf, and capsule reads use Rangefind's
+grouped/multipart byte-range transport. Results include
+`routeDistanceMeters`, `routeProgressMeters`, `routeBearingDegrees`, and an
+exact `rejoinPoint`. The input line direction defines forward travel order;
+`routeDirection: "reverse"` reverses it without rewriting the polyline.
+
+Natural constraints are also accepted by ordinary `searchOsmQuery` calls.
+Supported typed predicates include wheelchair access, accessible toilets,
+contactless payment, delivery, takeaway, drive-through, outdoor seating,
+internet, reservations, and free admission. Indexed facets prune candidates;
+the returned OSM details are verified again client-side. `open now` evaluates
+common `opening_hours` rules in the requested IANA time zone. Unsupported
+holiday or calendar expressions remain `unknown` and are excluded by default,
+so the client never invents an open status.
+
+Area-like OSM ways publish compact encoded polygon geometry in geo capsules.
+Map clients can decode it with `decodePolyline(result.geometry.encoded,
+result.geometry.precision)` and render the actual park, campus, venue, or
+building instead of only its marker.
 
 `reverseGeocodeOsm(engine, { lat, lon, radiusMeters, size })` resolves nearest
 indexed addresses inside a hard radius and routes only through shards whose

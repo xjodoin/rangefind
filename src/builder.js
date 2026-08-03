@@ -1659,9 +1659,10 @@ function prepareGeoCellIndexes(config, dicts) {
       id,
       codes: selectedCodes,
       codeSet: new Set(selectedCodes),
+      includeAll: item.includeAll === true,
       records: 0
     };
-  }).filter(item => item.codes.length);
+  }).filter(item => item.codes.length || item.includeAll);
 }
 
 function appendGeoCellLeafRoutes(spool, indexes, points, leaf, codes) {
@@ -1671,6 +1672,7 @@ function appendGeoCellLeafRoutes(spool, indexes, points, leaf, codes) {
       const doc = points.docs[position];
       const selected = facetCodesForBitmap(codeValue(codes, index.facet, doc))
         .filter(code => index.codeSet.has(code));
+      if (index.includeAll) selected.unshift(0);
       if (!selected.length) continue;
       for (const level of index.levels) {
         const cell = geoCellForE7(points.latsE7[position], points.lonsE7[position], level);
@@ -1811,6 +1813,7 @@ async function writeGeoCellRoutes(out, config, indexes, spool) {
         code_group_size: index.codeGroupSize,
         max_cells_per_query: index.maxCellsPerQuery,
         codes: index.codes,
+        ...(index.includeAll ? { all_code: 0 } : {}),
         records: index.records
       }))
     };

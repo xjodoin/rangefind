@@ -22,6 +22,7 @@ import { createNodeSearch } from "../src/runtime.node.js";
 import {
   addressFromTags,
   enrichDocLocality,
+  geometryForWay,
   interpolationRangeDocs,
   osmProminence,
   placeDetails,
@@ -50,6 +51,21 @@ test("address keys normalize directions, suffixes, punctuation, and ordinal word
   assert.equal(normalizePostalCodeSpacing("h4r 1p8"), "h4r 1p8");
   assert.equal(normalizePostalCodePrefixSpacing("J7A1V"), "J7A 1V");
   assert.equal(normalizePostalCodePrefixSpacing("pharmacy J7A1"), "pharmacy J7A 1");
+});
+
+test("OSM area geometry is compact and supplies a real polygon centroid", () => {
+  const shape = geometryForWay([
+    { lat: 45.5, lon: -73.6 },
+    { lat: 45.5, lon: -73.58 },
+    { lat: 45.52, lon: -73.58 },
+    { lat: 45.52, lon: -73.6 },
+    { lat: 45.5, lon: -73.6 }
+  ]);
+  assert.equal(shape.geometry.type, "Polygon");
+  assert.equal(shape.geometry.encoding, "polyline");
+  assert.ok(shape.geometry.encoded.length < 80);
+  assert.ok(Math.abs(shape.center.lat - 45.51) < 1e-6);
+  assert.ok(Math.abs(shape.center.lon + 73.59) < 1e-6);
 });
 
 test("named OSM roads publish locality-qualified street authority", () => {

@@ -244,6 +244,7 @@ function applyIndexProfile(config, raw) {
       codeGroupSize: clampInt(item.codeGroupSize, 16, 1, 256),
       maxCellsPerQuery: clampInt(item.maxCellsPerQuery, 48, 1, 256),
       maxFacetValues: clampInt(item.maxFacetValues, 256, 1, 4096),
+      includeAll: item.includeAll === true,
       values: Array.isArray(item.values)
         ? [...new Set(item.values.map(String).map(value => value.trim()).filter(Boolean))]
         : []

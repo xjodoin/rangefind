@@ -30,8 +30,9 @@ viewport restriction, discovery around a selected result, location-biased text,
 unanchored typo recovery, empty results, inline place-detail fields, and urban,
 interpolated, international, rural, locality-filtered, and uncovered
 reverse-geocoding probes. The next-index profile adds strict checks for compact
-OSM place details and exact named-road authority once those build-time fields
-have been published.
+OSM place details, exact named-road authority, typed/open-now constraints,
+route corridors, and useful area geometry once those schema-v3 build-time
+fields and routing cells have been published.
 
 ## API replacement coverage
 
@@ -43,10 +44,15 @@ have been published.
 | Forward Geocoding | Civic, street, postal, intersection, and interpolated addresses | Covered |
 | Place Details | Stable id, coordinates, address/locality, type, hours, contact, brand/operator, cuisine, accessibility, service/payment capabilities, and OSM references returned inline | Covered for indexed OSM fields |
 | Reverse Geocoding | Address-first coordinate lookup with a hard radius, covering-shard routing, structured components, result/accuracy filters, locality fallback, interpolation ranges, international/rural results, and bounded zero results | Covered |
-| Photos, reviews, live hours, traffic, and directions | Not present in the static OSM search index | Out of scope |
+| Typed place constraints | Accessibility, accessible toilets, contactless, delivery, takeaway, drive-through, outdoor seating, internet, reservations, and fees with facet pushdown plus result verification | Covered by schema-v3 promotion profile |
+| Open now | Conservative client evaluation of indexed common OSM `opening_hours` rules in an IANA timezone | Covered by schema-v3 promotion profile |
+| Search along route | Encoded polyline/GeoJSON corridor cells, exact distance, forward progress/direction, viewport bias, and rejoin points | Covered by schema-v3 promotion profile |
+| Area geometry | Compact simplified OSM polygon/line payload and geometry coverage | Covered by schema-v3 promotion profile |
+| Photos, reviews, real-time exceptional hours, traffic, driving detours, and directions | Not present in the static OSM search index | Out of scope |
 
 This is still not complete Google Maps API parity: dynamic place content,
-photos, reviews, live hours, traffic, and directions remain out of scope. The
+photos, reviews, real-time schedule exceptions, traffic, driving detours, and
+directions remain out of scope. The
 production score measures the supported static search and geocoding contract,
 while the full profile also retains lower-volume and pathological routing
 probes.
@@ -75,7 +81,7 @@ npm run bench:osm-maps
 # Strict 43-case Google Maps search/geocoding replacement workload.
 npm run bench:osm-maps:production
 
-# Strict 45-case promotion gate for a freshly rebuilt schema-v2 OSM index.
+# Strict 49-case promotion gate for a freshly rebuilt schema-v3 OSM index.
 npm run bench:osm-maps:next-index
 
 # All 56 cases, including lower-frequency transit, postal-code, native-script,
@@ -110,7 +116,9 @@ Every case includes:
 - cold and warm latency, requests, bytes, fetch buckets, and opened shards;
 - declarative quality checks for expected text/type, locality, viewport,
   distance ordering, routing lane, shard fan-out, target rank, structured
-  predictions, reverse semantics, and OSM detail coverage;
+  predictions, reverse semantics, OSM detail coverage, route distance/progress/
+  rejoin semantics, open-now truth, constraint satisfaction, and geometry
+  coverage;
 - a phone-oriented latency, request, and transfer budget.
 
 The summary reports weighted quality and budget pass rates, weighted mean cold

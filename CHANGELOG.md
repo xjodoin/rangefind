@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.4.0 — 2026-08-02
+
+### Added
+
+- `searchAlongRouteOsm` accepts encoded polylines or GeoJSON and performs
+  client-only route-corridor search. Results expose cross-track distance,
+  forward progress, bearing, route rank, and the closest rejoin point.
+- OSM queries understand reusable accessibility, service, payment, and
+  open-now constraints. Typed facets prune the static index before a
+  conservative client-side verification of result details and
+  `opening_hours` in the caller's time zone.
+- Searchable OSM areas retain simplified encoded geometry and true polygon
+  centroids; the map demo renders those shapes directly from geo capsules.
+- `createRangefindMapsAdapter` provides a typed, promise-based migration facade
+  for common Google Places and Geocoding request shapes while retaining native
+  Rangefind metadata. A complete migration guide covers real use cases,
+  deployment/cache requirements, attribution, benchmarks, and parity limits.
+
+### Performance
+
+- Multi-resolution category-cell indexes can include a compact wildcard
+  occupancy lane. Route text and brand searches use it to fetch only point
+  ordinals intersecting the corridor, while typed category searches retain
+  their narrower per-category routes.
+- Corridor pruning keeps overlapping segment boxes separate instead of
+  collapsing diagonal trips into one large bounding rectangle. Existing
+  grouped and multipart byte-range reads batch the resulting cell, leaf, and
+  capsule ranges without a route service or additional infrastructure.
+- The production Maps benchmark now covers open-now evaluation, compound OSM
+  constraints, route-corridor quality/range budgets, rejoin metadata, and
+  geometry coverage.
+
 ## 0.3.24 — 2026-08-02
 
 ### Added

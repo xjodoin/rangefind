@@ -39,10 +39,12 @@ import { scanPbf } from "./osm_pbf.mjs";
 import {
   addressFromTags,
   enrichDocLocality,
+  geometryForWay,
   interpolationRangeDocs,
   placeDoc,
   retainedAddressTagEntries,
   searchablePlaceTags,
+  shouldRetainPlaceGeometry,
   wayDocTagEntries
 } from "../src/integrations/osm/documents.js";
 import {
@@ -73,9 +75,8 @@ const REGIONS = {
 // Included in every reusable extraction-stage identity. Bump this whenever
 // document selection or normalized output changes so a large PBF can never
 // silently reuse an older corpus shape.
-// v9: locality enrichment — documents without addr:city get their containing
-// municipality (admin boundary containment, place-node radius fallback).
-const OSM_FIXTURE_SCHEMA_VERSION = 9;
+// v10: compact render geometry and true area centroids for useful POI ways.
+const OSM_FIXTURE_SCHEMA_VERSION = 10;
 
 function parseArgs(argv) {
   const args = {
@@ -314,6 +315,7 @@ async function writeJsonl(args) {
 
   let ways = 0;
   let interpolationWays = 0;
+  let geometryWays = 0;
   let boundaryWays = 0;
   let reusableWays = false;
   if (!args.force && existsSync(wayPath) && existsSync(wayMetaPath) && existsSync(boundaryWaysPath)) {
@@ -322,6 +324,7 @@ async function writeJsonl(args) {
       console.log(`[osm] reusing disk-backed candidate-way spool (${meta.ways} ways, ${meta.bytes} bytes)`);
       ways = meta.ways;
       interpolationWays = meta.interpolationWays || 0;
+      geometryWays = meta.geometryWays || 0;
       boundaryWays = meta.boundaryWays || 0;
       reusableWays = true;
     }
@@ -347,10 +350,16 @@ async function writeJsonl(args) {
           }
           if (!searchablePlaceTags(tags)) return;
           const interpolation = Boolean(tags.get("addr:interpolation"));
-          const anchorRefs = interpolation ? refs : refs[0];
-          writer.write([id, anchorRefs, wayDocTagEntries(tags)]);
-          if (interpolation) {
-            interpolationWays++;
+          const geometry = shouldRetainPlaceGeometry(tags, refs);
+          const descriptor = {
+            anchor: refs[0],
+            ...(interpolation ? { interpolation: refs } : {}),
+            ...(geometry ? { geometry: refs } : {})
+          };
+          writer.write([id, descriptor, wayDocTagEntries(tags)]);
+          if (interpolation) interpolationWays++;
+          if (geometry) geometryWays++;
+          if (interpolation || geometry) {
             for (const ref of refs) anchorWriter.write(ref);
           } else {
             anchorWriter.write(refs[0]);
@@ -366,7 +375,7 @@ async function writeJsonl(args) {
     }
     renameSync(wayPartialPath, wayPath);
     renameSync(boundaryWaysPartialPath, boundaryWaysPath);
-    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, interpolationWays, boundaryWays, bytes: statSync(wayPath).size }, null, 2));
+    writeFileSync(wayMetaPath, JSON.stringify({ ...identity, ways, interpolationWays, geometryWays, boundaryWays, bytes: statSync(wayPath).size }, null, 2));
     stageSeconds.candidateWays = elapsedSeconds(stageStart);
   }
 
@@ -382,12 +391,9 @@ async function writeJsonl(args) {
       let read = 0;
       const progress = progressLogger("anchor references");
       try {
-        await eachJsonLine(wayPath, ([, ref]) => {
-          if (Array.isArray(ref)) {
-            for (const item of ref) anchorWriter.write(item);
-          } else {
-            anchorWriter.write(ref);
-          }
+        await eachJsonLine(wayPath, ([, descriptor]) => {
+          const refs = descriptor?.interpolation || descriptor?.geometry || [descriptor?.anchor ?? descriptor];
+          for (const item of refs) anchorWriter.write(item);
           read++;
           progress(() => `${read.toLocaleString()}/${ways.toLocaleString()} references`);
         });
@@ -552,10 +558,12 @@ async function writeJsonl(args) {
       return Boolean(args.limit && docs >= args.limit);
     });
     if (!args.limit || docs < args.limit) {
-      await eachJsonLine(wayPath, ([id, ref, entries]) => {
+      await eachJsonLine(wayPath, ([id, descriptor, entries]) => {
         waysRead++;
         if (!args.limit || docs < args.limit) {
-          const refs = Array.isArray(ref) ? ref : [ref];
+          const interpolationRefs = descriptor?.interpolation || null;
+          const geometryRefs = descriptor?.geometry || null;
+          const refs = interpolationRefs || geometryRefs || [descriptor?.anchor ?? descriptor];
           const points = refs.map(item => {
             const point = coords.get(item);
             if (!point) return null;
@@ -568,7 +576,9 @@ async function writeJsonl(args) {
           const point = points[0];
           const tags = new Map(entries);
           if (point) {
-            const doc = placeDoc("way", id, point.lat, point.lon, tags);
+            const shape = geometryRefs ? geometryForWay(points) : null;
+            const center = shape?.center || point;
+            const doc = placeDoc("way", id, center.lat, center.lon, tags, { geometry: shape?.geometry });
             if (doc) {
               enrich(doc);
               writer.write(doc);
@@ -576,8 +586,8 @@ async function writeJsonl(args) {
               wayDocs++;
             }
           }
-          if ((!args.limit || docs < args.limit) && Array.isArray(ref)) {
-            for (const doc of interpolationRangeDocs(id, refs, points, tags)) {
+          if ((!args.limit || docs < args.limit) && interpolationRefs) {
+            for (const doc of interpolationRangeDocs(id, interpolationRefs, points, tags)) {
               if (args.limit && docs >= args.limit) break;
               enrich(doc);
               writer.write(doc);
@@ -603,6 +613,7 @@ async function writeJsonl(args) {
     nodeDocs,
     wayDocs,
     interpolationWays,
+    geometryWays,
     interpolationRangeDocs: interpolationRangeDocsWritten,
     ways,
     boundaryWays,

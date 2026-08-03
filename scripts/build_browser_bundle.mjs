@@ -22,7 +22,10 @@ await build({
 });
 
 await build({
-  entryPoints: [resolve("src/integrations/osm/query.js")],
+  // Bundle the complete browser-safe OSM surface, not only query.js. This
+  // keeps the raw dist entry aligned with the `rangefind/osm` package export
+  // (schema, documents, constraints, hours, route helpers, and adapters).
+  entryPoints: [resolve("src/integrations/osm/index.js")],
   outfile: resolve(outdir, "osm.browser.js"),
   bundle: true,
   format: "esm",

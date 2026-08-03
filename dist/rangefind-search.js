@@ -3389,6 +3389,16 @@ function readZigzag(bytes, state) {
   const raw = readVarint(bytes, state);
   return raw % 2 === 0 ? raw / 2 : -(raw + 1) / 2;
 }
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const phi1 = lat1 * (Math.PI / 180);
+  const phi2 = lat2 * (Math.PI / 180);
+  const dPhi = phi2 - phi1;
+  const dLambda = (lon2 - lon1) * (Math.PI / 180);
+  const sinPhi = Math.sin(dPhi / 2);
+  const sinLambda = Math.sin(dLambda / 2);
+  const a = sinPhi * sinPhi + Math.cos(phi1) * Math.cos(phi2) * sinLambda * sinLambda;
+  return 2 * EARTH_RADIUS_METERS * Math.asin(Math.min(1, Math.sqrt(a)));
+}
 function haversineMetersE7(latE7A, lonE7A, latE7B, lonE7B) {
   const phi1 = latE7A * RADIANS_PER_E7;
   const phi2 = latE7B * RADIANS_PER_E7;
@@ -3735,6 +3745,38 @@ function geoCellsForBoxes(boxes, zoom, limit = Infinity) {
   }
   return [...cells.values()];
 }
+function geoCellsForRoute(route, zoom, limit = Infinity) {
+  const max = Math.max(1, Math.floor(Number(limit) || 1));
+  const cells = /* @__PURE__ */ new Map();
+  const addBoxes = (boxes) => {
+    const next = geoCellsForBoxes(boxes, zoom, Math.max(1, max - cells.size));
+    if (!next) return false;
+    for (const cell of next) {
+      const key = `${cell.y}:${cell.x}`;
+      cells.set(key, cell);
+      if (cells.size > max) return false;
+    }
+    return true;
+  };
+  for (const segment of route?.segments || []) {
+    const midLat = (segment.start.lat + segment.end.lat) / 2 * Math.PI / 180;
+    const tileMeters = 40075016686e-3 * Math.max(0.05, Math.cos(midLat)) / 2 ** zoom;
+    const stepMeters = Math.max(50, Math.min(route.corridorMeters, tileMeters / 2));
+    const steps = Math.max(1, Math.ceil(segment.lengthMeters / stepMeters));
+    let lonDelta = segment.end.lon - segment.start.lon;
+    if (lonDelta > 180) lonDelta -= 360;
+    if (lonDelta < -180) lonDelta += 360;
+    for (let step = 0; step <= steps; step++) {
+      const ratio = step / steps;
+      const lat = segment.start.lat + (segment.end.lat - segment.start.lat) * ratio;
+      let lon = segment.start.lon + lonDelta * ratio;
+      if (lon > 180) lon -= 360;
+      if (lon < -180) lon += 360;
+      if (!addBoxes(boxesForRadiusE7(latToE7(lat), lonToE7(lon), route.corridorMeters))) return null;
+    }
+  }
+  return [...cells.values()];
+}
 function decodeGeoCellBlock(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, GEO_CELL_BLOCK_MAGIC, "Unsupported Rangefind geo category-cell block");
@@ -3778,6 +3820,185 @@ function decodeGeoCellBlock(buffer) {
     blockX,
     blockY,
     routes
+  };
+}
+
+// src/geo_route.js
+var EARTH_RADIUS_METERS2 = 63710087714e-4;
+var DEG_TO_RAD = Math.PI / 180;
+function finiteCoordinate(lat, lon) {
+  const latitude = Number(lat);
+  const longitude = Number(lon);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+    throw new RangeError("Rangefind: route coordinates require latitude in [-90, 90] and longitude in [-180, 180].");
+  }
+  return { lat: latitude, lon: longitude };
+}
+function decodePolyline(value, precision = 5) {
+  const encoded = String(value || "");
+  const factor = 10 ** Math.max(0, Math.min(7, Math.floor(Number(precision) || 5)));
+  const points = [];
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+  const component = () => {
+    let result = 0;
+    let shift = 0;
+    while (index < encoded.length) {
+      const byte = encoded.charCodeAt(index++) - 63;
+      if (byte < 0 || byte > 63) throw new Error("Rangefind: route is not a valid encoded polyline.");
+      result |= (byte & 31) << shift;
+      if (byte < 32) return result & 1 ? ~(result >> 1) : result >> 1;
+      shift += 5;
+      if (shift > 30) throw new Error("Rangefind: encoded polyline component is too large.");
+    }
+    throw new Error("Rangefind: encoded polyline ends inside a coordinate.");
+  };
+  while (index < encoded.length) {
+    lat += component();
+    lon += component();
+    points.push(finiteCoordinate(lat / factor, lon / factor));
+  }
+  return points;
+}
+function geoJsonCoordinateLines(value) {
+  const geometry = value?.type === "Feature" ? value.geometry : value;
+  if (value?.type === "FeatureCollection") {
+    return value.features.flatMap((feature) => geoJsonCoordinateLines(feature));
+  }
+  if (geometry?.type === "LineString") return [geometry.coordinates];
+  if (geometry?.type === "MultiLineString") return geometry.coordinates;
+  if (geometry?.type === "GeometryCollection") return geometry.geometries.flatMap((item) => geoJsonCoordinateLines(item));
+  throw new TypeError("Rangefind: route GeoJSON must contain a LineString or MultiLineString.");
+}
+function normalizeRouteGeometry(route, options = {}) {
+  let lines;
+  if (typeof route === "string") {
+    lines = [decodePolyline(route, options.precision ?? options.polylinePrecision ?? 5)];
+  } else if (Array.isArray(route)) {
+    lines = [route];
+  } else {
+    lines = geoJsonCoordinateLines(route).map((line) => line.map((coordinate) => finiteCoordinate(coordinate[1], coordinate[0])));
+  }
+  const points = [];
+  for (const line of lines) {
+    for (const raw of line) {
+      const point = Array.isArray(raw) ? finiteCoordinate(raw[1], raw[0]) : finiteCoordinate(raw.lat, raw.lon ?? raw.lng);
+      const previous = points.at(-1);
+      if (!previous || previous.lat !== point.lat || previous.lon !== point.lon) points.push(point);
+    }
+  }
+  if (points.length < 2) throw new RangeError("Rangefind: a route requires at least two distinct coordinates.");
+  return points;
+}
+function initialBearing(start, end) {
+  const phi1 = start.lat * DEG_TO_RAD;
+  const phi2 = end.lat * DEG_TO_RAD;
+  const lambda = (end.lon - start.lon) * DEG_TO_RAD;
+  const y = Math.sin(lambda) * Math.cos(phi2);
+  const x = Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(lambda);
+  return (Math.atan2(y, x) / DEG_TO_RAD + 360) % 360;
+}
+function uniqueBoxes(boxes) {
+  const seen = /* @__PURE__ */ new Set();
+  return boxes.filter((box) => {
+    const key = `${box.minLatE7}:${box.maxLatE7}:${box.minLonE7}:${box.maxLonE7}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+function prepareRoute(route, options = {}) {
+  const points = normalizeRouteGeometry(route, options);
+  const corridorMeters = Number(options.corridorMeters ?? 1e3);
+  if (!Number.isFinite(corridorMeters) || corridorMeters <= 0 || corridorMeters > 1e5) {
+    throw new RangeError("Rangefind: corridorMeters must be a positive number no greater than 100000.");
+  }
+  const segments = [];
+  let totalMeters = 0;
+  const boxes = [];
+  for (let index = 1; index < points.length; index++) {
+    const start = points[index - 1];
+    const end = points[index];
+    const lengthMeters = haversineMeters(start.lat, start.lon, end.lat, end.lon);
+    if (lengthMeters <= 0) continue;
+    segments.push({
+      index: segments.length,
+      start,
+      end,
+      startMeters: totalMeters,
+      lengthMeters,
+      bearingDegrees: initialBearing(start, end)
+    });
+    const steps = Math.max(1, Math.ceil(lengthMeters / Math.max(1e3, corridorMeters * 1.25)));
+    for (let step = 0; step <= steps; step++) {
+      const ratio = step / steps;
+      const lat = start.lat + (end.lat - start.lat) * ratio;
+      let lonDelta = end.lon - start.lon;
+      if (lonDelta > 180) lonDelta -= 360;
+      if (lonDelta < -180) lonDelta += 360;
+      let lon = start.lon + lonDelta * ratio;
+      if (lon > 180) lon -= 360;
+      if (lon < -180) lon += 360;
+      boxes.push(...boxesForRadiusE7(latToE7(lat), lonToE7(lon), corridorMeters));
+    }
+    totalMeters += lengthMeters;
+  }
+  if (!segments.length) throw new RangeError("Rangefind: a route requires at least one non-zero segment.");
+  return { points, segments, totalMeters, corridorMeters, boxes: uniqueBoxes(boxes) };
+}
+function matchPointToRoute(prepared, lat, lon) {
+  const point = finiteCoordinate(lat, lon);
+  let best = null;
+  for (const segment of prepared.segments) {
+    const referenceLat = (segment.start.lat + segment.end.lat + point.lat) / 3 * DEG_TO_RAD;
+    let endDeltaLon = segment.end.lon - segment.start.lon;
+    if (endDeltaLon > 180) endDeltaLon -= 360;
+    if (endDeltaLon < -180) endDeltaLon += 360;
+    let pointDeltaLon = point.lon - segment.start.lon;
+    if (pointDeltaLon > 180) pointDeltaLon -= 360;
+    if (pointDeltaLon < -180) pointDeltaLon += 360;
+    const ax = 0;
+    const ay = 0;
+    const bx = endDeltaLon * DEG_TO_RAD * Math.cos(referenceLat) * EARTH_RADIUS_METERS2;
+    const by = (segment.end.lat - segment.start.lat) * DEG_TO_RAD * EARTH_RADIUS_METERS2;
+    const px = pointDeltaLon * DEG_TO_RAD * Math.cos(referenceLat) * EARTH_RADIUS_METERS2;
+    const py = (point.lat - segment.start.lat) * DEG_TO_RAD * EARTH_RADIUS_METERS2;
+    const denominator = (bx - ax) ** 2 + (by - ay) ** 2;
+    const ratio = denominator ? Math.max(0, Math.min(1, ((px - ax) * (bx - ax) + (py - ay) * (by - ay)) / denominator)) : 0;
+    let routeLon = segment.start.lon + endDeltaLon * ratio;
+    if (routeLon > 180) routeLon -= 360;
+    if (routeLon < -180) routeLon += 360;
+    const routeLat = segment.start.lat + (segment.end.lat - segment.start.lat) * ratio;
+    const distanceMeters = haversineMeters(point.lat, point.lon, routeLat, routeLon);
+    const progressMeters = segment.startMeters + segment.lengthMeters * ratio;
+    if (!best || distanceMeters < best.distanceMeters || distanceMeters === best.distanceMeters && progressMeters < best.progressMeters) {
+      best = {
+        distanceMeters,
+        progressMeters,
+        progressRatio: prepared.totalMeters ? progressMeters / prepared.totalMeters : 0,
+        segmentIndex: segment.index,
+        segmentProgress: ratio,
+        bearingDegrees: segment.bearingDegrees,
+        rejoinPoint: { lat: routeLat, lon: routeLon }
+      };
+    }
+  }
+  return best;
+}
+function routeMatchPublic(match) {
+  if (!match) return null;
+  return {
+    distanceMeters: Math.round(match.distanceMeters * 10) / 10,
+    progressMeters: Math.round(match.progressMeters * 10) / 10,
+    progressRatio: Math.round(match.progressRatio * 1e6) / 1e6,
+    segmentIndex: match.segmentIndex,
+    segmentProgress: Math.round(match.segmentProgress * 1e6) / 1e6,
+    bearingDegrees: Math.round(match.bearingDegrees * 10) / 10,
+    rejoinPoint: {
+      lat: Math.round(match.rejoinPoint.lat * 1e7) / 1e7,
+      lon: Math.round(match.rejoinPoint.lon * 1e7) / 1e7
+    }
   };
 }
 
@@ -5527,16 +5748,25 @@ async function createSearch(options = {}) {
     });
   }
   function geoCellIndexForPlan(geoPlan, filterPlan) {
-    if (options.geoCellIndexes === false || !geoPlan?.boxes?.length || !filterPlan?.facets?.length) return null;
+    if (options.geoCellIndexes === false || !geoPlan?.boxes?.length) return null;
     if (Number(geoPlan.meta?.levels || 0) <= 1) return null;
     const indexes = geoPlan.meta?.category_cells || [];
+    if (geoPlan.route) {
+      const wildcard = indexes.find((index) => Number.isInteger(index.all_code));
+      if (wildcard) return {
+        index: { ...wildcard, field: geoPlan.field },
+        selected: [wildcard.all_code],
+        facet: null
+      };
+    }
+    if (!filterPlan?.facets?.length) return null;
     for (const index of indexes) {
       const facet = filterPlan.facets.find(([field]) => field === index.facet);
       if (!facet) continue;
       const selected = [...facet[1]].sort((a, b) => a - b);
       const indexed = new Set(index.codes || []);
       if (selected.length && selected.every((code) => indexed.has(code))) {
-        return { index: { ...index, field: geoPlan.field }, selected };
+        return { index: { ...index, field: geoPlan.field }, selected, facet: index.facet };
       }
     }
     return null;
@@ -5552,7 +5782,7 @@ async function createSearch(options = {}) {
     let level = null;
     let requests = null;
     for (const candidate of [...index.levels || []].sort((a, b) => b - a)) {
-      const next = geoCellsForBoxes(geoPlan.boxes, candidate, maxCells);
+      const next = geoPlan.route ? geoCellsForRoute(geoPlan.route, candidate, maxCells) : geoCellsForBoxes(geoPlan.boxes, candidate, maxCells);
       if (!next) continue;
       const nextRequests = /* @__PURE__ */ new Map();
       for (const cell of next) {
@@ -5624,7 +5854,7 @@ async function createSearch(options = {}) {
     return {
       leaves,
       ordinalsByLeaf,
-      facet: index.facet,
+      facet: planned.facet,
       level,
       cells: cells.length,
       blocksWanted: requests.size,
@@ -6762,8 +6992,29 @@ async function createSearch(options = {}) {
       boxes: [],
       near: null,
       sort: geo.sort === "distance",
+      routeSort: geo.sort === "route",
+      route: null,
+      routePositionMeters: 0,
+      routeDirection: "forward",
+      viewportAnchor: null,
       boost: null
     };
+    if (geo.route) {
+      plan.route = prepareRoute(geo.route, {
+        corridorMeters: geo.corridorMeters,
+        precision: geo.polylinePrecision
+      });
+      plan.boxes = plan.route.boxes;
+      const position = Number(geo.routePositionMeters || 0);
+      plan.routePositionMeters = Number.isFinite(position) ? Math.max(0, Math.min(plan.route.totalMeters, position)) : 0;
+      plan.routeDirection = geo.routeDirection === "reverse" ? "reverse" : "forward";
+      const viewport = geo.viewport;
+      if (viewport) {
+        const lat = Number(viewport.lat ?? (Number(viewport.minLat) + Number(viewport.maxLat)) / 2);
+        const lon = Number(viewport.lon ?? viewport.lng ?? (Number(viewport.minLon) + Number(viewport.maxLon)) / 2);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) plan.viewportAnchor = { lat, lon };
+      }
+    }
     if (geo.near) {
       const latE7 = latToE7(geo.near.lat);
       const lonE7 = lonToE7(geo.near.lon);
@@ -6775,6 +7026,7 @@ async function createSearch(options = {}) {
         radiusMeters: Number.isFinite(radiusMeters) && radiusMeters > 0 ? radiusMeters : null
       };
       if (plan.near.radiusMeters != null) {
+        if (plan.route) throw new Error("Rangefind: geo supports route or a near radius, not both.");
         plan.boxes = boxesForRadiusE7(latE7, lonE7, plan.near.radiusMeters);
       }
     }
@@ -6782,6 +7034,7 @@ async function createSearch(options = {}) {
       if (plan.near?.radiusMeters != null) {
         throw new Error("Rangefind: geo supports a radius or box, not both.");
       }
+      if (plan.route) throw new Error("Rangefind: geo supports route or box, not both.");
       plan.boxes = normalizeGeoBoxE7(geo.box);
     }
     if (geo.boost) {
@@ -6794,11 +7047,15 @@ async function createSearch(options = {}) {
       if (!plan.near) throw new Error("Rangefind: geo.boost needs geo.near.");
     }
     if (plan.sort && !plan.near) throw new Error('Rangefind: geo.sort "distance" needs geo.near.');
+    if (plan.routeSort && !plan.route) throw new Error('Rangefind: geo.sort "route" needs geo.route.');
     if (!plan.boxes.length && !plan.sort) throw new Error('Rangefind: geo needs near with radiusMeters, box, or sort "distance".');
     plan.filtered = plan.boxes.length > 0;
     return plan;
   }
   function geoPointMatchesE7(geoPlan, latE7, lonE7) {
+    if (geoPlan.route) {
+      return matchPointToRoute(geoPlan.route, latE7 / 1e7, lonE7 / 1e7).distanceMeters <= geoPlan.route.corridorMeters;
+    }
     if (geoPlan.near?.radiusMeters != null) {
       return haversineMetersE7(geoPlan.near.latE7, geoPlan.near.lonE7, latE7, lonE7) <= geoPlan.near.radiusMeters;
     }
@@ -6826,7 +7083,9 @@ async function createSearch(options = {}) {
       return {
         leaf,
         minDist: near ? pointToBoxDistanceMetersE7(near.latE7, near.lonE7, leaf) : 0,
-        geoDefinite: geoPlan.boxes.some((box) => boxContainsBoxE7(box, leaf))
+        // Route boxes are only a conservative prune. Exact point-to-polyline
+        // distance remains mandatory even when a leaf fits inside one box.
+        geoDefinite: !geoPlan.route && geoPlan.boxes.some((box) => boxContainsBoxE7(box, leaf))
       };
     }
     return {
@@ -8171,6 +8430,8 @@ async function createSearch(options = {}) {
     const near = geoPlan.near;
     const radius = near?.radiusMeters ?? null;
     const distanceSorted = !!geoPlan.sort;
+    const routeSorted = !!geoPlan.routeSort;
+    const geoOrdered = distanceSorted || routeSorted;
     const tracking = geoTraversalTracking();
     const geoBlockFilterPlan = docFilterPlan?.active ? makeBlockFilterPlan(filters) : null;
     const cellRoutingPromise = geoCellRoutedLeaves(geoPlan, rootPromise, docFilterPlan, tracking);
@@ -8189,6 +8450,7 @@ async function createSearch(options = {}) {
     const best = [];
     const collected = [];
     const distances = /* @__PURE__ */ new Map();
+    const routeMatches = /* @__PURE__ */ new Map();
     const capsuleByDoc = /* @__PURE__ */ new Map();
     let leavesVisited = 0;
     let pointsScanned = 0;
@@ -8196,6 +8458,19 @@ async function createSearch(options = {}) {
     let definiteLeaves = 0;
     let stoppedEarly = false;
     const kthDistance = () => best.length >= k ? best[k - 1].dist : Infinity;
+    const routeOrder = (match) => {
+      const directedProgress = geoPlan.routeDirection === "reverse" ? geoPlan.route.totalMeters - match.progressMeters : match.progressMeters;
+      const directedPosition = geoPlan.routeDirection === "reverse" ? geoPlan.route.totalMeters - geoPlan.routePositionMeters : geoPlan.routePositionMeters;
+      const behindMeters = Math.max(0, directedPosition - directedProgress);
+      const aheadMeters = Math.max(0, directedProgress - directedPosition);
+      const viewportMeters = geoPlan.viewportAnchor ? haversineMetersE7(
+        latToE7(geoPlan.viewportAnchor.lat),
+        lonToE7(geoPlan.viewportAnchor.lon),
+        latToE7(match.rejoinPoint.lat),
+        lonToE7(match.rejoinPoint.lon)
+      ) : 0;
+      return match.distanceMeters + aheadMeters * 2e-3 + viewportMeters * 0.025 + behindMeters * 1.25;
+    };
     const firstBatchHint = textMatchDocs ? GEO_TEXT_LEAF_PAGE_FIRST_BATCH_SIZE : GEO_LEAF_PAGE_FIRST_BATCH_SIZE;
     const leafPages = cellRouting ? geoRoutedLeafPages(
       geoPlan,
@@ -8229,6 +8504,8 @@ async function createSearch(options = {}) {
         const latE7 = latsE7[i];
         const lonE7 = lonsE7[i];
         if (!candidate.geoDefinite && !geoPointMatchesE7(geoPlan, latE7, lonE7)) continue;
+        const routeMatch = geoPlan.route ? matchPointToRoute(geoPlan.route, latE7 / 1e7, lonE7 / 1e7) : null;
+        if (routeMatch && routeMatch.distanceMeters > geoPlan.route.corridorMeters) continue;
         let dist = 0;
         if (near) {
           dist = haversineMetersE7(near.latE7, near.lonE7, latE7, lonE7);
@@ -8243,15 +8520,16 @@ async function createSearch(options = {}) {
         if (options.geoCapsules !== false && leafPage.capsules?.[i]) {
           capsuleByDoc.set(doc, leafPage.capsules[i]);
         }
-        if (distanceSorted) {
+        if (geoOrdered) {
+          const order = routeSorted ? routeOrder(routeMatch) : dist;
           let lo = 0;
           let hi = best.length;
           while (lo < hi) {
             const mid = lo + hi >> 1;
-            if (best[mid].dist < dist || best[mid].dist === dist && best[mid].doc < doc) lo = mid + 1;
+            if (best[mid].dist < order || best[mid].dist === order && best[mid].doc < doc) lo = mid + 1;
             else hi = mid;
           }
-          best.splice(lo, 0, { doc, dist });
+          best.splice(lo, 0, { doc, dist: order, routeMatch });
           if (best.length > k) best.length = k;
         } else {
           collected.push([doc, 0]);
@@ -8264,9 +8542,12 @@ async function createSearch(options = {}) {
       }
       if (stoppedEarly) break;
     }
-    const rows = distanceSorted ? best.slice(offset, offset + size).map((item) => [item.doc, 0]) : collected.slice(offset, offset + size);
+    const rows = geoOrdered ? best.slice(offset, offset + size).map((item) => [item.doc, 0]) : collected.slice(offset, offset + size);
     if (distanceSorted) {
       for (const item of best) distances.set(item.doc, item.dist);
+    }
+    if (routeSorted) {
+      for (const item of best) routeMatches.set(item.doc, { match: item.routeMatch, rank: item.dist });
     }
     const resultContext = { hasTextTerms: false, preferDocPages: true };
     const results = capsuleByDoc.size ? await rowsToGeoCapsuleResults(rows, capsuleByDoc, resultContext) : await rowsToResults(rows, resultContext);
@@ -8276,7 +8557,25 @@ async function createSearch(options = {}) {
         if (dist != null) result.distanceMeters = roundedDistanceMeters(dist);
       }
     }
-    const matched = distanceSorted ? best.length : collected.length;
+    if (geoPlan.route) {
+      for (const result of results) {
+        const routed = routeMatches.get(result.index);
+        let match = routed?.match;
+        if (!match && Number.isFinite(Number(result.lat)) && Number.isFinite(Number(result.lon))) {
+          match = matchPointToRoute(geoPlan.route, Number(result.lat), Number(result.lon));
+        }
+        if (!match) continue;
+        const routeMatch = routeMatchPublic(match);
+        result.routeMatch = routeMatch;
+        if (routed) result.routeRank = Math.round(routed.rank * 10) / 10;
+        result.routeDistanceMeters = routeMatch.distanceMeters;
+        result.routeProgressMeters = routeMatch.progressMeters;
+        result.routeProgressRatio = routeMatch.progressRatio;
+        result.routeBearingDegrees = routeMatch.bearingDegrees;
+        result.rejoinPoint = routeMatch.rejoinPoint;
+      }
+    }
+    const matched = routeSorted ? pointsAccepted : distanceSorted ? best.length : collected.length;
     const exactTotal = !stoppedEarly;
     return {
       total: exactTotal ? matched : Math.max(matched, k),
@@ -8285,10 +8584,17 @@ async function createSearch(options = {}) {
       size,
       approximate: !exactTotal,
       stats: {
-        exact: distanceSorted ? true : exactTotal,
-        geoLane: (distanceSorted ? "nearest" : "browse") + (textMatchDocs ? "Text" : "") + (cellRouting ? "CategoryCells" : ""),
+        exact: geoOrdered ? true : exactTotal,
+        geoLane: (distanceSorted ? "nearest" : routeSorted ? "route" : "browse") + (textMatchDocs ? "Text" : "") + (cellRouting ? "CategoryCells" : ""),
         geoField: geoPlan.field,
         geoDistanceSorted: distanceSorted,
+        geoRouteSorted: routeSorted,
+        ...geoPlan.route ? {
+          geoRouteMeters: Math.round(geoPlan.route.totalMeters),
+          geoRouteSegments: geoPlan.route.segments.length,
+          geoRouteCorridorMeters: geoPlan.route.corridorMeters,
+          geoRouteDirection: geoPlan.routeDirection
+        } : {},
         geoTreeLevels: root.levels,
         geoDirectoryLeaves: root.leafCount,
         geoCandidateBranches: tracking.counters.candidateBranches,
@@ -10880,7 +11186,7 @@ async function createSearch(options = {}) {
     const filters = geoPlan ? withGeoFilters(userFilters, geoPlan) : userFilters;
     const sort = params.sort || null;
     const sortPlan = makeSortPlan(sort);
-    if (geoPlan?.sort && sortPlan) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    if ((geoPlan?.sort || geoPlan?.routeSort) && sortPlan) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     const hasFilters = Object.keys(filters.facets || {}).length || Object.keys(filters.numbers || {}).length || Object.keys(filters.booleans || {}).length;
     if (!q) {
       if (sortPlan) await ensureDocValueSortedManifest();
@@ -10960,10 +11266,10 @@ async function createSearch(options = {}) {
     const queryAnalysis = await resolveQueryPlan(q);
     const analyzedTerms = queryAnalysis.analyzedTerms;
     const baseTerms = queryAnalysis.baseTerms;
-    if (geoPlan?.sort) {
+    if (geoPlan?.sort || geoPlan?.routeSort) {
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
-        const budgetError = new Error("Rangefind: text distance sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
+        const budgetError = new Error("Rangefind: text geo sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
         budgetError.code = "RANGEFIND_GEO_TEXT_SORT_BUDGET";
         throw budgetError;
       }
@@ -10977,7 +11283,7 @@ async function createSearch(options = {}) {
         hasFilters: hasUserFilters,
         textMatchDocs: match.docs
       });
-      if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for distance sort.");
+      if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for geographic sorting.");
       geoResponse.stats = {
         ...geoResponse.stats || {},
         textMatchDocs: match.docs.size,
@@ -11037,7 +11343,7 @@ async function createSearch(options = {}) {
     return attachGeoDistances(rerankedResponse, geoPlan);
   }
   async function attachGeoDistances(response, geoPlan) {
-    if (!geoPlan?.near || !response?.results?.length) return response;
+    if (!geoPlan?.near && !geoPlan?.route || !response?.results?.length) return response;
     const near = geoPlan.near;
     const indexes = response.results.map((result) => result.index).filter(Number.isInteger);
     if (!indexes.length) return response;
@@ -11047,7 +11353,18 @@ async function createSearch(options = {}) {
       const latE7 = latToE7(valueForDoc(store, geoPlan.latField, result.index));
       const lonE7 = lonToE7(valueForDoc(store, geoPlan.lonField, result.index));
       if (latE7 == null || lonE7 == null) continue;
-      result.distanceMeters = roundedDistanceMeters(haversineMetersE7(near.latE7, near.lonE7, latE7, lonE7));
+      if (near) {
+        result.distanceMeters = roundedDistanceMeters(haversineMetersE7(near.latE7, near.lonE7, latE7, lonE7));
+      }
+      if (geoPlan.route) {
+        const routeMatch = routeMatchPublic(matchPointToRoute(geoPlan.route, latE7 / 1e7, lonE7 / 1e7));
+        result.routeMatch = routeMatch;
+        result.routeDistanceMeters = routeMatch.distanceMeters;
+        result.routeProgressMeters = routeMatch.progressMeters;
+        result.routeProgressRatio = routeMatch.progressRatio;
+        result.routeBearingDegrees = routeMatch.bearingDegrees;
+        result.rejoinPoint = routeMatch.rejoinPoint;
+      }
     }
     if (geoPlan.boost) {
       const { weight, pivotMeters } = geoPlan.boost;
@@ -12075,7 +12392,8 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const offset = (page - 1) * size;
     const sortPlan = parseSortPlan(params.sort);
     const geoDistanceSort = params.geo?.sort === "distance";
-    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    const geoRouteSort = params.geo?.sort === "route";
+    if (sortPlan && (geoDistanceSort || geoRouteSort)) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     const addressResponse = await generationalAddressAuthoritySearch(
       activeParams,
       { q, page, size, offset }
@@ -12087,8 +12405,8 @@ async function createGenerationalSearch(root, options, baseUrl) {
       }
       return addressResponse;
     }
-    if (sortPlan || geoDistanceSort || params.geo && !q) {
-      return orderedSearch(activeParams, { q, page, size, offset, sortPlan, geoDistanceSort });
+    if (sortPlan || geoDistanceSort || geoRouteSort || params.geo && !q) {
+      return orderedSearch(activeParams, { q, page, size, offset, sortPlan, geoDistanceSort, geoRouteSort });
     }
     const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
       ...activeParams,
@@ -12130,7 +12448,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     }
     return response;
   }
-  async function orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort }) {
+  async function orderedSearch(params, { q, page, size, offset, sortPlan, geoDistanceSort, geoRouteSort }) {
     const responses = await Promise.all(engines.map((engine, genIndex) => engine.search({
       ...params,
       highlight: void 0,
@@ -12174,6 +12492,13 @@ async function createGenerationalSearch(root, options, baseUrl) {
           if (leftMissing && rightMissing) return compareMergedTies(a, b);
           return leftMissing ? 1 : -1;
         }
+        return left - right || compareMergedTies(a, b);
+      });
+    } else if (geoRouteSort) {
+      merged.sort((a, b) => {
+        const left = Number(a.result.routeRank ?? a.result.routeProgressMeters);
+        const right = Number(b.result.routeRank ?? b.result.routeProgressMeters);
+        if (!Number.isFinite(left) || !Number.isFinite(right)) return compareMergedTies(a, b);
         return left - right || compareMergedTies(a, b);
       });
     }
@@ -12673,6 +12998,26 @@ async function createShardedSearch(root, options, baseUrl) {
     const candidates = candidateShards(params);
     const all = candidates.map((shard) => shard.index);
     if (!geo || !candidates.some((shard) => shard.bbox)) return { selected: all, expanding: null };
+    if (geo.route) {
+      try {
+        const prepared = prepareRoute(geo.route, {
+          corridorMeters: geo.corridorMeters,
+          precision: geo.polylinePrecision
+        });
+        const boxes = prepared.boxes.map((box) => ({
+          minLat: box.minLatE7 / 1e7,
+          maxLat: box.maxLatE7 / 1e7,
+          minLon: box.minLonE7 / 1e7,
+          maxLon: box.maxLonE7 / 1e7
+        }));
+        return {
+          selected: candidates.filter((shard) => !shard.bbox || boxes.some((box) => shardBoxIntersects(shard.bbox, box))).map((shard) => shard.index),
+          expanding: null
+        };
+      } catch {
+        return { selected: all, expanding: null };
+      }
+    }
     if (geo.near) {
       const lat = Number(geo.near.lat);
       const lon = Number(geo.near.lon);
@@ -12769,7 +13114,8 @@ async function createShardedSearch(root, options, baseUrl) {
     const need = offset + size;
     const sortPlan = parseSortPlan(params.sort);
     const geoDistanceSort = activeParams.geo?.sort === "distance";
-    if (sortPlan && geoDistanceSort) throw new Error("Rangefind: use either sort or geo.sort, not both.");
+    const geoRouteSort = activeParams.geo?.sort === "route";
+    if (sortPlan && (geoDistanceSort || geoRouteSort)) throw new Error("Rangefind: use either sort or geo.sort, not both.");
     const routed = await withTextRoute(routeShards(activeParams.geo, activeParams), q);
     const route = routed.route;
     const perShardParams = { ...activeParams, shards: void 0, page: 1, size: Math.min(1e3, need) };
@@ -12815,6 +13161,13 @@ async function createShardedSearch(root, options, baseUrl) {
           if (left == null && right == null) return compareByScore(a, b);
           return left == null ? 1 : -1;
         }
+        return left - right || compareByScore(a, b);
+      });
+    } else if (geoRouteSort) {
+      rows.sort((a, b) => {
+        const left = Number(a.result.routeRank ?? a.result.routeProgressMeters);
+        const right = Number(b.result.routeRank ?? b.result.routeProgressMeters);
+        if (!Number.isFinite(left) || !Number.isFinite(right)) return compareByScore(a, b);
         return left - right || compareByScore(a, b);
       });
     } else if (q) {

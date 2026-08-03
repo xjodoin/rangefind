@@ -1,6 +1,6 @@
 {
   "name": "rangefind",
-  "version": "0.3.24",
+  "version": "0.4.0",
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",
@@ -117,6 +117,7 @@
     "LICENSE",
     "CONTRIBUTING.md",
     "examples/osm-geo/README.md",
+    "examples/osm-geo/google-maps-adapter.js",
     "examples/osm-geo/public/index.html",
     "examples/osm-geo/public/app.js",
     "examples/osm-geo/public/styles.css",

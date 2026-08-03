@@ -11,7 +11,7 @@ import {
 } from "../src/integrations/osm/schema.js";
 import { buildOsmIndex, buildOsmShardedIndex, writeOsmSite } from "../src/integrations/osm/node/builder.js";
 import { createNodeSearch } from "../src/runtime.node.js";
-import { searchOsmQuery } from "../src/integrations/osm/query.js";
+import { searchAlongRouteOsm, searchOsmQuery } from "../src/integrations/osm/query.js";
 
 test("OSM integration publishes the canonical Rangefind schema", () => {
   const config = createOsmIndexConfig({
@@ -20,7 +20,7 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
     workerCount: 6,
     buildProgressLogMs: 0
   });
-  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 2);
+  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 3);
   assert.equal(config.input, "data/osm-rqa-places.jsonl");
   assert.equal(config.output, "public/rangefind");
   assert.equal(config.scanWorkers, 6);
@@ -128,6 +128,42 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       lon: -73.6051,
       geo_lat: 45.5051,
       geo_lon: -73.6051
+    }, {
+      id: "node/5",
+      name: "Tim Hortons",
+      search_name: "Tim Hortons",
+      body: "fast food amenity coffee",
+      category: "amenity",
+      type: "fast_food",
+      details: { opening_hours: "24/7", wheelchair: "yes", payment_contactless: "yes" },
+      lat: 45.502,
+      lon: -73.6,
+      geo_lat: 45.502,
+      geo_lon: -73.6
+    }, {
+      id: "node/6",
+      name: "Tim Hortons",
+      search_name: "Tim Hortons",
+      body: "fast food amenity coffee",
+      category: "amenity",
+      type: "fast_food",
+      details: { opening_hours: "24/7", wheelchair: "yes", payment_contactless: "yes" },
+      lat: 45.56,
+      lon: -73.6,
+      geo_lat: 45.56,
+      geo_lon: -73.6
+    }, {
+      id: "node/7",
+      name: "Tim Hortons",
+      search_name: "Tim Hortons",
+      body: "fast food amenity coffee",
+      category: "amenity",
+      type: "fast_food",
+      details: { opening_hours: "Mo-Su 00:00-24:00", wheelchair: "yes", payment_contactless: "yes" },
+      lat: 45.515,
+      lon: -73.578,
+      geo_lat: 45.515,
+      geo_lon: -73.578
     }].map(doc => JSON.stringify(doc)).join("\n"));
     const built = await buildOsmIndex({
       root,
@@ -143,14 +179,14 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     const filterBitmaps = JSON.parse(gunzipSync(
       await readFile(join(root, "public", "rangefind", "filter-bitmaps", "manifest.json.gz"))
     ));
-    assert.equal(manifest.total, 4);
+    assert.equal(manifest.total, 7);
     assert.equal(manifest.features.geo, true);
     assert.equal(manifest.features.geoCapsules, true);
     assert.equal(manifest.features.geoCategoryCells, true);
     assert.equal(manifest.geo.fields.location.category_cells[0].facet, "type");
     // High-cardinality facets skip blanket bitmap generation, but the OSM
     // category vocabulary still materializes its explicitly selected types.
-    assert.equal(Object.keys(filterBitmaps.fields.type.values).length, 1);
+    assert.equal(Object.keys(filterBitmaps.fields.type.values).length, 2);
     const engine = await createNodeSearch({ source: join(root, "public", "rangefind") });
     const nearbyCinema = await engine.search({
       size: 1,
@@ -185,6 +221,25 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
     assert.equal(intersection.results[0]?.type, "intersection");
     assert.equal(intersection.results[0]?.city, "Testville");
     assert.equal(intersection.stats.plannerLane, "osmIntersectionLocality");
+    const alongRoute = await searchAlongRouteOsm(engine, {
+      route: {
+        type: "LineString",
+        coordinates: [[-73.62, 45.49], [-73.57, 45.52]]
+      },
+      query: "wheelchair-accessible Tim Hortons open now with contactless",
+      corridorMeters: 1000,
+      limit: 20,
+      at: "2026-08-03T15:00:00Z",
+      timeZone: "UTC",
+      trace: true
+    });
+    assert.deepEqual(alongRoute.results.map(result => result.id), ["node/5", "node/7"]);
+    assert.ok(alongRoute.results.every(result => result.openNow === true));
+    assert.ok(alongRoute.results.every(result => result.routeDistanceMeters <= 1000));
+    assert.ok(alongRoute.results[1].routeProgressMeters > alongRoute.results[0].routeProgressMeters);
+    assert.ok(alongRoute.results.every(result => Number.isFinite(result.rejoinPoint?.lat)));
+    assert.equal(alongRoute.stats.plannerLane, "osmRouteCorridor");
+    assert.equal(alongRoute.stats.geoRouteSorted, true);
     assert.equal(built.config.output, "public/rangefind");
     assert.equal(built.seconds >= 0, true);
   } finally {
@@ -229,14 +284,14 @@ test("Sharded OSM build embeds the category lexicon and keeps categories local",
     const lexicon = built.rootManifest.category_lexicon;
     assert.equal(built.rootManifest.features.geoCapsules, true);
     assert.ok(built.rootManifest.shards.every(shard => shard.features?.geoCapsules === true));
-    assert.equal(built.rootManifest.features.geoCategoryCells, false);
+    assert.equal(built.rootManifest.features.geoCategoryCells, true);
     assert.equal(
       built.rootManifest.shards.find(shard => shard.id === "quebec")?.features?.geoCategoryCells,
       true
     );
     assert.equal(
       built.rootManifest.shards.find(shard => shard.id === "uganda")?.features?.geoCategoryCells,
-      undefined
+      true
     );
     assert.equal(lexicon.facet, "type");
     assert.ok(lexicon.types.includes("cinema"));

@@ -261,12 +261,14 @@ followed by the same score ties.
 | street text | 166ms / 3.9MB / 45ms | 98ms / 2.6MB / 11ms | 4 of 4 |
 | suggest | 22.4ms / 514KB / 10ms | 17.8ms / 361KB / 11ms | all |
 
-Geo-routed lanes already transfer *less* than the monolithic index (per-shard
+These measurements predate root text and suggestion routing. Geo-routed lanes
+already transferred *less* than the monolithic index (per-shard
 structures are smaller), and the text+geo lane cut cold transfer in half by
-skipping a shard. Text-only queries pay the fan-out (4 manifests, 4 term
-directories) — that cost grows with shard count and is what the planned
-global locality/authority routing layer removes; geo-anchored queries, the
-bulk of a maps workload, don't pay it.
+skipping a shard. At that point text-only queries paid the fan-out (4 manifests,
+4 term directories). Current roots can publish `text_routing` and
+`suggest_routing` artifacts built from retained per-shard term/suggest sidecars,
+so text and autocomplete open only candidate shards while unknown routing keys
+fail open for correctness.
 
 ## Provenance
 

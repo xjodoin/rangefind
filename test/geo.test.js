@@ -624,6 +624,35 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
         `category cells should fetch fewer point ranges (${pointPacks(cellRequests)} vs ${pointPacks(fallbackRequests)})`
       );
 
+      if (manifest.geo.fields.location.category_cells[0].all_code === 0) {
+        const routeGeo = {
+          route: {
+            type: "LineString",
+            coordinates: [[-73.72, 45.45], [-73.48, 45.6]]
+          },
+          corridorMeters: 2500,
+          sort: "route"
+        };
+        const routeEngine = await createSearch({ baseUrl: server.baseUrl });
+        const routeStart = server.requests.length;
+        const routeResponse = await routeEngine.search({ q: "bakery", geo: routeGeo, size: 20 });
+        const routeRequests = server.requests.slice(routeStart);
+        const routeFallbackEngine = await createSearch({ baseUrl: server.baseUrl, geoCellIndexes: false });
+        const routeFallbackStart = server.requests.length;
+        const routeFallback = await routeFallbackEngine.search({ q: "bakery", geo: routeGeo, size: 20 });
+        const routeFallbackRequests = server.requests.slice(routeFallbackStart);
+        assert.deepEqual(
+          routeResponse.results.map(result => result.title),
+          routeFallback.results.map(result => result.title)
+        );
+        assert.match(routeResponse.stats.geoLane, /routeTextCategoryCells$/u);
+        assert.ok(routeResponse.results.every(result => result.routeDistanceMeters <= 2500));
+        assert.ok(
+          pointPacks(routeRequests) < pointPacks(routeFallbackRequests),
+          `wildcard route cells should fetch fewer point ranges (${pointPacks(routeRequests)} vs ${pointPacks(routeFallbackRequests)})`
+        );
+      }
+
       const broadFallback = await engine.search({
         q: "",
         filters: { facets: { category: ["bakery"] } },
@@ -847,12 +876,14 @@ test("multi-resolution category cells route exact map results to fewer geo leave
       blockZoom: 6,
       codeGroupSize: 4,
       maxCellsPerQuery: 48,
+      includeAll: true,
       values: ["bakery", "museum", "pharmacy", "cafe", "observatory"]
     }]
   }, manifest => {
     assert.equal(manifest.features.geoCategoryCells, true);
     assert.equal(manifest.geo.fields.location.category_cells[0].format, "rfgeocategorycell-v1");
     assert.deepEqual(manifest.geo.fields.location.category_cells[0].levels, [6, 10, 14]);
+    assert.equal(manifest.geo.fields.location.category_cells[0].all_code, 0);
     assert.ok(manifest.geo.category_cell_packs >= 1);
   });
 });

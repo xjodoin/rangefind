@@ -5,6 +5,7 @@ import {
   normalizeAddressKey,
   normalizePostalCodeSpacing
 } from "../../address.js";
+import { encodePolyline } from "../../geo_route.js";
 
 // Primary OSM keys that make a feature a searchable place, in ranking order.
 const CATEGORY_KEYS = [
@@ -43,7 +44,7 @@ const WAY_DOC_KEYS = new Set([
   "toilets:wheelchair", "internet_access", "outdoor_seating", "takeaway",
   "delivery", "drive_through", "reservation", "payment:cash",
   "payment:credit_cards", "payment:contactless", "capacity", "stars",
-  "fee", "access", "smoking", "entrance", "level"
+  "fee", "access", "smoking", "entrance", "level", "building", "area"
 ]);
 
 const DETAIL_TAGS = Object.freeze({
@@ -181,6 +182,101 @@ export function wayDocTagEntries(tags) {
   return entries;
 }
 
+// Keep shapes where geometry materially improves a search result (parks,
+// campuses, venues, shops, named buildings). Roads and enormous boundaries
+// stay out: they already have specialized representations and would dominate
+// capsule size. The cap protects pathological OSM ways on phone clients.
+export function shouldRetainPlaceGeometry(tags, refs = []) {
+  if (!Array.isArray(refs) || refs.length < 4 || refs.length > 2048 || refs[0] !== refs.at(-1)) return false;
+  const category = firstCategory(tags);
+  return Boolean(category || tags.get("building") || tags.get("area") === "yes")
+    && Boolean(tags.get("name") || category);
+}
+
+function squaredSegmentDistance(point, start, end) {
+  const dx = end.lon - start.lon;
+  const dy = end.lat - start.lat;
+  if (!dx && !dy) return (point.lon - start.lon) ** 2 + (point.lat - start.lat) ** 2;
+  const ratio = Math.max(0, Math.min(1,
+    ((point.lon - start.lon) * dx + (point.lat - start.lat) * dy) / (dx * dx + dy * dy)
+  ));
+  return (point.lon - (start.lon + dx * ratio)) ** 2 + (point.lat - (start.lat + dy * ratio)) ** 2;
+}
+
+function simplifyRing(points, tolerance = 0.00001, maxPoints = 256) {
+  const closed = points.length > 2
+    && points[0].lat === points.at(-1).lat
+    && points[0].lon === points.at(-1).lon;
+  const source = closed ? points.slice(0, -1) : points.slice();
+  if (source.length <= 4) return points;
+  const keep = new Uint8Array(source.length);
+  keep[0] = 1;
+  keep[source.length - 1] = 1;
+  const stack = [[0, source.length - 1]];
+  const threshold = tolerance ** 2;
+  while (stack.length) {
+    const [start, end] = stack.pop();
+    let best = threshold;
+    let bestIndex = -1;
+    for (let index = start + 1; index < end; index++) {
+      const distance = squaredSegmentDistance(source[index], source[start], source[end]);
+      if (distance > best) {
+        best = distance;
+        bestIndex = index;
+      }
+    }
+    if (bestIndex >= 0) {
+      keep[bestIndex] = 1;
+      stack.push([start, bestIndex], [bestIndex, end]);
+    }
+  }
+  let simplified = source.filter((_, index) => keep[index]);
+  if (simplified.length > maxPoints) {
+    const step = (simplified.length - 1) / (maxPoints - 1);
+    simplified = Array.from({ length: maxPoints }, (_, index) => simplified[Math.round(index * step)]);
+  }
+  if (closed && simplified.length < 3) simplified = source.slice(0, Math.min(source.length, 4));
+  if (closed) simplified.push({ ...simplified[0] });
+  return simplified;
+}
+
+export function geometryForWay(points) {
+  const sourceRing = (points || []).filter(Boolean).map(point => ({ lat: Number(point.lat), lon: Number(point.lon) }));
+  const ring = simplifyRing(sourceRing);
+  if (ring.length < 4) return null;
+  const closed = ring[0].lat === ring.at(-1).lat && ring[0].lon === ring.at(-1).lon;
+  let twiceArea = 0;
+  let centroidLon = 0;
+  let centroidLat = 0;
+  for (let index = 1; index < ring.length; index++) {
+    const left = ring[index - 1];
+    const right = ring[index];
+    const cross = left.lon * right.lat - right.lon * left.lat;
+    twiceArea += cross;
+    centroidLon += (left.lon + right.lon) * cross;
+    centroidLat += (left.lat + right.lat) * cross;
+  }
+  const unique = closed ? ring.slice(0, -1) : ring;
+  const center = closed && Math.abs(twiceArea) > 1e-12
+    ? { lat: centroidLat / (3 * twiceArea), lon: centroidLon / (3 * twiceArea) }
+    : {
+        lat: unique.reduce((sum, point) => sum + point.lat, 0) / unique.length,
+        lon: unique.reduce((sum, point) => sum + point.lon, 0) / unique.length
+      };
+  const lats = ring.map(point => point.lat);
+  const lons = ring.map(point => point.lon);
+  return {
+    center,
+    geometry: {
+      type: closed ? "Polygon" : "LineString",
+      encoding: "polyline",
+      precision: 5,
+      encoded: encodePolyline(ring, 5),
+      bbox: [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)]
+    }
+  };
+}
+
 export function retainedAddressTagEntries(tags) {
   if (!tags) return [];
   return ADDRESS_TAG_KEYS
@@ -237,7 +333,7 @@ export function addressFromTags(tags) {
   };
 }
 
-export function placeDoc(osmType, osmId, lat, lon, tags) {
+export function placeDoc(osmType, osmId, lat, lon, tags, options = {}) {
   const name = cleanText(tags.get("name"));
   const primaryCategory = firstCategory(tags);
   // Named road ways were already retained as searchable documents. Preserve
@@ -273,6 +369,7 @@ export function placeDoc(osmType, osmId, lat, lon, tags) {
     prominence: osmProminence(tags, category)
   };
   if (details) doc.details = details;
+  if (options.geometry) doc.geometry = options.geometry;
   if (aliases.length) doc.aliases = aliases;
   if (address) {
     doc.address = address.formatted;

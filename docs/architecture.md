@@ -381,6 +381,10 @@ range requests:
   doc-value read; exact geometry and any remaining filters still use the
   ordinary runtime predicates. Documents and capsules are not duplicated.
   Broad boxes, unindexed values, and legacy generations use the geo tree.
+- With `includeAll: true`, cell code zero carries all point ordinals. It is a
+  wildcard occupancy lane for arbitrary text/name/brand searches that cannot
+  select a facet code before retrieval. Typed category queries continue to use
+  the narrower facet-specific codes.
 - A gzipped tree root (`geo/<field>.<hash>.bin.gz`) is loaded lazily on the
   first geo query. Small trees list every leaf inline; large trees are
   two-level: the root lists branch entries (bbox, point count, object pointer)
@@ -414,6 +418,13 @@ Query lanes:
   as `count()`, bounded by `geoTextSortMaxDf`, default 200k postings), then
   the nearest lane orders it with the usual early-stop proof — "closest
   bakeries first" is exact.
+- **Route corridor** (`geo.route` with `geo.sort: "route"`): encoded polyline,
+  GeoJSON, or coordinate input is normalized into directed segments. Buffered
+  segment boxes are rasterized independently into multi-resolution cells so a
+  diagonal/winding route does not open its entire enclosing rectangle. Points
+  are verified against the closest segment, then ranked by cross-track
+  distance, progress, forward/behind direction, and optional viewport
+  proximity. Results carry exact progress, bearing, and rejoin metadata.
 
 Leaf and branch entries also carry posting-block-style filter summaries
 (facet words, numeric min/max, boolean bounds), so facet/boolean/numeric
@@ -424,6 +435,16 @@ category exists.
 Point-to-box minimum and maximum spherical distances are exact (including
 antimeridian wrap, facing-away meridians, and antipodal interiors), so radius
 pruning and containment proofs never drop a matching document.
+
+### OSM result geometry
+
+OSM schema-v3 geo capsules may contain simplified encoded geometry for useful
+closed ways. This is display geometry, not a second spatial relation index:
+point/radius/route search still uses the document's centroid and the point
+tree, while the client decodes the selected result's polygon or line for map
+rendering. Extraction caps source refs, simplifies the coordinate sequence,
+and publishes precision plus bbox so result payloads remain bounded. Polygon
+containment and general shape-vs-shape relations remain separate future lanes.
 
 ## Unified Authority Autocomplete
 

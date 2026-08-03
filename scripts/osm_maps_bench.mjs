@@ -884,6 +884,99 @@ const CASES = [
     run: engine => searchOsmQuery(engine, { q: "rue saint denis montreal", size: 18 })
   },
   {
+    id: "next-index-constraint-open-now",
+    family: "constraints",
+    scenario: "Evaluate open-now locally and return only verifiably open restaurants",
+    weight: 5,
+    common: false,
+    nextIndex: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 1,
+      allOpenNow: true,
+      allTopShards: ["quebec"],
+      lanes: ["osmCategoryNearby"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, {
+      q: "restaurant open now",
+      near: MONTREAL,
+      size: 18,
+      at: "2026-08-03T16:00:00Z",
+      timeZone: "America/Toronto"
+    })
+  },
+  {
+    id: "next-index-constraint-accessibility",
+    family: "constraints",
+    scenario: "Push accessibility and contactless constraints into typed OSM facets",
+    weight: 4,
+    common: false,
+    nextIndex: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 1,
+      topDetailFields: ["wheelchair", "payment_contactless"],
+      allTopShards: ["quebec"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, {
+      q: "wheelchair-accessible cafe with contactless",
+      near: MONTREAL,
+      size: 18
+    })
+  },
+  {
+    id: "next-index-route-corridor",
+    family: "route",
+    scenario: "Find Tim Hortons along a supplied trip without opening off-route cells",
+    weight: 6,
+    common: false,
+    nextIndex: true,
+    budget: { ...BUDGETS.journey, coldRequests: 90 },
+    expect: {
+      minResults: 1,
+      anyTextAny: ["Tim Horton"],
+      allRouteDistancesMax: 2500,
+      routeRankAscending: true,
+      topHasRejoinPoint: true,
+      allTopShards: ["quebec"],
+      lanes: ["osmRouteCorridor"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, {
+      route: {
+        type: "LineString",
+        coordinates: [[-73.57, 45.50], [-73.61, 45.55], [-73.68, 45.61]]
+      },
+      query: "Tim Hortons",
+      corridorMeters: 2500,
+      limit: 18,
+      viewport: LAVAL_BOX
+    })
+  },
+  {
+    id: "next-index-area-geometry",
+    family: "geometry",
+    scenario: "Return compact park polygons for geometry-first map rendering",
+    weight: 4,
+    common: false,
+    nextIndex: true,
+    budget: BUDGETS.discovery,
+    expect: {
+      minResults: 5,
+      geometryCoverageMin: 0.2,
+      viewportBox: MONTREAL_BOX,
+      allTopShards: ["quebec"],
+      maxShardsQueried: 1
+    },
+    run: engine => searchOsmQuery(engine, {
+      q: "park",
+      geo: { box: MONTREAL_BOX },
+      size: 18
+    })
+  },
+  {
     id: "coordinates",
     family: "reverse-geocode",
     scenario: "Reverse-geocode decimal coordinates typed into map search",

@@ -21,7 +21,14 @@ export interface GeoParams {
   field?: string;
   near?: GeoNear;
   box?: GeoBox;
-  sort?: "distance";
+  /** Encoded polyline, GeoJSON LineString/MultiLineString, or coordinate array. */
+  route?: string | Record<string, unknown> | Array<[number, number] | { lat: number; lon?: number; lng?: number }>;
+  corridorMeters?: number;
+  polylinePrecision?: number;
+  routePositionMeters?: number;
+  routeDirection?: "forward" | "reverse";
+  viewport?: GeoBox | { lat: number; lon: number };
+  sort?: "distance" | "route";
   boost?: { weight?: number; pivotMeters?: number };
 }
 
@@ -63,6 +70,21 @@ export interface SearchResult {
   title?: string;
   url?: string;
   distanceMeters?: number;
+  routeDistanceMeters?: number;
+  routeProgressMeters?: number;
+  routeProgressRatio?: number;
+  routeBearingDegrees?: number;
+  routeRank?: number;
+  rejoinPoint?: { lat: number; lon: number };
+  routeMatch?: {
+    distanceMeters: number;
+    progressMeters: number;
+    progressRatio: number;
+    segmentIndex: number;
+    segmentProgress: number;
+    bearingDegrees: number;
+    rejoinPoint: { lat: number; lon: number };
+  };
   /** Sharded indexes: owning shard id (hierarchical path when roots nest). */
   shard?: string;
   /** Generational indexes: owning generation. */

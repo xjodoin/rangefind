@@ -173,6 +173,46 @@ export function evaluateExpectations(response, expect = {}) {
       actual
     );
   }
+  if (expect.allRouteDistancesMax != null) {
+    const actual = rows.slice(0, expect.checkTop || 18)
+      .map(row => Number(row.routeDistanceMeters))
+      .filter(Number.isFinite);
+    addCheck(
+      checks,
+      "allRouteDistancesMax",
+      actual.length > 0 && actual.every(value => value <= expect.allRouteDistancesMax),
+      actual
+    );
+  }
+  if (expect.routeProgressAscending) {
+    const actual = rows.slice(0, expect.checkTop || 18)
+      .map(row => Number(row.routeProgressMeters))
+      .filter(Number.isFinite);
+    addCheck(checks, "routeProgressAscending", actual.length > 0
+      && actual.every((value, index) => index === 0 || value >= actual[index - 1]), actual);
+  }
+  if (expect.routeRankAscending) {
+    const actual = rows.slice(0, expect.checkTop || 18)
+      .map(row => Number(row.routeRank))
+      .filter(Number.isFinite);
+    addCheck(checks, "routeRankAscending", actual.length > 0
+      && actual.every((value, index) => index === 0 || value >= actual[index - 1]), actual);
+  }
+  if (expect.topHasRejoinPoint) {
+    const actual = top?.rejoinPoint;
+    addCheck(checks, "topHasRejoinPoint", Number.isFinite(Number(actual?.lat)) && Number.isFinite(Number(actual?.lon)), actual);
+  }
+  if (expect.allOpenNow) {
+    const actual = rows.slice(0, expect.checkTop || 18).map(row => row.openNow);
+    addCheck(checks, "allOpenNow", actual.length > 0 && actual.every(value => value === true), actual);
+  }
+  if (expect.geometryCoverageMin != null) {
+    const sample = rows.slice(0, expect.checkTop || 18);
+    const covered = sample.filter(row => row.geometry?.encoded && row.geometry?.type).length;
+    const ratio = sample.length ? covered / sample.length : 0;
+    addCheck(checks, "geometryCoverageMin", ratio >= expect.geometryCoverageMin, ratio);
+    metrics.geometryCoverage = ratio;
+  }
   if (expect.uniqueIds) {
     const actual = rows.slice(0, expect.checkTop || 18).map(row => row.id).filter(Boolean);
     addCheck(

@@ -25,6 +25,8 @@ export interface RangefindConfig {
     codeGroupSize?: number;
     maxCellsPerQuery?: number;
     maxFacetValues?: number;
+    /** Add a reserved all-points occupancy lane for arbitrary text/brand route queries. */
+    includeAll?: boolean;
     values?: string[];
   }>;
   suggest: Array<Record<string, unknown>>;

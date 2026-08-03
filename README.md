@@ -13,6 +13,10 @@ a large thesis corpus.
 
 ## What Is Implemented
 
+The list below is the compact overview. The **[complete feature guide](docs/features.md)**
+explains every supported search lane, build mode, runtime, integration, feature
+combination, fallback, and deliberate boundary with runnable examples.
+
 - JSONL document input.
 - Static-site crawler: `rangefind build ./dist` indexes built HTML directly,
   with `data-rangefind-*` attributes for body scoping, metadata, facets, and
@@ -65,6 +69,12 @@ a large thesis corpus.
   bounding-box and radius filters, exact nearest-neighbor distance sort with
   early-stop proofs (with or without a text query), text-plus-geo filtering,
   per-cell filter summaries, and distance boosts.
+- Optional compact geo result capsules and multi-resolution facet-to-cell
+  indexes for one-range map results and category-aware spatial routing, plus a
+  wildcard occupancy lane for arbitrary names and brands.
+- Generic route-corridor search over encoded polylines, coordinate arrays, or
+  GeoJSON: exact point-to-route filtering, multi-resolution corridor cells,
+  progress/direction/viewport ranking, and a rejoin point for every result.
 - Search-as-you-type autocomplete inside the range-addressed authority index:
   diacritic-folded prefix and mid-label token matching, popularity or custom
   weights, exact best-first top-k with per-shard weight proofs, and
@@ -97,6 +107,10 @@ a large thesis corpus.
   geocoding, bounded Québec RQA civic/postal augmentation, reusable
   `rangefind/osm` and `rangefind/osm/node` integration APIs, and exhaustive geo
   oracles.
+- OSM typed and natural-language constraints for accessibility, services,
+  payment, seating, reservations, fees, and open-now; conservative client-side
+  `opening_hours` evaluation; route-aware place search; compact place details;
+  and simplified encoded area geometry for real polygon/line map rendering.
 - Geographic index sharding for planet-scale corpora: independently built and
   updated per-region shards sharing one frozen scoring-stats artifact
   (`scoringStats` config + `rangefind/scoring-stats`), a tiny sharded root
@@ -140,6 +154,21 @@ npm run serve:example
 ```
 
 Open `http://localhost:5178/`.
+
+## Documentation
+
+Start with the guide that matches the job:
+
+| Guide | Use it for |
+| --- | --- |
+| **[Feature guide](docs/features.md)** | Complete capability catalog, examples, supported combinations, compatibility, and boundaries. |
+| **[Reference](docs/reference.md)** | Configuration properties, builder/runtime APIs, tuning knobs, UI component, and deployment requirements. |
+| **[Architecture](docs/architecture.md)** | Static file layout, range directories, posting retrieval, geo, authority, and vector internals. |
+| **[OSM example](examples/osm-geo/README.md)** | Map search, autocomplete, geocoding, constraints, route corridors, geometry, extraction, and RQA. |
+| **[Replace Google Maps APIs](docs/google-maps-migration.md)** | Migration adapter, API mapping, complete use cases, production checklist, attribution, and parity boundaries. |
+| **[Node](docs/node-runtime.md) / [mobile](docs/mobile.md)** | Local, remote, cached, embedded, and offline runtimes. |
+| **[Sharded OSM](docs/sharded-osm.md)** | Planet-scale regional builds, root routing, and exact score comparability. |
+| **[Production maps benchmark](docs/osm-maps-benchmark.md)** | Google Maps-style workload coverage, quality assertions, and phone budgets. |
 
 ## Crawl A Static Site
 

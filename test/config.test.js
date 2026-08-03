@@ -157,6 +157,7 @@ test("readConfig normalizes multi-resolution geo-cell indexes", async () => {
     codeGroupSize: 1,
     maxCellsPerQuery: 256,
     maxFacetValues: 256,
+    includeAll: false,
     values: ["cafe", "museum"]
   }]);
 });

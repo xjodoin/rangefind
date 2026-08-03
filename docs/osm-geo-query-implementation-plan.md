@@ -1,5 +1,14 @@
 # OSM Geo Query Implementation Plan
 
+> Historical design document. The point-tree milestones that started here have
+> since expanded into production OSM search, address interpolation, reverse
+> geocoding, prominence ranking, geo capsules, multi-resolution category/route
+> cells, route-corridor search, display geometry, and planet-scale sharding.
+> Use the current [feature guide](features.md), [reference](reference.md), and
+> [OSM example](../examples/osm-geo/README.md) as the product source of truth.
+> The unimplemented scope retained below is polygon filtering and a general
+> spatial shape-relation index, not result geometry rendering.
+
 ## Goal
 
 Give Rangefind full-featured geo query support so a single static index can
@@ -13,14 +22,10 @@ queries, nearest-neighbor result pages, polygon and shape relations, reverse
 lookup, address-aware place ranking, and distance-aware ranking — adapted to
 range-addressed static files.
 
-Planet-scale deployment sharding is explicitly out of scope for this plan.
-Rangefind stays a single-index engine here; regional and country-sized
-extracts are the supported scale (validated up to 4.27M points). If a
-planet-scale corpus ever becomes a requirement, deployment sharding should be
-designed as its own generic layer (useful for text-only corpora too), not as
-part of the geo subsystem. Nothing in the current format blocks that: the geo
-tree, packs, and manifests are all local to one index and would nest inside a
-shard unchanged.
+Planet-scale deployment sharding was explicitly out of scope for the original
+plan and was subsequently delivered as the generic `rangefind/shards` layer.
+The geo tree, packs, manifests, text routing, and suggestion routing remain
+local to independently updateable regions beneath a small federated root.
 
 ## Status
 
@@ -38,8 +43,10 @@ The point subsystem is implemented and benchmarked (see
   oracle-verified benchmarks (`scripts/osm_geo_bench.mjs`) for Luxembourg and
   Quebec extracts.
 
-The remaining scope is shapes, reverse lookup, OSM ranking quality, and the
-Lucene comparison bench, detailed below.
+The remaining original geo scope is point-in-polygon filtering, a general
+static shape-relation index, and the Lucene comparison bench. Reverse
+geocoding, address search/interpolation, static OSM prominence, result geometry,
+route corridors, and geographic sharding are implemented through later APIs.
 
 ## Product Scope
 
@@ -51,25 +58,36 @@ Implemented:
 - Distance sort: nearest places to a point, with optional text/category
   filters, exact via early-stop proofs.
 - Distance boost: combine text relevance and distance decay.
+- Address-aware forward search with canonical authority keys and compact
+  `addr:interpolation` ranges.
+- Address-first bounded reverse geocoding with structured components,
+  accuracy/result filters, locality fallback, and shard routing.
+- Static OSM prominence through generic `rankPrior`.
+- Geo capsules and multi-resolution category cells, including wildcard
+  occupancy for brand/text route queries.
+- Route-corridor search with exact cross-track distance, progress, direction,
+  viewport bias, and rejoin points.
+- Simplified encoded polygon/line geometry for selected-result rendering.
+- Independently built geographic shards with frozen scoring statistics and
+  root text/suggestion routing.
 
 Remaining:
 
-- OSM ranking: prefer more important, addressable, or better-scoped places
-  when text and distance are otherwise close.
 - Polygon filters over point places.
-- Indexed area/line shapes for administrative boundaries, streets, parks,
-  buildings, and other OSM ways/relations.
+- Indexed spatial area/line shapes for administrative boundaries, streets,
+  parks, buildings, and other OSM ways/relations. Compact result geometry is
+  already supported but is not queried as a shape tree.
 - Shape-vs-shape relation queries aligned with Lucene relations where
   exactness is practical: `INTERSECTS`, `WITHIN`, `CONTAINS`, and `DISJOINT`.
-- Reverse lookup: find the nearest or containing place/address hierarchy for
-  a coordinate.
-- Address-aware search with inherited/attached address parts for POIs, house
-  numbers, streets, localities, cities, regions, and countries.
+- Containing-area reverse hierarchy over a future shape tree. Current reverse
+  geocoding is nearest-address plus bounded locality fallback.
 - Optional external enrichment hooks for TIGER/OpenAddresses-style house
-  number data, without making those datasets mandatory.
+  number data. Québec RQA enrichment is already implemented without making it
+  mandatory.
 
-Out of scope for this engine layer: routing, turn-by-turn navigation,
-network-distance search, and planet-scale deployment sharding.
+Out of scope for the static search engine: route calculation, turn-by-turn
+navigation, traffic-aware/network driving distance, and detour-time
+recalculation. Searching along a caller-supplied route is implemented.
 
 ## Query API
 
@@ -406,19 +424,20 @@ text+geo lanes, exact nearest with and without text.
 - Indexed line/polygon bbox pruning and exact relation verification.
 - Shape relation runtime lane and stats.
 
-### Milestone 4: Reverse lookup and address hierarchy
+### Milestone 4: Reverse lookup and address hierarchy — PARTIALLY DELIVERED
 
-- Reverse lookup API over point and shape trees.
-- Containing-area and nearest-point hierarchy ranking.
-- Independent/dependent place modeling inspired by Nominatim.
-- Layer-specific response shape for address, POI, street, locality, admin,
-  and country levels.
+- Delivered: address-first nearest-point reverse geocoding, interpolation,
+  structured address components, accuracy/result filters, locality fallback,
+  and geographic shard routing through `reverseGeocodeOsm()`.
+- Remaining: containing-area hierarchy and shape-tree relations.
 
-### Milestone 5: OSM ranking and quality pass
+### Milestone 5: OSM ranking and quality pass — DELIVERED, BENCHMARKS ONGOING
 
-- Rank/importance score integration and category/special phrase mapping.
-- Ambiguous-name test set and regional benchmark report.
-- Lucene comparison bench for box, radius, nearest, and distance boost.
+- Delivered: generic static `rankPrior`, OSM prominence, multilingual category
+  lexicon/intents, ambiguity/locality regression cases, and production phone
+  workload benchmarks.
+- Remaining from the original plan: a direct Lucene comparison bench for box,
+  radius, nearest, and distance boost.
 
 ## Risks
 

@@ -6,6 +6,13 @@ import {
   lookupCategoryFuzzy,
   withinOneEdit
 } from "./category_lexicon.js";
+import {
+  annotateConstraintResult,
+  compileOsmConstraintFilters,
+  evaluateOsmConstraints,
+  parseOsmConstraints
+} from "./constraints.js";
+export { decodePolyline } from "../../geo_route.js";
 
 const LOCALITY_CONNECTORS = new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
 const LOCALITY_CACHE = new WeakMap();
@@ -2146,7 +2153,7 @@ function localityExactResponse(locality, params, surface) {
   };
 }
 
-export async function searchOsmQuery(engine, rawParams = {}) {
+async function searchOsmQueryBase(engine, rawParams = {}) {
   // `near` is an advisory anchor (user location or map viewport center) for
   // the cascade only; the engine never sees it. Explicit place intents in
   // the query text always outrank proximity.
@@ -2562,4 +2569,139 @@ export async function searchOsmQuery(engine, rawParams = {}) {
       ...(weakLocalProbe ? { osmWeakLocalityTextProbe: true } : {})
     }
   };
+}
+
+function availableFacetNames(manifest) {
+  const names = new Set(Object.keys(manifest?.facets || {}));
+  for (const shard of manifest?.shards || []) {
+    for (const name of Object.keys(shard?.facets || {})) names.add(name);
+  }
+  return names;
+}
+
+function withConstraintFilters(params, constraints, engine) {
+  const facets = compileOsmConstraintFilters(constraints, availableFacetNames(engine?.manifest));
+  if (!Object.keys(facets).length) return params;
+  return {
+    ...params,
+    filters: {
+      ...(params.filters || {}),
+      facets: { ...(params.filters?.facets || {}), ...facets }
+    }
+  };
+}
+
+function constraintOptions(rawParams) {
+  return {
+    at: rawParams.at ?? rawParams.now,
+    timeZone: rawParams.timeZone,
+    includeUnknownOpenNow: rawParams.includeUnknownOpenNow,
+    requireCompleteOpeningHours: rawParams.requireCompleteOpeningHours
+  };
+}
+
+function constrainedResponse(response, constraints, rawParams, requestedSize) {
+  const evaluated = (response.results || []).map(result => {
+    const evaluation = evaluateOsmConstraints(result, constraints, constraintOptions(rawParams));
+    return { result: annotateConstraintResult(result, evaluation), evaluation };
+  });
+  const results = evaluated.filter(item => item.evaluation.matches).map(item => item.result).slice(0, requestedSize);
+  return {
+    ...response,
+    total: results.length,
+    size: requestedSize,
+    results,
+    approximate: response.approximate || evaluated.length >= Number(response.size || evaluated.length),
+    stats: {
+      ...(response.stats || {}),
+      osmConstraints: constraints,
+      osmConstraintCandidates: evaluated.length,
+      osmConstraintMatches: results.length
+    }
+  };
+}
+
+/** Search only the static index cells intersecting a buffered route. */
+export async function searchAlongRouteOsm(engine, rawParams = {}) {
+  if (typeof engine?.search !== "function") throw new TypeError("route search requires a Rangefind search engine");
+  const route = rawParams.route;
+  if (!route) throw new TypeError("route search requires an encoded polyline or GeoJSON route");
+  const requestedSize = Math.max(1, Math.min(100, Math.floor(Number(rawParams.limit ?? rawParams.size ?? 20))));
+  const parsed = parseOsmConstraints(rawParams.query ?? rawParams.q ?? "", rawParams.constraints);
+  const lexicon = await engineCategoryLexicon(engine);
+  const category = lookupCategory(lexicon, parsed.query) || lookupCategoryFuzzy(lexicon, parsed.query);
+  const dynamicConstraints = Boolean(parsed.constraints.openNow) || Object.keys(parsed.constraints).length > 0;
+  const candidateSize = Math.min(100, dynamicConstraints ? Math.max(32, requestedSize * 4) : requestedSize);
+  const {
+    route: _route,
+    query: _query,
+    q: _q,
+    corridorMeters = 1500,
+    limit: _limit,
+    constraints: _constraints,
+    at: _at,
+    now: _now,
+    timeZone: _timeZone,
+    includeUnknownOpenNow: _includeUnknown,
+    requireCompleteOpeningHours: _requireComplete,
+    routePositionMeters,
+    routeDirection,
+    viewport,
+    polylinePrecision,
+    size: _size,
+    geo: rawGeo,
+    ...engineOptions
+  } = rawParams;
+  let params = {
+    ...engineOptions,
+    q: category ? "" : parsed.query,
+    size: candidateSize,
+    ...(category ? {
+      filters: {
+        ...(engineOptions.filters || {}),
+        facets: { ...(engineOptions.filters?.facets || {}), type: [category.type] }
+      }
+    } : {}),
+    geo: {
+      ...(rawGeo || {}),
+      route,
+      corridorMeters,
+      polylinePrecision,
+      routePositionMeters,
+      routeDirection,
+      viewport,
+      sort: "route"
+    }
+  };
+  params = withConstraintFilters(params, parsed.constraints, engine);
+  const response = await engine.search(params);
+  const constrained = constrainedResponse(response, parsed.constraints, rawParams, requestedSize);
+  return {
+    ...constrained,
+    resolvedQuery: category?.label || parsed.query,
+    stats: {
+      ...(constrained.stats || {}),
+      plannerLane: "osmRouteCorridor",
+      osmIntentRouteCategory: category?.type || null,
+      osmIntentRouteCorridorMeters: Number(corridorMeters),
+      osmIntentRouteDirection: routeDirection === "reverse" ? "reverse" : "forward"
+    }
+  };
+}
+
+export async function searchOsmQuery(engine, rawParams = {}) {
+  if (rawParams.route) return searchAlongRouteOsm(engine, rawParams);
+  const parsed = parseOsmConstraints(rawParams.query ?? rawParams.q ?? "", rawParams.constraints);
+  const constraintsActive = Object.keys(parsed.constraints).length > 0;
+  const requestedSize = Math.max(1, Math.min(100, Math.floor(Number(rawParams.limit ?? rawParams.size ?? 10))));
+  const candidateSize = constraintsActive ? Math.min(100, Math.max(32, requestedSize * 4)) : requestedSize;
+  let params = {
+    ...rawParams,
+    q: parsed.query,
+    size: candidateSize
+  };
+  params = withConstraintFilters(params, parsed.constraints, engine);
+  const response = await searchOsmQueryBase(engine, params);
+  if (!constraintsActive) return response;
+  return constrainedResponse(response, parsed.constraints, rawParams, requestedSize);
 }
