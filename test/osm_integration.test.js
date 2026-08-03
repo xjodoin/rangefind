@@ -20,7 +20,7 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
     workerCount: 6,
     buildProgressLogMs: 0
   });
-  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 4);
+  assert.equal(OSM_INTEGRATION_SCHEMA_VERSION, 5);
   assert.equal(config.input, "data/osm-rqa-places.jsonl");
   assert.equal(config.output, "public/rangefind");
   assert.equal(config.scanWorkers, 6);
@@ -29,6 +29,8 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
   assert.deepEqual(config.display, [...OSM_DISPLAY_FIELDS]);
   assert.deepEqual(config.authority.map(field => field.name), ["address", "address_interpolation", "postcode", "street"]);
   assert.deepEqual(config.rankPrior, { field: "prominence", boost: 0.45, overfetch: 4 });
+  assert.equal(config.fields.find(field => field.name === "aliases")?.phrase, true);
+  assert.equal(config.suggest.find(field => field.path === "aliases")?.weightPath, "population");
   assert.ok(config.geoCapsuleFields.includes("details"));
   assert.ok(config.facets.some(field => field.name === "wheelchair"));
   assert.ok(config.filterBitmapFacetValues.type.includes("cinema"));
@@ -111,6 +113,7 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       id: "node/2",
       name: "Testville Cinema",
       search_name: "Testville Cinema",
+      aliases: ["Picture House", "Salle obscure"],
       body: "cinema amenity",
       category: "amenity",
       type: "cinema",
@@ -229,6 +232,10 @@ test("Node OSM integration builds a normal searchable Rangefind index", async ()
       nearbyCinema.stats.trace.spans.find(span => span.name === "manifest.fetch")?.count,
       2
     );
+    const aliasSearch = await engine.search({ q: "picture house", size: 3 });
+    assert.equal(aliasSearch.results[0]?.id, "node/2");
+    const aliasSuggest = await engine.suggest({ q: "pict", size: 3 });
+    assert.equal(aliasSuggest.suggestions[0]?.text, "Picture House");
     const street = await engine.search({ q: "Test Road Testville", size: 5, trace: true });
     assert.equal(street.results[0]?.id, "way/3");
     assert.equal(street.results[0]?.category, "highway");

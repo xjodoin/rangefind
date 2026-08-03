@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Improved
+
+- OSM search now splits multi-value alternate names, indexes documented name
+  variants and their language-qualified forms deterministically, removes
+  folded duplicates and metadata-only `name:*` tags, and retains more useful
+  aliases without allowing tag order to exhaust the bounded budget. Exact
+  multi-word aliases receive phrase scoring and population-aware suggestions;
+  brand-only and language-only features also expose a useful searchable name.
+
 ## 0.4.0 — 2026-08-02
 
 ### Added

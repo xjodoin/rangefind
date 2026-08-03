@@ -26,7 +26,8 @@ import {
   interpolationRangeDocs,
   osmProminence,
   placeDetails,
-  placeDoc
+  placeDoc,
+  wayDocTagEntries
 } from "../src/integrations/osm/documents.js";
 
 test("address keys normalize directions, suffixes, punctuation, and ordinal words", () => {
@@ -161,6 +162,80 @@ test("OSM place documents retain compact useful details and a prominence prior",
 
   const city = new Map([["name", "Montréal"], ["place", "city"], ["population", "1704694"], ["capital", "yes"]]);
   assert.ok(osmProminence(city) > doc.prominence, "a populous capital should outrank an ordinary POI");
+});
+
+test("OSM alternate names are split, prioritized, folded-deduplicated, and metadata-safe", () => {
+  const tags = new Map([
+    ["name", "Montréal"],
+    ["name:pronunciation", "mɔ̃.ʁe.al"],
+    ["name:etymology", "Mount Royal"],
+    ["name:language", "fr"],
+    ["old_name", "Ville-Marie"],
+    ["operator", "Ville de Montréal"],
+    ["name:fr", "Montréal"],
+    ["name:en", "Montreal"],
+    ["official_name:en", "City of Montreal"],
+    ["nickname", "La Métropole"],
+    ["alt_name", "Hochelaga; Montréal, QC ; Hochelaga"],
+    ["short_name", "MTL"],
+    ["place", "city"],
+    ["population", "1704694"]
+  ]);
+  const doc = placeDoc("node", 624, 45.5019, -73.5674, tags);
+  assert.deepEqual(doc.aliases, [
+    "MTL",
+    "Hochelaga",
+    "Montréal, QC",
+    "La Métropole",
+    "City of Montreal",
+    "Ville-Marie",
+    "Ville de Montréal"
+  ]);
+  assert.ok(!doc.aliases.includes("Montreal"), "fold-equivalent names should not waste alias slots");
+  assert.ok(!doc.aliases.includes("mɔ̃.ʁe.al"));
+  assert.ok(!doc.aliases.includes("Mount Royal"));
+  assert.ok(!doc.aliases.includes("fr"));
+});
+
+test("OSM brand-only and localized-only features retain a useful searchable identity", () => {
+  const branded = placeDoc("node", 625, 45.5, -73.5, new Map([
+    ["amenity", "fast_food"],
+    ["brand", "Tim Hortons"],
+    ["operator", "The TDL Group Corp."]
+  ]));
+  assert.equal(branded.name, "Tim Hortons");
+  assert.deepEqual(branded.aliases, ["The TDL Group Corp."]);
+
+  const localizedWayTags = new Map([
+    ["highway", "residential"],
+    ["name:fr", "Rue des Érables"],
+    ["name:en", "Maple Street"],
+    ["alt_name:fr", "Chemin des Érables"],
+    ["name:pronunciation", "ʁy de ze.ʁabl"]
+  ]);
+  const retained = new Map(wayDocTagEntries(localizedWayTags));
+  assert.equal(retained.get("alt_name:fr"), "Chemin des Érables");
+  assert.equal(retained.has("name:pronunciation"), false);
+  const localized = placeDoc("way", 626, 45.5, -73.5, retained);
+  assert.equal(localized.name, "Maple Street");
+  assert.equal(localized.category, "highway");
+  assert.deepEqual(localized.aliases, ["Chemin des Érables", "Rue des Érables"]);
+});
+
+test("OSM alias budgets retain high-value names independently of tag order", () => {
+  const tags = new Map([
+    ["name", "Canonical Place"],
+    ["place", "city"],
+    ...Array.from({ length: 30 }, (_, index) => [
+      `name:aa-${String(index).padStart(2, "0")}`,
+      `Localized Place ${index}`
+    ]),
+    ["alt_name", "Common Place"],
+    ["short_name", "CP"]
+  ]);
+  const doc = placeDoc("node", 627, 45.5, -73.5, tags);
+  assert.equal(doc.aliases.length, 24);
+  assert.deepEqual(doc.aliases.slice(0, 2), ["CP", "Common Place"]);
 });
 
 test("address interpolation uses compact buckets and follows polyline distance", () => {

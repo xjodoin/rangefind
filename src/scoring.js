@@ -38,6 +38,16 @@ export function fieldText(doc, field) {
   return String(getPath(doc, field.path, ""));
 }
 
+function rawFieldValue(doc, path, fallback = "") {
+  if (!path) return fallback;
+  let value = doc;
+  for (const part of String(path).split(".")) {
+    if (value == null) return fallback;
+    value = value[part];
+  }
+  return value ?? fallback;
+}
+
 export function isAlwaysIndexField(field, config = {}) {
   const names = alwaysIndexFieldNames(config);
   return names.has(String(field.name || "")) || names.has(String(field.path || ""));
@@ -54,12 +64,29 @@ export function analyzeFieldText(doc, field, config = {}, options = {}) {
   const lang = options.lang ?? analyzer.docLanguage(doc, config);
   const text = fieldIndexText(doc, field, config);
   const terms = analyzer.tokenize(text, { unique: false, lang });
+  const rawValue = rawFieldValue(doc, field.path, "");
+  let phraseRuns = null;
+  if (field.phrase && Array.isArray(rawValue)) {
+    let consumed = 0;
+    phraseRuns = [];
+    for (const rawItem of rawValue) {
+      if (consumed >= text.length) break;
+      const item = String(rawItem ?? "");
+      const indexedItem = item.slice(0, Math.max(0, text.length - consumed));
+      const run = analyzer.tokenize(indexedItem, { unique: false, lang });
+      if (run.length) phraseRuns.push(run);
+      // getPath joins array items with one space. Count it against a truncated
+      // field without letting it join two independent phrase runs.
+      consumed += item.length + 1;
+    }
+  }
   return {
     text,
     terms,
     counts: termCountsFromTerms(terms),
     length: terms.length,
-    lang
+    lang,
+    ...(phraseRuns ? { phraseRuns } : {})
   };
 }
 
@@ -79,9 +106,12 @@ export function addFieldScores(doc, field, avgLen, scores, options = {}) {
 
   if (field.phrase) {
     const phraseTerms = terms || analyzer.tokenize(text, { unique: false, lang });
-    for (const n of [2, 3]) {
-      for (let i = 0; i <= phraseTerms.length - n; i++) {
-        addWeighted(scores, phraseTerms.slice(i, i + n).join("_"), field.phraseWeight ?? 8);
+    const phraseRuns = analysis?.phraseRuns || [phraseTerms];
+    for (const run of phraseRuns) {
+      for (const n of [2, 3]) {
+        for (let i = 0; i <= run.length - n; i++) {
+          addWeighted(scores, run.slice(i, i + n).join("_"), field.phraseWeight ?? 8);
+        }
       }
     }
   }

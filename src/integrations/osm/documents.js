@@ -5,6 +5,7 @@ import {
   normalizeAddressKey,
   normalizePostalCodeSpacing
 } from "../../address.js";
+import { foldMulti } from "../../analysis_fold.js";
 import { encodePolyline } from "../../geo_route.js";
 
 // Primary OSM keys that make a feature a searchable place, in ranking order.
@@ -22,10 +23,35 @@ const NOISE_TYPES = new Set([
   "parking_space", "tree_row"
 ]);
 
-const ALIAS_KEYS = [
-  "alt_name", "old_name", "short_name", "official_name", "loc_name",
-  "brand", "operator", "ref"
-];
+// Searchable identities in selection order. OSM supports language-qualified
+// variants of the name keys (for example `official_name:fr`) and occasionally
+// stores several alternatives in one semicolon-separated value. Keep the
+// priorities explicit so a mapper/PBF tag-order change cannot decide which
+// names survive the bounded alias budget.
+const ALIAS_KEY_PRIORITY = new Map([
+  ["short_name", 10], ["alt_name", 20], ["loc_name", 30],
+  ["nickname", 35], ["int_name", 40], ["nat_name", 45],
+  ["reg_name", 50], ["official_name", 55], ["full_name", 60],
+  ["brand", 65], ["ref_name", 70], ["bridge:name", 75],
+  ["tunnel:name", 75], ["name:left", 80], ["name:right", 80],
+  ["old_name", 90], ["operator", 100], ["ref", 110],
+  ["sorting_name", 120]
+]);
+const ALIAS_KEYS = [...ALIAS_KEY_PRIORITY.keys()];
+const FALLBACK_NAME_PRIORITY = new Map([
+  ["official_name", 10], ["loc_name", 20], ["int_name", 30],
+  ["nat_name", 35], ["reg_name", 40], ["full_name", 45],
+  ["brand", 50], ["short_name", 55], ["alt_name", 60],
+  ["nickname", 65], ["ref_name", 70], ["bridge:name", 75],
+  ["tunnel:name", 75], ["name:left", 80], ["name:right", 80]
+]);
+const NON_ALIAS_NAME_SUFFIXES = new Set([
+  "etymology", "language", "pronunciation", "signed", "source",
+  "prefix", "suffix", "conditional"
+]);
+const LANGUAGE_SUFFIX_RE = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/iu;
+const HISTORICAL_NAME_SUFFIX_RE = /^\d{4}(?:(?:-|--)\d{0,4})?$/u;
+const MAX_SEARCH_ALIASES = 24;
 
 const ADDRESS_TAG_KEYS = [
   "addr:street", "addr:housenumber", "addr:city", "addr:town",
@@ -100,14 +126,88 @@ function firstCategory(tags) {
   return null;
 }
 
-function collectAliases(tags, name) {
-  const aliases = [];
+function normalizedNameIdentity(value) {
+  return foldMulti(value)
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+function languageQualifiedAliasKey(key) {
+  for (const base of ALIAS_KEYS) {
+    if (!key.startsWith(`${base}:`)) continue;
+    const suffix = key.slice(base.length + 1);
+    if (LANGUAGE_SUFFIX_RE.test(suffix)) return base;
+  }
+  return null;
+}
+
+function aliasKeyPriority(key) {
+  if (ALIAS_KEY_PRIORITY.has(key)) return ALIAS_KEY_PRIORITY.get(key);
+  const qualifiedBase = languageQualifiedAliasKey(key);
+  if (qualifiedBase) return ALIAS_KEY_PRIORITY.get(qualifiedBase) + 1;
+  if (!key.startsWith("name:")) return null;
+  const suffix = key.slice("name:".length);
+  const namespace = suffix.split(":", 1)[0].toLowerCase();
+  if (!suffix || NON_ALIAS_NAME_SUFFIXES.has(namespace)) return null;
+  if (LANGUAGE_SUFFIX_RE.test(suffix)) return 25;
+  if (HISTORICAL_NAME_SUFFIX_RE.test(suffix)) return 91;
+  // Preserve useful established extensions such as name:botanical while the
+  // explicit deny-list above prevents metadata values from polluting search.
+  return 85;
+}
+
+function splitAliasValues(rawValue) {
+  return String(rawValue ?? "")
+    .split(";")
+    .map(cleanText)
+    .filter(Boolean);
+}
+
+function searchNameCandidates(tags) {
+  const candidates = [];
   for (const [key, rawValue] of tags) {
-    const value = cleanText(rawValue);
-    if (!value || value === name) continue;
-    if (ALIAS_KEYS.includes(key) || key.startsWith("name:")) {
-      if (!aliases.includes(value) && aliases.length < 8) aliases.push(value);
+    const priority = aliasKeyPriority(key);
+    if (priority == null) continue;
+    splitAliasValues(rawValue).forEach((value, valueIndex) => {
+      candidates.push({ key, priority, value, valueIndex });
+    });
+  }
+  return candidates.sort((left, right) => (
+    left.priority - right.priority
+    || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0)
+    || left.valueIndex - right.valueIndex
+    || (left.value < right.value ? -1 : left.value > right.value ? 1 : 0)
+  ));
+}
+
+function fallbackSearchName(candidates) {
+  let best = null;
+  for (const candidate of candidates) {
+    const qualifiedBase = languageQualifiedAliasKey(candidate.key);
+    const localized = candidate.key.startsWith("name:")
+      && LANGUAGE_SUFFIX_RE.test(candidate.key.slice("name:".length));
+    const priority = FALLBACK_NAME_PRIORITY.get(candidate.key)
+      ?? (qualifiedBase ? (FALLBACK_NAME_PRIORITY.get(qualifiedBase) ?? 100) + 1 : null)
+      ?? (localized ? 25 : null);
+    if (priority == null) continue;
+    if (!best || priority < best.priority
+      || (priority === best.priority && candidate.key < best.candidate.key)) {
+      best = { candidate, priority };
     }
+  }
+  return best?.candidate.value || "";
+}
+
+function collectAliases(candidates, name) {
+  const aliases = [];
+  const seen = new Set([normalizedNameIdentity(name)].filter(Boolean));
+  for (const { value } of candidates) {
+    const identity = normalizedNameIdentity(value);
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    aliases.push(value);
+    if (aliases.length >= MAX_SEARCH_ALIASES) break;
   }
   return aliases;
 }
@@ -177,7 +277,7 @@ export function osmProminence(tags, category = firstCategory(tags)) {
 export function wayDocTagEntries(tags) {
   const entries = [];
   for (const [key, value] of tags) {
-    if (WAY_DOC_KEYS.has(key) || key.startsWith("name:")) entries.push([key, value]);
+    if (WAY_DOC_KEYS.has(key) || aliasKeyPriority(key) != null) entries.push([key, value]);
   }
   return entries;
 }
@@ -334,7 +434,13 @@ export function addressFromTags(tags) {
 }
 
 export function placeDoc(osmType, osmId, lat, lon, tags, options = {}) {
-  const name = cleanText(tags.get("name"));
+  const primaryName = cleanText(tags.get("name"));
+  const searchNames = searchNameCandidates(tags);
+  // Brand-only shops and language-only names are common enough in real OSM
+  // data that rendering them as a generic "restaurant"/"shop" label loses
+  // the identity users actually type. Historical names, operators and refs
+  // remain searchable aliases but never masquerade as the current display.
+  const name = primaryName || fallbackSearchName(searchNames);
   const primaryCategory = firstCategory(tags);
   // Named road ways were already retained as searchable documents. Preserve
   // their OSM road class explicitly so street/locality authority can serve
@@ -346,7 +452,7 @@ export function placeDoc(osmType, osmId, lat, lon, tags, options = {}) {
   if (!name && !category && !address?.complete) return null;
   const label = typeLabel(category?.type || (address ? "address" : ""));
   const displayName = name || address?.formatted || label;
-  const aliases = name ? collectAliases(tags, name) : [];
+  const aliases = collectAliases(searchNames, name);
   const cuisine = typeLabel(tags.get("cuisine"));
   const details = placeDetails(tags);
   const bodyParts = [

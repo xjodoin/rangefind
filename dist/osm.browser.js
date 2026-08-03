@@ -1282,16 +1282,58 @@ var NOISE_TYPES = /* @__PURE__ */ new Set([
   "parking_space",
   "tree_row"
 ]);
-var ALIAS_KEYS = [
-  "alt_name",
-  "old_name",
-  "short_name",
-  "official_name",
-  "loc_name",
-  "brand",
-  "operator",
-  "ref"
-];
+var ALIAS_KEY_PRIORITY = /* @__PURE__ */ new Map([
+  ["short_name", 10],
+  ["alt_name", 20],
+  ["loc_name", 30],
+  ["nickname", 35],
+  ["int_name", 40],
+  ["nat_name", 45],
+  ["reg_name", 50],
+  ["official_name", 55],
+  ["full_name", 60],
+  ["brand", 65],
+  ["ref_name", 70],
+  ["bridge:name", 75],
+  ["tunnel:name", 75],
+  ["name:left", 80],
+  ["name:right", 80],
+  ["old_name", 90],
+  ["operator", 100],
+  ["ref", 110],
+  ["sorting_name", 120]
+]);
+var ALIAS_KEYS = [...ALIAS_KEY_PRIORITY.keys()];
+var FALLBACK_NAME_PRIORITY = /* @__PURE__ */ new Map([
+  ["official_name", 10],
+  ["loc_name", 20],
+  ["int_name", 30],
+  ["nat_name", 35],
+  ["reg_name", 40],
+  ["full_name", 45],
+  ["brand", 50],
+  ["short_name", 55],
+  ["alt_name", 60],
+  ["nickname", 65],
+  ["ref_name", 70],
+  ["bridge:name", 75],
+  ["tunnel:name", 75],
+  ["name:left", 80],
+  ["name:right", 80]
+]);
+var NON_ALIAS_NAME_SUFFIXES = /* @__PURE__ */ new Set([
+  "etymology",
+  "language",
+  "pronunciation",
+  "signed",
+  "source",
+  "prefix",
+  "suffix",
+  "conditional"
+]);
+var LANGUAGE_SUFFIX_RE = /^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/iu;
+var HISTORICAL_NAME_SUFFIX_RE = /^\d{4}(?:(?:-|--)\d{0,4})?$/u;
+var MAX_SEARCH_ALIASES = 24;
 var ADDRESS_TAG_KEYS = [
   "addr:street",
   "addr:housenumber",
@@ -1410,14 +1452,65 @@ function firstCategory(tags) {
   }
   return null;
 }
-function collectAliases(tags, name) {
-  const aliases = [];
+function normalizedNameIdentity(value) {
+  return foldMulti(value).replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/gu, " ");
+}
+function languageQualifiedAliasKey(key) {
+  for (const base of ALIAS_KEYS) {
+    if (!key.startsWith(`${base}:`)) continue;
+    const suffix = key.slice(base.length + 1);
+    if (LANGUAGE_SUFFIX_RE.test(suffix)) return base;
+  }
+  return null;
+}
+function aliasKeyPriority(key) {
+  if (ALIAS_KEY_PRIORITY.has(key)) return ALIAS_KEY_PRIORITY.get(key);
+  const qualifiedBase = languageQualifiedAliasKey(key);
+  if (qualifiedBase) return ALIAS_KEY_PRIORITY.get(qualifiedBase) + 1;
+  if (!key.startsWith("name:")) return null;
+  const suffix = key.slice("name:".length);
+  const namespace = suffix.split(":", 1)[0].toLowerCase();
+  if (!suffix || NON_ALIAS_NAME_SUFFIXES.has(namespace)) return null;
+  if (LANGUAGE_SUFFIX_RE.test(suffix)) return 25;
+  if (HISTORICAL_NAME_SUFFIX_RE.test(suffix)) return 91;
+  return 85;
+}
+function splitAliasValues(rawValue) {
+  return String(rawValue ?? "").split(";").map(cleanText).filter(Boolean);
+}
+function searchNameCandidates(tags) {
+  const candidates = [];
   for (const [key, rawValue] of tags) {
-    const value = cleanText(rawValue);
-    if (!value || value === name) continue;
-    if (ALIAS_KEYS.includes(key) || key.startsWith("name:")) {
-      if (!aliases.includes(value) && aliases.length < 8) aliases.push(value);
+    const priority = aliasKeyPriority(key);
+    if (priority == null) continue;
+    splitAliasValues(rawValue).forEach((value, valueIndex) => {
+      candidates.push({ key, priority, value, valueIndex });
+    });
+  }
+  return candidates.sort((left, right) => left.priority - right.priority || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0) || left.valueIndex - right.valueIndex || (left.value < right.value ? -1 : left.value > right.value ? 1 : 0));
+}
+function fallbackSearchName(candidates) {
+  let best = null;
+  for (const candidate of candidates) {
+    const qualifiedBase = languageQualifiedAliasKey(candidate.key);
+    const localized = candidate.key.startsWith("name:") && LANGUAGE_SUFFIX_RE.test(candidate.key.slice("name:".length));
+    const priority = FALLBACK_NAME_PRIORITY.get(candidate.key) ?? (qualifiedBase ? (FALLBACK_NAME_PRIORITY.get(qualifiedBase) ?? 100) + 1 : null) ?? (localized ? 25 : null);
+    if (priority == null) continue;
+    if (!best || priority < best.priority || priority === best.priority && candidate.key < best.candidate.key) {
+      best = { candidate, priority };
     }
+  }
+  return best?.candidate.value || "";
+}
+function collectAliases(candidates, name) {
+  const aliases = [];
+  const seen = new Set([normalizedNameIdentity(name)].filter(Boolean));
+  for (const { value } of candidates) {
+    const identity = normalizedNameIdentity(value);
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    aliases.push(value);
+    if (aliases.length >= MAX_SEARCH_ALIASES) break;
   }
   return aliases;
 }
@@ -1472,7 +1565,7 @@ function osmProminence(tags, category = firstCategory(tags)) {
 function wayDocTagEntries(tags) {
   const entries = [];
   for (const [key, value] of tags) {
-    if (WAY_DOC_KEYS.has(key) || key.startsWith("name:")) entries.push([key, value]);
+    if (WAY_DOC_KEYS.has(key) || aliasKeyPriority(key) != null) entries.push([key, value]);
   }
   return entries;
 }
@@ -1605,14 +1698,16 @@ function addressFromTags(tags) {
   };
 }
 function placeDoc(osmType, osmId, lat, lon, tags, options = {}) {
-  const name = cleanText(tags.get("name"));
+  const primaryName = cleanText(tags.get("name"));
+  const searchNames = searchNameCandidates(tags);
+  const name = primaryName || fallbackSearchName(searchNames);
   const primaryCategory = firstCategory(tags);
   const category = primaryCategory || (name && tags.get("highway") ? { category: "highway", type: cleanText(tags.get("highway")) } : null);
   const address = addressFromTags(tags);
   if (!name && !category && !address?.complete) return null;
   const label = typeLabel(category?.type || (address ? "address" : ""));
   const displayName = name || address?.formatted || label;
-  const aliases = name ? collectAliases(tags, name) : [];
+  const aliases = collectAliases(searchNames, name);
   const cuisine = typeLabel(tags.get("cuisine"));
   const details = placeDetails(tags);
   const bodyParts = [
@@ -4381,7 +4476,7 @@ function createRangefindMapsAdapter(engine, options = {}) {
 }
 
 // src/integrations/osm/schema.js
-var OSM_INTEGRATION_SCHEMA_VERSION = 4;
+var OSM_INTEGRATION_SCHEMA_VERSION = 5;
 var OSM_DISPLAY_FIELDS = Object.freeze([
   "name",
   "address",
@@ -4438,7 +4533,7 @@ function createOsmIndexConfig(options = {}) {
     builderWorkerCount: workerCount,
     fields: [
       { name: "title", path: "search_name", weight: 6, b: 0.4, phrase: true },
-      { name: "aliases", path: "aliases", weight: 4, b: 0.5 },
+      { name: "aliases", path: "aliases", weight: 4, b: 0.5, phrase: true },
       { name: "address", path: "address_search", weight: 10, b: 0.2 },
       { name: "body", path: "body", weight: 1, b: 0.75 }
     ],
@@ -4559,7 +4654,10 @@ function createOsmIndexConfig(options = {}) {
     ],
     suggest: [
       { path: "search_name", weightPath: "population" },
-      { path: "aliases" }
+      // Population is equally relevant when a user types a translated or
+      // alternate place name; without it a tiny feature can outrank the city
+      // merely because its alias is shorter.
+      { path: "aliases", weightPath: "population" }
     ],
     display: [...OSM_DISPLAY_FIELDS],
     buildProgressLogMs: Number(options.buildProgressLogMs ?? 15e3)

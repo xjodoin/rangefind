@@ -39,3 +39,20 @@ test("document index analysis reuses capped field terms for query bundle seeds",
   assert.deepEqual(analysis.selectedTerms, analyzeDocumentTerms(doc, config, avgLens));
   assert.deepEqual(analysis.fieldTerms, [["static", "range", "search"], null]);
 });
+
+test("phrase fields preserve array-value boundaries", () => {
+  const config = {
+    targetPostingsPerDoc: 32,
+    maxExpansionTermsPerDoc: 0,
+    bm25fK1: 1.2,
+    alwaysIndexFields: ["aliases"],
+    fields: [{ name: "aliases", path: "aliases", weight: 4, phrase: true }]
+  };
+  const terms = new Map(analyzeDocumentTerms({
+    aliases: ["New York", "Big Apple", "Separate", "Words"]
+  }, config, { aliases: 8 }));
+  assert.ok(terms.has("new_york"));
+  assert.ok(terms.has("big_apple"));
+  assert.equal(terms.has("york_big"), false);
+  assert.equal(terms.has("separate_word"), false);
+});

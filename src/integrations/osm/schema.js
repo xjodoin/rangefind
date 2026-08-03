@@ -1,6 +1,6 @@
 import { OSM_CANONICAL_TYPES } from "./category_lexicon.js";
 
-export const OSM_INTEGRATION_SCHEMA_VERSION = 4;
+export const OSM_INTEGRATION_SCHEMA_VERSION = 5;
 
 export const OSM_DISPLAY_FIELDS = Object.freeze([
   "name", "address", "house_number", "street", "unit", "suburb",
@@ -42,7 +42,7 @@ export function createOsmIndexConfig(options = {}) {
     builderWorkerCount: workerCount,
     fields: [
       { name: "title", path: "search_name", weight: 6.0, b: 0.4, phrase: true },
-      { name: "aliases", path: "aliases", weight: 4.0, b: 0.5 },
+      { name: "aliases", path: "aliases", weight: 4.0, b: 0.5, phrase: true },
       { name: "address", path: "address_search", weight: 10.0, b: 0.2 },
       { name: "body", path: "body", weight: 1.0, b: 0.75 }
     ],
@@ -143,7 +143,10 @@ export function createOsmIndexConfig(options = {}) {
     ],
     suggest: [
       { path: "search_name", weightPath: "population" },
-      { path: "aliases" }
+      // Population is equally relevant when a user types a translated or
+      // alternate place name; without it a tiny feature can outrank the city
+      // merely because its alias is shorter.
+      { path: "aliases", weightPath: "population" }
     ],
     display: [...OSM_DISPLAY_FIELDS],
     buildProgressLogMs: Number(options.buildProgressLogMs ?? 15000)
