@@ -3,10 +3,44 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Search a live, browser-native OpenStreetMap index with Rangefind. No API key, search server, or database required.">
+  <meta name="description" content="Try a free Google Maps search alternative powered by Rangefind and OpenStreetMap. Search places and addresses with no API key or per-request bill.">
+  <meta name="robots" content="index,follow,max-image-preview:large">
   <meta name="theme-color" content="#14161d">
-  <title>Rangefind Atlas — Live OpenStreetMap Search</title>
+  <title>Free Google Maps Search Alternative Demo | Rangefind</title>
+  <link rel="canonical" href="https://rangefind.dev/map/">
   <link rel="icon" href="https://rangefind.dev/assets/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:locale" content="en_CA">
+  <meta property="og:site_name" content="Rangefind">
+  <meta property="og:title" content="Free Google Maps Search Alternative Demo | Rangefind">
+  <meta property="og:description" content="Search the live public OpenStreetMap index from your browser with no API key, search server, or per-request bill.">
+  <meta property="og:url" content="https://rangefind.dev/map/">
+  <meta property="og:image" content="https://rangefind.dev/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Rangefind Atlas — live client-only OpenStreetMap place and address search.">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Free Google Maps Search Alternative Demo | Rangefind">
+  <meta name="twitter:description" content="Search the live public OpenStreetMap index with no API key or per-request bill.">
+  <meta name="twitter:image" content="https://rangefind.dev/assets/og.png">
+  <link rel="sitemap" href="https://rangefind.dev/sitemap.xml">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "Rangefind Atlas",
+      "url": "https://rangefind.dev/map/",
+      "description": "A free browser-native OpenStreetMap place and address search demo powered by the public Rangefind static index.",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Any",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "license": "https://opensource.org/license/mit/",
+      "codeRepository": "https://github.com/xjodoin/rangefind",
+      "isPartOf": { "@type": "WebSite", "name": "Rangefind", "url": "https://rangefind.dev/" },
+      "about": { "@type": "Dataset", "name": "OpenStreetMap", "license": "https://www.openstreetmap.org/copyright" }
+    }
+  </script>
   <link rel="preconnect" href="https://tile.openstreetmap.org">
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
   <link rel="stylesheet" href="styles.css">
@@ -63,7 +97,7 @@
             </button>
           </span>
         </div>
-        <p class="eyebrow">OSM / SHARDED PLANET INDEX</p>
+        <p class="eyebrow">FREE GOOGLE MAPS SEARCH ALTERNATIVE / OSM INDEX</p>
         <h1>Search the planet.<br><em>No search server.</em></h1>
         <p id="indexMeta" class="index-meta">Opening the public index directly from static files…</p>
 
@@ -154,6 +188,7 @@
         <p>OpenStreetMap data, searched in your browser from Cloudflare R2.</p>
         <nav aria-label="Demo resources">
           <a href="https://osm.rangefind.dev/" target="_blank" rel="noreferrer">Index status</a>
+          <a href="https://rangefind.dev/google-maps-api-alternative/">Migration guide</a>
           <a href="https://rangefind.dev/docs/geo-search/">How it works</a>
           <a href="https://www.openstreetmap.org/copyright">ODbL</a>
         </nav>

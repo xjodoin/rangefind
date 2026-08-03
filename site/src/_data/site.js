@@ -39,7 +39,8 @@ export default {
     {
       section: "Integrations",
       items: [
-        { title: "Plugins", url: "/docs/plugins/" }
+        { title: "Plugins", url: "/docs/plugins/" },
+        { title: "Google Maps migration", url: "/google-maps-api-alternative/" }
       ]
     },
     {

@@ -3,13 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% if title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}</title>
+  <title>{% if seoTitle %}{{ seoTitle }}{% elif title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}</title>
   <meta name="description" content="{{ description or site.description }}">
+  <meta name="robots" content="index,follow,max-image-preview:large">
   <link rel="canonical" href="{{ site.origin }}{{ page.url | url }}">
   <link rel="icon" href="{{ '/assets/favicon.svg' | url }}" type="image/svg+xml">
   <meta property="og:type" content="website">
+  <meta property="og:locale" content="en_CA">
   <meta property="og:site_name" content="{{ site.name }}">
-  <meta property="og:title" content="{% if title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}">
+  <meta property="og:title" content="{% if seoTitle %}{{ seoTitle }}{% elif title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}">
   <meta property="og:description" content="{{ description or site.description }}">
   <meta property="og:url" content="{{ site.origin }}{{ page.url | url }}">
   <meta property="og:image" content="{{ site.origin }}{{ '/assets/og.png' | url }}">
@@ -17,6 +19,9 @@
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="Rangefind — Search, without the server. A static search index read with HTTP range requests.">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{% if seoTitle %}{{ seoTitle }}{% elif title %}{{ title }} · {{ site.name }}{% else %}{{ site.name }} — {{ site.tagline }}{% endif %}">
+  <meta name="twitter:description" content="{{ description or site.description }}">
+  <meta name="twitter:image" content="{{ site.origin }}{{ '/assets/og.png' | url }}">
   <meta name="theme-color" content="#14161d">
   <script type="application/ld+json">{{ jsonLd | safe }}</script>
   <link rel="preload" href="{{ '/assets/fonts/bricolage-grotesque-400-800-latin.woff2' | url }}" as="font" type="font/woff2" crossorigin>
@@ -47,6 +52,7 @@
         <a href="{{ '/docs/' | url }}">Docs</a>
         <a href="{{ '/docs/benchmarks/' | url }}">Benchmarks</a>
         <a href="{{ '/map/' | url }}">Map demo</a>
+        <a href="{{ '/google-maps-api-alternative/' | url }}">Maps alternative</a>
         <a href="{{ '/changelog/' | url }}">Changelog</a>
         <a href="{{ site.repo }}" rel="external">GitHub</a>
       </nav>
@@ -77,6 +83,7 @@
         <a href="{{ site.npm }}" rel="external">npm</a>
         <a href="{{ '/basic/' | url }}">Minimal demo</a>
         <a href="{{ '/map/' | url }}">Map demo</a>
+        <a href="{{ '/google-maps-api-alternative/' | url }}">Google Maps API alternative</a>
         <a href="{{ '/changelog/' | url }}">Changelog</a>
       </nav>
       <p class="site-footer__legal">MIT licensed · © Xavier Jodoin · Fonts: Bricolage Grotesque &amp; Martian Mono (OFL)</p>

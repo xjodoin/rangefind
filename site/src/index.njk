@@ -17,6 +17,7 @@ description: "Rangefind is a static search engine: BM25F relevance, typo correct
       <div class="hero__actions">
         <a class="button button--marker" href="{{ '/docs/' | url }}">Get started</a>
         <a class="button button--ghost" href="{{ '/map/' | url }}">Search a live map</a>
+        <a class="button button--ghost" href="{{ '/google-maps-api-alternative/' | url }}">Replace Google Maps search</a>
       </div>
     </div>
     <div class="hero__demo">
@@ -130,6 +131,36 @@ await rf.search({ q: "byte ranges" });</code></pre>
         <p>Publish small delta generations over an existing index; unchanged packs keep their names and their CDN cache entries.</p>
       </div>
     </div>
+  </section>
+
+  <section class="section">
+    <span class="eyebrow">GOOGLE PLACES → RANGEFIND + OPENSTREETMAP</span>
+    <h2>Looking for a free Google Maps API alternative?</h2>
+    <p>
+      Rangefind replaces the OSM-backed search portion of many Google Maps
+      integrations: place autocomplete, text and nearby search, forward and
+      reverse geocoding, open-now constraints, inline place details, and
+      search along an existing route. Queries run in the browser against your
+      own static index, with no API key or per-request Rangefind fee.
+    </p>
+    <div class="features">
+      <div class="feature">
+        <h3>Smaller migration</h3>
+        <p>A tested adapter accepts familiar Google Places-style request shapes while preserving native Rangefind metadata.</p>
+      </div>
+      <div class="feature">
+        <h3>Honest boundaries</h3>
+        <p>Keep another provider for map tiles, route calculation, traffic, reviews, ratings, photos, and other live proprietary data.</p>
+      </div>
+      <div class="feature">
+        <h3>Predictable costs</h3>
+        <p>Pay for build compute, storage, and CDN traffic—not a proprietary API charge attached to every user query.</p>
+      </div>
+    </div>
+    <p style="margin-top:1.6rem">
+      <a class="button button--marker" href="{{ '/google-maps-api-alternative/' | url }}">Compare APIs and migrate</a>
+      <a class="button button--ghost" href="{{ '/map/' | url }}">Try the live OpenStreetMap demo</a>
+    </p>
   </section>
 
   <div class="band">

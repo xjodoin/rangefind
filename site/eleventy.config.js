@@ -80,6 +80,22 @@ export default function (eleventyConfig) {
       .replace(/href="(?!(?:[a-z][a-z0-9+.-]*:|\/|#))([^"]+)"/gu, `href="${repoTree}$1"`);
   });
 
+  // The public Google Maps migration page renders the repository guide rather
+  // than maintaining an SEO-only copy. Keep code links useful on the website
+  // and route readers to the equivalent first-party site documentation where
+  // one exists.
+  eleventyConfig.addGlobalData("googleMapsMigrationHtml", () => {
+    const md = markdownIt({ html: false, linkify: true });
+    const repoBlob = "https://github.com/xjodoin/rangefind/blob/main/";
+    const source = readFileSync(resolve(siteDir, "../docs/google-maps-migration.md"), "utf8")
+      .replace(/^# Replace Google Maps search APIs with Rangefind OSM\s*/u, "")
+      .replace(/\]\(\.\.\/src\/([^)]+)\)/gu, `](${repoBlob}src/$1)`)
+      .replace(/\]\(\.\.\/examples\/([^)]+)\)/gu, `](${repoBlob}examples/$1)`)
+      .replace(/\]\(sharded-osm\.md\)/gu, "](/docs/sharded-indexes/)")
+      .replace(/\]\(osm-maps-benchmark\.md\)/gu, `](${repoBlob}docs/osm-maps-benchmark.md)`);
+    return md.render(source);
+  });
+
   // llms-full.txt: every docs page as raw Markdown (front matter stripped,
   // title/lede promoted to a heading), in nav order.
   eleventyConfig.addGlobalData("llmsFullDocs", () => {

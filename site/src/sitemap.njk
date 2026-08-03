@@ -12,4 +12,7 @@ eleventyExcludeFromCollections: true
   </url>
   {%- endif %}
 {%- endfor %}
+  <url>
+    <loc>{{ site.origin }}{{ '/map/' | url }}</loc>
+  </url>
 </urlset>

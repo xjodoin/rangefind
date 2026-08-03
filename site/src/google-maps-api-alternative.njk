@@ -1,0 +1,221 @@
+---
+layout: base.njk
+title: Google Maps API alternative
+seoTitle: Free Google Maps API Alternative for Places & Geocoding
+description: Replace Google Places search, autocomplete, geocoding, and nearby search with a client-only OpenStreetMap index. No API key or per-request bill.
+permalink: /google-maps-api-alternative/
+---
+<div class="hero maps-hero">
+  <div class="hero__inner">
+    <div>
+      <span class="eyebrow">OPENSTREETMAP → STATIC INDEX → YOUR CDN</span>
+      <h1>A free Google Maps API alternative for place search</h1>
+      <p class="hero__lede">
+        Replace Google Places search, autocomplete, forward and reverse
+        geocoding, nearby search, and place details with a
+        <strong>client-only OpenStreetMap index</strong>. No API key, search
+        server, session token, or per-request bill.
+      </p>
+      <div class="hero__actions">
+        <a class="button button--marker" href="{{ '/map/' | url }}">Try the live map</a>
+        <a class="button button--ghost" href="#migration-guide">Read the migration guide</a>
+      </div>
+    </div>
+    <div class="hero__demo maps-hero__code">
+      <span class="eyebrow">npm install rangefind</span>
+      <pre><code class="language-js">import { createSearch } from "rangefind";
+import { createRangefindMapsAdapter } from "rangefind/osm";
+
+const engine = await createSearch({
+  baseUrl: "https://osm.rangefind.dev/"
+});
+const maps = createRangefindMapsAdapter(engine);
+const { places } = await maps.textSearch({
+  textQuery: "coffee near Laval",
+  maxResultCount: 10
+});</code></pre>
+      <p class="hero__demo-caption">
+        Queries read only the required byte ranges from static files. Your
+        users' searches stay in their browser and repeat queries can come
+        directly from the CDN or browser cache.
+      </p>
+    </div>
+  </div>
+  <div class="hero__stats">
+    <div class="stat"><div class="stat__value">$0</div><div class="stat__label">Rangefind license and per-query fees</div></div>
+    <div class="stat"><div class="stat__value">0</div><div class="stat__label">API keys or billing sessions</div></div>
+    <div class="stat"><div class="stat__value">OSM</div><div class="stat__label">open geographic source data</div></div>
+    <div class="stat"><div class="stat__value">206</div><div class="stat__label">cacheable HTTP range responses</div></div>
+  </div>
+</div>
+
+<main id="main" class="maps-alternative" data-rangefind-body>
+  <section class="section public-index">
+    <span class="eyebrow">PLANET-SCALE OSM INDEX · READY TO QUERY</span>
+    <h2>Use the free public OpenStreetMap index now</h2>
+    <p>
+      You do not have to build a planet index to try Rangefind or ship an
+      integration. <a href="https://osm.rangefind.dev/">osm.rangefind.dev</a>
+      is a ready-generated, cross-origin public index that works directly from
+      browsers and Node. It needs no Rangefind account, API key, or payment
+      method.
+    </p>
+    <div class="quickstart public-index__grid">
+      <div>
+        <h3>Connect in three lines</h3>
+        <pre><code class="language-js">import { createSearch } from "rangefind";
+
+const engine = await createSearch({
+  baseUrl: "https://osm.rangefind.dev/"
+});</code></pre>
+      </div>
+      <div>
+        <h3>Free public service, or fully self-hosted</h3>
+        <p>
+          The public index is free to query and continuously refreshed on a
+          best-effort basis. Use it for prototypes, public apps, evaluation,
+          and integrations that can tolerate a community service without an
+          availability SLA. Mirror or build the index under your own domain
+          when you need version pinning, guaranteed capacity, custom fields,
+          or an operational SLA.
+        </p>
+        <p>
+          Display
+          <a href="https://www.openstreetmap.org/copyright"><strong>© OpenStreetMap contributors</strong></a>
+          anywhere results or map data are shown.
+          <a href="https://osm.rangefind.dev/">Check coverage and freshness →</a>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <span class="eyebrow">REPLACE THE REQUEST PATH, NOT THE WHOLE MAP</span>
+    <h2>Where Rangefind replaces Google Maps APIs</h2>
+    <p>
+      Rangefind is an open-source alternative for applications that need
+      search and geocoding over OpenStreetMap data without sending every query
+      to a paid provider. It is intentionally not a clone of the entire Google
+      Maps Platform.
+    </p>
+    <div class="features maps-capabilities">
+      <div class="feature">
+        <h3>Places and autocomplete</h3>
+        <p>Search names, brands, categories, localities, streets, civic addresses, and multilingual aliases as the user types.</p>
+      </div>
+      <div class="feature">
+        <h3>Forward and reverse geocoding</h3>
+        <p>Resolve explicit and interpolated addresses, or turn a map click into nearby addresses, streets, and localities.</p>
+      </div>
+      <div class="feature">
+        <h3>Nearby and viewport search</h3>
+        <p>Use exact radius, nearest-first, bounding-box, open-now, accessibility, service, and payment constraints.</p>
+      </div>
+      <div class="feature">
+        <h3>Search along a route</h3>
+        <p>Find places inside a route corridor and return trip progress, direction, off-route distance, and the closest rejoin point.</p>
+      </div>
+      <div class="feature">
+        <h3>Inline place details</h3>
+        <p>Return configured OSM details and geometry with search results, avoiding a separately billed details request.</p>
+      </div>
+      <div class="feature">
+        <h3>Your renderer and infrastructure</h3>
+        <p>Start with the free public index, or pair Rangefind with MapLibre, Leaflet, or OpenLayers and host your own immutable index on any range-capable CDN.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section maps-scope">
+    <span class="eyebrow">HONEST COMPATIBILITY</span>
+    <h2>Google Maps Platform versus Rangefind OSM</h2>
+    <p>
+      Use Rangefind for the static OSM-backed search surface. Keep a routing
+      or specialist data provider only for capabilities that require live or
+      proprietary data.
+    </p>
+    <div class="maps-table-wrap">
+      <table class="maps-table">
+        <thead>
+          <tr><th>Capability</th><th>Rangefind replacement</th><th>Important boundary</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Places text search</td><td><strong>Yes</strong> — names, brands, categories, addresses, localities</td><td>Quality follows the indexed OSM data</td></tr>
+          <tr><td>Place autocomplete</td><td><strong>Yes</strong> — weighted, multilingual, typo-aware suggestions</td><td>No billing session token is needed</td></tr>
+          <tr><td>Nearby and viewport search</td><td><strong>Yes</strong> — radius, distance, bounds, typed constraints</td><td>Popularity is a static prominence signal</td></tr>
+          <tr><td>Forward/reverse geocoding</td><td><strong>Yes</strong> — including OSM address interpolation</td><td>Address completeness varies by region</td></tr>
+          <tr><td>Place details and geometry</td><td><strong>Yes</strong> — configured OSM fields returned inline</td><td>No Google reviews, ratings, or photos</td></tr>
+          <tr><td>Map rendering</td><td>Use MapLibre, Leaflet, OpenLayers, or another renderer</td><td>Rangefind does not supply basemap tiles</td></tr>
+          <tr><td>Directions, traffic, and ETA</td><td>Keep your routing engine</td><td>Rangefind can search an existing route but does not calculate it</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="band maps-cost-band">
+    <div class="band__inner">
+      <span class="eyebrow">NO SEARCH SAAS · NO PER-REQUEST METER</span>
+      <h2>Free software with predictable infrastructure costs</h2>
+      <div class="band__cols">
+        <div>
+          <h3>What is free</h3>
+          <p>
+            Rangefind is MIT licensed. There is no Rangefind account, API key,
+            request quota, monthly search plan, or charge for place details.
+            The browser can query the public <code>osm.rangefind.dev</code>
+            index or files hosted under your control.
+          </p>
+        </div>
+        <div>
+          <h3>What can still cost money</h3>
+          <p>
+            OSM extraction and index builds need compute, and production
+            storage, CDN traffic, and map tiles may have provider costs. The
+            difference is that these are cacheable infrastructure costs—not a
+            proprietary fee attached to every user query.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="docs docs--single maps-guide-shell">
+    <article class="docs-main maps-guide" id="migration-guide">
+      <span class="eyebrow">COMPLETE IMPLEMENTATION GUIDE</span>
+      <h2>Replace Google Places and Geocoding APIs step by step</h2>
+      <p class="docs-lede">
+        The guide below maps common Google request shapes to Rangefind,
+        includes production code for six map-search journeys, and documents
+        deployment, attribution, benchmarking, and parity limits.
+      </p>
+      {{ googleMapsMigrationHtml | safe }}
+    </article>
+  </div>
+
+  <section class="section section--last maps-faq">
+    <span class="eyebrow">COMMON MIGRATION QUESTIONS</span>
+    <h2>Is Rangefind the right Google Maps alternative?</h2>
+    <div class="features">
+      <div class="feature">
+        <h3>Can I use it without an API key?</h3>
+        <p>Yes. The runtime reads a static index directly from your origin or CDN. There is no Rangefind account or query credential.</p>
+      </div>
+      <div class="feature">
+        <h3>Can it replace Google Places API?</h3>
+        <p>For OSM-backed text, nearby, autocomplete, details, constraints, and geocoding use cases, yes. Proprietary ratings, reviews, photos, and live occupancy need another source.</p>
+      </div>
+      <div class="feature">
+        <h3>Does it provide map tiles or directions?</h3>
+        <p>No. Use a map renderer and tile source for display, and a routing engine for routes, traffic, ETA, and turn-by-turn instructions.</p>
+      </div>
+      <div class="feature">
+        <h3>Does “free” mean zero infrastructure cost?</h3>
+        <p>No. The software and query layer have no fee, but you still own build compute, storage, CDN traffic, and any tile-provider costs.</p>
+      </div>
+    </div>
+    <p class="maps-final-cta">
+      <a class="button button--marker" href="{{ '/map/' | url }}">Search the live OSM index</a>
+      <a class="button button--ghost" href="https://github.com/xjodoin/rangefind">View Rangefind on GitHub</a>
+    </p>
+  </section>
+</main>

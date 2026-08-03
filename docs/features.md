@@ -105,6 +105,27 @@ await buildOsmIndex({ root: "work", region: "quebec" });
 OSM attribution and source metadata are published in the manifest. The
 integration does not create a second search runtime or OSM-specific database.
 
+### Free public OpenStreetMap index
+
+The already-generated rolling index at
+[`https://osm.rangefind.dev/`](https://osm.rangefind.dev/) can be queried for
+free from browsers or Node without an account, API key, or payment method:
+
+```js
+import { createSearch } from "rangefind";
+
+const engine = await createSearch({
+  baseUrl: "https://osm.rangefind.dev/"
+});
+```
+
+The endpoint allows cross-origin range requests and its status page reports
+current coverage, source freshness, and rebuild progress. It is a best-effort
+public service without an availability SLA. Build or mirror the index under
+your own domain for guaranteed capacity, version pinning, custom source data,
+or custom OSM fields. Any result UI must retain the published OpenStreetMap
+[attribution](https://www.openstreetmap.org/copyright).
+
 ## Text search and ranking
 
 ### Weighted lexical retrieval

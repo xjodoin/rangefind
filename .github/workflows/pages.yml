@@ -54,6 +54,9 @@ jobs:
       - name: Build site
         run: PATH_PREFIX=/ SITE_ORIGIN=https://rangefind.dev GA_MEASUREMENT_ID=G-YXQZVK0FK0 npm run build --workspace rangefind-site
 
+      - name: Check search metadata and discovery
+        run: npm run check:seo
+
       - name: Assemble site
         run: |
           mkdir -p _site/basic _site/map

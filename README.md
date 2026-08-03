@@ -146,6 +146,23 @@ Demos: https://rangefind.dev/ — an OpenStreetMap map search backed by the
 rolling public sharded index (autocomplete, viewport geo queries, and
 nearest-neighbor) and the minimal example, both served as pure static files.
 
+The already-generated planet-scale OSM index is free to query directly from
+browsers or Node—no account or API key required:
+
+```js
+import { createSearch } from "rangefind";
+
+const engine = await createSearch({
+  baseUrl: "https://osm.rangefind.dev/"
+});
+```
+
+See its live coverage and freshness at https://osm.rangefind.dev/. It is a
+best-effort public service; self-host the index when you need guaranteed
+capacity, version pinning, custom fields, or an operational SLA. OSM result
+UIs must display
+[`© OpenStreetMap contributors`](https://www.openstreetmap.org/copyright).
+
 ```bash
 npm install
 npm run build:example
@@ -165,7 +182,7 @@ Start with the guide that matches the job:
 | **[Reference](docs/reference.md)** | Configuration properties, builder/runtime APIs, tuning knobs, UI component, and deployment requirements. |
 | **[Architecture](docs/architecture.md)** | Static file layout, range directories, posting retrieval, geo, authority, and vector internals. |
 | **[OSM example](examples/osm-geo/README.md)** | Map search, autocomplete, geocoding, constraints, route corridors, geometry, extraction, and RQA. |
-| **[Replace Google Maps APIs](docs/google-maps-migration.md)** | Migration adapter, API mapping, complete use cases, production checklist, attribution, and parity boundaries. |
+| **[Replace Google Maps APIs](https://rangefind.dev/google-maps-api-alternative/)** | Free public OSM index, migration adapter, API mapping, complete use cases, production checklist, attribution, and parity boundaries. |
 | **[Node](docs/node-runtime.md) / [mobile](docs/mobile.md)** | Local, remote, cached, embedded, and offline runtimes. |
 | **[Sharded OSM](docs/sharded-osm.md)** | Planet-scale regional builds, root routing, and exact score comparability. |
 | **[Production maps benchmark](docs/osm-maps-benchmark.md)** | Google Maps-style workload coverage, quality assertions, and phone budgets. |

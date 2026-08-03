@@ -59,6 +59,42 @@ OSM/RQA data -> Rangefind builder -> immutable static index -> browser Range req
 This makes cost, privacy, and offline behavior predictable, but missing source
 data cannot be recovered at query time.
 
+## Use the free public OSM index
+
+Rangefind publishes a ready-generated OpenStreetMap index at
+[`https://osm.rangefind.dev/`](https://osm.rangefind.dev/). It is free to
+query directly from browsers and Node, allows cross-origin range requests, and
+does not require an account, API key, session token, or payment method.
+
+```js
+import { createSearch } from "rangefind";
+import { createRangefindMapsAdapter } from "rangefind/osm";
+
+const engine = await createSearch({
+  baseUrl: "https://osm.rangefind.dev/"
+});
+
+const maps = createRangefindMapsAdapter(engine, {
+  defaults: {
+    near: { lat: 45.5019, lon: -73.5674 },
+    timeZone: "America/Toronto"
+  }
+});
+```
+
+The [public index status page](https://osm.rangefind.dev/) reports current
+coverage, document count, source freshness, and rebuild progress. Root
+manifests advance atomically, so clients see the last complete searchable
+snapshot while the next index is being built.
+
+The hosted index is a best-effort public service without an availability SLA.
+It is suitable for evaluation, prototypes, public applications, and production
+clients that can tolerate that service model. Build or mirror the index under
+your own domain when you need guaranteed capacity, version pinning, custom OSM
+fields, private source data, or an operational SLA. In every case, display
+[`© OpenStreetMap contributors`](https://www.openstreetmap.org/copyright)
+wherever OSM results or map data are shown.
+
 ## Fifteen-minute browser migration
 
 Install Rangefind. The migration adapter is part of the browser-safe OSM API:
@@ -67,15 +103,15 @@ Install Rangefind. The migration adapter is part of the browser-safe OSM API:
 npm install rangefind
 ```
 
-During development you can point at a compatible hosted index. For production,
-build and host the regions/data contract your application needs.
+Use the free public index immediately, or substitute your own compatible index
+URL when you need a controlled production data contract.
 
 ```js
 import { createSearch } from "rangefind";
 import { createRangefindMapsAdapter } from "rangefind/osm";
 
 const engine = await createSearch({
-  baseUrl: "https://maps-index.example.com/",
+  baseUrl: "https://osm.rangefind.dev/",
   multiRangeRequests: true,
   geoCapsules: true,
   geoCellIndexes: true
