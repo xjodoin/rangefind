@@ -87,26 +87,40 @@ class TripRecorder(context: Context) {
             .put("speedMps", if (location.hasSpeed()) location.speed else 0f)
             .put("hasBearing", location.hasBearing())
             .put("bearing", if (location.hasBearing()) location.bearing else -1f)
-        if (update != null) {
-            row.put(
-                "nav",
-                JSONObject()
-                    .put("stepIndex", update.stepIndex)
-                    .put("stepName", update.stepName)
-                    .put("nextStepName", update.nextStepName)
-                    .put("metersToManeuver", update.metersToManeuver)
-                    .put("remainingMeters", update.remainingMeters)
-                    .put("remainingSeconds", update.remainingSeconds)
-                    .put("turnDelta", update.turnDelta)
-                    .put("speedLimitKmh", update.speedLimitKmh)
-                    .put("heading", update.bearing)
-                    .put("offRoute", update.offRoute)
-                    .put("arrived", update.arrived)
-                    .put("voice", update.voice ?: JSONObject.NULL)
-            )
-        }
+        if (update != null) row.put("nav", navJson(update))
         runCatching { file.appendText(row.toString() + "\n") }
     }
+
+    /**
+     * The driver saying "that was wrong, right now".
+     *
+     * A trace without marks means reading thousands of fixes looking for the
+     * one that misbehaved. A mark turns that into a timestamp: whatever the
+     * state machine believed at this instant is what needs explaining.
+     */
+    fun mark(ordinal: Int, update: NavUpdate?, atMillis: Long) {
+        val file = sink ?: return
+        val row = JSONObject()
+            .put("kind", "mark")
+            .put("at", atMillis)
+            .put("ordinal", ordinal)
+        if (update != null) row.put("nav", navJson(update))
+        runCatching { file.appendText(row.toString() + "\n") }
+    }
+
+    private fun navJson(update: NavUpdate) = JSONObject()
+        .put("stepIndex", update.stepIndex)
+        .put("stepName", update.stepName)
+        .put("nextStepName", update.nextStepName)
+        .put("metersToManeuver", update.metersToManeuver)
+        .put("remainingMeters", update.remainingMeters)
+        .put("remainingSeconds", update.remainingSeconds)
+        .put("turnDelta", update.turnDelta)
+        .put("speedLimitKmh", update.speedLimitKmh)
+        .put("heading", update.bearing)
+        .put("offRoute", update.offRoute)
+        .put("arrived", update.arrived)
+        .put("voice", update.voice ?: JSONObject.NULL)
 
     /** Note something the caller did, so the trace explains its own gaps. */
     fun note(event: String, detail: String? = null, atMillis: Long) {

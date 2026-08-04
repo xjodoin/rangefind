@@ -137,6 +137,7 @@ class MainActivity : ComponentActivity() {
                     onDeleteRegion = viewModel::deleteRegion,
                     onActivateRegion = viewModel::activateRegion,
                     onRecordTripsChange = viewModel::setRecordTrips,
+                    onMarkIssue = viewModel::markIssue,
                     hasTrace = viewModel.latestTrace() != null,
                     onShareTrace = { shareTrace(viewModel.latestTrace()) },
                     onLongPress = viewModel::dropPin,

@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AltRoute
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.Straight
 import androidx.compose.material.icons.filled.TurnLeft
 import androidx.compose.material.icons.filled.TurnRight
@@ -45,6 +46,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -284,6 +287,7 @@ fun NavigationOverlay(
     topInset: Dp,
     bottomInset: Dp,
     onSelectRoute: (Int) -> Unit,
+    onMarkIssue: () -> Unit,
     onStop: () -> Unit
 ) {
     val context = LocalContext.current
@@ -411,6 +415,50 @@ fun NavigationOverlay(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // Flagging a fault has to survive being done at speed, by someone who
+        // must not look away from the road: one thumb-sized target on the side
+        // the hand already rests, no confirmation, no dialog. The running count
+        // is the only feedback that matters — it says the tap landed — and the
+        // haptic carries it when even a glance is too much.
+        if (state.recordTrips) {
+            val haptics = LocalHapticFeedback.current
+            Surface(
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onMarkIssue()
+                },
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.errorContainer,
+                shadowElevation = 8.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(
+                        end = 16.dp,
+                        bottom = bottomInset + 122.dp + if (offers.isNotEmpty()) 58.dp else 0.dp
+                    )
+                    .size(64.dp)
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Icon(
+                        Icons.Filled.Flag,
+                        contentDescription = stringResource(R.string.diag_mark),
+                        tint = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    if (state.issueMarks > 0) {
+                        Text(
+                            stringResource(R.string.diag_mark_count, state.issueMarks),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
                         )
                     }
                 }

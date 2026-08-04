@@ -64,7 +64,9 @@ data class UiState(
     val regions: List<RegionEntry> = emptyList(),
     val regionHost: String = "",
     val showRegions: Boolean = false,
-    val recordTrips: Boolean = false
+    val recordTrips: Boolean = false,
+    /** How many faults the driver has flagged on this drive. */
+    val issueMarks: Int = 0
 ) {
     val activeRoute: Route?
         get() = routes?.let { bundle ->
@@ -507,7 +509,7 @@ class MapsViewModel(
         if (regionPrefs.recordTrips) {
             recorder.start(_state.value.activeRoute, System.currentTimeMillis())
         }
-        _state.update { it.copy(sheet = SheetMode.Navigating) }
+        _state.update { it.copy(sheet = SheetMode.Navigating, issueMarks = 0) }
         greeting?.let { _voice.tryEmit(it) }
     }
 
@@ -526,6 +528,18 @@ class MapsViewModel(
         regionPrefs.recordTrips = enabled
         if (!enabled) recorder.stop()
         _state.update { it.copy(recordTrips = enabled) }
+    }
+
+    /**
+     * Flag the current moment as wrong. Deliberately does nothing but write:
+     * the driver is driving, and anything that needs a decision from them
+     * here is a worse idea than a single tap.
+     */
+    fun markIssue() {
+        if (!recorder.isRecording) return
+        val ordinal = _state.value.issueMarks + 1
+        recorder.mark(ordinal, _state.value.nav, System.currentTimeMillis())
+        _state.update { it.copy(issueMarks = ordinal) }
     }
 
     /** The most recent finished trace, for sharing off the device. */

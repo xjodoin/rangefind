@@ -79,6 +79,9 @@
     <string name="nav_rerouting">Rerouting.</string>
     <string name="nav_switching_route">Switching to the other route.</string>
 
+    <string name="diag_mark">Mark a problem</string>
+    <string name="diag_mark_count">%1$d</string>
+
     <!-- Offline regions -->
     <string name="region_offline_title">Offline regions</string>
     <string name="region_offline_subtitle">Keep a route index on this device</string>

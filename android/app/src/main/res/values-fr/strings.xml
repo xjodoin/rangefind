@@ -78,6 +78,9 @@
     <string name="nav_rerouting">Recalcul de l\'itinéraire.</string>
     <string name="nav_switching_route">Passage à l\'autre itinéraire.</string>
 
+    <string name="diag_mark">Signaler un problème</string>
+    <string name="diag_mark_count">%1$d</string>
+
     <!-- Régions hors ligne -->
     <string name="region_offline_title">Régions hors ligne</string>
     <string name="region_offline_subtitle">Conserver un index routier sur cet appareil</string>

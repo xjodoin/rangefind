@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
@@ -44,6 +45,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -85,6 +88,7 @@ fun MapScreen(
     onDeleteRegion: (String) -> Unit,
     onActivateRegion: (String?) -> Unit,
     onRecordTripsChange: (Boolean) -> Unit,
+    onMarkIssue: () -> Unit,
     onShareTrace: () -> Unit,
     hasTrace: Boolean,
     onLongPress: (LatLon) -> Unit,
@@ -345,6 +349,7 @@ fun MapScreen(
                 topInset = insets.calculateTopPadding(),
                 bottomInset = insets.calculateBottomPadding(),
                 onSelectRoute = onSelectRoute,
+                onMarkIssue = onMarkIssue,
                 onStop = onStopNavigation
             )
         }
