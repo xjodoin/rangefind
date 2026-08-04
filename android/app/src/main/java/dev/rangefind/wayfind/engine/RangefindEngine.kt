@@ -108,7 +108,9 @@ data class RouteStep(
     val name: String,
     val meters: Double,
     val seconds: Double,
-    val at: Int
+    val at: Int,
+    /** Posted limit in km/h, 0 when the way carries no maxspeed tag. */
+    val speedLimitKmh: Int
 )
 
 /** 1 signals, 2 stop, 3 give way, 4 level crossing, 5 crossing. */

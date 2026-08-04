@@ -241,9 +241,20 @@ function waySpeeds(tags, profile) {
     forward = Math.min(forward, cap);
     backward = Math.min(backward, cap);
   }
+  // The posted limit is what a sign says; the modelled speed above also folds
+  // in surface, smoothness and the profile cap, so the two must not be
+  // conflated. 0 means "no maxspeed tag" — a guess is not a limit.
+  const postedShared = profile.speedTags ? parseMaxspeed(tags.get("maxspeed")) : 0;
+  const postedForward = profile.speedTags
+    ? (parseMaxspeed(tags.get("maxspeed:forward")) || postedShared) : 0;
+  const postedBackward = profile.speedTags
+    ? (parseMaxspeed(tags.get("maxspeed:backward")) || postedShared) : 0;
+
   return {
     forward: Math.min(forward, profile.maxSpeedKmh),
-    backward: Math.min(backward, profile.maxSpeedKmh)
+    backward: Math.min(backward, profile.maxSpeedKmh),
+    postedForward: Math.min(postedForward || 0, 255),
+    postedBackward: Math.min(postedBackward || 0, 255)
   };
 }
 
@@ -429,6 +440,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
         refCount: refs.length,
         speedFwd: speeds.forward,
         speedBwd: speeds.backward,
+        postedFwd: speeds.postedForward,
+        postedBwd: speeds.postedBackward,
         oneway: profile.oneway(tags),
         nameId,
         classCode: classCodes.get(tags.get("highway")) ?? 0
@@ -510,10 +523,11 @@ export function extractRoadGraph(pbfPath, options = {}) {
   const edgeWay = [];
   const edgeClass = [];
   const edgeJunction = [];
+  const edgeSpeed = [];
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
   const geomScratch = [];
-  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, points, reversed) => {
+  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, postedKmh, points, reversed) => {
     edgeFrom.push(from);
     edgeTo.push(to);
     edgeWeightDs.push(weightDs);
@@ -522,6 +536,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeWay.push(wayId);
     edgeClass.push(classCode);
     edgeJunction.push(junctionKind);
+    edgeSpeed.push(postedKmh || 0);
     geomScratch.length = 0;
     // Interior polyline points only, zigzag-delta E7 from the from-node.
     const interior = points.length - 2;
@@ -603,14 +618,14 @@ export function extractRoadGraph(pbfPath, options = {}) {
       if (way.oneway >= 0) {
         const junction = pick(kindCode[used], lastIndex);
         const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedFwd * 1000) / 3600)) * 10) + penaltyDs[used] + segPenalty);
-        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, segment, false);
+        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, way.postedFwd, segment, false);
       }
       if (way.oneway <= 0) {
         const junction = pick(fromKind, lastIndex);
         // Reversed polyline: mirror the point index.
         const mirrored = junction.kind ? { kind: junction.kind, index: lastIndex - junction.index } : junction;
         const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedBwd * 1000) / 3600)) * 10) + fromPenalty + segPenalty);
-        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, segment, true);
+        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, way.postedBwd, segment, true);
       }
       fromNode = graphNode;
       fromPenalty = penaltyDs[used];
@@ -645,6 +660,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeWay,
     edgeClass,
     edgeJunction,
+    edgeSpeed,
     geomOffsets,
     geomBytes,
     log
@@ -663,6 +679,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
       edgeName: Uint32Array.from(expanded.edgeName),
       edgeClass: Uint8Array.from(expanded.edgeClass),
       edgeJunction: Uint8Array.from(expanded.edgeJunction),
+      edgeSpeed: Uint8Array.from(expanded.edgeSpeed),
       geomOffsets: Uint32Array.from(expanded.geomOffsets),
       geomBytes: Uint8Array.from(expanded.geomBytes.view()),
       names,
@@ -681,6 +698,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeName: Uint32Array.from(edgeName),
     edgeClass: Uint8Array.from(edgeClass),
     edgeJunction: Uint8Array.from(edgeJunction),
+    edgeSpeed: Uint8Array.from(edgeSpeed),
     geomOffsets: Uint32Array.from(geomOffsets),
     geomBytes: Uint8Array.from(geomBytes.view()),
     names,
@@ -697,6 +715,7 @@ export function applyTurnRestrictions(context) {
   } = context;
   const edgeClass = context.edgeClass || null;
   const edgeJunction = context.edgeJunction || null;
+  const edgeSpeed = context.edgeSpeed || null;
   if (!restrictions.length) return;
 
   const copyEdgeTo = (source, from, toOverride) => {
@@ -708,6 +727,7 @@ export function applyTurnRestrictions(context) {
     edgeWay.push(edgeWay[source]);
     if (edgeClass) edgeClass.push(edgeClass[source]);
     if (edgeJunction) edgeJunction.push(edgeJunction[source]);
+    if (edgeSpeed) edgeSpeed.push(edgeSpeed[source]);
     const start = geomOffsets[source];
     const end = geomOffsets[source + 1];
     geomBytes.ensure(end - start);
@@ -940,7 +960,7 @@ export function expandTurnCosts(context, turnCosts) {
   const {
     restrictions, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass, edgeJunction,
-    geomOffsets, geomBytes, log
+    edgeSpeed, geomOffsets, geomBytes, log
   } = context;
   const edgeCount = edgeFrom.length;
   const nodeCount = nodeLat.length;
@@ -1058,6 +1078,7 @@ export function expandTurnCosts(context, turnCosts) {
   const newName = [];
   const newClass = [];
   const newJunction = [];
+  const newSpeed = [];
   const newGeomOffsets = [0];
   const newGeomBytes = new GrowUint8();
   let filteredTurns = 0;
@@ -1076,6 +1097,7 @@ export function expandTurnCosts(context, turnCosts) {
       newName.push(edgeName[out]);
       newClass.push(edgeClass[out]);
       newJunction.push(edgeJunction ? edgeJunction[out] : 0);
+      newSpeed.push(edgeSpeed ? edgeSpeed[out] : 0);
       const start = geomOffsets[out];
       const end = geomOffsets[out + 1];
       newGeomBytes.ensure(end - start);
@@ -1095,6 +1117,7 @@ export function expandTurnCosts(context, turnCosts) {
     edgeName: newName,
     edgeClass: newClass,
     edgeJunction: newJunction,
+    edgeSpeed: newSpeed,
     geomOffsets: newGeomOffsets,
     geomBytes: newGeomBytes
   };
@@ -1203,6 +1226,7 @@ function filterLargestScc(graph, log) {
   const edgeName = [];
   const edgeClass = [];
   const edgeJunction = [];
+  const edgeSpeed = [];
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
   for (let i = 0; i < graph.edgeFrom.length; i++) {
@@ -1216,6 +1240,7 @@ function filterLargestScc(graph, log) {
     edgeName.push(graph.edgeName[i]);
     edgeClass.push(graph.edgeClass[i]);
     edgeJunction.push(graph.edgeJunction[i]);
+    edgeSpeed.push(graph.edgeSpeed ? graph.edgeSpeed[i] : 0);
     const start = graph.geomOffsets[i];
     const end = graph.geomOffsets[i + 1];
     geomBytes.ensure(end - start);
@@ -1233,6 +1258,7 @@ function filterLargestScc(graph, log) {
     edgeName: Uint32Array.from(edgeName),
     edgeClass: Uint8Array.from(edgeClass),
     edgeJunction: Uint8Array.from(edgeJunction),
+    edgeSpeed: Uint8Array.from(edgeSpeed),
     geomOffsets: Uint32Array.from(geomOffsets),
     geomBytes: Uint8Array.from(geomBytes.view()),
     names: graph.names,
@@ -1253,12 +1279,13 @@ export function writeRoadGraph(path, graph) {
     ["edgeName", graph.edgeName],
     ["edgeClass", graph.edgeClass],
     ["edgeJunction", graph.edgeJunction],
+    ["edgeSpeed", graph.edgeSpeed],
     ["geomOffsets", graph.geomOffsets],
     ["geomBytes", graph.geomBytes],
     ["namesBytes", namesBytes]
   ];
   const header = {
-    format: "rfroutesrc-v3",
+    format: "rfroutesrc-v4",
     nodes: graph.nodeLat.length,
     edges: graph.edgeFrom.length,
     profile: graph.profile || "car",
@@ -1284,7 +1311,7 @@ export async function readRoadGraph(path) {
   const bytes = readFileSync(path);
   const newline = bytes.indexOf(0x0a);
   const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
-  if (header.format !== "rfroutesrc-v3") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
+  if (header.format !== "rfroutesrc-v4") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
   const graph = { profile: header.profile || "car", classes: header.classes || [] };
   let offset = newline + 1;
   for (const section of header.sections) {

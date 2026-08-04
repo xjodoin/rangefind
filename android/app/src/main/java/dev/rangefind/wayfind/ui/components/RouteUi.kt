@@ -1,6 +1,7 @@
 package dev.rangefind.wayfind.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -39,7 +40,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -331,7 +335,17 @@ fun NavigationOverlay(
                         bottom = bottomInset + 122.dp + if (offers.isNotEmpty()) 58.dp else 0.dp
                     )
             ) {
-                Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surface, shadowElevation = 4.dp) {
+                // Over the posted limit by more than GPS noise, the readout
+                // itself turns: a driver checking their speed should not have
+                // to compare two numbers to know the answer.
+                val speeding = it.speedLimitKmh > 0 &&
+                    it.speedMps * 3.6 > it.speedLimitKmh + SPEEDING_TOLERANCE_KMH
+                Surface(
+                    shape = CircleShape,
+                    color = if (speeding) MaterialTheme.colorScheme.errorContainer
+                    else MaterialTheme.colorScheme.surface,
+                    shadowElevation = 4.dp
+                ) {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
@@ -339,15 +353,18 @@ fun NavigationOverlay(
                         Text(
                             formatSpeed(it.speedMps),
                             style = MaterialTheme.typography.titleLarge,
-                            color = MaterialTheme.colorScheme.onSurface
+                            color = if (speeding) MaterialTheme.colorScheme.onErrorContainer
+                            else MaterialTheme.colorScheme.onSurface
                         )
                         Text(
                             "km/h",
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (speeding) MaterialTheme.colorScheme.onErrorContainer
+                            else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
+                if (it.speedLimitKmh > 0) SpeedLimitSign(it.speedLimitKmh)
                 if (it.stepName.isNotBlank()) {
                     Surface(
                         shape = RoundedCornerShape(14.dp),
@@ -466,6 +483,34 @@ fun NavigationOverlay(
                 }
             }
         }
+    }
+}
+
+/** Allowance for GPS speed noise before the readout calls it speeding. */
+private const val SPEEDING_TOLERANCE_KMH = 5
+
+/**
+ * Posted speed limit, drawn as the circular sign used across most of the
+ * world (and in the region this index covers). Deliberately not restyled to
+ * the app palette: a speed limit is a road sign, and drivers read it by shape
+ * and color before they read the number.
+ */
+@Composable
+private fun SpeedLimitSign(limitKmh: Int) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(52.dp)
+            .shadow(4.dp, CircleShape)
+            .background(Color.White, CircleShape)
+            .border(6.dp, Color(0xFFD7382C), CircleShape)
+    ) {
+        Text(
+            limitKmh.toString(),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Black,
+            color = Color(0xFF14161D)
+        )
     }
 }
 

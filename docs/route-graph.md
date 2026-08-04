@@ -244,6 +244,24 @@ cut): cold 110–126 ms, 4.4–4.7 MB, warm 20–43 ms, 90 MB index.
 - Snap results are cached per coordinate, so matrices re-snap each stop
   once, not once per pair.
 
+## Speed limits
+
+Cells carry a per-edge posted limit in km/h (0 when the way has no `maxspeed`
+tag), and `route()` reports it on every edge plus a per-step summary — the
+limit covering the most of that street:
+
+```js
+route.steps[0].speedLimitKmh   // 50
+route.edges[0].speedLimitKmh   // 50
+```
+
+This is deliberately a separate column rather than something derived from
+`seconds`. The travel weight also absorbs surface and smoothness degradation,
+the profile cap, and junction penalties, so reading a speed back out of it
+would report 35 km/h on a posted 50 road — wrong in a way that matters for a
+display drivers trust. An untagged way reports 0 rather than the profile
+default, because a guess is not a limit.
+
 ## Live traffic providers
 
 Live data enters through a generic, pluggable provider contract — a P2P

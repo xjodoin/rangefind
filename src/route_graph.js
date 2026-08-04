@@ -25,7 +25,7 @@ export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
 const ROOT_VERSION = 3;
-const CELL_VERSION = 4;
+const CELL_VERSION = 5;
 const OVERLAY_VERSION = 1;
 const GEOMETRY_VERSION = 1;
 
@@ -133,6 +133,10 @@ export function encodeRouteCell(cell) {
       pushVarint(out, cell.nameIds[e]);
       pushVarint(out, cell.classes ? cell.classes[e] : 0);
       pushVarint(out, cell.junctions ? cell.junctions[e] : 0);
+      // Posted limit in km/h, 0 when the way carries no maxspeed tag. Kept
+      // apart from the weight, which also folds in surface and junction
+      // penalties and so cannot be read back as a legal limit.
+      pushVarint(out, cell.speeds ? cell.speeds[e] : 0);
       const external = cell.targets[e] < cell.firstNode || cell.targets[e] >= cell.firstNode + cell.nodeCount;
       if (external) {
         // Cross-cell edges carry their far endpoint so snapping and
@@ -173,6 +177,7 @@ export function decodeRouteCell(bytes) {
   const nameIds = new Uint32Array(edgeCount);
   const classes = new Uint8Array(edgeCount);
   const junctions = new Uint8Array(edgeCount);
+  const speeds = new Uint8Array(edgeCount);
   const extLat = new Int32Array(edgeCount);
   const extLon = new Int32Array(edgeCount);
   const geomRefs = new Uint32Array(edgeCount);
@@ -188,6 +193,7 @@ export function decodeRouteCell(bytes) {
       nameIds[cursor] = readVarint(bytes, state);
       classes[cursor] = readVarint(bytes, state);
       junctions[cursor] = readVarint(bytes, state);
+      speeds[cursor] = readVarint(bytes, state);
       const external = targets[cursor] < firstNode || targets[cursor] >= firstNode + nodeCount;
       if (external) {
         extLat[cursor] = latE7[node] + readZigzag(bytes, state);
@@ -198,7 +204,7 @@ export function decodeRouteCell(bytes) {
     }
   }
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
-  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, junctions, extLat, extLon, geomRefs };
+  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, junctions, speeds, extLat, extLon, geomRefs };
 }
 
 // --- Geometry object ----------------------------------------------------

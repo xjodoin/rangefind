@@ -25,7 +25,8 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   receipt showing how many range requests the route cost.
 - **Turn-by-turn navigation**: a chevron puck aimed where the car is actually
   heading, a pitched follow camera with speed-banded zoom, maneuver banner,
-  traveled-route dimming, current-road pill, speed readout, spoken guidance,
+  traveled-route dimming, current-road pill, speed readout against the posted
+  speed limit (the readout turns when you are over it), spoken guidance,
   and automatic rerouting when you leave the line. Alternates you could still
   take stay on the map with their ETA delta, and one tap re-tracks onto the
   other line from where the car already is — they disappear once you commit to

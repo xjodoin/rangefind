@@ -69,7 +69,9 @@ function trimRoute(route) {
       name: step.name || "",
       meters: step.meters,
       seconds: step.seconds,
-      at: step.at ?? 0
+      at: step.at ?? 0,
+      // Posted limit in km/h; 0 when the way carries no maxspeed tag.
+      speedLimitKmh: step.speedLimitKmh ?? 0
     })),
     junctions: (route.junctions || []).map(j => ({
       kind: j.kind,

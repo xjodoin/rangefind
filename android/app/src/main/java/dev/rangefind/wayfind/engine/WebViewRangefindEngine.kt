@@ -245,7 +245,8 @@ private fun JSONObject.toRoute(): Route {
                 name = it.optString("name"),
                 meters = it.optDouble("meters"),
                 seconds = it.optDouble("seconds"),
-                at = it.optInt("at")
+                at = it.optInt("at"),
+                speedLimitKmh = it.optInt("speedLimitKmh")
             )
         },
         junctions = optJSONArray("junctions").map {

@@ -45,6 +45,12 @@ export interface RouteStep {
   seconds: number;
   /** Index into `geometry` where this step begins (for per-street slices). */
   at?: number;
+  /**
+   * Posted limit in km/h for the majority of this step, 0 when the ways carry
+   * no `maxspeed` tag. This is the sign, not the modelled speed: `seconds`
+   * also absorbs surface degradation and junction penalties.
+   */
+  speedLimitKmh?: number;
 }
 
 /** 1 traffic signals, 2 stop, 3 give way, 4 level crossing, 5 crossing. */
@@ -68,6 +74,8 @@ export interface RouteEdgeRef {
   segment: string;
   seconds: number;
   meters: number;
+  /** Posted limit in km/h, 0 when untagged. */
+  speedLimitKmh?: number;
 }
 
 export interface RouteResult {

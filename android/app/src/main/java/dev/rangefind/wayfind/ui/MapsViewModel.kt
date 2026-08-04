@@ -52,6 +52,8 @@ data class NavProgress(
     val position: LatLon,
     val bearing: Double,
     val speedMps: Double,
+    /** Posted limit for the street being driven, 0 when unknown. */
+    val speedLimitKmh: Int,
     val offRoute: Boolean,
     val arrived: Boolean,
     /** Alternates the driver could still take from here, with ETA deltas. */
@@ -423,6 +425,7 @@ class MapsViewModel(
                     position = match.snapped,
                     bearing = heading,
                     speedMps = speed,
+                    speedLimitKmh = route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0,
                     offRoute = offRouteStrikes >= OFF_ROUTE_STRIKES,
                     arrived = arrived,
                     alternatives = alternatives

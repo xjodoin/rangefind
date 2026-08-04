@@ -1159,19 +1159,51 @@ export async function openRouteGraph(options) {
       const meters = cell.distsDm[edge] / 10;
       const seconds = cellEdgeWeight(cell, edge, factors) / 10;
       distanceMeters += meters;
-      edges.push({ leaf: raw.leaf, edge, segment: edgeSegmentId(cell, edge), seconds, meters });
+      // Posted limit in km/h, 0 when the way carried no maxspeed tag. This is
+      // the sign, not the modelled speed: `seconds` also absorbs surface
+      // degradation and junction penalties.
+      const speedLimitKmh = cell.speeds ? cell.speeds[edge] : 0;
+      edges.push({
+        leaf: raw.leaf,
+        edge,
+        segment: edgeSegmentId(cell, edge),
+        seconds,
+        meters,
+        speedLimitKmh
+      });
       const name = names ? names[cell.nameIds[edge]] || "" : "";
       const last = steps[steps.length - 1];
       if (last && last.name === name) {
         last.meters += meters;
         last.seconds += seconds;
+        if (speedLimitKmh) last.limitMeters.set(speedLimitKmh, (last.limitMeters.get(speedLimitKmh) || 0) + meters);
       } else {
         // `at` indexes the route geometry point where this step begins, so
         // clients can slice per-street geometry (e.g. road-name labels).
-        steps.push({ name, meters, seconds, at: Math.max(0, geometry.length - 1) });
+        steps.push({
+          name,
+          meters,
+          seconds,
+          at: Math.max(0, geometry.length - 1),
+          limitMeters: new Map(speedLimitKmh ? [[speedLimitKmh, meters]] : [])
+        });
       }
     }
     if (chain.endMatch) pushPoint(chain.endMatch.snappedLatE7, chain.endMatch.snappedLonE7);
+    // A step can span several posted limits; report the one covering the most
+    // of it, which is what the driver is under for most of the street.
+    for (const step of steps) {
+      let best = 0;
+      let bestMeters = 0;
+      for (const [limit, covered] of step.limitMeters || []) {
+        if (covered > bestMeters) {
+          best = limit;
+          bestMeters = covered;
+        }
+      }
+      step.speedLimitKmh = best;
+      delete step.limitMeters;
+    }
     response.distanceMeters = distanceMeters;
     response.geometry = geometry;
     response.steps = steps;
