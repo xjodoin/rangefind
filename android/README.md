@@ -200,6 +200,34 @@ Three things make it behave in a vehicle:
 `androidx.car.app.ACCESS_SURFACE` is required to draw at all — without it the
 host kills the app the moment it asks for the surface.
 
+### Testing on an Automotive emulator
+
+```bash
+sdkmanager "system-images;android-33;android-automotive;arm64-v8a"
+avdmanager create avd -n WayfindCar \
+  -k "system-images;android-33;android-automotive;arm64-v8a" \
+  -d automotive_1024p_landscape
+emulator -avd WayfindCar
+```
+
+Two things that look like app bugs but are not:
+
+- **Automotive runs apps as user 10, not user 0.** `pm grant <pkg>
+  android.permission.ACCESS_FINE_LOCATION` silently grants to the wrong user
+  and the app never registers a location request. Use `pm grant --user 10`,
+  and launch with `am start --user 10`.
+- **Location services start switched off.** `cmd location set-location-enabled
+  true` before the app subscribes, or its provider query comes back empty and
+  it waits forever.
+
+Confirm the app is actually listening before blaming `geo fix`:
+
+```bash
+adb shell "dumpsys location | grep -i wayfind"
+```
+
+A registration line with a rising `locations = N` means fixes are arriving.
+
 ## Brand
 
 Wayfind is a Rangefind-family product and shares its identity rather than
