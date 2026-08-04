@@ -1912,3 +1912,42 @@ a { color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* Navigation HUD extras: live speed and current road name. */
+.nav-speed {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  color: #9ba3ad;
+  border: 1px solid #343a42;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  white-space: nowrap;
+}
+
+/* Google-style current-road pill floating above the nav footer. */
+.nav-road-pill {
+  position: absolute;
+  bottom: 132px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 21;
+  font-size: 0.86rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #f4f5f2;
+  background: rgba(28, 32, 38, 0.92);
+  border: 1px solid var(--line-bright, #3a4048);
+  border-radius: 999px;
+  padding: 0.3rem 0.95rem;
+  max-width: min(70vw, 24rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+@media (max-width: 720px) {
+  .nav-road-pill { bottom: 118px; font-size: 0.8rem; }
+}

@@ -423,6 +423,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     const distsDm = new Uint32Array(cellEdgeCount);
     const nameIds = new Uint32Array(cellEdgeCount);
     const cellClasses = new Uint8Array(cellEdgeCount);
+    const cellJunctions = new Uint8Array(cellEdgeCount);
     const extLat = new Int32Array(cellEdgeCount);
     const extLon = new Int32Array(cellEdgeCount);
     const geomRefs = new Uint32Array(cellEdgeCount);
@@ -440,6 +441,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         distsDm[cursor] = graph.edgeDistDm[edgeId];
         nameIds[cursor] = graph.edgeName[edgeId];
         cellClasses[cursor] = edgeClassOf(edgeId);
+        cellJunctions[cursor] = graph.edgeJunction ? graph.edgeJunction[edgeId] : 0;
         if (target < start || target >= end) {
           extLat[cursor] = latE7[target];
           extLon[cursor] = lonE7[target];
@@ -494,6 +496,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       distsDm,
       nameIds,
       classes: cellClasses,
+      junctions: cellJunctions,
       extLat,
       extLon,
       geomRefs

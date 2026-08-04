@@ -131,6 +131,10 @@ const map = new maplibregl.Map({
   container: "map",
   style: {
     version: 8,
+    // Free glyphs so vector text (route street names) can render over the
+    // raster basemap; raster labels rotate with the nav camera, these stay
+    // upright.
+    glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
     sources: {
       osm: {
         type: "raster",
@@ -1845,6 +1849,93 @@ function highlightStopSuggest(stop) {
 let pendingRouteFeatures = null;
 let routeLayersWaiting = false;
 
+// Recognizable road-sign icons drawn on canvas (no image assets): a
+// three-lamp traffic light, a STOP octagon, and a level-crossing diamond.
+function addJunctionIcons() {
+  const scale = 2;
+  const size = 24 * scale;
+  const draw = (paint) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    paint(ctx);
+    return ctx.getImageData(0, 0, size, size);
+  };
+  const register = (name, image) => {
+    if (!map.hasImage(name)) map.addImage(name, image, { pixelRatio: scale });
+  };
+  register("nav-junction-1", draw(ctx => {
+    const w = 11 * scale;
+    const h = 20 * scale;
+    const x = (size - w) / 2;
+    const y = (size - h) / 2;
+    ctx.fillStyle = "#262a31";
+    ctx.strokeStyle = "#faf9f2";
+    ctx.lineWidth = 1.6 * scale;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 3 * scale);
+    ctx.fill();
+    ctx.stroke();
+    const lampR = 2.6 * scale;
+    const colors = ["#e5484d", "#f2a60d", "#46a758"];
+    colors.forEach((color, index) => {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(size / 2, y + (4.2 + index * 5.8) * scale, lampR, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }));
+  register("nav-junction-2", draw(ctx => {
+    const r = 10 * scale;
+    const cx = size / 2;
+    const cy = size / 2;
+    ctx.fillStyle = "#d23b2f";
+    ctx.strokeStyle = "#faf9f2";
+    ctx.lineWidth = 1.8 * scale;
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const angle = (Math.PI / 8) + (i * Math.PI) / 4;
+      const px = cx + r * Math.cos(angle);
+      const py = cy + r * Math.sin(angle);
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = `700 ${5.6 * scale}px system-ui, sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("STOP", cx, cy + 0.5 * scale);
+  }));
+  register("nav-junction-4", draw(ctx => {
+    const r = 10 * scale;
+    const cx = size / 2;
+    const cy = size / 2;
+    ctx.fillStyle = "#f5c518";
+    ctx.strokeStyle = "#262a31";
+    ctx.lineWidth = 1.6 * scale;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx + r, cy);
+    ctx.lineTo(cx, cy + r);
+    ctx.lineTo(cx - r, cy);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.strokeStyle = "#262a31";
+    ctx.lineWidth = 2 * scale;
+    ctx.beginPath();
+    ctx.moveTo(cx - 4 * scale, cy - 4 * scale);
+    ctx.lineTo(cx + 4 * scale, cy + 4 * scale);
+    ctx.moveTo(cx + 4 * scale, cy - 4 * scale);
+    ctx.lineTo(cx - 4 * scale, cy + 4 * scale);
+    ctx.stroke();
+  }));
+}
+
 function createRouteLayers() {
   map.addSource("routeLines", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
   map.addLayer({
@@ -1875,6 +1966,48 @@ function createRouteLayers() {
     filter: ["match", ["get", "kind"], ["active", "leg"], true, false],
     layout: { "line-cap": "round", "line-join": "round" },
     paint: { "line-color": ["get", "color"], "line-width": 4.5, "line-opacity": 0.96 }
+  });
+  map.addLayer({
+    id: "route-traveled",
+    type: "line",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "traveled"],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: { "line-color": "#8d939c", "line-width": 4.5, "line-opacity": 0.9 }
+  });
+  addJunctionIcons();
+  map.addLayer({
+    id: "route-junctions",
+    type: "symbol",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "junction"],
+    minzoom: 12,
+    layout: {
+      "icon-image": ["concat", "nav-junction-", ["to-string", ["get", "jk"]]],
+      "icon-size": ["interpolate", ["linear"], ["zoom"], 12, 0.55, 15, 0.8, 17.5, 1],
+      "icon-allow-overlap": true,
+      "icon-ignore-placement": true
+    }
+  });
+  map.addLayer({
+    id: "route-names",
+    type: "symbol",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "roadname"],
+    minzoom: 12.5,
+    layout: {
+      "symbol-placement": "line",
+      "text-field": ["get", "name"],
+      "text-font": ["Open Sans Semibold"],
+      "text-size": 11.5,
+      "text-max-angle": 30,
+      "symbol-spacing": 320
+    },
+    paint: {
+      "text-color": "#243040",
+      "text-halo-color": "rgba(250, 249, 242, 0.92)",
+      "text-halo-width": 1.6
+    }
   });
   map.addLayer({
     id: "route-coarse",
@@ -1983,7 +2116,11 @@ function drawRoutePlan() {
       features.push(lineFeature(candidate.geometry, { kind: "alt", candidate: index }));
     }
     const active = routePlan.candidates[routePlan.active];
-    if (active?.geometry) features.push(lineFeature(active.geometry, { kind: "active", color: ROUTE_COLORS.active }));
+    if (active?.geometry) {
+      features.push(lineFeature(active.geometry, { kind: "active", color: ROUTE_COLORS.active }));
+      features.push(...roadNameFeatures(active));
+      features.push(...junctionFeatures(active.junctions));
+    }
   } else if (routePlan?.kind === "trip") {
     for (const [index, leg] of routePlan.trip.legs.entries()) {
       if (!leg.geometry) continue;
@@ -1991,6 +2128,8 @@ function drawRoutePlan() {
         kind: "leg",
         color: index % 2 ? ROUTE_COLORS.legAlt : ROUTE_COLORS.active
       }));
+      features.push(...roadNameFeatures(leg));
+      features.push(...junctionFeatures(leg.junctions));
     }
   }
   features.push(...snapFeatures());
@@ -2382,6 +2521,8 @@ const navProgressFill = document.querySelector("#navProgressFill");
 const navEtaEl = document.querySelector("#navEta");
 const navRemainingEl = document.querySelector("#navRemaining");
 const navSourceTag = document.querySelector("#navSourceTag");
+const navRoadChip = document.querySelector("#navRoadChip");
+const navSpeedChip = document.querySelector("#navSpeedChip");
 const navSpeedGroup = document.querySelector("#navSpeedGroup");
 const navOffRouteButton = document.querySelector("#navOffRouteButton");
 const navMuteButton = document.querySelector("#navMuteButton");
@@ -2502,7 +2643,7 @@ function buildNavModel(route, destinationLabel) {
   }
   maneuvers[0] = { type: "depart", side: "right", name: steps[0]?.name || "" };
   maneuvers[steps.length] = { type: "arrive", side: "right", name: destinationLabel || "" };
-  return { prepared, steps, starts, cumSeconds, totalSeconds, scale, maneuvers, total: prepared.totalMeters };
+  return { prepared, steps, starts, cumSeconds, totalSeconds, scale, maneuvers, total: prepared.totalMeters, junctions: route.junctions || [], geometry: route.geometry || null };
 }
 
 // Boundary the vehicle is approaching: index i means the maneuver entering
@@ -2539,6 +2680,50 @@ function navSpeak(text) {
   }
 }
 
+// Traffic signals (1), stop signs (2), and level crossings (4) along the
+// active route, from the engine's per-edge junction annotations. Give-way
+// and pedestrian crossings exist in the data but are too dense to draw.
+// Street-name labels along the active route, sliced from the route
+// geometry at each named step's start index.
+function roadNameFeatures(route) {
+  const steps = route?.steps;
+  const geometry = route?.geometry;
+  if (!steps || !geometry) return [];
+  const features = [];
+  for (let i = 0; i < steps.length; i++) {
+    if (!steps[i].name || steps[i].at == null) continue;
+    const end = steps[i + 1]?.at != null ? steps[i + 1].at + 1 : geometry.length;
+    const slice = geometry.slice(steps[i].at, Math.min(end, geometry.length));
+    if (slice.length < 2) continue;
+    features.push(lineFeature(slice, { kind: "roadname", name: steps[i].name }));
+  }
+  return features;
+}
+
+function activeRouteForNames() {
+  if (routePlan?.kind === "pair") return routePlan.candidates[routePlan.active];
+  if (routePlan?.kind === "trip") {
+    return null; // per-leg steps already carry names in the leg list
+  }
+  return null;
+}
+
+function junctionFeatures(junctions) {
+  return (junctions || [])
+    .filter(junction => junction.kind === 1 || junction.kind === 2 || junction.kind === 4)
+    .map(junction => ({
+      type: "Feature",
+      properties: { kind: "junction", jk: junction.kind },
+      geometry: { type: "Point", coordinates: [junction.lon, junction.lat] }
+    }));
+}
+
+function activeJunctions() {
+  if (routePlan?.kind === "pair") return routePlan.candidates[routePlan.active]?.junctions || [];
+  if (routePlan?.kind === "trip") return routePlan.trip.legs.flatMap(leg => leg.junctions || []);
+  return [];
+}
+
 function navRouteSource() {
   if (routePlan?.kind === "pair") {
     const active = routePlan.candidates[routePlan.active];
@@ -2550,6 +2735,7 @@ function navRouteSource() {
     return {
       geometry,
       steps: routePlan.trip.legs.flatMap(leg => leg.steps || []),
+      junctions: routePlan.trip.legs.flatMap(leg => leg.junctions || []),
       seconds: routePlan.trip.totalSeconds,
       distanceMeters: routePlan.trip.totalMeters,
       bucket: routePlan.trip.legs[0]?.bucket || routeBucketNames[0] || "base"
@@ -2559,9 +2745,48 @@ function navRouteSource() {
 }
 
 function drawNavRoute(geometry, { coarse = false } = {}) {
-  setRouteFeatures(geometry
+  const features = geometry
     ? [lineFeature(geometry, coarse ? { kind: "coarse" } : { kind: "active", color: ROUTE_COLORS.active })]
-    : []);
+    : [];
+  if (geometry && !coarse && nav?.model?.junctions) features.push(...junctionFeatures(nav.model.junctions));
+  if (geometry && !coarse && nav?.model) features.push(...roadNameFeatures({ steps: nav.model.steps, geometry }));
+  setRouteFeatures(features);
+}
+
+// Google-style covered-route dimming: split the line at the current
+// progress and grey out what's behind the puck.
+function drawNavProgress(progress) {
+  const prepared = nav?.model?.prepared;
+  if (!prepared) return;
+  const points = prepared.points;
+  const behind = [];
+  const ahead = [];
+  let placed = false;
+  for (let i = 0; i < prepared.segments.length; i++) {
+    const segment = prepared.segments[i];
+    const segmentEnd = segment.startMeters + segment.lengthMeters;
+    const from = points[segment.index];
+    if (!placed) behind.push([from.lat, from.lon]);
+    else ahead.push([from.lat, from.lon]);
+    if (!placed && progress <= segmentEnd) {
+      const ratio = segment.lengthMeters > 0 ? Math.max(0, (progress - segment.startMeters) / segment.lengthMeters) : 0;
+      const to = points[segment.index + 1];
+      const split = [from.lat + (to.lat - from.lat) * ratio, from.lon + (to.lon - from.lon) * ratio];
+      behind.push(split);
+      ahead.push(split);
+      placed = true;
+    }
+  }
+  const last = points[points.length - 1];
+  ahead.push([last.lat, last.lon]);
+  if (!placed) behind.push([last.lat, last.lon]);
+  const features = [];
+  if (behind.length > 1) features.push(lineFeature(behind, { kind: "traveled" }));
+  if (ahead.length > 1) features.push(lineFeature(ahead, { kind: "active", color: ROUTE_COLORS.active }));
+  features.push(...junctionFeatures(nav.model.junctions));
+  const routeGeometry = nav.model.geometry;
+  if (routeGeometry) features.push(...roadNameFeatures({ steps: nav.model.steps, geometry: routeGeometry }));
+  setRouteFeatures(features);
 }
 
 function renderNavSteps() {
@@ -2619,7 +2844,22 @@ function updateNavHud() {
   const remainingSeconds = navRemainingSeconds(model, progress);
   const remainingMeters = Math.max(0, model.total - progress);
   navEtaEl.textContent = formatDuration(remainingSeconds);
-  navRemainingEl.textContent = formatDistance(remainingMeters);
+  const arrival = new Date(Date.now() + remainingSeconds * 1000)
+    .toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  navRemainingEl.textContent = `${formatDistance(remainingMeters)} \u00b7 ${arrival}`;
+  if (navRoadChip) {
+    const roadName = model.steps[Math.max(0, boundary - 1)]?.name || "";
+    navRoadChip.textContent = roadName;
+    navRoadChip.hidden = !roadName;
+  }
+  if (navSpeedChip) {
+    // In simulation the fixes advance at the playback multiple; show the
+    // modeled vehicle speed, not the fast-forward rate.
+    const divisor = nav.source === "sim" ? Math.max(1, nav.speed || 1) : 1;
+    const kmh = Math.round(((nav.speedMps || 0) / divisor) * 3.6);
+    navSpeedChip.textContent = `${kmh} km/h`;
+    navSpeedChip.hidden = kmh <= 0;
+  }
   navProgressFill.style.width = `${Math.min(100, (progress / model.total) * 100).toFixed(1)}%`;
   updateNavStepsHighlight(boundary - 1);
 
@@ -2650,15 +2890,45 @@ function navCameraTo(options, duration) {
   map.easeTo({ ...options, duration, easing: t => t, essential: true });
 }
 
+// Google-style follow camera: high pitch, the puck anchored in the lower
+// third (top padding pushes the look-ahead onto the screen), and zoom that
+// backs out as speed rises. Zoom changes only at band boundaries so the
+// camera never pumps.
+function navFollowZoom() {
+  // Google-drive framing: street-level detail in town, backing out just
+  // enough on fast roads to keep the next maneuver in view. Simulation
+  // playback multiplies apparent speed, so normalize by the sim rate.
+  const divisor = nav.source === "sim" ? Math.max(1, nav.speed || 1) : 1;
+  const speed = (nav.speedMps || 0) / divisor;
+  if (speed > 19) return 16.6;
+  if (speed > 8) return 17.4;
+  return 18.2;
+}
+
 function updateNavCamera(lat, lon, bearing, duration) {
   if (!nav.follow) return;
-  navCameraTo({ center: [lon, lat], bearing, pitch: 48 }, duration);
+  const zoom = navFollowZoom();
+  navCameraTo({
+    center: [lon, lat],
+    bearing,
+    pitch: 58,
+    zoom,
+    padding: { top: Math.round(map.getContainer().clientHeight * 0.42), bottom: 0, left: 0, right: 0 }
+  }, duration);
 }
 
 function navHandleFix(lat, lon, headingHint) {
   if (!nav || nav.arrived) return;
   const match = matchPointToRoute(nav.model.prepared, lat, lon);
   const bearing = Number.isFinite(headingHint) ? headingHint : match.bearingDegrees;
+  const nowMs = performance.now();
+  if (nav.speedSample && nowMs - nav.speedSample.t > 200) {
+    const metersPerSecond = Math.max(0, match.progressMeters - nav.speedSample.p) / ((nowMs - nav.speedSample.t) / 1000);
+    nav.speedMps = nav.speedMps == null ? metersPerSecond : nav.speedMps * 0.6 + metersPerSecond * 0.4;
+    nav.speedSample = { t: nowMs, p: match.progressMeters };
+  } else if (!nav.speedSample) {
+    nav.speedSample = { t: nowMs, p: match.progressMeters };
+  }
   nav.lastFix = { lat, lon, bearing };
   nav.puck?.setLngLat([lon, lat]);
   nav.puck?.setRotation(bearing);
@@ -2671,6 +2941,7 @@ function navHandleFix(lat, lon, headingHint) {
   }
   nav.offRouteCount = 0;
   nav.progress = match.progressMeters;
+  drawNavProgress(nav.progress);
   if (nav.progress >= nav.model.total - NAV_ARRIVE_METERS) {
     navArrive();
     return;
@@ -2853,9 +3124,10 @@ function startNavigation(source) {
     .addTo(map);
   navCameraTo({
     center: [startPoint.lon, startPoint.lat],
-    zoom: 16,
-    pitch: 48,
-    bearing: startPoint.bearing
+    zoom: 18.2,
+    pitch: 58,
+    bearing: startPoint.bearing,
+    padding: { top: Math.round(map.getContainer().clientHeight * 0.42), bottom: 0, left: 0, right: 0 }
   }, 1100);
   updateNavHud();
 
@@ -2922,8 +3194,9 @@ function endNavigation() {
   atlasEl.classList.remove("nav-active");
   navHud.hidden = true;
   navFooter.hidden = true;
+  if (navRoadChip) navRoadChip.hidden = true;
   navBanner.dataset.state = "";
-  navCameraTo({ pitch: 0, bearing: 0 }, 700);
+  navCameraTo({ pitch: 0, bearing: 0, padding: { top: 0, bottom: 0, left: 0, right: 0 } }, 700);
   updateStopMarkers();
   drawRoutePlan();
   renderRouteCard();

@@ -344,6 +344,7 @@ test("junction expansion prices turns by bearing and filters restrictions", asyn
     edgeName: edges.map(() => 0),
     edgeWay: edges.map(edge => edge[2]),
     edgeClass: edges.map(() => 0),
+    edgeJunction: edges.map(() => 0),
     geomOffsets: [0, ...edges.map((_, i) => i + 1)],
     geomBytes: { data: new Uint8Array(edges.map(() => 0)), length: edges.length },
     log: () => {}

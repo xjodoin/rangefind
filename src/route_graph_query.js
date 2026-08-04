@@ -942,6 +942,10 @@ export async function openRouteGraph(options) {
     let distanceMeters = 0;
     const steps = [];
     const edges = [];
+    // Junctions the route passes through (traffic signals, stop signs,
+    // give-way, level crossings, pedestrian crossings) with positions —
+    // navigation UIs draw these along the line.
+    const junctions = [];
     const pushPoint = (latE7, lonE7) => {
       const last = geometry[geometry.length - 1];
       if (last && last[0] === latE7 / 1e7 && last[1] === lonE7 / 1e7) return;
@@ -953,6 +957,21 @@ export async function openRouteGraph(options) {
       const edge = raw.edge;
       const points = edgePolyline(cell.geomRefs[edge], geometryByLeaf.get(raw.leaf));
       for (let i = 0; i < points.length; i += 2) pushPoint(points[i], points[i + 1]);
+      if (cell.junctions[edge]) {
+        // Packed as kind + polylinePointIndex * 8 (signals often sit on
+        // interior way nodes, not the junction node itself).
+        const packed = cell.junctions[edge];
+        const kind = packed % 8;
+        const pointCount = points.length / 2;
+        const pointIndex = Math.min((packed - kind) / 8, pointCount - 1);
+        const along = pointCount > 1 ? pointIndex / (pointCount - 1) : 1;
+        junctions.push({
+          kind,
+          lat: points[pointIndex * 2] / 1e7,
+          lon: points[pointIndex * 2 + 1] / 1e7,
+          atMeters: Math.round((distanceMeters + (cell.distsDm[edge] / 10) * along) * 10) / 10
+        });
+      }
       const meters = cell.distsDm[edge] / 10;
       const seconds = cellEdgeWeight(cell, edge, factors) / 10;
       distanceMeters += meters;
@@ -963,7 +982,9 @@ export async function openRouteGraph(options) {
         last.meters += meters;
         last.seconds += seconds;
       } else {
-        steps.push({ name, meters, seconds });
+        // `at` indexes the route geometry point where this step begins, so
+        // clients can slice per-street geometry (e.g. road-name labels).
+        steps.push({ name, meters, seconds, at: Math.max(0, geometry.length - 1) });
       }
     }
     if (chain.endMatch) pushPoint(chain.endMatch.snappedLatE7, chain.endMatch.snappedLonE7);
@@ -971,6 +992,7 @@ export async function openRouteGraph(options) {
     response.geometry = geometry;
     response.steps = steps;
     response.edges = edges;
+    response.junctions = junctions;
     // Recompute the exact unpenalized total from seeds plus raw edges; for
     // the primary route this equals the search result, for penalized
     // alternatives it replaces the inflated search weight.

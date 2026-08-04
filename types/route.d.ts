@@ -43,6 +43,17 @@ export interface RouteStep {
   name: string;
   meters: number;
   seconds: number;
+  /** Index into `geometry` where this step begins (for per-street slices). */
+  at?: number;
+}
+
+/** 1 traffic signals, 2 stop, 3 give way, 4 level crossing, 5 crossing. */
+export interface RouteJunction {
+  kind: number;
+  lat: number;
+  lon: number;
+  /** Distance from the route start, meters. */
+  atMeters: number;
 }
 
 export interface RouteEdgeRef {
@@ -69,6 +80,8 @@ export interface RouteResult {
   steps?: RouteStep[];
   /** Stable per-edge refs, present unless `geometry: false`. */
   edges?: RouteEdgeRef[];
+  /** Signals, stops, and crossings along the route, present with geometry. */
+  junctions?: RouteJunction[];
   /**
    * Instant sketch polyline (snapped endpoints through traversed leaf-cell
    * centers), available before path unpacking; render it immediately and

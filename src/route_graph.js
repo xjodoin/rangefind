@@ -25,7 +25,7 @@ export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
 const ROOT_VERSION = 3;
-const CELL_VERSION = 3;
+const CELL_VERSION = 4;
 const OVERLAY_VERSION = 1;
 const GEOMETRY_VERSION = 1;
 
@@ -132,6 +132,7 @@ export function encodeRouteCell(cell) {
       pushVarint(out, cell.distsDm[e]);
       pushVarint(out, cell.nameIds[e]);
       pushVarint(out, cell.classes ? cell.classes[e] : 0);
+      pushVarint(out, cell.junctions ? cell.junctions[e] : 0);
       const external = cell.targets[e] < cell.firstNode || cell.targets[e] >= cell.firstNode + cell.nodeCount;
       if (external) {
         // Cross-cell edges carry their far endpoint so snapping and
@@ -171,6 +172,7 @@ export function decodeRouteCell(bytes) {
   const distsDm = new Uint32Array(edgeCount);
   const nameIds = new Uint32Array(edgeCount);
   const classes = new Uint8Array(edgeCount);
+  const junctions = new Uint8Array(edgeCount);
   const extLat = new Int32Array(edgeCount);
   const extLon = new Int32Array(edgeCount);
   const geomRefs = new Uint32Array(edgeCount);
@@ -185,6 +187,7 @@ export function decodeRouteCell(bytes) {
       distsDm[cursor] = readVarint(bytes, state);
       nameIds[cursor] = readVarint(bytes, state);
       classes[cursor] = readVarint(bytes, state);
+      junctions[cursor] = readVarint(bytes, state);
       const external = targets[cursor] < firstNode || targets[cursor] >= firstNode + nodeCount;
       if (external) {
         extLat[cursor] = latE7[node] + readZigzag(bytes, state);
@@ -195,7 +198,7 @@ export function decodeRouteCell(bytes) {
     }
   }
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
-  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, extLat, extLon, geomRefs };
+  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, junctions, extLat, extLon, geomRefs };
 }
 
 // --- Geometry object ----------------------------------------------------
