@@ -18,9 +18,11 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -62,6 +64,7 @@ import dev.rangefind.wayfind.ui.theme.LocalMapPalette
 fun MapScreen(
     state: UiState,
     darkTheme: Boolean,
+    wideLayout: Boolean,
     onQueryChange: (String) -> Unit,
     onSubmit: () -> Unit,
     onClear: () -> Unit,
@@ -92,6 +95,11 @@ fun MapScreen(
     // whichever sheet happens to be taller than the estimate.
     var sheetHeightPx by remember { mutableIntStateOf(0) }
     val sheetHeight = with(density) { sheetHeightPx.toDp() }
+    // Tablets, foldables and landscape phones get a panel beside the map
+    // instead of a sheet over it: a sheet on a 10" screen wastes the width and
+    // covers the very thing the panel is describing.
+    val panelWidth = 380.dp
+    val panelWidthPx = with(density) { panelWidth.roundToPx() }
 
     val navigating = state.sheet == SheetMode.Navigating
 
@@ -110,7 +118,8 @@ fun MapScreen(
             state = state,
             darkTheme = darkTheme,
             palette = palette,
-            bottomInsetPx = sheetHeightPx,
+            bottomInsetPx = if (wideLayout) 0 else sheetHeightPx,
+            startInsetPx = if (wideLayout && !navigating) panelWidthPx else 0,
             onCenterChanged = onCenterChanged,
             onResultTapped = onSelectResult,
             onRouteTapped = onSelectRoute,
@@ -118,34 +127,36 @@ fun MapScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Search chrome hides entirely while navigating: the driver needs the
-        // road, not a text field.
-        AnimatedVisibility(
-            visible = !navigating,
-            enter = fadeIn() + slideInVertically { -it },
-            exit = fadeOut() + slideOutVertically { -it },
-            modifier = Modifier.align(Alignment.TopCenter)
-        ) {
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(top = insets.calculateTopPadding() + 10.dp)
-                    .padding(horizontal = 14.dp)
+        if (!wideLayout) {
+            // Search chrome hides entirely while navigating: the driver needs the
+            // road, not a text field.
+            AnimatedVisibility(
+                visible = !navigating,
+                enter = fadeIn() + slideInVertically { -it },
+                exit = fadeOut() + slideOutVertically { -it },
+                modifier = Modifier.align(Alignment.TopCenter)
             ) {
-                SearchField(
-                    query = state.query,
-                    searching = state.searching,
-                    onQueryChange = onQueryChange,
-                    onSubmit = onSubmit,
-                    onClear = onClear,
-                    onFocusChanged = { focused = it }
-                )
-                AnimatedVisibility(visible = state.suggestions.isNotEmpty() && focused) {
-                    SuggestionList(
-                        suggestions = state.suggestions,
-                        onPick = onSuggestion,
-                        modifier = Modifier.padding(top = 8.dp)
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = insets.calculateTopPadding() + 10.dp)
+                        .padding(horizontal = 14.dp)
+                ) {
+                    SearchField(
+                        query = state.query,
+                        searching = state.searching,
+                        onQueryChange = onQueryChange,
+                        onSubmit = onSubmit,
+                        onClear = onClear,
+                        onFocusChanged = { focused = it }
                     )
+                    AnimatedVisibility(visible = state.suggestions.isNotEmpty() && focused) {
+                        SuggestionList(
+                            suggestions = state.suggestions,
+                            onPick = onSuggestion,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                    }
                 }
             }
         }
@@ -157,7 +168,7 @@ fun MapScreen(
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 16.dp, bottom = sheetHeight + 16.dp)
+                .padding(end = 16.dp, bottom = if (wideLayout) 28.dp else sheetHeight + 16.dp)
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Surface(
@@ -204,39 +215,112 @@ fun MapScreen(
                 info = state.info,
                 modifier = Modifier
                     .align(Alignment.BottomStart)
-                    .padding(start = 14.dp, bottom = sheetHeight + 10.dp)
+                    .padding(
+                        start = if (wideLayout) panelWidth + 26.dp else 14.dp,
+                        bottom = if (wideLayout) 14.dp else sheetHeight + 10.dp
+                    )
             )
         }
 
-        Column(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .onSizeChanged { sheetHeightPx = it.height }
-        ) {
-            when (state.sheet) {
-                SheetMode.Search -> ResultsSheet(
-                    state = state,
-                    bottomInset = insets.calculateBottomPadding(),
-                    onSelect = onSelectResult
-                )
+        if (!wideLayout) {
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .onSizeChanged { sheetHeightPx = it.height }
+            ) {
+                when (state.sheet) {
+                    SheetMode.Search -> ResultsSheet(
+                        state = state,
+                        bottomInset = insets.calculateBottomPadding(),
+                        onSelect = onSelectResult
+                    )
 
-                SheetMode.Place -> PlaceSheet(
-                    state = state,
-                    bottomInset = insets.calculateBottomPadding(),
-                    onDismiss = onDismissPlace,
-                    onDirections = onDirections
-                )
+                    SheetMode.Place -> PlaceSheet(
+                        state = state,
+                        bottomInset = insets.calculateBottomPadding(),
+                        onDismiss = onDismissPlace,
+                        onDirections = onDirections
+                    )
 
-                SheetMode.Directions -> DirectionsSheet(
-                    state = state,
-                    bottomInset = insets.calculateBottomPadding(),
-                    onSelectRoute = onSelectRoute,
-                    onStart = onStartNavigation,
-                    onClose = onExitDirections
-                )
+                    SheetMode.Directions -> DirectionsSheet(
+                        state = state,
+                        bottomInset = insets.calculateBottomPadding(),
+                        onSelectRoute = onSelectRoute,
+                        onStart = onStartNavigation,
+                        onClose = onExitDirections
+                    )
 
-                SheetMode.Navigating -> Unit
+                    SheetMode.Navigating -> Unit
+                }
+            }
+        } else {
+            AnimatedVisibility(
+                visible = !navigating,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.align(Alignment.TopStart)
+            ) {
+                Surface(
+                    shape = MaterialTheme.shapes.large,
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 14.dp,
+                    modifier = Modifier
+                        .padding(
+                            start = 14.dp,
+                            top = insets.calculateTopPadding() + 12.dp,
+                            bottom = insets.calculateBottomPadding() + 12.dp
+                        )
+                        .width(panelWidth)
+                        // Wrap the content: an empty full-height slab beside a
+                        // map reads as a loading failure, not a panel.
+                        .heightIn(max = 640.dp)
+                ) {
+                    Column(Modifier.padding(vertical = 12.dp)) {
+                        Box(Modifier.padding(horizontal = 12.dp)) {
+                            SearchField(
+                                query = state.query,
+                                searching = state.searching,
+                                onQueryChange = onQueryChange,
+                                onSubmit = onSubmit,
+                                onClear = onClear,
+                                onFocusChanged = { focused = it }
+                            )
+                        }
+                        AnimatedVisibility(visible = state.suggestions.isNotEmpty() && focused) {
+                            SuggestionList(
+                                suggestions = state.suggestions,
+                                onPick = onSuggestion,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        when (state.sheet) {
+                            SheetMode.Search -> ResultsSheet(
+                                state = state,
+                                bottomInset = 0.dp,
+                                onSelect = onSelectResult
+                            )
+
+                            SheetMode.Place -> PlaceSheet(
+                                state = state,
+                                bottomInset = 0.dp,
+                                onDismiss = onDismissPlace,
+                                onDirections = onDirections
+                            )
+
+                            SheetMode.Directions -> DirectionsSheet(
+                                state = state,
+                                bottomInset = 0.dp,
+                                onSelectRoute = onSelectRoute,
+                                onStart = onStartNavigation,
+                                onClose = onExitDirections
+                            )
+
+                            SheetMode.Navigating -> Unit
+                        }
+                    }
+                }
             }
         }
 

@@ -32,6 +32,11 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   other line from where the car already is — they disappear once you commit to
   a branch, because by then they are no longer an option.
 - **Day and night** basemaps, edge-to-edge layout, and full attribution.
+- **Adapts to the screen**: phones get a bottom sheet, tablets, foldables and
+  landscape get a floating panel beside a full-bleed map, and the map's camera
+  frames routes clear of whichever one is showing.
+- **Android Auto and Android Automotive OS**: search, route preview and
+  turn-by-turn on the head unit, with a map drawn by the app itself.
 - **Offline regions**: preload a route index onto the device, refresh it, or
   delete it, and route from it with no network at all.
 
@@ -156,6 +161,44 @@ search keeps working and the Directions button explains why it is disabled.
 For release builds, set `ROUTE_BASE_URL` to an https base that serves the route
 graph with `Accept-Ranges` and permissive CORS (a `Range` header is not
 CORS-safelisted, so the origin must answer the preflight).
+
+## Cars
+
+Two build variants, because projected Android Auto and Android Automotive OS
+ship mutually exclusive car-app artifacts:
+
+```bash
+./gradlew installMobileDebug       # phone, projects to Android Auto
+./gradlew installAutomotiveDebug   # runs natively on Automotive OS
+```
+
+The head unit gets its own screens — a `SearchTemplate` for the destination, a
+`RoutePreviewNavigationTemplate` for the options, and a `NavigationTemplate`
+whose maneuver card and travel estimate come from the same route the phone
+would draw. Screens are lean by design: driving is not the time for a place
+detail card.
+
+**The map on the car surface is drawn by the app.** MapLibre exposes no
+renderer that targets an arbitrary `Surface` — only `MapView` — so rather than
+fork a large native codebase for one class, the car view composes itself:
+raster basemap tiles underneath, then the route with its casing, the junctions
+ahead, the destination and the car. It is a real map, not a schematic.
+
+Three things make it behave in a vehicle:
+
+- **One render thread owns the surface.** Tiles land on a pool thread and car
+  state arrives on main; two threads inside `lockCanvas` is a crash, not a
+  glitch.
+- **The camera eases toward each fix** instead of snapping. Location arrives
+  about once a second, and a map that jumps once a second reads as broken
+  however correct the geometry is. Frames stop when the camera catches up, so
+  a parked car costs nothing.
+- **Everything scales off the reported visible area**, not the raw surface.
+  Head units vary enormously in size and aspect, and the host covers part of
+  the display with its own chrome.
+
+`androidx.car.app.ACCESS_SURFACE` is required to draw at all — without it the
+host kills the app the moment it asks for the surface.
 
 ## Brand
 

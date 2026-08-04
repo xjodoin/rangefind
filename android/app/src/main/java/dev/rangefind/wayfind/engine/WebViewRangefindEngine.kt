@@ -1,6 +1,7 @@
 package dev.rangefind.wayfind.engine
 
 import android.app.Activity
+import android.content.Context
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -29,7 +30,7 @@ import kotlin.coroutines.resumeWithException
  * stay enabled. Index bytes are fetched by the runtime itself and never cross
  * the JS bridge — only small JSON results do.
  */
-class WebViewRangefindEngine(activity: Activity) : RangefindEngine {
+class WebViewRangefindEngine(context: Context) : RangefindEngine {
 
     private val ready = CompletableDeferred<Unit>()
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<JSONObject>>()
@@ -53,10 +54,10 @@ class WebViewRangefindEngine(activity: Activity) : RangefindEngine {
 
     init {
         val loader = WebViewAssetLoader.Builder()
-            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(activity))
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
             .build()
 
-        webView = WebView(activity).apply {
+        webView = WebView(context).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.cacheMode = WebSettings.LOAD_DEFAULT
@@ -72,10 +73,13 @@ class WebViewRangefindEngine(activity: Activity) : RangefindEngine {
             }
         }
 
-        // A detached WebView can have its timers throttled. Parking it in the
-        // view tree at 1x1 keeps it scheduled without being visible.
-        val root = activity.findViewById<ViewGroup>(android.R.id.content)
-        root.addView(webView, ViewGroup.LayoutParams(1, 1))
+        // A detached WebView can have its timers throttled. When an Activity
+        // hosts us, park it in the view tree at 1x1 so it stays scheduled; the
+        // car app has no Activity and runs it detached, which is fine because
+        // the work is fetch-driven rather than timer-driven.
+        (context as? Activity)
+            ?.findViewById<ViewGroup>(android.R.id.content)
+            ?.addView(webView, ViewGroup.LayoutParams(1, 1))
         webView.loadUrl("https://appassets.androidplatform.net/assets/rangefind/engine.html")
     }
 

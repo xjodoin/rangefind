@@ -77,6 +77,7 @@ fun MapCanvas(
     darkTheme: Boolean,
     palette: MapPalette,
     bottomInsetPx: Int,
+    startInsetPx: Int = 0,
     onCenterChanged: (LatLon) -> Unit,
     onResultTapped: (Int) -> Unit,
     onRouteTapped: (Int) -> Unit,
@@ -205,6 +206,9 @@ fun MapCanvas(
             .build()
         val side = (48 * density).toInt()
         val top = (110 * density).toInt()
+        // On wide layouts the panel floats over the map's start edge, so the
+        // route has to be framed clear of it rather than centred behind it.
+        val start = side + startInsetPx
         // Keep the whole line clear of the sheet, but never let padding exceed
         // the viewport or MapLibre rejects the camera update outright.
         val bottom = (bottomInsetPx + (24 * density).toInt())
@@ -213,13 +217,13 @@ fun MapCanvas(
             // Fitting a very short route would otherwise slam the camera to
             // max zoom, where the map reads as an abstract stripe. Clamp it so
             // a 40 m hop still shows its neighborhood.
-            val fitted = map.getCameraForLatLngBounds(bounds, intArrayOf(side, top, side, bottom))
+            val fitted = map.getCameraForLatLngBounds(bounds, intArrayOf(start, top, side, bottom))
             val update = if (fitted != null) {
                 CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder(fitted).zoom(minOf(fitted.zoom, 17.0)).tilt(0.0).build()
                 )
             } else {
-                CameraUpdateFactory.newLatLngBounds(bounds, side, top, side, bottom)
+                CameraUpdateFactory.newLatLngBounds(bounds, start, top, side, bottom)
             }
             map.animateCamera(update, 700)
         }

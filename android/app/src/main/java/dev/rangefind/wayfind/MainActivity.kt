@@ -10,6 +10,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
+import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
+import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -28,8 +31,7 @@ import dev.rangefind.wayfind.ui.MapsViewModel
 import dev.rangefind.wayfind.ui.theme.WayfindTheme
 import java.util.Locale
 
-private const val SEARCH_BASE = "https://osm.rangefind.dev/"
-
+@OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
 class MainActivity : ComponentActivity() {
 
     private lateinit var engine: WebViewRangefindEngine
@@ -94,9 +96,12 @@ class MainActivity : ComponentActivity() {
                     viewModel.voice.collect { phrase -> speaker.say(phrase) }
                 }
 
+                // Phones get a sheet, tablets and unfolded devices a panel.
+                val widthClass = calculateWindowSizeClass(this).widthSizeClass
                 MapScreen(
                     state = state,
                     darkTheme = darkTheme,
+                    wideLayout = widthClass != WindowWidthSizeClass.Compact,
                     onQueryChange = viewModel::onQueryChange,
                     onSubmit = { viewModel.submitSearch() },
                     onClear = viewModel::clearQuery,

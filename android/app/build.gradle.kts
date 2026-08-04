@@ -10,7 +10,9 @@ android {
 
     defaultConfig {
         applicationId = "dev.rangefind.wayfind"
-        minSdk = 26
+        // Android Automotive's templates need 29, and a 2026 navigation app
+        // wanting a modern WebView and MapLibre has no reason to sit below it.
+        minSdk = 29
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
@@ -44,6 +46,17 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    // Projected Android Auto and Android Automotive OS ship mutually exclusive
+    // car-app artifacts, so they are separate variants rather than one build.
+    flavorDimensions += "platform"
+    productFlavors {
+        create("mobile") { dimension = "platform" }
+        create("automotive") {
+            dimension = "platform"
+            applicationIdSuffix = ".automotive"
+        }
     }
 
     buildFeatures {
@@ -90,6 +103,17 @@ dependencies {
 
     // Native vector map rendering.
     implementation("org.maplibre.gl:android-sdk:11.11.0")
+
+    // Android Auto. `app-projected` is the host binding for phone-projected
+    // head units; the templates themselves come from `app`.
+    implementation("androidx.car.app:app:1.7.0")
+    "mobileImplementation"("androidx.car.app:app-projected:1.7.0")
+    // Android Automotive OS runs the same templates natively, which is also
+    // what makes the car UI testable on an emulator.
+    "automotiveImplementation"("androidx.car.app:app-automotive:1.7.0")
+
+    // Window size classes drive the phone/tablet/foldable layout switch.
+    implementation("androidx.compose.material3:material3-window-size-class")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 }
