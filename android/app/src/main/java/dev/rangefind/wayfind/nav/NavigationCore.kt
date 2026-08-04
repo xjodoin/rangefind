@@ -134,12 +134,26 @@ class NavigationCore(private val context: Context) {
         val heading = if (moving && hasBearing && gpsBearing != null) gpsBearing else match.bearing
         val headingWrong = speedMps > 2.0 && absBearingDelta(match.bearing, heading) > 110.0
 
+        // How far the car still is from where the route ends. Needed before the
+        // off-route test, not just for arrival.
+        val destination = route.geometry.lastOrNull()
+        val toDestination = destination?.let { haversineMeters(point, it) } ?: Double.MAX_VALUE
+
+        // The last hundred metres of a trip are usually not on the road
+        // network at all: a supermarket car park, a forecourt, a driveway.
+        // Leaving the line there is arriving, not straying, and rerouting a
+        // driver who has already parked is worse than saying nothing — so
+        // inside the destination's apron nothing counts as off-route.
+        val arriving = toDestination < ARRIVAL_APRON_METERS
+
         // A trip that starts in a pedestrian zone or a car park begins tens of
         // metres from the nearest routable road, so a standstill can never be
         // off-route; only a wild distance overrides that.
-        val off = (match.crossTrackMeters > OFF_ROUTE_METERS && moving) ||
-            match.crossTrackMeters > OFF_ROUTE_HARD_METERS ||
-            headingWrong
+        val off = !arriving && (
+            (match.crossTrackMeters > OFF_ROUTE_METERS && moving) ||
+                match.crossTrackMeters > OFF_ROUTE_HARD_METERS ||
+                headingWrong
+            )
         offRouteStrikes = if (off) offRouteStrikes + 1 else 0
 
         lastAlong = max(lastAlong, match.distanceAlong)
@@ -161,9 +175,18 @@ class NavigationCore(private val context: Context) {
         // road, a polyline that stops at the kerb — the remaining distance
         // never reaches zero and the drive never completes. Standing at the
         // destination counts regardless of what the odometer says.
-        val destination = route.geometry.lastOrNull()
-        val toDestination = destination?.let { haversineMeters(point, it) } ?: Double.MAX_VALUE
-        val arrived = geometric < ARRIVAL_METERS || toDestination < ARRIVAL_METERS
+        // Parking is how a drive ends. Inside the apron, a car that has come
+        // to a stop and is no longer on the road line has arrived: waiting for
+        // it to roll within 25 m of a kerb point it may never approach leaves
+        // guidance talking to an empty car park. Stopped *on* the line is a
+        // red light rather than an arrival, which is what the cross-track test
+        // separates.
+        val parked = arriving &&
+            speedMps < PARKED_SPEED_MPS &&
+            match.crossTrackMeters > OFF_ROUTE_METERS
+        val arrived = geometric < ARRIVAL_METERS ||
+            toDestination < ARRIVAL_METERS ||
+            parked
 
         val offRoute = offRouteStrikes >= OFF_ROUTE_STRIKES
         val turnDelta = turnDeltaAt(route, next?.at)
@@ -308,6 +331,15 @@ class NavigationCore(private val context: Context) {
         const val OFF_ROUTE_HARD_METERS = 150.0
         const val OFF_ROUTE_STRIKES = 3
         const val ARRIVAL_METERS = 25.0
+        /**
+         * Radius around the end of the route inside which straying off the
+         * line is expected rather than wrong. Sized for a large store's car
+         * park, which is where this bites: the driver has reached the place
+         * they asked for, and the road network simply does not cover it.
+         */
+        const val ARRIVAL_APRON_METERS = 150.0
+        /** Slow enough to be stationary rather than crawling. */
+        const val PARKED_SPEED_MPS = 0.8
         /** How far off an alternate the car can be before it stops being one. */
         const val ALT_LIVE_METERS = 60.0
         private val ANNOUNCE_THRESHOLDS = listOf(60, 200, 400)
