@@ -1,4 +1,4 @@
-package dev.rangefind.maps.ui
+package dev.rangefind.wayfind.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
@@ -6,6 +6,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,10 +21,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -37,19 +40,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
-import dev.rangefind.maps.engine.LatLon
-import dev.rangefind.maps.engine.Suggestion
-import dev.rangefind.maps.ui.components.AttributionChip
-import dev.rangefind.maps.ui.components.DirectionsSheet
-import dev.rangefind.maps.ui.components.NavigationOverlay
-import dev.rangefind.maps.ui.components.PlaceSheet
-import dev.rangefind.maps.ui.components.ResultsSheet
-import dev.rangefind.maps.ui.components.SearchField
-import dev.rangefind.maps.ui.components.SuggestionList
-import dev.rangefind.maps.ui.map.MapCanvas
-import dev.rangefind.maps.ui.theme.LocalMapPalette
+import dev.rangefind.wayfind.R
+import dev.rangefind.wayfind.engine.LatLon
+import dev.rangefind.wayfind.engine.Suggestion
+import dev.rangefind.wayfind.ui.components.AttributionChip
+import dev.rangefind.wayfind.ui.components.DirectionsSheet
+import dev.rangefind.wayfind.ui.components.NavigationOverlay
+import dev.rangefind.wayfind.ui.components.PlaceSheet
+import dev.rangefind.wayfind.ui.components.ResultsSheet
+import dev.rangefind.wayfind.ui.components.SearchField
+import dev.rangefind.wayfind.ui.components.SuggestionList
+import dev.rangefind.wayfind.ui.map.MapCanvas
+import dev.rangefind.wayfind.ui.theme.LocalMapPalette
 
 @Composable
 fun MapScreen(
@@ -220,18 +225,28 @@ fun MapScreen(
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.92f)),
+                    .background(MaterialTheme.colorScheme.background),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(strokeWidth = 3.dp)
-                    Spacer(Modifier.height(18.dp))
-                    Text("Opening the static index", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(4.dp))
+                    Image(
+                        painter = painterResource(R.drawable.ic_wayfind_mark),
+                        contentDescription = null,
+                        modifier = Modifier.size(84.dp)
+                    )
+                    Spacer(Modifier.height(22.dp))
+                    Text("Wayfind", style = MaterialTheme.typography.displaySmall)
+                    Spacer(Modifier.height(6.dp))
                     Text(
-                        "Byte ranges only — no search server",
-                        style = MaterialTheme.typography.bodyMedium,
+                        "Maps on static byte ranges",
+                        style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(30.dp))
+                    LinearProgressIndicator(
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier.width(132.dp).height(3.dp)
                     )
                 }
             }

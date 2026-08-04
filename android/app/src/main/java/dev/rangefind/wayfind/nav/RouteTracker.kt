@@ -1,7 +1,7 @@
-package dev.rangefind.maps.nav
+package dev.rangefind.wayfind.nav
 
-import dev.rangefind.maps.engine.LatLon
-import dev.rangefind.maps.engine.Route
+import dev.rangefind.wayfind.engine.LatLon
+import dev.rangefind.wayfind.engine.Route
 import kotlin.math.max
 
 /**

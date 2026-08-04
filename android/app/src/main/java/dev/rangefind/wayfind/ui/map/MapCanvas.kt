@@ -1,4 +1,4 @@
-package dev.rangefind.maps.ui.map
+package dev.rangefind.wayfind.ui.map
 
 import android.graphics.PointF
 import androidx.compose.runtime.Composable
@@ -15,11 +15,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import dev.rangefind.maps.engine.LatLon
-import dev.rangefind.maps.engine.RouteJunction
-import dev.rangefind.maps.ui.SheetMode
-import dev.rangefind.maps.ui.UiState
-import dev.rangefind.maps.ui.theme.MapPalette
+import dev.rangefind.wayfind.engine.LatLon
+import dev.rangefind.wayfind.engine.RouteJunction
+import dev.rangefind.wayfind.ui.SheetMode
+import dev.rangefind.wayfind.ui.UiState
+import dev.rangefind.wayfind.ui.theme.MapPalette
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -55,6 +55,9 @@ private const val SRC_CROSSING = "rf-src-crossing"
 private const val SRC_PUCK = "rf-src-puck"
 
 private const val LYR_RESULTS = "rf-lyr-results"
+
+/** Rangefind ink — the glyph punched out of the amber destination marker. */
+private const val INK = 0xFF14161D.toInt()
 
 @Composable
 fun MapCanvas(
@@ -380,7 +383,7 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
         }
     }
 
-    style.addImage(MapIcons.DESTINATION, MapIcons.pin(palette.destination.toArgb(), density))
+    style.addImage(MapIcons.DESTINATION, MapIcons.pin(palette.destination.toArgb(), INK, density))
     style.addImage(MapIcons.SIGNAL, MapIcons.signal(density))
     style.addImage(MapIcons.STOP, MapIcons.stop(density))
     style.addImage(MapIcons.CROSSING, MapIcons.crossing(density))

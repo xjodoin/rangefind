@@ -1,4 +1,4 @@
-package dev.rangefind.maps
+package dev.rangefind.wayfind
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -18,11 +18,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import dev.rangefind.maps.engine.WebViewRangefindEngine
-import dev.rangefind.maps.location.LocationProvider
-import dev.rangefind.maps.ui.MapScreen
-import dev.rangefind.maps.ui.MapsViewModel
-import dev.rangefind.maps.ui.theme.RangefindTheme
+import dev.rangefind.wayfind.engine.WebViewRangefindEngine
+import dev.rangefind.wayfind.location.LocationProvider
+import dev.rangefind.wayfind.ui.MapScreen
+import dev.rangefind.wayfind.ui.MapsViewModel
+import dev.rangefind.wayfind.ui.theme.WayfindTheme
 import java.util.Locale
 
 private const val SEARCH_BASE = "https://osm.rangefind.dev/"
@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val darkTheme = isSystemInDarkTheme()
-            RangefindTheme(darkTheme = darkTheme) {
+            WayfindTheme(darkTheme = darkTheme) {
                 val viewModel: MapsViewModel = viewModel(
                     factory = MapsViewModel.factory(
                         engine = engine,

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="108" height="108" role="img" aria-label="Wayfind">
+  <!--
+    Wayfind mark. Rangefind's favicon is a muted track with a highlighted
+    sub-range inside it. This keeps that grammar — ink field, muted track,
+    amber range — and bends the track into a way with two turns.
+  -->
+  <rect width="108" height="108" rx="24" fill="#14161D"/>
+  <path d="M36,72 L45,72 Q52,72 52,65 L52,47 Q52,40 59,40 L72,40"
+        fill="none" stroke="#FAF9F6" stroke-opacity="0.28"
+        stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M48,72 Q52,72 52,65 L52,47 Q52,40 59,40 L64,40"
+        fill="none" stroke="#FFC940"
+        stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

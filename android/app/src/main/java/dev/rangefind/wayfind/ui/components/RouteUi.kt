@@ -1,4 +1,4 @@
-package dev.rangefind.maps.ui.components
+package dev.rangefind.wayfind.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -42,17 +42,17 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import dev.rangefind.maps.engine.Route
-import dev.rangefind.maps.nav.bearingDegrees
-import dev.rangefind.maps.nav.bearingDelta
-import dev.rangefind.maps.ui.UiState
-import dev.rangefind.maps.ui.formatArrivalClock
-import dev.rangefind.maps.ui.formatBytes
-import dev.rangefind.maps.ui.formatDistance
-import dev.rangefind.maps.ui.formatDuration
-import dev.rangefind.maps.ui.formatManeuverDistance
-import dev.rangefind.maps.ui.formatSpeed
-import dev.rangefind.maps.ui.theme.LocalMapPalette
+import dev.rangefind.wayfind.engine.Route
+import dev.rangefind.wayfind.nav.bearingDegrees
+import dev.rangefind.wayfind.nav.bearingDelta
+import dev.rangefind.wayfind.ui.UiState
+import dev.rangefind.wayfind.ui.formatArrivalClock
+import dev.rangefind.wayfind.ui.formatBytes
+import dev.rangefind.wayfind.ui.formatDistance
+import dev.rangefind.wayfind.ui.formatDuration
+import dev.rangefind.wayfind.ui.formatManeuverDistance
+import dev.rangefind.wayfind.ui.formatSpeed
+import dev.rangefind.wayfind.ui.theme.LocalMapPalette
 import kotlin.math.abs
 
 @Composable

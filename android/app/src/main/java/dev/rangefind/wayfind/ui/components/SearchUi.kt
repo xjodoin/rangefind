@@ -1,4 +1,4 @@
-package dev.rangefind.maps.ui.components
+package dev.rangefind.wayfind.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -57,13 +57,13 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import dev.rangefind.maps.engine.EngineInfo
-import dev.rangefind.maps.engine.Place
-import dev.rangefind.maps.engine.Suggestion
-import dev.rangefind.maps.ui.SheetMode
-import dev.rangefind.maps.ui.UiState
-import dev.rangefind.maps.ui.formatDistance
-import dev.rangefind.maps.ui.humanizeType
+import dev.rangefind.wayfind.engine.EngineInfo
+import dev.rangefind.wayfind.engine.Place
+import dev.rangefind.wayfind.engine.Suggestion
+import dev.rangefind.wayfind.ui.SheetMode
+import dev.rangefind.wayfind.ui.UiState
+import dev.rangefind.wayfind.ui.formatDistance
+import dev.rangefind.wayfind.ui.humanizeType
 
 @Composable
 fun SearchField(

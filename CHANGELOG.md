@@ -63,7 +63,7 @@
   itineraries, search-along-route against the live planet index, and a
   Route X-Ray fetch receipt), computed entirely in the browser from
   static byte ranges. See `docs/route-graph.md`.
-- A native Android app (`android/`): Jetpack Compose UI with MapLibre Native
+- **Wayfind**, a native Android app (`android/`): Jetpack Compose UI with MapLibre Native
   rendering, backed entirely by Rangefind static indexes — worldwide search and
   autocomplete against the public OSM index, place details, reverse-geocoded
   dropped pins, directions with alternatives and maneuver steps, and
@@ -72,7 +72,9 @@
   in a headless WebView on a WebViewAssetLoader https origin, so index bytes are
   fetched by the runtime itself and never cross the JS bridge, and gzip
   inflation plus SHA-256 pack verification stay native. `RangefindEngine` keeps
-  the JS host swappable. See `android/README.md`.
+  the JS host swappable. It carries Rangefind's identity — the mark keeps the
+  favicon's ink/muted-track/amber-range grammar, bent into a way, and amber is
+  reserved for the destination. See `android/README.md`.
 
 ## 0.4.6 — 2026-08-04
 

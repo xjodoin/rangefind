@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "dev.rangefind.maps"
+    namespace = "dev.rangefind.wayfind"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.rangefind.maps"
+        applicationId = "dev.rangefind.wayfind"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

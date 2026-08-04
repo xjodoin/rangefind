@@ -1,6 +1,6 @@
-package dev.rangefind.maps.nav
+package dev.rangefind.wayfind.nav
 
-import dev.rangefind.maps.engine.LatLon
+import dev.rangefind.wayfind.engine.LatLon
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos

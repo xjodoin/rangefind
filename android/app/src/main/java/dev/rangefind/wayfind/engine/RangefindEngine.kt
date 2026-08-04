@@ -1,4 +1,4 @@
-package dev.rangefind.maps.engine
+package dev.rangefind.wayfind.engine
 
 /**
  * The app's whole dependency on rangefind. The JS host behind it is an

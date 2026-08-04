@@ -1,10 +1,15 @@
-# Rangefind Maps — native Android app
+# Wayfind
 
-A native Android maps app — Jetpack Compose UI, MapLibre Native rendering —
-whose search, geocoding, and routing all come from Rangefind's static indexes
-over HTTP Range requests. There is no search server, no geocoding API, and no
-routing service: the app reads byte ranges out of immutable, content-addressed
-files on a CDN.
+<img src="brand/wayfind-mark.svg" width="72" align="right" alt="">
+
+**Maps on static byte ranges.** A native Android app — Jetpack Compose UI,
+MapLibre Native rendering — whose search, geocoding, and routing all come from
+Rangefind's static indexes over HTTP Range requests. There is no search server,
+no geocoding API, and no routing service: the app reads byte ranges out of
+immutable, content-addressed files on a CDN.
+
+The name is the sibling of *Rangefind*: a **way** is OpenStreetMap's own
+primitive for a road, and *wayfinding* is the discipline of navigating space.
 
 ## What it does
 
@@ -102,6 +107,35 @@ search keeps working and the Directions button explains why it is disabled.
 For release builds, set `ROUTE_BASE_URL` to an https base that serves the route
 graph with `Accept-Ranges` and permissive CORS (a `Range` header is not
 CORS-safelisted, so the origin must answer the preflight).
+
+## Brand
+
+Wayfind is a Rangefind-family product and shares its identity rather than
+inventing a parallel one.
+
+The Rangefind favicon is a muted track with a highlighted sub-range inside it —
+a byte range, drawn literally. The Wayfind mark keeps that exact three-value
+grammar and bends the track into a way with two turns, so the resemblance is
+structural rather than merely a shared palette. Source: `brand/wayfind-mark.svg`.
+
+| Token | Value | Used for |
+| --- | --- | --- |
+| Ink | `#14161D` | Mark field, dark background |
+| Paper | `#FAF9F6` | Light background |
+| Marker (amber) | `#FFC940` | The highlighted range — and the destination pin |
+| Marker soft / ink | `#FFE9AD` / `#7A5200` | Amber containers and their text |
+| Pine | `#0E6F63` | Primary actions, route line (light) |
+| Pine bright | `#35C2AC` | Primary actions, route line (dark) |
+| Muted | `#5B6370` / `#9AA1AD` | Secondary text, alternate routes |
+| Surface (dark) | `#21242E` | Sheets and cards at night |
+
+Two deliberate rules:
+
+- **Amber is reserved for the destination.** It is the highlighted range in the
+  mark, so in the app it marks the one place you asked for — never a generic
+  accent.
+- **The location puck stays a conventional blue.** "You are here" is a
+  functional signal drivers read at a glance, not a place to spend brand equity.
 
 ## Notes
 

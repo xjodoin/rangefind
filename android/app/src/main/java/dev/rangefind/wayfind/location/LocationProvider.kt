@@ -1,4 +1,4 @@
-package dev.rangefind.maps.location
+package dev.rangefind.wayfind.location
 
 import android.annotation.SuppressLint
 import android.content.Context

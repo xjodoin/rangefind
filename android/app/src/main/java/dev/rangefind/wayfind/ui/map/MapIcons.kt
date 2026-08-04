@@ -1,4 +1,4 @@
-package dev.rangefind.maps.ui.map
+package dev.rangefind.wayfind.ui.map
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -19,7 +19,7 @@ object MapIcons {
     const val STOP = "rf-junction-stop"
     const val CROSSING = "rf-junction-crossing"
 
-    fun pin(color: Int, density: Float, glyph: Boolean = true): Bitmap {
+    fun pin(color: Int, glyphColor: Int, density: Float): Bitmap {
         val width = (34 * density).toInt().coerceAtLeast(24)
         val height = (46 * density).toInt().coerceAtLeast(32)
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -59,10 +59,8 @@ object MapIcons {
         }
         canvas.drawPath(inner, paint)
 
-        if (glyph) {
-            paint.color = 0xFFFFFFFF.toInt()
-            canvas.drawCircle(cx, cy, radius * 0.30f, paint)
-        }
+        paint.color = glyphColor
+        canvas.drawCircle(cx, cy, radius * 0.30f, paint)
         return bitmap
     }
 

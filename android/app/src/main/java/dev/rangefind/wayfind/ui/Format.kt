@@ -1,4 +1,4 @@
-package dev.rangefind.maps.ui
+package dev.rangefind.wayfind.ui
 
 import java.util.Calendar
 import java.util.Locale

@@ -1,4 +1,4 @@
-package dev.rangefind.maps.nav
+package dev.rangefind.wayfind.nav
 
 import android.app.Service
 import android.content.Intent
