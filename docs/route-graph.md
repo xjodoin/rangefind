@@ -244,6 +244,56 @@ cut): cold 110–126 ms, 4.4–4.7 MB, warm 20–43 ms, 90 MB index.
 - Snap results are cached per coordinate, so matrices re-snap each stop
   once, not once per pair.
 
+## Live traffic providers
+
+Live data enters through a generic, pluggable provider contract — a P2P
+mesh ([PulseMesh](pulsemesh.md) is the first design), a CDN-published
+delta sidecar, a municipal feed, or an in-memory loopback all implement
+the same interface:
+
+```js
+const provider = {
+  name: "my-feed",
+  async fetch({ epoch, areas, maxAgeSeconds }) {
+    // epoch === root.sourceHash, or return [].
+    return [
+      { segment: "412/31/0", speedMps: 4.2, meters: 380, confidence: 0.8, observedAt: Date.now() },
+      { segment: "413/7/1", closed: true } // verified closures only
+    ];
+  }
+};
+
+const result = await engine.route({ from, to, live: provider });
+// result.adjustedSeconds — ETA under the live metric
+// result.live — { provider, states, applied, error }
+```
+
+Segments are identified by the stable physical directed-segment id
+`"leaf/polyline/direction"` (exposed on `result.edges[].segment` and
+`snap()` matches) — every approach copy of a road edge from the turn-cost
+expansion shares one id, so a single state fans out correctly. States
+carry a time `factor` or `speedMps` + `meters`, an optional confidence
+that decays with age and blends the cost toward the static model, and
+`closed` / `penaltySeconds` for incidents.
+
+The search itself runs under the live metric: leaves referenced by live
+states join the context set like snap leaves, and overlay shortcuts
+through live-adjusted subtrees are suppressed so the search descends to
+the adjusted raw edges — closures and jams are exact wherever the
+provider reports, and the far field falls back to the static metric
+(which is where live data is sparse anyway). Clique unpacking and the
+reported `seconds` stay on the exact static metric; `adjustedSeconds` is
+the live estimate. Provider failures and unknown epochs degrade
+gracefully to the static route. `createStaticLiveProvider(states)` ships
+as the reference implementation for tests and loopbacks. In `matrix()`
+the live metric applies to fetched corridor edges without shortcut
+suppression (approximate); `route()` legs of an itinerary get the full
+treatment.
+
+`liveWeights` remains as the lower-level re-rank input (adjust ETAs of
+already-computed alternatives without re-searching), now also accepting
+physical segment ids as keys.
+
 ## Time-of-day and live traffic
 
 Bucket metrics are the static half of traffic support: an index built with

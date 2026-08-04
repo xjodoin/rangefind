@@ -60,6 +60,12 @@ export interface RouteEdgeRef {
   /** Leaf cell id — with `edge`, a stable per-build edge identity. */
   leaf: number;
   edge: number;
+  /**
+   * Physical directed-segment id "leaf/polyline/direction": shared by all
+   * approach copies of one road edge, stable for this build epoch. The
+   * key live-traffic feeds should report against.
+   */
+  segment: string;
   seconds: number;
   meters: number;
 }
@@ -88,8 +94,10 @@ export interface RouteResult {
    * replace with `geometry` when it arrives.
    */
   coarseGeometry?: Array<[number, number]>;
-  /** ETA re-ranked with liveWeights, when provided. */
+  /** ETA under the live metric (liveWeights re-rank or `live` search). */
   adjustedSeconds?: number;
+  /** Application report when a `live` provider was consulted. */
+  live?: { provider: string; states: number; applied: number; error: string | null };
   /** Diverging candidate routes, when `alternatives` was requested. */
   alternatives?: RouteResult[];
 }
@@ -97,8 +105,50 @@ export interface RouteResult {
 export interface LiveWeights {
   /** Must equal the index root's sourceHash when provided. */
   epoch?: string;
-  /** Per-edge time multipliers keyed by "leaf/edgeIndex". */
+  /** Per-edge time multipliers keyed by "leaf/edgeIndex" or physical segment id. */
   factors: Record<string, number>;
+}
+
+/**
+ * One ephemeral traffic state for a physical directed segment
+ * ("leaf/polyline/direction", as exposed on RouteEdgeRef.segment and
+ * SnapMatch.segment). Either `factor` (time multiplier over the static
+ * weight) or `speedMps` + `meters` must be provided; `closed: true` makes
+ * the segment impassable and must only be set for verified closures.
+ */
+export interface LiveSegmentState {
+  segment: string;
+  factor?: number;
+  speedMps?: number;
+  meters?: number;
+  /** 0..1; decays with observedAt age and blends toward the static cost. */
+  confidence?: number;
+  observedAt?: number;
+  closed?: boolean;
+  penaltySeconds?: number;
+}
+
+/**
+ * Pluggable source of ephemeral traffic states: a P2P mesh (PulseMesh), a
+ * CDN-published delta sidecar, a municipal feed, or an in-memory test
+ * loopback. `areas` is a hint (the query's endpoint contexts); providers
+ * may return states anywhere — the engine fetches the referenced cells
+ * (capped) and suppresses stale shortcuts through them, making closures
+ * and jams exact under the live metric. Must return [] for unknown epochs.
+ * Failures degrade the query to the static metric.
+ */
+export interface LiveTrafficProvider {
+  name?: string;
+  fetch(query: {
+    epoch: string;
+    areas: Array<{ leaf: number; bbox: { minLat: number; maxLat: number; minLon: number; maxLon: number } }>;
+    maxAgeSeconds: number;
+  }): LiveSegmentState[] | Promise<LiveSegmentState[]>;
+}
+
+export interface LiveProviderSpec {
+  provider: LiveTrafficProvider;
+  maxAgeSeconds?: number;
 }
 
 export interface RouteParams {
@@ -116,6 +166,12 @@ export interface RouteParams {
   alternatives?: number;
   /** Re-rank candidates and adjust ETAs with fresh per-edge factors. */
   liveWeights?: LiveWeights;
+  /**
+   * Live-traffic source consulted during the search itself: the route is
+   * chosen under the live metric (closures impassable, jams costed),
+   * exact wherever the provider reports and static elsewhere.
+   */
+  live?: LiveTrafficProvider | LiveProviderSpec;
   /** Called with the coarse route as soon as the search finishes. */
   onCoarseRoute?: (coarse: { seconds: number; geometry: Array<[number, number]>; bucket: string }) => void;
 }
@@ -143,6 +199,8 @@ export interface ItineraryResult {
 export interface SnapMatch {
   leaf: number;
   edgeIndex: number;
+  /** Physical directed-segment id — the key contribution pipelines report. */
+  segment: string;
   fromNode: number;
   toNode: number;
   weight: number;
@@ -166,6 +224,7 @@ export interface RouteGraphEngine {
     points: RoutePoint[];
     bucket?: string;
     departureTime?: string | number | Date;
+    live?: LiveTrafficProvider | LiveProviderSpec;
     /** Force k^2 point-to-point routes instead of shared-context one-to-many searches. */
     pairwise?: boolean;
   }): Promise<MatrixResult>;
@@ -175,6 +234,7 @@ export interface RouteGraphEngine {
     geometry?: boolean;
     bucket?: string;
     departureTime?: string | number | Date;
+    live?: LiveTrafficProvider | LiveProviderSpec;
   }): Promise<ItineraryResult>;
   snap(point: RoutePoint, options?: {
     maxCandidates?: number;
@@ -195,3 +255,12 @@ export declare function createRouteGraphHttpIo(baseUrl: string, options?: {
 export declare function openRouteGraphUrl(baseUrl: string, options?: Partial<OpenRouteGraphOptions> & {
   fetch?: typeof fetch;
 }): Promise<RouteGraphEngine>;
+
+/**
+ * Reference LiveTrafficProvider serving a fixed (or lazily computed) state
+ * list — for tests, demo loopbacks, and pre-fetched sidecar payloads.
+ */
+export declare function createStaticLiveProvider(
+  states: LiveSegmentState[] | ((query: { epoch: string }) => LiveSegmentState[]),
+  options?: { name?: string; epoch?: string }
+): LiveTrafficProvider;

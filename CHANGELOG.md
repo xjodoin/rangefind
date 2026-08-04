@@ -29,7 +29,18 @@
   by penalized re-search over already-fetched objects, and `liveWeights`
   re-ranks candidates and adjusts ETAs with per-edge factors keyed by
   stable `leaf/edgeIndex` ids tied to the build epoch — the consumption
-  path for CDN-published or peer-to-peer traffic deltas. Turn-angle costs
+  path for CDN-published or peer-to-peer traffic deltas. Live traffic is
+  consumed through a generic pluggable provider contract
+  (`route({ live: provider })`): states keyed by physical directed-segment
+  ids (`leaf/polyline/direction`, shared by all approach copies via the
+  geometry dedup) with confidence/age blending, verified closures, and
+  incident penalties; the search runs under the live metric by pulling
+  referenced cells into the context set and suppressing stale overlay
+  shortcuts through them, exact wherever states exist and static
+  elsewhere, with graceful degradation on provider failure or epoch
+  mismatch. `createStaticLiveProvider` ships as the reference
+  implementation, and `docs/pulsemesh.md` specifies the first planned
+  network provider — a privacy-preserving P2P mesh. Turn-angle costs
   ship via full junction expansion into an edge-based graph (per-approach
   junction copies with bearing-priced turns, left costlier than right,
   u-turns penalized), with via-node restrictions as exact per-approach

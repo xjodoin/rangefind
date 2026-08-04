@@ -109,6 +109,19 @@ export function createRouteGraphHttpIo(baseUrl, options = {}) {
   };
 }
 
+// In-memory provider: serves a fixed (or lazily computed) state list.
+// The reference implementation of the provider contract — useful for
+// tests, demo loopbacks, and adapting pre-fetched CDN sidecar payloads.
+export function createStaticLiveProvider(states, options = {}) {
+  return {
+    name: options.name || "static-live",
+    fetch({ epoch }) {
+      if (options.epoch && options.epoch !== epoch) return [];
+      return typeof states === "function" ? states({ epoch }) : states;
+    }
+  };
+}
+
 // Convenience: open a route graph served over HTTP(S).
 export async function openRouteGraphUrl(baseUrl, options = {}) {
   const io = options.io || createRouteGraphHttpIo(baseUrl, options);
@@ -298,6 +311,160 @@ export async function openRouteGraph(options) {
 
   const cellEdgeWeight = (cell, edge, factors) => bucketWeight(cell.weights[edge], cell.classes[edge], factors);
 
+  // --- Live traffic providers -------------------------------------------
+  //
+  // A provider supplies ephemeral per-segment states (speeds, closures,
+  // incident penalties) from any source: a P2P mesh such as PulseMesh, a
+  // CDN-published delta sidecar, a municipal feed, or an in-memory test
+  // loopback. The engine stays source-agnostic; the contract is:
+  //
+  //   provider.fetch({ epoch, areas: [{leaf, bbox°}], maxAgeSeconds })
+  //     -> [{ segment, factor? | speedMps?, confidence?, observedAt?,
+  //           closed?, penaltySeconds? }]
+  //
+  // `segment` is the stable physical directed-segment id "leaf/poly/dir":
+  // every approach copy of one road edge (junction expansion) shares its
+  // leaf's deduplicated canonical polyline, so one live state fans out to
+  // all copies automatically. Ids are only valid for `epoch` ===
+  // root.sourceHash; providers must return [] for unknown epochs.
+
+  function edgeSegmentId(cell, edge) {
+    const ref = cell.geomRefs[edge];
+    return `${cell.cellId}/${ref >>> 1}/${ref & 1}`;
+  }
+
+  // Blend an observed state into a time multiplier over the static edge
+  // weight: confidence decays with age, and a low-confidence report only
+  // nudges the cost toward the observation (PulseMesh section 14 blend).
+  function resolveLiveFactor(state, staticSeconds, nowMs) {
+    if (state.closed === true) return { factor: Infinity, penaltyDs: 0 };
+    let factor = Number(state.factor);
+    if (!Number.isFinite(factor) && Number.isFinite(state.speedMps) && state.speedMps > 0 && staticSeconds > 0) {
+      const meters = Number(state.meters);
+      // Without meters we cannot turn a speed into a time; providers that
+      // send speedMps should send meters too, or precompute `factor`.
+      factor = Number.isFinite(meters) && meters > 0
+        ? (meters / Math.max(1.4, state.speedMps)) / staticSeconds
+        : NaN;
+    }
+    if (!Number.isFinite(factor) || factor <= 0) return null;
+    let confidence = Number.isFinite(state.confidence) ? Math.max(0, Math.min(1, state.confidence)) : 1;
+    if (Number.isFinite(state.observedAt)) {
+      const ageSeconds = Math.max(0, (nowMs - state.observedAt) / 1000);
+      confidence *= Math.exp(-ageSeconds / 60);
+    }
+    const blended = confidence * factor + (1 - confidence);
+    const clamped = Math.max(0.25, Math.min(10, blended));
+    const penaltyDs = Number.isFinite(state.penaltySeconds) && state.penaltySeconds > 0
+      ? Math.round(Math.min(600, state.penaltySeconds) * 10)
+      : 0;
+    return { factor: clamped, penaltyDs };
+  }
+
+  // Resolves provider states into per-fetched-cell adjustment arrays.
+  // Kept per query (never attached to the shared cell cache) so providers
+  // and queries cannot leak into each other.
+  async function buildLiveAdjustments(providerSpec, fetched, factors) {
+    if (!providerSpec) return null;
+    const provider = providerSpec.provider || providerSpec;
+    if (typeof provider.fetch !== "function") {
+      throw routeError("RANGEFIND_ROUTE_BAD_PROVIDER", "Live traffic providers must expose fetch().");
+    }
+    const cells = [...fetched.cells.values()];
+    const areas = cells.map(cell => {
+      const bbox = root.leaves[cell.cellId].bbox;
+      return {
+        leaf: cell.cellId,
+        bbox: {
+          minLat: bbox.minLat / 1e7,
+          maxLat: bbox.maxLat / 1e7,
+          minLon: bbox.minLon / 1e7,
+          maxLon: bbox.maxLon / 1e7
+        }
+      };
+    });
+    const live = {
+      name: provider.name || "live",
+      byCell: new Map(),
+      bySegment: new Map(),
+      referencedLeaves: new Set(),
+      dirtyKeys: new Set(),
+      applied: 0,
+      states: 0,
+      error: null
+    };
+    let states;
+    try {
+      states = await provider.fetch({
+        epoch: root.sourceHash,
+        areas,
+        maxAgeSeconds: providerSpec.maxAgeSeconds ?? 120
+      });
+    } catch (error) {
+      // Live data is best-effort: degrade to the static metric.
+      live.error = error?.message || String(error);
+      return live;
+    }
+    if (!Array.isArray(states) || !states.length) return live;
+    live.states = states.length;
+    for (const state of states) {
+      if (!state || typeof state.segment !== "string") continue;
+      live.bySegment.set(state.segment, state);
+      const leaf = Number(state.segment.split("/")[0]);
+      if (Number.isInteger(leaf) && leaf >= 0 && leaf < root.leaves.length) live.referencedLeaves.add(leaf);
+    }
+    applyLiveToCells(live, cells, factors);
+    return live;
+  }
+
+  // Resolves states onto the raw edges of the given fetched cells and
+  // marks every ancestor cell of a live-adjusted leaf as dirty. Dirty
+  // subtrees have their overlay shortcuts suppressed during the search,
+  // forcing the descent that makes closures and jams exact under the live
+  // metric (paths through unaffected sibling cells keep their shortcuts).
+  function applyLiveToCells(live, cells, factors) {
+    const nowMs = Date.now();
+    for (const cell of cells) {
+      if (live.byCell.has(cell)) continue;
+      const edgeCount = cell.rowStart[cell.nodeCount];
+      let factorsArr = null;
+      let penalties = null;
+      for (let e = 0; e < edgeCount; e++) {
+        const state = live.bySegment.get(edgeSegmentId(cell, e));
+        if (!state) continue;
+        const resolved = resolveLiveFactor(state, cellEdgeWeight(cell, e, factors) / 10, nowMs);
+        if (!resolved) continue;
+        if (!factorsArr) {
+          factorsArr = new Float64Array(edgeCount).fill(1);
+          penalties = new Float64Array(edgeCount);
+        }
+        factorsArr[e] = resolved.factor;
+        penalties[e] = resolved.penaltyDs;
+        live.applied++;
+      }
+      if (factorsArr) {
+        live.byCell.set(cell, { factors: factorsArr, penalties });
+        for (let level = 0; level <= levelCount; level++) {
+          live.dirtyKeys.add(`${level}:${cellAtLevel(cell.cellId, level)}`);
+        }
+      }
+    }
+  }
+
+  // Applies live adjustments to one raw edge weight. Only the search uses
+  // this — clique unpacking must keep exact static weights, and overlays
+  // stay on the static metric (live detail belongs to the corridor; the
+  // far field falls back to static, which is where live data is sparse
+  // anyway).
+  function liveAdjustedWeight(live, cell, edge, weight) {
+    const entry = live?.byCell.get(cell);
+    if (!entry) return weight;
+    const factor = entry.factors[edge];
+    if (factor === Infinity) return Infinity;
+    if (factor === 1 && !entry.penalties[edge]) return weight;
+    return Math.round(weight * factor) + entry.penalties[edge];
+  }
+
   let namesPromise = null;
   function loadNames() {
     if (!namesPromise) {
@@ -423,6 +590,7 @@ export async function openRouteGraph(options) {
           matches.push({
             leaf: cell.cellId,
             edgeIndex: e,
+            segment: edgeSegmentId(cell, e),
             fromNode: cell.firstNode + node,
             toNode: target,
             weight: cell.weights[e],
@@ -539,7 +707,7 @@ export async function openRouteGraph(options) {
   // the CRP region decomposition guarantees every needed edge is present in
   // at least one fetched object. Relaxing the union is therefore both
   // complete and exact, and needs no region bookkeeping.
-  function searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized) {
+  function searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live) {
     const INF = Infinity;
     // Optional query-graph edge penalties (alternative-route computation):
     // multiplies specific (from, to) transitions without refetching.
@@ -607,7 +775,7 @@ export async function openRouteGraph(options) {
         const local = node - cell.firstNode;
         for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
           const target = cell.targets[e];
-          const next = weight + penaltyFor(node, target, cellEdgeWeight(cell, e, factors));
+          const next = weight + penaltyFor(node, target, liveAdjustedWeight(live, cell, e, cellEdgeWeight(cell, e, factors)));
           if (next < (distF.get(target) ?? INF)) {
             distF.set(target, next);
             prevF.set(target, { prev: node, kind: "raw", leaf: cell.cellId, edge: e });
@@ -618,7 +786,16 @@ export async function openRouteGraph(options) {
       for (const { overlay, level, cell } of entry.overlays || []) {
         const index = overlay.index.get(node);
         if (index == null) continue;
+        const dirtyChildKey = live?.dirtyKeys.size
+          ? `${level - 1}:${cellAtLevel(leafOfNode(node), level - 1)}`
+          : null;
         for (let e = overlay.rowStart[index]; e < overlay.rowStart[index + 1]; e++) {
+          // Shortcuts through a live-adjusted subtree are stale; skip them
+          // so the search descends to the adjusted raw edges instead.
+          if (dirtyChildKey && live.dirtyKeys.has(dirtyChildKey)) {
+            if (overlay.isClique[e]) continue;
+            if (live.byCell.has(fetched.cells.get(leafOfNode(node)))) continue;
+          }
           const target = overlay.nodes[overlay.targetIndex[e]];
           const next = weight + penaltyFor(node, target, overlay.weights[e]);
           if (next < (distF.get(target) ?? INF)) {
@@ -644,7 +821,7 @@ export async function openRouteGraph(options) {
           for (let e = reverse.rowStart[local]; e < reverse.rowStart[local + 1]; e++) {
             const edge = reverse.edgeIds[e];
             const source = reverse.sources[e];
-            const next = weight + penaltyFor(source, node, cellEdgeWeight(cell, edge, factors));
+            const next = weight + penaltyFor(source, node, liveAdjustedWeight(live, cell, edge, cellEdgeWeight(cell, edge, factors)));
             if (next < (distB.get(source) ?? INF)) {
               distB.set(source, next);
               prevB.set(source, { prev: node, kind: "raw", leaf: cell.cellId, edge });
@@ -657,7 +834,7 @@ export async function openRouteGraph(options) {
           for (let i = 0; i < external.length; i += 2) {
             const source = external[i];
             const edge = external[i + 1];
-            const next = weight + penaltyFor(source, node, cellEdgeWeight(cell, edge, factors));
+            const next = weight + penaltyFor(source, node, liveAdjustedWeight(live, cell, edge, cellEdgeWeight(cell, edge, factors)));
             if (next < (distB.get(source) ?? INF)) {
               distB.set(source, next);
               prevB.set(source, { prev: node, kind: "raw", leaf: cell.cellId, edge });
@@ -673,6 +850,13 @@ export async function openRouteGraph(options) {
         for (let e = reverse.rowStart[index]; e < reverse.rowStart[index + 1]; e++) {
           const edge = reverse.edgeIds[e];
           const source = overlay.nodes[reverse.sources[e]];
+          if (live?.dirtyKeys.size) {
+            const key = `${level - 1}:${cellAtLevel(leafOfNode(source), level - 1)}`;
+            if (live.dirtyKeys.has(key)) {
+              if (overlay.isClique[edge]) continue;
+              if (live.byCell.has(fetched.cells.get(leafOfNode(source)))) continue;
+            }
+          }
           const next = weight + penaltyFor(source, node, overlay.weights[edge]);
           if (next < (distB.get(source) ?? INF)) {
             distB.set(source, next);
@@ -975,7 +1159,7 @@ export async function openRouteGraph(options) {
       const meters = cell.distsDm[edge] / 10;
       const seconds = cellEdgeWeight(cell, edge, factors) / 10;
       distanceMeters += meters;
-      edges.push({ leaf: raw.leaf, edge, seconds, meters });
+      edges.push({ leaf: raw.leaf, edge, segment: edgeSegmentId(cell, edge), seconds, meters });
       const name = names ? names[cell.nameIds[edge]] || "" : "";
       const last = steps[steps.length - 1];
       if (last && last.name === name) {
@@ -1013,7 +1197,8 @@ export async function openRouteGraph(options) {
     if (!response.edges) return response.seconds;
     let adjusted = response.seconds;
     for (const edge of response.edges) {
-      const factor = liveWeights.factors?.[`${edge.leaf}/${edge.edge}`];
+      const factor = liveWeights.factors?.[`${edge.leaf}/${edge.edge}`]
+        ?? liveWeights.factors?.[edge.segment];
       if (factor != null && Number.isFinite(factor) && factor > 0) {
         adjusted += edge.seconds * (factor - 1);
       }
@@ -1077,18 +1262,34 @@ export async function openRouteGraph(options) {
       contexts = buildContexts([...union]);
       fetched = await fetchContexts(contexts, bucket);
     }
+    let live = await buildLiveAdjustments(params.live, fetched, factors);
+    if (live && live.referencedLeaves.size) {
+      // Leaves carrying live states join the context set exactly like snap
+      // leaves: their ancestors' overlays let the search descend into them
+      // from anywhere on the route, capped to keep queries bounded.
+      const extra = [...live.referencedLeaves].filter(leaf => !fetched.cells.has(leaf)).slice(0, 24);
+      if (extra.length) {
+        contexts = buildContexts([...new Set([...fetched.cells.keys(), ...extra])]);
+        fetched = await fetchContexts(contexts, bucket);
+        applyLiveToCells(live, [...fetched.cells.values()], factors);
+      }
+    }
 
-    const effMatchWeight = (match) => bucketWeight(match.weight, match.classCode, factors);
+    const effMatchWeight = (match) => {
+      const base = bucketWeight(match.weight, match.classCode, factors);
+      const cell = fetched.cells.get(match.leaf);
+      return cell ? liveAdjustedWeight(live, cell, match.edgeIndex, base) : base;
+    };
     const forwardSeeds = snapFrom.matches.map(match => ({
       node: match.toNode,
       weight: Math.round(effMatchWeight(match) * (1 - match.ratio)),
       match
-    }));
+    })).filter(seed => Number.isFinite(seed.weight));
     const backwardSeeds = snapTo.matches.map(match => ({
       node: match.fromNode,
       weight: Math.round(effMatchWeight(match) * match.ratio),
       match
-    }));
+    })).filter(seed => Number.isFinite(seed.weight));
 
     // Same-edge special case: both points on one directed edge, in order.
     let sameEdge = null;
@@ -1096,7 +1297,7 @@ export async function openRouteGraph(options) {
       for (const to of snapTo.matches) {
         if (from.leaf === to.leaf && from.edgeIndex === to.edgeIndex && to.ratio >= from.ratio) {
           const weight = Math.round(effMatchWeight(from) * (to.ratio - from.ratio));
-          if (!sameEdge || weight < sameEdge.weight) sameEdge = { weight, from, to };
+          if (Number.isFinite(weight) && (!sameEdge || weight < sameEdge.weight)) sameEdge = { weight, from, to };
         }
       }
     }
@@ -1153,7 +1354,7 @@ export async function openRouteGraph(options) {
       return response;
     };
 
-    const primarySearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, null);
+    const primarySearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, null, live);
     let totalWeight = primarySearch.best;
     let usedSameEdge = false;
     if (sameEdge && sameEdge.weight <= totalWeight) {
@@ -1164,6 +1365,12 @@ export async function openRouteGraph(options) {
       throw routeError("RANGEFIND_ROUTE_NO_PATH", "No route found between the requested points.");
     }
     const primary = await buildResponse(primarySearch, totalWeight, usedSameEdge);
+    if (live) {
+      primary.live = { provider: live.name, states: live.states, applied: live.applied, error: live.error };
+      // The search itself ran on live-adjusted corridor weights, so the
+      // optimal total under the live metric is the search result.
+      primary.adjustedSeconds = totalWeight / 10;
+    }
 
     if (!alternativeCount || usedSameEdge) {
       if (liveWeights) primary.adjustedSeconds = adjustedSeconds(primary, liveWeights);
@@ -1181,7 +1388,7 @@ export async function openRouteGraph(options) {
     const candidates = [primary];
     const searches = [primarySearch];
     for (let i = 0; i < alternativeCount; i++) {
-      const alternativeSearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized);
+      const alternativeSearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live);
       if (alternativeSearch.best === Infinity) break;
       // Recompute the alternative's true (unpenalized) weight from its path.
       const transitions = transitionsOf(alternativeSearch);
@@ -1207,7 +1414,7 @@ export async function openRouteGraph(options) {
   // stops. Exact for every pair by the same argument as the bidirectional
   // search: the union contains each pair's context, and every extra edge is
   // a real path length.
-  function forwardToTargets(contexts, fetched, seeds, targetSeeds, factors) {
+  function forwardToTargets(contexts, fetched, seeds, targetSeeds, factors, live) {
     const INF = Infinity;
     const cellList = [...fetched.cells.values()];
     const overlayList = [...fetched.overlays.values()];
@@ -1259,7 +1466,7 @@ export async function openRouteGraph(options) {
       for (const cell of entry.cells || []) {
         const local = node - cell.firstNode;
         for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
-          const next = weight + cellEdgeWeight(cell, e, factors);
+          const next = weight + liveAdjustedWeight(live, cell, e, cellEdgeWeight(cell, e, factors));
           const target = cell.targets[e];
           if (next < (dist.get(target) ?? INF)) {
             dist.set(target, next);
@@ -1297,7 +1504,8 @@ export async function openRouteGraph(options) {
             to: points[j],
             geometry: false,
             bucket: params.bucket,
-            departureTime: params.departureTime
+            departureTime: params.departureTime,
+            live: params.live
           });
           seconds[i][j] = result.seconds;
         }
@@ -1317,7 +1525,12 @@ export async function openRouteGraph(options) {
     }
     const contexts = buildContexts([...allLeaves]);
     const fetched = await fetchContexts(contexts, bucket);
-    const effMatchWeight = (match) => bucketWeight(match.weight, match.classCode, factors);
+    const live = await buildLiveAdjustments(params.live, fetched, factors);
+    const effMatchWeight = (match) => {
+      const base = bucketWeight(match.weight, match.classCode, factors);
+      const cell = fetched.cells.get(match.leaf);
+      return cell ? liveAdjustedWeight(live, cell, match.edgeIndex, base) : base;
+    };
     const forwardSeedsOf = (snapped) => snapped.matches.map(match => ({
       node: match.toNode,
       weight: Math.round(effMatchWeight(match) * (1 - match.ratio))
@@ -1328,7 +1541,7 @@ export async function openRouteGraph(options) {
     }));
     const targetSeeds = snaps.map(backwardSeedsOf);
     for (let i = 0; i < size; i++) {
-      const best = forwardToTargets(contexts, fetched, forwardSeedsOf(snaps[i]), targetSeeds, factors);
+      const best = forwardToTargets(contexts, fetched, forwardSeedsOf(snaps[i]), targetSeeds, factors, live);
       for (let j = 0; j < size; j++) {
         if (i === j) continue;
         let weight = best[j];
@@ -1357,7 +1570,7 @@ export async function openRouteGraph(options) {
     if (!Array.isArray(stops) || stops.length < 2) throw new Error("Itineraries need at least two stops.");
     const roundTrip = params.roundTrip === true;
     const fixedEnd = !roundTrip;
-    const { seconds } = await matrix({ points: stops, bucket: params.bucket, departureTime: params.departureTime });
+    const { seconds } = await matrix({ points: stops, bucket: params.bucket, departureTime: params.departureTime, live: params.live });
     const size = stops.length;
     const interior = [];
     for (let i = 1; i < size - (fixedEnd ? 1 : 0); i++) interior.push(i);
@@ -1379,7 +1592,8 @@ export async function openRouteGraph(options) {
         to: stops[order[i + 1]],
         geometry: params.geometry !== false,
         bucket: params.bucket,
-        departureTime: params.departureTime
+        departureTime: params.departureTime,
+        live: params.live
       });
       legs.push({ ...leg, fromStop: order[i], toStop: order[i + 1] });
       totalSeconds += leg.seconds;

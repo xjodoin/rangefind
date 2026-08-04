@@ -733,6 +733,64 @@ test("one-to-many matrix equals pairwise routes", async (t) => {
   assert.deepEqual(fast.seconds, slow.seconds, "shared-context matrix matches pairwise exactly");
 });
 
+test("live traffic providers reroute, close, and degrade gracefully", async (t) => {
+  const { createStaticLiveProvider } = await import("../src/route_graph_query.js");
+  const graph = syntheticGraph(20, 18, 77);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-live-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 48, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+  const point = (node) => ({ lat: graph.nodeLat[node] / 1e7, lon: graph.nodeLon[node] / 1e7 });
+  const from = point(21);
+  const to = point(20 * 18 - 25);
+
+  const base = await engine.route({ from, to });
+  assert.ok(base.edges.every(edge => typeof edge.segment === "string"), "edges expose physical segment ids");
+  const baseSegments = base.edges.map(edge => edge.segment);
+
+  // Jamming every segment of the base route must push the search onto a
+  // different corridor, and the live estimate must exceed the static one.
+  const jam = createStaticLiveProvider(baseSegments.map(segment => ({
+    segment,
+    factor: 6,
+    confidence: 1,
+    observedAt: Date.now()
+  })));
+  const jammed = await engine.route({ from, to, live: jam });
+  assert.ok(jammed.live.applied > 0, "jam states applied to corridor edges");
+  const overlap = jammed.edges.filter(edge => baseSegments.includes(edge.segment)).length / jammed.edges.length;
+  assert.ok(overlap < 0.6, `route diverges from the jammed corridor (overlap ${overlap.toFixed(2)})`);
+  assert.ok(jammed.adjustedSeconds >= base.seconds, "live estimate is no faster than free flow");
+
+  // A verified closure removes the segment outright.
+  const closure = createStaticLiveProvider([{ segment: baseSegments[Math.floor(baseSegments.length / 2)], closed: true }]);
+  const rerouted = await engine.route({ from, to, live: closure });
+  assert.ok(!rerouted.edges.some(edge => edge.segment === baseSegments[Math.floor(baseSegments.length / 2)]),
+    "closed segment is avoided");
+
+  // Unknown epoch: provider contract returns nothing, route is static.
+  const staleEpoch = createStaticLiveProvider([{ segment: baseSegments[0], factor: 6 }], { epoch: "not-this-build" });
+  const stale = await engine.route({ from, to, live: staleEpoch });
+  assert.equal(stale.seconds, base.seconds, "stale-epoch provider leaves the static route untouched");
+  assert.equal(stale.live.applied, 0);
+
+  // A throwing provider degrades to the static metric instead of failing.
+  const broken = { name: "broken", fetch() { throw new Error("mesh unreachable"); } };
+  const degraded = await engine.route({ from, to, live: broken });
+  assert.equal(degraded.seconds, base.seconds, "provider failure degrades to static");
+  assert.ok(degraded.live.error, "provider failure is reported");
+
+  // Low confidence only nudges the cost: same route, milder estimate.
+  const mild = createStaticLiveProvider(baseSegments.map(segment => ({
+    segment,
+    factor: 6,
+    confidence: 0.1,
+    observedAt: Date.now()
+  })));
+  const nudged = await engine.route({ from, to, live: mild });
+  assert.ok(nudged.adjustedSeconds < jammed.adjustedSeconds, "confidence blending softens the live estimate");
+});
+
 test("itinerary orders stops and concatenates legs", async (t) => {
   const graph = syntheticGraph(16, 16, 5);
   const dir = mkdtempSync(join(tmpdir(), "rangefind-route-trip-"));
