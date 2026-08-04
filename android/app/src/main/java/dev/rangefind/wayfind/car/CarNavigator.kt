@@ -186,14 +186,18 @@ class CarNavigator(private val context: Context) {
         say(context.getString(R.string.nav_switching_route))
     }
 
-    private fun reroute(from: LatLon) {
+    /** The travel direction to route from, or null when too slow to trust it. */
+    private fun headingOf(speedMps: Double, bearing: Double): Double? =
+        if (speedMps >= NavigationCore.MIN_HEADING_SPEED_MPS) bearing else null
+
+    private fun reroute(from: LatLon, heading: Double?) {
         val destination = _state.value.destination ?: return
         if (_state.value.rerouting) return
         _state.update { it.copy(rerouting = true) }
         say(context.getString(R.string.nav_rerouting))
         scope.launch {
             val engine = WayfindRuntime.engineOrNull() ?: return@launch
-            runCatching { engine.route(from, destination.point, alternatives = 0) }
+            runCatching { engine.route(from, destination.point, alternatives = 0, fromHeading = heading) }
                 .onSuccess { bundle ->
                     core.replaceRoutes(listOf(bundle.primary))
                     _state.update { it.copy(routes = bundle, rerouting = false) }
@@ -237,7 +241,7 @@ class CarNavigator(private val context: Context) {
             _state.update { it.copy(navigating = false) }
             return
         }
-        if (update.offRoute) reroute(point)
+        if (update.offRoute) reroute(point, headingOf(update.speedMps, update.bearing))
     }
 
 }

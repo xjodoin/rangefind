@@ -536,16 +536,23 @@ class MapsViewModel(
             core.stop()
             return
         }
-        if (update.offRoute) reroute(point)
+        if (update.offRoute) {
+            // Reroute from where the car is pointing, not just where it is.
+            reroute(point, headingOf(update.speedMps, update.bearing))
+        }
     }
 
-    private fun reroute(from: LatLon) {
+    /** The travel direction to route from, or null when too slow to trust it. */
+    private fun headingOf(speedMps: Double, bearing: Double): Double? =
+        if (speedMps >= NavigationCore.MIN_HEADING_SPEED_MPS) bearing else null
+
+    private fun reroute(from: LatLon, heading: Double?) {
         val destination = _state.value.selected ?: return
         if (_state.value.rerouting) return
         _state.update { it.copy(rerouting = true) }
         _voice.tryEmit(context.getString(R.string.nav_rerouting))
         viewModelScope.launch {
-            runCatching { engine.route(from, destination.point, alternatives = 0) }
+            runCatching { engine.route(from, destination.point, alternatives = 0, fromHeading = heading) }
                 .onSuccess { bundle ->
                     core.replaceRoutes(listOf(bundle.primary))
                     _state.update { it.copy(routes = bundle, activeRouteIndex = 0, rerouting = false) }

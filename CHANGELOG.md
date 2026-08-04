@@ -85,6 +85,15 @@
   the JS host swappable. It carries Rangefind's identity — the mark keeps the
   favicon's ink/muted-track/amber-range grammar, bent into a way, and amber is
   reserved for the destination. See `android/README.md`.
+- Heading-aware origin snapping (`route({ fromHeading, headingPenaltySeconds })`).
+  Both directions of a road snap equally well, so rerouting a moving vehicle
+  could seed the opposing edge for free and return a route starting with an
+  implicit U-turn back the way the driver came. A reported heading charges the
+  misaligned candidates — free within 45°, full penalty past 135°, ramped
+  between so a noisy compass cannot flip the decision — and the default 60 s
+  is configurable, with 0 restoring the unbiased search. Since the charge is
+  paid only when the route really does turn around, and a U-turn does cost
+  time, it stays in the reported total.
 
 ## 0.4.6 — 2026-08-04
 

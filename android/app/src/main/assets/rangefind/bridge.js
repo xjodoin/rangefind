@@ -287,13 +287,17 @@ const handlers = {
     return { place: places[0] || null };
   },
 
-  async route({ from, to, alternatives, departureTime }) {
+  async route({ from, to, alternatives, departureTime, fromHeading }) {
     if (!routeEngine) throw new Error(routeUnavailable || "Routing unavailable");
     const result = await routeEngine.route({
       from,
       to,
       alternatives: alternatives || 0,
-      ...(departureTime ? { departureTime } : {})
+      ...(departureTime ? { departureTime } : {}),
+      // Only sent while actually moving: a heading from a standing vehicle is
+      // noise, and biasing the snap with it would invent a U-turn penalty for
+      // a driver who is free to pull away in either direction.
+      ...(Number.isFinite(fromHeading) ? { fromHeading } : {})
     });
     return {
       primary: trimRoute(result),

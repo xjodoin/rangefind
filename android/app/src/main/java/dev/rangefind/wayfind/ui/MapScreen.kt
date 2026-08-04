@@ -46,6 +46,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.unit.dp
 import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.LatLon
@@ -104,6 +105,16 @@ fun MapScreen(
 
     val navigating = state.sheet == SheetMode.Navigating
 
+    // Committing to a place or a route ends the typing session. Without this
+    // the field keeps focus and the keyboard stays up over the map, hiding the
+    // very suggestion or result the user just tapped — the text field only
+    // gave focus back on the IME's own Search action or the clear button.
+    val focusManager = LocalFocusManager.current
+    val pickSuggestion: (Suggestion) -> Unit = { focusManager.clearFocus(); onSuggestion(it) }
+    val selectResult: (Int) -> Unit = { focusManager.clearFocus(); onSelectResult(it) }
+    val longPressMap: (LatLon) -> Unit = { focusManager.clearFocus(); onLongPress(it) }
+    val startDirections: () -> Unit = { focusManager.clearFocus(); onDirections() }
+
     BackHandler(enabled = state.sheet != SheetMode.Search || state.query.isNotEmpty()) {
         when (state.sheet) {
             SheetMode.Navigating -> onStopNavigation()
@@ -122,9 +133,9 @@ fun MapScreen(
             bottomInsetPx = if (wideLayout) 0 else sheetHeightPx,
             startInsetPx = if (wideLayout && !navigating) panelWidthPx else 0,
             onCenterChanged = onCenterChanged,
-            onResultTapped = onSelectResult,
+            onResultTapped = selectResult,
             onRouteTapped = onSelectRoute,
-            onLongPress = onLongPress,
+            onLongPress = longPressMap,
             modifier = Modifier.fillMaxSize()
         )
 
@@ -154,7 +165,7 @@ fun MapScreen(
                     AnimatedVisibility(visible = state.suggestions.isNotEmpty() && focused) {
                         SuggestionList(
                             suggestions = state.suggestions,
-                            onPick = onSuggestion,
+                            onPick = pickSuggestion,
                             modifier = Modifier.padding(top = 8.dp)
                         )
                     }
@@ -234,14 +245,14 @@ fun MapScreen(
                     SheetMode.Search -> ResultsSheet(
                         state = state,
                         bottomInset = insets.calculateBottomPadding(),
-                        onSelect = onSelectResult
+                        onSelect = selectResult
                     )
 
                     SheetMode.Place -> PlaceSheet(
                         state = state,
                         bottomInset = insets.calculateBottomPadding(),
                         onDismiss = onDismissPlace,
-                        onDirections = onDirections
+                        onDirections = startDirections
                     )
 
                     SheetMode.Directions -> DirectionsSheet(
@@ -291,7 +302,7 @@ fun MapScreen(
                         AnimatedVisibility(visible = state.suggestions.isNotEmpty() && focused) {
                             SuggestionList(
                                 suggestions = state.suggestions,
-                                onPick = onSuggestion,
+                                onPick = pickSuggestion,
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                             )
                         }
@@ -300,14 +311,14 @@ fun MapScreen(
                             SheetMode.Search -> ResultsSheet(
                                 state = state,
                                 bottomInset = 0.dp,
-                                onSelect = onSelectResult
+                                onSelect = selectResult
                             )
 
                             SheetMode.Place -> PlaceSheet(
                                 state = state,
                                 bottomInset = 0.dp,
                                 onDismiss = onDismissPlace,
-                                onDirections = onDirections
+                                onDirections = startDirections
                             )
 
                             SheetMode.Directions -> DirectionsSheet(

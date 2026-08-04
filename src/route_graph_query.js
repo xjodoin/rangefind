@@ -23,6 +23,12 @@ import {
 
 const EARTH_RADIUS_METERS = 6371008.7714;
 const E7_RAD = Math.PI / 180 / 1e7;
+// How far a snap candidate's direction may differ from the reported heading
+// before it starts to look like a U-turn: free up to the first, charged in
+// full past the second, ramped in between so a noisy compass does not flip
+// the decision.
+const HEADING_ALIGNED_DEG = 45;
+const HEADING_OPPOSED_DEG = 135;
 
 function routeError(code, message) {
   const error = new Error(message);
@@ -522,6 +528,20 @@ export async function openRouteGraph(options) {
     return best;
   }
 
+  // Bearing of the polyline segment a point projected onto, in degrees
+  // clockwise from north. Edge geometry is stored oriented along the edge's
+  // travel direction, so this is the direction a vehicle on that edge is
+  // actually moving — which is what tells the two directions of one road
+  // apart when they snap to the same spot.
+  function segmentBearing(points, segment, cosLat) {
+    const i = segment * 2;
+    if (i + 3 >= points.length) return null;
+    const dLat = points[i + 2] - points[i];
+    const dLon = (points[i + 3] - points[i + 1]) * cosLat;
+    if (dLat === 0 && dLon === 0) return null;
+    return (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
+  }
+
   const snapCache = new Map();
   const defaultMaxSnapMeters = Number(options.maxSnapMeters ?? 250);
 
@@ -600,7 +620,8 @@ export async function openRouteGraph(options) {
             distMeters: projected.distMeters,
             ratio: projected.totalMeters > 0 ? projected.alongMeters / projected.totalMeters : 0,
             snappedLatE7: projected.latE7,
-            snappedLonE7: projected.lonE7
+            snappedLonE7: projected.lonE7,
+            bearingDeg: segmentBearing(points, projected.segment, cosLat)
           });
         }
       }
@@ -1312,9 +1333,30 @@ export async function openRouteGraph(options) {
       const cell = fetched.cells.get(match.leaf);
       return cell ? liveAdjustedWeight(live, cell, match.edgeIndex, base) : base;
     };
+    // A reroute happens while the driver is moving, and the snap offers both
+    // directions of the road they are on — the two are metres apart, so both
+    // are near-equally good matches. Seeding the opposing edge at its bare
+    // cost lets the search turn the vehicle around for free and hand back a
+    // route that starts by driving back the way they just came. Charging the
+    // misaligned seeds makes going back cost what a U-turn costs, so it wins
+    // only when it genuinely saves more than that.
+    const headingPenaltyDs = Math.max(0, Math.round((params.headingPenaltySeconds ?? 60) * 10));
+    const fromHeading = Number(params.fromHeading);
+    const headingPenalty = (match) => {
+      if (headingPenaltyDs === 0) return 0;
+      if (!Number.isFinite(fromHeading) || !Number.isFinite(match.bearingDeg)) return 0;
+      // 0° means travelling the same way as the edge, 180° straight against it.
+      const off = Math.abs(((match.bearingDeg - fromHeading + 540) % 360) - 180);
+      if (off <= HEADING_ALIGNED_DEG) return 0;
+      if (off >= HEADING_OPPOSED_DEG) return headingPenaltyDs;
+      return Math.round(
+        headingPenaltyDs * (off - HEADING_ALIGNED_DEG) / (HEADING_OPPOSED_DEG - HEADING_ALIGNED_DEG)
+      );
+    };
+
     const forwardSeeds = snapFrom.matches.map(match => ({
       node: match.toNode,
-      weight: Math.round(effMatchWeight(match) * (1 - match.ratio)),
+      weight: Math.round(effMatchWeight(match) * (1 - match.ratio)) + headingPenalty(match),
       match
     })).filter(seed => Number.isFinite(seed.weight));
     const backwardSeeds = snapTo.matches.map(match => ({
@@ -1328,7 +1370,7 @@ export async function openRouteGraph(options) {
     for (const from of snapFrom.matches) {
       for (const to of snapTo.matches) {
         if (from.leaf === to.leaf && from.edgeIndex === to.edgeIndex && to.ratio >= from.ratio) {
-          const weight = Math.round(effMatchWeight(from) * (to.ratio - from.ratio));
+          const weight = Math.round(effMatchWeight(from) * (to.ratio - from.ratio)) + headingPenalty(from);
           if (Number.isFinite(weight) && (!sameEdge || weight < sameEdge.weight)) sameEdge = { weight, from, to };
         }
       }

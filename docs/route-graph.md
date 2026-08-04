@@ -128,6 +128,18 @@ const withAlternatives = await engine.route({
 });
 // withAlternatives.adjustedSeconds, withAlternatives.alternatives[],
 // each route's edges expose stable "leaf/edgeIndex" ids for feeds.
+
+// Rerouting a moving vehicle: both directions of the road it is on snap
+// equally well, so without a heading the search may seed the opposing edge
+// for free and return a route that starts by driving back the way the
+// driver came. `fromHeading` (degrees clockwise from north) charges the
+// misaligned candidates, so turning around wins only when it saves more
+// than it costs.
+const continuing = await engine.route({
+  from, to,
+  fromHeading: 92,            // direction of travel, not the bearing to `to`
+  headingPenaltySeconds: 60   // default; 0 disables the bias entirely
+});
 ```
 
 Browsers (and any fetch-capable host) use the built-in HTTP adapter — all

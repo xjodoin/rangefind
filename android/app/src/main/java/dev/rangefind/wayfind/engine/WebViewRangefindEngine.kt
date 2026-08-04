@@ -189,13 +189,19 @@ class WebViewRangefindEngine(context: Context) : RangefindEngine {
         return payload.optJSONObject("place")?.toPlace()
     }
 
-    override suspend fun route(from: LatLon, to: LatLon, alternatives: Int): RouteBundle {
+    override suspend fun route(
+        from: LatLon,
+        to: LatLon,
+        alternatives: Int,
+        fromHeading: Double?
+    ): RouteBundle {
         val payload = call(
             "route",
             JSONObject()
                 .put("from", JSONObject().put("lat", from.lat).put("lon", from.lon))
                 .put("to", JSONObject().put("lat", to.lat).put("lon", to.lon))
                 .put("alternatives", alternatives)
+                .apply { fromHeading?.let { put("fromHeading", it) } }
         )
         val primary = payload.optJSONObject("primary")?.toRoute()
             ?: throw RangefindException("No route found")

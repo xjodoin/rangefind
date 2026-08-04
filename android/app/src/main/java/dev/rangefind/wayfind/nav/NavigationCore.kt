@@ -242,6 +242,14 @@ class NavigationCore(private val context: Context) {
     }
 
     companion object {
+        /**
+         * Below this the reported bearing is noise, not a direction of travel:
+         * a stationary GPS heading wanders freely, and handing that to the
+         * router would price a U-turn against a driver who is free to pull
+         * away whichever way they like.
+         */
+        const val MIN_HEADING_SPEED_MPS = 2.5
+
         const val OFF_ROUTE_METERS = 45.0
         /** Distance that means "off route" even at a standstill. */
         const val OFF_ROUTE_HARD_METERS = 150.0

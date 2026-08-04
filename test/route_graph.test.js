@@ -813,3 +813,36 @@ test("itinerary orders stops and concatenates legs", async (t) => {
   const naiveTotal = naiveSeconds.reduce((a, b) => a + b, 0);
   assert.ok(trip.totalSeconds <= naiveTotal + 1e-9, "optimized order is no worse than input order");
 });
+
+test("a reported heading prices turning around at the origin", async (t) => {
+  const graph = syntheticGraph(14, 14, 73);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-heading-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 40, fanout: 4, topMaxCells: 5 });
+  const engine = await openRouteGraphDir(dir);
+  const nodeAt = (x, y) => y * 14 + x;
+  const point = (node) => ({ lat: graph.nodeLat[node] / 1e7, lon: graph.nodeLon[node] / 1e7 });
+
+  // Sit the driver between two nodes of one east-west street so both
+  // directions of it are near-equal snap candidates, and send them somewhere
+  // the search has to leave that street to reach.
+  const west = point(nodeAt(4, 6));
+  const east = point(nodeAt(5, 6));
+  const from = { lat: (west.lat + east.lat) / 2, lon: (west.lon + east.lon) / 2 };
+  const to = point(nodeAt(9, 10));
+
+  const plain = await engine.route({ from, to, geometry: false });
+  const eastward = await engine.route({ from, to, geometry: false, fromHeading: 90 });
+  const westward = await engine.route({ from, to, geometry: false, fromHeading: 270 });
+
+  // Driving with the edge the route already wanted costs nothing extra.
+  assert.equal(eastward.seconds, plain.seconds, "aligned heading leaves the route untouched");
+  // Driving against it has to pay for the U-turn it implies.
+  assert.ok(
+    westward.seconds > plain.seconds,
+    `opposed heading should cost more than ${plain.seconds}s, got ${westward.seconds}s`
+  );
+  // The charge is the configured one, not an arbitrary detour.
+  const free = await engine.route({ from, to, geometry: false, fromHeading: 270, headingPenaltySeconds: 0 });
+  assert.equal(free.seconds, plain.seconds, "a zero penalty restores the unbiased route");
+});

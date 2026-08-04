@@ -19,7 +19,18 @@ interface RangefindEngine {
     ): SearchOutcome
     suspend fun suggest(query: String, anchor: LatLon?): List<Suggestion>
     suspend fun reverse(point: LatLon): Place?
-    suspend fun route(from: LatLon, to: LatLon, alternatives: Int = 2): RouteBundle
+    /**
+     * [fromHeading] is the direction of travel in degrees, and belongs only to
+     * a vehicle that is actually moving: it stops a reroute from snapping to
+     * the opposite side of the road and routing the driver back the way they
+     * came. Null means no opinion, so both directions stay equally good.
+     */
+    suspend fun route(
+        from: LatLon,
+        to: LatLon,
+        alternatives: Int = 2,
+        fromHeading: Double? = null
+    ): RouteBundle
     suspend fun snap(point: LatLon): SnapPoint?
 }
 
