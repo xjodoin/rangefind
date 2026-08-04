@@ -2880,6 +2880,35 @@ function updateNavHud() {
   }
 }
 
+// The footer's height changes as its controls wrap (narrow screens) and as
+// the step list opens. Publishing it as a CSS variable keeps the road pill
+// and the map attribution clear of it without hardcoded offsets.
+function syncNavFooterHeight() {
+  const root = document.documentElement;
+  if (!navFooter || navFooter.hidden) {
+    root.style.removeProperty("--nav-footer-height");
+    root.style.removeProperty("--nav-chrome-height");
+    return;
+  }
+  // Space the footer occupies measured from the viewport bottom, so its own
+  // bottom offset (which differs per breakpoint) is included.
+  const height = Math.max(0, Math.round(window.innerHeight - navFooter.getBoundingClientRect().top));
+  root.style.setProperty("--nav-footer-height", `${height}px`);
+  // Attribution is lifted above the footer during navigation; measure from
+  // its actual top edge so the pill also clears MapLibre's control margins.
+  const attrib = document.querySelector(".maplibregl-ctrl-attrib");
+  const attribTop = attrib?.getBoundingClientRect().top;
+  const chrome = Number.isFinite(attribTop) && attribTop > 0
+    ? Math.round(window.innerHeight - attribTop)
+    : height;
+  root.style.setProperty("--nav-chrome-height", `${Math.max(height, chrome)}px`);
+}
+
+if (typeof ResizeObserver === "function" && navFooter) {
+  new ResizeObserver(syncNavFooterHeight).observe(navFooter);
+}
+window.addEventListener("resize", syncNavFooterHeight);
+
 // Animated camera ops depend on requestAnimationFrame, which hidden tabs
 // never receive — a backgrounded easeTo would freeze mid-flight. Jump there.
 function navCameraTo(options, duration) {
@@ -3098,6 +3127,7 @@ function startNavigation(source) {
   atlasEl.classList.add("nav-active");
   navHud.hidden = false;
   navFooter.hidden = false;
+  syncNavFooterHeight();
   navBanner.dataset.state = "";
   navStepsWrap.open = false;
   navSpeedGroup.hidden = source !== "sim";
@@ -3195,6 +3225,7 @@ function endNavigation() {
   navHud.hidden = true;
   navFooter.hidden = true;
   if (navRoadChip) navRoadChip.hidden = true;
+  syncNavFooterHeight();
   navBanner.dataset.state = "";
   navCameraTo({ pitch: 0, bearing: 0, padding: { top: 0, bottom: 0, left: 0, right: 0 } }, 700);
   updateStopMarkers();

@@ -1951,3 +1951,70 @@ a { color: inherit; }
 @media (max-width: 720px) {
   .nav-road-pill { bottom: 118px; font-size: 0.8rem; }
 }
+
+/* --- Navigation on phones -------------------------------------------
+   Driving one-handed on a 375px screen: the HUD must not sit under the
+   map controls, controls must be thumb-sized, OSM attribution has to stay
+   readable (it is a licence condition, not decoration), and nothing may
+   hide under the notch or home indicator. */
+.atlas.nav-active .maplibregl-ctrl-top-right {
+  /* The maneuver banner owns the top of the screen while navigating. */
+  display: none;
+}
+
+.nav-hud {
+  top: max(8px, env(safe-area-inset-top));
+}
+
+.atlas.nav-active .maplibregl-ctrl-bottom-right,
+.atlas.nav-active .maplibregl-ctrl-bottom-left {
+  /* Lift attribution clear of the nav footer. */
+  bottom: calc(var(--nav-footer-height, 140px) + 6px);
+  z-index: 22;
+}
+
+.nav-road-pill {
+  bottom: calc(var(--nav-chrome-height, 168px) + 10px);
+}
+
+@media (max-width: 720px) {
+  .nav-footer {
+    bottom: max(8px, env(safe-area-inset-bottom));
+  }
+
+  /* 44px minimum touch targets (Apple HIG / WCAG 2.5.5). */
+  .nav-footer .nav-controls button,
+  .nav-footer .nav-speeds button {
+    min-height: 44px;
+    padding-inline: 0.75rem;
+    font-size: 0.82rem;
+  }
+
+  .nav-footer .nav-speeds button {
+    min-width: 44px;
+  }
+
+  .nav-controls {
+    gap: 0.4rem;
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  /* Never let the speed pills be squeezed into ellipsis. */
+  .nav-footer .nav-speeds {
+    flex: 0 0 auto;
+  }
+
+  .nav-footer .nav-controls button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .nav-road-pill {
+    bottom: calc(var(--nav-chrome-height, 190px) + 8px);
+  }
+
+  /* Keep the maneuver banner from eating the map on short screens. */
+  .nav-hud { max-height: 40vh; }
+}
