@@ -31,6 +31,15 @@ import kotlin.math.max
 
 enum class SheetMode { Search, Place, Directions, Navigating }
 
+/** A candidate still reachable from where the car actually is. */
+data class NavAlternative(
+    val index: Int,
+    val remainingSeconds: Double,
+    val deltaSeconds: Double,
+    /** Where the car sits on this candidate, so its label can lead the driver. */
+    val alongMeters: Double
+)
+
 data class NavProgress(
     val stepIndex: Int,
     val stepName: String,
@@ -44,7 +53,9 @@ data class NavProgress(
     val bearing: Double,
     val speedMps: Double,
     val offRoute: Boolean,
-    val arrived: Boolean
+    val arrived: Boolean,
+    /** Alternates the driver could still take from here, with ETA deltas. */
+    val alternatives: List<NavAlternative> = emptyList()
 )
 
 data class UiState(
@@ -101,6 +112,9 @@ class MapsViewModel(
     private var locationJob: Job? = null
 
     private var tracker: RouteTracker? = null
+    /** One per candidate, so alternates can be matched against live position. */
+    private var trackers: List<RouteTracker> = emptyList()
+    private val altAlong = mutableMapOf<Int, Double>()
     private var lastAlong = 0.0
     private var announcedStep = -1
     private var announcedThreshold = Int.MAX_VALUE
@@ -291,6 +305,17 @@ class MapsViewModel(
     }
 
     fun selectRoute(index: Int) {
+        // Switching mid-drive re-tracks onto the new line from where the car
+        // already is, rather than restarting the trip at its origin.
+        if (_state.value.sheet == SheetMode.Navigating) {
+            val next = trackers.getOrNull(index) ?: return
+            tracker = next
+            lastAlong = altAlong[index] ?: 0.0
+            announcedStep = -1
+            announcedThreshold = Int.MAX_VALUE
+            offRouteStrikes = 0
+            _voice.tryEmit("Switching to the other route.")
+        }
         _state.update { it.copy(activeRouteIndex = index) }
     }
 
@@ -305,7 +330,9 @@ class MapsViewModel(
 
     fun startNavigation() {
         val route = _state.value.activeRoute ?: return
-        tracker = RouteTracker(route)
+        trackers = _state.value.allRoutes.map { RouteTracker(it) }
+        tracker = trackers.getOrNull(_state.value.activeRouteIndex) ?: RouteTracker(route)
+        altAlong.clear()
         lastAlong = 0.0
         announcedStep = -1
         announcedThreshold = Int.MAX_VALUE
@@ -318,6 +345,8 @@ class MapsViewModel(
 
     fun stopNavigation() {
         tracker = null
+        trackers = emptyList()
+        altAlong.clear()
         _state.update { it.copy(sheet = SheetMode.Directions, nav = null, rerouting = false) }
     }
 
@@ -352,7 +381,15 @@ class MapsViewModel(
         val heading = if (speed > 1.5 && location.hasBearing()) location.bearing.toDouble() else match.bearing
         val headingWrong = speed > 2.0 && absBearingDelta(match.bearing, heading) > 110.0
 
-        val off = match.crossTrackMeters > OFF_ROUTE_METERS || headingWrong
+        // A trip that starts in a pedestrian zone or a car park begins tens of
+        // metres from the nearest routable road, so the very first fix looks
+        // "off route" — and rerouting there throws away the alternates before
+        // the driver has moved an inch. Standing still cannot be off-route;
+        // only a wild distance overrides that.
+        val moving = speed > 1.5
+        val off = (match.crossTrackMeters > OFF_ROUTE_METERS && moving) ||
+            match.crossTrackMeters > OFF_ROUTE_HARD_METERS ||
+            headingWrong
         offRouteStrikes = if (off) offRouteStrikes + 1 else 0
 
         lastAlong = max(lastAlong, match.distanceAlong)
@@ -369,6 +406,8 @@ class MapsViewModel(
         val stepIndex = activeTracker.stepIndexAt(lastAlong)
         val toManeuver = activeTracker.metersToNextManeuver(lastAlong)
         val arrived = geometricRemaining < ARRIVAL_METERS
+        val remainingSeconds = route.seconds * fraction
+        val alternatives = liveAlternatives(point, remainingSeconds, match.crossTrackMeters)
 
         _state.update {
             it.copy(
@@ -378,14 +417,15 @@ class MapsViewModel(
                     nextStepName = route.steps.getOrNull(stepIndex + 1)?.name.orEmpty(),
                     metersToManeuver = toManeuver ?: remainingMeters,
                     remainingMeters = remainingMeters,
-                    remainingSeconds = route.seconds * fraction,
+                    remainingSeconds = remainingSeconds,
                     traveled = traveled,
                     ahead = ahead,
                     position = match.snapped,
                     bearing = heading,
                     speedMps = speed,
                     offRoute = offRouteStrikes >= OFF_ROUTE_STRIKES,
-                    arrived = arrived
+                    arrived = arrived,
+                    alternatives = alternatives
                 )
             )
         }
@@ -402,6 +442,39 @@ class MapsViewModel(
         }
 
         announce(stepIndex, toManeuver, route.steps.getOrNull(stepIndex + 1)?.name.orEmpty())
+    }
+
+    /**
+     * An alternate stays on screen only while the car could still take it.
+     * Once the driver commits to a branch the other line stops being an option,
+     * and continuing to advertise its ETA would be a lie.
+     */
+    private fun liveAlternatives(
+        point: LatLon,
+        activeRemainingSeconds: Double,
+        activeCrossTrackMeters: Double
+    ): List<NavAlternative> {
+        // Compare against the active line's own offset: if the car is 80 m from
+        // the route because it is inside a pedestrian zone, it is equally 80 m
+        // from the alternate, and that alternate is still a real option.
+        val limit = max(ALT_LIVE_METERS, activeCrossTrackMeters + 25.0)
+        val routes = _state.value.allRoutes
+        val activeIndex = _state.value.activeRouteIndex
+        return trackers.mapIndexedNotNull { index, candidate ->
+            if (index == activeIndex || !candidate.isUsable) return@mapIndexedNotNull null
+            val match = candidate.match(point, altAlong[index] ?: 0.0)
+                ?: return@mapIndexedNotNull null
+            if (match.crossTrackMeters > limit) {
+                altAlong.remove(index)
+                return@mapIndexedNotNull null
+            }
+            val along = max(altAlong[index] ?: 0.0, match.distanceAlong)
+            altAlong[index] = along
+            val total = candidate.totalMeters
+            val fraction = if (total <= 0) 0.0 else (1 - along / total).coerceIn(0.0, 1.0)
+            val remaining = (routes.getOrNull(index)?.seconds ?: 0.0) * fraction
+            NavAlternative(index, remaining, remaining - activeRemainingSeconds, along)
+        }
     }
 
     private fun announce(stepIndex: Int, metersToManeuver: Double?, nextName: String) {
@@ -425,7 +498,9 @@ class MapsViewModel(
         viewModelScope.launch {
             runCatching { engine.route(from, destination.point, alternatives = 0) }
                 .onSuccess { bundle ->
-                    tracker = RouteTracker(bundle.primary)
+                    trackers = listOf(RouteTracker(bundle.primary))
+                    tracker = trackers.first()
+                    altAlong.clear()
                     lastAlong = 0.0
                     offRouteStrikes = 0
                     announcedStep = -1
@@ -440,8 +515,12 @@ class MapsViewModel(
         private const val OUT_OF_COVERAGE =
             "This place is outside the area covered by the route map."
         private const val OFF_ROUTE_METERS = 45.0
+        /** Distance that means "off route" even at a standstill. */
+        private const val OFF_ROUTE_HARD_METERS = 150.0
         private const val OFF_ROUTE_STRIKES = 3
         private const val ARRIVAL_METERS = 25.0
+        /** How far off an alternate the car can be before it stops being one. */
+        private const val ALT_LIVE_METERS = 60.0
         private val ANNOUNCE_THRESHOLDS = listOf(60, 200, 400)
 
         fun factory(

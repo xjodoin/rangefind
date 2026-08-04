@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AltRoute
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.Straight
@@ -50,6 +51,7 @@ import dev.rangefind.wayfind.ui.formatArrivalClock
 import dev.rangefind.wayfind.ui.formatBytes
 import dev.rangefind.wayfind.ui.formatDistance
 import dev.rangefind.wayfind.ui.formatDuration
+import dev.rangefind.wayfind.ui.formatEtaDelta
 import dev.rangefind.wayfind.ui.formatManeuverDistance
 import dev.rangefind.wayfind.ui.formatSpeed
 import dev.rangefind.wayfind.ui.theme.LocalMapPalette
@@ -248,11 +250,13 @@ fun NavigationOverlay(
     state: UiState,
     topInset: Dp,
     bottomInset: Dp,
+    onSelectRoute: (Int) -> Unit,
     onStop: () -> Unit
 ) {
     val nav = state.nav
     val route = state.activeRoute
     val palette = LocalMapPalette.current
+    val offers = nav?.alternatives.orEmpty()
 
     Box(Modifier.fillMaxSize()) {
 
@@ -322,7 +326,10 @@ fun NavigationOverlay(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
                     .align(Alignment.BottomStart)
-                    .padding(start = 16.dp, bottom = bottomInset + 122.dp)
+                    .padding(
+                        start = 16.dp,
+                        bottom = bottomInset + 122.dp + if (offers.isNotEmpty()) 58.dp else 0.dp
+                    )
             ) {
                 Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surface, shadowElevation = 4.dp) {
                     Column(
@@ -379,6 +386,48 @@ fun NavigationOverlay(
                     trackColor = MaterialTheme.colorScheme.surfaceVariant,
                     modifier = Modifier.fillMaxWidth().height(3.dp)
                 )
+                // Alternates the car could still take. At driving zoom their
+                // map bubbles are usually off-screen, so the offer belongs
+                // here — one tap re-tracks onto the other line.
+                if (offers.isNotEmpty()) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(start = 22.dp, end = 16.dp, top = 12.dp)
+                    ) {
+                        offers.forEach { offer ->
+                            Surface(
+                                onClick = { onSelectRoute(offer.index) },
+                                shape = RoundedCornerShape(12.dp),
+                                color = if (offer.deltaSeconds < -30)
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                else MaterialTheme.colorScheme.surfaceVariant
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Filled.AltRoute,
+                                        contentDescription = null,
+                                        tint = if (offer.deltaSeconds < -30)
+                                            MaterialTheme.colorScheme.onSecondaryContainer
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        formatEtaDelta(offer.deltaSeconds),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (offer.deltaSeconds < -30)
+                                            MaterialTheme.colorScheme.onSecondaryContainer
+                                        else MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier

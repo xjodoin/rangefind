@@ -218,6 +218,7 @@ fun MapScreen(
                 state = state,
                 topInset = insets.calculateTopPadding(),
                 bottomInset = insets.calculateBottomPadding(),
+                onSelectRoute = onSelectRoute,
                 onStop = onStopNavigation
             )
         }

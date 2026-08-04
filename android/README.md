@@ -23,9 +23,13 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   bubble or a grey alternate selects it — the camera deliberately holds still
   while you compare. Plus maneuver steps, ETA and arrival clock, and a fetch
   receipt showing how many range requests the route cost.
-- **Turn-by-turn navigation**: pitched follow camera with speed-banded zoom,
-  maneuver banner, traveled-route dimming, current-road pill, speed readout,
-  spoken guidance, and automatic rerouting when you leave the line.
+- **Turn-by-turn navigation**: a chevron puck aimed where the car is actually
+  heading, a pitched follow camera with speed-banded zoom, maneuver banner,
+  traveled-route dimming, current-road pill, speed readout, spoken guidance,
+  and automatic rerouting when you leave the line. Alternates you could still
+  take stay on the map with their ETA delta, and one tap re-tracks onto the
+  other line from where the car already is — they disappear once you commit to
+  a branch, because by then they are no longer an option.
 - **Day and night** basemaps, edge-to-edge layout, and full attribution.
 
 ## Architecture

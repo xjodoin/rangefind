@@ -19,6 +19,7 @@ import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.RouteJunction
 import dev.rangefind.wayfind.ui.SheetMode
 import dev.rangefind.wayfind.ui.formatDuration
+import dev.rangefind.wayfind.ui.formatEtaDelta
 import dev.rangefind.wayfind.ui.UiState
 import dev.rangefind.wayfind.ui.theme.MapPalette
 import org.maplibre.android.MapLibre
@@ -55,9 +56,12 @@ private const val SRC_STOP = "rf-src-stop"
 private const val SRC_CROSSING = "rf-src-crossing"
 private const val SRC_PUCK = "rf-src-puck"
 private const val SRC_ORIGIN = "rf-src-origin"
+private const val SRC_NAV = "rf-src-nav"
 
 private const val LYR_RESULTS = "rf-lyr-results"
 private const val LYR_ALT = "rf-lyr-alt"
+private const val LYR_NAV = "rf-lyr-nav"
+private const val IMG_NAV = "rf-nav-arrow"
 
 /** Up to three candidates: the fastest plus two alternates. */
 private val SRC_LABEL = listOf("rf-src-label-0", "rf-src-label-1", "rf-src-label-2")
@@ -344,13 +348,19 @@ private class MapHolder {
 
         // Alternatives sit under the active line so the choice reads clearly,
         // and each carries its index so tapping one selects it.
-        val altFeatures = if (navigating) emptyList() else
-            state.allRoutes.mapIndexedNotNull { index, candidate ->
-                if (index == state.activeRouteIndex || candidate.geometry.size < 2) null
-                else Feature.fromGeometry(
-                    LineString.fromLngLats(candidate.geometry.map { Point.fromLngLat(it.lon, it.lat) })
-                ).apply { addNumberProperty("route", index) }
-            }
+        // While driving, only the alternates the car could still take stay on
+        // screen; the rest have been committed away from.
+        val shown: Set<Int> = when {
+            navigating -> state.nav?.alternatives?.map { it.index }?.toSet() ?: emptySet()
+            state.routes != null -> state.allRoutes.indices.filter { it != state.activeRouteIndex }.toSet()
+            else -> emptySet()
+        }
+        val altFeatures = state.allRoutes.mapIndexedNotNull { index, candidate ->
+            if (index !in shown || candidate.geometry.size < 2) null
+            else Feature.fromGeometry(
+                LineString.fromLngLats(candidate.geometry.map { Point.fromLngLat(it.lon, it.lat) })
+            ).apply { addNumberProperty("route", index) }
+        }
         style.setSource(SRC_ALT, FeatureCollection.fromFeatures(altFeatures))
 
         if (navigating && state.nav != null) {
@@ -407,27 +417,35 @@ private class MapHolder {
             )
         )
 
-        val candidates = if (navigating) emptyList() else state.allRoutes
+        val deltas = state.nav?.alternatives?.associateBy { it.index } ?: emptyMap()
         SRC_LABEL.indices.forEach { i ->
-            val candidate = candidates.getOrNull(i)
-            if (candidate == null || candidate.geometry.size < 2) {
+            val candidate = state.allRoutes.getOrNull(i)
+            // Driving: label the alternates only — the active route's ETA is
+            // already the largest number on screen, in the footer.
+            val visible = if (navigating) i in shown else state.routes != null
+            if (candidate == null || !visible || candidate.geometry.size < 2) {
                 style.setSource(SRC_LABEL[i], FeatureCollection.fromFeatures(emptyList()))
                 return@forEach
             }
-            val isActive = i == state.activeRouteIndex
+            val isActive = !navigating && i == state.activeRouteIndex
             style.addImage(
                 IMG_LABEL[i],
                 MapIcons.durationLabel(
-                    text = formatDuration(candidate.seconds),
+                    text = if (navigating) formatEtaDelta(deltas[i]?.deltaSeconds ?: 0.0)
+                    else formatDuration(candidate.seconds),
                     fill = if (isActive) palette.routeLine.toArgb() else 0xFFFFFFFF.toInt(),
                     textColor = if (isActive) 0xFFFAF9F6.toInt() else INK,
                     outline = if (isActive) palette.routeCasing.toArgb() else 0x1F000000,
                     density = density
                 )
             )
-            // Stagger the anchors so three bubbles on a shared corridor do not
-            // stack on top of each other.
-            val fraction = 0.32 + 0.17 * i
+            // Parked: stagger the anchors so three bubbles on a shared corridor
+            // do not stack. Driving: put the bubble up the road ahead of the
+            // car, where the driver is looking.
+            val fraction = deltas[i]?.let { alt ->
+                val total = candidate.distanceMeters
+                if (total <= 0) 0.5 else ((alt.alongMeters + 350.0) / total).coerceIn(0.05, 0.95)
+            } ?: (0.32 + 0.17 * i)
             val at = ((candidate.geometry.size - 1) * fraction).toInt()
                 .coerceIn(0, candidate.geometry.size - 1)
             val anchor = candidate.geometry[at]
@@ -442,13 +460,27 @@ private class MapHolder {
             )
         }
 
-        val puck = if (navigating) state.nav?.position else state.userLocation
+        // Parked: a plain dot. Driving: a chevron aimed down the road.
+        val browsing = if (navigating) null else state.userLocation
         style.setSource(
             SRC_PUCK,
             FeatureCollection.fromFeatures(
-                listOfNotNull(puck?.let { Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)) })
+                listOfNotNull(browsing?.let { Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)) })
             )
         )
+        val driving = if (navigating) state.nav else null
+        style.setSource(
+            SRC_NAV,
+            FeatureCollection.fromFeatures(
+                listOfNotNull(
+                    driving?.let { Feature.fromGeometry(Point.fromLngLat(it.position.lon, it.position.lat)) }
+                )
+            )
+        )
+        if (driving != null) {
+            style.getLayerAs<SymbolLayer>(LYR_NAV)
+                ?.setProperties(PropertyFactory.iconRotate(driving.bearing.toFloat()))
+        }
     }
 }
 
@@ -469,7 +501,7 @@ private fun Style.setLine(id: String, lines: List<List<LatLon>>) {
 private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     (listOf(
         SRC_ALT, SRC_ROUTE, SRC_TRAVELED, SRC_RESULTS, SRC_DESTINATION,
-        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN
+        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN, SRC_NAV
     ) + SRC_LABEL).forEach { id ->
         if (style.getSource(id) == null) {
             style.addSource(GeoJsonSource(id, FeatureCollection.fromFeatures(emptyList())))
@@ -477,6 +509,7 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     }
 
     style.addImage(MapIcons.DESTINATION, MapIcons.pin(palette.destination.toArgb(), INK, density))
+    style.addImage(IMG_NAV, MapIcons.navArrow(palette.puck.toArgb(), 0xFFFFFFFF.toInt(), density))
     style.addImage(MapIcons.SIGNAL, MapIcons.signal(density))
     style.addImage(MapIcons.STOP, MapIcons.stop(density))
     style.addImage(MapIcons.CROSSING, MapIcons.crossing(density))
@@ -563,6 +596,19 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
             PropertyFactory.circleColor(palette.puck.toArgb()),
             PropertyFactory.circleStrokeWidth(3.5f),
             PropertyFactory.circleStrokeColor(0xFFFFFFFF.toInt())
+        )
+    )
+
+    // While driving the puck becomes a chevron pointing where the car is
+    // heading. Rotation aligns to the map, so it stays truthful even if the
+    // driver spins the view away from the direction of travel.
+    style.addLayer(
+        SymbolLayer(LYR_NAV, SRC_NAV).withProperties(
+            PropertyFactory.iconImage(IMG_NAV),
+            PropertyFactory.iconAllowOverlap(true),
+            PropertyFactory.iconIgnorePlacement(true),
+            PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_MAP),
+            PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_MAP)
         )
     )
 }

@@ -65,6 +65,46 @@ object MapIcons {
     }
 
     /**
+     * The navigating puck: a chevron that points where the car is actually
+     * heading. Drawn pointing north and rotated by the layer, so it stays
+     * correct even when the driver spins the map away from the heading.
+     */
+    fun navArrow(fill: Int, outline: Int, density: Float): Bitmap {
+        val size = (46 * density).toInt().coerceAtLeast(28)
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        val cx = size / 2f
+        val cy = size / 2f
+        val r = size * 0.40f
+
+        // Chevron: nose at the top, notched tail, so direction is unambiguous
+        // at a glance even at small sizes.
+        val arrow = Path().apply {
+            moveTo(cx, cy - r)
+            lineTo(cx + r * 0.78f, cy + r * 0.82f)
+            lineTo(cx, cy + r * 0.36f)
+            lineTo(cx - r * 0.78f, cy + r * 0.82f)
+            close()
+        }
+
+        paint.color = 0x30000000
+        canvas.drawCircle(cx, cy + density, r * 1.02f, paint)
+
+        paint.color = outline
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 5f * density
+        paint.strokeJoin = Paint.Join.ROUND
+        canvas.drawPath(arrow, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.color = fill
+        canvas.drawPath(arrow, paint)
+        return bitmap
+    }
+
+    /**
      * Duration bubble placed on a route in the overview, the way a paper map
      * would letter each option. Drawn rather than typeset as a text layer so it
      * never depends on which glyph stacks the basemap style happens to ship.

@@ -38,6 +38,16 @@ fun formatDuration(seconds: Double): String {
     }
 }
 
+/** Relative ETA for an alternate route, the way a driver compares them. */
+fun formatEtaDelta(seconds: Double): String {
+    val minutes = (seconds / 60).roundToInt()
+    return when {
+        minutes >= 1 -> "+$minutes min"
+        minutes <= -1 -> "$minutes min"
+        else -> "same ETA"
+    }
+}
+
 fun formatArrivalClock(seconds: Double): String {
     val calendar = Calendar.getInstance()
     calendar.add(Calendar.SECOND, seconds.roundToInt())
