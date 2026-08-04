@@ -1,9 +1,14 @@
 package dev.rangefind.wayfind.region
 
 import android.content.Context
+import androidx.annotation.StringRes
+import dev.rangefind.wayfind.R
 
-/** A route index the user can keep on the device. */
-data class RegionSpec(val id: String, val label: String, val note: String)
+/**
+ * A route index the user can keep on the device. The label is a place name and
+ * stays as authored; the note is prose, so it travels as a string resource.
+ */
+data class RegionSpec(val id: String, val label: String, @StringRes val noteRes: Int)
 
 enum class RegionStatus { Absent, Downloading, Ready, Failed }
 
@@ -26,8 +31,8 @@ data class RegionEntry(
  * exactly what they are about to keep.
  */
 val REGION_CATALOG = listOf(
-    RegionSpec("luxembourg", "Luxembourg", "Small test extract"),
-    RegionSpec("quebec", "Québec", "Full province")
+    RegionSpec("luxembourg", "Luxembourg", R.string.region_note_luxembourg),
+    RegionSpec("quebec", "Québec", R.string.region_note_quebec)
 )
 
 /**

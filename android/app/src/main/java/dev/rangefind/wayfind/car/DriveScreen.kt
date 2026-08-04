@@ -83,7 +83,10 @@ class DriveScreen(
             })
             .addDestination(
                 Destination.Builder()
-                    .setName(state.destination?.name ?: "Destination")
+                    .setName(
+                        state.destination?.name
+                            ?: carContext.getString(R.string.car_destination)
+                    )
                     .build(),
                 estimate
             )
@@ -92,7 +95,10 @@ class DriveScreen(
     }
 
     private fun currentStep(state: CarState): Step = Step.Builder()
-        .setCue(state.nextStepName.ifBlank { state.stepName }.ifBlank { "Continue" })
+        .setCue(
+            state.nextStepName.ifBlank { state.stepName }
+                .ifBlank { carContext.getString(R.string.nav_continue) }
+        )
         .setManeuver(Maneuver.Builder(maneuverType(state.turnDelta)).build())
         .build()
 
@@ -113,7 +119,11 @@ class DriveScreen(
         val strip = ActionStrip.Builder()
         strip.addAction(
             Action.Builder()
-                .setTitle(if (state.navigating) "End" else "Search")
+                .setTitle(
+                    carContext.getString(
+                        if (state.navigating) R.string.car_end else R.string.car_search
+                    )
+                )
                 .setIcon(
                     CarIcon.Builder(
                         IconCompat.createWithResource(carContext, R.drawable.ic_car_action)

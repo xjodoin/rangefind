@@ -49,7 +49,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -57,6 +60,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.EngineInfo
 import dev.rangefind.wayfind.engine.Place
 import dev.rangefind.wayfind.engine.Suggestion
@@ -100,7 +104,7 @@ fun SearchField(
             Box(Modifier.weight(1f)) {
                 if (query.isEmpty()) {
                     Text(
-                        "Search places, addresses…",
+                        stringResource(R.string.search_hint),
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -129,7 +133,7 @@ fun SearchField(
             } else if (query.isNotEmpty()) {
                 Icon(
                     Icons.Filled.Close,
-                    contentDescription = "Clear",
+                    contentDescription = stringResource(R.string.action_clear),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier
                         .size(22.dp)
@@ -220,7 +224,11 @@ fun ResultsSheet(
 
         if (state.results.isNotEmpty()) {
             Text(
-                "${state.results.size} places",
+                pluralStringResource(
+                    R.plurals.search_result_count,
+                    state.results.size,
+                    state.results.size
+                ),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 20.dp, bottom = 6.dp)
@@ -242,6 +250,7 @@ fun PlaceSheet(
     onDirections: () -> Unit
 ) {
     val place = state.selected ?: return
+    val context = LocalContext.current
     val bounds = state.info?.routeBounds
     val outsideCoverage = bounds != null && !bounds.contains(place.point)
     val routingReady = state.info?.routing == true && !outsideCoverage
@@ -267,7 +276,7 @@ fun PlaceSheet(
                     }
                     place.distanceMeters?.let {
                         Text(
-                            formatDistance(it),
+                            formatDistance(context, it),
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -284,7 +293,7 @@ fun PlaceSheet(
             }
             Icon(
                 Icons.Filled.Close,
-                contentDescription = "Close",
+                contentDescription = stringResource(R.string.action_close),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier
                     .size(24.dp)
@@ -307,11 +316,13 @@ fun PlaceSheet(
             Icon(Icons.Filled.Directions, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(10.dp))
             Text(
-                when {
-                    routingReady -> "Directions"
-                    outsideCoverage -> "Outside route coverage"
-                    else -> "Routing unavailable"
-                },
+                stringResource(
+                    when {
+                        routingReady -> R.string.place_directions
+                        outsideCoverage -> R.string.place_outside_coverage
+                        else -> R.string.place_routing_unavailable
+                    }
+                ),
                 style = MaterialTheme.typography.labelLarge
             )
         }
@@ -320,7 +331,7 @@ fun PlaceSheet(
         // here rather than letting the user press a button that cannot work.
         val note = when {
             routingReady -> null
-            outsideCoverage -> "The route map covers a limited region, and this place falls outside it."
+            outsideCoverage -> stringResource(R.string.place_outside_coverage_note)
             else -> state.info?.routingError
         }
         if (note != null) {
@@ -337,6 +348,7 @@ fun PlaceSheet(
 
 @Composable
 fun PlaceRow(place: Place, onClick: () -> Unit) {
+    val context = LocalContext.current
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -383,7 +395,7 @@ fun PlaceRow(place: Place, onClick: () -> Unit) {
         place.distanceMeters?.let {
             Spacer(Modifier.width(10.dp))
             Text(
-                formatDistance(it),
+                formatDistance(context, it),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -408,6 +420,8 @@ fun CategoryChip(type: String) {
 
 @Composable
 fun AttributionChip(info: EngineInfo?, modifier: Modifier = Modifier) {
+    val source = info?.attribution ?: stringResource(R.string.attribution_openstreetmap)
+    val carto = stringResource(R.string.attribution_carto)
     Surface(
         shape = RoundedCornerShape(6.dp),
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
@@ -416,9 +430,9 @@ fun AttributionChip(info: EngineInfo?, modifier: Modifier = Modifier) {
         Text(
             buildAnnotatedString {
                 withStyle(SpanStyle(fontWeight = FontWeight.Medium)) {
-                    append(info?.attribution ?: "© OpenStreetMap contributors")
+                    append(source)
                 }
-                append(" · © CARTO")
+                append(carto)
             },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,

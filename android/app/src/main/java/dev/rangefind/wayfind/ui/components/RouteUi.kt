@@ -43,10 +43,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.nav.bearingDegrees
 import dev.rangefind.wayfind.nav.bearingDelta
@@ -69,6 +73,7 @@ fun DirectionsSheet(
     onStart: () -> Unit,
     onClose: () -> Unit
 ) {
+    val context = LocalContext.current
     SheetSurface(bottomInset = bottomInset) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -78,7 +83,11 @@ fun DirectionsSheet(
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    "To ${state.selected?.name ?: "destination"}",
+                    stringResource(
+                        R.string.directions_to,
+                        state.selected?.name
+                            ?: stringResource(R.string.directions_destination_fallback)
+                    ),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
@@ -87,7 +96,7 @@ fun DirectionsSheet(
             }
             Icon(
                 Icons.Filled.Close,
-                contentDescription = "Close",
+                contentDescription = stringResource(R.string.action_close),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier
                     .size(22.dp)
@@ -104,7 +113,10 @@ fun DirectionsSheet(
                 ) {
                     CircularProgressIndicator(strokeWidth = 2.5.dp, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(14.dp))
-                    Text("Fetching byte ranges…", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        stringResource(R.string.directions_fetching),
+                        style = MaterialTheme.typography.bodyLarge
+                    )
                 }
                 Spacer(Modifier.height(18.dp))
             }
@@ -129,13 +141,17 @@ fun DirectionsSheet(
                         modifier = Modifier.padding(horizontal = 20.dp)
                     ) {
                         Text(
-                            formatDuration(route.seconds),
+                            formatDuration(context, route.seconds),
                             style = MaterialTheme.typography.displaySmall,
                             color = MaterialTheme.colorScheme.primary
                         )
                         Spacer(Modifier.width(12.dp))
                         Text(
-                            "${formatDistance(route.distanceMeters)} · arrive ${formatArrivalClock(route.seconds)}",
+                            stringResource(
+                                R.string.directions_summary,
+                                formatDistance(context, route.distanceMeters),
+                                formatArrivalClock(context, route.seconds)
+                            ),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(bottom = 6.dp)
@@ -150,8 +166,12 @@ fun DirectionsSheet(
                         ) {
                             state.allRoutes.forEachIndexed { index, candidate ->
                                 RouteChip(
-                                    label = if (index == 0) "Fastest" else "Alt ${index}",
-                                    detail = formatDuration(candidate.seconds),
+                                    label = if (index == 0) {
+                                        stringResource(R.string.route_option_fastest)
+                                    } else {
+                                        stringResource(R.string.route_option_alternative, index)
+                                    },
+                                    detail = formatDuration(context, candidate.seconds),
                                     selected = index == state.activeRouteIndex,
                                     onClick = { onSelectRoute(index) }
                                 )
@@ -171,7 +191,10 @@ fun DirectionsSheet(
                     ) {
                         Icon(Icons.Filled.Navigation, contentDescription = null, modifier = Modifier.size(20.dp))
                         Spacer(Modifier.width(10.dp))
-                        Text("Start", style = MaterialTheme.typography.labelLarge)
+                        Text(
+                            stringResource(R.string.directions_start),
+                            style = MaterialTheme.typography.labelLarge
+                        )
                     }
 
                     Spacer(Modifier.height(12.dp))
@@ -179,7 +202,12 @@ fun DirectionsSheet(
 
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "${route.httpRequests} range requests · ${formatBytes(route.bytesFetched)} fetched",
+                        pluralStringResource(
+                            R.plurals.directions_range_requests,
+                            route.httpRequests,
+                            route.httpRequests,
+                            formatBytes(context, route.bytesFetched)
+                        ),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline,
                         modifier = Modifier.padding(horizontal = 20.dp)
@@ -192,6 +220,7 @@ fun DirectionsSheet(
 
 @Composable
 private fun StepsPreview(route: Route) {
+    val context = LocalContext.current
     LazyColumn(Modifier.heightIn(max = 132.dp)) {
         itemsIndexed(route.steps.take(12)) { index, step ->
             Row(
@@ -208,14 +237,14 @@ private fun StepsPreview(route: Route) {
                 )
                 Spacer(Modifier.width(14.dp))
                 Text(
-                    step.name.ifBlank { "Unnamed road" },
+                    step.name.ifBlank { stringResource(R.string.directions_unnamed_road) },
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    formatDistance(step.meters),
+                    formatDistance(context, step.meters),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -257,10 +286,13 @@ fun NavigationOverlay(
     onSelectRoute: (Int) -> Unit,
     onStop: () -> Unit
 ) {
+    val context = LocalContext.current
     val nav = state.nav
     val route = state.activeRoute
     val palette = LocalMapPalette.current
     val offers = nav?.alternatives.orEmpty()
+    val placeholder = stringResource(R.string.format_placeholder)
+    val continueLabel = stringResource(R.string.nav_continue)
 
     Box(Modifier.fillMaxSize()) {
 
@@ -290,12 +322,14 @@ fun NavigationOverlay(
                     Spacer(Modifier.width(16.dp))
                     Column(Modifier.weight(1f)) {
                         Text(
-                            nav?.let { formatManeuverDistance(it.metersToManeuver) } ?: "—",
+                            nav?.let { formatManeuverDistance(context, it.metersToManeuver) }
+                                ?: placeholder,
                             style = MaterialTheme.typography.headlineMedium,
                             color = MaterialTheme.colorScheme.onPrimary
                         )
                         Text(
-                            nav?.nextStepName?.ifBlank { nav.stepName }?.ifBlank { "Continue" } ?: "Continue",
+                            nav?.nextStepName?.ifBlank { nav.stepName }?.ifBlank { continueLabel }
+                                ?: continueLabel,
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.86f),
                             maxLines = 1,
@@ -314,7 +348,7 @@ fun NavigationOverlay(
                         )
                         Spacer(Modifier.width(10.dp))
                         Text(
-                            "Rerouting",
+                            stringResource(R.string.nav_rerouting_label),
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onPrimary
                         )
@@ -357,7 +391,7 @@ fun NavigationOverlay(
                             else MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            "km/h",
+                            stringResource(R.string.nav_speed_unit),
                             style = MaterialTheme.typography.labelSmall,
                             color = if (speeding) MaterialTheme.colorScheme.onErrorContainer
                             else MaterialTheme.colorScheme.onSurfaceVariant
@@ -433,7 +467,7 @@ fun NavigationOverlay(
                                     )
                                     Spacer(Modifier.width(8.dp))
                                     Text(
-                                        formatEtaDelta(offer.deltaSeconds),
+                                        formatEtaDelta(context, offer.deltaSeconds),
                                         style = MaterialTheme.typography.labelLarge,
                                         color = if (offer.deltaSeconds < -30)
                                             MaterialTheme.colorScheme.onSecondaryContainer
@@ -454,13 +488,18 @@ fun NavigationOverlay(
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            nav?.let { formatDuration(it.remainingSeconds) } ?: "—",
+                            nav?.let { formatDuration(context, it.remainingSeconds) }
+                                ?: placeholder,
                             style = MaterialTheme.typography.headlineSmall,
                             color = MaterialTheme.colorScheme.primary
                         )
                         Text(
                             nav?.let {
-                                "${formatDistance(it.remainingMeters)} · ${formatArrivalClock(it.remainingSeconds)}"
+                                context.getString(
+                                    R.string.nav_trip_summary,
+                                    formatDistance(context, it.remainingMeters),
+                                    formatArrivalClock(context, it.remainingSeconds)
+                                )
                             } ?: "",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -475,7 +514,7 @@ fun NavigationOverlay(
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
                                 Icons.Filled.Close,
-                                contentDescription = "End navigation",
+                                contentDescription = stringResource(R.string.action_end_navigation),
                                 tint = MaterialTheme.colorScheme.onErrorContainer
                             )
                         }

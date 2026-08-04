@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- app_name is a product name and is intentionally not translated. -->
+    <string name="app_tagline">Des cartes sur de simples plages d\'octets</string>
+
+    <!-- Démarrage / erreurs fatales -->
+    <string name="startup_failed_title">Démarrage impossible</string>
+    <string name="engine_failed_to_start">Le moteur n\'a pas pu démarrer</string>
+
+    <!-- Descriptions partagées -->
+    <string name="action_close">Fermer</string>
+    <string name="action_clear">Effacer</string>
+    <string name="action_recenter">Recentrer</string>
+    <string name="action_end_navigation">Arrêter la navigation</string>
+
+    <!-- Recherche -->
+    <string name="search_hint">Rechercher un lieu ou une adresse</string>
+    <plurals name="search_result_count">
+        <item quantity="one">%1$d lieu</item>
+        <item quantity="other">%1$d lieux</item>
+    </plurals>
+    <string name="search_no_matches">Aucun résultat pour « %1$s »</string>
+    <string name="search_failed">Échec de la recherche</string>
+
+    <!-- Fiche du lieu -->
+    <string name="place_directions">Itinéraire</string>
+    <string name="place_outside_coverage">Hors de la zone couverte</string>
+    <string name="place_routing_unavailable">Itinéraires indisponibles</string>
+    <string name="place_outside_coverage_note">La carte routière ne couvre qu\'une région limitée, et ce lieu se trouve en dehors.</string>
+    <string name="place_dropped_pin">Point déposé</string>
+
+    <!-- Attribution cartographique -->
+    <string name="attribution_openstreetmap">© les contributeurs OpenStreetMap</string>
+    <string name="attribution_carto">" · © CARTO"</string>
+
+    <!-- Feuille d'itinéraire -->
+    <string name="directions_to">Vers %1$s</string>
+    <string name="directions_destination_fallback">la destination</string>
+    <string name="directions_fetching">Récupération des plages d\'octets…</string>
+    <string name="directions_summary">%1$s · arrivée à %2$s</string>
+    <string name="directions_start">Démarrer</string>
+    <string name="directions_unnamed_road">Route sans nom</string>
+    <string name="route_option_fastest">Le plus rapide</string>
+    <string name="route_option_alternative">Var. %1$d</string>
+    <plurals name="directions_range_requests">
+        <item quantity="one">%1$d requête de plage · %2$s téléchargés</item>
+        <item quantity="other">%1$d requêtes de plage · %2$s téléchargés</item>
+    </plurals>
+
+    <!-- Erreurs de calcul d'itinéraire -->
+    <string name="route_waiting_for_location">En attente de votre position</string>
+    <string name="route_outside_coverage">Ce lieu se trouve en dehors de la zone couverte par la carte routière.</string>
+    <string name="route_no_driveable_route">Aucun itinéraire routier vers ce lieu.</string>
+    <string name="route_unavailable">Les itinéraires sont indisponibles pour le moment.</string>
+
+    <!-- Guidage à l'écran -->
+    <string name="nav_rerouting_label">Recalcul</string>
+    <string name="nav_continue">Continuer</string>
+    <string name="nav_speed_unit">km/h</string>
+    <string name="nav_trip_summary">%1$s · %2$s</string>
+
+    <!-- Guidage vocal -->
+    <string name="nav_starting">Démarrage de la navigation.</string>
+    <string name="nav_starting_onto">Démarrage de la navigation. Prenez %1$s.</string>
+    <string name="nav_arrived">Vous êtes arrivé.</string>
+    <string name="nav_continue_now">Maintenant, continuez sur %1$s.</string>
+    <string name="nav_continue_in_meters">Dans %1$d mètres, continuez sur %2$s.</string>
+    <string name="nav_rerouting">Recalcul de l\'itinéraire.</string>
+    <string name="nav_switching_route">Passage à l\'autre itinéraire.</string>
+
+    <!-- Régions hors ligne -->
+    <string name="region_offline_title">Régions hors ligne</string>
+    <string name="region_offline_subtitle">Conserver un index routier sur cet appareil</string>
+    <string name="region_source_host">Hôte source</string>
+    <string name="region_use_network_index">Utiliser l\'index réseau</string>
+    <string name="region_in_use">Utilisé</string>
+    <string name="region_action_use">Utiliser</string>
+    <string name="region_action_refresh">Actualiser</string>
+    <string name="region_action_delete">Supprimer</string>
+    <string name="region_action_preload">Télécharger</string>
+    <plurals name="region_downloading">
+        <item quantity="one">Téléchargement de %1$d fichier sur %2$d · %3$s</item>
+        <item quantity="other">Téléchargement de %1$d fichiers sur %2$d · %3$s</item>
+    </plurals>
+    <string name="region_reading_manifest">Lecture du manifeste de l\'index…</string>
+    <string name="region_ready">%1$s · mis à jour le %2$s</string>
+    <string name="region_download_failed">Échec du téléchargement</string>
+    <string name="region_note_luxembourg">Petit extrait de test</string>
+    <string name="region_note_quebec">Province complète</string>
+
+    <!-- Surfaces embarquées (Android Auto / Automotive) -->
+    <string name="car_search_hint">Rechercher un lieu</string>
+    <string name="car_route_title">Itinéraire</string>
+    <string name="car_route_detail">%1$s · %2$s</string>
+    <string name="car_route_fastest">le plus rapide</string>
+    <string name="car_route_alternative">variante</string>
+    <string name="car_go">Démarrer</string>
+    <string name="car_end">Arrêter</string>
+    <string name="car_search">Rechercher</string>
+    <string name="car_destination">Destination</string>
+    <string name="car_no_matches">Aucun résultat</string>
+    <string name="car_waiting_for_location">En attente de la position</string>
+    <string name="car_no_route">Aucun itinéraire</string>
+
+    <!-- Unités et formats -->
+    <string name="format_placeholder">—</string>
+    <string name="format_meters">%1$d m</string>
+    <string name="format_kilometers_fraction">%1$.1f km</string>
+    <string name="format_kilometers">%1$d km</string>
+    <string name="format_maneuver_now">Maintenant</string>
+    <string name="format_duration_hours_minutes">%1$d h %2$d min</string>
+    <string name="format_duration_hours">%1$d h</string>
+    <string name="format_duration_minutes">%1$d min</string>
+    <string name="format_eta_later">+%1$d min</string>
+    <string name="format_eta_earlier">%1$d min</string>
+    <string name="format_eta_same">même heure d\'arrivée</string>
+    <!-- Le français utilise l'horloge de 24 heures : %3$d (heure sur 24) et
+         %2$d (minutes). %1$d, l'heure sur 12, reste inutilisé. -->
+    <string name="format_clock_am">%3$d h %2$02d</string>
+    <string name="format_clock_pm">%3$d h %2$02d</string>
+    <string name="format_bytes">%1$d o</string>
+    <string name="format_kilobytes">%1$d ko</string>
+    <string name="format_megabytes">%1$.1f Mo</string>
+</resources>

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Location
 import dev.rangefind.wayfind.BuildConfig
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.SEARCH_BASE
 import dev.rangefind.wayfind.WayfindRuntime
 import dev.rangefind.wayfind.engine.LatLon
@@ -68,7 +69,7 @@ class CarNavigator(private val context: Context) {
     private val _state = MutableStateFlow(CarState())
     val state: StateFlow<CarState> = _state.asStateFlow()
 
-    private val core = NavigationCore()
+    private val core = NavigationCore(context)
     private var locationJob: Job? = null
     private var searchJob: Job? = null
 
@@ -118,12 +119,19 @@ class CarNavigator(private val context: Context) {
                         it.copy(
                             searching = false,
                             results = outcome.places,
-                            error = if (outcome.places.isEmpty()) "No matches" else null
+                            error = if (outcome.places.isEmpty()) {
+                                context.getString(R.string.car_no_matches)
+                            } else null
                         )
                     }
                 }
                 .onFailure { error ->
-                    _state.update { it.copy(searching = false, error = error.message ?: "Search failed") }
+                    _state.update {
+                        it.copy(
+                            searching = false,
+                            error = error.message ?: context.getString(R.string.search_failed)
+                        )
+                    }
                 }
         }
     }
@@ -134,7 +142,12 @@ class CarNavigator(private val context: Context) {
         scope.launch {
             val engine = WayfindRuntime.engineOrNull() ?: return@launch
             if (origin == null) {
-                _state.update { it.copy(routing = false, error = "Waiting for location") }
+                _state.update {
+                    it.copy(
+                        routing = false,
+                        error = context.getString(R.string.car_waiting_for_location)
+                    )
+                }
                 return@launch
             }
             runCatching { engine.route(origin, place.point, alternatives = 2) }
@@ -143,7 +156,12 @@ class CarNavigator(private val context: Context) {
                     onRouted()
                 }
                 .onFailure { error ->
-                    _state.update { it.copy(routing = false, error = error.message ?: "No route") }
+                    _state.update {
+                        it.copy(
+                            routing = false,
+                            error = error.message ?: context.getString(R.string.car_no_route)
+                        )
+                    }
                 }
         }
     }
@@ -165,14 +183,14 @@ class CarNavigator(private val context: Context) {
     /** Take one of the alternates without leaving the drive. */
     fun selectRoute(index: Int) {
         if (!core.selectRoute(index)) return
-        say("Switching to the other route.")
+        say(context.getString(R.string.nav_switching_route))
     }
 
     private fun reroute(from: LatLon) {
         val destination = _state.value.destination ?: return
         if (_state.value.rerouting) return
         _state.update { it.copy(rerouting = true) }
-        say("Rerouting.")
+        say(context.getString(R.string.nav_rerouting))
         scope.launch {
             val engine = WayfindRuntime.engineOrNull() ?: return@launch
             runCatching { engine.route(from, destination.point, alternatives = 0) }

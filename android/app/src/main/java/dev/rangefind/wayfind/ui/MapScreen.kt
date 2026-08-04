@@ -44,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import dev.rangefind.wayfind.R
@@ -181,7 +182,7 @@ fun MapScreen(
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
                             Icons.Filled.CloudDownload,
-                            contentDescription = "Offline regions",
+                            contentDescription = stringResource(R.string.region_offline_title),
                             tint = if (state.regions.any { it.active })
                                 MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant
@@ -199,7 +200,7 @@ fun MapScreen(
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
                             Icons.Filled.MyLocation,
-                            contentDescription = "Recenter",
+                            contentDescription = stringResource(R.string.action_recenter),
                             tint = if (state.userLocation != null) palette.puck
                             else MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -361,10 +362,13 @@ fun MapScreen(
                         modifier = Modifier.size(84.dp)
                     )
                     Spacer(Modifier.height(22.dp))
-                    Text("Wayfind", style = MaterialTheme.typography.displaySmall)
+                    Text(
+                        stringResource(R.string.app_name),
+                        style = MaterialTheme.typography.displaySmall
+                    )
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "Maps on static byte ranges",
+                        stringResource(R.string.app_tagline),
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -389,7 +393,10 @@ fun MapScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.padding(32.dp)
                 ) {
-                    Text("Couldn't start", style = MaterialTheme.typography.headlineSmall)
+                    Text(
+                        stringResource(R.string.startup_failed_title),
+                        style = MaterialTheme.typography.headlineSmall
+                    )
                     Spacer(Modifier.height(8.dp))
                     Text(
                         message,

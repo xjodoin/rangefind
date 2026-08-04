@@ -1,5 +1,7 @@
 package dev.rangefind.wayfind.nav
 
+import android.content.Context
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Route
 import kotlin.math.max
@@ -43,8 +45,11 @@ data class NavUpdate(
  * are still reachable live here once. Side effects stay with the caller: this
  * decides *that* a reroute is needed or *that* a phrase is due, and the
  * surface owning the engine and the speaker does it.
+ *
+ * The [context] is only ever used to resolve the spoken phrases, so guidance
+ * is spoken in the user's language rather than the one it was written in.
  */
-class NavigationCore {
+class NavigationCore(private val context: Context) {
 
     private var trackers: List<RouteTracker> = emptyList()
     private var routes: List<Route> = emptyList()
@@ -68,7 +73,8 @@ class NavigationCore {
         tracker = trackers.getOrNull(activeIndex)
         resetProgress()
         val first = activeRoute?.steps?.firstOrNull()?.name?.takeIf { it.isNotBlank() }
-        return "Starting navigation." + (first?.let { " Head onto $it." } ?: "")
+        return if (first != null) context.getString(R.string.nav_starting_onto, first)
+        else context.getString(R.string.nav_starting)
     }
 
     fun stop() {
@@ -151,7 +157,7 @@ class NavigationCore {
         val voice = when {
             arrived && !announcedArrival -> {
                 announcedArrival = true
-                "You have arrived."
+                context.getString(R.string.nav_arrived)
             }
             offRoute -> null
             else -> announcement(stepIndex, toManeuver, next?.name.orEmpty())
@@ -184,8 +190,15 @@ class NavigationCore {
         if (stepIndex == announcedStep && threshold >= announcedThreshold) return null
         announcedStep = stepIndex
         announcedThreshold = threshold
-        return if (threshold <= 60) "Now, continue onto $nextName."
-        else "In ${(meters / 50).roundToInt() * 50} meters, continue onto $nextName."
+        return if (threshold <= 60) {
+            context.getString(R.string.nav_continue_now, nextName)
+        } else {
+            context.getString(
+                R.string.nav_continue_in_meters,
+                (meters / 50).roundToInt() * 50,
+                nextName
+            )
+        }
     }
 
     /**

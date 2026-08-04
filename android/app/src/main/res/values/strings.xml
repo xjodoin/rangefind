@@ -1,4 +1,125 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Product name: never translated. -->
     <string name="app_name">Wayfind</string>
+    <string name="app_tagline">Maps on static byte ranges</string>
+
+    <!-- Startup / fatal errors -->
+    <string name="startup_failed_title">Couldn\'t start</string>
+    <string name="engine_failed_to_start">Engine failed to start</string>
+
+    <!-- Shared content descriptions -->
+    <string name="action_close">Close</string>
+    <string name="action_clear">Clear</string>
+    <string name="action_recenter">Recenter</string>
+    <string name="action_end_navigation">End navigation</string>
+
+    <!-- Search -->
+    <string name="search_hint">Search places, addresses…</string>
+    <plurals name="search_result_count">
+        <item quantity="one">%1$d place</item>
+        <item quantity="other">%1$d places</item>
+    </plurals>
+    <string name="search_no_matches">No matches for “%1$s”</string>
+    <string name="search_failed">Search failed</string>
+
+    <!-- Place sheet -->
+    <string name="place_directions">Directions</string>
+    <string name="place_outside_coverage">Outside route coverage</string>
+    <string name="place_routing_unavailable">Routing unavailable</string>
+    <string name="place_outside_coverage_note">The route map covers a limited region, and this place falls outside it.</string>
+    <string name="place_dropped_pin">Dropped pin</string>
+
+    <!-- Map attribution -->
+    <string name="attribution_openstreetmap">© OpenStreetMap contributors</string>
+    <string name="attribution_carto">" · © CARTO"</string>
+
+    <!-- Directions sheet -->
+    <string name="directions_to">To %1$s</string>
+    <string name="directions_destination_fallback">destination</string>
+    <string name="directions_fetching">Fetching byte ranges…</string>
+    <string name="directions_summary">%1$s · arrive %2$s</string>
+    <string name="directions_start">Start</string>
+    <string name="directions_unnamed_road">Unnamed road</string>
+    <string name="route_option_fastest">Fastest</string>
+    <string name="route_option_alternative">Alt %1$d</string>
+    <plurals name="directions_range_requests">
+        <item quantity="one">%1$d range request · %2$s fetched</item>
+        <item quantity="other">%1$d range requests · %2$s fetched</item>
+    </plurals>
+
+    <!-- Routing errors -->
+    <string name="route_waiting_for_location">Waiting for your location</string>
+    <string name="route_outside_coverage">This place is outside the area covered by the route map.</string>
+    <string name="route_no_driveable_route">No driveable route to this place.</string>
+    <string name="route_unavailable">Directions are unavailable right now.</string>
+
+    <!-- Navigation overlay -->
+    <string name="nav_rerouting_label">Rerouting</string>
+    <string name="nav_continue">Continue</string>
+    <string name="nav_speed_unit">km/h</string>
+    <string name="nav_trip_summary">%1$s · %2$s</string>
+
+    <!-- Spoken guidance -->
+    <string name="nav_starting">Starting navigation.</string>
+    <string name="nav_starting_onto">Starting navigation. Head onto %1$s.</string>
+    <string name="nav_arrived">You have arrived.</string>
+    <string name="nav_continue_now">Now, continue onto %1$s.</string>
+    <string name="nav_continue_in_meters">In %1$d meters, continue onto %2$s.</string>
+    <string name="nav_rerouting">Rerouting.</string>
+    <string name="nav_switching_route">Switching to the other route.</string>
+
+    <!-- Offline regions -->
+    <string name="region_offline_title">Offline regions</string>
+    <string name="region_offline_subtitle">Keep a route index on this device</string>
+    <string name="region_source_host">Source host</string>
+    <string name="region_use_network_index">Use the network index</string>
+    <string name="region_in_use">In use</string>
+    <string name="region_action_use">Use</string>
+    <string name="region_action_refresh">Refresh</string>
+    <string name="region_action_delete">Delete</string>
+    <string name="region_action_preload">Preload</string>
+    <plurals name="region_downloading">
+        <item quantity="one">Downloading %1$d of %2$d file · %3$s</item>
+        <item quantity="other">Downloading %1$d of %2$d files · %3$s</item>
+    </plurals>
+    <string name="region_reading_manifest">Reading index manifest…</string>
+    <string name="region_ready">%1$s · updated %2$s</string>
+    <string name="region_download_failed">Download failed</string>
+    <string name="region_note_luxembourg">Small test extract</string>
+    <string name="region_note_quebec">Full province</string>
+
+    <!-- Car / head-unit surfaces -->
+    <string name="car_search_hint">Search places</string>
+    <string name="car_route_title">Route</string>
+    <string name="car_route_detail">%1$s · %2$s</string>
+    <string name="car_route_fastest">fastest</string>
+    <string name="car_route_alternative">alternative</string>
+    <string name="car_go">Go</string>
+    <string name="car_end">End</string>
+    <string name="car_search">Search</string>
+    <string name="car_destination">Destination</string>
+    <string name="car_no_matches">No matches</string>
+    <string name="car_waiting_for_location">Waiting for location</string>
+    <string name="car_no_route">No route</string>
+
+    <!-- Units and formatting -->
+    <string name="format_placeholder">—</string>
+    <string name="format_meters">%1$d m</string>
+    <string name="format_kilometers_fraction">%1$.1f km</string>
+    <string name="format_kilometers">%1$d km</string>
+    <string name="format_maneuver_now">Now</string>
+    <string name="format_duration_hours_minutes">%1$d h %2$d min</string>
+    <string name="format_duration_hours">%1$d h</string>
+    <string name="format_duration_minutes">%1$d min</string>
+    <string name="format_eta_later">+%1$d min</string>
+    <string name="format_eta_earlier">%1$d min</string>
+    <string name="format_eta_same">same ETA</string>
+    <!-- %1$d is the 12-hour clock hour, %2$d the minute, %3$d the 24-hour
+         clock hour. Locales on a 24-hour clock use %3$d and ignore %1$d. -->
+    <string name="format_clock_am">%1$d:%2$02d AM</string>
+    <string name="format_clock_pm">%1$d:%2$02d PM</string>
+    <string name="format_bytes">%1$d B</string>
+    <string name="format_kilobytes">%1$d KB</string>
+    <string name="format_megabytes">%1$.1f MB</string>
 </resources>

@@ -8,6 +8,7 @@ import androidx.car.app.model.Row
 import androidx.car.app.model.SearchTemplate
 import androidx.car.app.model.Template
 import androidx.lifecycle.lifecycleScope
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.ui.formatDistance
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -31,7 +32,7 @@ class SearchCarScreen(
             override fun onSearchTextChanged(searchText: String) = Unit
         })
             .setHeaderAction(Action.BACK)
-            .setSearchHint("Search places")
+            .setSearchHint(carContext.getString(R.string.car_search_hint))
             .setShowKeyboardByDefault(false)
 
         when {
@@ -49,7 +50,7 @@ class SearchCarScreen(
         // Car UIs cap list length; the driver only needs the nearest handful.
         state.results.take(6).forEach { place ->
             val detail = listOfNotNull(
-                place.distanceMeters?.let { formatDistance(it) },
+                place.distanceMeters?.let { formatDistance(carContext, it) },
                 place.address.takeIf { it.isNotBlank() } ?: place.locality.takeIf { it.isNotBlank() }
             ).joinToString(" · ")
             list.addItem(

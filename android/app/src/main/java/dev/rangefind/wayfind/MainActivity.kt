@@ -17,6 +17,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -28,6 +29,7 @@ import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.ui.MapScreen
 import dev.rangefind.wayfind.ui.MapsViewModel
+import dev.rangefind.wayfind.ui.SheetMode
 import dev.rangefind.wayfind.ui.theme.WayfindTheme
 
 @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
@@ -53,6 +55,7 @@ class MainActivity : ComponentActivity() {
             WayfindTheme(darkTheme = darkTheme) {
                 val viewModel: MapsViewModel = viewModel(
                     factory = MapsViewModel.factory(
+                        context = applicationContext,
                         engine = engine,
                         locationProvider = locationProvider,
                         regionStore = regionStore,
@@ -97,6 +100,16 @@ class MainActivity : ComponentActivity() {
 
                 // Phones get a sheet, tablets and unfolded devices a panel.
                 val widthClass = calculateWindowSizeClass(this).widthSizeClass
+                // Guidance is only useful while it is visible: the driver is
+                // following the screen, not touching it, so nothing would stop
+                // the display timing out mid-route.
+                val view = LocalView.current
+                val navigating = state.sheet == SheetMode.Navigating
+                DisposableEffect(navigating) {
+                    view.keepScreenOn = navigating
+                    onDispose { view.keepScreenOn = false }
+                }
+
                 MapScreen(
                     state = state,
                     darkTheme = darkTheme,

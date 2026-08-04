@@ -30,9 +30,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import android.content.Context
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.region.RegionEntry
 import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.ui.formatBytes
@@ -71,16 +75,19 @@ fun RegionsSheet(
                     .padding(horizontal = 20.dp)
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("Offline regions", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "Keep a route index on this device",
+                        stringResource(R.string.region_offline_title),
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                    Text(
+                        stringResource(R.string.region_offline_subtitle),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Icon(
                     Icons.Filled.Close,
-                    contentDescription = "Close",
+                    contentDescription = stringResource(R.string.action_close),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier
                         .size(24.dp)
@@ -101,7 +108,7 @@ fun RegionsSheet(
             ) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                     Text(
-                        "Source host",
+                        stringResource(R.string.region_source_host),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -146,7 +153,7 @@ fun RegionsSheet(
                 )
                 Spacer(Modifier.width(14.dp))
                 Text(
-                    "Use the network index",
+                    stringResource(R.string.region_use_network_index),
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurface
                 )
@@ -162,6 +169,7 @@ private fun RegionRow(
     onDelete: () -> Unit,
     onActivate: () -> Unit
 ) {
+    val context = LocalContext.current
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -174,7 +182,7 @@ private fun RegionRow(
                             color = MaterialTheme.colorScheme.primaryContainer
                         ) {
                             Text(
-                                "In use",
+                                stringResource(R.string.region_in_use),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
                                 modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
@@ -183,7 +191,7 @@ private fun RegionRow(
                     }
                 }
                 Text(
-                    entry.statusLine(),
+                    entry.statusLine(context),
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (entry.status == RegionStatus.Failed) MaterialTheme.colorScheme.error
                     else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -195,15 +203,31 @@ private fun RegionRow(
             when (entry.status) {
                 RegionStatus.Ready -> {
                     if (!entry.active) {
-                        RegionAction(Icons.Filled.Check, "Use", onActivate)
+                        RegionAction(
+                            Icons.Filled.Check,
+                            stringResource(R.string.region_action_use),
+                            onActivate
+                        )
                         Spacer(Modifier.width(6.dp))
                     }
-                    RegionAction(Icons.Filled.Refresh, "Refresh", onPreload)
+                    RegionAction(
+                        Icons.Filled.Refresh,
+                        stringResource(R.string.region_action_refresh),
+                        onPreload
+                    )
                     Spacer(Modifier.width(6.dp))
-                    RegionAction(Icons.Filled.Delete, "Delete", onDelete)
+                    RegionAction(
+                        Icons.Filled.Delete,
+                        stringResource(R.string.region_action_delete),
+                        onDelete
+                    )
                 }
                 RegionStatus.Downloading -> Unit
-                else -> RegionAction(Icons.Filled.CloudDownload, "Preload", onPreload)
+                else -> RegionAction(
+                    Icons.Filled.CloudDownload,
+                    stringResource(R.string.region_action_preload),
+                    onPreload
+                )
             }
         }
 
@@ -243,14 +267,16 @@ private fun RegionAction(
     }
 }
 
-private fun RegionEntry.statusLine(): String = when (status) {
-    RegionStatus.Absent -> spec.note
+private fun RegionEntry.statusLine(context: Context): String = when (status) {
+    RegionStatus.Absent -> context.getString(spec.noteRes)
     RegionStatus.Downloading ->
-        if (total > 0) "Downloading $done of $total files · ${formatBytes(bytes)}"
-        else "Reading index manifest…"
+        if (total > 0) context.resources.getQuantityString(
+            R.plurals.region_downloading, total, done, total, formatBytes(context, bytes)
+        )
+        else context.getString(R.string.region_reading_manifest)
     RegionStatus.Ready -> {
         val stamp = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(updatedAt))
-        "${formatBytes(bytes)} · updated $stamp"
+        context.getString(R.string.region_ready, formatBytes(context, bytes), stamp)
     }
-    RegionStatus.Failed -> error ?: "Download failed"
+    RegionStatus.Failed -> error ?: context.getString(R.string.region_download_failed)
 }

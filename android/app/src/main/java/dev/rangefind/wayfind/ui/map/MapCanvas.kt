@@ -1,5 +1,6 @@
 package dev.rangefind.wayfind.ui.map
 
+import android.content.Context
 import android.graphics.RectF
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -7,6 +8,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
@@ -71,6 +73,9 @@ private val IMG_LABEL = listOf("rf-label-0", "rf-label-1", "rf-label-2")
 /** Rangefind ink — the glyph punched out of the amber destination marker. */
 private const val INK = 0xFF14161D.toInt()
 
+/** Per-frame fraction of the remaining distance to the newest fix. */
+private const val FOLLOW_EASE = 0.12
+
 @Composable
 fun MapCanvas(
     state: UiState,
@@ -85,6 +90,9 @@ fun MapCanvas(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current.density
+    // Route bubbles are drawn into bitmaps rather than composed, so the map
+    // layer needs a context of its own to resolve their labels.
+    val appContext = LocalContext.current.applicationContext
     val holder = remember { MapHolder() }
 
     // The click listener is bound once; without this it would compare taps
@@ -186,6 +194,7 @@ fun MapCanvas(
         holder.latest = state
         holder.palette = palette
         holder.density = density
+        holder.context = appContext
         holder.flush()
     }
 
@@ -229,41 +238,18 @@ fun MapCanvas(
         }
     }
 
-    // Camera: follow the driver.
-    LaunchedEffect(state.nav?.position, state.nav?.bearing, state.sheet) {
-        if (state.sheet != SheetMode.Navigating) return@LaunchedEffect
-        val nav = state.nav ?: return@LaunchedEffect
-        val map = holder.map ?: return@LaunchedEffect
-
-        // Google-style framing: zoom tightens as speed drops, and the camera
-        // targets a point ahead of the puck so the driver sits low on screen
-        // with the road ahead filling the view.
-        val speedKmh = nav.speedMps * 3.6
-        val zoom = when {
-            speedKmh < 25 -> 18.1
-            speedKmh < 65 -> 17.3
-            else -> 16.5
+    // Follow camera and puck, driven by the frame clock rather than by the
+    // fix rate. Location lands about once a second: easing the camera over
+    // 900 ms while the puck's map position is set discretely made the map
+    // glide and the arrow teleport. Both now advance together every frame.
+    LaunchedEffect(state.sheet == SheetMode.Navigating) {
+        if (state.sheet != SheetMode.Navigating) {
+            holder.resetFollow()
+            return@LaunchedEffect
         }
-        // Targeting a point ahead of the puck pushes it toward the lower third
-        // of the screen, so the road being driven into fills the view.
-        val leadMeters = when {
-            speedKmh < 25 -> 85.0
-            speedKmh < 65 -> 150.0
-            else -> 240.0
+        while (true) {
+            withFrameNanos { holder.stepFollow() }
         }
-        val target = advance(nav.position, nav.bearing, leadMeters)
-
-        map.easeCamera(
-            CameraUpdateFactory.newCameraPosition(
-                CameraPosition.Builder()
-                    .target(LatLng(target.lat, target.lon))
-                    .zoom(zoom)
-                    .bearing(nav.bearing)
-                    .tilt(58.0)
-                    .build()
-            ),
-            900
-        )
     }
 
     // Camera: center a selected place when there is no route on screen.
@@ -332,10 +318,81 @@ private class MapHolder {
     var ready = false
     var listenersBound = false
 
+    /** Eased follow state, advanced once per frame while navigating. */
+    private var followLat = Double.NaN
+    private var followLon = Double.NaN
+    private var followBearing = 0.0
+
+    fun resetFollow() {
+        followLat = Double.NaN
+        followLon = Double.NaN
+    }
+
+    /**
+     * Moves the puck and the camera a fraction of the way toward the newest
+     * fix. A fraction per frame gives an ease-out that never overshoots and
+     * needs no animation bookkeeping when the target changes mid-flight.
+     */
+    fun stepFollow() {
+        val style = style ?: return
+        val map = map ?: return
+        val nav = latest?.nav ?: return
+        if (!ready || !style.isFullyLoaded) return
+
+        if (followLat.isNaN()) {
+            followLat = nav.position.lat
+            followLon = nav.position.lon
+            followBearing = nav.bearing
+        } else {
+            followLat += (nav.position.lat - followLat) * FOLLOW_EASE
+            followLon += (nav.position.lon - followLon) * FOLLOW_EASE
+            val delta = (nav.bearing - followBearing + 540.0) % 360.0 - 180.0
+            followBearing = (followBearing + delta * FOLLOW_EASE + 360.0) % 360.0
+        }
+
+        style.setSource(
+            SRC_NAV,
+            FeatureCollection.fromFeatures(
+                listOf(Feature.fromGeometry(Point.fromLngLat(followLon, followLat)))
+            )
+        )
+        style.getLayerAs<SymbolLayer>(LYR_NAV)
+            ?.setProperties(PropertyFactory.iconRotate(followBearing.toFloat()))
+
+        // Zoom tightens as speed drops, and the camera targets a point ahead
+        // of the puck so the driver sits low on screen with the road ahead
+        // filling the view.
+        val speedKmh = nav.speedMps * 3.6
+        val zoom = when {
+            speedKmh < 25 -> 18.1
+            speedKmh < 65 -> 17.3
+            else -> 16.5
+        }
+        val leadMeters = when {
+            speedKmh < 25 -> 85.0
+            speedKmh < 65 -> 150.0
+            else -> 240.0
+        }
+        val target = advance(LatLon(followLat, followLon), followBearing, leadMeters)
+        // Moving rather than animating: this *is* the animation, so a second
+        // easing on top would fight it.
+        map.moveCamera(
+            CameraUpdateFactory.newCameraPosition(
+                CameraPosition.Builder()
+                    .target(LatLng(target.lat, target.lon))
+                    .zoom(zoom)
+                    .bearing(followBearing)
+                    .tilt(58.0)
+                    .build()
+            )
+        )
+    }
+
     /** Most recent app state, replayed whenever a new style finishes loading. */
     var latest: UiState? = null
     var palette: MapPalette? = null
     var density: Float = 1f
+    var context: Context? = null
 
     fun flush() {
         val state = latest ?: return
@@ -345,6 +402,7 @@ private class MapHolder {
 
     fun pushAll(state: UiState, palette: MapPalette) {
         val style = style ?: return
+        val context = context ?: return
         if (!ready || !style.isFullyLoaded) return
 
         val navigating = state.sheet == SheetMode.Navigating
@@ -435,8 +493,11 @@ private class MapHolder {
             style.addImage(
                 IMG_LABEL[i],
                 MapIcons.durationLabel(
-                    text = if (navigating) formatEtaDelta(deltas[i]?.deltaSeconds ?: 0.0)
-                    else formatDuration(candidate.seconds),
+                    text = if (navigating) {
+                        formatEtaDelta(context, deltas[i]?.deltaSeconds ?: 0.0)
+                    } else {
+                        formatDuration(context, candidate.seconds)
+                    },
                     fill = if (isActive) palette.routeLine.toArgb() else 0xFFFFFFFF.toInt(),
                     textColor = if (isActive) 0xFFFAF9F6.toInt() else INK,
                     outline = if (isActive) palette.routeCasing.toArgb() else 0x1F000000,
@@ -472,18 +533,10 @@ private class MapHolder {
                 listOfNotNull(browsing?.let { Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)) })
             )
         )
-        val driving = if (navigating) state.nav else null
-        style.setSource(
-            SRC_NAV,
-            FeatureCollection.fromFeatures(
-                listOfNotNull(
-                    driving?.let { Feature.fromGeometry(Point.fromLngLat(it.position.lon, it.position.lat)) }
-                )
-            )
-        )
-        if (driving != null) {
-            style.getLayerAs<SymbolLayer>(LYR_NAV)
-                ?.setProperties(PropertyFactory.iconRotate(driving.bearing.toFloat()))
+        // While driving, the arrow is owned by the frame loop; writing it here
+        // at the fix rate would reintroduce exactly the jump it removes.
+        if (!navigating) {
+            style.setSource(SRC_NAV, FeatureCollection.fromFeatures(emptyList()))
         }
     }
 }

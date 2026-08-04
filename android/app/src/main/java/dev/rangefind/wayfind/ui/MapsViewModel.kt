@@ -1,9 +1,11 @@
 package dev.rangefind.wayfind.ui
 
+import android.content.Context
 import android.location.Location
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.EngineInfo
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Place
@@ -73,6 +75,8 @@ data class UiState(
 
 @OptIn(FlowPreview::class)
 class MapsViewModel(
+    /** Application context: only ever used to resolve user-facing strings. */
+    private val context: Context,
     private val engine: RangefindEngine,
     private val locationProvider: LocationProvider,
     private val regionStore: RegionStore,
@@ -96,7 +100,7 @@ class MapsViewModel(
     private var routeJob: Job? = null
     private var locationJob: Job? = null
 
-    private val core = NavigationCore()
+    private val core = NavigationCore(context)
     private var suppressSuggestFor: String? = null
 
     private val downloads = mutableMapOf<String, Job>()
@@ -111,7 +115,13 @@ class MapsViewModel(
             runCatching { engine.init(searchBase, base) }
                 .onSuccess { info -> _state.update { it.copy(loading = false, info = info) } }
                 .onFailure { error ->
-                    _state.update { it.copy(loading = false, fatalError = error.message ?: "Engine failed to start") }
+                    _state.update {
+                        it.copy(
+                            loading = false,
+                            fatalError = error.message
+                                ?: context.getString(R.string.engine_failed_to_start)
+                        )
+                    }
                 }
         }
 
@@ -201,7 +211,11 @@ class MapsViewModel(
                 downloads.remove(id)
                 regionStore.delete(id)
                 updateRegion(id) {
-                    it.copy(status = RegionStatus.Failed, error = error.message ?: "Download failed")
+                    it.copy(
+                        status = RegionStatus.Failed,
+                        error = error.message
+                            ?: context.getString(R.string.region_download_failed)
+                    )
                 }
             }
         }
@@ -294,12 +308,20 @@ class MapsViewModel(
                             searching = false,
                             results = outcome.places,
                             sheet = SheetMode.Search,
-                            searchError = if (outcome.places.isEmpty()) "No matches for “$query”" else null
+                            searchError = if (outcome.places.isEmpty()) {
+                                context.getString(R.string.search_no_matches, query)
+                            } else null
                         )
                     }
                 }
                 .onFailure { error ->
-                    _state.update { it.copy(searching = false, searchError = error.message ?: "Search failed") }
+                    _state.update {
+                        it.copy(
+                            searching = false,
+                            searchError = error.message
+                                ?: context.getString(R.string.search_failed)
+                        )
+                    }
                 }
         }
     }
@@ -325,7 +347,7 @@ class MapsViewModel(
             val resolved = runCatching { engine.reverse(point) }.getOrNull()
             val place = resolved ?: Place(
                 id = "pin",
-                name = "Dropped pin",
+                name = context.getString(R.string.place_dropped_pin),
                 address = String.format("%.5f, %.5f", point.lat, point.lon),
                 locality = "",
                 category = "",
@@ -350,14 +372,20 @@ class MapsViewModel(
                     sheet = SheetMode.Directions,
                     routes = null,
                     routing = false,
-                    routeError = OUT_OF_COVERAGE
+                    routeError = context.getString(R.string.route_outside_coverage)
                 )
             }
             return
         }
         val origin = _state.value.userLocation
         if (origin == null) {
-            _state.update { it.copy(routeError = "Waiting for your location", sheet = SheetMode.Directions, selected = destination) }
+            _state.update {
+                it.copy(
+                    routeError = context.getString(R.string.route_waiting_for_location),
+                    sheet = SheetMode.Directions,
+                    selected = destination
+                )
+            }
             return
         }
         routeJob?.cancel()
@@ -390,9 +418,11 @@ class MapsViewModel(
         val bounds = _state.value.info?.routeBounds
         val outside = _state.value.selected?.point?.let { bounds != null && !bounds.contains(it) } ?: false
         return when {
-            outside || message.contains("Nearest road", ignoreCase = true) -> OUT_OF_COVERAGE
-            message.contains("no route", ignoreCase = true) -> "No driveable route to this place."
-            message.isBlank() -> "Directions are unavailable right now."
+            outside || message.contains("Nearest road", ignoreCase = true) ->
+                context.getString(R.string.route_outside_coverage)
+            message.contains("no route", ignoreCase = true) ->
+                context.getString(R.string.route_no_driveable_route)
+            message.isBlank() -> context.getString(R.string.route_unavailable)
             else -> message
         }
     }
@@ -402,7 +432,7 @@ class MapsViewModel(
         // already is, rather than restarting the trip at its origin.
         if (_state.value.sheet == SheetMode.Navigating) {
             if (!core.selectRoute(index)) return
-            _voice.tryEmit("Switching to the other route.")
+            _voice.tryEmit(context.getString(R.string.nav_switching_route))
         }
         _state.update { it.copy(activeRouteIndex = index) }
     }
@@ -469,7 +499,7 @@ class MapsViewModel(
         val destination = _state.value.selected ?: return
         if (_state.value.rerouting) return
         _state.update { it.copy(rerouting = true) }
-        _voice.tryEmit("Rerouting.")
+        _voice.tryEmit(context.getString(R.string.nav_rerouting))
         viewModelScope.launch {
             runCatching { engine.route(from, destination.point, alternatives = 0) }
                 .onSuccess { bundle ->
@@ -481,10 +511,8 @@ class MapsViewModel(
     }
 
     companion object {
-        private const val OUT_OF_COVERAGE =
-            "This place is outside the area covered by the route map."
-
         fun factory(
+            context: Context,
             engine: RangefindEngine,
             locationProvider: LocationProvider,
             regionStore: RegionStore,
@@ -496,8 +524,8 @@ class MapsViewModel(
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
                 MapsViewModel(
-                    engine, locationProvider, regionStore, regionServer, regionPrefs,
-                    searchBase, routeBase
+                    context.applicationContext, engine, locationProvider, regionStore,
+                    regionServer, regionPrefs, searchBase, routeBase
                 ) as T
         }
     }
