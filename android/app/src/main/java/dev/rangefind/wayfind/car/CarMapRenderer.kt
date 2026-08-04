@@ -384,8 +384,8 @@ class CarMapRenderer(
                 postsRectangularSpeedLimits(it.lat, it.lon)
             } ?: false
             if (plate) {
-                val halfWidth = 5.4f * unit
-                val halfHeight = 6.0f * unit
+                val halfWidth = 4.6f * unit
+                val halfHeight = 6.6f * unit
                 val rect = RectF(cx - halfWidth, cy - halfHeight, cx + halfWidth, cy + halfHeight)
                 paint.style = Paint.Style.FILL
                 paint.color = Color.WHITE
@@ -395,11 +395,11 @@ class CarMapRenderer(
                 paint.color = Color.parseColor("#14161D")
                 canvas.drawRoundRect(rect, 1.2f * unit, 1.2f * unit, paint)
                 paint.style = Paint.Style.FILL
-                paint.textSize = 2.4f * unit
+                paint.textSize = 1.9f * unit
                 canvas.drawText(
                     speedLimitLabel,
                     cx,
-                    cy - 1.4f * unit,
+                    cy - 1.8f * unit,
                     paint
                 )
                 paint.textSize = 5.0f * unit

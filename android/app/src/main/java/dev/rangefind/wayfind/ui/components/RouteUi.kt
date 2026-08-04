@@ -594,7 +594,7 @@ private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
             modifier = Modifier
-                .size(width = 62.dp, height = 58.dp)
+                .size(width = 54.dp, height = 68.dp)
                 .shadow(4.dp, SIGN_PLATE)
                 .background(Color.White, SIGN_PLATE)
                 .border(3.dp, Color(0xFF14161D), SIGN_PLATE)
@@ -603,8 +603,9 @@ private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
             Text(
                 stringResource(R.string.nav_speed_limit_label),
                 style = MaterialTheme.typography.labelSmall,
-                fontSize = 9.sp,
-                lineHeight = 11.sp,
+                fontSize = 7.sp,
+                lineHeight = 9.sp,
+                letterSpacing = 0.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
                 softWrap = false,
