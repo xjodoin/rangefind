@@ -53,7 +53,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.rangefind.wayfind.R
+import dev.rangefind.wayfind.engine.LatLon
+import dev.rangefind.wayfind.nav.postsRectangularSpeedLimits
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.nav.bearingDegrees
 import dev.rangefind.wayfind.nav.bearingDelta
@@ -402,7 +405,7 @@ fun NavigationOverlay(
                         )
                     }
                 }
-                if (it.speedLimitKmh > 0) SpeedLimitSign(it.speedLimitKmh)
+                if (it.speedLimitKmh > 0) SpeedLimitSign(it.speedLimitKmh, it.position)
                 if (it.stepName.isNotBlank()) {
                     Surface(
                         shape = RoundedCornerShape(14.dp),
@@ -583,7 +586,39 @@ private const val SPEEDING_TOLERANCE_KMH = 5
  * and color before they read the number.
  */
 @Composable
-private fun SpeedLimitSign(limitKmh: Int) {
+private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
+    // The sign a driver actually sees out of the windscreen: a white plate in
+    // the US and Canada, a red-ringed disc most other places.
+    if (at != null && postsRectangularSpeedLimits(at.lat, at.lon)) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier
+                .size(width = 62.dp, height = 58.dp)
+                .shadow(4.dp, SIGN_PLATE)
+                .background(Color.White, SIGN_PLATE)
+                .border(3.dp, Color(0xFF14161D), SIGN_PLATE)
+                .padding(horizontal = 3.dp)
+        ) {
+            Text(
+                stringResource(R.string.nav_speed_limit_label),
+                style = MaterialTheme.typography.labelSmall,
+                fontSize = 9.sp,
+                lineHeight = 11.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false,
+                color = Color(0xFF14161D)
+            )
+            Text(
+                limitKmh.toString(),
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Black,
+                color = Color(0xFF14161D)
+            )
+        }
+        return
+    }
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
@@ -600,6 +635,9 @@ private fun SpeedLimitSign(limitKmh: Int) {
         )
     }
 }
+
+/** Highway plates have barely-rounded corners, not pill ends. */
+private val SIGN_PLATE = RoundedCornerShape(5.dp)
 
 /**
  * Maneuver glyph inferred from the turn angle between the segment entering a

@@ -66,3 +66,21 @@ fun interpolate(a: LatLon, b: LatLon, t: Double) =
 fun normalizeBearing(value: Double) = ((value % 360.0) + 360.0) % 360.0
 
 fun absBearingDelta(from: Double, to: Double) = abs(bearingDelta(from, to))
+
+/**
+ * Whether posted speed limits here are shown on a white rectangle rather than
+ * inside a red ring.
+ *
+ * The red-ringed disc is the Vienna Convention sign used across Europe and
+ * much of the world; the United States and Canada post limits on a plain
+ * white rectangle instead (MUTCD, and Canada's metric "MAXIMUM" variant).
+ * Drawing the wrong one is not cosmetic — a driver reads a sign shape before
+ * they read the number on it.
+ *
+ * Judged on where the car is, not on the phone's locale: a French-locale
+ * handset driving in Québec must still be shown Québec's signs. The box
+ * clips a corner of northern Mexico, which posts discs; the alternative is
+ * jurisdiction boundaries the route index does not carry.
+ */
+fun postsRectangularSpeedLimits(lat: Double, lon: Double): Boolean =
+    lat in 24.0..84.0 && lon in -172.0..-52.0

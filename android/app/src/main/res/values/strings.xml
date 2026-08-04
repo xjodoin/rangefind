@@ -58,6 +58,8 @@
     <string name="nav_rerouting_label">Rerouting</string>
     <string name="nav_continue">Continue</string>
     <string name="nav_speed_unit">km/h</string>
+    <!-- North American speed-limit plate; the same word in French. -->
+    <string name="nav_speed_limit_label">MAXIMUM</string>
     <string name="nav_trip_summary">%1$s · %2$s</string>
 
     <!-- Spoken guidance -->

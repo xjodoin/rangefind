@@ -12,7 +12,9 @@ import android.os.Handler
 import android.os.HandlerThread
 import androidx.car.app.SurfaceCallback
 import androidx.car.app.SurfaceContainer
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.LatLon
+import dev.rangefind.wayfind.nav.postsRectangularSpeedLimits
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.cos
 import kotlin.math.floor
@@ -39,6 +41,9 @@ class CarMapRenderer(
     context: Context,
     private val dark: Boolean
 ) : SurfaceCallback {
+
+    /** Resolved once: the render loop runs off the main thread. */
+    private val speedLimitLabel = context.getString(R.string.nav_speed_limit_label)
 
     private var container: SurfaceContainer? = null
     private var visible = Rect()
@@ -371,25 +376,59 @@ class CarMapRenderer(
             val radius = 5.5f * unit
             val cx = left + radius
             val cy = bottom - radius
-            paint.style = Paint.Style.FILL
-            paint.color = Color.WHITE
-            canvas.drawCircle(cx, cy, radius, paint)
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = 1.5f * unit
-            paint.color = Color.parseColor("#D7382C")
-            canvas.drawCircle(cx, cy, radius - 0.7f * unit, paint)
-            paint.style = Paint.Style.FILL
-            paint.color = Color.parseColor("#14161D")
             paint.textAlign = Paint.Align.CENTER
-            paint.textSize = 4.4f * unit
             paint.typeface = android.graphics.Typeface.DEFAULT_BOLD
-            canvas.drawText(
-                state.speedLimitKmh.toString(),
-                cx,
-                cy + paint.textSize * 0.36f,
-                paint
-            )
-            left = cx + radius + 2.5f * unit
+            // Match the sign the driver is actually passing: a white plate in
+            // the US and Canada, a red-ringed disc elsewhere.
+            val plate = state.position?.let {
+                postsRectangularSpeedLimits(it.lat, it.lon)
+            } ?: false
+            if (plate) {
+                val halfWidth = 5.4f * unit
+                val halfHeight = 6.0f * unit
+                val rect = RectF(cx - halfWidth, cy - halfHeight, cx + halfWidth, cy + halfHeight)
+                paint.style = Paint.Style.FILL
+                paint.color = Color.WHITE
+                canvas.drawRoundRect(rect, 1.2f * unit, 1.2f * unit, paint)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = 1.0f * unit
+                paint.color = Color.parseColor("#14161D")
+                canvas.drawRoundRect(rect, 1.2f * unit, 1.2f * unit, paint)
+                paint.style = Paint.Style.FILL
+                paint.textSize = 2.4f * unit
+                canvas.drawText(
+                    speedLimitLabel,
+                    cx,
+                    cy - 1.4f * unit,
+                    paint
+                )
+                paint.textSize = 5.0f * unit
+                canvas.drawText(
+                    state.speedLimitKmh.toString(),
+                    cx,
+                    cy + 4.2f * unit,
+                    paint
+                )
+                left = cx + halfWidth + 2.5f * unit
+            } else {
+                paint.style = Paint.Style.FILL
+                paint.color = Color.WHITE
+                canvas.drawCircle(cx, cy, radius, paint)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = 1.5f * unit
+                paint.color = Color.parseColor("#D7382C")
+                canvas.drawCircle(cx, cy, radius - 0.7f * unit, paint)
+                paint.style = Paint.Style.FILL
+                paint.color = Color.parseColor("#14161D")
+                paint.textSize = 4.4f * unit
+                canvas.drawText(
+                    state.speedLimitKmh.toString(),
+                    cx,
+                    cy + paint.textSize * 0.36f,
+                    paint
+                )
+                left = cx + radius + 2.5f * unit
+            }
         }
 
         val road = state.stepName
