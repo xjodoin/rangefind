@@ -88,6 +88,46 @@ function trimRoute(route) {
   };
 }
 
+// The route graph covers whatever region it was built for, while search and
+// the basemap are worldwide. Publishing its extent lets the app say "outside
+// the routable area" instead of failing a snap 5 km from a road. A single
+// rectangle around the whole graph is too generous — it spans neighbouring
+// countries the extract never included. The leaf boxes tile the actual node
+// distribution, so shipping them tells "3 km past the border" from "in a
+// covered town".
+function routingInfo() {
+  let routeBounds = null;
+  const leaves = routeEngine?.root?.leaves;
+  if (leaves?.length) {
+    let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+    const cells = [];
+    for (const leaf of leaves) {
+      const box = leaf.bbox;
+      if (!box) continue;
+      if (box.minLat < minLat) minLat = box.minLat;
+      if (box.maxLat > maxLat) maxLat = box.maxLat;
+      if (box.minLon < minLon) minLon = box.minLon;
+      if (box.maxLon > maxLon) maxLon = box.maxLon;
+      cells.push(box.minLat / 1e7, box.maxLat / 1e7, box.minLon / 1e7, box.maxLon / 1e7);
+    }
+    if (Number.isFinite(minLat)) {
+      routeBounds = {
+        minLat: minLat / 1e7,
+        maxLat: maxLat / 1e7,
+        minLon: minLon / 1e7,
+        maxLon: maxLon / 1e7,
+        cells
+      };
+    }
+  }
+  return {
+    routing: Boolean(routeEngine),
+    routingError: routeUnavailable,
+    profile: routeEngine?.root?.profile || "",
+    routeBounds
+  };
+}
+
 const handlers = {
   async init({ searchBase, routeBase }) {
     searchEngine = await createSearch({ baseUrl: searchBase });
@@ -107,47 +147,34 @@ const handlers = {
       routeUnavailable = "No route index configured";
     }
 
-    // The route graph covers whatever region it was built for, while search
-    // and the basemap are worldwide. Publishing its extent lets the app say
-    // "outside the routable area" instead of failing a snap 5 km from a road.
-    // A single rectangle around the whole graph is too generous — it spans
-    // neighbouring countries the extract never included. The leaf boxes tile
-    // the actual node distribution, so shipping them lets the app tell the
-    // difference between "3 km past the border" and "in a covered town".
-    let routeBounds = null;
-    const leaves = routeEngine?.root?.leaves;
-    if (leaves?.length) {
-      let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-      const cells = [];
-      for (const leaf of leaves) {
-        const box = leaf.bbox;
-        if (!box) continue;
-        if (box.minLat < minLat) minLat = box.minLat;
-        if (box.maxLat > maxLat) maxLat = box.maxLat;
-        if (box.minLon < minLon) minLon = box.minLon;
-        if (box.maxLon > maxLon) maxLon = box.maxLon;
-        cells.push(box.minLat / 1e7, box.maxLat / 1e7, box.minLon / 1e7, box.maxLon / 1e7);
-      }
-      if (Number.isFinite(minLat)) {
-        routeBounds = {
-          minLat: minLat / 1e7,
-          maxLat: maxLat / 1e7,
-          minLon: minLon / 1e7,
-          maxLon: maxLon / 1e7,
-          cells
-        };
-      }
-    }
-
     return {
       attribution: meta.attribution || "© OpenStreetMap contributors",
       license: meta.license || "ODbL-1.0",
       total: searchEngine.manifest?.total ?? 0,
-      routing: Boolean(routeEngine),
-      routingError: routeUnavailable,
-      profile: routeEngine?.root?.profile || "",
-      routeBounds
+      ...routingInfo()
     };
+  },
+
+  /**
+   * Point routing at a different index — a freshly preloaded region served
+   * from local storage, or back at the network base. Only the route engine is
+   * rebuilt; search is unrelated and stays warm.
+   */
+  async useRouteBase({ routeBase }) {
+    routeEngine = null;
+    routeUnavailable = null;
+    if (!routeBase) {
+      routeUnavailable = "No route index configured";
+      return routingInfo();
+    }
+    try {
+      const probe = await fetch(new URL("manifest.json", routeBase).toString());
+      if (!probe.ok) throw new Error(`manifest ${probe.status}`);
+      routeEngine = await openRouteGraphUrl(routeBase);
+    } catch (err) {
+      routeUnavailable = String(err?.message || err);
+    }
+    return routingInfo();
   },
 
   async search({ q, anchor, size, shards }) {
@@ -200,6 +227,34 @@ const handlers = {
     return {
       primary: trimRoute(result),
       alternatives: (result.alternatives || []).map(trimRoute)
+    };
+  },
+
+  /**
+   * Every file that makes up a route index, for offline preloading. The root
+   * enumerates its own shards and names file, so the download list is exact
+   * rather than guessed from a directory listing HTTP does not provide.
+   */
+  async regionFiles({ baseUrl }) {
+    const manifestUrl = new URL("manifest.json", baseUrl).toString();
+    const response = await fetch(manifestUrl);
+    if (!response.ok) throw new Error(`manifest ${response.status}`);
+    const manifest = await response.json();
+
+    const probe = await openRouteGraphUrl(baseUrl);
+    const root = probe.root;
+    const files = ["manifest.json", manifest.root];
+    if (root.namesFile) files.push(root.namesFile);
+    for (const shard of root.shards || []) {
+      for (const pack of shard.packs || []) {
+        files.push(shard.dir ? `${shard.dir}/${pack}` : pack);
+      }
+    }
+    return {
+      files,
+      profile: root.profile || "",
+      nodes: manifest.nodes ?? 0,
+      leaves: manifest.leaves ?? 0
     };
   },
 

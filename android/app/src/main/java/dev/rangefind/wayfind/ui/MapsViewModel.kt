@@ -12,6 +12,12 @@ import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.engine.RouteBundle
 import dev.rangefind.wayfind.engine.Suggestion
 import dev.rangefind.wayfind.location.LocationProvider
+import dev.rangefind.wayfind.region.REGION_CATALOG
+import dev.rangefind.wayfind.region.RegionEntry
+import dev.rangefind.wayfind.region.RegionPreferences
+import dev.rangefind.wayfind.region.RegionServer
+import dev.rangefind.wayfind.region.RegionStatus
+import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.nav.RouteTracker
 import dev.rangefind.wayfind.nav.absBearingDelta
 import kotlinx.coroutines.FlowPreview
@@ -80,7 +86,10 @@ data class UiState(
     val rerouting: Boolean = false,
     /** Bumped to ask the map to fly back to the user; state-driven so the
      *  map layer never needs a handle on the view model. */
-    val recenterTick: Int = 0
+    val recenterTick: Int = 0,
+    val regions: List<RegionEntry> = emptyList(),
+    val regionHost: String = "",
+    val showRegions: Boolean = false
 ) {
     val activeRoute: Route?
         get() = routes?.let { bundle ->
@@ -95,6 +104,9 @@ data class UiState(
 class MapsViewModel(
     private val engine: RangefindEngine,
     private val locationProvider: LocationProvider,
+    private val regionStore: RegionStore,
+    private val regionServer: RegionServer,
+    private val regionPrefs: RegionPreferences,
     private val searchBase: String,
     private val routeBase: String
 ) : ViewModel() {
@@ -123,9 +135,16 @@ class MapsViewModel(
     private var offRouteStrikes = 0
     private var suppressSuggestFor: String? = null
 
+    private val downloads = mutableMapOf<String, Job>()
+
     init {
+        refreshRegions()
         viewModelScope.launch {
-            runCatching { engine.init(searchBase, routeBase) }
+            // A region kept on the device wins over the network base: the user
+            // downloaded it precisely so routing would not depend on a server.
+            val active = regionPrefs.activeRegion?.takeIf { regionStore.isReady(it) }
+            val base = active?.let { regionServer.baseUrlFor(it) } ?: routeBase
+            runCatching { engine.init(searchBase, base) }
                 .onSuccess { info -> _state.update { it.copy(loading = false, info = info) } }
                 .onFailure { error ->
                     _state.update { it.copy(loading = false, fatalError = error.message ?: "Engine failed to start") }
@@ -152,6 +171,114 @@ class MapsViewModel(
                         .onFailure { _state.update { it.copy(suggestions = emptyList()) } }
                 }
         }
+    }
+
+    // ---- offline regions ----------------------------------------------
+
+    fun showRegions(show: Boolean) {
+        _state.update { it.copy(showRegions = show) }
+    }
+
+    fun setRegionHost(host: String) {
+        regionPrefs.host = host
+        refreshRegions()
+    }
+
+    private fun refreshRegions() {
+        val active = regionPrefs.activeRegion
+        _state.update { current ->
+            current.copy(
+                regionHost = regionPrefs.host,
+                regions = REGION_CATALOG.map { spec ->
+                    val existing = current.regions.firstOrNull { it.spec.id == spec.id }
+                    if (downloads[spec.id]?.isActive == true && existing != null) {
+                        existing.copy(active = spec.id == active)
+                    } else if (regionStore.isReady(spec.id)) {
+                        RegionEntry(
+                            spec = spec,
+                            status = RegionStatus.Ready,
+                            bytes = regionStore.bytesOf(spec.id),
+                            updatedAt = regionStore.updatedAt(spec.id),
+                            active = spec.id == active
+                        )
+                    } else {
+                        RegionEntry(spec = spec, status = RegionStatus.Absent, error = existing?.error)
+                    }
+                }
+            )
+        }
+    }
+
+    private fun updateRegion(id: String, transform: (RegionEntry) -> RegionEntry) {
+        _state.update { current ->
+            current.copy(regions = current.regions.map { if (it.spec.id == id) transform(it) else it })
+        }
+    }
+
+    /** Download or re-download a region; refreshing is the same operation. */
+    fun preloadRegion(id: String) {
+        if (downloads[id]?.isActive == true) return
+        val source = regionPrefs.sourceUrlOf(id)
+        updateRegion(id) { it.copy(status = RegionStatus.Downloading, done = 0, total = 0, error = null) }
+        downloads[id] = viewModelScope.launch {
+            runCatching {
+                val manifest = engine.regionFiles(source)
+                updateRegion(id) { it.copy(total = manifest.files.size) }
+                regionStore.install(id, source, manifest.files) { done, total, bytes ->
+                    updateRegion(id) { it.copy(done = done, total = total, bytes = bytes) }
+                }
+            }.onSuccess {
+                downloads.remove(id)
+                refreshRegions()
+                // A refresh of the region already in use must be picked up, or
+                // routing keeps answering from the copy that was just replaced.
+                if (regionPrefs.activeRegion == id) applyRouteBase(regionServer.baseUrlFor(id))
+            }.onFailure { error ->
+                downloads.remove(id)
+                regionStore.delete(id)
+                updateRegion(id) {
+                    it.copy(status = RegionStatus.Failed, error = error.message ?: "Download failed")
+                }
+            }
+        }
+    }
+
+    fun deleteRegion(id: String) {
+        downloads.remove(id)?.cancel()
+        regionStore.delete(id)
+        if (regionPrefs.activeRegion == id) {
+            regionPrefs.activeRegion = null
+            viewModelScope.launch { applyRouteBase(routeBase) }
+        }
+        refreshRegions()
+    }
+
+    /** Route from a stored region, or pass null to go back to the network. */
+    fun activateRegion(id: String?) {
+        if (id != null && !regionStore.isReady(id)) return
+        regionPrefs.activeRegion = id
+        refreshRegions()
+        viewModelScope.launch {
+            applyRouteBase(id?.let { regionServer.baseUrlFor(it) } ?: routeBase)
+        }
+    }
+
+    private suspend fun applyRouteBase(base: String) {
+        runCatching { engine.useRouteBase(base) }
+            .onSuccess { info ->
+                _state.update {
+                    it.copy(
+                        info = it.info?.copy(
+                            routing = info.routing,
+                            routingError = info.routingError,
+                            profile = info.profile,
+                            routeBounds = info.routeBounds
+                        ),
+                        routes = null,
+                        routeError = null
+                    )
+                }
+            }
     }
 
     private fun anchor(): LatLon? = _state.value.userLocation ?: mapCenter
@@ -529,12 +656,18 @@ class MapsViewModel(
         fun factory(
             engine: RangefindEngine,
             locationProvider: LocationProvider,
+            regionStore: RegionStore,
+            regionServer: RegionServer,
+            regionPrefs: RegionPreferences,
             searchBase: String,
             routeBase: String
         ) = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                MapsViewModel(engine, locationProvider, searchBase, routeBase) as T
+                MapsViewModel(
+                    engine, locationProvider, regionStore, regionServer, regionPrefs,
+                    searchBase, routeBase
+                ) as T
         }
     }
 }

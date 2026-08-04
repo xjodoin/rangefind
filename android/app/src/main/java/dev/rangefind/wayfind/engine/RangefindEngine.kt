@@ -7,6 +7,10 @@ package dev.rangefind.wayfind.engine
  */
 interface RangefindEngine {
     suspend fun init(searchBase: String, routeBase: String): EngineInfo
+    /** Repoint routing at another index (a preloaded region, or the network). */
+    suspend fun useRouteBase(routeBase: String): RoutingInfo
+    /** Every file that makes up the index at [baseUrl], for offline preload. */
+    suspend fun regionFiles(baseUrl: String): RegionManifest
     suspend fun search(
         query: String,
         anchor: LatLon?,
@@ -20,6 +24,20 @@ interface RangefindEngine {
 }
 
 data class LatLon(val lat: Double, val lon: Double)
+
+data class RoutingInfo(
+    val routing: Boolean,
+    val routingError: String?,
+    val profile: String,
+    val routeBounds: RouteBounds?
+)
+
+data class RegionManifest(
+    val files: List<String>,
+    val profile: String,
+    val nodes: Long,
+    val leaves: Int
+)
 
 data class EngineInfo(
     val attribution: String,

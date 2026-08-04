@@ -32,6 +32,47 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   other line from where the car already is — they disappear once you commit to
   a branch, because by then they are no longer an option.
 - **Day and night** basemaps, edge-to-edge layout, and full attribution.
+- **Offline regions**: preload a route index onto the device, refresh it, or
+  delete it, and route from it with no network at all.
+
+## Offline regions
+
+Chromium's HTTP cache would keep *some* of an index around, but offers no
+guarantee about what survives, and Range responses are the first thing it
+declines to store. A region the user asked to keep has to be bytes the app
+owns.
+
+Tap the cloud button to open the sheet. Each entry preloads, refreshes, or
+deletes, and one of them can be marked in use. The download list is exact
+rather than guessed: the index root enumerates its own shards, packs and names
+file, so the JS side hands Kotlin the precise file list. Files land in a
+staging directory and are swapped in only once every one has arrived — a
+half-downloaded index would fail deep inside a route instead of simply being
+absent.
+
+Stored regions are served back over a **loopback HTTP socket**, not through
+`shouldInterceptRequest`. WebView's interception cannot answer a Range request
+honestly: Chromium applies its own range handling to whatever the interceptor
+returns, so a 206 is rejected outright and a 200 gets sliced twice — once by
+the browser, again by the runtime — surfacing as a checksum mismatch deep
+inside a route. A real socket on `127.0.0.1` sidesteps all of it.
+
+Two honest limits: **search still needs the network** (the OSM index is
+remote), so offline covers routing only; and a local read costs more bytes
+than the same query over HTTP, because multi-range requests fall back to a
+full-file response, which is cheap from disk but shows up in the fetch
+receipt.
+
+The source host is editable in the sheet. `10.0.2.2` is the emulator's alias
+for your machine's loopback; a phone on Wi-Fi needs your machine's LAN
+address instead. Serve the built indexes with:
+
+```bash
+node scripts/serve.mjs bench/route 5185
+```
+
+which exposes `luxembourg-index/` and `quebec-index/` at the paths the
+catalogue expects.
 
 ## Architecture
 

@@ -1,0 +1,60 @@
+package dev.rangefind.wayfind.region
+
+import android.content.Context
+
+/** A route index the user can keep on the device. */
+data class RegionSpec(val id: String, val label: String, val note: String)
+
+enum class RegionStatus { Absent, Downloading, Ready, Failed }
+
+data class RegionEntry(
+    val spec: RegionSpec,
+    val status: RegionStatus,
+    val bytes: Long = 0,
+    val done: Int = 0,
+    val total: Int = 0,
+    val updatedAt: Long = 0,
+    val error: String? = null,
+    val active: Boolean = false
+) {
+    val progress: Float get() = if (total <= 0) 0f else done.toFloat() / total
+}
+
+/**
+ * The catalogue is deliberately small and explicit rather than discovered:
+ * an index is a deliberate multi-megabyte download, so the user should see
+ * exactly what they are about to keep.
+ */
+val REGION_CATALOG = listOf(
+    RegionSpec("luxembourg", "Luxembourg", "Small test extract"),
+    RegionSpec("quebec", "Québec", "Full province")
+)
+
+/**
+ * Remembers which region is in use and where they are fetched from. The host
+ * is editable because a phone on Wi-Fi cannot reach the emulator's 10.0.2.2
+ * loopback alias — it needs the development machine's LAN address.
+ */
+class RegionPreferences(context: Context) {
+
+    private val prefs = context.getSharedPreferences("wayfind.regions", Context.MODE_PRIVATE)
+
+    var host: String
+        get() = prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST
+        set(value) = prefs.edit().putString(KEY_HOST, value.trim().trimEnd('/')).apply()
+
+    var activeRegion: String?
+        get() = prefs.getString(KEY_ACTIVE, null)
+        set(value) = prefs.edit().apply {
+            if (value == null) remove(KEY_ACTIVE) else putString(KEY_ACTIVE, value)
+        }.apply()
+
+    fun sourceUrlOf(id: String) = "$host/$id-index/"
+
+    private companion object {
+        const val KEY_HOST = "host"
+        const val KEY_ACTIVE = "active"
+        /** The emulator's alias for the development machine's loopback. */
+        const val DEFAULT_HOST = "http://10.0.2.2:5185"
+    }
+}

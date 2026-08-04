@@ -1,0 +1,85 @@
+package dev.rangefind.wayfind.region
+
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.coroutines.coroutineContext
+
+/**
+ * Offline route indexes on local storage.
+ *
+ * Chromium's HTTP cache would keep some of an index around, but it offers no
+ * guarantee about what survives, and Range responses are the first thing it
+ * declines to store. A region the user asked to keep has to be bytes the app
+ * owns — downloaded deliberately, served back over a loopback socket by
+ * [RegionServer], and deleted when they say so.
+ */
+class RegionStore(context: Context) {
+
+    private val root = File(context.filesDir, "regions")
+
+    fun directoryOf(id: String) = File(root, id)
+
+    fun isReady(id: String) = File(directoryOf(id), "manifest.json").isFile
+
+    fun bytesOf(id: String): Long =
+        directoryOf(id).walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+    fun updatedAt(id: String): Long = File(directoryOf(id), "manifest.json").lastModified()
+
+    fun delete(id: String) {
+        directoryOf(id).deleteRecursively()
+    }
+
+    /**
+     * Downloads [files] into a staging directory and swaps it in only once
+     * every file has landed. A half-downloaded index that answered queries
+     * would fail deep inside a route with a checksum error instead of simply
+     * being absent.
+     */
+    suspend fun install(
+        id: String,
+        baseUrl: String,
+        files: List<String>,
+        onProgress: (done: Int, total: Int, bytes: Long) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        val staging = File(root, "$id.staging")
+        staging.deleteRecursively()
+        staging.mkdirs()
+
+        var bytes = 0L
+        files.forEachIndexed { index, relative ->
+            coroutineContext.ensureActive()
+            val target = File(staging, relative)
+            target.parentFile?.mkdirs()
+            bytes += download(URL(URL(baseUrl), relative), target)
+            onProgress(index + 1, files.size, bytes)
+        }
+
+        val destination = directoryOf(id)
+        destination.deleteRecursively()
+        staging.renameTo(destination)
+    }
+
+    private fun download(url: URL, target: File): Long {
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 60_000
+            requestMethod = "GET"
+        }
+        try {
+            if (connection.responseCode !in 200..299) {
+                throw IllegalStateException("${url.path.substringAfterLast('/')}: HTTP ${connection.responseCode}")
+            }
+            target.outputStream().use { out -> connection.inputStream.use { it.copyTo(out) } }
+            return target.length()
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+}

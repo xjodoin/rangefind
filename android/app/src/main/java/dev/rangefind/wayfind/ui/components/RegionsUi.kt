@@ -1,0 +1,256 @@
+package dev.rangefind.wayfind.ui.components
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import dev.rangefind.wayfind.region.RegionEntry
+import dev.rangefind.wayfind.region.RegionStatus
+import dev.rangefind.wayfind.ui.formatBytes
+import java.text.DateFormat
+import java.util.Date
+
+/**
+ * Offline region management. An index is a deliberate multi-megabyte download,
+ * so every row states its size and the user drives every transition: preload,
+ * refresh, delete, and which one routing actually uses.
+ */
+@Composable
+fun RegionsSheet(
+    regions: List<RegionEntry>,
+    host: String,
+    bottomInset: Dp,
+    onHostChange: (String) -> Unit,
+    onPreload: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onActivate: (String?) -> Unit,
+    onClose: () -> Unit
+) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.32f))
+            .clickable(onClick = onClose)
+    )
+
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+        SheetSurface(bottomInset = bottomInset) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Offline regions", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Keep a route index on this device",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "Close",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clickable { onClose() }
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            // A phone on Wi-Fi cannot reach the emulator's loopback alias, so
+            // the source host has to be editable rather than compiled in.
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+            ) {
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    Text(
+                        "Source host",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    BasicTextField(
+                        value = host,
+                        onValueChange = onHostChange,
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            regions.forEach { entry ->
+                RegionRow(
+                    entry = entry,
+                    onPreload = { onPreload(entry.spec.id) },
+                    onDelete = { onDelete(entry.spec.id) },
+                    onActivate = { onActivate(entry.spec.id) }
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onActivate(null) }
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Icon(
+                    if (regions.none { it.active }) Icons.Filled.Check else Icons.Filled.CloudDownload,
+                    contentDescription = null,
+                    tint = if (regions.none { it.active }) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(14.dp))
+                Text(
+                    "Use the network index",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RegionRow(
+    entry: RegionEntry,
+    onPreload: () -> Unit,
+    onDelete: () -> Unit,
+    onActivate: () -> Unit
+) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(entry.spec.label, style = MaterialTheme.typography.titleMedium)
+                    if (entry.active) {
+                        Spacer(Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer
+                        ) {
+                            Text(
+                                "In use",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+                Text(
+                    entry.statusLine(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (entry.status == RegionStatus.Failed) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            when (entry.status) {
+                RegionStatus.Ready -> {
+                    if (!entry.active) {
+                        RegionAction(Icons.Filled.Check, "Use", onActivate)
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    RegionAction(Icons.Filled.Refresh, "Refresh", onPreload)
+                    Spacer(Modifier.width(6.dp))
+                    RegionAction(Icons.Filled.Delete, "Delete", onDelete)
+                }
+                RegionStatus.Downloading -> Unit
+                else -> RegionAction(Icons.Filled.CloudDownload, "Preload", onPreload)
+            }
+        }
+
+        if (entry.status == RegionStatus.Downloading) {
+            Spacer(Modifier.height(8.dp))
+            if (entry.total > 0) {
+                LinearProgressIndicator(
+                    progress = { entry.progress },
+                    modifier = Modifier.fillMaxWidth().height(4.dp)
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(4.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun RegionAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        Box(Modifier.size(width = 44.dp, height = 40.dp), contentAlignment = Alignment.Center) {
+            Icon(
+                icon,
+                contentDescription = label,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+    }
+}
+
+private fun RegionEntry.statusLine(): String = when (status) {
+    RegionStatus.Absent -> spec.note
+    RegionStatus.Downloading ->
+        if (total > 0) "Downloading $done of $total files · ${formatBytes(bytes)}"
+        else "Reading index manifest…"
+    RegionStatus.Ready -> {
+        val stamp = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(updatedAt))
+        "${formatBytes(bytes)} · updated $stamp"
+    }
+    RegionStatus.Failed -> error ?: "Download failed"
+}

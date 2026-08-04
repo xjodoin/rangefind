@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
@@ -50,6 +51,7 @@ import dev.rangefind.wayfind.ui.components.AttributionChip
 import dev.rangefind.wayfind.ui.components.DirectionsSheet
 import dev.rangefind.wayfind.ui.components.NavigationOverlay
 import dev.rangefind.wayfind.ui.components.PlaceSheet
+import dev.rangefind.wayfind.ui.components.RegionsSheet
 import dev.rangefind.wayfind.ui.components.ResultsSheet
 import dev.rangefind.wayfind.ui.components.SearchField
 import dev.rangefind.wayfind.ui.components.SuggestionList
@@ -72,6 +74,11 @@ fun MapScreen(
     onStopNavigation: () -> Unit,
     onExitDirections: () -> Unit,
     onRecenter: () -> Unit,
+    onShowRegions: (Boolean) -> Unit,
+    onRegionHostChange: (String) -> Unit,
+    onPreloadRegion: (String) -> Unit,
+    onDeleteRegion: (String) -> Unit,
+    onActivateRegion: (String?) -> Unit,
     onLongPress: (LatLon) -> Unit,
     onCenterChanged: (LatLon) -> Unit
 ) {
@@ -152,20 +159,40 @@ fun MapScreen(
                 .align(Alignment.BottomEnd)
                 .padding(end = 16.dp, bottom = sheetHeight + 16.dp)
         ) {
-            Surface(
-                onClick = onRecenter,
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.surface,
-                shadowElevation = 6.dp,
-                modifier = Modifier.size(48.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        Icons.Filled.MyLocation,
-                        contentDescription = "Recenter",
-                        tint = if (state.userLocation != null) palette.puck
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Surface(
+                    onClick = { onShowRegions(true) },
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 6.dp,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.CloudDownload,
+                            contentDescription = "Offline regions",
+                            tint = if (state.regions.any { it.active })
+                                MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Surface(
+                    onClick = onRecenter,
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 6.dp,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.MyLocation,
+                            contentDescription = "Recenter",
+                            tint = if (state.userLocation != null) palette.puck
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -220,6 +247,19 @@ fun MapScreen(
                 bottomInset = insets.calculateBottomPadding(),
                 onSelectRoute = onSelectRoute,
                 onStop = onStopNavigation
+            )
+        }
+
+        if (state.showRegions) {
+            RegionsSheet(
+                regions = state.regions,
+                host = state.regionHost,
+                bottomInset = insets.calculateBottomPadding(),
+                onHostChange = onRegionHostChange,
+                onPreload = onPreloadRegion,
+                onDelete = onDeleteRegion,
+                onActivate = onActivateRegion,
+                onClose = { onShowRegions(false) }
             )
         }
 

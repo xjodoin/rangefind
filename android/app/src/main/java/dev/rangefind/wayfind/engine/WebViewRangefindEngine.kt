@@ -117,23 +117,32 @@ class WebViewRangefindEngine(activity: Activity) : RangefindEngine {
             "init",
             JSONObject().put("searchBase", searchBase).put("routeBase", routeBase)
         )
+        val routing = payload.toRoutingInfo()
         return EngineInfo(
             attribution = payload.optString("attribution"),
             license = payload.optString("license"),
             total = payload.optLong("total"),
-            routing = payload.optBoolean("routing"),
-            routingError = payload.optString("routingError").takeIf { it.isNotEmpty() && it != "null" },
+            routing = routing.routing,
+            routingError = routing.routingError,
+            profile = routing.profile,
+            routeBounds = routing.routeBounds
+        )
+    }
+
+    override suspend fun useRouteBase(routeBase: String): RoutingInfo {
+        val payload = call("useRouteBase", JSONObject().put("routeBase", routeBase))
+        return payload.toRoutingInfo()
+    }
+
+    override suspend fun regionFiles(baseUrl: String): RegionManifest {
+        val payload = call("regionFiles", JSONObject().put("baseUrl", baseUrl))
+        val array = payload.optJSONArray("files")
+        return RegionManifest(
+            files = (0 until (array?.length() ?: 0)).mapNotNull { array?.optString(it) }
+                .filter { it.isNotEmpty() },
             profile = payload.optString("profile"),
-            routeBounds = payload.optJSONObject("routeBounds")?.let {
-                val cells = it.optJSONArray("cells")
-                RouteBounds(
-                    minLat = it.optDouble("minLat"),
-                    maxLat = it.optDouble("maxLat"),
-                    minLon = it.optDouble("minLon"),
-                    maxLon = it.optDouble("maxLon"),
-                    cells = DoubleArray(cells?.length() ?: 0) { index -> cells!!.optDouble(index) }
-                )
-            }
+            nodes = payload.optLong("nodes"),
+            leaves = payload.optInt("leaves")
         )
     }
 
@@ -199,7 +208,24 @@ class WebViewRangefindEngine(activity: Activity) : RangefindEngine {
             segment = payload.optString("segment")
         )
     }
+
 }
+
+private fun JSONObject.toRoutingInfo() = RoutingInfo(
+    routing = optBoolean("routing"),
+    routingError = optString("routingError").takeIf { it.isNotEmpty() && it != "null" },
+    profile = optString("profile"),
+    routeBounds = optJSONObject("routeBounds")?.let {
+        val cells = it.optJSONArray("cells")
+        RouteBounds(
+            minLat = it.optDouble("minLat"),
+            maxLat = it.optDouble("maxLat"),
+            minLon = it.optDouble("minLon"),
+            maxLon = it.optDouble("maxLon"),
+            cells = DoubleArray(cells?.length() ?: 0) { index -> cells!!.optDouble(index) }
+        )
+    }
+)
 
 private fun JSONObject.putAnchor(anchor: LatLon?): JSONObject = apply {
     if (anchor != null) {

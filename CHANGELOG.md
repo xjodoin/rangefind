@@ -62,7 +62,11 @@
   autocomplete and map picking, alternatives, time buckets, multi-stop
   itineraries, search-along-route against the live planet index, and a
   Route X-Ray fetch receipt), computed entirely in the browser from
-  static byte ranges. Route cells carry the posted speed limit per edge
+  static byte ranges. The Android app can preload a whole region's route index
+  onto the device, refresh it, or delete it, and route from it with no network
+  at all — served back over a loopback socket, since WebView's request
+  interception cannot answer a Range request honestly. Route cells carry the
+  posted speed limit per edge
   (`rfroutesrc-v4`, cell v5), reported on `route().edges[]` and summarized
   per step, kept separate from the travel weight so it stays a legal limit
   rather than a modelled speed — existing indexes must be re-extracted and

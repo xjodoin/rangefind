@@ -20,6 +20,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.rangefind.wayfind.engine.WebViewRangefindEngine
 import dev.rangefind.wayfind.location.LocationProvider
+import dev.rangefind.wayfind.region.RegionPreferences
+import dev.rangefind.wayfind.region.RegionServer
+import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.ui.MapScreen
 import dev.rangefind.wayfind.ui.MapsViewModel
 import dev.rangefind.wayfind.ui.theme.WayfindTheme
@@ -30,6 +33,7 @@ private const val SEARCH_BASE = "https://osm.rangefind.dev/"
 class MainActivity : ComponentActivity() {
 
     private lateinit var engine: WebViewRangefindEngine
+    private lateinit var regionServer: RegionServer
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,6 +41,9 @@ class MainActivity : ComponentActivity() {
 
         // Built before setContent so the headless host is already parked in the
         // view tree and loading its module graph while the UI composes.
+        val regionStore = RegionStore(this)
+        regionServer = RegionServer(regionStore).apply { start() }
+        val regionPrefs = RegionPreferences(this)
         engine = WebViewRangefindEngine(this)
         val locationProvider = LocationProvider(this)
 
@@ -47,6 +54,9 @@ class MainActivity : ComponentActivity() {
                     factory = MapsViewModel.factory(
                         engine = engine,
                         locationProvider = locationProvider,
+                        regionStore = regionStore,
+                        regionServer = regionServer,
+                        regionPrefs = regionPrefs,
                         searchBase = SEARCH_BASE,
                         routeBase = BuildConfig.ROUTE_BASE_URL
                     )
@@ -101,6 +111,11 @@ class MainActivity : ComponentActivity() {
                     onStopNavigation = viewModel::stopNavigation,
                     onExitDirections = viewModel::exitDirections,
                     onRecenter = viewModel::recenter,
+                    onShowRegions = viewModel::showRegions,
+                    onRegionHostChange = viewModel::setRegionHost,
+                    onPreloadRegion = viewModel::preloadRegion,
+                    onDeleteRegion = viewModel::deleteRegion,
+                    onActivateRegion = viewModel::activateRegion,
                     onLongPress = viewModel::dropPin,
                     onCenterChanged = { viewModel.mapCenter = it }
                 )
@@ -111,6 +126,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         if (::engine.isInitialized) engine.destroy()
+        if (::regionServer.isInitialized) regionServer.stop()
     }
 }
 
