@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.6 — 2026-08-04
+
+### Improved
+
+- Address enrichment now streams gzip-compressed OSM base corpora, allowing
+  large global pipelines to keep raw snapshots compressed between stages.
+
 ## 0.4.5 — 2026-08-04
 
 ### Fixed

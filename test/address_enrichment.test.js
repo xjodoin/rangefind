@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import {
   augmentOsmWithAddressSources,
   createDelimitedAddressSource,
@@ -12,6 +13,32 @@ import {
 async function* records(values) {
   yield* values;
 }
+
+test("address enrichment streams a gzip-compressed OSM base corpus", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-address-enrichment-gzip-"));
+  try {
+    const osmPath = join(root, "osm.jsonl.gz");
+    const outputPath = join(root, "combined.jsonl");
+    const osmDoc = { id: "node/1", name: "Compressed OSM place", lat: 45.64, lon: -73.8 };
+    await writeFile(osmPath, gzipSync(`${JSON.stringify(osmDoc)}\n`));
+    const result = await augmentOsmWithAddressSources({
+      root,
+      osmPath,
+      outputPath,
+      osmDocs: 1,
+      sources: [{
+        id: "address-authority",
+        name: "Address Authority",
+        records: () => records([{ id: "new", houseNumber: "12", street: "Rue Exemple", city: "Rosemère", lat: 45.641, lon: -73.801 }])
+      }]
+    });
+    const docs = (await readFile(outputPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(result.meta.totalDocs, 2);
+    assert.deepEqual(docs[0], osmDoc);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("generic enrichment merges postal authorities and deduplicates civic addresses by source priority", async () => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-address-enrichment-"));

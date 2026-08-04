@@ -2,6 +2,7 @@ import {
   closeSync,
   copyFileSync,
   createReadStream,
+  createWriteStream,
   existsSync,
   mkdirSync,
   openSync,
@@ -18,11 +19,13 @@ import { createRequire } from "node:module";
 import { dirname, extname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
+import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import {
   normalizeAddressAuthorityKey,
   normalizePostalCodeSpacing
 } from "../../../address.js";
+import { createJsonlReadStream } from "../../../jsonl.js";
 
 export const ADDRESS_ENRICHMENT_SCHEMA_VERSION = 1;
 
@@ -454,7 +457,7 @@ function baseAddressKeys(doc) {
 async function indexBaseAddresses(db, osmPath) {
   const insert = db.prepare("INSERT OR IGNORE INTO base_addresses (key) VALUES (?)");
   const batch = beginBatch(db);
-  const lines = createInterface({ input: createReadStream(osmPath), crlfDelay: Infinity });
+  const lines = createInterface({ input: createJsonlReadStream(osmPath), crlfDelay: Infinity });
   let addresses = 0;
   try {
     for await (const line of lines) {
@@ -573,7 +576,11 @@ export async function augmentOsmWithAddressSources(options = {}) {
   mkdirSync(dirname(outputPath), { recursive: true });
   mkdirSync(dirname(sqlitePath), { recursive: true });
   rmSync(outputPartial, { force: true });
-  copyFileSync(osmPath, outputPartial);
+  if (osmPath.toLowerCase().endsWith(".gz")) {
+    await pipeline(createJsonlReadStream(osmPath), createWriteStream(outputPartial));
+  } else {
+    copyFileSync(osmPath, outputPartial);
+  }
   const writer = createAppendJsonlWriter(outputPartial);
   const db = openDedupeStore(sqlitePath);
   const started = performance.now();
