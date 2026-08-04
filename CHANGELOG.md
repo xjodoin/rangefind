@@ -39,8 +39,13 @@
   shortcuts through them, exact wherever states exist and static
   elsewhere, with graceful degradation on provider failure or epoch
   mismatch. `createStaticLiveProvider` ships as the reference
-  implementation, and `docs/pulsemesh.md` specifies the first planned
-  network provider — a privacy-preserving P2P mesh. Turn-angle costs
+  implementation; `docs/pulsemesh.md` specifies the first planned
+  network provider — a privacy-preserving P2P mesh — and
+  `docs/pulsemesh-protocol.md` pins its implementable wire protocol
+  (record/digest/snapshot byte layouts, topic grammar, bin tables, a
+  deterministic integer aggregation algorithm, numbered validation
+  rules, contributor/consumer state machines, and executable-verified
+  test vectors). Turn-angle costs
   ship via full junction expansion into an edge-based graph (per-approach
   junction copies with bearing-priced turns, left costlier than right,
   u-turns penalized), with via-node restrictions as exact per-approach

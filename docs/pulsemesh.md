@@ -14,7 +14,10 @@ This document is rangefind's adaptation of an externally drafted concept
 intact; the sections below note where this version deliberately differs
 and why. Status: **design** — the consumption side (provider contract,
 segment identity, live-metric search) is implemented and tested; the
-mesh itself is not.
+mesh itself is not. The wire-level implementation specification —
+byte layouts, topic grammar, bin tables, the deterministic aggregation
+algorithm, validation rules, state machines, and test vectors — is
+[pulsemesh-protocol.md](pulsemesh-protocol.md).
 
 ## Design rules
 
@@ -222,11 +225,13 @@ graceful degradation, and the `result.live` application report.
 1. **Loopback (no networking).** `createStaticLiveProvider` +
    contributions synthesized from the demo's own simulated drive —
    validates the full contribute→aggregate→route loop in one browser.
-   The engine work for this phase is done.
+   The engine work for this phase is done; milestones M1–M2 of
+   [pulsemesh-protocol.md](pulsemesh-protocol.md) implement it with
+   real protocol bytes.
 2. **Wire prototype.** js-libp2p simulation: churn, convergence time,
    digest bandwidth by density, decoy/batch-size trade-offs, malformed/
    replay/Sybil floods, clock skew. Produces measured defaults for the
-   constants above.
+   constants above (protocol spec milestones M3–M4).
 3. **Corridor pilot.** A handful of commuter corridors with the mobile
    runtime as contributor and browsers as consumers; keeper nodes for
    sparsity; read-only mode default.
