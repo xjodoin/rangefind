@@ -123,7 +123,17 @@ class WebViewRangefindEngine(activity: Activity) : RangefindEngine {
             total = payload.optLong("total"),
             routing = payload.optBoolean("routing"),
             routingError = payload.optString("routingError").takeIf { it.isNotEmpty() && it != "null" },
-            profile = payload.optString("profile")
+            profile = payload.optString("profile"),
+            routeBounds = payload.optJSONObject("routeBounds")?.let {
+                val cells = it.optJSONArray("cells")
+                RouteBounds(
+                    minLat = it.optDouble("minLat"),
+                    maxLat = it.optDouble("maxLat"),
+                    minLon = it.optDouble("minLon"),
+                    maxLon = it.optDouble("maxLon"),
+                    cells = DoubleArray(cells?.length() ?: 0) { index -> cells!!.optDouble(index) }
+                )
+            }
         )
     }
 

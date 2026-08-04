@@ -242,7 +242,9 @@ fun PlaceSheet(
     onDirections: () -> Unit
 ) {
     val place = state.selected ?: return
-    val routingReady = state.info?.routing == true
+    val bounds = state.info?.routeBounds
+    val outsideCoverage = bounds != null && !bounds.contains(place.point)
+    val routingReady = state.info?.routing == true && !outsideCoverage
 
     SheetSurface(bottomInset = bottomInset) {
         Row(
@@ -304,13 +306,27 @@ fun PlaceSheet(
         ) {
             Icon(Icons.Filled.Directions, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(10.dp))
-            Text(if (routingReady) "Directions" else "Routing unavailable", style = MaterialTheme.typography.labelLarge)
+            Text(
+                when {
+                    routingReady -> "Directions"
+                    outsideCoverage -> "Outside route coverage"
+                    else -> "Routing unavailable"
+                },
+                style = MaterialTheme.typography.labelLarge
+            )
         }
 
-        if (!routingReady && state.info?.routingError != null) {
+        // Search and the basemap are worldwide; the route graph is not. Say so
+        // here rather than letting the user press a button that cannot work.
+        val note = when {
+            routingReady -> null
+            outsideCoverage -> "The route map covers a limited region, and this place falls outside it."
+            else -> state.info?.routingError
+        }
+        if (note != null) {
             Spacer(Modifier.height(8.dp))
             Text(
-                state.info.routingError,
+                note,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 20.dp)

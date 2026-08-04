@@ -235,6 +235,19 @@ class MapsViewModel(
 
     fun requestDirections(target: Place? = null) {
         val destination = target ?: _state.value.selected ?: return
+        val bounds = _state.value.info?.routeBounds
+        if (bounds != null && !bounds.contains(destination.point)) {
+            _state.update {
+                it.copy(
+                    selected = destination,
+                    sheet = SheetMode.Directions,
+                    routes = null,
+                    routing = false,
+                    routeError = OUT_OF_COVERAGE
+                )
+            }
+            return
+        }
         val origin = _state.value.userLocation
         if (origin == null) {
             _state.update { it.copy(routeError = "Waiting for your location", sheet = SheetMode.Directions, selected = destination) }
@@ -255,8 +268,25 @@ class MapsViewModel(
             runCatching { engine.route(origin, destination.point, alternatives = 2) }
                 .onSuccess { bundle -> _state.update { it.copy(routing = false, routes = bundle) } }
                 .onFailure { error ->
-                    _state.update { it.copy(routing = false, routeError = error.message ?: "No route found") }
+                    _state.update { it.copy(routing = false, routeError = humanizeRouteError(error)) }
                 }
+        }
+    }
+
+    /**
+     * Engine diagnostics name byte distances and raw coordinates. Useful in a
+     * log, useless on a phone: a failed snap almost always means the place sits
+     * outside the region this route graph was built for.
+     */
+    private fun humanizeRouteError(error: Throwable): String {
+        val message = error.message.orEmpty()
+        val bounds = _state.value.info?.routeBounds
+        val outside = _state.value.selected?.point?.let { bounds != null && !bounds.contains(it) } ?: false
+        return when {
+            outside || message.contains("Nearest road", ignoreCase = true) -> OUT_OF_COVERAGE
+            message.contains("no route", ignoreCase = true) -> "No driveable route to this place."
+            message.isBlank() -> "Directions are unavailable right now."
+            else -> message
         }
     }
 
@@ -407,6 +437,8 @@ class MapsViewModel(
     }
 
     companion object {
+        private const val OUT_OF_COVERAGE =
+            "This place is outside the area covered by the route map."
         private const val OFF_ROUTE_METERS = 45.0
         private const val OFF_ROUTE_STRIKES = 3
         private const val ARRIVAL_METERS = 25.0

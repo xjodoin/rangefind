@@ -27,8 +27,55 @@ data class EngineInfo(
     val total: Long,
     val routing: Boolean,
     val routingError: String?,
-    val profile: String
+    val profile: String,
+    /** Extent of the route graph. Search and the basemap are worldwide; this is not. */
+    val routeBounds: RouteBounds?
 )
+
+/**
+ * Extent of the route graph: the overall envelope plus the leaf boxes that
+ * tile it. The envelope alone spans neighbouring countries the extract never
+ * covered, so containment is tested per leaf.
+ */
+data class RouteBounds(
+    val minLat: Double,
+    val maxLat: Double,
+    val minLon: Double,
+    val maxLon: Double,
+    /** Flat [minLat, maxLat, minLon, maxLon] runs, one per leaf cell. */
+    val cells: DoubleArray
+) {
+    fun contains(point: LatLon): Boolean {
+        // Cheap envelope reject first.
+        if (point.lat < minLat - MARGIN_DEG || point.lat > maxLat + MARGIN_DEG) return false
+        if (point.lon < minLon - MARGIN_DEG || point.lon > maxLon + MARGIN_DEG) return false
+        if (cells.isEmpty()) return true
+
+        var i = 0
+        while (i + 3 < cells.size) {
+            if (point.lat >= cells[i] - MARGIN_DEG && point.lat <= cells[i + 1] + MARGIN_DEG &&
+                point.lon >= cells[i + 2] - MARGIN_DEG && point.lon <= cells[i + 3] + MARGIN_DEG
+            ) {
+                return true
+            }
+            i += 4
+        }
+        return false
+    }
+
+    override fun equals(other: Any?): Boolean =
+        other is RouteBounds && minLat == other.minLat && maxLat == other.maxLat &&
+            minLon == other.minLon && maxLon == other.maxLon && cells.contentEquals(other.cells)
+
+    override fun hashCode(): Int =
+        (((minLat.hashCode() * 31 + maxLat.hashCode()) * 31 + minLon.hashCode()) * 31 +
+            maxLon.hashCode()) * 31 + cells.contentHashCode()
+
+    private companion object {
+        /** Slightly beyond the engine's 250 m snap limit, in degrees. */
+        const val MARGIN_DEG = 0.004
+    }
+}
 
 data class Place(
     val id: String,

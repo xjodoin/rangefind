@@ -105,13 +105,46 @@ const handlers = {
       routeUnavailable = "No route index configured";
     }
 
+    // The route graph covers whatever region it was built for, while search
+    // and the basemap are worldwide. Publishing its extent lets the app say
+    // "outside the routable area" instead of failing a snap 5 km from a road.
+    // A single rectangle around the whole graph is too generous — it spans
+    // neighbouring countries the extract never included. The leaf boxes tile
+    // the actual node distribution, so shipping them lets the app tell the
+    // difference between "3 km past the border" and "in a covered town".
+    let routeBounds = null;
+    const leaves = routeEngine?.root?.leaves;
+    if (leaves?.length) {
+      let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
+      const cells = [];
+      for (const leaf of leaves) {
+        const box = leaf.bbox;
+        if (!box) continue;
+        if (box.minLat < minLat) minLat = box.minLat;
+        if (box.maxLat > maxLat) maxLat = box.maxLat;
+        if (box.minLon < minLon) minLon = box.minLon;
+        if (box.maxLon > maxLon) maxLon = box.maxLon;
+        cells.push(box.minLat / 1e7, box.maxLat / 1e7, box.minLon / 1e7, box.maxLon / 1e7);
+      }
+      if (Number.isFinite(minLat)) {
+        routeBounds = {
+          minLat: minLat / 1e7,
+          maxLat: maxLat / 1e7,
+          minLon: minLon / 1e7,
+          maxLon: maxLon / 1e7,
+          cells
+        };
+      }
+    }
+
     return {
       attribution: meta.attribution || "© OpenStreetMap contributors",
       license: meta.license || "ODbL-1.0",
       total: searchEngine.manifest?.total ?? 0,
       routing: Boolean(routeEngine),
       routingError: routeUnavailable,
-      profile: routeEngine?.root?.profile || ""
+      profile: routeEngine?.root?.profile || "",
+      routeBounds
     };
   },
 
