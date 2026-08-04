@@ -1,5 +1,12 @@
 import { createSearch } from "./runtime.browser.js";
-import { decodePolyline, reverseGeocodeOsm, searchOsmQuery, suggestOsmQuery } from "./osm.browser.js";
+import {
+  decodePolyline,
+  matchPointToRoute,
+  prepareRoute,
+  reverseGeocodeOsm,
+  searchOsmQuery,
+  suggestOsmQuery
+} from "./osm.browser.js";
 import { openRouteGraphUrl } from "./route.browser.js";
 import { geometryFeatureBounds, resultGeometryFeature } from "./result_geometry.js";
 
@@ -1831,8 +1838,14 @@ function highlightStopSuggest(stop) {
 
 // --- Route rendering -------------------------------------------------------
 
-function ensureRouteLayers() {
-  if (map.getSource("routeLines")) return;
+// The map style may still be loading when the first draw happens (slow
+// raster tiles); addSource/addLayer throw until it settles. All route
+// drawing funnels through setRouteFeatures, which queues the latest feature
+// set until the map is ready and never lets a style race break data flow.
+let pendingRouteFeatures = null;
+let routeLayersWaiting = false;
+
+function createRouteLayers() {
   map.addSource("routeLines", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
   map.addLayer({
     id: "route-alt",
@@ -1864,6 +1877,19 @@ function ensureRouteLayers() {
     paint: { "line-color": ["get", "color"], "line-width": 4.5, "line-opacity": 0.96 }
   });
   map.addLayer({
+    id: "route-coarse",
+    type: "line",
+    source: "routeLines",
+    filter: ["==", ["get", "kind"], "coarse"],
+    layout: { "line-join": "round" },
+    paint: {
+      "line-color": ROUTE_COLORS.active,
+      "line-width": 3.5,
+      "line-opacity": 0.65,
+      "line-dasharray": [0.8, 1.6]
+    }
+  });
+  map.addLayer({
     id: "route-snap-line",
     type: "line",
     source: "routeLines",
@@ -1888,6 +1914,34 @@ function ensureRouteLayers() {
   });
   map.on("mouseenter", "route-alt", () => { map.getCanvas().style.cursor = "pointer"; });
   map.on("mouseleave", "route-alt", () => { map.getCanvas().style.cursor = ""; });
+}
+
+function setRouteFeatures(features) {
+  pendingRouteFeatures = features;
+  if (!map.getSource("routeLines")) {
+    let created = false;
+    if (map.isStyleLoaded()) {
+      try {
+        createRouteLayers();
+        created = true;
+      } catch {
+        // fall through to the retry below
+      }
+    }
+    if (!created) {
+      // Style still settling (slow raster tiles): retry until it accepts
+      // the source, drawing whatever the latest pending feature set is.
+      if (!routeLayersWaiting) {
+        routeLayersWaiting = true;
+        setTimeout(() => {
+          routeLayersWaiting = false;
+          if (pendingRouteFeatures) setRouteFeatures(pendingRouteFeatures);
+        }, 400);
+      }
+      return;
+    }
+  }
+  map.getSource("routeLines")?.setData({ type: "FeatureCollection", features });
 }
 
 function lineFeature(geometry, properties) {
@@ -1922,7 +1976,6 @@ function snapFeatures() {
 }
 
 function drawRoutePlan() {
-  ensureRouteLayers();
   const features = [];
   if (routePlan?.kind === "pair") {
     for (const [index, candidate] of routePlan.candidates.entries()) {
@@ -1941,11 +1994,11 @@ function drawRoutePlan() {
     }
   }
   features.push(...snapFeatures());
-  map.getSource("routeLines")?.setData({ type: "FeatureCollection", features });
+  setRouteFeatures(features);
 }
 
 function clearRouteLayers() {
-  map.getSource("routeLines")?.setData({ type: "FeatureCollection", features: [] });
+  setRouteFeatures([]);
 }
 
 function clearStopMarkers() {
@@ -1973,13 +2026,7 @@ function updateStopMarkers() {
 
 function drawRoutePlanIfAny() {
   if (routePlan) drawRoutePlan();
-  else if (map.getSource("routeLines")) {
-    map.getSource("routeLines").setData({ type: "FeatureCollection", features: snapFeatures() });
-    ensureRouteLayers();
-  } else if (snapFeatures().length) {
-    ensureRouteLayers();
-    map.getSource("routeLines").setData({ type: "FeatureCollection", features: snapFeatures() });
-  }
+  else setRouteFeatures(snapFeatures());
 }
 
 function activeRouteGeometry() {
@@ -2241,6 +2288,7 @@ function renderRouteCard() {
   }
   renderSteps();
   routeStepsWrap.open = true;
+  routeNavActions.hidden = !routeEngine;
 }
 
 function renderRouteReceipt(ms) {
@@ -2310,6 +2358,626 @@ function runCorridorSearch(query, label, chip) {
   runSearch({ fit: false });
   routeStepsWrap.open = false;
 }
+
+// --- Live navigation -------------------------------------------------------
+//
+// Turn-by-turn over the same static substrate: the position stream (real
+// geolocation or a simulated demo drive replaying the route at the road
+// speeds the metric itself modeled) is matched against the active route with
+// rangefind's own corridor math (prepareRoute / matchPointToRoute), and going
+// off route triggers a client-side reroute whose coarse polyline renders
+// before the exact geometry finishes unpacking.
+
+const atlasEl = document.querySelector(".atlas");
+const navHud = document.querySelector("#navHud");
+const navBanner = document.querySelector("#navBanner");
+const navGlyph = document.querySelector("#navGlyph");
+const navDistanceEl = document.querySelector("#navDistance");
+const navInstructionEl = document.querySelector("#navInstruction");
+const navThen = document.querySelector("#navThen");
+const navThenGlyph = document.querySelector("#navThenGlyph");
+const navThenName = document.querySelector("#navThenName");
+const navFooter = document.querySelector("#navFooter");
+const navProgressFill = document.querySelector("#navProgressFill");
+const navEtaEl = document.querySelector("#navEta");
+const navRemainingEl = document.querySelector("#navRemaining");
+const navSourceTag = document.querySelector("#navSourceTag");
+const navSpeedGroup = document.querySelector("#navSpeedGroup");
+const navOffRouteButton = document.querySelector("#navOffRouteButton");
+const navMuteButton = document.querySelector("#navMuteButton");
+const navRecenterButton = document.querySelector("#navRecenterButton");
+const navEndButton = document.querySelector("#navEndButton");
+const navStepsWrap = document.querySelector("#navStepsWrap");
+const navStepsEl = document.querySelector("#navSteps");
+const routeNavActions = document.querySelector("#routeNavActions");
+const navDemoButton = document.querySelector("#navDemoButton");
+const navGpsButton = document.querySelector("#navGpsButton");
+
+const NAV_SIM_TICK_MS = 350;
+const NAV_OFF_ROUTE_METERS = 40;
+const NAV_ARRIVE_METERS = 30;
+const NAV_EARTH_M_PER_DEG = 111320;
+
+let nav = null;
+
+// Inline SVG maneuver glyphs (24x24, stroked with currentColor). Left-side
+// variants mirror the right-side path with a scaleX(-1) transform.
+const NAV_GLYPHS = {
+  depart: '<path d="M12 21V8"/><path d="M7 12l5-6 5 6"/>',
+  straight: '<path d="M12 21V8"/><path d="M7 12l5-6 5 6"/>',
+  slight: '<path d="M10 21v-7l6-6"/><path d="M11 7h6v6"/>',
+  turn: '<path d="M8 21v-8a3 3 0 0 1 3-3h7"/><path d="M14 5l5 5-5 5"/>',
+  sharp: '<path d="M9 21V9l9 8"/><path d="M18 11v6h-6"/>',
+  uturn: '<path d="M16 21v-9a4 4 0 0 0-8 0v4"/><path d="M4.5 13.5L8 18l3.5-4.5"/>',
+  arrive: '<circle cx="12" cy="12" r="7.5"/><circle cx="12" cy="12" r="2.6" fill="currentColor" stroke="none"/>'
+};
+
+function maneuverGlyphSvg(maneuver) {
+  const body = NAV_GLYPHS[maneuver?.type] || NAV_GLYPHS.straight;
+  const mirror = maneuver?.side === "left" ? ' transform="scale(-1,1) translate(-24,0)"' : "";
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g${mirror}>${body}</g></svg>`;
+}
+
+function maneuverPhrase(maneuver, { spoken = false } = {}) {
+  const road = maneuver.name || (spoken ? "the unnamed road" : "unnamed road");
+  switch (maneuver.type) {
+    case "arrive": return spoken ? "arrive at your destination" : "Arrive at destination";
+    case "uturn": return spoken ? "make a U-turn" : "Make a U-turn";
+    case "straight": return `${spoken ? "continue straight onto" : "Continue onto"} ${road}`;
+    case "slight": return `${spoken ? `bear ${maneuver.side} onto` : `Bear ${maneuver.side} onto`} ${road}`;
+    case "sharp": return `${spoken ? `turn sharply ${maneuver.side} onto` : `Sharp ${maneuver.side} onto`} ${road}`;
+    default: return `${spoken ? `turn ${maneuver.side} onto` : `Turn ${maneuver.side} onto`} ${road}`;
+  }
+}
+
+function navFormatCountdown(meters) {
+  if (meters <= 20) return "Now";
+  if (meters >= 1000) return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(meters / 1000)} km`;
+  return `${Math.round(meters / 10) * 10} m`;
+}
+
+function offsetPointMeters(lat, lon, bearingDegrees, meters) {
+  const bearing = bearingDegrees * Math.PI / 180;
+  const dLat = (Math.cos(bearing) * meters) / NAV_EARTH_M_PER_DEG;
+  const dLon = (Math.sin(bearing) * meters) / (NAV_EARTH_M_PER_DEG * Math.cos(lat * Math.PI / 180));
+  return { lat: lat + dLat, lon: lon + dLon };
+}
+
+function pointAtProgress(prepared, meters) {
+  const segments = prepared.segments;
+  const target = Math.max(0, Math.min(prepared.totalMeters, meters));
+  let low = 0;
+  let high = segments.length - 1;
+  while (low < high) {
+    const mid = (low + high + 1) >> 1;
+    if (segments[mid].startMeters <= target) low = mid;
+    else high = mid - 1;
+  }
+  const segment = segments[low];
+  const ratio = segment.lengthMeters ? Math.max(0, Math.min(1, (target - segment.startMeters) / segment.lengthMeters)) : 0;
+  return {
+    lat: segment.start.lat + (segment.end.lat - segment.start.lat) * ratio,
+    lon: segment.start.lon + (segment.end.lon - segment.start.lon) * ratio,
+    bearing: segment.bearingDegrees
+  };
+}
+
+function classifyTurn(bearingIn, bearingOut) {
+  const delta = ((bearingOut - bearingIn + 540) % 360) - 180;
+  const magnitude = Math.abs(delta);
+  const side = delta >= 0 ? "right" : "left";
+  if (magnitude <= 28) return { type: "straight", side };
+  if (magnitude <= 62) return { type: "slight", side };
+  if (magnitude <= 140) return { type: "turn", side };
+  if (magnitude <= 166) return { type: "sharp", side };
+  return { type: "uturn", side };
+}
+
+// Precomputed per-route navigation model: the corridor-matched polyline, the
+// step boundaries mapped onto it, and a classified maneuver per boundary.
+function buildNavModel(route, destinationLabel) {
+  // prepareRoute reads coordinate ARRAYS in GeoJSON [lon, lat] order; route
+  // geometry is [lat, lon] pairs, so hand it unambiguous {lat, lon} objects.
+  const prepared = prepareRoute(route.geometry.map(([lat, lon]) => ({ lat, lon })), { corridorMeters: 1000 });
+  const steps = route.steps || [];
+  const stepsTotal = steps.reduce((sum, step) => sum + step.meters, 0) || 1;
+  const scale = prepared.totalMeters / stepsTotal;
+  const starts = [];
+  const cumSeconds = [];
+  let meters = 0;
+  let seconds = 0;
+  for (const step of steps) {
+    starts.push(meters * scale);
+    cumSeconds.push(seconds);
+    meters += step.meters;
+    seconds += step.seconds;
+  }
+  const totalSeconds = seconds;
+  const maneuvers = new Array(steps.length + 1);
+  for (let i = 1; i < steps.length; i++) {
+    const boundary = starts[i];
+    const inBearing = pointAtProgress(prepared, Math.max(0, boundary - 10)).bearing;
+    const outBearing = pointAtProgress(prepared, Math.min(prepared.totalMeters, boundary + 10)).bearing;
+    maneuvers[i] = { ...classifyTurn(inBearing, outBearing), name: steps[i].name || "" };
+  }
+  maneuvers[0] = { type: "depart", side: "right", name: steps[0]?.name || "" };
+  maneuvers[steps.length] = { type: "arrive", side: "right", name: destinationLabel || "" };
+  return { prepared, steps, starts, cumSeconds, totalSeconds, scale, maneuvers, total: prepared.totalMeters };
+}
+
+// Boundary the vehicle is approaching: index i means the maneuver entering
+// step i (i === steps.length is arrival). The current step is i - 1.
+function navNextBoundary(model, progress) {
+  for (let i = 1; i < model.starts.length; i++) {
+    if (model.starts[i] > progress + 1) return i;
+  }
+  return model.steps.length;
+}
+
+function navRemainingSeconds(model, progress) {
+  const boundary = navNextBoundary(model, progress);
+  const stepIndex = boundary - 1;
+  const step = model.steps[stepIndex];
+  const stepStart = model.starts[stepIndex];
+  const stepMeters = (step?.meters || 0) * model.scale || 1;
+  const within = Math.max(0, Math.min(1, (progress - stepStart) / stepMeters));
+  const elapsed = model.cumSeconds[stepIndex] + (step?.seconds || 0) * within;
+  return Math.max(0, model.totalSeconds - elapsed);
+}
+
+function navSpeak(text) {
+  if (!nav || nav.muted) return;
+  if (typeof speechSynthesis === "undefined" || typeof SpeechSynthesisUtterance !== "function") return;
+  try {
+    speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.rate = 1.05;
+    speechSynthesis.speak(utterance);
+  } catch {
+    // Voice guidance is strictly best-effort.
+  }
+}
+
+function navRouteSource() {
+  if (routePlan?.kind === "pair") {
+    const active = routePlan.candidates[routePlan.active];
+    return active?.geometry ? active : null;
+  }
+  if (routePlan?.kind === "trip") {
+    const geometry = activeRouteGeometry();
+    if (!geometry) return null;
+    return {
+      geometry,
+      steps: routePlan.trip.legs.flatMap(leg => leg.steps || []),
+      seconds: routePlan.trip.totalSeconds,
+      distanceMeters: routePlan.trip.totalMeters,
+      bucket: routePlan.trip.legs[0]?.bucket || routeBucketNames[0] || "base"
+    };
+  }
+  return null;
+}
+
+function drawNavRoute(geometry, { coarse = false } = {}) {
+  setRouteFeatures(geometry
+    ? [lineFeature(geometry, coarse ? { kind: "coarse" } : { kind: "active", color: ROUTE_COLORS.active })]
+    : []);
+}
+
+function renderNavSteps() {
+  navStepsEl.replaceChildren(...nav.model.steps.map((step, index) => {
+    const item = document.createElement("li");
+    item.className = "nav-step";
+    const glyph = document.createElement("span");
+    glyph.className = "nav-step__glyph";
+    glyph.innerHTML = maneuverGlyphSvg(nav.model.maneuvers[index]);
+    const name = document.createElement("span");
+    name.className = "nav-step__name";
+    if (step.name) name.textContent = step.name;
+    else {
+      name.textContent = "Unnamed road";
+      name.classList.add("is-unnamed");
+    }
+    const meters = document.createElement("span");
+    meters.className = "nav-step__meters";
+    meters.textContent = formatDistance(step.meters);
+    item.append(glyph, name, meters);
+    return item;
+  }));
+}
+
+function updateNavStepsHighlight(currentIndex) {
+  const items = navStepsEl.children;
+  for (let i = 0; i < items.length; i++) {
+    items[i].classList.toggle("is-current", i === currentIndex);
+    items[i].classList.toggle("is-done", i < currentIndex);
+  }
+  if (navStepsWrap.open && items[currentIndex]) {
+    items[currentIndex].scrollIntoView({ block: "nearest" });
+  }
+}
+
+function updateNavHud() {
+  const model = nav.model;
+  const progress = nav.progress;
+  const boundary = navNextBoundary(model, progress);
+  const maneuver = model.maneuvers[boundary];
+  const distToManeuver = Math.max(0, (boundary >= model.starts.length ? model.total : model.starts[boundary]) - progress);
+  navGlyph.innerHTML = maneuverGlyphSvg(maneuver);
+  navDistanceEl.textContent = navFormatCountdown(distToManeuver);
+  navInstructionEl.textContent = maneuverPhrase(maneuver);
+  const followup = model.maneuvers[boundary + 1];
+  if (followup && distToManeuver < 250) {
+    navThen.hidden = false;
+    navThenGlyph.innerHTML = maneuverGlyphSvg(followup);
+    navThenName.textContent = followup.type === "arrive"
+      ? "arrive at destination"
+      : followup.name || "unnamed road";
+  } else {
+    navThen.hidden = true;
+  }
+  const remainingSeconds = navRemainingSeconds(model, progress);
+  const remainingMeters = Math.max(0, model.total - progress);
+  navEtaEl.textContent = formatDuration(remainingSeconds);
+  navRemainingEl.textContent = formatDistance(remainingMeters);
+  navProgressFill.style.width = `${Math.min(100, (progress / model.total) * 100).toFixed(1)}%`;
+  updateNavStepsHighlight(boundary - 1);
+
+  // Voice guidance: a long-range cue near 300 m and a short-range cue near
+  // 60 m, each spoken once per boundary.
+  if (boundary !== nav.voicedBoundary) {
+    nav.voicedBoundary = boundary;
+    nav.voicedLevels = 0;
+  }
+  if (maneuver.type !== "depart") {
+    if (!(nav.voicedLevels & 2) && distToManeuver <= 65) {
+      nav.voicedLevels |= 3;
+      navSpeak(maneuverPhrase(maneuver, { spoken: true }));
+    } else if (!(nav.voicedLevels & 1) && distToManeuver <= 320 && distToManeuver > 65) {
+      nav.voicedLevels |= 1;
+      navSpeak(`In ${Math.round(distToManeuver / 50) * 50} meters, ${maneuverPhrase(maneuver, { spoken: true })}`);
+    }
+  }
+}
+
+// Animated camera ops depend on requestAnimationFrame, which hidden tabs
+// never receive — a backgrounded easeTo would freeze mid-flight. Jump there.
+function navCameraTo(options, duration) {
+  if (document.visibilityState === "hidden") {
+    map.jumpTo(options);
+    return;
+  }
+  map.easeTo({ ...options, duration, easing: t => t, essential: true });
+}
+
+function updateNavCamera(lat, lon, bearing, duration) {
+  if (!nav.follow) return;
+  navCameraTo({ center: [lon, lat], bearing, pitch: 48 }, duration);
+}
+
+function navHandleFix(lat, lon, headingHint) {
+  if (!nav || nav.arrived) return;
+  const match = matchPointToRoute(nav.model.prepared, lat, lon);
+  const bearing = Number.isFinite(headingHint) ? headingHint : match.bearingDegrees;
+  nav.lastFix = { lat, lon, bearing };
+  nav.puck?.setLngLat([lon, lat]);
+  nav.puck?.setRotation(bearing);
+  updateNavCamera(lat, lon, bearing, nav.source === "sim" ? NAV_SIM_TICK_MS + 60 : 900);
+  if (nav.rerouting) return;
+  if (match.distanceMeters > NAV_OFF_ROUTE_METERS) {
+    nav.offRouteCount++;
+    if (nav.offRouteCount >= 2) startNavReroute(lat, lon);
+    return;
+  }
+  nav.offRouteCount = 0;
+  nav.progress = match.progressMeters;
+  if (nav.progress >= nav.model.total - NAV_ARRIVE_METERS) {
+    navArrive();
+    return;
+  }
+  updateNavHud();
+}
+
+function navArrive() {
+  nav.arrived = true;
+  clearInterval(nav.simTimer);
+  nav.simTimer = null;
+  navBanner.dataset.state = "arrived";
+  navGlyph.innerHTML = maneuverGlyphSvg({ type: "arrive" });
+  navDistanceEl.textContent = "Arrived";
+  navInstructionEl.textContent = nav.destinationLabel
+    ? `You have arrived at ${nav.destinationLabel}`
+    : "You have arrived";
+  navThen.hidden = true;
+  navProgressFill.style.width = "100%";
+  navEtaEl.textContent = "0 min";
+  navRemainingEl.textContent = "0 m";
+  navSpeedGroup.hidden = true;
+  navOffRouteButton.hidden = true;
+  updateNavStepsHighlight(nav.model.steps.length);
+  navSpeak("You have arrived at your destination");
+  showToast("You have arrived — nicely driven.", "info");
+}
+
+function installNavRoute(route) {
+  nav.route = route;
+  nav.model = buildNavModel(route, nav.destinationLabel);
+  nav.progress = 0;
+  nav.offRouteCount = 0;
+  nav.voicedBoundary = -1;
+  nav.voicedLevels = 0;
+  if (nav.sim) {
+    nav.sim.progress = 0;
+    nav.sim.veer = null;
+  }
+  drawNavRoute(route.geometry);
+  renderNavSteps();
+  updateNavHud();
+}
+
+async function startNavReroute(lat, lon) {
+  if (!routeEngine || nav.rerouting) return;
+  nav.rerouting = true;
+  nav.offRouteCount = 0;
+  navBanner.dataset.state = "rerouting";
+  navGlyph.innerHTML = maneuverGlyphSvg({ type: "straight" });
+  navDistanceEl.textContent = "Rerouting…";
+  navInstructionEl.textContent = "Computing a new route from your position";
+  navThen.hidden = true;
+  navSpeak("Rerouting");
+  const generation = nav.generation;
+  try {
+    const route = await routeEngine.route({
+      from: { lat, lon },
+      to: nav.destination,
+      bucket: nav.route.bucket,
+      onCoarseRoute: coarse => {
+        if (nav && nav.generation === generation) drawNavRoute(coarse.geometry, { coarse: true });
+      }
+    });
+    if (!nav || nav.generation !== generation) return;
+    // The rerouted path replaces the whole plan so exiting navigation shows it.
+    routePlan = { kind: "pair", candidates: [route], active: 0 };
+    installNavRoute(route);
+    navBanner.dataset.state = "";
+    showToast(`Rerouted — ${formatDuration(route.seconds)} to destination`, "info");
+    setTimeout(() => { if (nav && !nav.muted) navSpeak(maneuverPhrase(nav.model.maneuvers[navNextBoundary(nav.model, 0)] || nav.model.maneuvers[0], { spoken: true })); }, 250);
+  } catch (error) {
+    if (!nav || nav.generation !== generation) return;
+    navBanner.dataset.state = "";
+    showToast(error?.code === "RANGEFIND_ROUTE_SNAP_TOO_FAR"
+      ? "Can't reroute yet — no road near your position."
+      : "Rerouting failed — trying again shortly.", "error");
+    // Back off a little before the next attempt.
+    nav.offRouteCount = -4;
+  } finally {
+    if (nav && nav.generation === generation) nav.rerouting = false;
+  }
+}
+
+function navSimTick() {
+  if (!nav?.sim || nav.arrived) return;
+  const sim = nav.sim;
+  // Wall-clock dt: hidden tabs throttle timers, so a fixed per-tick step
+  // would slow the drive down. Clamp to keep resumes from teleporting.
+  const now = performance.now();
+  const elapsed = Math.min(2, (now - (sim.lastTick || now)) / 1000) || NAV_SIM_TICK_MS / 1000;
+  sim.lastTick = now;
+  const dt = elapsed * nav.speed;
+  if (sim.veer) {
+    sim.veer.dist += 11 * dt;
+    const pos = offsetPointMeters(sim.veer.lat, sim.veer.lon, sim.veer.bearing, sim.veer.dist);
+    navHandleFix(pos.lat, pos.lon, sim.veer.bearing);
+    return;
+  }
+  const model = nav.model;
+  const boundary = navNextBoundary(model, sim.progress);
+  const step = model.steps[boundary - 1];
+  const speed = step && step.seconds > 0 ? Math.max(3.5, (step.meters * model.scale) / step.seconds) : 12;
+  sim.progress = Math.min(model.total, sim.progress + speed * dt);
+  const point = pointAtProgress(model.prepared, sim.progress);
+  // GPS-like jitter: a small smoothed random walk, in meters.
+  sim.jitterX = sim.jitterX * 0.72 + (Math.random() - 0.5) * 2.4;
+  sim.jitterY = sim.jitterY * 0.72 + (Math.random() - 0.5) * 2.4;
+  const lat = point.lat + sim.jitterY / NAV_EARTH_M_PER_DEG;
+  const lon = point.lon + sim.jitterX / (NAV_EARTH_M_PER_DEG * Math.cos(point.lat * Math.PI / 180));
+  navHandleFix(lat, lon, point.bearing);
+}
+
+function navSetSpeed(multiplier) {
+  if (!nav) return;
+  nav.speed = multiplier;
+  for (const option of navSpeedGroup.querySelectorAll("[data-nav-speed]")) {
+    option.classList.toggle("active", Number(option.dataset.navSpeed) === multiplier);
+  }
+}
+
+function startNavigation(source) {
+  const route = navRouteSource();
+  if (!route || !routeEngine || nav) return;
+  const destinationStop = stops[stops.length - 1];
+  const destination = destinationStop?.place
+    ? { lat: destinationStop.place.lat, lon: destinationStop.place.lon }
+    : { lat: route.geometry[route.geometry.length - 1][0], lon: route.geometry[route.geometry.length - 1][1] };
+  nav = {
+    source,
+    generation: Date.now(),
+    route,
+    destination,
+    destinationLabel: destinationStop?.place?.label || "",
+    muted: false,
+    follow: true,
+    speed: 4,
+    progress: 0,
+    offRouteCount: 0,
+    rerouting: false,
+    arrived: false,
+    voicedBoundary: -1,
+    voicedLevels: 0,
+    sim: null,
+    simTimer: null,
+    watchId: null,
+    puck: null
+  };
+  nav.model = buildNavModel(route, nav.destinationLabel);
+  cancelStopPick();
+  hidePlaceLens();
+  clearCorridorResults();
+  hideSuggestionsForNav();
+  atlasEl.classList.add("nav-active");
+  navHud.hidden = false;
+  navFooter.hidden = false;
+  navBanner.dataset.state = "";
+  navStepsWrap.open = false;
+  navSpeedGroup.hidden = source !== "sim";
+  navOffRouteButton.hidden = source !== "sim";
+  navRecenterButton.hidden = true;
+  navMuteButton.setAttribute("aria-pressed", "false");
+  navMuteButton.textContent = "Voice on";
+  navSourceTag.textContent = source === "sim" ? "demo drive" : "live gps";
+  navSetSpeed(4);
+  drawNavRoute(route.geometry);
+  renderNavSteps();
+
+  const startPoint = pointAtProgress(nav.model.prepared, 0);
+  const element = document.createElement("div");
+  element.className = "nav-puck";
+  const cone = document.createElement("i");
+  cone.className = "nav-puck__cone";
+  const dot = document.createElement("i");
+  dot.className = "nav-puck__dot";
+  element.append(cone, dot);
+  nav.puck = new maplibregl.Marker({ element, rotationAlignment: "map", pitchAlignment: "map" })
+    .setLngLat([startPoint.lon, startPoint.lat])
+    .setRotation(startPoint.bearing)
+    .addTo(map);
+  navCameraTo({
+    center: [startPoint.lon, startPoint.lat],
+    zoom: 16,
+    pitch: 48,
+    bearing: startPoint.bearing
+  }, 1100);
+  updateNavHud();
+
+  if (source === "sim") {
+    nav.sim = { progress: 0, veer: null, jitterX: 0, jitterY: 0 };
+    nav.simTimer = setInterval(navSimTick, NAV_SIM_TICK_MS);
+    navSpeak("Starting demo drive");
+  } else {
+    navDistanceEl.textContent = "—";
+    navInstructionEl.textContent = "Waiting for a GPS fix…";
+    nav.watchId = navigator.geolocation.watchPosition(
+      position => {
+        const { latitude, longitude, heading } = position.coords;
+        if (!nav || nav.source !== "gps") return;
+        if (routeCoverage && !insideCoverage({ lat: latitude, lon: longitude }, 0.05)) {
+          showToast("Your GPS fix is outside the Luxembourg route graph — switching to the demo drive.", "error", 5200);
+          switchNavToSim();
+          return;
+        }
+        navHandleFix(latitude, longitude, Number.isFinite(heading) ? heading : undefined);
+      },
+      error => {
+        if (!nav || nav.source !== "gps") return;
+        showToast(error?.code === 1
+          ? "Location permission denied — try the demo drive instead."
+          : "No GPS fix available — try the demo drive instead.", "error", 5200);
+        endNavigation();
+      },
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 }
+    );
+  }
+}
+
+function switchNavToSim() {
+  if (!nav) return;
+  if (nav.watchId != null) {
+    navigator.geolocation.clearWatch(nav.watchId);
+    nav.watchId = null;
+  }
+  nav.source = "sim";
+  nav.sim = { progress: nav.progress, veer: null, jitterX: 0, jitterY: 0 };
+  clearInterval(nav.simTimer);
+  nav.simTimer = setInterval(navSimTick, NAV_SIM_TICK_MS);
+  navSpeedGroup.hidden = false;
+  navOffRouteButton.hidden = false;
+  navSourceTag.textContent = "demo drive";
+}
+
+// Suggest dropdowns must not linger under the hidden panel.
+function hideSuggestionsForNav() {
+  hideSuggestions();
+  for (const stop of stops) hideStopSuggest(stop);
+}
+
+function endNavigation() {
+  if (!nav) return;
+  clearInterval(nav.simTimer);
+  if (nav.watchId != null) navigator.geolocation.clearWatch(nav.watchId);
+  if (typeof speechSynthesis !== "undefined") {
+    try { speechSynthesis.cancel(); } catch { /* best effort */ }
+  }
+  nav.puck?.remove();
+  nav = null;
+  atlasEl.classList.remove("nav-active");
+  navHud.hidden = true;
+  navFooter.hidden = true;
+  navBanner.dataset.state = "";
+  navCameraTo({ pitch: 0, bearing: 0 }, 700);
+  updateStopMarkers();
+  drawRoutePlan();
+  renderRouteCard();
+  fitRoutePlan();
+  const seconds = routePlan?.kind === "pair"
+    ? routePlan.candidates[routePlan.active].seconds
+    : routePlan?.trip.totalSeconds;
+  if (Number.isFinite(seconds)) setStatus(`Route ready · ${formatDuration(seconds)}`);
+  mapHudText.textContent = "Navigation ended";
+}
+
+navDemoButton.addEventListener("click", () => startNavigation("sim"));
+navGpsButton.addEventListener("click", () => {
+  if (!navigator.geolocation) {
+    showToast("Geolocation is unavailable in this browser — try the demo drive.", "error");
+    return;
+  }
+  startNavigation("gps");
+});
+navEndButton.addEventListener("click", endNavigation);
+navMuteButton.addEventListener("click", () => {
+  if (!nav) return;
+  nav.muted = !nav.muted;
+  navMuteButton.setAttribute("aria-pressed", String(nav.muted));
+  navMuteButton.textContent = nav.muted ? "Voice off" : "Voice on";
+  if (nav.muted && typeof speechSynthesis !== "undefined") {
+    try { speechSynthesis.cancel(); } catch { /* best effort */ }
+  }
+});
+navRecenterButton.addEventListener("click", () => {
+  if (!nav) return;
+  nav.follow = true;
+  navRecenterButton.hidden = true;
+  if (nav.lastFix) updateNavCamera(nav.lastFix.lat, nav.lastFix.lon, nav.lastFix.bearing, 600);
+});
+navOffRouteButton.addEventListener("click", () => {
+  if (!nav?.sim || nav.arrived || nav.sim.veer) return;
+  const here = pointAtProgress(nav.model.prepared, nav.sim.progress);
+  nav.sim.veer = {
+    lat: here.lat,
+    lon: here.lon,
+    bearing: (here.bearing + (Math.random() < 0.5 ? 55 : -55) + 360) % 360,
+    dist: 0
+  };
+  showToast("Veering off the route — watch the reroute.", "info");
+});
+for (const option of navSpeedGroup.querySelectorAll("[data-nav-speed]")) {
+  option.addEventListener("click", () => navSetSpeed(Number(option.dataset.navSpeed)));
+}
+map.on("dragstart", () => {
+  if (!nav || !nav.follow) return;
+  nav.follow = false;
+  navRecenterButton.hidden = false;
+});
 
 // --- Directions events -----------------------------------------------------
 
@@ -2386,6 +3054,10 @@ map.on("click", event => {
 
 document.addEventListener("keydown", event => {
   if (event.key !== "Escape" || !directionsMode) return;
+  if (nav) {
+    endNavigation();
+    return;
+  }
   if (!placeLens.hidden) return; // the base handler closes the lens first
   if (document.activeElement?.closest?.(".stop-row")) return; // input handles it
   if (stopPickIndex >= 0) {

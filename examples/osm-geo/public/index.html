@@ -51,6 +51,47 @@
     <div id="map" aria-label="Interactive OpenStreetMap"></div>
     <div class="map-wash" aria-hidden="true"></div>
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <section id="navHud" class="nav-hud" aria-live="polite" hidden>
+      <div id="navBanner" class="nav-banner">
+        <span id="navGlyph" class="nav-banner__glyph" aria-hidden="true"></span>
+        <span class="nav-banner__body">
+          <b id="navDistance">—</b>
+          <span id="navInstruction">Starting navigation…</span>
+        </span>
+      </div>
+      <p id="navThen" class="nav-then" hidden>
+        <span>then</span>
+        <span id="navThenGlyph" class="nav-then__glyph" aria-hidden="true"></span>
+        <span id="navThenName"></span>
+      </p>
+    </section>
+
+    <section id="navFooter" class="nav-footer" aria-label="Navigation status" hidden>
+      <div class="nav-progress" aria-hidden="true"><i id="navProgressFill"></i></div>
+      <div class="nav-footer__row">
+        <p class="nav-stats">
+          <b id="navEta">—</b>
+          <span id="navRemaining">—</span>
+          <span id="navSourceTag" class="nav-source"></span>
+        </p>
+        <span class="nav-controls">
+          <span id="navSpeedGroup" class="nav-speeds" role="group" aria-label="Simulation speed">
+            <button type="button" data-nav-speed="1">1×</button>
+            <button type="button" data-nav-speed="4" class="active">4×</button>
+            <button type="button" data-nav-speed="16">16×</button>
+          </span>
+          <button id="navOffRouteButton" type="button" title="Veer off the route to demo rerouting">Go off route</button>
+          <button id="navMuteButton" type="button" aria-pressed="false" title="Toggle voice guidance">Voice on</button>
+          <button id="navRecenterButton" type="button" hidden>Recenter</button>
+          <button id="navEndButton" type="button">End</button>
+        </span>
+      </div>
+      <details id="navStepsWrap" class="nav-steps-wrap">
+        <summary><span>Upcoming steps</span><span class="query-receipt__chevron" aria-hidden="true">⌄</span></summary>
+        <ol id="navSteps" class="nav-steps"></ol>
+      </details>
+    </section>
     <div class="map-hud" aria-live="polite">
       <span class="map-hud__signal" aria-hidden="true"></span>
       <span id="mapHudText">Connecting to the atlas</span>
@@ -237,6 +278,13 @@
             </p>
           </header>
           <p id="routeOrder" class="route-card__order" hidden></p>
+          <div id="routeNavActions" class="route-nav-actions" hidden>
+            <button id="navDemoButton" class="route-nav-actions__primary" type="button">
+              <span class="route-nav-actions__play" aria-hidden="true"></span>
+              Start demo drive
+            </button>
+            <button id="navGpsButton" class="route-nav-actions__secondary" type="button">Use my location</button>
+          </div>
           <div id="routeAlternatives" class="route-alternatives" role="group" aria-label="Route alternatives" hidden></div>
           <div class="route-corridor">
             <p class="route-corridor__label">Search along this route</p>
