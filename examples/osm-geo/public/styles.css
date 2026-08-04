@@ -2018,3 +2018,80 @@ a { color: inherit; }
   /* Keep the maneuver banner from eating the map on short screens. */
   .nav-hud { max-height: 40vh; }
 }
+
+/* --- Bottom sheet (phones) -------------------------------------------
+   The directions panel becomes a draggable sheet with three snap points so
+   the map stays usable: peek (inputs only), half, and full. Desktop keeps
+   the fixed side panel — the handle is hidden there. */
+.sheet-handle { display: none; }
+
+@media (max-width: 720px) {
+  .sheet-handle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 100%;
+    height: 26px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: grab;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .sheet-handle:active { cursor: grabbing; }
+
+  .sheet-handle span {
+    width: 40px;
+    height: 4px;
+    border-radius: 999px;
+    background: #4b515b;
+    transition: background .18s ease, width .18s ease;
+  }
+
+  .sheet-handle:hover span,
+  .sheet-handle:focus-visible span { background: #6b7280; width: 52px; }
+
+  .panel.is-sheet {
+    inset: auto 8px max(8px, env(safe-area-inset-bottom)) 8px;
+    width: auto;
+    max-height: none;
+    height: var(--sheet-height, 62vh);
+    transition: height .26s cubic-bezier(.32, .72, 0, 1), box-shadow .24s ease;
+  }
+
+  /* While a finger is down the height follows the pointer directly. */
+  .panel.is-sheet.is-dragging {
+    transition: none;
+    user-select: none;
+  }
+
+  .panel.is-sheet[data-snap="peek"] .results,
+  .panel.is-sheet[data-snap="peek"] .panel-footer { display: none; }
+
+  .panel.is-sheet[data-snap="peek"] .eyebrow,
+  .panel.is-sheet[data-snap="peek"] .panel-header h1 { display: none; }
+
+  .panel.is-sheet[data-snap="peek"] .panel-header { padding-bottom: 6px; }
+
+  /* Scroll the sheet body, not the page, and never under the home bar. */
+  .panel.is-sheet .results,
+  .panel.is-sheet .route-card {
+    overscroll-behavior: contain;
+  }
+}
+
+@media (max-width: 720px) {
+  /* In sheet mode the body scrolls inside the sheet, so a half-height
+     sheet can still reach the route summary and turn list. */
+  .panel.is-sheet .results {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .panel.is-sheet .route-steps {
+    max-height: none;
+  }
+}

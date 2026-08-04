@@ -486,6 +486,7 @@ function showEmpty(title, copy) {
 
 function setPanelCollapsed(collapsed, selection = "") {
   searchPanel.classList.toggle("is-collapsed", collapsed);
+  if (typeof syncSheetMode === "function") syncSheetMode();
   panelToggle.setAttribute("aria-expanded", String(!collapsed));
   panelToggle.setAttribute("aria-label", collapsed ? "Expand search panel" : "Collapse search panel");
   panelToggle.title = collapsed ? "Expand search panel" : "Collapse search panel";
@@ -1042,6 +1043,8 @@ function renderSuggestions(response) {
     hideSuggestions();
     return;
   }
+  // A peek-height sheet would clip the list; give it room to be tapped.
+  if (searchPanel.dataset.snap === "peek") snapSheet("half");
   visibleSuggestions = suggestions;
   suggestList.replaceChildren(...suggestions.map((item, index) => {
     const option = document.createElement("li");
@@ -1464,6 +1467,10 @@ function setDirectionsMode(on) {
     suppressedQuery = "";
     hidePlaceLens();
     setPanelCollapsed(false);
+    if (typeof snapSheet === "function") {
+      // Let the directions controls lay out before measuring peek.
+      requestAnimationFrame(() => snapSheet("peek"));
+    }
     searchPanel.classList.add("has-query");
     clearMarkers();
     if (routeAvailable === false) {
@@ -1568,6 +1575,8 @@ function renderStopSuggest(stop, index, suggestions) {
     return option;
   }));
   stop.suggestEl.hidden = !suggestions.length;
+  // A peek-height sheet clips the list; give it room to be tapped.
+  if (suggestions.length && searchPanel.dataset.snap === "peek") snapSheet("half");
 }
 
 function chooseStopSuggestion(index, item) {
@@ -2395,6 +2404,9 @@ function renderRouteCard() {
   if (!routePlan) return;
   emptyState.hidden = true;
   routeCard.hidden = false;
+  // A finished route deserves the summary on screen; leave taller sheets
+  // alone so a deliberate drag is never undone.
+  if (searchPanel.dataset.snap === "peek") snapSheet("half");
   if (routePlan.kind === "pair") {
     const active = routePlan.candidates[routePlan.active];
     routeEta.textContent = formatDuration(active.seconds);
@@ -3371,6 +3383,135 @@ document.addEventListener("keydown", event => {
   }
   setDirectionsMode(false);
 });
+
+// --- Bottom sheet (phones) -------------------------------------------
+//
+// On narrow screens the panel becomes a draggable sheet with three snap
+// points, so the map keeps most of the screen while directions are open.
+// Dragging tracks the finger 1:1; releasing snaps to whichever point the
+// gesture is heading for (position, biased by flick velocity).
+
+const SHEET_BREAKPOINT = 720;
+const SHEET_SNAPS = { peek: 0.26, half: 0.55, full: 0.88 };
+const sheetHandle = document.querySelector("#sheetHandle");
+let sheetSnap = "half";
+let sheetDrag = null;
+
+function sheetEnabled() {
+  return window.innerWidth <= SHEET_BREAKPOINT;
+}
+
+// Peek must clear the panel header plus whichever controls are active —
+// a fixed fraction clips the destination field in directions mode.
+function peekHeight() {
+  const header = searchPanel.querySelector(".panel-header");
+  const controls = directionsMode ? directionsControls : searchControls;
+  const chrome = (sheetHandle?.offsetHeight || 0)
+    + (header?.offsetHeight || 0)
+    + (controls && !controls.hidden ? controls.offsetHeight : 0);
+  const min = SHEET_SNAPS.peek * window.innerHeight;
+  const max = SHEET_SNAPS.half * window.innerHeight;
+  return Math.min(max, Math.max(min, chrome + 16));
+}
+
+function applySheetSnap(snap, { persist = true } = {}) {
+  if (persist) sheetSnap = snap;
+  searchPanel.dataset.snap = snap;
+  const height = snap === "peek" ? peekHeight() : SHEET_SNAPS[snap] * window.innerHeight;
+  searchPanel.style.setProperty("--sheet-height", `${Math.round(height)}px`);
+}
+
+// Programmatic snap used by flow transitions (entering directions, a route
+// becoming ready). No-op on desktop.
+function snapSheet(snap) {
+  if (!searchPanel.classList.contains("is-sheet")) return;
+  applySheetSnap(snap);
+}
+
+function syncSheetMode() {
+  const on = sheetEnabled() && !searchPanel.classList.contains("is-collapsed");
+  searchPanel.classList.toggle("is-sheet", on);
+  if (on) applySheetSnap(sheetSnap);
+  else {
+    searchPanel.style.removeProperty("--sheet-height");
+    delete searchPanel.dataset.snap;
+  }
+}
+
+function nearestSnap(heightPx, velocity, travelPx = 0) {
+  const ratio = heightPx / window.innerHeight;
+  // A short quick flick steps one stop, the way native sheets behave. A
+  // long drag is deliberate, so its end position wins instead.
+  const shortFlick = travelPx < window.innerHeight * 0.16;
+  if (shortFlick && Math.abs(velocity) > 0.55) {
+    const order = ["peek", "half", "full"];
+    const index = order.indexOf(sheetSnap);
+    const next = velocity < 0 ? index + 1 : index - 1;
+    return order[Math.min(order.length - 1, Math.max(0, next))];
+  }
+  let best = "half";
+  let bestDelta = Infinity;
+  for (const [name, target] of Object.entries(SHEET_SNAPS)) {
+    const delta = Math.abs(ratio - target);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = name;
+    }
+  }
+  return best;
+}
+
+if (sheetHandle) {
+  sheetHandle.addEventListener("pointerdown", event => {
+    if (!searchPanel.classList.contains("is-sheet")) return;
+    sheetHandle.setPointerCapture(event.pointerId);
+    sheetDrag = {
+      startY: event.clientY,
+      startHeight: searchPanel.getBoundingClientRect().height,
+      lastY: event.clientY,
+      lastT: event.timeStamp,
+      velocity: 0,
+      moved: false
+    };
+    searchPanel.classList.add("is-dragging");
+  });
+
+  sheetHandle.addEventListener("pointermove", event => {
+    if (!sheetDrag) return;
+    const dy = event.clientY - sheetDrag.startY;
+    if (Math.abs(dy) > 3) sheetDrag.moved = true;
+    const dt = event.timeStamp - sheetDrag.lastT;
+    if (dt > 0) sheetDrag.velocity = (event.clientY - sheetDrag.lastY) / dt;
+    sheetDrag.lastY = event.clientY;
+    sheetDrag.lastT = event.timeStamp;
+    // Dragging up grows the sheet; clamp within the snap range.
+    const min = SHEET_SNAPS.peek * window.innerHeight * 0.7;
+    const max = SHEET_SNAPS.full * window.innerHeight;
+    const height = Math.min(max, Math.max(min, sheetDrag.startHeight - dy));
+    searchPanel.style.setProperty("--sheet-height", `${Math.round(height)}px`);
+  });
+
+  const endSheetDrag = (event) => {
+    if (!sheetDrag) return;
+    const drag = sheetDrag;
+    sheetDrag = null;
+    searchPanel.classList.remove("is-dragging");
+    if (sheetHandle.hasPointerCapture?.(event.pointerId)) sheetHandle.releasePointerCapture(event.pointerId);
+    if (!drag.moved) {
+      // Tap cycles the snap points for keyboard and non-drag users.
+      const order = ["peek", "half", "full"];
+      applySheetSnap(order[(order.indexOf(sheetSnap) + 1) % order.length]);
+      return;
+    }
+    const travel = Math.abs(drag.lastY - drag.startY);
+    applySheetSnap(nearestSnap(searchPanel.getBoundingClientRect().height, drag.velocity, travel));
+  };
+  sheetHandle.addEventListener("pointerup", endSheetDrag);
+  sheetHandle.addEventListener("pointercancel", endSheetDrag);
+}
+
+window.addEventListener("resize", syncSheetMode);
+syncSheetMode();
 
 async function boot() {
   loadIndexStatus();
