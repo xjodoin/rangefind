@@ -33,7 +33,19 @@ function parseRange(header, size) {
   return { start, end: Math.min(end, size - 1) };
 }
 
+// A `Range` header is not CORS-safelisted, so cross-origin clients preflight
+// every read. Answering that here lets another origin — a second dev server, a
+// native app's WebView — consume an index served from this one.
+const CORS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, HEAD, OPTIONS",
+  "access-control-allow-headers": "range, content-type",
+  "access-control-expose-headers": "content-range, content-length, accept-ranges",
+  "access-control-max-age": "86400"
+};
+
 createServer(async (req, res) => {
+  if (req.method === "OPTIONS") return res.writeHead(204, CORS).end();
   let path = decodeURIComponent(new URL(req.url, "http://x").pathname);
   if (path.endsWith("/")) path += "index.html";
   const file = resolve(ROOT, "." + path);
@@ -43,6 +55,7 @@ createServer(async (req, res) => {
     if (s.isDirectory()) return res.writeHead(404).end();
     const ext = extname(file);
     const headers = {
+      ...CORS,
       "content-type": MIME[ext] || "application/octet-stream",
       "accept-ranges": "bytes",
       "cache-control": "no-store"

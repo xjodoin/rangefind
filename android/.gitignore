@@ -1,0 +1,14 @@
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Copied from the repo's dist/ by the syncRangefindBundles Gradle task.
+app/src/main/assets/rangefind/runtime.browser.js
+app/src/main/assets/rangefind/osm.browser.js
+app/src/main/assets/rangefind/route.browser.js

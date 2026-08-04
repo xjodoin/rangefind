@@ -63,6 +63,16 @@
   itineraries, search-along-route against the live planet index, and a
   Route X-Ray fetch receipt), computed entirely in the browser from
   static byte ranges. See `docs/route-graph.md`.
+- A native Android app (`android/`): Jetpack Compose UI with MapLibre Native
+  rendering, backed entirely by Rangefind static indexes — worldwide search and
+  autocomplete against the public OSM index, place details, reverse-geocoded
+  dropped pins, directions with alternatives and maneuver steps, and
+  turn-by-turn navigation with a pitched follow camera, spoken guidance,
+  traveled-route dimming, and snap-based off-route rerouting. The runtime runs
+  in a headless WebView on a WebViewAssetLoader https origin, so index bytes are
+  fetched by the runtime itself and never cross the JS bridge, and gzip
+  inflation plus SHA-256 pack verification stay native. `RangefindEngine` keeps
+  the JS host swappable. See `android/README.md`.
 
 ## 0.4.6 — 2026-08-04
 

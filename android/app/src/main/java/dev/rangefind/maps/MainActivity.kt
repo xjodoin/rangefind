@@ -1,0 +1,144 @@
+package dev.rangefind.maps
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.speech.tts.TextToSpeech
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.rangefind.maps.engine.WebViewRangefindEngine
+import dev.rangefind.maps.location.LocationProvider
+import dev.rangefind.maps.ui.MapScreen
+import dev.rangefind.maps.ui.MapsViewModel
+import dev.rangefind.maps.ui.theme.RangefindTheme
+import java.util.Locale
+
+private const val SEARCH_BASE = "https://osm.rangefind.dev/"
+
+class MainActivity : ComponentActivity() {
+
+    private lateinit var engine: WebViewRangefindEngine
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+
+        // Built before setContent so the headless host is already parked in the
+        // view tree and loading its module graph while the UI composes.
+        engine = WebViewRangefindEngine(this)
+        val locationProvider = LocationProvider(this)
+
+        setContent {
+            val darkTheme = isSystemInDarkTheme()
+            RangefindTheme(darkTheme = darkTheme) {
+                val viewModel: MapsViewModel = viewModel(
+                    factory = MapsViewModel.factory(
+                        engine = engine,
+                        locationProvider = locationProvider,
+                        searchBase = SEARCH_BASE,
+                        routeBase = BuildConfig.ROUTE_BASE_URL
+                    )
+                )
+                val state by viewModel.state.collectAsStateWithLifecycle()
+                val context = LocalContext.current
+
+                val permissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestMultiplePermissions()
+                ) { granted ->
+                    if (granted.values.any { it }) viewModel.startLocationUpdates()
+                }
+
+                LaunchedEffect(Unit) {
+                    val fine = ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.ACCESS_FINE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (fine) {
+                        viewModel.startLocationUpdates()
+                    } else {
+                        permissionLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
+                    }
+                }
+
+                // Voice guidance: the view model emits phrases, the UI speaks
+                // them, so navigation logic stays free of Android media APIs.
+                val speaker = remember { Speaker(context) }
+                DisposableEffect(Unit) { onDispose { speaker.shutdown() } }
+                LaunchedEffect(Unit) {
+                    viewModel.voice.collect { phrase -> speaker.say(phrase) }
+                }
+
+                MapScreen(
+                    state = state,
+                    darkTheme = darkTheme,
+                    onQueryChange = viewModel::onQueryChange,
+                    onSubmit = { viewModel.submitSearch() },
+                    onClear = viewModel::clearQuery,
+                    onSuggestion = viewModel::pickSuggestion,
+                    onSelectResult = { index ->
+                        state.results.getOrNull(index)?.let(viewModel::selectPlace)
+                    },
+                    onDismissPlace = viewModel::dismissPlace,
+                    onDirections = { viewModel.requestDirections() },
+                    onSelectRoute = viewModel::selectRoute,
+                    onStartNavigation = viewModel::startNavigation,
+                    onStopNavigation = viewModel::stopNavigation,
+                    onExitDirections = viewModel::exitDirections,
+                    onRecenter = viewModel::recenter,
+                    onLongPress = viewModel::dropPin,
+                    onCenterChanged = { viewModel.mapCenter = it }
+                )
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (::engine.isInitialized) engine.destroy()
+    }
+}
+
+/** Minimal TTS wrapper that queues phrases until the engine is ready. */
+private class Speaker(context: android.content.Context) {
+    private var ready = false
+    private var pending: String? = null
+    private val tts = TextToSpeech(context.applicationContext) { status ->
+        ready = status == TextToSpeech.SUCCESS
+        if (ready) pending?.let { say(it) }
+        pending = null
+    }.apply { }
+
+    fun say(phrase: String) {
+        if (!ready) {
+            pending = phrase
+            return
+        }
+        runCatching {
+            tts.language = Locale.getDefault()
+            tts.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "rf-nav")
+        }
+    }
+
+    fun shutdown() {
+        runCatching {
+            tts.stop()
+            tts.shutdown()
+        }
+    }
+}
