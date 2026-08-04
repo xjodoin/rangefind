@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.4 — 2026-08-04
+
+### Improved
+
+- Builders and corpus-wide scoring-stat passes now stream `.jsonl.gz` inputs
+  directly, avoiding large temporary decompressions for static planet-scale
+  indexes.
+
 ## 0.4.3 — 2026-08-03
 
 ### Fixed

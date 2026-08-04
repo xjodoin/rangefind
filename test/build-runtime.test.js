@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import test from "node:test";
 import { build } from "../src/builder.js";
 import { parseDocPagePointerPage } from "../src/doc_pages.js";
@@ -79,6 +79,26 @@ async function resumeStageFile(output, stage) {
   assert.equal(fingerprints.length, 1);
   return join(resumeRoot, fingerprints[0], "stages", `${stage}.json`);
 }
+
+test("builder reads gzip-compressed JSONL input", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-build-gzip-"));
+  const input = join(root, "docs.jsonl.gz");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(input, gzipSync([
+    { id: "gzip-a", title: "Compressed corpus" },
+    { id: "gzip-b", title: "Streaming build" }
+  ].map(JSON.stringify).join("\n")));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl.gz",
+    output: "public/rangefind",
+    fields: [{ name: "title", path: "title", weight: 1 }],
+    display: ["title"]
+  }));
+
+  await build({ configPath });
+  const manifest = JSON.parse(await readFile(join(root, "public/rangefind/manifest.json"), "utf8"));
+  assert.equal(manifest.total, 2);
+});
 
 test("zero-hit typo recovery prioritizes the rare conflicting token", async () => {
   const root = await mkdtemp(join(tmpdir(), "rangefind-typo-collision-"));

@@ -6,6 +6,7 @@ import { Worker } from "node:worker_threads";
 import { analyzerForConfig } from "./analysis.js";
 import { setScoringDfProvider } from "./codec.js";
 import { computeScoringStatsBatch } from "./scoring_stats_batch.js";
+import { createJsonlReadStream } from "./jsonl.js";
 
 // Cross-shard scoring statistics.
 //
@@ -423,7 +424,7 @@ function mergeBbox(target, bbox) {
 }
 
 async function eachInputBatch(input, batchDocs, onBatch) {
-  const rl = createInterface({ input: createReadStream(input), crlfDelay: Infinity });
+  const rl = createInterface({ input: createJsonlReadStream(input), crlfDelay: Infinity });
   let batch = [];
   for await (const line of rl) {
     if (!line.trim()) continue;

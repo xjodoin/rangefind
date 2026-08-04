@@ -3,6 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import { collectScoringStats, loadScoringStats, openDfFile } from "../src/scoring_stats.js";
 import { readConfig } from "../src/config.js";
 
@@ -73,6 +74,23 @@ test("collectScoringStats sums totals and counts df across inputs", async () => 
   assert.equal(reader.lookup("glacier"), 20);
   assert.equal(reader.lookup("no-such-term"), undefined);
   reader.close();
+});
+
+test("collectScoringStats reads gzip-compressed JSONL inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-stats-gzip-"));
+  const docs = Array.from({ length: 25 }, (_, i) => makeDoc(i));
+  const input = join(root, "docs.jsonl.gz");
+  await writeFile(input, gzipSync(`${docs.map(doc => JSON.stringify(doc)).join("\n")}\n`));
+  const config = await writeConfigAt(root);
+
+  const { stats } = await collectScoringStats({
+    config,
+    inputs: [{ id: "gzip", input }],
+    outDir: join(root, "stats")
+  });
+
+  assert.equal(stats.total, 25);
+  assert.equal(stats.inputs[0].total, 25);
 });
 
 test("df accumulation survives spill-and-merge with tiny thresholds", async () => {

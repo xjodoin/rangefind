@@ -106,7 +106,7 @@ import {
 } from "./doc_value_tree.js";
 import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
 import { buildDocPointerTableFromReader } from "./doc_pointers.js";
-import { eachJsonLine } from "./jsonl.js";
+import { createJsonlReadStream, eachJsonLine } from "./jsonl.js";
 import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
 import { buildIndexOptimizerReport, INDEX_OPTIMIZER_PATH } from "./optimizer.js";
@@ -287,7 +287,7 @@ async function measureWithWorkers(config) {
   }
 
   try {
-    const rl = createInterface({ input: createReadStream(config.input), crlfDelay: Infinity });
+    const rl = createInterface({ input: createJsonlReadStream(config.input), crlfDelay: Infinity });
     let batch = [];
     for await (const line of rl) {
       if (!line.trim()) continue;
@@ -3489,7 +3489,7 @@ async function scanWithWorkers(state, dirs) {
       segmentsDir: resolve(dirs.build, "segments", `worker-${String(index).padStart(2, "0")}`),
       segmentIdPrefix: `segment-w${String(index).padStart(2, "0")}`
     })));
-    const rl = createInterface({ input: createReadStream(state.config.input), crlfDelay: Infinity });
+    const rl = createInterface({ input: createJsonlReadStream(state.config.input), crlfDelay: Infinity });
     let index = 0;
     let baseIndex = 0;
     let batch = [];
