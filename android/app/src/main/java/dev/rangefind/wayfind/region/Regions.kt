@@ -54,11 +54,21 @@ class RegionPreferences(context: Context) {
             if (value == null) remove(KEY_ACTIVE) else putString(KEY_ACTIVE, value)
         }.apply()
 
+    /**
+     * Whether the user has ever picked a routing source. A null [activeRegion]
+     * otherwise means two different things — "chose the network" and "has not
+     * chosen yet" — and only the second is the app's to resolve.
+     */
+    var hasChosenSource: Boolean
+        get() = prefs.getBoolean(KEY_CHOSEN, false)
+        set(value) = prefs.edit().putBoolean(KEY_CHOSEN, value).apply()
+
     fun sourceUrlOf(id: String) = "$host/$id-index/"
 
     private companion object {
         const val KEY_HOST = "host"
         const val KEY_ACTIVE = "active"
+        const val KEY_CHOSEN = "chosen"
         /** The emulator's alias for the development machine's loopback. */
         const val DEFAULT_HOST = "http://10.0.2.2:5185"
     }

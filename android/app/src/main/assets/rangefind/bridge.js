@@ -14,9 +14,59 @@ import {
 } from "./osm.browser.js";
 import { openRouteGraphUrl } from "./route.browser.js";
 
+const ROUTE_PROBE_TIMEOUT_MS = 6000;
+const MANIFEST_CACHE_PREFIX = "rangefind.manifest:";
+
 let searchEngine = null;
+let searchUnavailable = null;
 let routeEngine = null;
 let routeUnavailable = null;
+
+function readCachedManifest(baseUrl) {
+  try {
+    const raw = localStorage.getItem(MANIFEST_CACHE_PREFIX + baseUrl);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function writeCachedManifest(baseUrl, manifest) {
+  if (!manifest) return;
+  try {
+    localStorage.setItem(MANIFEST_CACHE_PREFIX + baseUrl, JSON.stringify(manifest));
+  } catch (err) {
+    // Quota, or storage turned off. The cache is an optimisation for the
+    // offline case, never a requirement for the online one.
+  }
+}
+
+/**
+ * Opens the search index, falling back to the manifest cached from a previous
+ * run when the network is gone.
+ *
+ * Search reads still need the network, so this does not make search work
+ * offline. What it does is keep the failure local: a device holding a
+ * downloaded region can navigate with no connectivity at all, and letting an
+ * unreachable search host throw out of init would take that away over
+ * something routing never needed.
+ */
+async function openSearch(baseUrl) {
+  try {
+    searchEngine = await createSearch({ baseUrl });
+    writeCachedManifest(baseUrl, searchEngine.manifest);
+    return;
+  } catch (err) {
+    searchUnavailable = String(err?.message || err);
+  }
+  const manifest = readCachedManifest(baseUrl);
+  if (!manifest) return;
+  try {
+    searchEngine = await createSearch({ baseUrl, manifest });
+  } catch (err) {
+    // Keep the original failure: it describes why the network is unusable.
+  }
+}
 
 function post(id, ok, body) {
   const message = ok ? { ok: true, payload: body } : { ok: false, error: String(body?.message || body) };
@@ -130,18 +180,27 @@ function routingInfo() {
 
 const handlers = {
   async init({ searchBase, routeBase }) {
-    searchEngine = await createSearch({ baseUrl: searchBase });
-    const meta = searchEngine.manifest?.meta || {};
+    searchUnavailable = null;
+    await openSearch(searchBase);
+    const meta = searchEngine?.manifest?.meta || {};
 
     // Directions are optional: with no reachable route index the app still
     // does search, exactly like the web demo degrades.
     if (routeBase) {
       try {
-        const probe = await fetch(new URL("manifest.json", routeBase).toString());
+        // Bounded for the same reason as useRouteBase, and more urgently: this
+        // is the startup path, so an index that hangs holds the whole app on
+        // its loading screen rather than degrading to "no routing".
+        const probe = await fetch(new URL("manifest.json", routeBase).toString(), {
+          signal: AbortSignal.timeout(ROUTE_PROBE_TIMEOUT_MS)
+        });
         if (!probe.ok) throw new Error(`manifest ${probe.status}`);
         routeEngine = await openRouteGraphUrl(routeBase);
       } catch (err) {
-        routeUnavailable = String(err?.message || err);
+        const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
+        routeUnavailable = timedOut
+          ? `No answer from ${routeBase}`
+          : String(err?.message || err);
       }
     } else {
       routeUnavailable = "No route index configured";
@@ -150,7 +209,8 @@ const handlers = {
     return {
       attribution: meta.attribution || "© OpenStreetMap contributors",
       license: meta.license || "ODbL-1.0",
-      total: searchEngine.manifest?.total ?? 0,
+      total: searchEngine?.manifest?.total ?? 0,
+      searchUnavailable,
       ...routingInfo()
     };
   },
@@ -168,16 +228,25 @@ const handlers = {
       return routingInfo();
     }
     try {
-      const probe = await fetch(new URL("manifest.json", routeBase).toString());
+      // A base that has gone away answers by hanging, not by refusing, and
+      // the UI cannot show anything until this returns. Bound the wait so an
+      // unreachable index degrades to "no routing" instead of a dead screen.
+      const probe = await fetch(new URL("manifest.json", routeBase).toString(), {
+        signal: AbortSignal.timeout(ROUTE_PROBE_TIMEOUT_MS)
+      });
       if (!probe.ok) throw new Error(`manifest ${probe.status}`);
       routeEngine = await openRouteGraphUrl(routeBase);
     } catch (err) {
-      routeUnavailable = String(err?.message || err);
+      const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
+      routeUnavailable = timedOut
+        ? `No answer from ${routeBase}`
+        : String(err?.message || err);
     }
     return routingInfo();
   },
 
   async search({ q, anchor, size, shards }) {
+    if (!searchEngine) throw new Error(searchUnavailable || "Search index unavailable");
     const response = await searchOsmQuery(searchEngine, {
       q,
       size: size || 20,
@@ -190,6 +259,7 @@ const handlers = {
   },
 
   async suggest({ q, anchor, inputOffset }) {
+    if (!searchEngine) throw new Error(searchUnavailable || "Search index unavailable");
     const response = await suggestOsmQuery(searchEngine, {
       q,
       size: 8,
@@ -211,6 +281,7 @@ const handlers = {
   },
 
   async reverse({ lat, lon }) {
+    if (!searchEngine) throw new Error(searchUnavailable || "Search index unavailable");
     const response = await reverseGeocodeOsm(searchEngine, { lat, lon, size: 1 });
     const places = placesOf(response);
     return { place: places[0] || null };

@@ -110,8 +110,10 @@ class MapsViewModel(
         viewModelScope.launch {
             // A region kept on the device wins over the network base: the user
             // downloaded it precisely so routing would not depend on a server.
-            val active = regionPrefs.activeRegion?.takeIf { regionStore.isReady(it) }
+            val active = resolveActiveRegion()
             val base = active?.let { regionServer.baseUrlFor(it) } ?: routeBase
+            // Adopting a region changes which row reads as active.
+            if (active != null) refreshRegions()
             runCatching { engine.init(searchBase, base) }
                 .onSuccess { info -> _state.update { it.copy(loading = false, info = info) } }
                 .onFailure { error ->
@@ -183,6 +185,20 @@ class MapsViewModel(
         }
     }
 
+    /**
+     * The region to route from. A stored region wins over the network base:
+     * the user downloaded it precisely so routing would not depend on a
+     * server. When they have never chosen a source, a region sitting ready on
+     * the device is the better default — the network base is not reachable
+     * from every device, and an index they already waited for always is.
+     */
+    private fun resolveActiveRegion(): String? {
+        regionPrefs.activeRegion?.takeIf { regionStore.isReady(it) }?.let { return it }
+        if (regionPrefs.hasChosenSource) return null
+        return REGION_CATALOG.map { it.id }.firstOrNull { regionStore.isReady(it) }
+            ?.also { regionPrefs.activeRegion = it }
+    }
+
     private fun updateRegion(id: String, transform: (RegionEntry) -> RegionEntry) {
         _state.update { current ->
             current.copy(regions = current.regions.map { if (it.spec.id == id) transform(it) else it })
@@ -203,6 +219,16 @@ class MapsViewModel(
                 }
             }.onSuccess {
                 downloads.remove(id)
+                // Downloading a region is the user asking to route from it.
+                // Nothing else adopts it, so leaving the base alone means
+                // directions keep going to the network — which on a real
+                // device is an address that never answers — with the region
+                // they just waited for sitting unused. Only claim an unset
+                // base: choosing the network is a real choice, and a refresh
+                // must not drag routing away from another active region.
+                if (regionPrefs.activeRegion == null && !regionPrefs.hasChosenSource) {
+                    regionPrefs.activeRegion = id
+                }
                 refreshRegions()
                 // A refresh of the region already in use must be picked up, or
                 // routing keeps answering from the copy that was just replaced.
@@ -211,14 +237,30 @@ class MapsViewModel(
                 downloads.remove(id)
                 regionStore.delete(id)
                 updateRegion(id) {
-                    it.copy(
-                        status = RegionStatus.Failed,
-                        error = error.message
-                            ?: context.getString(R.string.region_download_failed)
-                    )
+                    it.copy(status = RegionStatus.Failed, error = describeFailure(error, source))
                 }
             }
         }
+    }
+
+    /**
+     * A download fails because of the host far more often than because of the
+     * region: the index server is stopped, the device is on another network,
+     * or the configured address has gone stale. None of that is recoverable
+     * from "Failed to fetch", which is all a blocked request inside the WebView
+     * reports, so name the address that was actually tried.
+     */
+    private fun describeFailure(error: Throwable, source: String): String {
+        val detail = error.message?.takeIf { it.isNotBlank() }
+        val opaque = detail == null ||
+            error is java.io.IOException ||
+            detail.contains("Failed to fetch", ignoreCase = true) ||
+            detail.contains("cleartext", ignoreCase = true)
+        if (!opaque) return detail
+        val host = runCatching {
+            java.net.URL(source).let { "${it.protocol}://${it.authority}" }
+        }.getOrNull() ?: return context.getString(R.string.region_download_failed)
+        return context.getString(R.string.region_host_unreachable, host)
     }
 
     fun deleteRegion(id: String) {
@@ -235,6 +277,8 @@ class MapsViewModel(
     fun activateRegion(id: String?) {
         if (id != null && !regionStore.isReady(id)) return
         regionPrefs.activeRegion = id
+        // From here on the choice is theirs, including the choice of network.
+        regionPrefs.hasChosenSource = true
         refreshRegions()
         viewModelScope.launch {
             applyRouteBase(id?.let { regionServer.baseUrlFor(it) } ?: routeBase)

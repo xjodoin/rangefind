@@ -33,7 +33,14 @@ class RegionStore(context: Context) {
 
     fun delete(id: String) {
         directoryOf(id).deleteRecursively()
+        // A download that failed or was cancelled leaves its staging directory
+        // behind, holding up to the full size of the region. Nothing reports
+        // those bytes — [bytesOf] only walks the installed directory — so they
+        // would sit there as storage the user cannot see or reclaim.
+        stagingOf(id).deleteRecursively()
     }
+
+    private fun stagingOf(id: String) = File(root, "$id.staging")
 
     /**
      * Downloads [files] into a staging directory and swaps it in only once
@@ -47,22 +54,46 @@ class RegionStore(context: Context) {
         files: List<String>,
         onProgress: (done: Int, total: Int, bytes: Long) -> Unit
     ) = withContext(Dispatchers.IO) {
-        val staging = File(root, "$id.staging")
+        val staging = stagingOf(id)
         staging.deleteRecursively()
         staging.mkdirs()
 
-        var bytes = 0L
-        files.forEachIndexed { index, relative ->
-            coroutineContext.ensureActive()
-            val target = File(staging, relative)
-            target.parentFile?.mkdirs()
-            bytes += download(URL(URL(baseUrl), relative), target)
-            onProgress(index + 1, files.size, bytes)
+        try {
+            var bytes = 0L
+            files.forEachIndexed { index, relative ->
+                coroutineContext.ensureActive()
+                val target = File(staging, relative)
+                target.parentFile?.mkdirs()
+                bytes += downloadWithRetry(URL(URL(baseUrl), relative), target)
+                onProgress(index + 1, files.size, bytes)
+            }
+        } catch (failure: Throwable) {
+            staging.deleteRecursively()
+            throw failure
         }
 
         val destination = directoryOf(id)
         destination.deleteRecursively()
         staging.renameTo(destination)
+    }
+
+    /**
+     * A region is tens of megabytes spread over dozens of files, and any one
+     * of them failing throws the whole download away. Over Wi-Fi a single
+     * dropped connection is ordinary, so give each file a few attempts before
+     * giving up on the region.
+     */
+    private suspend fun downloadWithRetry(url: URL, target: File): Long {
+        var attempt = 0
+        while (true) {
+            coroutineContext.ensureActive()
+            try {
+                return download(url, target)
+            } catch (failure: java.io.IOException) {
+                if (++attempt >= DOWNLOAD_ATTEMPTS) throw failure
+                kotlinx.coroutines.delay(RETRY_BACKOFF_MS * attempt)
+            }
+        }
     }
 
     private fun download(url: URL, target: File): Long {
@@ -82,4 +113,8 @@ class RegionStore(context: Context) {
         }
     }
 
+    private companion object {
+        const val DOWNLOAD_ATTEMPTS = 3
+        const val RETRY_BACKOFF_MS = 400L
+    }
 }
