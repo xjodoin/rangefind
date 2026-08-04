@@ -178,6 +178,18 @@ whose maneuver card and travel estimate come from the same route the phone
 would draw. Screens are lean by design: driving is not the time for a place
 detail card.
 
+**The driving itself is not a second implementation.** `nav/NavigationCore`
+owns the rules — what counts as off-route, when a phrase is due, which
+alternates are still reachable — and both the phone and the car drive it. Side
+effects stay with the caller: the core decides *that* a reroute is needed or
+*that* something should be said, and each surface does it with its own engine
+and speaker. So the car speaks the same guidance, reroutes on the same
+evidence, and detects arrival the same way, without the logic existing twice.
+
+The car also calls `NavigationManager.updateTrip()`, which is what feeds the
+instrument cluster and the host's own notification surface — without it the
+maneuver only exists inside our template.
+
 **The map on the car surface is drawn by the app.** MapLibre exposes no
 renderer that targets an arbitrary `Surface` — only `MapView` — so rather than
 fork a large native codebase for one class, the car view composes itself:

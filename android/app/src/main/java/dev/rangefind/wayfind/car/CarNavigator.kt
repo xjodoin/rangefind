@@ -3,6 +3,8 @@ package dev.rangefind.wayfind.car
 import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Location
+import android.speech.tts.TextToSpeech
+import java.util.Locale
 import dev.rangefind.wayfind.BuildConfig
 import dev.rangefind.wayfind.SEARCH_BASE
 import dev.rangefind.wayfind.WayfindRuntime
@@ -10,7 +12,8 @@ import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Place
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.engine.RouteBundle
-import dev.rangefind.wayfind.nav.RouteTracker
+import dev.rangefind.wayfind.nav.NavAlternative
+import dev.rangefind.wayfind.nav.NavigationCore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -43,8 +46,11 @@ data class CarState(
     val ahead: List<LatLon> = emptyList(),
     val position: LatLon? = null,
     val bearing: Double = 0.0,
+    val speedMps: Double = 0.0,
     val speedLimitKmh: Int = 0,
-    val turnDelta: Double = 0.0
+    val turnDelta: Double = 0.0,
+    val alternatives: List<NavAlternative> = emptyList(),
+    val rerouting: Boolean = false
 ) {
     val route: Route? get() = routes?.primary
 }
@@ -52,10 +58,10 @@ data class CarState(
 /**
  * Car-side session state.
  *
- * Deliberately its own small state machine rather than a second copy of the
- * phone view model: the head unit shows a much narrower flow (find, preview,
- * drive), and the parts worth sharing — the engine and the route matching in
- * [RouteTracker] — are shared already.
+ * The head unit shows a much narrower flow than the phone — find, preview,
+ * drive — but the driving itself is identical, so the rules about off-route,
+ * announcements and reachable alternates come from the shared
+ * [NavigationCore] rather than a second copy of them.
  */
 class CarNavigator(private val context: Context) {
 
@@ -63,10 +69,24 @@ class CarNavigator(private val context: Context) {
     private val _state = MutableStateFlow(CarState())
     val state: StateFlow<CarState> = _state.asStateFlow()
 
-    private var tracker: RouteTracker? = null
-    private var lastAlong = 0.0
+    private val core = NavigationCore()
     private var locationJob: Job? = null
     private var searchJob: Job? = null
+
+    // Driving is exactly when the driver should not be reading the screen, so
+    // the head unit speaks the same guidance the phone does.
+    private var ttsReady = false
+    private val tts = TextToSpeech(context.applicationContext) { status ->
+        ttsReady = status == TextToSpeech.SUCCESS
+    }
+
+    private fun say(phrase: String) {
+        if (!ttsReady) return
+        runCatching {
+            tts.language = Locale.getDefault()
+            tts.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "wayfind-car")
+        }
+    }
 
     fun start() {
         WayfindRuntime.ensureStarted(context)
@@ -79,6 +99,7 @@ class CarNavigator(private val context: Context) {
 
     fun stop() {
         locationJob?.cancel()
+        runCatching { tts.stop(); tts.shutdown() }
         scope.cancel()
     }
 
@@ -137,16 +158,38 @@ class CarNavigator(private val context: Context) {
     }
 
     fun startNavigation() {
-        val route = _state.value.route ?: return
-        tracker = RouteTracker(route)
-        lastAlong = 0.0
+        val routes = _state.value.routes ?: return
+        val greeting = core.start(listOf(routes.primary) + routes.alternatives, 0)
         _state.update { it.copy(navigating = true) }
+        greeting?.let { say(it) }
     }
 
     fun stopNavigation() {
-        tracker = null
+        core.stop()
         _state.update {
             it.copy(navigating = false, traveled = emptyList(), ahead = emptyList())
+        }
+    }
+
+    /** Take one of the alternates without leaving the drive. */
+    fun selectRoute(index: Int) {
+        if (!core.selectRoute(index)) return
+        say("Switching to the other route.")
+    }
+
+    private fun reroute(from: LatLon) {
+        val destination = _state.value.destination ?: return
+        if (_state.value.rerouting) return
+        _state.update { it.copy(rerouting = true) }
+        say("Rerouting.")
+        scope.launch {
+            val engine = WayfindRuntime.engineOrNull() ?: return@launch
+            runCatching { engine.route(from, destination.point, alternatives = 0) }
+                .onSuccess { bundle ->
+                    core.replaceRoutes(listOf(bundle.primary))
+                    _state.update { it.copy(routes = bundle, rerouting = false) }
+                }
+                .onFailure { _state.update { it.copy(rerouting = false) } }
         }
     }
 
@@ -154,44 +197,38 @@ class CarNavigator(private val context: Context) {
         val point = LatLon(location.latitude, location.longitude)
         _state.update { it.copy(location = point) }
 
-        val active = tracker ?: return
-        val route = active.route
-        val match = active.match(point, lastAlong) ?: return
-        lastAlong = max(lastAlong, match.distanceAlong)
+        val update = core.onLocation(
+            point = point,
+            speedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0,
+            gpsBearing = if (location.hasBearing()) location.bearing.toDouble() else null,
+            hasBearing = location.hasBearing()
+        ) ?: return
 
-        val (traveled, ahead) = active.split(lastAlong)
-        val geometric = max(0.0, active.totalMeters - lastAlong)
-        val fraction = if (active.totalMeters <= 0) 0.0
-        else (geometric / active.totalMeters).coerceIn(0.0, 1.0)
-        val stepIndex = active.stepIndexAt(lastAlong)
-        val step = route.steps.getOrNull(stepIndex)
-        val next = route.steps.getOrNull(stepIndex + 1)
-
+        update.voice?.let { say(it) }
         _state.update {
             it.copy(
-                stepName = step?.name.orEmpty(),
-                nextStepName = next?.name.orEmpty(),
-                metersToManeuver = active.metersToNextManeuver(lastAlong) ?: geometric,
-                remainingMeters = route.distanceMeters * fraction,
-                remainingSeconds = route.seconds * fraction,
-                traveled = traveled,
-                ahead = ahead,
-                position = match.snapped,
-                bearing = if (location.hasBearing() && location.speed > 1.5f) location.bearing.toDouble()
-                else match.bearing,
-                speedLimitKmh = step?.speedLimitKmh ?: 0,
-                turnDelta = turnDeltaAt(route, next?.at)
+                stepName = update.stepName,
+                nextStepName = update.nextStepName,
+                metersToManeuver = update.metersToManeuver,
+                remainingMeters = update.remainingMeters,
+                remainingSeconds = update.remainingSeconds,
+                traveled = update.traveled,
+                ahead = update.ahead,
+                position = update.position,
+                bearing = update.bearing,
+                speedMps = update.speedMps,
+                speedLimitKmh = update.speedLimitKmh,
+                turnDelta = update.turnDelta,
+                alternatives = update.alternatives
             )
         }
+
+        if (update.arrived) {
+            core.stop()
+            _state.update { it.copy(navigating = false) }
+            return
+        }
+        if (update.offRoute) reroute(point)
     }
 
-    /** Signed turn angle at a step boundary, for the car's maneuver glyph. */
-    private fun turnDeltaAt(route: Route, at: Int?): Double {
-        val index = at ?: return 0.0
-        val points = route.geometry
-        if (index <= 0 || index >= points.size - 1) return 0.0
-        val incoming = dev.rangefind.wayfind.nav.bearingDegrees(points[index - 1], points[index])
-        val outgoing = dev.rangefind.wayfind.nav.bearingDegrees(points[index], points[index + 1])
-        return dev.rangefind.wayfind.nav.bearingDelta(incoming, outgoing)
-    }
 }

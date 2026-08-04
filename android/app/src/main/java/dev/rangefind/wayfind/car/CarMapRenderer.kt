@@ -164,7 +164,16 @@ class CarMapRenderer(
 
         // Follow camera: tighter when slow, and the driver sits low on screen
         // with the road ahead filling the view.
-        val zoom = if (state.navigating) 16.6 else 15.2
+        // Zoom bands with speed, like the phone's follow camera: tight in
+        // town where turns come fast, wider at road speed where the driver
+        // needs to see further ahead.
+        val speedKmh = state.speedMps * 3.6
+        val zoom = when {
+            !state.navigating -> 15.2
+            speedKmh < 25 -> 17.0
+            speedKmh < 65 -> 16.4
+            else -> 15.6
+        }
         val bearing = if (state.navigating) camBearing else 0.0
         val anchorY = if (state.navigating) area.top + area.height() * 0.68f else area.centerY()
         val anchorX = area.centerX()

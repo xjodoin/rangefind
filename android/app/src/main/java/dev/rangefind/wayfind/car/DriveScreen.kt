@@ -12,7 +12,9 @@ import androidx.car.app.navigation.NavigationManager
 import androidx.car.app.navigation.model.Maneuver
 import androidx.car.app.navigation.model.NavigationTemplate
 import androidx.car.app.navigation.model.RoutingInfo
+import androidx.car.app.navigation.model.Destination
 import androidx.car.app.navigation.model.Step
+import androidx.car.app.navigation.model.Trip
 import androidx.car.app.navigation.model.TravelEstimate
 import androidx.car.app.model.DateTimeWithZone
 import androidx.core.graphics.drawable.IconCompat
@@ -58,8 +60,41 @@ class DriveScreen(
         } else if (!state.navigating && navigationActive) {
             navigationActive = false
             runCatching { manager.navigationEnded() }
+            return
+        }
+
+        // The host needs the trip, not just our template: this is what feeds
+        // the instrument cluster and the car's own notification surface.
+        if (state.navigating && state.route != null) {
+            runCatching { manager.updateTrip(trip(state)) }
         }
     }
+
+    private fun trip(state: CarState): Trip {
+        val estimate = travelEstimate(state)
+        return Trip.Builder()
+            .addStep(currentStep(state), DriveScreen.distanceOf(state.metersToManeuver).let {
+                TravelEstimate.Builder(it, DateTimeWithZone.create(
+                    Calendar.getInstance().apply {
+                        add(Calendar.SECOND, state.remainingSeconds.roundToInt())
+                    }.timeInMillis,
+                    TimeZone.getDefault()
+                )).setRemainingTimeSeconds(state.remainingSeconds.toLong().coerceAtLeast(0)).build()
+            })
+            .addDestination(
+                Destination.Builder()
+                    .setName(state.destination?.name ?: "Destination")
+                    .build(),
+                estimate
+            )
+            .apply { if (state.stepName.isNotBlank()) setCurrentRoad(state.stepName) }
+            .build()
+    }
+
+    private fun currentStep(state: CarState): Step = Step.Builder()
+        .setCue(state.nextStepName.ifBlank { state.stepName }.ifBlank { "Continue" })
+        .setManeuver(Maneuver.Builder(maneuverType(state.turnDelta)).build())
+        .build()
 
     override fun onGetTemplate(): Template {
         val state = navigator.state.value
@@ -96,16 +131,10 @@ class DriveScreen(
         return strip.build()
     }
 
-    private fun routingInfo(state: CarState): RoutingInfo {
-        val cue = state.nextStepName.ifBlank { state.stepName }.ifBlank { "Continue" }
-        val step = Step.Builder()
-            .setCue(cue)
-            .setManeuver(Maneuver.Builder(maneuverType(state.turnDelta)).build())
-            .build()
-        return RoutingInfo.Builder()
-            .setCurrentStep(step, distanceOf(state.metersToManeuver))
-            .build()
-    }
+    private fun routingInfo(state: CarState): RoutingInfo = RoutingInfo.Builder()
+        .setCurrentStep(currentStep(state), distanceOf(state.metersToManeuver))
+        .apply { if (state.rerouting) setLoading(true) }
+        .build()
 
     private fun travelEstimate(state: CarState): TravelEstimate {
         val arrival = Calendar.getInstance().apply {
