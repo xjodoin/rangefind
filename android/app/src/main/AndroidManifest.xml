@@ -59,12 +59,30 @@
 
         <service
             android:name=".car.WayfindCarAppService"
-            android:exported="true"
-            android:foregroundServiceType="location">
+            android:exported="true">
             <intent-filter>
                 <action android:name="androidx.car.app.CarAppService" />
                 <category android:name="androidx.car.app.category.NAVIGATION" />
             </intent-filter>
+            <!-- "Navigate to X" from Assistant or another app. A navigation
+                 app is required to handle this; without it Wayfind can be
+                 opened but never targeted. -->
+            <intent-filter>
+                <action android:name="androidx.car.app.action.NAVIGATE" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="geo" />
+            </intent-filter>
         </service>
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.traces"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 </manifest>

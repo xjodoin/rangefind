@@ -84,6 +84,9 @@ fun MapScreen(
     onPreloadRegion: (String) -> Unit,
     onDeleteRegion: (String) -> Unit,
     onActivateRegion: (String?) -> Unit,
+    onRecordTripsChange: (Boolean) -> Unit,
+    onShareTrace: () -> Unit,
+    hasTrace: Boolean,
     onLongPress: (LatLon) -> Unit,
     onCenterChanged: (LatLon) -> Unit
 ) {
@@ -355,6 +358,10 @@ fun MapScreen(
                 onPreload = onPreloadRegion,
                 onDelete = onDeleteRegion,
                 onActivate = onActivateRegion,
+                recordTrips = state.recordTrips,
+                hasTrace = hasTrace,
+                onRecordTripsChange = onRecordTripsChange,
+                onShareTrace = onShareTrace,
                 onClose = { onShowRegions(false) }
             )
         }

@@ -198,15 +198,41 @@ over the music instead of ducking it.
 
 ### Driving with a sideloaded build
 
-Android Auto only lists apps installed from Play, so a debug build is
-invisible to the car until you allow unknown sources:
+There is no Android Auto launcher on a phone. Phone-screen mode was
+discontinued, so the Android Auto app on a handset is settings only — the
+projected car UI exists on a head unit or on the Desktop Head Unit (DHU),
+and nowhere else. An app that never appears "in Android Auto" on the phone
+is not misconfigured; there is no list there to appear in.
 
-1. **Settings → Connected devices → Android Auto**
-2. Tap **Version** about ten times to unlock developer mode
-3. **⋮ → Developer settings → Unknown sources**
+The **Unknown sources** developer toggle does not help either. Google's
+testing documentation states that it covers media, messaging and parked
+apps, and explicitly *not* apps built with the Android for Cars App Library.
+A sideloaded template app will not be listed by a production head unit no
+matter what that toggle says.
+
+Two supported paths:
+
+- **DHU, for local development.** Install *Android Auto Desktop Head Unit
+  Emulator* from the SDK Manager's SDK Tools tab, unlock developer mode in
+  the Android Auto app (About → tap the version 10×), turn on **Add new cars
+  to Android Auto**, launch the phone app once so it leaves the stopped
+  state and holds its location grant, then **⋮ → Start head unit server**
+  and, with the phone unlocked over USB:
+
+  ```
+  adb forward tcp:5277 tcp:5277
+  "$ANDROID_SDK_ROOT/extras/google/auto/desktop-head-unit"
+  ```
+
+  If the launcher comes up blank or without Wayfind, restart the head unit
+  server and relaunch the DHU; a stale host is the usual cause.
+
+- **A real vehicle** needs the build to come from a trusted source: Play
+  Internal App Sharing or an internal test track. `adb install` is not
+  enough.
 
 `HostValidator.ALLOW_ALL_HOSTS_VALIDATOR` is already active for debuggable
-builds, which is what lets a real head unit bind to an unpublished app.
+builds, which is what lets an unpublished app bind once it is reachable.
 
 Routing needs no network once a region is preloaded, but **search and the
 car's basemap tiles do**. Tiles are disk-cached, so roads already seen redraw

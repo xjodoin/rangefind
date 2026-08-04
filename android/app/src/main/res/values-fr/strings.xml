@@ -65,6 +65,16 @@
     <string name="nav_arrived">Vous êtes arrivé.</string>
     <string name="nav_continue_now">Maintenant, continuez sur %1$s.</string>
     <string name="nav_continue_in_meters">Dans %1$d mètres, continuez sur %2$s.</string>
+    <string name="nav_turn_left_now">Tournez \u00e0 gauche sur %1$s.</string>
+    <string name="nav_turn_left_in_meters">Dans %1$d m\u00e8tres, tournez \u00e0 gauche sur %2$s.</string>
+    <string name="nav_bear_left_now">Serrez \u00e0 gauche sur %1$s.</string>
+    <string name="nav_bear_left_in_meters">Dans %1$d m\u00e8tres, serrez \u00e0 gauche sur %2$s.</string>
+    <string name="nav_turn_right_now">Tournez \u00e0 droite sur %1$s.</string>
+    <string name="nav_turn_right_in_meters">Dans %1$d m\u00e8tres, tournez \u00e0 droite sur %2$s.</string>
+    <string name="nav_bear_right_now">Serrez \u00e0 droite sur %1$s.</string>
+    <string name="nav_bear_right_in_meters">Dans %1$d m\u00e8tres, serrez \u00e0 droite sur %2$s.</string>
+    <string name="nav_uturn_now">Faites demi-tour sur %1$s.</string>
+    <string name="nav_uturn_in_meters">Dans %1$d m\u00e8tres, faites demi-tour sur %2$s.</string>
     <string name="nav_rerouting">Recalcul de l\'itinéraire.</string>
     <string name="nav_switching_route">Passage à l\'autre itinéraire.</string>
 
@@ -88,6 +98,12 @@
     <string name="region_host_unreachable">Impossible de joindre %1$s — vérifiez que le serveur d\'index fonctionne et que cet appareil est sur le même réseau</string>
     <string name="region_note_luxembourg">Petit extrait de test</string>
     <string name="region_note_quebec">Province complète</string>
+
+    <string name="diag_title">Enregistrement des trajets</string>
+    <string name="diag_subtitle">Tracer les trajets pour analyser ceux qui se passent mal</string>
+    <string name="diag_share">Partager le dernier enregistrement</string>
+    <string name="diag_none">Aucun enregistrement</string>
+    <string name="diag_share_chooser">Partager l\'enregistrement</string>
 
     <!-- Surfaces embarquées (Android Auto / Automotive) -->
     <string name="car_search_hint">Rechercher un lieu</string>

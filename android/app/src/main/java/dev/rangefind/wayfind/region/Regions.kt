@@ -63,12 +63,22 @@ class RegionPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_CHOSEN, false)
         set(value) = prefs.edit().putBoolean(KEY_CHOSEN, value).apply()
 
+    /**
+     * Whether drives are traced for diagnostics. Off by default: a trace is a
+     * precise record of where the user drove, so it is only ever written when
+     * they have deliberately asked for one.
+     */
+    var recordTrips: Boolean
+        get() = prefs.getBoolean(KEY_RECORD, false)
+        set(value) = prefs.edit().putBoolean(KEY_RECORD, value).apply()
+
     fun sourceUrlOf(id: String) = "$host/$id-index/"
 
     private companion object {
         const val KEY_HOST = "host"
         const val KEY_ACTIVE = "active"
         const val KEY_CHOSEN = "chosen"
+        const val KEY_RECORD = "recordTrips"
         /** The emulator's alias for the development machine's loopback. */
         const val DEFAULT_HOST = "http://10.0.2.2:5185"
     }

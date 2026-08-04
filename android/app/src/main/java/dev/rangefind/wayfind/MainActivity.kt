@@ -28,6 +28,9 @@ import dev.rangefind.wayfind.region.RegionPreferences
 import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.ui.MapScreen
+import android.content.Intent
+import androidx.core.content.FileProvider
+import java.io.File
 import dev.rangefind.wayfind.ui.MapsViewModel
 import dev.rangefind.wayfind.ui.SheetMode
 import dev.rangefind.wayfind.ui.theme.WayfindTheme
@@ -133,6 +136,9 @@ class MainActivity : ComponentActivity() {
                     onPreloadRegion = viewModel::preloadRegion,
                     onDeleteRegion = viewModel::deleteRegion,
                     onActivateRegion = viewModel::activateRegion,
+                    onRecordTripsChange = viewModel::setRecordTrips,
+                    hasTrace = viewModel.latestTrace() != null,
+                    onShareTrace = { shareTrace(viewModel.latestTrace()) },
                     onLongPress = viewModel::dropPin,
                     onCenterChanged = { viewModel.mapCenter = it }
                 )
@@ -145,4 +151,26 @@ class MainActivity : ComponentActivity() {
         if (::engine.isInitialized) engine.destroy()
         if (::regionServer.isInitialized) regionServer.stop()
     }
+
+    /**
+     * Hands a trip trace to whatever the user wants to send it with. Shared
+     * through a FileProvider scoped to the trace directory alone, so the grant
+     * cannot reach the region indexes or anything else in private storage.
+     */
+    private fun shareTrace(trace: File?) {
+        if (trace == null || !trace.isFile) return
+        val uri = runCatching {
+            FileProvider.getUriForFile(this, "$packageName.traces", trace)
+        }.getOrNull() ?: return
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "application/json"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, trace.name)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching {
+            startActivity(Intent.createChooser(send, getString(R.string.diag_share_chooser)))
+        }
+    }
+
 }

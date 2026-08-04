@@ -21,6 +21,7 @@ import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.nav.NavUpdate
+import dev.rangefind.wayfind.nav.TripRecorder
 import dev.rangefind.wayfind.nav.NavigationCore
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
@@ -62,7 +63,8 @@ data class UiState(
     val recenterTick: Int = 0,
     val regions: List<RegionEntry> = emptyList(),
     val regionHost: String = "",
-    val showRegions: Boolean = false
+    val showRegions: Boolean = false,
+    val recordTrips: Boolean = false
 ) {
     val activeRoute: Route?
         get() = routes?.let { bundle ->
@@ -101,6 +103,7 @@ class MapsViewModel(
     private var locationJob: Job? = null
 
     private val core = NavigationCore(context)
+    private val recorder = TripRecorder(context)
     private var suppressSuggestFor: String? = null
 
     private val downloads = mutableMapOf<String, Job>()
@@ -165,6 +168,7 @@ class MapsViewModel(
         _state.update { current ->
             current.copy(
                 regionHost = regionPrefs.host,
+                recordTrips = regionPrefs.recordTrips,
                 regions = REGION_CATALOG.map { spec ->
                     val existing = current.regions.firstOrNull { it.spec.id == spec.id }
                     if (downloads[spec.id]?.isActive == true && existing != null) {
@@ -500,14 +504,32 @@ class MapsViewModel(
 
     fun startNavigation() {
         val greeting = core.start(_state.value.allRoutes, _state.value.activeRouteIndex)
+        if (regionPrefs.recordTrips) {
+            recorder.start(_state.value.activeRoute, System.currentTimeMillis())
+        }
         _state.update { it.copy(sheet = SheetMode.Navigating) }
         greeting?.let { _voice.tryEmit(it) }
     }
 
     fun stopNavigation() {
+        recorder.note("stopped-by-user", atMillis = System.currentTimeMillis())
+        recorder.stop()
         core.stop()
         _state.update { it.copy(sheet = SheetMode.Directions, nav = null, rerouting = false) }
     }
+
+    // ---- diagnostics ---------------------------------------------------
+
+    val recordTrips: Boolean get() = regionPrefs.recordTrips
+
+    fun setRecordTrips(enabled: Boolean) {
+        regionPrefs.recordTrips = enabled
+        if (!enabled) recorder.stop()
+        _state.update { it.copy(recordTrips = enabled) }
+    }
+
+    /** The most recent finished trace, for sharing off the device. */
+    fun latestTrace(): java.io.File? = recorder.traces().firstOrNull()
 
     fun recenter() {
         _state.update { it.copy(recenterTick = it.recenterTick + 1) }
@@ -535,13 +557,32 @@ class MapsViewModel(
             speedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0,
             gpsBearing = if (location.hasBearing()) location.bearing.toDouble() else null,
             hasBearing = location.hasBearing()
-        ) ?: return
+        )
+        // Trace the fix whether or not the core made anything of it: a fix it
+        // declined to use is exactly the kind of gap worth seeing afterwards.
+        recorder.log(location, update, System.currentTimeMillis())
+        if (update == null) return
 
         update.voice?.let { _voice.tryEmit(it) }
         _state.update { it.copy(nav = update) }
 
         if (update.arrived) {
+            recorder.note("arrived", atMillis = System.currentTimeMillis())
+            recorder.stop()
             core.stop()
+            // Stopping the state machine is not finishing the drive: without
+            // this the phone stayed on the navigation sheet at the doorstep,
+            // with no guidance left to give and no way out but Back. The car
+            // surface had always ended its own trip here.
+            _state.update {
+                it.copy(
+                    sheet = if (it.selected != null) SheetMode.Place else SheetMode.Search,
+                    nav = null,
+                    routes = null,
+                    activeRouteIndex = 0,
+                    rerouting = false
+                )
+            }
             return
         }
         if (update.offRoute) {
@@ -567,6 +608,7 @@ class MapsViewModel(
         val destination = _state.value.selected ?: return
         if (_state.value.rerouting) return
         _state.update { it.copy(rerouting = true) }
+        recorder.note("reroute", detail = "heading=${heading ?: "none"}", atMillis = System.currentTimeMillis())
         _voice.tryEmit(context.getString(R.string.nav_rerouting))
         viewModelScope.launch {
             runCatching { engine.route(from, destination.point, alternatives = 0, fromHeading = heading) }

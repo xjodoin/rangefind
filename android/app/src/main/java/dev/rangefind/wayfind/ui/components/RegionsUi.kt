@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import android.content.Context
 import dev.rangefind.wayfind.R
+import androidx.compose.material3.Switch
 import dev.rangefind.wayfind.region.RegionEntry
 import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.ui.formatBytes
@@ -57,6 +58,10 @@ fun RegionsSheet(
     onPreload: (String) -> Unit,
     onDelete: (String) -> Unit,
     onActivate: (String?) -> Unit,
+    recordTrips: Boolean,
+    hasTrace: Boolean,
+    onRecordTripsChange: (Boolean) -> Unit,
+    onShareTrace: () -> Unit,
     onClose: () -> Unit
 ) {
     Box(
@@ -156,6 +161,46 @@ fun RegionsSheet(
                     stringResource(R.string.region_use_network_index),
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+
+            // Diagnostics. A trace is a precise record of where someone drove,
+            // so it is opt-in, capped to the last few drives, and never leaves
+            // the device unless they share it themselves.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onRecordTripsChange(!recordTrips) }
+                    .padding(start = 20.dp, end = 12.dp, top = 6.dp, bottom = 6.dp)
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        stringResource(R.string.diag_title),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        stringResource(R.string.diag_subtitle),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = recordTrips, onCheckedChange = onRecordTripsChange)
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = hasTrace, onClick = onShareTrace)
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+            ) {
+                Text(
+                    stringResource(if (hasTrace) R.string.diag_share else R.string.diag_none),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = if (hasTrace) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }

@@ -1,9 +1,11 @@
 package dev.rangefind.wayfind.nav
 
 import android.content.Context
+import androidx.annotation.StringRes
 import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Route
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -62,6 +64,7 @@ class NavigationCore(private val context: Context) {
     private var announcedThreshold = Int.MAX_VALUE
     private var offRouteStrikes = 0
     private var announcedArrival = false
+    private var announcedFirst = false
 
     val isRunning: Boolean get() = tracker != null
     val activeRoute: Route? get() = routes.getOrNull(activeIndex)
@@ -93,6 +96,7 @@ class NavigationCore(private val context: Context) {
         announcedStep = -1
         announcedThreshold = Int.MAX_VALUE
         offRouteStrikes = 0
+        announcedFirst = false
         return true
     }
 
@@ -112,6 +116,7 @@ class NavigationCore(private val context: Context) {
         announcedThreshold = Int.MAX_VALUE
         offRouteStrikes = 0
         announcedArrival = false
+        announcedFirst = false
     }
 
     fun onLocation(
@@ -151,16 +156,24 @@ class NavigationCore(private val context: Context) {
         val stepIndex = active.stepIndexAt(lastAlong)
         val next = route.steps.getOrNull(stepIndex + 1)
         val toManeuver = active.metersToNextManeuver(lastAlong) ?: geometric
-        val arrived = geometric < ARRIVAL_METERS
+        // Arrival used to depend purely on progress along the line. When the
+        // match saturates short of the end — a destination set back from the
+        // road, a polyline that stops at the kerb — the remaining distance
+        // never reaches zero and the drive never completes. Standing at the
+        // destination counts regardless of what the odometer says.
+        val destination = route.geometry.lastOrNull()
+        val toDestination = destination?.let { haversineMeters(point, it) } ?: Double.MAX_VALUE
+        val arrived = geometric < ARRIVAL_METERS || toDestination < ARRIVAL_METERS
 
         val offRoute = offRouteStrikes >= OFF_ROUTE_STRIKES
+        val turnDelta = turnDeltaAt(route, next?.at)
         val voice = when {
             arrived && !announcedArrival -> {
                 announcedArrival = true
                 context.getString(R.string.nav_arrived)
             }
             offRoute -> null
-            else -> announcement(stepIndex, toManeuver, next?.name.orEmpty())
+            else -> announcement(stepIndex, toManeuver, next?.name.orEmpty(), turnDelta)
         }
 
         return NavUpdate(
@@ -176,7 +189,7 @@ class NavigationCore(private val context: Context) {
             bearing = heading,
             speedMps = speedMps,
             speedLimitKmh = route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0,
-            turnDelta = turnDeltaAt(route, next?.at),
+            turnDelta = turnDelta,
             offRoute = offRoute,
             arrived = arrived,
             alternatives = liveAlternatives(point, remainingSeconds, match.crossTrackMeters),
@@ -184,21 +197,61 @@ class NavigationCore(private val context: Context) {
         )
     }
 
-    private fun announcement(stepIndex: Int, meters: Double, nextName: String): String? {
+    private fun announcement(
+        stepIndex: Int,
+        meters: Double,
+        nextName: String,
+        turnDelta: Double
+    ): String? {
         if (nextName.isBlank()) return null
-        val threshold = ANNOUNCE_THRESHOLDS.firstOrNull { meters <= it } ?: return null
-        if (stepIndex == announcedStep && threshold >= announcedThreshold) return null
+        val threshold = ANNOUNCE_THRESHOLDS.firstOrNull { meters <= it }
+        // The first instruction goes out as soon as the drive starts, however
+        // far off the first maneuver is. Waiting for the 400 m threshold meant
+        // a driver pulling away was told about the road *after* the one they
+        // had to take first, and never about that first one at all.
+        val opening = !announcedFirst
+        if (threshold == null && !opening) return null
+        if (!opening && stepIndex == announcedStep && threshold!! >= announcedThreshold) return null
+        announcedFirst = true
         announcedStep = stepIndex
-        announcedThreshold = threshold
-        return if (threshold <= 60) {
-            context.getString(R.string.nav_continue_now, nextName)
+        announcedThreshold = threshold ?: Int.MAX_VALUE
+        // "Now" only once the maneuver is genuinely at the windscreen; an
+        // opening call from 2 km out still has to say how far.
+        return if (threshold != null && threshold <= IMMINENT_METERS) {
+            context.getString(nowPhraseFor(turnDelta), nextName)
         } else {
             context.getString(
-                R.string.nav_continue_in_meters,
+                inMetersPhraseFor(turnDelta),
                 (meters / 50).roundToInt() * 50,
                 nextName
             )
         }
+    }
+
+    /**
+     * Guidance used to say "continue onto X" for every maneuver, including
+     * hard turns: the turn angle was computed for the on-screen glyph and
+     * never reached the voice. A driver listening rather than looking got no
+     * turn at all.
+     */
+    @StringRes
+    private fun nowPhraseFor(delta: Double): Int = when {
+        abs(delta) > U_TURN_DEGREES -> R.string.nav_uturn_now
+        delta <= -TURN_DEGREES -> R.string.nav_turn_left_now
+        delta <= -BEAR_DEGREES -> R.string.nav_bear_left_now
+        delta >= TURN_DEGREES -> R.string.nav_turn_right_now
+        delta >= BEAR_DEGREES -> R.string.nav_bear_right_now
+        else -> R.string.nav_continue_now
+    }
+
+    @StringRes
+    private fun inMetersPhraseFor(delta: Double): Int = when {
+        abs(delta) > U_TURN_DEGREES -> R.string.nav_uturn_in_meters
+        delta <= -TURN_DEGREES -> R.string.nav_turn_left_in_meters
+        delta <= -BEAR_DEGREES -> R.string.nav_bear_left_in_meters
+        delta >= TURN_DEGREES -> R.string.nav_turn_right_in_meters
+        delta >= BEAR_DEGREES -> R.string.nav_bear_right_in_meters
+        else -> R.string.nav_continue_in_meters
     }
 
     /**
@@ -258,5 +311,11 @@ class NavigationCore(private val context: Context) {
         /** How far off an alternate the car can be before it stops being one. */
         const val ALT_LIVE_METERS = 60.0
         private val ANNOUNCE_THRESHOLDS = listOf(60, 200, 400)
+        /** Close enough that the instruction is "now" rather than a distance. */
+        private const val IMMINENT_METERS = 60
+        /** Turn-angle bands, matching the on-screen maneuver glyph. */
+        private const val BEAR_DEGREES = 22.0
+        private const val TURN_DEGREES = 60.0
+        private const val U_TURN_DEGREES = 150.0
     }
 }

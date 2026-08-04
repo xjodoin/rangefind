@@ -66,6 +66,16 @@
     <string name="nav_arrived">You have arrived.</string>
     <string name="nav_continue_now">Now, continue onto %1$s.</string>
     <string name="nav_continue_in_meters">In %1$d meters, continue onto %2$s.</string>
+    <string name="nav_turn_left_now">Now, turn left onto %1$s.</string>
+    <string name="nav_turn_left_in_meters">In %1$d meters, turn left onto %2$s.</string>
+    <string name="nav_bear_left_now">Now, bear left onto %1$s.</string>
+    <string name="nav_bear_left_in_meters">In %1$d meters, bear left onto %2$s.</string>
+    <string name="nav_turn_right_now">Now, turn right onto %1$s.</string>
+    <string name="nav_turn_right_in_meters">In %1$d meters, turn right onto %2$s.</string>
+    <string name="nav_bear_right_now">Now, bear right onto %1$s.</string>
+    <string name="nav_bear_right_in_meters">In %1$d meters, bear right onto %2$s.</string>
+    <string name="nav_uturn_now">Now, make a U-turn onto %1$s.</string>
+    <string name="nav_uturn_in_meters">In %1$d meters, make a U-turn onto %2$s.</string>
     <string name="nav_rerouting">Rerouting.</string>
     <string name="nav_switching_route">Switching to the other route.</string>
 
@@ -89,6 +99,12 @@
     <string name="region_host_unreachable">Can\'t reach %1$s — check that the index server is running and that this device is on the same network</string>
     <string name="region_note_luxembourg">Small test extract</string>
     <string name="region_note_quebec">Full province</string>
+
+    <string name="diag_title">Trip recording</string>
+    <string name="diag_subtitle">Trace drives so a bad one can be examined afterwards</string>
+    <string name="diag_share">Share last recording</string>
+    <string name="diag_none">No recordings yet</string>
+    <string name="diag_share_chooser">Share trip recording</string>
 
     <!-- Car / head-unit surfaces -->
     <string name="car_search_hint">Search places</string>
