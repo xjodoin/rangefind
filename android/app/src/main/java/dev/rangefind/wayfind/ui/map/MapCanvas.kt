@@ -1,6 +1,6 @@
 package dev.rangefind.wayfind.ui.map
 
-import android.graphics.PointF
+import android.graphics.RectF
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -18,6 +18,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.RouteJunction
 import dev.rangefind.wayfind.ui.SheetMode
+import dev.rangefind.wayfind.ui.formatDuration
 import dev.rangefind.wayfind.ui.UiState
 import dev.rangefind.wayfind.ui.theme.MapPalette
 import org.maplibre.android.MapLibre
@@ -53,8 +54,15 @@ private const val SRC_SIGNAL = "rf-src-signal"
 private const val SRC_STOP = "rf-src-stop"
 private const val SRC_CROSSING = "rf-src-crossing"
 private const val SRC_PUCK = "rf-src-puck"
+private const val SRC_ORIGIN = "rf-src-origin"
 
 private const val LYR_RESULTS = "rf-lyr-results"
+private const val LYR_ALT = "rf-lyr-alt"
+
+/** Up to three candidates: the fastest plus two alternates. */
+private val SRC_LABEL = listOf("rf-src-label-0", "rf-src-label-1", "rf-src-label-2")
+private val LYR_LABEL = listOf("rf-lyr-label-0", "rf-lyr-label-1", "rf-lyr-label-2")
+private val IMG_LABEL = listOf("rf-label-0", "rf-label-1", "rf-label-2")
 
 /** Rangefind ink — the glyph punched out of the amber destination marker. */
 private const val INK = 0xFF14161D.toInt()
@@ -67,14 +75,19 @@ fun MapCanvas(
     bottomInsetPx: Int,
     onCenterChanged: (LatLon) -> Unit,
     onResultTapped: (Int) -> Unit,
+    onRouteTapped: (Int) -> Unit,
     onLongPress: (LatLon) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current.density
     val holder = remember { MapHolder() }
 
+    // The click listener is bound once; without this it would compare taps
+    // against whatever the selection was at bind time.
+    val currentState by rememberUpdatedState(state)
     val currentOnCenter by rememberUpdatedState(onCenterChanged)
     val currentOnResult by rememberUpdatedState(onResultTapped)
+    val currentOnRoute by rememberUpdatedState(onRouteTapped)
     val currentOnLongPress by rememberUpdatedState(onLongPress)
 
     val mapView = rememberMapViewWithLifecycle()
@@ -113,11 +126,33 @@ fun MapCanvas(
                 }
                 map.addOnMapClickListener { point ->
                     val screen = map.projection.toScreenLocation(point)
-                    val hits = map.queryRenderedFeatures(
-                        PointF(screen.x, screen.y),
-                        LYR_RESULTS
+                    fun boxOf(dp: Float) = RectF(
+                        screen.x - dp * density, screen.y - dp * density,
+                        screen.x + dp * density, screen.y + dp * density
                     )
-                    val index = hits.firstOrNull()?.getNumberProperty("index")?.toInt()
+                    fun routeOf(feature: org.maplibre.geojson.Feature) =
+                        runCatching { feature.getNumberProperty("route")?.toInt() }.getOrNull()
+
+                    // Duration bubbles are already finger-sized, so they get a
+                    // tight box: a generous one spans all three and the first
+                    // hit is always the active route, which reads as a dead tap.
+                    val labelHits = map.queryRenderedFeatures(boxOf(6f), *LYR_LABEL.toTypedArray())
+                        .mapNotNull(::routeOf)
+                    // A route line is only a few pixels wide and deserves the
+                    // slop a finger actually has.
+                    val lineHits = map.queryRenderedFeatures(boxOf(22f), LYR_ALT)
+                        .mapNotNull(::routeOf)
+
+                    val picked = (labelHits + lineHits).let { hits ->
+                        hits.firstOrNull { it != currentState.activeRouteIndex } ?: hits.firstOrNull()
+                    }
+                    if (picked != null) {
+                        currentOnRoute(picked)
+                        return@addOnMapClickListener true
+                    }
+
+                    val index = map.queryRenderedFeatures(boxOf(18f), LYR_RESULTS)
+                        .firstOrNull()?.getNumberProperty("index")?.toInt()
                     if (index != null) {
                         currentOnResult(index)
                         true
@@ -145,15 +180,21 @@ fun MapCanvas(
     ) {
         holder.latest = state
         holder.palette = palette
+        holder.density = density
         holder.flush()
     }
 
-    // Camera: fit a freshly computed route.
-    LaunchedEffect(state.routes, state.activeRouteIndex) {
-        val route = state.activeRoute ?: return@LaunchedEffect
+    // Camera: frame every candidate, so the overview shows the whole choice.
+    // Not keyed on the active index — switching alternates must not re-frame,
+    // or comparing them turns into the map lurching under your thumb. It *is*
+    // keyed on the sheet height, because routes arrive before the directions
+    // sheet has laid out, and framing against the old height buries the line
+    // under it.
+    LaunchedEffect(state.routes, bottomInsetPx) {
+        if (state.routes == null) return@LaunchedEffect
         if (state.sheet == SheetMode.Navigating) return@LaunchedEffect
         val map = holder.map ?: return@LaunchedEffect
-        val points = route.geometry
+        val points = state.allRoutes.flatMap { it.geometry }
         if (points.size < 2) return@LaunchedEffect
         val bounds = LatLngBounds.Builder()
             .includes(points.map { LatLng(it.lat, it.lon) })
@@ -286,6 +327,7 @@ private class MapHolder {
     /** Most recent app state, replayed whenever a new style finishes loading. */
     var latest: UiState? = null
     var palette: MapPalette? = null
+    var density: Float = 1f
 
     fun flush() {
         val state = latest ?: return
@@ -300,10 +342,16 @@ private class MapHolder {
         val navigating = state.sheet == SheetMode.Navigating
         val active = state.activeRoute
 
-        // Alternatives sit under the active line so the choice reads clearly.
-        val alternates = if (navigating) emptyList() else
-            state.allRoutes.filterIndexed { index, _ -> index != state.activeRouteIndex }
-        style.setLine(SRC_ALT, alternates.map { it.geometry })
+        // Alternatives sit under the active line so the choice reads clearly,
+        // and each carries its index so tapping one selects it.
+        val altFeatures = if (navigating) emptyList() else
+            state.allRoutes.mapIndexedNotNull { index, candidate ->
+                if (index == state.activeRouteIndex || candidate.geometry.size < 2) null
+                else Feature.fromGeometry(
+                    LineString.fromLngLats(candidate.geometry.map { Point.fromLngLat(it.lon, it.lat) })
+                ).apply { addNumberProperty("route", index) }
+            }
+        style.setSource(SRC_ALT, FeatureCollection.fromFeatures(altFeatures))
 
         if (navigating && state.nav != null) {
             style.setLine(SRC_TRAVELED, listOf(state.nav.traveled))
@@ -349,6 +397,51 @@ private class MapHolder {
         style.setSource(SRC_STOP, junctions.filter { it.kind == 2 }.toPoints())
         style.setSource(SRC_CROSSING, junctions.filter { it.kind == 3 || it.kind == 4 || it.kind == 5 }.toPoints())
 
+        // Trip start marker, and a duration bubble on each candidate — the
+        // overview should answer "which one, and how long" without the sheet.
+        val originPoint = if (navigating) null else active?.geometry?.firstOrNull()
+        style.setSource(
+            SRC_ORIGIN,
+            FeatureCollection.fromFeatures(
+                listOfNotNull(originPoint?.let { Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)) })
+            )
+        )
+
+        val candidates = if (navigating) emptyList() else state.allRoutes
+        SRC_LABEL.indices.forEach { i ->
+            val candidate = candidates.getOrNull(i)
+            if (candidate == null || candidate.geometry.size < 2) {
+                style.setSource(SRC_LABEL[i], FeatureCollection.fromFeatures(emptyList()))
+                return@forEach
+            }
+            val isActive = i == state.activeRouteIndex
+            style.addImage(
+                IMG_LABEL[i],
+                MapIcons.durationLabel(
+                    text = formatDuration(candidate.seconds),
+                    fill = if (isActive) palette.routeLine.toArgb() else 0xFFFFFFFF.toInt(),
+                    textColor = if (isActive) 0xFFFAF9F6.toInt() else INK,
+                    outline = if (isActive) palette.routeCasing.toArgb() else 0x1F000000,
+                    density = density
+                )
+            )
+            // Stagger the anchors so three bubbles on a shared corridor do not
+            // stack on top of each other.
+            val fraction = 0.32 + 0.17 * i
+            val at = ((candidate.geometry.size - 1) * fraction).toInt()
+                .coerceIn(0, candidate.geometry.size - 1)
+            val anchor = candidate.geometry[at]
+            style.setSource(
+                SRC_LABEL[i],
+                FeatureCollection.fromFeatures(
+                    listOf(
+                        Feature.fromGeometry(Point.fromLngLat(anchor.lon, anchor.lat))
+                            .apply { addNumberProperty("route", i) }
+                    )
+                )
+            )
+        }
+
         val puck = if (navigating) state.nav?.position else state.userLocation
         style.setSource(
             SRC_PUCK,
@@ -374,10 +467,10 @@ private fun Style.setLine(id: String, lines: List<List<LatLon>>) {
 }
 
 private fun installLayers(style: Style, palette: MapPalette, density: Float) {
-    listOf(
+    (listOf(
         SRC_ALT, SRC_ROUTE, SRC_TRAVELED, SRC_RESULTS, SRC_DESTINATION,
-        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK
-    ).forEach { id ->
+        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN
+    ) + SRC_LABEL).forEach { id ->
         if (style.getSource(id) == null) {
             style.addSource(GeoJsonSource(id, FeatureCollection.fromFeatures(emptyList())))
         }
@@ -398,7 +491,7 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
         )
 
     style.addLayer(line("rf-lyr-alt-casing", SRC_ALT, palette.routeAlternateCasing.toArgb(), 11f, 0.9f))
-    style.addLayer(line("rf-lyr-alt", SRC_ALT, palette.routeAlternate.toArgb(), 6.5f, 0.9f))
+    style.addLayer(line(LYR_ALT, SRC_ALT, palette.routeAlternate.toArgb(), 6.5f, 0.9f))
     style.addLayer(line("rf-lyr-traveled", SRC_TRAVELED, palette.routeTraveled.toArgb(), 9f, 0.85f))
     style.addLayer(line("rf-lyr-casing", SRC_ROUTE, palette.routeCasing.toArgb(), 14f))
     style.addLayer(line("rf-lyr-route", SRC_ROUTE, palette.routeLine.toArgb(), 8.5f))
@@ -436,6 +529,26 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
             PropertyFactory.iconAnchor(Property.ICON_ANCHOR_BOTTOM)
         )
     )
+
+    // Trip start, so an overview reads as a journey rather than a stray line.
+    style.addLayer(
+        CircleLayer("rf-lyr-origin", SRC_ORIGIN).withProperties(
+            PropertyFactory.circleRadius(7f),
+            PropertyFactory.circleColor(0xFFFAF9F6.toInt()),
+            PropertyFactory.circleStrokeWidth(4f),
+            PropertyFactory.circleStrokeColor(palette.routeCasing.toArgb())
+        )
+    )
+
+    SRC_LABEL.indices.forEach { i ->
+        style.addLayer(
+            SymbolLayer(LYR_LABEL[i], SRC_LABEL[i]).withProperties(
+                PropertyFactory.iconImage(IMG_LABEL[i]),
+                PropertyFactory.iconAllowOverlap(true),
+                PropertyFactory.iconIgnorePlacement(true)
+            )
+        )
+    }
 
     style.addLayer(
         CircleLayer("rf-lyr-puck-halo", SRC_PUCK).withProperties(

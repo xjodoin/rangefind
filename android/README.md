@@ -18,8 +18,11 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   categories ("cafe", "pharmacy") come back nearest-first.
 - **Place details** with category, address, and distance, plus long-press
   anywhere to drop a pin and reverse-geocode it.
-- **Directions** with up to three alternatives, maneuver steps, ETA and arrival
-  clock, and a fetch receipt showing how many range requests the route cost.
+- **Directions** open a route overview, not just a line: every candidate is
+  framed at once, each carries a duration bubble on the map, and tapping a
+  bubble or a grey alternate selects it — the camera deliberately holds still
+  while you compare. Plus maneuver steps, ETA and arrival clock, and a fetch
+  receipt showing how many range requests the route cost.
 - **Turn-by-turn navigation**: pitched follow camera with speed-banded zoom,
   maneuver banner, traveled-route dimming, current-road pill, speed readout,
   spoken guidance, and automatic rerouting when you leave the line.

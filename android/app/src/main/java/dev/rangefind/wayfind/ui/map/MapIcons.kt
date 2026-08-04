@@ -64,6 +64,56 @@ object MapIcons {
         return bitmap
     }
 
+    /**
+     * Duration bubble placed on a route in the overview, the way a paper map
+     * would letter each option. Drawn rather than typeset as a text layer so it
+     * never depends on which glyph stacks the basemap style happens to ship.
+     */
+    fun durationLabel(
+        text: String,
+        fill: Int,
+        textColor: Int,
+        outline: Int,
+        density: Float
+    ): Bitmap {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 13f * density
+            typeface = android.graphics.Typeface.create(
+                android.graphics.Typeface.DEFAULT,
+                android.graphics.Typeface.BOLD
+            )
+        }
+        val padH = 10f * density
+        val padV = 6f * density
+        val textWidth = paint.measureText(text)
+        val metrics = paint.fontMetrics
+        val textHeight = metrics.descent - metrics.ascent
+
+        val width = (textWidth + padH * 2).toInt().coerceAtLeast(1)
+        val height = (textHeight + padV * 2 + 3f * density).toInt().coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+
+        val radius = (height - 3f * density) / 2f
+        val body = RectF(0f, 0f, width.toFloat(), height - 3f * density)
+
+        paint.color = 0x26000000
+        canvas.drawRoundRect(RectF(body.left, body.top + 2f * density, body.right, body.bottom + 2f * density), radius, radius, paint)
+
+        paint.color = fill
+        canvas.drawRoundRect(body, radius, radius, paint)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 1.2f * density
+        paint.color = outline
+        canvas.drawRoundRect(body, radius, radius, paint)
+        paint.style = Paint.Style.FILL
+
+        paint.color = textColor
+        canvas.drawText(text, padH, padV - metrics.ascent, paint)
+        return bitmap
+    }
+
     /** Traffic-signal head: three stacked lamps on a dark housing. */
     fun signal(density: Float): Bitmap {
         val size = (22 * density).toInt().coerceAtLeast(16)

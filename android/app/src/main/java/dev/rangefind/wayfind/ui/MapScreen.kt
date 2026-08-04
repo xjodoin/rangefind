@@ -106,6 +106,7 @@ fun MapScreen(
             bottomInsetPx = sheetHeightPx,
             onCenterChanged = onCenterChanged,
             onResultTapped = onSelectResult,
+            onRouteTapped = onSelectRoute,
             onLongPress = onLongPress,
             modifier = Modifier.fillMaxSize()
         )
