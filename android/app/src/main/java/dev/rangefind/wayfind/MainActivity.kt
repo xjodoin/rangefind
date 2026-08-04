@@ -3,7 +3,6 @@ package dev.rangefind.wayfind
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -23,13 +22,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.rangefind.wayfind.engine.WebViewRangefindEngine
 import dev.rangefind.wayfind.location.LocationProvider
+import dev.rangefind.wayfind.nav.GuidanceSpeaker
 import dev.rangefind.wayfind.region.RegionPreferences
 import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.ui.MapScreen
 import dev.rangefind.wayfind.ui.MapsViewModel
 import dev.rangefind.wayfind.ui.theme.WayfindTheme
-import java.util.Locale
 
 @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
 class MainActivity : ComponentActivity() {
@@ -90,7 +89,7 @@ class MainActivity : ComponentActivity() {
 
                 // Voice guidance: the view model emits phrases, the UI speaks
                 // them, so navigation logic stays free of Android media APIs.
-                val speaker = remember { Speaker(context) }
+                val speaker = remember { GuidanceSpeaker(context) }
                 DisposableEffect(Unit) { onDispose { speaker.shutdown() } }
                 LaunchedEffect(Unit) {
                     viewModel.voice.collect { phrase -> speaker.say(phrase) }
@@ -132,34 +131,5 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         if (::engine.isInitialized) engine.destroy()
         if (::regionServer.isInitialized) regionServer.stop()
-    }
-}
-
-/** Minimal TTS wrapper that queues phrases until the engine is ready. */
-private class Speaker(context: android.content.Context) {
-    private var ready = false
-    private var pending: String? = null
-    private val tts = TextToSpeech(context.applicationContext) { status ->
-        ready = status == TextToSpeech.SUCCESS
-        if (ready) pending?.let { say(it) }
-        pending = null
-    }.apply { }
-
-    fun say(phrase: String) {
-        if (!ready) {
-            pending = phrase
-            return
-        }
-        runCatching {
-            tts.language = Locale.getDefault()
-            tts.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "rf-nav")
-        }
-    }
-
-    fun shutdown() {
-        runCatching {
-            tts.stop()
-            tts.shutdown()
-        }
     }
 }

@@ -3,8 +3,6 @@ package dev.rangefind.wayfind.car
 import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Location
-import android.speech.tts.TextToSpeech
-import java.util.Locale
 import dev.rangefind.wayfind.BuildConfig
 import dev.rangefind.wayfind.SEARCH_BASE
 import dev.rangefind.wayfind.WayfindRuntime
@@ -12,6 +10,7 @@ import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Place
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.engine.RouteBundle
+import dev.rangefind.wayfind.nav.GuidanceSpeaker
 import dev.rangefind.wayfind.nav.NavAlternative
 import dev.rangefind.wayfind.nav.NavigationCore
 import kotlinx.coroutines.CoroutineScope
@@ -74,19 +73,11 @@ class CarNavigator(private val context: Context) {
     private var searchJob: Job? = null
 
     // Driving is exactly when the driver should not be reading the screen, so
-    // the head unit speaks the same guidance the phone does.
-    private var ttsReady = false
-    private val tts = TextToSpeech(context.applicationContext) { status ->
-        ttsReady = status == TextToSpeech.SUCCESS
-    }
+    // the head unit speaks the same guidance the phone does — tagged as
+    // navigation audio so the car plays it and ducks the music.
+    private val speaker = GuidanceSpeaker(context)
 
-    private fun say(phrase: String) {
-        if (!ttsReady) return
-        runCatching {
-            tts.language = Locale.getDefault()
-            tts.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "wayfind-car")
-        }
-    }
+    private fun say(phrase: String) = speaker.say(phrase)
 
     fun start() {
         WayfindRuntime.ensureStarted(context)
@@ -99,7 +90,7 @@ class CarNavigator(private val context: Context) {
 
     fun stop() {
         locationJob?.cancel()
-        runCatching { tts.stop(); tts.shutdown() }
+        speaker.shutdown()
         scope.cancel()
     }
 

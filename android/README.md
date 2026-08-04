@@ -190,6 +190,29 @@ The car also calls `NavigationManager.updateTrip()`, which is what feeds the
 instrument cluster and the host's own notification surface — without it the
 maneuver only exists inside our template.
 
+Guidance audio goes through `nav/GuidanceSpeaker`, which tags the stream
+`USAGE_ASSISTANCE_NAVIGATION_GUIDANCE` and takes transient focus for the
+length of each phrase. A bare `TextToSpeech.speak()` is media audio: a head
+unit may play it on the handset rather than the car speakers, and it talks
+over the music instead of ducking it.
+
+### Driving with a sideloaded build
+
+Android Auto only lists apps installed from Play, so a debug build is
+invisible to the car until you allow unknown sources:
+
+1. **Settings → Connected devices → Android Auto**
+2. Tap **Version** about ten times to unlock developer mode
+3. **⋮ → Developer settings → Unknown sources**
+
+`HostValidator.ALLOW_ALL_HOSTS_VALIDATOR` is already active for debuggable
+builds, which is what lets a real head unit bind to an unpublished app.
+
+Routing needs no network once a region is preloaded, but **search and the
+car's basemap tiles do**. Tiles are disk-cached, so roads already seen redraw
+offline; a fresh area with no signal shows the route line on an empty
+background.
+
 **The map on the car surface is drawn by the app.** MapLibre exposes no
 renderer that targets an arbitrary `Surface` — only `MapView` — so rather than
 fork a large native codebase for one class, the car view composes itself:
