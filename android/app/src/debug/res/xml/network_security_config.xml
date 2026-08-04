@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug builds only. A development index server lives on whatever LAN address
+  the machine happens to have, and a phone on Wi-Fi reaches it over cleartext
+  http — an address that cannot be enumerated ahead of time the way the
+  emulator's 10.0.2.2 alias can. Release builds keep the strict main config,
+  where https is the only way in.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
