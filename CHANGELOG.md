@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.5 — 2026-08-04
+
+### Fixed
+
+- OSM extraction now drops malformed optional way geometry instead of
+  aborting an entire regional corpus on an out-of-range coordinate.
+
 ## 0.4.4 — 2026-08-04
 
 ### Improved

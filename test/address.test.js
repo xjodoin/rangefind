@@ -69,6 +69,15 @@ test("OSM area geometry is compact and supplies a real polygon centroid", () => 
   assert.ok(Math.abs(shape.center.lon + 73.59) < 1e-6);
 });
 
+test("invalid optional OSM way geometry is dropped without aborting extraction", () => {
+  assert.equal(geometryForWay([
+    { lat: -89.9, lon: 10 },
+    { lat: -90.000001, lon: 11 },
+    { lat: -89.9, lon: 12 },
+    { lat: -89.9, lon: 10 }
+  ]), null);
+});
+
 test("named OSM roads publish locality-qualified street authority", () => {
   const tags = new Map([["name", "Rue Saint-Denis"], ["highway", "primary"]]);
   const doc = placeDoc("way", 101, 45.52, -73.57, tags);

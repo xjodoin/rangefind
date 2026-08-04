@@ -342,6 +342,17 @@ function simplifyRing(points, tolerance = 0.00001, maxPoints = 256) {
 
 export function geometryForWay(points) {
   const sourceRing = (points || []).filter(Boolean).map(point => ({ lat: Number(point.lat), lon: Number(point.lon) }));
+  // OSM occasionally contains malformed or slightly out-of-range way-node
+  // coordinates. Geometry is optional search-display metadata, so discard the
+  // whole shape instead of aborting extraction for an otherwise useful place.
+  if (sourceRing.some(point => (
+    !Number.isFinite(point.lat)
+    || !Number.isFinite(point.lon)
+    || point.lat < -90
+    || point.lat > 90
+    || point.lon < -180
+    || point.lon > 180
+  ))) return null;
   const ring = simplifyRing(sourceRing);
   if (ring.length < 4) return null;
   const closed = ring[0].lat === ring.at(-1).lat && ring[0].lon === ring.at(-1).lon;
