@@ -186,9 +186,18 @@ class CarNavigator(private val context: Context) {
         say(context.getString(R.string.nav_switching_route))
     }
 
-    /** The travel direction to route from, or null when too slow to trust it. */
-    private fun headingOf(speedMps: Double, bearing: Double): Double? =
-        if (speedMps >= NavigationCore.MIN_HEADING_SPEED_MPS) bearing else null
+    /**
+     * The vehicle's own heading, or null when it cannot be trusted.
+     *
+     * Taken from the fix rather than NavUpdate.bearing on purpose: that one
+     * falls back to the matched road's direction so the arrow stays steady,
+     * and on an off-route event the matched road is the one the driver has
+     * just left — precisely the direction a reroute must not assume.
+     */
+    private fun travelHeading(location: Location): Double? =
+        if (location.hasBearing() && location.speed >= NavigationCore.MIN_HEADING_SPEED_MPS) {
+            location.bearing.toDouble()
+        } else null
 
     private fun reroute(from: LatLon, heading: Double?) {
         val destination = _state.value.destination ?: return
@@ -241,7 +250,7 @@ class CarNavigator(private val context: Context) {
             _state.update { it.copy(navigating = false) }
             return
         }
-        if (update.offRoute) reroute(point, headingOf(update.speedMps, update.bearing))
+        if (update.offRoute) reroute(point, travelHeading(location))
     }
 
 }
