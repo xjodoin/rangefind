@@ -118,9 +118,20 @@ function createRuntimeTrace() {
 }
 
 // Shared by the single engine and the sharded routing layer: queries up to
-// four terms require every term, longer ones tolerate a single miss.
+// four terms require every term, longer ones tolerate a miss per four.
+//
+// A single fixed miss does not survive a pasted postal address. "5505 Rue
+// Maurice-Cullen, Laval, QC H7C 2T8" is eight terms, of which the matching
+// document carries six: the postal code exists in the index, on other
+// addresses, so it is a real term that this document simply lacks. Demanding
+// seven of eight threw away the exact address the user pasted. Tolerance that
+// grows with the query keeps short queries as strict as they were — nothing
+// below eight terms changes — while letting a long, mostly-right address
+// still find its street.
 function minShouldMatchFor(baseTerms) {
-  return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+  const count = baseTerms.length;
+  if (count <= 4) return count;
+  return count - Math.floor(count / 4);
 }
 
 function traceBucketFromPath(path) {

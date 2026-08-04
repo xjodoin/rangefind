@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { build } from "../src/builder.js";
 import { createSearch } from "../src/runtime.js";
+import { createNodeSearch } from "../src/runtime.node.js";
 import { serveStatic } from "../scripts/bench_support.mjs";
 
 async function buildCountFixture() {
@@ -120,4 +121,46 @@ test("search benchmark game adapter returns numeric COUNT protocol responses", a
     "TOP_10\tcommon"
   ]);
   assert.deepEqual(responses, ["5", "5", "5", "5", "5", "0", "1"]);
+});
+
+test("a long query tolerates a miss per four terms", async () => {
+  // A pasted postal address is a query whose every token is a real term in
+  // the index, but where the matching document carries only most of them:
+  // the postal code lives on other addresses. A single fixed miss threw the
+  // right answer away. Tolerance grows with the query, so short queries stay
+  // exactly as strict as they were.
+  const root = await mkdtemp(join(tmpdir(), "rangefind-msm-"));
+  const docsPath = join(root, "docs.jsonl");
+  const configPath = join(root, "rangefind.config.json");
+  await writeFile(docsPath, [
+    JSON.stringify({ id: "target", title: "5505 Rue Maurice Cullen Laval QC", url: "/target" }),
+    JSON.stringify({ id: "elsewhere", title: "7 Rue Ailleurs H7C 2T8 Somewhere", url: "/elsewhere" })
+  ].join("\n"));
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/rangefind",
+    queryBundles: false,
+    typoMode: "off",
+    fields: [{ name: "title", path: "title", weight: 2.0 }],
+    display: ["title", "url"]
+  }));
+  await build({ configPath });
+
+  const engine = await createNodeSearch({ source: join(root, "public", "rangefind") });
+
+  // Eight terms, six of which the target carries: h7c and 2t8 are indexed,
+  // just on a different document.
+  const pastedQuery = "5505 Rue Maurice Cullen Laval QC H7C 2T8";
+  assert.equal((await engine.count({ q: pastedQuery })).stats.minShouldMatch, 6);
+  const pasted = await engine.search({ q: pastedQuery, size: 5 });
+  assert.ok(
+    pasted.results.some(result => result.id === "target"),
+    "the pasted address should still find its street"
+  );
+
+  // Nothing shorter loosens: five terms still demand four.
+  assert.equal(
+    (await engine.count({ q: "5505 Rue Maurice Cullen Laval" })).stats.minShouldMatch,
+    4
+  );
 });
