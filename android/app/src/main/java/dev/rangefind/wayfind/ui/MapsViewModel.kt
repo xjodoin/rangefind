@@ -314,6 +314,11 @@ class MapsViewModel(
 
     fun clearQuery() {
         searchJob?.cancel()
+        // A proposed itinerary belongs to the place that was searched for.
+        // Clearing the search takes that place away, so the routes drawn for
+        // it have to go with it — along with the request still in flight,
+        // which would otherwise land afterwards and put them back.
+        routeJob?.cancel()
         queryFlow.value = ""
         _state.update {
             it.copy(
@@ -322,6 +327,9 @@ class MapsViewModel(
                 results = emptyList(),
                 selected = null,
                 searchError = null,
+                routes = null,
+                routeError = null,
+                activeRouteIndex = 0,
                 sheet = SheetMode.Search
             )
         }
