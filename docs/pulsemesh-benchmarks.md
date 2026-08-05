@@ -149,10 +149,11 @@ component a centralized service has to keep paying for.
 Density is the real cost driver, and it scales linearly, as it must —
 more traffic to describe means more bytes. At 60 vehicles in one z15
 neighborhood a peer pays ~6.5 MB/hour, which is too much for a metered
-phone. Three levers exist and are all already in the protocol: subscribe
-to a shard subset rather than all 16 (§11.4), raise
-`ANTI_ENTROPY_SECONDS`, and let the reticent profile cut emissions (§8
-below measures a 4–11× reduction).
+phone. Two levers exist and are already in the protocol: subscribe to a
+shard subset rather than all 16 (§11.4), and let the reticent profile cut
+emissions (§8 below measures a 4–11× reduction). Raising
+`ANTI_ENTROPY_SECONDS` looks like a third and is not — see the negative
+result immediately below.
 
 **Anti-entropy is 4–5× the gossip cost and dominates the bill**, and
 chasing that number produced the most useful negative result in this
@@ -422,10 +423,11 @@ WebCrypto path, so the same numbers apply in a browser.
 | Sign (publisher) | 0.064 ms |
 | Verify (subscriber) | 0.066 ms |
 | Seal / open (AES-256-GCM) | 47 k / 50 k per second |
-| **Full receive path** (decode + open + parse + verify) | **0.087 ms → 11 k updates/s** |
+| **Full receive path** (decode + open + parse + verify) | **~0.09 ms → ~11 k updates/s** |
 
-A subscriber following one fine-mode thread at 5 s cadence spends about
-0.002% of one core on crypto. The cost is not the reason to prefer coarse
+Throughput figures here drift a few percent between runs, as in §1; the
+sizes are exact. A subscriber following one fine-mode thread at 5 s
+cadence spends about 0.002% of one core on crypto. The cost is not the reason to prefer coarse
 mode; safety is.
 
 **What a flood costs a phone.** §7 drops an unknown tag at step 3, before
@@ -433,7 +435,7 @@ any crypto runs:
 
 | Measure | Result |
 | --- | --- |
-| Records with an unguessable tag rejected | **1.22 M/s on one core** |
+| Records with an unguessable tag rejected | **~1.2–1.3 M/s on one core** |
 | Crypto performed on them | none |
 
 An attacker cannot make a subscriber do asymmetric work without the

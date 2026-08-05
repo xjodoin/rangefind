@@ -447,22 +447,36 @@ the record set and reports recovered-route fraction per gate.
   in the public-route argument that lets fleets contribute at all
   ([threads §10](pulsemesh-threads.md#10-rules-between-the-two-channels)).
 - ~~Whether the reticent profile should simply be the only profile.~~
-  **Answered** ([benchmarks §8](pulsemesh-benchmarks.md)): it should be
-  the default. Cadence leaks 100% of a courier's driven route at low
-  density (anonymity set 1) and a median 38.5% even at 32 background
-  vehicles; reticence holds at 7.7% everywhere, worst case included. The
-  latency picture is mixed rather than a clean win — reticence is slower
-  at density 4, a tie at 12, faster at 32 — but cadence wins on latency
-  only in the regime where it also leaks the entire route, which is not
-  an argument for keeping it.
+  **Answered — and the answer is no** ([benchmarks §8](pulsemesh-benchmarks.md),
+  medians over 12 seeds). Privacy is decisive: cadence leaks 84.6–100% of
+  a courier's driven route up to moderate density (anonymity set ~1) and
+  a median 27% even at 32 background vehicles, while reticence holds at
+  7.7% — median *and* worst case — everywhere. But cadence's latency
+  argument survives: at density 12 it detects a jam in 40.5 s against
+  reticence's 116.5 s, with every run detecting under both. So the right
+  axis is the one [threads §10 rule 3](pulsemesh-threads.md) already
+  named — cadence where the route is published and correlation reveals
+  nothing new, reticence mandatory where it is not. An earlier five-seed
+  run, measured against a stricter detection threshold than the router
+  itself uses, pointed the other way; the fuller data does not.
 - Jam onset under universal reticence: the first witness of a new jam
   has no company by construction. A surprise bypasses the company gate
-  for exactly this reason. **Measured, and it is the profile's one real
-  weakness**: at 4 vehicles in the zone reticence took a median 84 s
-  against cadence's 31.5 s, converging by ~12 and reversing by ~32.
-  Candidate fixes to measure: keeper-supplied corroboration in sparse
-  regions, or relaxing `AGG_MIN_REPORTS` to the hint threshold for
-  surprise-flagged records specifically.
+  for exactly this reason. **Measured, and it is a reliability gap rather
+  than a latency one** — the distinction a single-threshold measurement
+  could not see. At 4 vehicles in the zone reticence detects *faster when
+  it works* (44 s vs cadence's 214 s) but works less often (6 runs in 12
+  against 9 in 12). Above ~12 vehicles both always detect and cadence is
+  the quicker of the two. Candidate fixes still worth measuring:
+  keeper-supplied corroboration in sparse regions, and letting a
+  surprise-flagged record publish at the hint threshold rather than
+  waiting for a third witness.
+
+  One incidental result belongs here: for reticence the hint (n = 2) and
+  full-confidence (n = 3) thresholds are always reached together, while
+  for cadence they differ by 15 s or more. Reticent corroboration arrives
+  simultaneously because surprises are shared events — everyone in the
+  jam reports it at once — so n goes from 0 to 3 in a burst rather than
+  trickling.
 - Whether keepers should also cache thread records opportunistically:
   same blind, TTL-bounded, padded-request store, no keys, and it would
   cover the sparse-audience case threads are weakest at.

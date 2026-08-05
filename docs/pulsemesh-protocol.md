@@ -1109,22 +1109,37 @@ penalty is 0 throughout regardless of score.
 ## 14. Repository layout and milestones
 
 ```
-src/pulsemesh/codec.js       PMC1/PMB1/PMI1/PMD1/PMG1/PMQ1/PMS1/PMF1 + PoW       (§4, §5.3)
+src/pulsemesh/index.js       public entry point (rangefind/pulsemesh)
+src/pulsemesh/sha256.js      dependency-free SHA-256 for PoW, shards, msg ids     (§1, §5.3)
+src/pulsemesh/codec.js       PMC1/PMB1/PMI1/PMD1/PMG1/PMN1/PMQ1/PMS1/PMF1 + PoW   (§4, §5.3)
 src/pulsemesh/bins.js        speed/quality bins, FRESHNESS + Q tables, cells      (§2, §8.1)
-src/pulsemesh/store.js       TTL store, three indexes, eviction, digests          (§6.6, §7)
+src/pulsemesh/store.js       TTL store, three indexes, eviction, digests, folds   (§4.4, §7)
 src/pulsemesh/aggregate.js   weighted median, confidence, trust ledger            (§8)
 src/pulsemesh/validate.js    rules 1–12, rate limiting                            (§6)
 src/pulsemesh/topics.js      topic grammar, shards, rotation                      (§5.2)
-src/pulsemesh/sync.js        anti-entropy + padded/split cell fetch               (§4.5, §11.3)
+src/pulsemesh/sync.js        anti-entropy, corridor cells, padded/split fetch     (§4.5, §11.2, §11.3)
 src/pulsemesh/provider.js    LiveTrafficProvider adapter                          (§9)
 src/pulsemesh/contribute.js  contributor state machine (engine.snap-based)        (§10.1)
 src/pulsemesh/reticent.js    the four emission gates + forwarder rotation         (§10.2)
 src/pulsemesh/incidents.js   type table, scoring, contradiction decay, policy     (§2.6, §8.5)
 src/pulsemesh/forward.js     PMF1 accept/validate/hold/republish                  (§4.5)
-src/pulsemesh/node.js        js-libp2p host wiring, keeper profile                (§5.1, §12)
-scripts/pulsemesh_sim.mjs    phase-2 simulation harness
+src/pulsemesh/node.js        transport-agnostic node, epoch overlap, keeper       (§5.1, §11, §12)
+src/pulsemesh/libp2p.js      js-libp2p binding: GossipSub + sync streams          (§5.1)
+src/pulsemesh/thread_*.js    the thread channel (pulsemesh-threads.md §17)
+src/pulsemesh/threads.js     thread entry point (rangefind/pulsemesh/threads)
+scripts/pulsemesh_sim.mjs        phase-2 simulation harness                       (M4, M5)
+scripts/pulsemesh_bench.mjs      per-operation cost
+scripts/pulsemesh_wire_bench.mjs real-socket transport measurements               (M3)
+scripts/pulsemesh_thread_bench.mjs thread crypto, bandwidth, catch-up availability
+scripts/pulsemesh_keeper.mjs     runnable keeper process                          (§12)
+scripts/pulsemesh_demo.mjs       end-to-end demo on the real OSM route graph
 test/pulsemesh_*.test.js     per-module + cross-implementation vectors (§13)
 ```
+
+Measured results for every milestone are in
+[pulsemesh-benchmarks.md](pulsemesh-benchmarks.md); that document is the
+single place any number lives, and this one links to it rather than
+restating it.
 
 Milestones, each independently testable with `node --test`:
 
@@ -1179,53 +1194,62 @@ Milestones, each independently testable with `node --test`:
   contribute, so it must be measured rather than argued.
 
   **Done** — [pulsemesh-benchmarks.md §8](pulsemesh-benchmarks.md),
-  medians over 5 seeds. Privacy is decisive: cadence leaks **100%** of a
-  courier's driven route at low density with a mean anonymity set of 1,
-  and a median 38.5% even at 32 background vehicles; reticent holds at
-  **7.7%**, median and worst case, at every density. Utility is mixed —
-  reticence is slower at density 4 (84 s vs 31.5 s), a tie at 12 (95 s vs
-  106 s), and faster at 32 (23 s vs 33 s) — at 4–11× fewer emissions.
-  Recommendation: adopt reticent as the default and close the
-  sparse-onset gap directly (keeper corroboration, or the hint threshold
-  for surprise-flagged records), rather than keeping a profile whose only
-  advantage appears in the regime where it also leaks the whole route.
+  medians over 12 seeds, at both the router's own hint threshold (n = 2)
+  and the full-confidence one (n = 3). Privacy is decisive: cadence leaks
+  **84.6–100%** of a courier's driven route up to moderate density with a
+  mean anonymity set near 1, and a median 27% even at 32 background
+  vehicles; reticent holds at **7.7%**, median and worst case, at every
+  density. Utility favours cadence: 40.5 s vs 116.5 s at density 12, and
+  16.5 s vs 21.5 s at 32 — reticence emits 4–11× less, and at density 4
+  its gap is one of reliability (6/12 runs detecting vs 9/12) rather than
+  latency.
+  Recommendation: keep both profiles and choose by route publicity, as
+  [threads §10 rule 3](pulsemesh-threads.md) prescribes — the measurement
+  validates that rule rather than replacing it. Cadence is the faster,
+  more reliable detector (40.5 s vs 116.5 s at density 12) and costs
+  nothing where the route is already a published timetable; reticence is
+  mandatory where it is not.
 
 ## 15. Conformance checklist
 
-An implementation is conformant when:
+This implementation is conformant on every row below; each is covered by
+a test in `test/pulsemesh_*.test.js`, and the boxes are ticked only where
+a test asserts it rather than where the code merely looks right.
 
-- [ ] Encodes/decodes every §4 format byte-identically to the §13
+- [x] Encodes/decodes every §4 format byte-identically to the §13
       vectors; rejects trailing bytes and oversized records.
-- [ ] Enforces validation rules 1–9 unconditionally and 10–12 when the
+- [x] Enforces validation rules 1–9 unconditionally and 10–12 when the
       leaf cell is available; proofType 0/2 never accepted on the wire.
-- [ ] Never accepts a record on a rule-12 denied class, whatever the
+- [x] Never accepts a record on a rule-12 denied class, whatever the
       sender claims.
-- [ ] Store: reportId dedup, TTL expiry (senders can only shorten),
+- [x] Store: reportId dedup, TTL expiry (senders can only shorten),
       caps with lowest-weight eviction, no disk persistence.
-- [ ] Aggregation reproduces §13.3 exactly, uses the FRESHNESS/Q tables
+- [x] Aggregation reproduces §13.3 exactly, uses the FRESHNESS/Q tables
       verbatim, ties broken by reportId.
-- [ ] Incidents: §13.4 vector byte-identical; scoring reproduces §13.5,
+- [x] Incidents: §13.4 vector byte-identical; scoring reproduces §13.5,
       including `score = min(raw, sources)`; contradiction decay applied;
       `incidentPolicy.suppressedTypes` honoured on both emit and receive.
-- [ ] No incident penalty without an independent speed aggregate at or
+- [x] No incident penalty without an independent speed aggregate at or
       below `INCIDENT_ANCHOR_RATIO`; informational types never reach
       `LiveSegmentState` at all.
-- [ ] Reports are filed only for the reporter's own snapped position,
+- [x] Reports are filed only for the reporter's own snapped position,
       never an arbitrary map point; the user is told at report time that
       a report is public and locating.
-- [ ] Emits nothing but PMC1/PMI1/PMB1/PMD1/PMS1/PMF1 payloads;
+- [x] Emits nothing but PMC1/PMI1/PMB1/PMD1/PMS1/PMF1 payloads — plus
+      the §4.5 sync requests PMG1/PMQ1 and the PMN1 agreement answer,
+      which this row omitted;
       contribution cadence, standstill and suppression rules per §10.1.
-- [ ] Reticent profile, where selected: all four gates of §10.2, in
+- [x] Reticent profile, where selected: all four gates of §10.2, in
       order, with forwarders rotated per record. Never emits a decoy
       contribution under any profile.
-- [ ] As a forwarder: validates a PMF1's inner record fully before
+- [x] As a forwarder: validates a PMF1's inner record fully before
       republishing, alters no byte, never chains PMF1 to PMF1, and
       rate-limits per source.
-- [ ] Every cell fetch (including provider-triggered) is padded to
+- [x] Every cell fetch (including provider-triggered) is padded to
       8/16/32 with decoys, shuffled, and split across peers; endpoint
       cells never fetched unpadded.
-- [ ] Provider returns `[]` on epoch mismatch, never sets
+- [x] Provider returns `[]` on epoch mismatch, never sets
       `closed: true`, never pre-blends confidence.
-- [ ] Router behavior under mesh failure = static routing (this is
+- [x] Router behavior under mesh failure = static routing (this is
       already guaranteed by the engine, but must not be broken by the
       adapter throwing synchronously outside `fetch`).

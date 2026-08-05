@@ -55,9 +55,9 @@
   into coordinates; it is independently useful for rendering a snapped
   marker or replaying a matched trace.
 - Thread benchmarks (`npm run bench:pulsemesh:threads`). The full receive
-  path — decode, decrypt, parse, verify — costs 0.087 ms, and a record
-  addressed to an unguessable tag is rejected at 1.22 M/s before any
-  crypto runs. Answers two of the threads spec's open questions: catch-up
+  path — decode, decrypt, parse, verify — costs about 0.09 ms, and a
+  record addressed to an unguessable tag is rejected at over a million
+  per second before any crypto runs. Answers two of the threads spec's open questions: catch-up
   availability depends on how many providers a joiner asks (3 → 95%,
   8 → 100%) rather than on audience size, and catch-up can never recover
   more than `THREAD_MAX_AGE` of history.

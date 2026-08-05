@@ -723,8 +723,12 @@ generates about 47 MB in total across the mesh. A subscriber's own
 catch-up cache is 120 × 130 B ≈ 16 KB per thread — small enough that
 audience caching costs a phone nothing, which is what makes §8's
 host-free design practical. A relay peer caching the maximum
-`THREAD_CACHE_TAGS` holds about 4 MB. Coarse mode is two orders of
-magnitude below all of these.
+`THREAD_CACHE_TAGS` holds about 4 MB (measured: 7.6 MB at the default
+ring). Coarse mode is **about 5× below** all of these — this document
+originally claimed two orders of magnitude, and the measurement
+([benchmarks §9c](pulsemesh-benchmarks.md)) puts it at 19.5% of fine
+rather than 1%. Coarse remains the right default for child transport,
+but on §11's safety argument, not on bandwidth.
 
 The subscriber side is dominated not by the thread but by the traffic
 cells its ETA query fetches — which is the existing corridor-fetch
@@ -817,6 +821,9 @@ src/pulsemesh/thread_publish.js  publisher state machine, snap-driven, modes    
 src/pulsemesh/thread_consume.js  validation, seq ledger, staleness                   (§7)
 src/pulsemesh/thread_cache.js    catch-up ring buffers, padded PMR1, admission caps  (§5.5, §8)
 src/pulsemesh/thread_eta.js      locate + fixed-order matrix arrival estimation      (§9)
+src/pulsemesh/thread_contribute.js  the rules between the two channels               (§10)
+src/pulsemesh/threads.js         public entry point (rangefind/pulsemesh/threads)
+scripts/pulsemesh_thread_bench.mjs  crypto, bandwidth, catch-up availability        (§15, §18)
 test/pulsemesh_thread_*.test.js  per-module + §16 vectors
 ```
 
@@ -908,29 +915,44 @@ test/pulsemesh_thread_*.test.js  per-module + §16 vectors
 
 ## 19. Conformance checklist
 
-- [ ] Reproduces §16 byte-identically: key schedule from `P`, tag,
+This implementation is conformant on every row below except the one
+marked `[~]`, which is honest about a piece that is not built yet. Boxes
+are ticked only where a test in `test/pulsemesh_thread_*.test.js` asserts
+the behaviour, not where the code merely looks right.
+
+- [x] Reproduces §16 byte-identically: key schedule from `P`, tag,
       rendezvous, link, signed preimage, sealed record.
-- [ ] Generates a fresh keypair per run; never publishes, logs, reuses,
-      or transmits `P`; never uses it as a peer identity.
-- [ ] Never transmits `K_content` or a nonce; derives every nonce from
+- [x] Generates a fresh keypair per run; never publishes, reuses, or
+      transmits `P`; never uses it as a peer identity. *(Not logging it
+      is the embedding application's obligation — the library never
+      writes it anywhere, and a test asserts `P` does not appear in a
+      record's bytes.)*
+- [x] Never transmits `K_content` or a nonce; derives every nonce from
       `noncePrefix ‖ seq`.
-- [ ] Carries the capability in a URL fragment, never a query string or
+- [x] Carries the capability in a URL fragment, never a query string or
       path.
-- [ ] Rejects: bad AEAD tag, missing or invalid signature, non-increasing
+- [x] Rejects: bad AEAD tag, missing or invalid signature, non-increasing
       `seq`, out-of-window `unixSeconds`, records past `notAfter`,
       unknown tags.
-- [ ] Discovers peers from the derived rendezvous key alone — no host,
-      mailbox, or bootstrap address in the link.
-- [ ] Every PMR1 padded to 4/8/16 tags with CSPRNG decoys; responders
+- [~] Derivation of the tag, topic and rendezvous key from the link
+      alone is implemented and tested, and the link carries no host,
+      mailbox, or bootstrap address. **Live DHT provider lookup is not
+      implemented** — it is transport wiring on the traffic channel's
+      libp2p adapter, and until it lands a deployment must supply peers
+      by the ordinary bootstrap path.
+- [x] Every PMR1 padded to 4/8/16 tags with CSPRNG decoys; responders
       never distinguish unknown from empty tags.
-- [ ] Thread records never enter a traffic aggregate.
-- [ ] Anonymous contribution while a thread is active is off by default,
+- [x] Thread records never enter a traffic aggregate.
+- [x] Anonymous contribution while a thread is active is off by default,
       settable only per-thread and never inferred; suppressed at stops
       per §10 rule 4; reticent profile (protocol §10.2) enforced for
       any thread whose route is not published.
-- [ ] ETA computed locally with `matrix()` over the planned order; no
+- [x] ETA computed locally with `matrix()` over the planned order; no
       request carries the subscriber's stop, home, or identity.
-- [ ] UI distinguishes all four rows of §12 and stops claiming "live"
-      past `THREAD_STALE`.
-- [ ] Coarse is the default for child transport; fine requires an
-      explicit operator choice.
+- [x] The subscriber exposes all four rows of §12 as `status().row`
+      with the exact claim each is allowed to make, and reports
+      `live: false` past `THREAD_STALE`. *(Honouring it is the UI's
+      obligation; the library makes the correct claim available and
+      refuses to overstate it.)*
+- [x] Coarse is the library default (`createThreadPublisher` without a
+      `mode`); fine requires an explicit operator choice.
