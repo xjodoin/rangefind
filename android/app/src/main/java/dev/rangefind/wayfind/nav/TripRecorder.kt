@@ -109,6 +109,11 @@ class TripRecorder(context: Context) {
     }
 
     private fun navJson(update: NavUpdate) = JSONObject()
+        // Where the arrow was drawn, which is not always where the fix was:
+        // on route it is snapped to the line, off route it is the fix itself.
+        // Without both, "the arrow was stuck" is unfalsifiable.
+        .put("shownLat", update.position.lat)
+        .put("shownLon", update.position.lon)
         .put("stepIndex", update.stepIndex)
         .put("stepName", update.stepName)
         .put("nextStepName", update.nextStepName)

@@ -131,7 +131,13 @@ class NavigationCore(private val context: Context) {
 
         // GPS bearing is unreliable at low speed; the road's own is better.
         val moving = speedMps > 1.5
-        val heading = if (moving && hasBearing && gpsBearing != null) gpsBearing else match.bearing
+        val heading = when {
+            moving && hasBearing && gpsBearing != null -> gpsBearing
+            // Off the line, the route's bearing describes a road the car is
+            // not on. A stale GPS bearing is at least still about this car.
+            match.crossTrackMeters > SNAP_TRUST_METERS && gpsBearing != null -> gpsBearing
+            else -> match.bearing
+        }
         val headingWrong = speedMps > 2.0 && absBearingDelta(match.bearing, heading) > 110.0
 
         // How far the car still is from where the route ends. Needed before the
@@ -199,6 +205,15 @@ class NavigationCore(private val context: Context) {
             else -> announcement(stepIndex, toManeuver, next?.name.orEmpty(), turnDelta)
         }
 
+        // Snapping the arrow to the route line is what keeps it steady on the
+        // road while the fix jitters around. Once the car has genuinely left
+        // that line the same snap becomes a lie: the arrow sits on a road the
+        // driver is no longer on and stays there until a reroute lands,
+        // which is the whole time they most need to see where they actually
+        // are. Past the point where the deviation is larger than GPS error,
+        // show the fix itself.
+        val position = if (match.crossTrackMeters > SNAP_TRUST_METERS) point else match.snapped
+
         return NavUpdate(
             stepIndex = stepIndex,
             stepName = route.steps.getOrNull(stepIndex)?.name.orEmpty(),
@@ -208,7 +223,7 @@ class NavigationCore(private val context: Context) {
             remainingSeconds = remainingSeconds,
             traveled = traveled,
             ahead = ahead,
-            position = match.snapped,
+            position = position,
             bearing = heading,
             speedMps = speedMps,
             speedLimitKmh = route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0,
@@ -325,6 +340,14 @@ class NavigationCore(private val context: Context) {
          * away whichever way they like.
          */
         const val MIN_HEADING_SPEED_MPS = 2.5
+
+        /**
+         * How far the fix may sit from the route before the arrow stops being
+         * snapped to it. Comfortably beyond ordinary GPS error on a road, and
+         * well below the off-route threshold, so the arrow leaves the line as
+         * soon as the driver does rather than waiting for a reroute.
+         */
+        const val SNAP_TRUST_METERS = 25.0
 
         const val OFF_ROUTE_METERS = 45.0
         /** Distance that means "off route" even at a standstill. */
