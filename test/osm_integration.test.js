@@ -25,6 +25,8 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
   assert.equal(config.output, "public/rangefind");
   assert.equal(config.scanWorkers, 6);
   assert.equal(config.builderWorkerCount, 6);
+  assert.equal(config.codeStorePreloadMaxBytes, 3 * 1024 * 1024 * 1024);
+  assert.equal(config.geoCapsuleDocPageCachePages, 4096);
   assert.deepEqual(config.geo, [{ name: "location", latPath: "geo_lat", lonPath: "geo_lon" }]);
   assert.deepEqual(config.display, [...OSM_DISPLAY_FIELDS]);
   assert.deepEqual(config.authority.map(field => field.name), ["address", "address_interpolation", "postcode", "street"]);
@@ -62,7 +64,7 @@ test("OSM integration applies national-scale builder tuning without another inde
   assert.equal(config.docLayoutStrategy, "doc-id");
   assert.equal(config.postingGzipLevel, 3);
   assert.equal(config.segmentMergeFanIn, 512);
-  assert.equal(config.codeStorePreloadMaxBytes, 2304 * 1024 * 1024);
+  assert.equal(config.codeStorePreloadMaxBytes, 3 * 1024 * 1024 * 1024);
   assert.equal(config.buildTelemetryPath, "osm-us-build-telemetry.json");
   assert.equal(config.sidecar, undefined);
 });

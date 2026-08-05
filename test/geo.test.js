@@ -864,6 +864,16 @@ test("geo cell capsules return complete map rows without document fetches", asyn
   });
 });
 
+test("parallel geo-leaf compression preserves ordered packs and exhaustive results", async () => {
+  await runGeoOracleSuite({
+    geoCapsules: true,
+    builderWorkerCount: 2,
+    geoLeafWorkerBatchLeaves: 3
+  }, manifest => {
+    assert.equal(manifest.geo.fields.location.capsules.rows, manifest.geo.fields.location.total);
+  });
+});
+
 test("multi-resolution category cells route exact map results to fewer geo leaves", async () => {
   await runGeoOracleSuite({
     geoCapsules: true,

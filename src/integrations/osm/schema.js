@@ -40,6 +40,15 @@ export function createOsmIndexConfig(options = {}) {
     output: options.output || "public/rangefind",
     scanWorkers: workerCount,
     builderWorkerCount: workerCount,
+    // OSM's geo summaries touch every compact facet in spatial (rather than
+    // document) order. National shards are dramatically faster when this
+    // roughly 2 GiB store is resident, while still staying below the builder's
+    // normal multi-worker memory envelope.
+    codeStorePreloadMaxBytes: 3 * 1024 * 1024 * 1024,
+    // KD-tree leaves revisit source document pages in spatial order. A larger
+    // bounded LRU keeps nearby leaves from repeatedly inflating the same
+    // capsule pages while remaining a small fraction of national build RAM.
+    geoCapsuleDocPageCachePages: 4096,
     fields: [
       { name: "title", path: "search_name", weight: 6.0, b: 0.4, phrase: true },
       { name: "aliases", path: "aliases", weight: 4.0, b: 0.5, phrase: true },
@@ -155,7 +164,6 @@ export function createOsmIndexConfig(options = {}) {
     config.docLayoutStrategy = "doc-id";
     config.postingGzipLevel = 3;
     config.segmentMergeFanIn = 512;
-    config.codeStorePreloadMaxBytes = 2304 * 1024 * 1024;
     config.buildTelemetryPath = "osm-us-build-telemetry.json";
   }
   return { ...config, ...(options.overrides || {}) };

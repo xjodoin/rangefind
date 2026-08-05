@@ -92,6 +92,18 @@ enum class TravelMode(
     val movingSpeedMps: Double
         get() = if (this == Walk) 0.4 else 1.5
 
+    /**
+     * About as fast as this mode ever goes. Used to recognise a fix that
+     * cannot be true — a jump of two hundred metres in a second is the
+     * receiver guessing, not a cyclist.
+     */
+    val topPlausibleSpeedMps: Double
+        get() = when (this) {
+            Car -> 45.0
+            Bike -> 15.0
+            Walk -> 4.0
+        }
+
     /** Posted limits and lane markings are addressed to drivers. */
     val showsRoadSigns: Boolean get() = this == Car
 

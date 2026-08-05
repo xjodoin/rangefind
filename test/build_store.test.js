@@ -44,9 +44,48 @@ test("file-backed build code store reads random values and chunks without heap a
 
     const reopened = openCodeStore(store.descriptor());
     try {
+      const preload = reopened.preloadFields(["tags", "featured"], 1024);
+      assert.deepEqual(preload.loadedFields, ["tags", "featured"]);
+      assert.deepEqual(preload.skippedFields, []);
+      assert.ok(preload.preloadedBytes > 0);
       assert.deepEqual(reopened.chunk("tags", 1, 3), [{ codes: [2] }, { codes: [3] }, { codes: [1, 3] }]);
       assert.deepEqual(reopened.chunk("year", 0, 4), [2024, null, 2026, -5]);
       assert.deepEqual(reopened.chunk("featured", 0, 4), [true, false, null, true]);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("field-selective code-store preload skips oversized fields without blocking smaller hot fields", () => {
+  const root = mkdtempSync(join(tmpdir(), "rangefind-codes-selective-"));
+  const config = {
+    facets: [{ name: "large" }, { name: "small" }],
+    numbers: [{ name: "latitude" }],
+    booleans: []
+  };
+  const store = createCodeStore(root, config, 4, {
+    large: { values: [{ value: "" }, { value: "large" }] },
+    small: { values: [{ value: "" }, { value: "small" }] }
+  });
+  try {
+    for (let doc = 0; doc < 4; doc++) {
+      store.set("large", doc, { codes: [1, 1, 1, 1] });
+      store.set("small", doc, { codes: [1] });
+      store.set("latitude", doc, 45 + doc);
+    }
+    const reopened = openCodeStore(store.descriptor());
+    try {
+      // The facet needs its 64-byte index plus data and cannot fit, while the
+      // numeric column does. Priority-budgeted loading must continue past it.
+      const result = reopened.preloadFields(["large", "latitude"], 40);
+      assert.deepEqual(result.loadedFields, ["latitude"]);
+      assert.deepEqual(result.skippedFields, ["large"]);
+      assert.deepEqual(reopened.chunk("latitude", 0, 4), [45, 46, 47, 48]);
+      assert.deepEqual(reopened.get("large", 2), { codes: [1] });
     } finally {
       reopened.close();
     }

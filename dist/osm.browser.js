@@ -1620,6 +1620,7 @@ function simplifyRing(points, tolerance = 1e-5, maxPoints = 256) {
 }
 function geometryForWay(points) {
   const sourceRing = (points || []).filter(Boolean).map((point) => ({ lat: Number(point.lat), lon: Number(point.lon) }));
+  if (sourceRing.some((point) => !Number.isFinite(point.lat) || !Number.isFinite(point.lon) || point.lat < -90 || point.lat > 90 || point.lon < -180 || point.lon > 180)) return null;
   const ring = simplifyRing(sourceRing);
   if (ring.length < 4) return null;
   const closed = ring[0].lat === ring.at(-1).lat && ring[0].lon === ring.at(-1).lon;
@@ -4531,6 +4532,15 @@ function createOsmIndexConfig(options = {}) {
     output: options.output || "public/rangefind",
     scanWorkers: workerCount,
     builderWorkerCount: workerCount,
+    // OSM's geo summaries touch every compact facet in spatial (rather than
+    // document) order. National shards are dramatically faster when this
+    // roughly 2 GiB store is resident, while still staying below the builder's
+    // normal multi-worker memory envelope.
+    codeStorePreloadMaxBytes: 3 * 1024 * 1024 * 1024,
+    // KD-tree leaves revisit source document pages in spatial order. A larger
+    // bounded LRU keeps nearby leaves from repeatedly inflating the same
+    // capsule pages while remaining a small fraction of national build RAM.
+    geoCapsuleDocPageCachePages: 4096,
     fields: [
       { name: "title", path: "search_name", weight: 6, b: 0.4, phrase: true },
       { name: "aliases", path: "aliases", weight: 4, b: 0.5, phrase: true },
@@ -4666,7 +4676,6 @@ function createOsmIndexConfig(options = {}) {
     config.docLayoutStrategy = "doc-id";
     config.postingGzipLevel = 3;
     config.segmentMergeFanIn = 512;
-    config.codeStorePreloadMaxBytes = 2304 * 1024 * 1024;
     config.buildTelemetryPath = "osm-us-build-telemetry.json";
   }
   return { ...config, ...options.overrides || {} };

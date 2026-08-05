@@ -1159,10 +1159,28 @@ async function finishDocPages(out, spool, total, config) {
 function openDocPageSpoolReader(spool, config, cacheLimit = 1024) {
   const fd = openSync(spool.pagePath, "r");
   const entryFd = openSync(spool.pageEntryPath, "r");
+  const entryBytes = statSync(spool.pageEntryPath).size;
+  const entryPreloadLimit = Math.max(0, Math.floor(Number(config.geoCapsuleDocPageIndexPreloadMaxBytes || 0)));
+  const entryView = entryPreloadLimit && entryBytes <= entryPreloadLimit
+    ? readFileSync(spool.pageEntryPath)
+    : null;
   const pageSize = Math.max(1, Math.floor(Number(spool.pageSize || config.docPageSize || 32)));
   const fields = spool.pageFields || docPayloadFieldNames(config);
   const maxCachePages = Math.max(1, Math.floor(Number(cacheLimit || 1024)));
   const cache = new Map();
+
+  function readPageEntry(pageIndex) {
+    if (!entryView) return readDocSpoolEntry(entryFd, pageIndex);
+    const offset = pageIndex * DOC_SPOOL_ENTRY_BYTES;
+    if (offset + DOC_SPOOL_ENTRY_BYTES > entryView.length) {
+      throw new Error(`Rangefind doc page spool is missing entry ${pageIndex}.`);
+    }
+    return {
+      offset: readBigUInt(entryView, offset),
+      length: readBigUInt(entryView, offset + 8),
+      logicalLength: readBigUInt(entryView, offset + 16)
+    };
+  }
 
   function readPage(pageIndex) {
     if (cache.has(pageIndex)) {
@@ -1171,7 +1189,7 @@ function openDocPageSpoolReader(spool, config, cacheLimit = 1024) {
       cache.set(pageIndex, docs);
       return docs;
     }
-    const entry = readDocSpoolEntry(entryFd, pageIndex);
+    const entry = readPageEntry(pageIndex);
     const docs = decodeDocPageColumns(readSpooledDoc(fd, entry), fields, pageIndex * pageSize);
     cache.set(pageIndex, docs);
     while (cache.size > maxCachePages) cache.delete(cache.keys().next().value);
@@ -1194,7 +1212,13 @@ function openDocPageSpoolReader(spool, config, cacheLimit = 1024) {
       const pages = new Map();
       for (const index of indexes) {
         const pageIndex = Math.floor(index / pageSize);
-        if (!pages.has(pageIndex)) pages.set(pageIndex, readPage(pageIndex));
+        if (!pages.has(pageIndex)) pages.set(pageIndex, null);
+      }
+      // Spatial leaf order is unrelated to document/page order. Reading the
+      // leaf's unique pages monotonically gives the kernel and object-backed
+      // filesystems a useful access pattern without changing output ordering.
+      for (const pageIndex of [...pages.keys()].sort((a, b) => a - b)) {
+        pages.set(pageIndex, readPage(pageIndex));
       }
       return indexes.map(index => {
         const pageIndex = Math.floor(index / pageSize);
@@ -1639,6 +1663,19 @@ function geoEntriesBbox(entries) {
   return { minLatE7, maxLatE7, minLonE7, maxLonE7 };
 }
 
+function createGeoBuildProgress(config) {
+  const interval = Math.max(0, Math.floor(Number(config.buildProgressLogMs || 0)));
+  let last = performance.now();
+  return (phase, completed, total, force = false) => {
+    if (!interval) return;
+    const now = performance.now();
+    if (!force && now - last < interval) return;
+    last = now;
+    const percent = total > 0 ? ` ${((completed / total) * 100).toFixed(1)}%` : "";
+    console.error(`Rangefind: geo-trees ${phase} ${completed}/${total}${percent}`);
+  };
+}
+
 function prepareGeoCellIndexes(config, dicts) {
   return (config.geoCellIndexes || []).map((item, id) => {
     const dict = dicts?.[item.facet];
@@ -1667,42 +1704,40 @@ function prepareGeoCellIndexes(config, dicts) {
 
 function appendGeoCellLeafRoutes(spool, indexes, points, leaf, codes) {
   for (const index of indexes) {
-    const tuples = new Map();
+    const tuple = new Array(10);
+    tuple[0] = index.id;
+    tuple[8] = leaf.index;
     for (let position = leaf.start; position < leaf.end; position++) {
       const doc = points.docs[position];
-      const selected = facetCodesForBitmap(codeValue(codes, index.facet, doc))
-        .filter(code => index.codeSet.has(code));
-      if (index.includeAll) selected.unshift(0);
-      if (!selected.length) continue;
+      const facetCodes = codeValue(codes, index.facet, doc)?.codes || [];
+      if (!index.includeAll && !facetCodes.length) continue;
       for (const level of index.levels) {
         const cell = geoCellForE7(points.latsE7[position], points.lonsE7[position], level);
         const block = geoCellBlock(cell, index.blockZoom);
-        for (const code of selected) {
-          const group = Math.floor(code / index.codeGroupSize);
-          const tuple = [
-            index.id,
-            group,
-            block.y,
-            block.x,
-            level,
-            cell.y,
-            cell.x,
-            code,
-            leaf.index,
-            position - leaf.start
-          ];
-          tuples.set(tuple.join(":"), tuple);
+        tuple[2] = block.y;
+        tuple[3] = block.x;
+        tuple[4] = level;
+        tuple[5] = cell.y;
+        tuple[6] = cell.x;
+        tuple[9] = position - leaf.start;
+        for (let codeIndex = index.includeAll ? -1 : 0; codeIndex < facetCodes.length; codeIndex++) {
+          const code = codeIndex < 0 ? 0 : Number(facetCodes[codeIndex]);
+          if (codeIndex >= 0 && (!Number.isFinite(code) || !index.codeSet.has(code))) continue;
+          tuple[1] = Math.floor(code / index.codeGroupSize);
+          tuple[7] = code;
+          // Code-store facets are normalized to sorted unique codes, levels
+          // are unique, and each point ordinal appears once per leaf. Routes
+          // are therefore unique by construction; the former Map + joined
+          // string key only repeated that invariant for every emitted row.
+          appendGeoCellRoute(spool, tuple);
+          index.records++;
         }
       }
-    }
-    for (const tuple of tuples.values()) {
-      appendGeoCellRoute(spool, tuple);
-      index.records++;
     }
   }
 }
 
-async function writeGeoCellRoutes(out, config, indexes, spool) {
+async function writeGeoCellRoutes(out, config, indexes, spool, reportProgress) {
   if (!spool?.records || !indexes.length) {
     if (spool?.path) rmSync(spool.path, { force: true });
     return null;
@@ -1713,8 +1748,14 @@ async function writeGeoCellRoutes(out, config, indexes, spool) {
   );
   const directorySpool = createDirectoryEntrySpool(resolve(out, "_build", "geo-cell-directory.bin"));
   const byId = new Map(indexes.map(index => [index.id, index]));
-  let blockKey = "";
-  let routeKey = "";
+  let lastIndexId = -1;
+  let lastGroup = -1;
+  let lastBlockY = -1;
+  let lastBlockX = -1;
+  let lastZoom = -1;
+  let lastCellY = -1;
+  let lastCellX = -1;
+  let lastCode = -1;
   let currentBlock = null;
   let currentRoute = null;
   let currentMember = null;
@@ -1757,27 +1798,32 @@ async function writeGeoCellRoutes(out, config, indexes, spool) {
 
   try {
     for await (const tuple of sortedGeoCellRoutes(spool, {
-      chunkRecords: config.geoCellSortChunkRecords
+      chunkRecords: config.geoCellSortChunkRecords,
+      onProgress: reportProgress
     })) {
       const [indexId, group, blockY, blockX, zoom, cellY, cellX, code, leaf, ordinal] = tuple;
-      const nextBlockKey = `${indexId}:${group}:${blockY}:${blockX}`;
-      if (nextBlockKey !== blockKey) {
+      const nextBlock = indexId !== lastIndexId || group !== lastGroup || blockY !== lastBlockY || blockX !== lastBlockX;
+      if (nextBlock) {
         finishBlock();
-        blockKey = nextBlockKey;
-        routeKey = "";
+        lastIndexId = indexId;
+        lastGroup = group;
+        lastBlockY = blockY;
+        lastBlockX = blockX;
         currentBlock = { indexId, group, blockY, blockX, routes: [] };
       }
-      const nextRouteKey = `${zoom}:${cellY}:${cellX}:${code}`;
-      if (nextRouteKey !== routeKey) {
+      if (nextBlock || zoom !== lastZoom || cellY !== lastCellY || cellX !== lastCellX || code !== lastCode) {
         finishRoute();
-        routeKey = nextRouteKey;
+        lastZoom = zoom;
+        lastCellY = cellY;
+        lastCellX = cellX;
+        lastCode = code;
         currentRoute = { zoom, y: cellY, x: cellX, code, members: [] };
       }
       if (!currentMember || currentMember.leaf !== leaf) {
         if (currentMember) currentRoute.members.push(currentMember);
         currentMember = { leaf, ordinals: [] };
       }
-      if (currentMember.ordinals.at(-1) !== ordinal) currentMember.ordinals.push(ordinal);
+      if (currentMember.ordinals[currentMember.ordinals.length - 1] !== ordinal) currentMember.ordinals.push(ordinal);
     }
     finishBlock();
     finalizePackWriter(packWriter);
@@ -1826,12 +1872,14 @@ async function writeGeoCellRoutes(out, config, indexes, spool) {
 async function writeGeoTrees(out, config, total, codes, blockFilters, docSpool, dicts) {
   if (!config.geo?.length) return null;
   const summaryFilters = Array.isArray(blockFilters) && blockFilters.length ? blockFilters : null;
+  const reportProgress = createGeoBuildProgress(config);
   const leafSize = Math.max(16, Math.floor(Number(config.geoLeafSize || 512)));
   const capsuleFields = config.geoCapsules ? (config.geoCapsuleFields || []) : [];
   const capsuleReader = capsuleFields.length
     ? openDocPageSpoolReader(docSpool, config, config.geoCapsuleDocPageCachePages)
     : null;
   const packWriter = createPackWriter(resolve(out, "geo", "point-packs"), config.geoPackBytes || config.docValuePackBytes);
+  const geoLeafPool = await createDocPageWorkerPool(config, { gzipLevel: 6 });
   const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
   const fields = {};
   const rootsByField = new Map();
@@ -1866,14 +1914,18 @@ async function writeGeoTrees(out, config, total, codes, blockFilters, docSpool, 
           docs[count] = start + row;
           count += 1;
         }
+        reportProgress(`${geoField.name}:coordinates`, end, total);
       }
+      reportProgress(`${geoField.name}:coordinates`, total, total, true);
       const points = {
         latsE7: latsE7.subarray(0, count),
         lonsE7: lonsE7.subarray(0, count),
         docs: docs.subarray(0, count)
       };
       const leaves = buildGeoTreeLeaves(points.latsE7, points.lonsE7, points.docs, leafSize);
-      for (let leafIndex = 0; leafIndex < leaves.length; leafIndex++) {
+      const fieldCellIndexes = geoCellIndexesByField.get(geoField.name);
+
+      function prepareLeaf(leafIndex) {
         const leaf = leaves[leafIndex];
         leaf.index = leafIndex;
         const capsules = capsuleReader
@@ -1887,25 +1939,54 @@ async function writeGeoTrees(out, config, total, codes, blockFilters, docSpool, 
           leaf,
           capsules ? { capsules, capsuleFields } : {}
         );
-        leaf.entry = writePackedShard(packWriter, `${geoField.name}\u0000${leafIndex}`, gzipSync(encoded, { level: 6 }), {
-          kind: "geo-leaf-page",
-          codec: capsules ? GEO_LEAF_CAPSULE_PAGE_FORMAT : GEO_LEAF_PAGE_FORMAT,
-          logicalLength: encoded.length
-        });
         if (summaryFilters) {
           leaf.summary = summarizeBlockFilters(summaryFilters, codes, points.docs.subarray(leaf.start, leaf.end));
         }
-        const fieldCellIndexes = geoCellIndexesByField.get(geoField.name);
         if (geoCellSpool && fieldCellIndexes?.length) {
           appendGeoCellLeafRoutes(geoCellSpool, fieldCellIndexes, points, leaf, codes);
         }
+        reportProgress(`${geoField.name}:leaves`, leafIndex + 1, leaves.length);
+        return { key: leafIndex, bytes: encoded };
       }
+
+      function writeLeaf(leafIndex, compressed, logicalLength) {
+        leaves[leafIndex].entry = writePackedShard(packWriter, `${geoField.name}\u0000${leafIndex}`, compressed, {
+          kind: "geo-leaf-page",
+          codec: capsuleReader ? GEO_LEAF_CAPSULE_PAGE_FORMAT : GEO_LEAF_PAGE_FORMAT,
+          logicalLength
+        });
+      }
+
+      if (geoLeafPool) {
+        const batchLeaves = Math.max(1, Math.floor(Number(config.geoLeafWorkerBatchLeaves || 16)));
+        function* leafBatches() {
+          for (let start = 0; start < leaves.length; start += batchLeaves) {
+            const items = [];
+            for (let leafIndex = start; leafIndex < Math.min(leaves.length, start + batchLeaves); leafIndex++) {
+              items.push(prepareLeaf(leafIndex));
+            }
+            yield { kind: "gzip", items };
+          }
+        }
+        await mapWorkerBatchesOrdered(geoLeafPool, leafBatches(), response => {
+          for (const item of response.items) {
+            writeLeaf(item.key, toBatchBuffer(item.compressed), item.logicalLength);
+          }
+        });
+      } else {
+        for (let leafIndex = 0; leafIndex < leaves.length; leafIndex++) {
+          const item = prepareLeaf(leafIndex);
+          writeLeaf(leafIndex, gzipSync(item.bytes, { level: 6 }), item.bytes.length);
+        }
+      }
+      reportProgress(`${geoField.name}:leaves`, leaves.length, leaves.length, true);
       const bbox = geoEntriesBbox(leaves);
       rootsByField.set(geoField.name, { geoField, total: count, bbox, leaves });
     }
   } finally {
     capsuleReader?.close();
     if (geoCellSpool) closeGeoCellRouteSpool(geoCellSpool);
+    await geoLeafPool?.close();
   }
 
   // Large trees page their leaf tables into lazily fetched branch pages so
@@ -1949,7 +2030,7 @@ async function writeGeoTrees(out, config, total, codes, blockFilters, docSpool, 
   }
 
   finalizePackWriter(packWriter);
-  const geoCells = await writeGeoCellRoutes(out, config, geoCellIndexes, geoCellSpool);
+  const geoCells = await writeGeoCellRoutes(out, config, geoCellIndexes, geoCellSpool, reportProgress);
   const packFiles = packTable(packWriter.packs);
   const packIndexes = new Map(packFiles.map((file, index) => [file, index]));
   let directoryBytes = 0;
@@ -4490,7 +4571,23 @@ export async function build({ configPath, update = false, compact = false }) {
     const defaultCodeStorePreloadBytes = measured.total >= 10_000_000
       ? 2304 * 1024 * 1024
       : 1536 * 1024 * 1024;
-    runData.codes.preload?.(Math.max(0, Math.floor(Number(config.codeStorePreloadMaxBytes ?? defaultCodeStorePreloadBytes))));
+    const allCodeStorePreloaded = runData.codes.preload?.(
+      Math.max(0, Math.floor(Number(config.codeStorePreloadMaxBytes ?? defaultCodeStorePreloadBytes)))
+    );
+    if (!allCodeStorePreloaded && runData.codes.preloadFields && config.geo?.length) {
+      const geoHotFields = [
+        ...config.geo.flatMap(field => Object.values(geoComponentFieldNames(field))),
+        ...(config.geoCellIndexes || []).map(index => index.facet),
+        ...(reduced.filters || []).map(filter => filter.name)
+      ];
+      const geoPreloadBudget = Math.max(0, Math.floor(Number(config.geoCodeStorePreloadMaxBytes || 0)));
+      if (geoPreloadBudget > 0) {
+        const preloaded = runData.codes.preloadFields(geoHotFields, geoPreloadBudget);
+        addBuildCounter(telemetry, "geo_code_store_preloaded_bytes", preloaded.preloadedBytes);
+        addBuildCounter(telemetry, "geo_code_store_preloaded_fields", preloaded.loadedFields.length);
+        addBuildCounter(telemetry, "geo_code_store_skipped_fields", preloaded.skippedFields.length);
+      }
+    }
     const fieldRows = createFieldRowPipeline(runData.codes, config, measured.total);
     addBuildCounter(telemetry, "field_row_fields", fieldRows.fieldCount);
     addBuildCounter(telemetry, "field_row_facet_fields", fieldRows.facetFields);

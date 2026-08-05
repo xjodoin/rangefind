@@ -107,79 +107,111 @@ granularity mode and the audience size do.
 
 ## 4. Capability model
 
-### 4.1 Keys
+### 4.1 One key does everything
 
-Per run, the publisher generates:
+Per run, the publisher generates **one Ed25519 keypair** and nothing
+else. The private key stays on the publishing device forever. The
+32-byte public key `P` is the entire capability that travels in the
+link: it is what lets a holder *find*, *decrypt*, and *authenticate* the
+thread, and it is useless for publishing.
 
-- **`threadRoot`** — 32 CSPRNG bytes. The *read* capability. Never
-  appears on the mesh in any form. From it, HKDF-SHA256 (empty salt,
-  the label as `info`) derives:
+Everything derives from `P` by HKDF-SHA256 (empty salt, label as
+`info`):
 
-  | Key | `info` label | Length |
-  | --- | --- | --- |
-  | `K_topic` | `pulsemesh/thread/topic/1` | 32 |
-  | `K_content` | `pulsemesh/thread/content/1` | 32 |
-  | `noncePrefix` | `pulsemesh/thread/nonce/1` | 4 |
+| Key | `info` label | Length | Purpose |
+| --- | --- | --- | --- |
+| `K_topic` | `pulsemesh/thread/topic/1` | 32 | topic tag derivation (§4.2) |
+| `K_content` | `pulsemesh/thread/content/1` | 32 | AES-256-GCM content key |
+| `noncePrefix` | `pulsemesh/thread/nonce/1` | 4 | nonce prefix (§5.1) |
 
-- **publisher keypair** — Ed25519, per run. The *write* capability. The
-  private key never leaves the publishing device.
+So the split is:
 
-Separating them is the non-obvious part and it is load-bearing: every
-subscriber holds `K_content`, so without a signature any parent could
-seal a well-formed update and move the bus. Confidentiality comes from
-the AEAD; **authenticity comes only from the signature**.
+- **Private key → write.** Only the publisher can sign, so only the
+  publisher can move the bus. Impersonation is impossible for anyone
+  holding the link, which matters because every subscriber holds it.
+- **Public key → read + find + verify.** Confidentiality comes from
+  AES-GCM under a key derived from `P`; authenticity comes from the
+  signature verified with `P`.
 
-### 4.2 Topic derivation
+The confidentiality here rests on `P` being **distributed, not
+published** — it is a capability, not an identity. Therefore, normatively:
+
+- The keypair MUST be generated fresh per run, from a CSPRNG.
+- `P` MUST NOT be published, registered in any directory, reused across
+  runs, or used as a libp2p peer identity. A publisher's mesh peer id is
+  a *different*, unrelated key.
+- `P` MUST NOT appear on the wire. Nothing transmitted reveals it: the
+  topic tag is an HMAC under `HKDF(P)`, the payload is sealed, and the
+  signature — which is verified with `P` but does not disclose it — is
+  inside the sealed body (§5.2), not the envelope.
+
+This is a deliberate departure from how public keys are normally
+treated, and it is the whole reason one key in a QR code is enough. An
+implementation that logs `P`, puts it in a URL query string, or reuses
+it across runs has broken the confidentiality of every thread it ever
+signed.
+
+### 4.2 Finding the thread with the key
 
 ```
-tag(window) = HMAC-SHA256(K_topic,
-                "pulsemesh/thread/1" ‖ epoch32 ‖ uint64be(window))[0..8]
-topic       = /rangefind/pulsemesh/1/t/<epochPrefix16hex>/<tagHex16>
+tag(window)  = HMAC-SHA256(K_topic,
+                 "pulsemesh/thread/1" ‖ epoch32 ‖ uint64be(window))[0..8]
+topic        = /rangefind/pulsemesh/1/t/<epochPrefix16hex>/<tagHex16>
+rendezvous   = SHA-256(utf8(topic))
 ```
 
 `window = floor(unixSeconds / 300)`, the same rotation as the traffic
 channel, with the same `TOPIC_OVERLAP` dual-subscribe behaviour.
 
-Three consequences worth stating:
+`rendezvous` is the DHT/rendezvous key that peers holding this thread
+advertise as providers for. **This is what makes the link
+self-sufficient**: a holder derives the tag, derives the rendezvous key,
+asks the DHT who is providing it, connects to them, and subscribes.
+No directory, no name server, no address in the link.
 
-1. The topic name is a pseudorandom 8 bytes. It does not contain a
-   zone, a route number, an operator, or anything else. Threads cannot
-   be enumerated or browsed.
-2. Subscribing requires the capability. There is no "listen to all
-   buses" position, even for a relay.
+Four consequences worth stating:
+
+1. The topic name is a pseudorandom 8 bytes — no zone, route number,
+   operator, or anything else. Threads cannot be enumerated or browsed.
+2. Finding a thread *requires* the capability. There is no "listen to
+   all buses" position, even for a relay: without `P` you cannot compute
+   the address, let alone open the payload.
 3. Tags rotate every 5 minutes and are unlinkable across rotations
-   without `K_topic`, so an observer cannot follow one thread through
-   the day by its address.
+   without `K_topic`, so an observer cannot follow a thread through the
+   day by its address — and neither can the DHT.
+4. The DHT learns only that some peers provide an opaque, rotating key.
 
-The cost is that thread topics carry no geography, so they cannot use
-the traffic channel's zone-scoped gossip mesh for discovery. §8 handles
-delivery.
+The cost is that thread topics carry no geography, so they cannot ride
+the traffic channel's zone-scoped gossip mesh. §8 covers delivery.
 
 ### 4.3 Distribution and revocation
 
-The capability travels as a **thread invite** (§5.4) over a channel the
-operator already has: a QR code, a deep link, the order confirmation,
-the school portal. It is a bearer token — anyone holding it can read
-the thread until `notAfter`, exactly like today's delivery-tracking
-URLs, but read-only, run-scoped, and time-bounded.
+The capability travels as a **link** (§5.4) over a channel the operator
+already has: an SMS, a QR code on a permission slip, the order
+confirmation email, the school portal. The link is a bearer token —
+anyone holding it can follow the thread until `notAfter`, exactly like
+today's delivery-tracking URLs, but read-only, run-scoped,
+time-bounded, and unable to reach a server that knows anything.
 
-Revocation is **non-renewal**, which is why roots are per-run:
+Revocation is **non-renewal**, which is why the keypair is per-run:
 
-- Delivery: no revocation problem exists.
-- School: the operator's portal issues the root for each run to
-  currently-entitled families, a day or two ahead. Removing a family
-  means not serving tomorrow's root. A compromised root exposes one
-  run, not a school year.
+- Delivery: no revocation problem exists — the thread dies at the door.
+- School: the operator issues each run's link to currently-entitled
+  families, a day or two ahead. Removing a family means not sending
+  tomorrow's link. A leaked link exposes one run, not a school year.
 
-Group rekeying is thereby avoided entirely. The cost is a per-user
-authenticated service — but it is the operator's existing portal, not
-new rangefind infrastructure, and it learns only *who is entitled*,
-never who watched or where anyone lives.
+Group rekeying is thereby avoided entirely, and no revocation list
+exists anywhere. Recurring subscriptions need a per-user authenticated
+issuer, but that is the operator's existing portal or SMS pipeline, not
+new rangefind infrastructure, and it learns only *who is entitled* —
+never who watched, or where anyone lives.
 
-Where the distribution channel is not confidential (a logged email
-pipeline, say), the invite MAY instead be sealed to a subscriber-held
-X25519 public key; `threadRoot` is then wrapped per recipient and the
-rest of the protocol is unchanged.
+Because the link is a bearer capability, treat it like one: SMS and
+email are not confidential channels, and a forwarded link is a granted
+capability. The mitigations are the ones already in the design — short
+`notAfter`, per-run keys, and coarse mode as the default for child
+transport (§11), so that the worst case of a forwarded link is a
+schedule rather than a live locator.
 
 ## 5. Wire formats
 
@@ -256,45 +288,69 @@ There is deliberately no "approaching your stop" state and no "delayed"
 field. Both are subscriber-side computations (§9): the publisher does
 not know which stop a subscriber cares about, and must not learn it.
 
-### 5.4 Thread invite (out-of-band, never on the mesh)
+### 5.4 The link (out-of-band, never on the mesh)
 
-```json
-{
-  "format": "pulsemesh-thread-invite-v1",
-  "epoch": "<64 hex — the route-graph root sourceHash>",
-  "threadRoot": "<64 hex>",
-  "publisherKey": "<32-byte ed25519 public key, hex>",
-  "mode": "coarse",
-  "notBefore": 1754265600,
-  "notAfter": 1754294400,
-  "planUrl": "https://cdn.example/runs/2026-08-04/r17.json",
-  "mailboxes": ["/dns4/mailbox.example/tcp/443/wss/p2p/12D3Koo…"]
-}
+The capability is 45 bytes, so it fits an SMS, a QR code, or a tap
+target without a shortener:
+
+| # | Field | Encoding | Notes |
+| --- | --- | --- | --- |
+| 1 | version | u8 | 1 |
+| 2 | publicKey | bytes(32) | `P` — the whole capability |
+| 3 | epochPrefix8 | bytes(8) | binds the link to a graph epoch |
+| 4 | notAfter | uint32be | absolute expiry, unix seconds |
+
+base64url-encoded into a **URL fragment**:
+
+```
+https://track.example/r#Ac3wz7QizS-q8k64NDz_ZBpBykvko6pCnnIp1pBxl2G99EeWyMwfP6dokGiA
 ```
 
-A subscriber MUST reject updates outside `[notBefore, notAfter]` and
-MUST discard the whole invite at `notAfter`. `planUrl` is an ordinary
-static asset; a subscriber that can reach it but not the mesh still has
-a usable product (§12).
+The fragment is deliberate and load-bearing: browsers never transmit it,
+so the page host — which may be the operator, a CDN, or an app-store
+landing page — never receives the capability. It serves inert static
+code that then derives keys locally. There is no endpoint anywhere that
+sees a tracking key.
 
-### 5.5 Mailbox messages
+The link carries no bootstrap address, mailbox host, or plan URL. Peers
+are found through the mesh's normal bootstrap plus the §4.2 rendezvous
+key; the run plan is fetched from the static index by `planRef` (§5.2)
+once the first update is decrypted. **A link is a key, not a location.**
 
-Protocol id `/rangefind/pulsemesh/1/thread`, magic-discriminated:
+A subscriber MUST reject updates timestamped after `notAfter`, MUST
+discard the key material at `notAfter`, and MUST reject a link whose
+`epochPrefix8` matches no epoch it can load.
 
-- **PMP1** (publish to mailbox): `"PMP1"` ‖ verbatim PMT1.
-- **PMR1** (fetch): `"PMR1"` ‖ epochPrefix8 ‖ tagCount varint (MUST be
-  exactly 4, 8, or 16) ‖ per tag: bytes(8) ‖ sinceSeq varint.
+Where the distribution channel is especially untrusted, `P` MAY instead
+be wrapped to a subscriber-held X25519 public key; nothing else in the
+protocol changes.
+
+### 5.5 Catch-up messages
+
+There is no mailbox host and no designated server. Every subscriber
+already caches the thread's recent records to render it, so **any
+subscriber can answer a late joiner** over protocol id
+`/rangefind/pulsemesh/1/thread`, magic-discriminated:
+
+- **PMR1** (catch-up request): `"PMR1"` ‖ epochPrefix8 ‖ tagCount varint
+  (MUST be exactly 4, 8, or 16) ‖ per tag: bytes(8) ‖ sinceSeq varint.
 - **PMM1** (response): `"PMM1"` ‖ epochPrefix8 ‖ tagCount ‖ per tag:
   bytes(8) ‖ recordCount varint ‖ that many verbatim PMT1 records.
-  Tags echo the request order. Unknown tags return count 0; a mailbox
+  Tags echo the request order. Unknown tags return count 0; a responder
   MUST NOT distinguish "tag I do not hold" from "tag with no new data".
+
+A responder relays sealed bytes it may not even be able to open (a
+subscriber caches records for tags it holds; a plain relay peer caches
+opportunistically). Records are verbatim, so the signature and AEAD tag
+travel intact and the late joiner validates them itself — a relaying
+peer cannot alter, forge, or drop-and-substitute anything, and does not
+need to be trusted.
 
 The padded-request discipline is inherited from the traffic channel's
 cell fetches, and here it is *free*: tags are indistinguishable from
 uniform random bytes, so decoy tags cost one CSPRNG call and are
-perfectly indistinguishable from real ones. A mailbox operator serving
-a school's own buses still cannot tell which of 8 tags a given
-subscriber came for.
+perfectly indistinguishable from real ones. Even a peer that holds the
+same thread cannot tell which of 8 tags a given requester came for.
 
 ## 6. Constants
 
@@ -306,13 +362,14 @@ subscriber came for.
 | `THREAD_MAX_AGE` | 120 s | yes | oldest update a subscriber accepts |
 | `THREAD_MAX_FUTURE_SKEW` | 15 s | yes | |
 | `THREAD_STALE` | 90 s | yes | UI must stop claiming "live" past this |
-| `THREAD_MAILBOX_TTL` | 600 s | yes | mailbox retention per tag |
-| `THREAD_MAILBOX_RING` | 240 | yes | records retained per tag |
-| `THREAD_MAILBOX_PEERS` | 3 | yes | mailboxes a publisher pushes to |
-| `THREAD_POLL_INTERVAL` | 10 s ± 3 jitter | yes | mailbox poll when gossip is cold |
+| `THREAD_CACHE_TTL` | 600 s | yes | catch-up cache retention per tag |
+| `THREAD_CACHE_RING` | 240 | yes | records cached per tag |
+| `THREAD_CACHE_TAGS` | 256 | yes | tags a relay peer caches (LRU) |
+| `THREAD_PROVIDE_INTERVAL` | 120 s | yes | DHT provider re-advertise |
+| `THREAD_POLL_INTERVAL` | 10 s ± 3 jitter | yes | catch-up poll when gossip is cold |
 | `THREAD_MAX_RUN_SECONDS` | 21600 (6 h) | no | absolute thread lifetime |
-| `THREAD_TAG_BUDGET` | 32 / peer / window | yes | new mailbox tags per source peer |
-| `THREAD_PUSH_RATE` | 1 rec / 3 s / tag | yes | mailbox write rate limit |
+| `THREAD_TAG_BUDGET` | 32 / peer / window | yes | new cached tags per source peer |
+| `THREAD_CACHE_RATE` | 1 rec / 3 s / tag | yes | relay cache admission rate |
 
 `TOPIC_WINDOW` (300 s), `TOPIC_OVERLAP` (30 s) and `EPOCH_OVERLAP`
 (600 s) are shared with the traffic channel unchanged.
@@ -329,53 +386,80 @@ A subscriber applies these in order, dropping on first failure.
    this is the entire cost of a hostile flood on the gossip path.)
 4. AEAD opens with `K_content` under nonce `noncePrefix ‖ seq`.
 5. Inner magic `"PMTP"`, well-formed, no trailing bytes.
-6. Ed25519 signature verifies against the invite's `publisherKey`.
-   **A read-capable but unsigned record is an attack, not an error**;
-   log it and drop the delivering peer's standing.
+6. Ed25519 signature verifies against `P` from the link. **A record
+   that decrypts but does not verify is an attack, not an error** —
+   it means a link holder tried to publish; log it and drop the
+   delivering peer's standing.
 7. `seq` strictly greater than the highest accepted `seq` for this
    thread — replay and rollback protection.
 8. `unixSeconds` within `[now − THREAD_MAX_AGE, now + THREAD_MAX_FUTURE_SKEW]`
-   and within `[notBefore, notAfter]`.
+   and not after the link's `notAfter`.
 9. Plausibility: implied speed between consecutive accepted updates ≤
    the class cap × 1.15 from traffic-channel §6 rule 10; `geomRef >>> 1`
    below the leaf's polyline count.
 
-A **mailbox** validates only steps 1–3 and the rate limits — it holds
-no keys and therefore cannot check 4–9. Write access is consequently an
-operator-configured peer allowlist by default; open mailboxes are
-opt-in and live entirely on `THREAD_PUSH_RATE` and
-`THREAD_TAG_BUDGET`. This is a real difference from the traffic
-channel, where proof-of-work makes open write access safe: the thread
-channel has no equivalent because its records are opaque to the
-relay.
+A **caching relay** (§8) validates only steps 1–3 — it holds no key and
+therefore cannot check 4–9. It does not need to: it forwards verbatim
+sealed records, and the late joiner runs the full pipeline itself. A
+relay that tampers produces an AEAD failure; a relay that forges
+produces a signature failure; a relay that replays produces a `seq`
+failure. **Nothing in this channel requires trusting a relay**, which
+is why the channel does not name one.
 
-## 8. Delivery
+A relay caching for tags it cannot open is nevertheless a flood target,
+since it cannot tell real records from garbage addressed to invented
+tags. It is bounded by `THREAD_CACHE_RATE`, `THREAD_TAG_BUDGET`, and an
+LRU over `THREAD_CACHE_TAGS`; caching is best-effort by definition, so
+shedding under load is correct behaviour, not failure.
 
-Three paths, in preference order. All three carry identical bytes, so a
-thread does not know or care which one reached its subscriber.
+## 8. Delivery: no mailbox, no host
 
-1. **Gossip.** Publisher and subscriber both subscribe to `tag`'s
-   topic. Works where the mesh is dense and both are online. Best case,
-   no infrastructure.
-2. **Mailbox keepers.** The publisher PMP1s every update to
-   `THREAD_MAILBOX_PEERS` mailboxes from the invite; subscribers PMR1
-   with padded tag sets. This is the default path and the one the
-   product should be designed around, because a parent's phone is
-   asleep and a courier's route may cross no peers at all.
-3. **Direct.** Dispatch consoles and other always-on subscribers can
-   hold a stream to the publisher's peer.
+The link is a key, so discovery is a computation rather than an address
+lookup. All paths carry identical bytes; a thread neither knows nor
+cares which one reached a subscriber.
 
-A **mailbox is blind**: opaque ciphertext, pseudorandom addresses that
-rotate every 5 minutes, no way to count threads, tell them apart across
-rotations, or learn who fetched which of 8 tags. And it is naturally
-operated by the party that already knows the answer — a school board or
-a delivery platform running its own mailbox learns nothing it did not
-already have. That is the honest reason this is acceptable
-infrastructure where a plaintext tracking server is not.
+1. **Rendezvous + gossip (primary).** The subscriber derives
+   `tag(window)` and `rendezvous` from `P` (§4.2), asks the DHT which
+   peers provide that key, connects, and subscribes to the topic. The
+   publisher advertises itself as a provider for the same key each
+   window. This is the whole discovery mechanism: no bootstrap address
+   in the link, no directory, no host.
+2. **Audience caching (catch-up).** Every subscriber retains the
+   thread's last `THREAD_CACHE_RING` records and answers PMR1 for tags
+   it holds. A parent whose phone was asleep for four minutes rejoins,
+   finds current providers through the same rendezvous key, and pulls
+   the gap from *another parent* — or from any relay peer that cached
+   the bytes opportunistically. Availability therefore scales **with
+   audience size**, which is exactly backwards from a server, where a
+   larger audience costs more.
+3. **Direct.** Dispatch consoles and other always-on subscribers hold a
+   stream to the publisher.
 
-It is still, like the credential issuer in
-[pulsemesh.md](pulsemesh.md#deltas-from-the-original-concept) §5, a
-non-static service, and product copy must say so.
+This removes the second non-static service from the design. What
+remains is the traffic channel's optional keeper (pulsemesh.md §12) —
+already an ordinary, blind, TTL-bounded mesh peer — which can cache
+thread records too, without keys, without being named in any link, and
+without becoming anything a thread depends on.
+
+**Where this is weaker than a mailbox, stated plainly.** GossipSub is
+not store-and-forward, so a record only survives if *someone* was
+subscribed when it was published. The two shapes land differently:
+
+- **School run** — 30–500 subscribers, many of them awake and in the
+  same city. Someone is always holding the thread, and the catch-up
+  path is well supplied. This is the good case, and it gets better the
+  more families subscribe.
+- **Delivery** — an audience of one. If the recipient's app is closed,
+  nobody caches, and the position for those minutes is simply gone.
+  That is acceptable *because* the recipient is actively watching a
+  courier who is minutes away — the live connection is the product —
+  but an implementation MUST NOT promise history it cannot hold, and
+  the recipient's own device is the only reliable cache.
+
+The design consequence: a run's early minutes may have no live position
+for a subscriber who joined late and found no cache. §12's degradation
+rows are not a corner case here, they are a normal Tuesday, and the UI
+must handle them as such.
 
 ### 8.1 The wake-up problem
 
@@ -390,10 +474,13 @@ a sleeping phone cannot compute it. Three options, weakest leak first:
 - **Wake on state change.** The device also wakes on the publisher's
   coarse stop events during the run window. Fewer wakes than polling,
   still no server-side knowledge.
-- **Content-free push.** A mailbox emits an empty "tag has news" push;
-  the device wakes and decrypts. This links a push token to a tag at
-  the mailbox — the one linkage in this design that a mailbox can
-  actually accumulate. It MUST be opt-in and MUST be disclosed.
+- **Content-free push.** With no mailbox there is no natural place for
+  this to live: it needs a service holding a push token, and pairing a
+  token with a tag re-creates exactly the linkage the rest of the
+  design removes. If an operator adds one, it MUST be opt-in, MUST be
+  disclosed, and MUST carry no payload — and the honest framing is that
+  it is a separate product decision layered on top of this protocol,
+  not part of it.
 
 ## 9. Arrival time is a local route query
 
@@ -449,38 +536,85 @@ interface MUST stop presenting a position as live and fall back to §12.
 
 ## 10. Rules between the two channels
 
-These three are normative, and the third is the uncomfortable one.
+Thread publishers **should** contribute traffic — a fleet on the road
+all day is the best sustained probe the traffic channel could ask for.
+The rules below make that safe rather than forbidding it.
 
-1. **A thread never feeds a traffic aggregate.** Thread updates are
-   authenticated single-source; traffic aggregates are corroborated
-   multi-source with `AGG_MIN_REPORTS`. Admitting signed fleet data
-   into the aggregate would turn one fleet key into a traffic
-   authority, which is precisely the property the traffic channel was
-   designed not to have. A fleet that wants to contribute traffic emits
-   ordinary PMC1 records under the same PoW and corroboration
-   minimums as everyone else.
+1. **A thread record never enters a traffic aggregate.** This one is
+   absolute. Thread updates are authenticated single-source; traffic
+   aggregates are corroborated multi-source with `AGG_MIN_REPORTS`.
+   Admitting a signed fleet record into the aggregate would turn one
+   fleet key into a traffic authority, the exact property the traffic
+   channel is built not to have. A fleet contributes by emitting
+   **ordinary PMC1 records** — same PoW, same corroboration minimums,
+   same anonymity as everyone else. Two records, two channels, never a
+   bridge between them.
 
 2. **A thread consumes traffic aggregates freely.** §9. The subscriber
    is a normal traffic consumer, with the normal padding, decoy and
    split rules on every cell fetch.
 
-3. **A device MUST NOT publish a thread update and an anonymous
-   contribution for the same (segment, time bucket).** A vehicle doing
-   both is trivially correlatable — an observer who sees a PMT1 and a
-   PMC1 leave the same peer in the same 15 s window has just
-   de-anonymized the contribution, and worse, can now follow the
-   *encrypted* thread by watching the plaintext one. The default is
-   therefore: **a thread publisher does not contribute anonymously
-   while a thread is active.**
+3. **Contribution is gated on whether the route is already public.**
 
-   This is genuinely costly. Fleets are the best sustained contributors
-   in the whole design — fixed routes, professional drivers, powered
-   devices, all day — and this rule benches exactly them. A weaker rule
-   worth measuring in the phase-2 simulation: contribute only on
-   segments already carrying ≥ 3 other contributors in the current
-   bucket, so the anonymity set is never one. Whether that survives a
-   timing analysis is an open question (§17), and until it is measured
-   the conservative rule stands.
+   The risk is correlation: an observer who sees a PMT1 and a PMC1
+   leave one peer in the same window has de-anonymized the
+   contribution, and can then follow the *encrypted* thread by watching
+   its plaintext twin. Timing offsets do not fix this — the leak is the
+   trajectory, not the clock. But what a trajectory costs depends
+   entirely on whether it was ever secret:
+
+   - **Scheduled vehicles on published routes SHOULD contribute.** A
+     school bus's route and timetable are a public static asset — the
+     run plan is literally published next to the map pack so
+     subscribers can predict arrivals. Correlating a bus's
+     contributions to its thread reveals a route anyone could already
+     read off the timetable. There is no anonymity to lose, so the
+     conservative rule protects nothing and costs the network its best
+     contributor. Applies to transit, school runs, snow clearing, waste
+     collection, scheduled shuttles.
+   - **Couriers and unscheduled vehicles MUST contribute under the
+     reticent profile** (protocol §10.2) or not at all. A courier's
+     route is *not* public, and it is not merely private — it is a list
+     of customer addresses, and reconstructing it from contributions is
+     the worst outcome in this document.
+
+     The reticent profile exists for this case: suppress near the
+     device's own stops and on residential streets, emit only
+     observations that *surprise* the current expectation, only when
+     other contributors are already present, and publish through
+     rotating forwarders. It removes the trajectory rather than the
+     contributor, and because surprises are shared events, what a
+     courier does emit is emitted simultaneously by everyone else stuck
+     in the same jam. The residual exposure is stated honestly in
+     protocol §10.3, and M5 measures it as a
+     recovered-route fraction rather than asserting it.
+
+   The distinguishing test is not vehicle type but a question:
+   **would an observer learn anything from the correlation that a
+   published document does not already tell them?** Where the answer is
+   yes, the reticent profile is mandatory rather than the contribution
+   being refused. Implementations MUST make contribution an explicit
+   per-thread setting, MUST default it to off, and MUST NOT infer the
+   profile from vehicle class.
+
+4. **A contributing thread publisher MUST suppress contributions at its
+   own stops.** This is a data-quality rule, not a privacy one, and it
+   is easy to miss: a bus dwelling at every stop reports 0 km/h on
+   roads that are flowing perfectly. Feeding that into a weighted
+   median would make the traffic layer systematically pessimistic about
+   exactly the arterials transit runs on — and worse, self-consistently
+   so, since several buses on one corridor corroborate each other's
+   false standstill.
+
+   Therefore a publisher with a run plan MUST NOT emit PMC1 while
+   `state` is dwelling, within 40 m of a planned stop, or for 10 s
+   after departing one. The same applies to a courier stopped to hand
+   over a package on a free-flowing street. The traffic channel's
+   standstill rule (protocol §10.4) catches parking, not
+   service stops — this rule is what catches service stops.
+
+   A vehicle that stops for *traffic* between stops reports normally;
+   that is real congestion and precisely what the channel wants.
 
 ## 11. Granularity is a safety control
 
@@ -581,10 +715,12 @@ it should not pretend to.
 
 A fine-mode PMT1 is 130 bytes (§16). At 5 s cadence that is 26 B/s per
 thread, 94 KB per thread-hour. A 500-bus fleet in a morning window
-generates about 47 MB in total across the mesh, and a mailbox holding
-`THREAD_MAILBOX_TTL` for all 500 threads needs roughly
-500 × 120 × 130 B ≈ 7.8 MB resident. Coarse mode is two orders of
-magnitude below that.
+generates about 47 MB in total across the mesh. A subscriber's own
+catch-up cache is 120 × 130 B ≈ 16 KB per thread — small enough that
+audience caching costs a phone nothing, which is what makes §8's
+host-free design practical. A relay peer caching the maximum
+`THREAD_CACHE_TAGS` holds about 4 MB. Coarse mode is two orders of
+magnitude below all of these.
 
 The subscriber side is dominated not by the thread but by the traffic
 cells its ETA query fetches — which is the existing corridor-fetch
@@ -600,31 +736,45 @@ the traffic channel's test epoch,
 
 ### 16.1 Key schedule
 
-```
-threadRoot   = SHA256("pulsemesh-thread-test-vector")
-             = 91d993d38ed5d37e11f4a00726462ca3ebdecbdcbc7e3e9a1ef29a3430a3757f
-K_topic      = 318fc2cc6de1de112a0e5651bdc2784feb2f5c647cbc267e9c246fcf29f6e7f1
-K_content    = f538c14e179c82cf77bb3eb841b23112c791be2ecc684521924f4ce50a97a3d7
-noncePrefix4 = fa427ba0
-```
-
-Publisher key from seed `SHA256("pulsemesh-thread-publisher")` =
-`0a0d7e721ae1571ceb2c444c3c661176175d0392d27040031a9f175f98de8ded`:
+Ed25519 keypair from seed `SHA256("pulsemesh-thread-publisher")` =
+`0a0d7e721ae1571ceb2c444c3c661176175d0392d27040031a9f175f98de8ded`,
+giving the capability `P` and everything derived from it:
 
 ```
-publisherKey = cdf0cfb422cd2faaf24eb8343cff641a41ca4be4a3aa429e7229d690719761bd
+P            = cdf0cfb422cd2faaf24eb8343cff641a41ca4be4a3aa429e7229d690719761bd
+K_topic      = HKDF(P, "pulsemesh/thread/topic/1",   32)
+             = 0a3e8b5df4d51e0ce7306d79a309b78c35c21f460ca07cdd5f6cfd7f30453c4b
+K_content    = HKDF(P, "pulsemesh/thread/content/1", 32)
+             = 39413c192f15a7068ac77abdf8a96eb9a769db3d226ed9731c7a201e88b8b3d7
+noncePrefix4 = HKDF(P, "pulsemesh/thread/nonce/1",    4) = 576cd8f8
 ```
 
-### 16.2 Topic tag
+### 16.2 Topic tag and rendezvous
 
 At unixSeconds 1754265600, window = 5847552:
 
 ```
-tag   = b3a426eff70cd207
-topic = /rangefind/pulsemesh/1/t/f44796c8cc1f3fa7/b3a426eff70cd207
+tag        = cbfa3ae2fdc2cf0f
+topic      = /rangefind/pulsemesh/1/t/f44796c8cc1f3fa7/cbfa3ae2fdc2cf0f
+rendezvous = SHA-256(utf8(topic))
+           = a6213aeb6a36ac6d3380b05b6181124601c2234197377c6a6a086f68f8620849
 ```
 
-### 16.3 Sealed update
+### 16.3 The link
+
+Version 1, `P`, epochPrefix8, `notAfter` 1754294400 — 45 bytes:
+
+```
+Ac3wz7QizS-q8k64NDz_ZBpBykvko6pCnnIp1pBxl2G99EeWyMwfP6dokGiA
+```
+
+as delivered (60 characters after the `#`, SMS- and QR-sized):
+
+```
+https://track.example/r#Ac3wz7QizS-q8k64NDz_ZBpBykvko6pCnnIp1pBxl2G99EeWyMwfP6dokGiA
+```
+
+### 16.4 Sealed update
 
 Body fields: unixSeconds 1754265600, state 2 (en route), mode 2 (fine),
 leafCell 3181, geomRef 885 (polyline 442, direction 1), ratioQ12 2048,
@@ -642,84 +792,102 @@ b0b3192ceefeb4be4a2addebc3a74409324ee4613b1715cb974a5841edc982e4
 8500128fde33572ebaef2b639d34d283b1b68dcedfa7a092b86936c1bf783c07
 ```
 
-Sealed at `seq` 42 — nonce `fa427ba0000000000000002a`, AAD
-`504d5431f44796c8cc1f3fa7b3a426eff70cd2072a` — the full 130-byte PMT1
+Sealed at `seq` 42 — nonce `576cd8f8000000000000002a`, AAD
+`504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a` — the full 130-byte PMT1
 record is:
 
 ```
-504d5431f44796c8cc1f3fa7b3a426eff70cd2072a6cc033c740fac2cad2fc61
-9bb21e325c8deff858cc135c6eea2af21bd84103e873a4fd8b321e6d6c48f847
-847529e6b0618c60d3b82985967f0895652686f9c4070219d6b42cd3923de5a0
-3b1486dd26645c801408fd1204619b82cfb57c79d29054d923e8d93893d376b3
-7ae5
+504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a6c7a8da4d85d9063cc5eb7
+17fe848766a01c64b39e7051e5a88fc7d84c799bbaab39ea92bce979fdbb5412
+f46e0a53c20d5243e25caceba50baea321a0a61066048684867b197163aa0633
+0039f2730fcd49b1f3535d5d4ce4467d9de6e36c35429b0f6cc17c58ab3098ae
+12d4
 ```
 
 ## 17. Repository layout and milestones
 
 ```
-src/pulsemesh/thread_crypto.js   HKDF schedule, tag derivation, seal/open, Ed25519  (§4, §5.1)
-src/pulsemesh/thread_codec.js    PMT1/PMTP/PMP1/PMR1/PMM1                            (§5)
+src/pulsemesh/thread_crypto.js   HKDF-from-P, tag/rendezvous, seal/open, Ed25519     (§4, §5.1)
+src/pulsemesh/thread_codec.js    PMT1/PMTP/PMR1/PMM1 + link encode/decode            (§5)
 src/pulsemesh/thread_publish.js  publisher state machine, snap-driven, modes         (§5.3, §11)
 src/pulsemesh/thread_consume.js  validation, seq ledger, staleness                   (§7)
-src/pulsemesh/thread_mailbox.js  blind ring-buffer keeper, rate limits               (§5.5, §8)
+src/pulsemesh/thread_cache.js    catch-up ring buffers, padded PMR1, admission caps  (§5.5, §8)
 src/pulsemesh/thread_eta.js      locate + fixed-order matrix arrival estimation      (§9)
 test/pulsemesh_thread_*.test.js  per-module + §16 vectors
 ```
 
-- **T1 — crypto and codecs (no network).** Reproduce §16 byte for byte;
-  property test that a tampered AAD, a rolled-back `seq`, and a
-  correctly-sealed-but-unsigned record are all rejected. Requires
-  `engine.locate()` (§13).
+- **T1 — crypto, codecs and the link (no network).** Reproduce §16 byte
+  for byte; property test that a tampered AAD, a rolled-back `seq`, and
+  a correctly-sealed-but-unsigned record (the link-holder-turned-forger
+  case) are all rejected. Requires `engine.locate()` (§13).
 - **T2 — loopback thread.** Publisher and subscriber in one process
   over an in-memory duplex, publisher fed by the demo's simulated
   drive; subscriber renders a position and an ETA that moves when a
   synthesized jam is injected into the traffic provider. This proves
   the §9 claim, which is the whole thesis, with no networking at all.
-- **T3 — mailbox.** Blind keeper with ring buffers, padded PMR1,
-  rate limits and tag budgets; sleep/wake test where a subscriber
-  offline for 4 minutes recovers the full sequence.
-- **T4 — coarse pilot.** One operator, one route, coarse mode, run
-  plans published as static assets, invites through the operator's
-  existing portal. Measure: ETA error against observed arrival, wake
-  budget and battery on the subscriber side, and whether families ever
-  ask for fine mode once coarse works.
+- **T3 — discovery and catch-up.** Rendezvous derivation, DHT provider
+  records, audience caching; sleep/wake test where a subscriber offline
+  for 4 minutes rejoins from *another subscriber's* cache with no
+  designated host anywhere in the test.
+- **T4 — contribution.** A publisher emitting both PMT1 and PMC1 under
+  §10 rule 3, with rule 4 stop suppression; assert the traffic
+  aggregate for a corridor served by buses is not biased downward by
+  dwell time — the failure this rule exists to prevent.
+- **T5 — coarse pilot.** One operator, one route, coarse mode, run
+  plans as static assets, links by SMS. Measure: ETA error against
+  observed arrival, wake budget and battery, catch-up hit rate as a
+  function of how many families are subscribed, and whether families
+  ever ask for fine mode once coarse works.
 
 ## 18. Open questions
 
-- Whether a fleet can contribute anonymous traffic while publishing a
-  thread without becoming correlatable (§10 rule 3). This is the most
-  valuable open question in the design, because fleets are the best
-  contributors the traffic channel could have.
-- Mailbox abuse posture for open (non-allowlisted) mailboxes, given
-  that a relay cannot verify a signature it has no key for.
+- Catch-up availability as a function of audience size: how many
+  concurrent subscribers does a run need before a late joiner reliably
+  finds the gap? T5 measures it, and the answer decides whether small
+  audiences need a cache incentive of some kind.
+- Flood posture for relay peers caching tags they cannot open, given
+  that no signature is verifiable without `P` and no proof-of-work
+  envelope exists on this channel.
+- Whether §10 rule 3's public-route test holds up in practice: a run
+  plan is public, but does correlating contributions to it leak
+  anything about *deviations* from the plan (a driver's detour, an
+  unscheduled stop) that the timetable does not?
 - Whether coarse mode's ETA error is small enough that fine mode is
-  never needed for school runs — measurable in T4, and the answer
+  never needed for school runs — measurable in T5, and the answer
   decides a safety default rather than a feature.
-- Content-free push (§8.1): is the mailbox's token↔tag linkage
-  acceptable, and can it be blinded (rotating tokens, an intermediary
-  that sees one but not the other) without adding a fourth service?
 - Cross-epoch handover mid-run, when the index republishes while a bus
   is halfway through its route: `EPOCH_OVERLAP` covers the consumer,
-  but the run plan and `planRef` are epoch-bound too.
+  but the run plan, `planRef` and the link's `epochPrefix8` are
+  epoch-bound too. A link that dies mid-route is a bad failure.
 - Multi-vehicle threads (a run continued by a replacement bus): a new
-  keypair under the same `threadRoot`, or a new invite?
+  keypair means a new link to every family mid-morning, which is
+  unworkable. Chaining a successor key inside the sealed body of the
+  final update is the obvious fix and needs its own analysis.
 
 ## 19. Conformance checklist
 
-- [ ] Reproduces §16 byte-identically: key schedule, tag, signed
-      preimage, sealed record.
-- [ ] Never transmits `threadRoot`, `K_content`, or a nonce; derives
-      every nonce from `noncePrefix ‖ seq`.
+- [ ] Reproduces §16 byte-identically: key schedule from `P`, tag,
+      rendezvous, link, signed preimage, sealed record.
+- [ ] Generates a fresh keypair per run; never publishes, logs, reuses,
+      or transmits `P`; never uses it as a peer identity.
+- [ ] Never transmits `K_content` or a nonce; derives every nonce from
+      `noncePrefix ‖ seq`.
+- [ ] Carries the capability in a URL fragment, never a query string or
+      path.
 - [ ] Rejects: bad AEAD tag, missing or invalid signature, non-increasing
-      `seq`, out-of-window `unixSeconds`, records outside
-      `[notBefore, notAfter]`, unknown tags.
-- [ ] Mailbox is blind: no key material, no distinction between unknown
-      and empty tags, enforced ring/TTL/rate/tag budgets.
-- [ ] Every PMR1 padded to 4/8/16 tags with CSPRNG decoys.
-- [ ] Thread records never enter a traffic aggregate; publisher does not
-      emit PMC1 for a segment/bucket it published a PMT1 for.
-- [ ] ETA computed locally; no request carries the subscriber's stop,
-      home, or identity.
+      `seq`, out-of-window `unixSeconds`, records past `notAfter`,
+      unknown tags.
+- [ ] Discovers peers from the derived rendezvous key alone — no host,
+      mailbox, or bootstrap address in the link.
+- [ ] Every PMR1 padded to 4/8/16 tags with CSPRNG decoys; responders
+      never distinguish unknown from empty tags.
+- [ ] Thread records never enter a traffic aggregate.
+- [ ] Anonymous contribution while a thread is active is off by default,
+      settable only per-thread and never inferred; suppressed at stops
+      per §10 rule 4; reticent profile (protocol §10.2) enforced for
+      any thread whose route is not published.
+- [ ] ETA computed locally with `matrix()` over the planned order; no
+      request carries the subscriber's stop, home, or identity.
 - [ ] UI distinguishes all four rows of §12 and stops claiming "live"
       past `THREAD_STALE`.
 - [ ] Coarse is the default for child transport; fine requires an

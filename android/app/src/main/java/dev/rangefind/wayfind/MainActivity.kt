@@ -130,6 +130,7 @@ class MainActivity : ComponentActivity() {
                     onDirections = { viewModel.requestDirections() },
                     onSelectRoute = viewModel::selectRoute,
                     onSelectMode = viewModel::setTravelMode,
+                    poseAt = viewModel::currentPose,
                     onStartNavigation = viewModel::startNavigation,
                     onStopNavigation = viewModel::stopNavigation,
                     onExitDirections = viewModel::exitDirections,

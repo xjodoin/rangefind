@@ -167,6 +167,22 @@ reported.
 | `TRUST_INIT / MIN / MAX` | 1000 / 250 / 2000 | no | per-peer trust (milli) |
 | `AGG_MIN_REPORTS` | 3 (2 for hint) | yes | corroboration minimums |
 
+Reticent-profile constants (§10.2), applying to contributors that opt
+into trajectory suppression:
+
+| Name | Value | Tunable | Meaning |
+| --- | --- | --- | --- |
+| `SURPRISE_BINS` | 3 (15 km/h) | yes | deviation from expectation that unlocks emission |
+| `SURPRISE_CONFIDENCE` | 0.4 | yes | aggregate confidence above which it, not the static metric, is the expectation |
+| `BASE_SAMPLE_RATE` | 0.05 | yes | probability of emitting an unsurprising observation |
+| `RETICENT_GAP` | 120 s | yes | min seconds between emissions, reticent profile |
+| `COMPANY_WINDOW` | 60 s | yes | window for the "not alone" check |
+| `STOP_RADIUS` | 150 m | yes | suppression radius around own stops and trip endpoints |
+| `STOP_SECONDS` | 90 s | yes | suppression window around a dwell |
+| `FORWARD_POOL` | 4 | yes | distinct forwarders rotated per record |
+| `FORWARD_MAX_DELAY` | 10 s | yes | max hold a forwarder may add |
+| `FORWARD_RATE` | 4 rec/min | yes | per-source forwarding rate at a forwarder |
+
 ## 4. Wire formats
 
 All stream messages are framed `varint length ‖ payload` (the standard
@@ -264,6 +280,22 @@ One libp2p protocol, magic-discriminated:
   cells return counts of 0 — a responder MUST NOT distinguish "cell I
   don't track" from "cell with no data".
 
+- **PMF1** (forward for me): `"PMF1"` ‖ epochPrefix8 ‖ delayMs varint
+  (≤ `FORWARD_MAX_DELAY`) ‖ a verbatim PMB1 or PMI1. The receiver
+  validates it exactly as if it had arrived over gossip (§6, all
+  rules), holds it for `delayMs`, then publishes it to the correct
+  topic **as its own** publication. There is no response.
+
+  A forwarder MUST NOT forward a record that fails validation (it would
+  become an amplifier), MUST NOT alter any byte (records are
+  self-validating; altering one only destroys its proof), MUST NOT
+  forward a PMF1 it received via PMF1 (one hop only, no chains), and
+  MUST rate-limit per source peer at `FORWARD_RATE`. Forwarding is
+  cheap and safe precisely because PMC1 carries no sender identity:
+  there is nothing in the record for a forwarder to strip, substitute,
+  or need to be trusted about. What forwarding changes is only *which
+  peer id the mesh observes publishing it*.
+
 Snapshots carry **raw contributions, not aggregates**: the merge is a
 set union keyed by reportId, and every subscriber recomputes aggregates
 locally (§8) — this is what makes the aggregate consensus-free.
@@ -352,7 +384,7 @@ until then receivers MUST reject proofType 2.
 ## 6. Validation pipeline
 
 A receiver applies these rules **in order** to every record, dropping
-on first failure. Rules 1–9 are cheap and unconditional; 10–11 need
+on first failure. Rules 1–9 are cheap and unconditional; 10–12 need
 context.
 
 1. Frame/magic/size: well-formed, no trailing bytes, encoded size ≤
@@ -379,10 +411,23 @@ context.
     `meters` within ±20% of the static edge length when nonzero.
 11. Segment existence *(same condition)*: `geomRef >>> 1` < the leaf's
     polyline count.
+12. Reportable class *(same condition)*: the segment's highway class is
+    **not** one of `service`, `driveway`, `parking_aisle`, `track`,
+    `living_street`, `pedestrian`, or `footway`. Records on these are
+    dropped unconditionally.
 
-Failing 10–11 additionally applies a trust penalty to the delivering
-peer (§8.4). Records that pass validation are stored even when rule
-10–11 could not be evaluated — plausibility is enforced probabilistically
+    These classes are where a contribution is least useful and most
+    identifying: a driveway or a parking aisle carries no through
+    traffic that anyone routes over, and a report from one is close to
+    a statement about a single address. Excluding them at validation
+    means the rule holds regardless of what the contributor intended,
+    and it costs the routing layer nothing — the router degrades to the
+    static metric on exactly the segments where the static metric was
+    already right.
+
+Failing 10–12 additionally applies a trust penalty to the delivering
+peer (§8.4). Records that pass validation are stored even when rules
+10–12 could not be evaluated — plausibility is enforced probabilistically
 by whichever peers do hold the cell.
 
 ## 7. Local store
@@ -507,6 +552,8 @@ pre-blend.
 
 ## 10. Contributor pipeline (mobile runtime)
 
+### 10.1 Per-fix state machine
+
 State machine per GPS fix (target cadence 1 Hz):
 
 1. **Match**: `engine.snap(fix)`; take the best match. No match, or
@@ -530,6 +577,119 @@ State machine per GPS fix (target cadence 1 Hz):
 
 Incident reports (PMI1) are user-initiated (a button), same proof and
 topic rules, at most one per (type, 5 min) per device.
+
+### 10.2 The reticent profile
+
+A contributor emitting on cadence produces a **trajectory**. Records
+carry no identifier, but a walk on adjacent segments in consecutive
+buckets is reconstructible from the record set alone, by anyone, with
+no identifier needed: on a quiet street the chain is unique. For a
+private driver that leaks a commute. For a **courier it leaks the
+customer list**, which is why §10 rule 3 of
+[pulsemesh-threads.md](pulsemesh-threads.md) originally forbade
+couriers from contributing at all.
+
+The fix is not to exclude them. It is that **the aggregate never wanted
+what cadence collects**. Aggregation wants *breadth* — many vehicles
+across many segments — and §8.3 discards everything below
+`AGG_MIN_REPORTS` anyway. One vehicle reporting 120 consecutive
+segments and 120 vehicles reporting one segment each produce the same
+aggregates; only the first produces a trajectory. Cadence buys depth
+the aggregate cannot use, and pays for it in exactly the currency this
+design refuses to spend.
+
+The reticent profile therefore replaces cadence with four gates. A
+contributor MUST pass all four to emit. It is **mandatory for thread
+publishers on unpublished routes** (couriers, field service) and
+RECOMMENDED as the default for every contributor pending phase-2
+measurement (§14, M4).
+
+**Gate 1 — place.** Suppress within `STOP_RADIUS` of the device's own
+trip origin or destination, within `STOP_RADIUS` of any of its own
+service stops, and for `STOP_SECONDS` around any dwell. Suppress on
+`residential` and `unclassified` classes entirely — the deny list of
+rule 12 is the floor, not the target. A courier's addresses are on
+those streets; its useful traffic observations are not.
+
+**Gate 2 — surprise.** Let
+
+```
+expected = live aggregate speedBin for this segment, when one exists
+           with confidence ≥ SURPRISE_CONFIDENCE
+         = the time-bucket static free-flow bin otherwise
+```
+
+(the contributor is also a consumer, so it already holds both). Emit
+when `|observedBin − expected| ≥ SURPRISE_BINS`. Otherwise fall through
+to gate 3.
+
+This is the load-bearing one, and it improves the channel rather than
+compromising it:
+
+- **Silence becomes a signal.** No live state means observations match
+  the static metric, and the router's degrade-to-static behaviour is
+  then not a degradation but the correct answer. The ambiguity between
+  "matches static" and "nobody there" is harmless because both resolve
+  the same way.
+- **It self-corrects chronic error.** A segment whose time-bucket
+  metric is wrong generates surprises until the aggregate fixes it,
+  then goes quiet.
+- **Clearance is detected.** Because `expected` follows the live
+  aggregate when one exists, observing free flow where the aggregate
+  says jam is itself a surprise, and gets reported.
+- **Surprises are inherently shared.** Everyone in a jam observes the
+  same jam and reports it, so the anonymity set for a surprise report
+  is everyone in the jam. Free-flow reports — the ones with a small,
+  identifying anonymity set — are exactly the ones now suppressed.
+
+**Gate 3 — company.** Emit an unsurprising observation only with
+probability `BASE_SAMPLE_RATE`, never within `RETICENT_GAP` of the
+previous emission, and only when the contributor's own store already
+holds ≥ 1 other live contribution for that segment within
+`COMPANY_WINDOW`.
+
+The company check costs nothing in utility: a record with no company
+falls below `AGG_MIN_REPORTS` and **produces no aggregate at all**, so
+a lone report is pure privacy cost against zero benefit. The one
+exception is jam onset — the first witness of a new jam has no company
+by definition — which is why a gate-2 surprise bypasses gate 3
+entirely. A lone surprise still publishes nothing visible until two
+more arrive, and if the jam is real they will.
+
+**Gate 4 — forwarding.** Publish through PMF1 (§4.5) to a forwarder
+drawn from a pool of `FORWARD_POOL` peers, **rotated per record**, not
+directly to the topic.
+
+State plainly what this does and does not buy, per design rule 5 of
+[pulsemesh.md](pulsemesh.md#design-rules): it does not make a
+contributor anonymous. It replaces the publishing peer id with the
+forwarder's, so trajectory reconstruction from peer identity requires
+the forwarders to collude — with rotation, all of them. A global
+passive observer of the mesh, or a full-pool collusion, still sees the
+record set. Forwarding narrows the observer set; the first three gates
+are what shrink the data.
+
+**Prohibited: decoy contributions.** Padding and decoys protect
+*queries* (§11.3) and cost nothing because a query is a question. A
+decoy contribution is a lie about the road, and it would be
+indistinguishable from a Sybil attack — by the network and by the
+aggregate. A contributor that cannot emit safely emits nothing.
+
+### 10.3 What remains exposed
+
+Honesty about the residual, since the gates do not reduce it to zero:
+
+- A surprise report on an empty road at 03:00 can have an anonymity set
+  of one. The gates are weakest at low density — where traffic data is
+  also least valuable, but the trade is real.
+- Gates 1–3 are contributor-side and unenforceable by receivers, unlike
+  rule 12. That is acceptable here in a way it is not for Sybil
+  controls: a contributor that violates a privacy gate harms only
+  itself, so there is no incentive to defect and no need to police it.
+- Sparse surprise reports still cluster along a courier's arterial
+  path. Against an adversary that already knows the courier was working
+  a given area, they narrow the search; against one that does not, they
+  are a handful of unlinked points among everyone else's.
 
 ## 11. Consumer pipeline (any client)
 
@@ -637,15 +797,17 @@ F[5]/1000 = 0.920; confidence ≈ 0.680962 → **confidenceBin 5**.
 ## 14. Repository layout and milestones
 
 ```
-src/pulsemesh/codec.js       PMC1/PMB1/PMI1/PMD1/PMG1/PMQ1/PMS1 + preimage/PoW   (§4, §5.3)
+src/pulsemesh/codec.js       PMC1/PMB1/PMI1/PMD1/PMG1/PMQ1/PMS1/PMF1 + PoW       (§4, §5.3)
 src/pulsemesh/bins.js        speed/quality bins, FRESHNESS + Q tables, cells      (§2, §8.1)
 src/pulsemesh/store.js       TTL store, three indexes, eviction, digests          (§6.6, §7)
 src/pulsemesh/aggregate.js   weighted median, confidence, trust ledger            (§8)
-src/pulsemesh/validate.js    rules 1–11, rate limiting                            (§6)
+src/pulsemesh/validate.js    rules 1–12, rate limiting                            (§6)
 src/pulsemesh/topics.js      topic grammar, shards, rotation                      (§5.2)
 src/pulsemesh/sync.js        anti-entropy + padded/split cell fetch               (§4.5, §11.3)
 src/pulsemesh/provider.js    LiveTrafficProvider adapter                          (§9)
-src/pulsemesh/contribute.js  contributor state machine (engine.snap-based)        (§10)
+src/pulsemesh/contribute.js  contributor state machine (engine.snap-based)        (§10.1)
+src/pulsemesh/reticent.js    the four emission gates + forwarder rotation         (§10.2)
+src/pulsemesh/forward.js     PMF1 accept/validate/hold/republish                  (§4.5)
 src/pulsemesh/node.js        js-libp2p host wiring, keeper profile                (§5.1, §12)
 scripts/pulsemesh_sim.mjs    phase-2 simulation harness
 test/pulsemesh_*.test.js     per-module + cross-implementation vectors (§13)
@@ -671,6 +833,23 @@ Milestones, each independently testable with `node --test`:
   bandwidth per peer per minute vs density, decoy/batch overhead,
   flood resilience (malformed/replayed/Sybil load vs PoW difficulty).
   These measurements finalize the §3 tunables.
+- **M5 — reticent profile (§10.2).** The measurement that decides
+  whether it becomes the default for everyone. Two axes, both against
+  the cadence profile as baseline:
+
+  *Utility.* Aggregate coverage and jam-detection latency under
+  reticent emission at varying density. The question is how much later
+  a jam is detected when only surprises are reported, and at what
+  density the answer stops mattering. If detection latency is within a
+  bucket or two of baseline, cadence has no remaining argument.
+
+  *Privacy.* Run a trajectory-reconstruction attack directly against
+  the record set: given all PMC1s from a simulated courier round plus
+  background traffic, how much of the route can an adversary chain by
+  adjacency and timing, with and without each gate? Report it as
+  recovered-route fraction and as the size of the anonymity set per
+  emitted record. This is the number that decides whether couriers can
+  contribute, so it must be measured rather than argued.
 
 ## 15. Conformance checklist
 
@@ -678,14 +857,22 @@ An implementation is conformant when:
 
 - [ ] Encodes/decodes every §4 format byte-identically to the §13
       vectors; rejects trailing bytes and oversized records.
-- [ ] Enforces validation rules 1–9 unconditionally and 10–11 when the
+- [ ] Enforces validation rules 1–9 unconditionally and 10–12 when the
       leaf cell is available; proofType 0/2 never accepted on the wire.
+- [ ] Never accepts a record on a rule-12 denied class, whatever the
+      sender claims.
 - [ ] Store: reportId dedup, TTL expiry (senders can only shorten),
       caps with lowest-weight eviction, no disk persistence.
 - [ ] Aggregation reproduces §13.3 exactly, uses the FRESHNESS/Q tables
       verbatim, ties broken by reportId.
-- [ ] Emits nothing but PMC1/PMI1/PMB1/PMD1/PMS1 payloads; contribution
-      cadence, standstill and suppression rules per §10.
+- [ ] Emits nothing but PMC1/PMI1/PMB1/PMD1/PMS1/PMF1 payloads;
+      contribution cadence, standstill and suppression rules per §10.1.
+- [ ] Reticent profile, where selected: all four gates of §10.2, in
+      order, with forwarders rotated per record. Never emits a decoy
+      contribution under any profile.
+- [ ] As a forwarder: validates a PMF1's inner record fully before
+      republishing, alters no byte, never chains PMF1 to PMF1, and
+      rate-limits per source.
 - [ ] Every cell fetch (including provider-triggered) is padded to
       8/16/32 with decoys, shuffled, and split across peers; endpoint
       cells never fetched unpadded.

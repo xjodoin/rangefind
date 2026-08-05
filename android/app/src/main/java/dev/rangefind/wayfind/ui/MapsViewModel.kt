@@ -14,7 +14,9 @@ import dev.rangefind.wayfind.engine.RangefindEngine
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.engine.RouteBundle
 import dev.rangefind.wayfind.engine.Suggestion
+import dev.rangefind.wayfind.location.HeadingSensor
 import dev.rangefind.wayfind.location.LocationProvider
+import dev.rangefind.wayfind.nav.MotionModel
 import dev.rangefind.wayfind.region.REGION_CATALOG
 import dev.rangefind.wayfind.region.RegionEntry
 import dev.rangefind.wayfind.region.RegionPreferences
@@ -112,6 +114,11 @@ class MapsViewModel(
 
     private val core = NavigationCore(context)
     private val recorder = TripRecorder(context)
+    // A fix a second is not a position; it is a sample of one. The model
+    // carries the vehicle between them and decides how far each sample is
+    // allowed to move the estimate.
+    private val motion = MotionModel()
+    private val heading = HeadingSensor(context)
     private var suppressSuggestFor: String? = null
 
     private val downloads = mutableMapOf<String, Job>()
@@ -631,7 +638,11 @@ class MapsViewModel(
 
     // ---- navigation ---------------------------------------------------
 
+    /** The pose right now, carried forward since the last fix. */
+    fun currentPose(nowMs: Long): MotionModel.Pose? = motion.pose(nowMs)
+
     fun startNavigation() {
+        heading.start()
         val greeting = core.start(_state.value.allRoutes, _state.value.activeRouteIndex)
         if (regionPrefs.recordTrips) {
             recorder.start(_state.value.activeRoute, System.currentTimeMillis(), environment())
@@ -641,6 +652,8 @@ class MapsViewModel(
     }
 
     fun stopNavigation() {
+        heading.stop()
+        motion.reset()
         recorder.note("stopped-by-user", atMillis = System.currentTimeMillis())
         recorder.stop()
         core.stop()
@@ -722,11 +735,19 @@ class MapsViewModel(
         _state.update { it.copy(userLocation = point) }
         if (_state.value.sheet != SheetMode.Navigating) return
 
+        motion.onFix(
+            location = location,
+            roadBearing = _state.value.nav?.bearing,
+            compassBearing = heading.bearing,
+            mode = _state.value.mode,
+            nowMs = System.currentTimeMillis()
+        )
+        val fused = motion.pose(System.currentTimeMillis())
         val update = core.onLocation(
-            point = point,
-            speedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0,
-            gpsBearing = if (location.hasBearing()) location.bearing.toDouble() else null,
-            hasBearing = location.hasBearing()
+            point = fused?.position ?: point,
+            speedMps = fused?.speedMps ?: if (location.hasSpeed()) location.speed.toDouble() else 0.0,
+            gpsBearing = fused?.bearing,
+            hasBearing = fused != null || location.hasBearing()
         )
         // Trace the fix whether or not the core made anything of it: a fix it
         // declined to use is exactly the kind of gap worth seeing afterwards.

@@ -34,7 +34,20 @@ class LocationProvider(context: Context) {
     @SuppressLint("MissingPermission")
     fun updates(minIntervalMs: Long = 1000L, minDistanceM: Float = 0f): Flow<Location> =
         callbackFlow {
-            val listener = LocationListener { location -> trySend(location) }
+            // Both providers are registered, but a network fix is a cell-tower
+            // guess good to hundreds of metres. Letting one through moments
+            // after a satellite fix teleports the vehicle across town and back.
+            var lastFine = 0L
+            val listener = LocationListener { location ->
+                val fine = location.provider == LocationManager.GPS_PROVIDER
+                val now = location.elapsedRealtimeNanos / 1_000_000L
+                if (fine) {
+                    lastFine = now
+                    trySend(location)
+                } else if (now - lastFine > COARSE_GRACE_MS) {
+                    trySend(location)
+                }
+            }
 
             val enabled = buildList {
                 if (manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) add(LocationManager.GPS_PROVIDER)
@@ -57,4 +70,9 @@ class LocationProvider(context: Context) {
 
             awaitClose { runCatching { manager.removeUpdates(listener) } }
         }
+
+    private companion object {
+        /** How long a satellite fix keeps a coarse one out. */
+        const val COARSE_GRACE_MS = 15_000L
+    }
 }

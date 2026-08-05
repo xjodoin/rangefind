@@ -16,6 +16,12 @@ export interface RangefindConfig {
   geoCapsuleFields?: string[];
   /** Maximum document pages retained while building geo capsules. */
   geoCapsuleDocPageCachePages?: number;
+  /** Maximum bytes for preloading the random-access capsule page-entry table. */
+  geoCapsuleDocPageIndexPreloadMaxBytes?: number;
+  /** Field-selective memory budget for hot geo build code-store columns. */
+  geoCodeStorePreloadMaxBytes?: number;
+  /** Geo leaves compressed together in each ordered worker task. */
+  geoLeafWorkerBatchLeaves?: number;
   /** Multi-resolution geo-cell routing indexes keyed by a facet. */
   geoCellIndexes?: Array<{
     field: string;

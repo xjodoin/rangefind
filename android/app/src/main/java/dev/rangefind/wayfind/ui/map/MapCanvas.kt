@@ -18,6 +18,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.rangefind.wayfind.engine.LatLon
+import dev.rangefind.wayfind.nav.MotionModel
 import dev.rangefind.wayfind.engine.RouteJunction
 import dev.rangefind.wayfind.ui.SheetMode
 import dev.rangefind.wayfind.ui.formatDuration
@@ -75,6 +76,13 @@ private const val INK = 0xFF14161D.toInt()
 
 /** Per-frame fraction of the remaining distance to the newest fix. */
 private const val FOLLOW_EASE = 0.12
+/**
+ * Gentler still, for a source that is already continuous: with the motion
+ * model carrying the vehicle between fixes, the only step left to absorb is
+ * the correction each fix applies, and easing hard would reintroduce the lag
+ * the model exists to remove.
+ */
+private const val SETTLED_EASE = 0.22
 
 @Composable
 fun MapCanvas(
@@ -87,6 +95,8 @@ fun MapCanvas(
     onResultTapped: (Int) -> Unit,
     onRouteTapped: (Int) -> Unit,
     onLongPress: (LatLon) -> Unit,
+    /** The vehicle's pose right now, carried forward since the last fix. */
+    poseAt: ((Long) -> MotionModel.Pose?)? = null,
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current.density
@@ -365,21 +375,30 @@ private class MapHolder {
      * fix. A fraction per frame gives an ease-out that never overshoots and
      * needs no animation bookkeeping when the target changes mid-flight.
      */
-    fun stepFollow() {
+    fun stepFollow(poseAt: ((Long) -> MotionModel.Pose?)? = null) {
         val style = style ?: return
         val map = map ?: return
         val nav = latest?.nav ?: return
         if (!ready || !style.isFullyLoaded) return
 
+        // Where the vehicle is this frame, not where it was when the last fix
+        // landed. The model carries it forward continuously, so what remains
+        // here is absorbing the step each fix's correction makes.
+        val pose = poseAt?.invoke(System.currentTimeMillis())
+        val targetLat = pose?.position?.lat ?: nav.position.lat
+        val targetLon = pose?.position?.lon ?: nav.position.lon
+        val targetBearing = pose?.bearing ?: nav.bearing
+        val ease = if (pose != null) SETTLED_EASE else FOLLOW_EASE
+
         if (followLat.isNaN()) {
-            followLat = nav.position.lat
-            followLon = nav.position.lon
-            followBearing = nav.bearing
+            followLat = targetLat
+            followLon = targetLon
+            followBearing = targetBearing
         } else {
-            followLat += (nav.position.lat - followLat) * FOLLOW_EASE
-            followLon += (nav.position.lon - followLon) * FOLLOW_EASE
-            val delta = (nav.bearing - followBearing + 540.0) % 360.0 - 180.0
-            followBearing = (followBearing + delta * FOLLOW_EASE + 360.0) % 360.0
+            followLat += (targetLat - followLat) * ease
+            followLon += (targetLon - followLon) * ease
+            val delta = (targetBearing - followBearing + 540.0) % 360.0 - 180.0
+            followBearing = (followBearing + delta * ease + 360.0) % 360.0
         }
 
         style.setSource(
@@ -394,7 +413,7 @@ private class MapHolder {
         // Zoom tightens as speed drops, and the camera targets a point ahead
         // of the puck so the driver sits low on screen with the road ahead
         // filling the view.
-        val speedKmh = nav.speedMps * 3.6
+        val speedKmh = (pose?.speedMps ?: nav.speedMps) * 3.6
         val zoom = when {
             speedKmh < 25 -> 18.1
             speedKmh < 65 -> 17.3

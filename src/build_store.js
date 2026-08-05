@@ -162,6 +162,31 @@ function createReader(descriptor, openMode) {
     return value;
   }
 
+  function preloadFields(names, maxBytes) {
+    const limit = Math.max(0, Math.floor(Number(maxBytes || 0)));
+    const candidates = names == null
+      ? fields.filter(field => !field.dataView)
+      : [...new Set(Array.from(names, String))]
+        .map(name => byName.get(name))
+        .filter(field => field && !field.dataView);
+    const loadedFields = [];
+    const skippedFields = [];
+    let preloadedBytes = 0;
+    for (const field of candidates) {
+      const bytes = statSync(field.path).size + (field.indexPath ? statSync(field.indexPath).size : 0);
+      if (limit && preloadedBytes + bytes > limit) {
+        skippedFields.push(field.name);
+        continue;
+      }
+      field.dataView = readFileSync(field.path);
+      if (field.indexPath) field.indexView = readFileSync(field.indexPath);
+      field.cache.clear();
+      loadedFields.push(field.name);
+      preloadedBytes += bytes;
+    }
+    return { loadedFields, skippedFields, preloadedBytes };
+  }
+
   return {
     format: CODE_STORE_FORMAT,
     _fieldRecords: fields,
@@ -221,13 +246,14 @@ function createReader(descriptor, openMode) {
         if (field.indexPath) totalBytes += statSync(field.indexPath).size;
       }
       if (limit && totalBytes > limit) return false;
-      for (const field of fields) {
-        if (field.dataView) continue;
-        field.dataView = readFileSync(field.path);
-        if (field.indexPath) field.indexView = readFileSync(field.indexPath);
-      }
+      preloadFields(null, limit);
       return true;
     },
+    // Preload only the fields a random-access stage needs. Unlike preload(),
+    // this is deliberately best-effort: fields are loaded in caller priority
+    // order until the byte budget is exhausted. A single oversized field no
+    // longer prevents every smaller hot field from using the memory fast path.
+    preloadFields,
     close() {
       for (const field of fields) {
         if (field.fd != null) closeSync(field.fd);

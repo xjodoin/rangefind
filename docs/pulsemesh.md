@@ -155,7 +155,8 @@ Router: engine.route({ live: pulseMeshProvider })
 
 ### Contribution (what a device emits)
 
-Per ~15 s of driving on a matched segment, at most one record:
+At most one record per emission, gated by the reticent profile above
+(the raw `EMIT_INTERVAL` cadence below is the ceiling, not the rate):
 
 ```
 { epoch, segment, timeBucket(15s), speedBin(5 km/h),
@@ -257,16 +258,67 @@ is compelling alone; together they replace the tracking servers these
 products run today, where continuous child or courier positions sit in
 a vendor database indefinitely, joined to accounts.
 
-**Where the two must not touch.** Threads never feed traffic
-aggregates — a signed single-source record entering a corroborated
-aggregate would turn a fleet key into a traffic authority, the exact
-property this channel is built not to have. And a device publishing a
-thread must not also contribute anonymously for the same segment and
-bucket, or the two are trivially correlated and the anonymous
-contribution is de-anonymized by its own encrypted twin. That rule
-benches fleets, which would otherwise be the best sustained
-contributors in the design; whether a weaker rule survives timing
-analysis is the most valuable open question in either document.
+**A link is a key, not a location.** A thread's whole capability is one
+Ed25519 public key, 45 bytes in a URL fragment — SMS, QR code, order
+email. The private key signs, so no one can impersonate the publisher;
+the public key derives the content key, the rotating topic tag, and the
+DHT rendezvous key, so holding the link is what lets you *find*,
+decrypt and verify the thread. Nothing else is in the link: no host, no
+mailbox, no bootstrap address. Late joiners catch up from other
+subscribers' caches, so availability scales with audience size instead
+of costing a server.
+
+**How the two touch.** Threads never feed traffic aggregates — a signed
+single-source record entering a corroborated aggregate would turn a
+fleet key into a traffic authority, the exact property this channel is
+built not to have. But fleets should absolutely contribute as ordinary
+anonymous PMC1 peers, and working out how to let a *courier* do that
+safely produced the reticent profile below, which is the more important
+change of the two. The subtle rule is the data-quality one — a
+contributing bus must suppress reports at its own stops, or several
+buses on one corridor will corroborate each other into a convincing,
+entirely false standstill.
+
+## Cadence was the mistake
+
+The contribution rule as originally drafted — one record per device per
+`EMIT_INTERVAL` while driving — produces a **trajectory**. The records
+carry no identifier, but they do not need one: a walk across adjacent
+segments in consecutive buckets is reconstructible from the record set
+alone, by anyone, and on a quiet street it is unique. Design rule 1
+says privacy comes from data minimization, and cadence is not
+minimization.
+
+The correction is that **the aggregate never wanted what cadence
+collects**. Aggregation wants breadth — many vehicles over many
+segments — and discards anything below the corroboration minimum
+anyway. One vehicle reporting 120 consecutive segments and 120 vehicles
+reporting one segment each produce identical aggregates; only the first
+produces a trajectory. So cadence buys depth the aggregate cannot use
+and pays for it in the one currency this design refuses to spend.
+
+The **reticent profile** ([protocol §10.2](pulsemesh-protocol.md))
+replaces cadence with four gates — suppress near your own stops and on
+residential streets; emit only what *surprises* the current
+expectation; only when others are already reporting the same segment;
+and through forwarders rotated per record. The load-bearing one is
+surprise, and it is not a privacy/utility trade:
+
+- **Silence becomes a signal.** No live state means reality matches the
+  static metric, so degrading to static is the right answer rather than
+  a degradation.
+- **Surprises are shared.** Everyone in a jam reports the same jam, so
+  a surprise report's anonymity set is everyone in the jam. Free-flow
+  reports — the ones with a small, identifying anonymity set — are
+  exactly what gets suppressed.
+- **A lone report was always worthless.** Below the corroboration
+  minimum it produces no aggregate at all, so suppressing it costs
+  nothing and removes a pure privacy liability.
+
+This is what lets a courier contribute at all. It is a candidate
+default for *every* contributor, decided by measurement rather than
+argument: milestone M5 runs a trajectory-reconstruction attack against
+the record set and reports recovered-route fraction per gate.
 
 ## Phased plan
 
@@ -298,6 +350,10 @@ analysis is the most valuable open question in either document.
 - No accepted record outlives the receiver-enforced TTL; a departing
   node removes no replicated state; an empty region forgets.
 - A single peer can neither force a closure nor a reliable estimate.
+- **A contributor's route is not reconstructible from its
+  contributions.** Absent from the original criteria, and the omission
+  is what let cadence through: the record format was checked for
+  identifiers, the record *sequence* was not.
 - The router always returns a route; mesh unavailability degrades to the
   static metric (enforced by the provider contract and tested).
 - Direct, relayed, and two-hop modes are distinguished honestly in
@@ -311,9 +367,18 @@ analysis is the most valuable open question in either document.
   the cell; measure in phase 2).
 - Cross-epoch handover during index republishes (overlap window length).
 - Bandwidth ceilings per zone under stadium-exit-grade density.
-- Whether a fleet publishing a thread can also contribute anonymously
-  without becoming correlatable — the crossover question between the
-  two channels ([threads §10](pulsemesh-threads.md#10-rules-between-the-two-channels)).
-- Whether keepers and thread mailboxes are the same node profile; both
-  are blind, TTL-bounded stores answering padded requests, and an
-  operator running one would rather not run two.
+- Whether a scheduled fleet's anonymous contributions leak anything
+  about *deviations* from its published timetable, which is the one gap
+  in the public-route argument that lets fleets contribute at all
+  ([threads §10](pulsemesh-threads.md#10-rules-between-the-two-channels)).
+- Whether the reticent profile should simply be the only profile. The
+  argument for cadence is jam-detection latency; M5 measures it, and if
+  the gap is a bucket or two, there is no case for keeping a mode whose
+  only distinguishing property is that it leaks routes.
+- Jam onset under universal reticence: the first witness of a new jam
+  has no company by construction. A surprise bypasses the company gate
+  for exactly this reason, but the onset-latency curve at low density
+  is unmeasured.
+- Whether keepers should also cache thread records opportunistically:
+  same blind, TTL-bounded, padded-request store, no keys, and it would
+  cover the sparse-audience case threads are weakest at.

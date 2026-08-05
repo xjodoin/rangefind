@@ -409,9 +409,21 @@ and nearest queries can return display fields without opening document packs:
 {
   "geoCapsules": true,
   "geoCapsuleFields": ["id", "name", "type", "lat", "lon"],
-  "geoCapsuleDocPageCachePages": 256
+  "geoCapsuleDocPageCachePages": 256,
+  "geoCapsuleDocPageIndexPreloadMaxBytes": 67108864,
+  "geoCodeStorePreloadMaxBytes": 1610612736,
+  "geoLeafWorkerBatchLeaves": 16
 }
 ```
+
+The builder preloads the compact capsule page-entry table when it fits, reads
+each leaf's source pages in monotonic order, and uses `builderWorkerCount` to
+compress geo leaves concurrently while committing packs deterministically.
+When the complete code store is larger than `codeStorePreloadMaxBytes`,
+`geoCodeStorePreloadMaxBytes` is a separate best-effort budget for coordinates,
+cell-index facets, and geo summary fields. This avoids random 16-byte reads from
+dominating national builds. OSM's schema selects a 3 GiB complete-store budget
+and a 4096-page capsule cache; lower these settings on memory-constrained hosts.
 
 Multi-resolution cell indexes route a facet-constrained radius, viewport, or
 route query directly to intersecting point ordinals:
@@ -515,7 +527,7 @@ production `static-large` profile; you rarely need to change these.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `scanWorkers` | `1` | Worker threads that parse/analyze documents. Set near `cores-2` for large builds. |
-| `builderWorkerCount` | `1` | Workers for doc-page/rank-map compression and the reducer fallback. |
+| `builderWorkerCount` | `1` | Workers for doc-page, rank-map, and geo-leaf compression plus the reducer fallback. |
 | `partitionReducerWorkers` | `0` | Reduce-phase workers (`0` = `builderWorkerCount`). |
 | `scanBatchDocs` | `128` | Documents per worker batch. |
 | `partitionReducerInFlightBytes` | `1 GiB` | Backpressure budget for the reducer. |

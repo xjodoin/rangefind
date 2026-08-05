@@ -7,7 +7,7 @@ import {
   writeSync
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { encodeRunRecord, readRunRecords } from "./runs.js";
+import { readRunRecords, varintLength, writeVarint } from "./runs.js";
 
 const ROUTE_SCHEMA = new Array(10).fill("number");
 const SPOOL_FLUSH_BYTES = 256 * 1024;
@@ -24,7 +24,7 @@ export function createGeoCellRouteSpool(path) {
   return {
     path,
     fd: null,
-    pending: [],
+    pending: Buffer.allocUnsafe(SPOOL_FLUSH_BYTES + 128),
     pendingBytes: 0,
     records: 0,
     bytes: 0
@@ -32,20 +32,21 @@ export function createGeoCellRouteSpool(path) {
 }
 
 function flushGeoCellRouteSpool(spool) {
-  if (!spool.pending.length) return;
+  if (!spool.pendingBytes) return;
   if (spool.fd == null) spool.fd = openSync(spool.path, "w");
-  const bytes = Buffer.concat(spool.pending, spool.pendingBytes);
-  writeSync(spool.fd, bytes, 0, bytes.length);
-  spool.pending.length = 0;
+  writeSync(spool.fd, spool.pending, 0, spool.pendingBytes);
   spool.pendingBytes = 0;
 }
 
 export function appendGeoCellRoute(spool, tuple) {
-  const record = encodeRunRecord(ROUTE_SCHEMA, tuple);
-  spool.pending.push(record);
-  spool.pendingBytes += record.length;
+  let recordBytes = 0;
+  for (const value of tuple) recordBytes += varintLength(value);
+  if (spool.pendingBytes + recordBytes > SPOOL_FLUSH_BYTES) flushGeoCellRouteSpool(spool);
+  let offset = spool.pendingBytes;
+  for (const value of tuple) offset = writeVarint(spool.pending, offset, value);
+  spool.pendingBytes = offset;
   spool.records++;
-  spool.bytes += record.length;
+  spool.bytes += recordBytes;
   if (spool.pendingBytes >= SPOOL_FLUSH_BYTES) flushGeoCellRouteSpool(spool);
 }
 
@@ -58,7 +59,16 @@ export function closeGeoCellRouteSpool(spool) {
 }
 
 function writeChunk(path, rows) {
-  writeFileSync(path, Buffer.concat(rows.map(row => encodeRunRecord(ROUTE_SCHEMA, row))));
+  let bytes = 0;
+  for (const row of rows) {
+    for (const value of row) bytes += varintLength(value);
+  }
+  const buffer = Buffer.allocUnsafe(bytes);
+  let offset = 0;
+  for (const row of rows) {
+    for (const value of row) offset = writeVarint(buffer, offset, value);
+  }
+  writeFileSync(path, buffer);
 }
 
 class TupleHeap {
@@ -107,6 +117,7 @@ async function next(iterator) {
 export async function* sortedGeoCellRoutes(spool, options = {}) {
   closeGeoCellRouteSpool(spool);
   const chunkRecords = Math.max(1, Math.floor(Number(options.chunkRecords || 262144)));
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
   const tempDir = resolve(
     dirname(spool.path),
     `geo-cell-sort-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -122,12 +133,15 @@ export async function* sortedGeoCellRoutes(spool, options = {}) {
         const path = resolve(tempDir, `${String(chunks.length).padStart(6, "0")}.bin`);
         writeChunk(path, rows);
         chunks.push(path);
+        onProgress?.("geo-cell-sort", Math.min(spool.records, chunks.length * chunkRecords), spool.records);
         rows = [];
       }
     }
     if (!chunks.length) {
       rows.sort(compareTuple);
+      onProgress?.("geo-cell-sort", spool.records, spool.records);
       for (const row of rows) yield row;
+      onProgress?.("geo-cell-merge", rows.length, spool.records);
       return;
     }
     if (rows.length) {
@@ -138,6 +152,7 @@ export async function* sortedGeoCellRoutes(spool, options = {}) {
     }
     const iterators = chunks.map(path => readRunRecords(path, ROUTE_SCHEMA)[Symbol.asyncIterator]());
     const heap = new TupleHeap();
+    let merged = 0;
     for (let index = 0; index < iterators.length; index++) {
       const row = await next(iterators[index]);
       if (row) heap.push({ index, row });
@@ -145,9 +160,12 @@ export async function* sortedGeoCellRoutes(spool, options = {}) {
     while (heap.items.length) {
       const item = heap.pop();
       yield item.row;
+      merged++;
+      if (merged % chunkRecords === 0) onProgress?.("geo-cell-merge", merged, spool.records);
       const row = await next(iterators[item.index]);
       if (row) heap.push({ index: item.index, row });
     }
+    onProgress?.("geo-cell-merge", merged, spool.records);
   } finally {
     if (chunks.length) rmSync(tempDir, { recursive: true, force: true });
   }

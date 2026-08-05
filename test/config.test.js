@@ -32,6 +32,9 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.geoCapsules, false);
   assert.deepEqual(config.geoCapsuleFields, []);
   assert.equal(config.geoCapsuleDocPageCachePages, 256);
+  assert.equal(config.geoCapsuleDocPageIndexPreloadMaxBytes, 64 * 1024 * 1024);
+  assert.equal(config.geoCodeStorePreloadMaxBytes, 1536 * 1024 * 1024);
+  assert.equal(config.geoLeafWorkerBatchLeaves, 16);
   assert.deepEqual(config.geoCellIndexes, []);
   assert.equal(config.targetPostingsPerDoc, 12);
   assert.equal(config.maxTermsPerDoc, 12);

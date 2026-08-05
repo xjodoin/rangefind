@@ -24,6 +24,14 @@ export const DEFAULTS = {
   geoCapsules: false,
   geoCapsuleFields: [],
   geoCapsuleDocPageCachePages: 256,
+  // The page-entry table is tiny compared with capsule payloads and is read
+  // randomly in geo-tree order. Keep it resident to avoid one positional
+  // syscall for every page cache miss.
+  geoCapsuleDocPageIndexPreloadMaxBytes: 64 * 1024 * 1024,
+  // Hot geo columns get a second, field-selective preload budget when the
+  // complete build code store is just too large for its all-or-nothing path.
+  geoCodeStorePreloadMaxBytes: 1536 * 1024 * 1024,
+  geoLeafWorkerBatchLeaves: 16,
   // Optional multi-resolution facet routing over geo cells. Cell blocks carry
   // exact leaf/point ordinals; result payloads remain single-copy in geo leaves.
   geoCellIndexes: [],
@@ -204,6 +212,24 @@ function applyIndexProfile(config, raw) {
     DEFAULTS.geoCapsuleDocPageCachePages,
     1,
     4096
+  );
+  config.geoCapsuleDocPageIndexPreloadMaxBytes = clampInt(
+    config.geoCapsuleDocPageIndexPreloadMaxBytes,
+    DEFAULTS.geoCapsuleDocPageIndexPreloadMaxBytes,
+    0,
+    1024 * 1024 * 1024
+  );
+  config.geoCodeStorePreloadMaxBytes = clampInt(
+    config.geoCodeStorePreloadMaxBytes,
+    DEFAULTS.geoCodeStorePreloadMaxBytes,
+    0,
+    8 * 1024 * 1024 * 1024
+  );
+  config.geoLeafWorkerBatchLeaves = clampInt(
+    config.geoLeafWorkerBatchLeaves,
+    DEFAULTS.geoLeafWorkerBatchLeaves,
+    1,
+    1024
   );
   config.geoCapsuleFields = Array.isArray(config.geoCapsuleFields)
     ? [...new Set(config.geoCapsuleFields.map(String).map(field => field.trim()).filter(Boolean))]

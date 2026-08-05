@@ -4757,7 +4757,9 @@ function createRuntimeTrace() {
   };
 }
 function minShouldMatchFor(baseTerms) {
-  return baseTerms.length <= 4 ? baseTerms.length : baseTerms.length - 1;
+  const count = baseTerms.length;
+  if (count <= 4) return count;
+  return count - Math.floor(count / 4);
 }
 function traceBucketFromPath(path) {
   if (path.endsWith("/manifest.min.json")) return "manifest";

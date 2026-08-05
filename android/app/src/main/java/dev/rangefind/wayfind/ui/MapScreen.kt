@@ -58,6 +58,7 @@ import dev.rangefind.wayfind.ui.components.AttributionChip
 import dev.rangefind.wayfind.ui.components.DirectionsSheet
 import dev.rangefind.wayfind.ui.components.NavigationOverlay
 import dev.rangefind.wayfind.ui.components.PlaceSheet
+import dev.rangefind.wayfind.nav.MotionModel
 import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.ui.components.RegionsSheet
 import dev.rangefind.wayfind.ui.components.ResultsSheet
@@ -80,6 +81,7 @@ fun MapScreen(
     onDirections: () -> Unit,
     onSelectRoute: (Int) -> Unit,
     onSelectMode: (TravelMode) -> Unit,
+    poseAt: ((Long) -> MotionModel.Pose?)? = null,
     onStartNavigation: () -> Unit,
     onStopNavigation: () -> Unit,
     onExitDirections: () -> Unit,
@@ -144,6 +146,7 @@ fun MapScreen(
             onCenterChanged = onCenterChanged,
             onResultTapped = selectResult,
             onRouteTapped = onSelectRoute,
+            poseAt = poseAt,
             onLongPress = longPressMap,
             modifier = Modifier.fillMaxSize()
         )
