@@ -40,7 +40,12 @@ import dev.rangefind.wayfind.R
 import androidx.compose.material.icons.filled.DirectionsBike
 import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.DirectionsWalk
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.Switch
+import androidx.compose.ui.semantics.Role
 import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.region.RegionEntry
 import dev.rangefind.wayfind.region.RegionStatus
@@ -146,17 +151,28 @@ fun RegionsSheet(
                 )
             }
 
+            // Routing comes from exactly one place, and the network is one of
+            // the candidates rather than a switch over them. Drawn as a tick
+            // it read as a checkbox that would not clear: tapping the chosen
+            // option can do nothing, because something has to be chosen. A
+            // radio says that, and says it before the tap.
+            val onNetwork = regions.none { it.active }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onActivate(null) }
-                    .padding(horizontal = 20.dp, vertical = 12.dp)
+                    .selectable(
+                        selected = onNetwork,
+                        role = Role.RadioButton,
+                        onClick = { onActivate(null) }
+                    )
+                    .padding(horizontal = 20.dp, vertical = 14.dp)
             ) {
                 Icon(
-                    if (regions.none { it.active }) Icons.Filled.Check else Icons.Filled.CloudDownload,
+                    if (onNetwork) Icons.Filled.RadioButtonChecked
+                    else Icons.Filled.RadioButtonUnchecked,
                     contentDescription = null,
-                    tint = if (regions.none { it.active }) MaterialTheme.colorScheme.primary
+                    tint = if (onNetwork) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(20.dp)
                 )
@@ -164,8 +180,10 @@ fun RegionsSheet(
                 Text(
                     stringResource(R.string.region_use_network_index),
                     style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
                 )
+                if (onNetwork) InUseChip()
             }
 
             // Diagnostics. A trace is a precise record of where someone drove,
@@ -212,6 +230,21 @@ fun RegionsSheet(
 }
 
 @Composable
+private fun InUseChip() {
+    Surface(
+        shape = RoundedCornerShape(6.dp),
+        color = MaterialTheme.colorScheme.primaryContainer
+    ) {
+        Text(
+            stringResource(R.string.region_in_use),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+        )
+    }
+}
+
+@Composable
 private fun RegionRow(
     entry: RegionEntry,
     onPreload: () -> Unit,
@@ -219,7 +252,23 @@ private fun RegionRow(
     onActivate: () -> Unit
 ) {
     val context = LocalContext.current
-    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp)) {
+    val selectable = entry.status == RegionStatus.Ready
+    Column(
+        Modifier
+            .fillMaxWidth()
+            // A downloaded region is chosen by tapping it, the same gesture
+            // and the same target size as the network row above. The small
+            // tick button it replaces was the only way to leave the network,
+            // and nothing about the row said so.
+            .then(
+                if (selectable) Modifier.selectable(
+                    selected = entry.active,
+                    role = Role.RadioButton,
+                    onClick = onActivate
+                ) else Modifier
+            )
+            .padding(horizontal = 20.dp, vertical = 10.dp)
+    ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -242,17 +291,7 @@ private fun RegionRow(
                     }
                     if (entry.active) {
                         Spacer(Modifier.width(8.dp))
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = MaterialTheme.colorScheme.primaryContainer
-                        ) {
-                            Text(
-                                stringResource(R.string.region_in_use),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                            )
-                        }
+                        InUseChip()
                     }
                 }
                 Text(
@@ -267,14 +306,6 @@ private fun RegionRow(
 
             when (entry.status) {
                 RegionStatus.Ready -> {
-                    if (!entry.active) {
-                        RegionAction(
-                            Icons.Filled.Check,
-                            stringResource(R.string.region_action_use),
-                            onActivate
-                        )
-                        Spacer(Modifier.width(6.dp))
-                    }
                     RegionAction(
                         Icons.Filled.Refresh,
                         stringResource(R.string.region_action_refresh),
