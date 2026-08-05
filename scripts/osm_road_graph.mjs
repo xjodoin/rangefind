@@ -220,6 +220,75 @@ const VERY_SLOW_SMOOTHNESS = new Set(["bad", "very_bad", "horrible", "very_horri
 
 // Per-direction km/h for a way: profile class default, capped by maxspeed
 // tags (car only), degraded by surface and smoothness.
+// Lane guidance. OSM writes `turn:lanes` as one entry per lane, left to right,
+// separated by "|", and a lane that serves more than one movement joins them
+// with ";" — "left|through;right" is a two-lane approach. A lane's movements
+// pack into one byte, which keeps a whole approach inside a handful of bytes
+// even on the widest junction.
+const LANE_TURNS = new Map([
+  ["reverse", 1],
+  ["sharp_left", 2],
+  ["left", 4],
+  ["slight_left", 8],
+  ["merge_to_left", 8],
+  ["through", 16],
+  ["slight_right", 32],
+  ["merge_to_right", 32],
+  ["right", 64],
+  ["sharp_right", 128]
+]);
+
+/** A lane's movements as a bit set; 0 for "none" or anything unrecognised. */
+function laneMask(spec) {
+  let mask = 0;
+  for (const part of spec.split(";")) {
+    const turn = LANE_TURNS.get(part.trim());
+    if (turn) mask |= turn;
+  }
+  return mask;
+}
+
+function laneListFrom(spec, count) {
+  if (spec) {
+    const masks = spec.split("|").map(laneMask);
+    // A tagged lane count that disagrees with the turn list is a mapping
+    // error, not something to reconcile: the turn list is the specific claim.
+    if (masks.length) return masks;
+  }
+  // A lane count with no turn tags still tells a driver how many lanes the
+  // road has, which is worth drawing even when no movement is known.
+  if (count > 0 && count <= 12) return new Array(count).fill(0);
+  return [];
+}
+
+function parseLaneCount(value) {
+  const count = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+}
+
+/**
+ * Per-direction lane lists for a way.
+ *
+ * Unsuffixed `turn:lanes` describes a one-way's only direction, or — on a
+ * two-way road — the lanes in the way's own direction. The suffixed forms win
+ * where present, which is how a two-way street with different approaches at
+ * each end is tagged.
+ */
+export function wayLanes(tags, oneway) {
+  const shared = tags.get("turn:lanes");
+  const forwardSpec = tags.get("turn:lanes:forward") || shared || "";
+  const backwardSpec = tags.get("turn:lanes:backward") || (oneway ? "" : shared) || "";
+  const sharedCount = parseLaneCount(tags.get("lanes"));
+  const forwardCount = parseLaneCount(tags.get("lanes:forward")) ||
+    (oneway ? sharedCount : Math.floor(sharedCount / 2));
+  const backwardCount = parseLaneCount(tags.get("lanes:backward")) ||
+    (oneway ? 0 : Math.floor(sharedCount / 2));
+  return {
+    forward: laneListFrom(forwardSpec, forwardCount),
+    backward: laneListFrom(backwardSpec, backwardCount)
+  };
+}
+
 function waySpeeds(tags, profile) {
   const base = profile.speeds[tags.get("highway")];
   let forward = base;
@@ -443,6 +512,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
         postedFwd: speeds.postedForward,
         postedBwd: speeds.postedBackward,
         oneway: profile.oneway(tags),
+        lanes: wayLanes(tags, profile.oneway(tags)),
         nameId,
         classCode: classCodes.get(tags.get("highway")) ?? 0
       });
@@ -527,7 +597,11 @@ export function extractRoadGraph(pbfPath, options = {}) {
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
   const geomScratch = [];
-  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, postedKmh, points, reversed) => {
+  // Lane movements, jagged the same way the geometry is: most edges carry
+  // none, so an empty list costs the single byte that says so.
+  const laneOffsets = [0];
+  const laneBytes = new GrowUint8();
+  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, postedKmh, lanes, points, reversed) => {
     edgeFrom.push(from);
     edgeTo.push(to);
     edgeWeightDs.push(weightDs);
@@ -553,6 +627,13 @@ export function extractRoadGraph(pbfPath, options = {}) {
     geomBytes.ensure(geomScratch.length);
     for (const byte of geomScratch) geomBytes.data[geomBytes.length++] = byte;
     geomOffsets.push(geomBytes.length);
+    const laneList = lanes || [];
+    laneBytes.ensure(laneList.length + 1);
+    laneBytes.data[laneBytes.length++] = Math.min(laneList.length, 255);
+    for (let i = 0; i < laneList.length && i < 255; i++) {
+      laneBytes.data[laneBytes.length++] = laneList[i] & 0xff;
+    }
+    laneOffsets.push(laneBytes.length);
   };
 
   const segment = [];
@@ -618,14 +699,14 @@ export function extractRoadGraph(pbfPath, options = {}) {
       if (way.oneway >= 0) {
         const junction = pick(kindCode[used], lastIndex);
         const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedFwd * 1000) / 3600)) * 10) + penaltyDs[used] + segPenalty);
-        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, way.postedFwd, segment, false);
+        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, way.postedFwd, way.lanes.forward, segment, false);
       }
       if (way.oneway <= 0) {
         const junction = pick(fromKind, lastIndex);
         // Reversed polyline: mirror the point index.
         const mirrored = junction.kind ? { kind: junction.kind, index: lastIndex - junction.index } : junction;
         const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedBwd * 1000) / 3600)) * 10) + fromPenalty + segPenalty);
-        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, way.postedBwd, segment, true);
+        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, way.postedBwd, way.lanes.backward, segment, true);
       }
       fromNode = graphNode;
       fromPenalty = penaltyDs[used];
@@ -663,6 +744,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeSpeed,
     geomOffsets,
     geomBytes,
+    laneOffsets,
+    laneBytes,
     log
   };
   applyTurnRestrictions(context);
@@ -682,6 +765,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
       edgeSpeed: Uint8Array.from(expanded.edgeSpeed),
       geomOffsets: Uint32Array.from(expanded.geomOffsets),
       geomBytes: Uint8Array.from(expanded.geomBytes.view()),
+      laneOffsets: Uint32Array.from(expanded.laneOffsets),
+      laneBytes: Uint8Array.from(expanded.laneBytes.view()),
       names,
       profile: profile.name,
       classes: classTable
@@ -699,6 +784,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeClass: Uint8Array.from(edgeClass),
     edgeJunction: Uint8Array.from(edgeJunction),
     edgeSpeed: Uint8Array.from(edgeSpeed),
+    laneOffsets: Uint32Array.from(laneOffsets),
+    laneBytes: Uint8Array.from(laneBytes.view()),
     geomOffsets: Uint32Array.from(geomOffsets),
     geomBytes: Uint8Array.from(geomBytes.view()),
     names,
@@ -711,7 +798,7 @@ export function applyTurnRestrictions(context) {
   const {
     restrictions, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay,
-    geomOffsets, geomBytes, log
+    geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
   const edgeClass = context.edgeClass || null;
   const edgeJunction = context.edgeJunction || null;
@@ -734,6 +821,14 @@ export function applyTurnRestrictions(context) {
     geomBytes.data.set(geomBytes.data.subarray(start, end), geomBytes.length);
     geomBytes.length += end - start;
     geomOffsets.push(geomBytes.length);
+    if (laneOffsets && laneBytes) {
+      const laneStart = laneOffsets[source];
+      const laneEnd = laneOffsets[source + 1];
+      laneBytes.ensure(laneEnd - laneStart);
+      laneBytes.data.set(laneBytes.data.subarray(laneStart, laneEnd), laneBytes.length);
+      laneBytes.length += laneEnd - laneStart;
+      laneOffsets.push(laneBytes.length);
+    }
     return edgeFrom.length - 1;
   };
 
@@ -960,7 +1055,7 @@ export function expandTurnCosts(context, turnCosts) {
   const {
     restrictions, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass, edgeJunction,
-    edgeSpeed, geomOffsets, geomBytes, log
+    edgeSpeed, geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
   const edgeCount = edgeFrom.length;
   const nodeCount = nodeLat.length;
@@ -1081,6 +1176,9 @@ export function expandTurnCosts(context, turnCosts) {
   const newSpeed = [];
   const newGeomOffsets = [0];
   const newGeomBytes = new GrowUint8();
+  const newLaneOffsets = [0];
+  const newLaneBytes = new GrowUint8();
+  const laneData = laneBytes ? laneBytes.view() : null;
   let filteredTurns = 0;
   for (let out = 0; out < edgeCount; out++) {
     const junction = edgeFrom[out];
@@ -1104,6 +1202,17 @@ export function expandTurnCosts(context, turnCosts) {
       newGeomBytes.data.set(geomData.subarray(start, end), newGeomBytes.length);
       newGeomBytes.length += end - start;
       newGeomOffsets.push(newGeomBytes.length);
+      if (laneData && laneOffsets) {
+        const laneStart = laneOffsets[out];
+        const laneEnd = laneOffsets[out + 1];
+        newLaneBytes.ensure(laneEnd - laneStart);
+        newLaneBytes.data.set(laneData.subarray(laneStart, laneEnd), newLaneBytes.length);
+        newLaneBytes.length += laneEnd - laneStart;
+      } else {
+        newLaneBytes.ensure(1);
+        newLaneBytes.data[newLaneBytes.length++] = 0;
+      }
+      newLaneOffsets.push(newLaneBytes.length);
     }
   }
   log(`turn costs: ${edgeCount} junction copies, ${newFrom.length} expanded edges, ${filteredTurns} restricted turns filtered, ${byVia.size} restricted approaches`);
@@ -1119,7 +1228,9 @@ export function expandTurnCosts(context, turnCosts) {
     edgeJunction: newJunction,
     edgeSpeed: newSpeed,
     geomOffsets: newGeomOffsets,
-    geomBytes: newGeomBytes
+    geomBytes: newGeomBytes,
+    laneOffsets: newLaneOffsets,
+    laneBytes: newLaneBytes
   };
 }
 
@@ -1229,6 +1340,8 @@ function filterLargestScc(graph, log) {
   const edgeSpeed = [];
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
+  const laneOffsets = [0];
+  const laneBytes = new GrowUint8();
   for (let i = 0; i < graph.edgeFrom.length; i++) {
     const from = remap[graph.edgeFrom[i]];
     const to = remap[graph.edgeTo[i]];
@@ -1247,6 +1360,17 @@ function filterLargestScc(graph, log) {
     geomBytes.data.set(graph.geomBytes.subarray(start, end), geomBytes.length);
     geomBytes.length += end - start;
     geomOffsets.push(geomBytes.length);
+    if (graph.laneOffsets && graph.laneBytes) {
+      const laneStart = graph.laneOffsets[i];
+      const laneEnd = graph.laneOffsets[i + 1];
+      laneBytes.ensure(laneEnd - laneStart);
+      laneBytes.data.set(graph.laneBytes.subarray(laneStart, laneEnd), laneBytes.length);
+      laneBytes.length += laneEnd - laneStart;
+    } else {
+      laneBytes.ensure(1);
+      laneBytes.data[laneBytes.length++] = 0;
+    }
+    laneOffsets.push(laneBytes.length);
   }
   return {
     nodeLat,
@@ -1259,6 +1383,8 @@ function filterLargestScc(graph, log) {
     edgeClass: Uint8Array.from(edgeClass),
     edgeJunction: Uint8Array.from(edgeJunction),
     edgeSpeed: Uint8Array.from(edgeSpeed),
+    laneOffsets: Uint32Array.from(laneOffsets),
+    laneBytes: Uint8Array.from(laneBytes.view()),
     geomOffsets: Uint32Array.from(geomOffsets),
     geomBytes: Uint8Array.from(geomBytes.view()),
     names: graph.names,
@@ -1280,12 +1406,14 @@ export function writeRoadGraph(path, graph) {
     ["edgeClass", graph.edgeClass],
     ["edgeJunction", graph.edgeJunction],
     ["edgeSpeed", graph.edgeSpeed],
+    ["laneOffsets", graph.laneOffsets],
+    ["laneBytes", graph.laneBytes],
     ["geomOffsets", graph.geomOffsets],
     ["geomBytes", graph.geomBytes],
     ["namesBytes", namesBytes]
   ];
   const header = {
-    format: "rfroutesrc-v4",
+    format: "rfroutesrc-v5",
     nodes: graph.nodeLat.length,
     edges: graph.edgeFrom.length,
     profile: graph.profile || "car",
@@ -1311,7 +1439,7 @@ export async function readRoadGraph(path) {
   const bytes = readFileSync(path);
   const newline = bytes.indexOf(0x0a);
   const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
-  if (header.format !== "rfroutesrc-v4") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
+  if (header.format !== "rfroutesrc-v5") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
   const graph = { profile: header.profile || "car", classes: header.classes || [] };
   let offset = newline + 1;
   for (const section of header.sections) {

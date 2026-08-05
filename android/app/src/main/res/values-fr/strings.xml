@@ -57,6 +57,7 @@
     <string name="nav_rerouting_label">Recalcul</string>
     <string name="nav_continue">Continuer</string>
     <string name="nav_speed_unit">km/h</string>
+    <string name="nav_lane_guidance">Voies conseillées</string>
     <!-- North American speed-limit plate; the same word in French. -->
     <string name="nav_speed_limit_label">MAXIMUM</string>
     <string name="nav_trip_summary">%1$s · %2$s</string>

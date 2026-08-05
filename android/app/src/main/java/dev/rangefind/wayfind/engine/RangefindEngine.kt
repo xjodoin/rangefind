@@ -139,8 +139,26 @@ data class RouteStep(
     val seconds: Double,
     val at: Int,
     /** Posted limit in km/h, 0 when the way carries no maxspeed tag. */
-    val speedLimitKmh: Int
+    val speedLimitKmh: Int,
+    /**
+     * Movements allowed from each lane of the approach to this step, left to
+     * right, as a bit set per lane. Empty when the road carried no lane tags;
+     * a zero entry is a lane whose movements are unknown.
+     */
+    val lanes: List<Int> = emptyList()
 )
+
+/** Lane movement bits, matching the route index's own encoding. */
+object LaneTurn {
+    const val REVERSE = 1
+    const val SHARP_LEFT = 2
+    const val LEFT = 4
+    const val SLIGHT_LEFT = 8
+    const val THROUGH = 16
+    const val SLIGHT_RIGHT = 32
+    const val RIGHT = 64
+    const val SHARP_RIGHT = 128
+}
 
 /** 1 signals, 2 stop, 3 give way, 4 level crossing, 5 crossing. */
 data class RouteJunction(

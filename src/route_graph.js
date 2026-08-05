@@ -25,7 +25,12 @@ export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
 const ROOT_VERSION = 3;
-const CELL_VERSION = 5;
+const CELL_VERSION = 6;
+// v5 cells carry no lane column. A published index is a large download that
+// somebody already has on a phone, so a reader that can only read the newest
+// cell would strand it; lane guidance simply stays empty until the index is
+// rebuilt.
+const MIN_READABLE_CELL_VERSION = 5;
 const OVERLAY_VERSION = 1;
 const GEOMETRY_VERSION = 1;
 
@@ -137,6 +142,12 @@ export function encodeRouteCell(cell) {
       // apart from the weight, which also folds in surface and junction
       // penalties and so cannot be read back as a legal limit.
       pushVarint(out, cell.speeds ? cell.speeds[e] : 0);
+      // Lane movements for this edge, left to right. Jagged because most
+      // edges have none: an untagged edge costs the single zero that says so.
+      const lanes = cell.lanes ? cell.lanes[e] : null;
+      const laneCount = lanes ? Math.min(lanes.length, 255) : 0;
+      pushVarint(out, laneCount);
+      for (let i = 0; i < laneCount; i++) pushVarint(out, lanes[i] & 0xff);
       const external = cell.targets[e] < cell.firstNode || cell.targets[e] >= cell.firstNode + cell.nodeCount;
       if (external) {
         // Cross-cell edges carry their far endpoint so snapping and
@@ -154,7 +165,10 @@ export function decodeRouteCell(bytes) {
   assertMagic(bytes, ROUTE_CELL_MAGIC, "Invalid Rangefind route cell block.");
   const state = { pos: ROUTE_CELL_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== CELL_VERSION) throw new Error(`Unsupported route cell version ${version}.`);
+  if (version > CELL_VERSION || version < MIN_READABLE_CELL_VERSION) {
+    throw new Error(`Unsupported route cell version ${version}.`);
+  }
+  const hasLanes = version >= 6;
   const cellId = readVarint(bytes, state);
   const firstNode = readVarint(bytes, state);
   const nodeCount = readVarint(bytes, state);
@@ -178,6 +192,8 @@ export function decodeRouteCell(bytes) {
   const classes = new Uint8Array(edgeCount);
   const junctions = new Uint8Array(edgeCount);
   const speeds = new Uint8Array(edgeCount);
+  const laneOffsets = new Uint32Array(edgeCount + 1);
+  const laneMasks = [];
   const extLat = new Int32Array(edgeCount);
   const extLon = new Int32Array(edgeCount);
   const geomRefs = new Uint32Array(edgeCount);
@@ -194,6 +210,11 @@ export function decodeRouteCell(bytes) {
       classes[cursor] = readVarint(bytes, state);
       junctions[cursor] = readVarint(bytes, state);
       speeds[cursor] = readVarint(bytes, state);
+      if (hasLanes) {
+        const laneCount = readVarint(bytes, state);
+        for (let i = 0; i < laneCount; i++) laneMasks.push(readVarint(bytes, state));
+      }
+      laneOffsets[cursor + 1] = laneMasks.length;
       const external = targets[cursor] < firstNode || targets[cursor] >= firstNode + nodeCount;
       if (external) {
         extLat[cursor] = latE7[node] + readZigzag(bytes, state);
@@ -204,7 +225,12 @@ export function decodeRouteCell(bytes) {
     }
   }
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
-  return { cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm, nameIds, classes, junctions, speeds, extLat, extLon, geomRefs };
+  return {
+    cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm,
+    nameIds, classes, junctions, speeds,
+    laneOffsets, laneMasks: Uint8Array.from(laneMasks),
+    extLat, extLon, geomRefs
+  };
 }
 
 // --- Geometry object ----------------------------------------------------

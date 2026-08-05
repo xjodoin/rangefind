@@ -909,3 +909,75 @@ test("step.at marks the junction a turn happens at, not a point down the street"
   // count was zero for every route in the sample.
   assert.ok(turnsSeen > 0, `expected real turns at step boundaries, saw ${turnsSeen}`);
 });
+
+test("lane movements survive the cell codec, jagged and mostly absent", async () => {
+  const { encodeRouteCell: encode, decodeRouteCell: decode } = await import("../src/route_graph.js");
+  const cell = {
+    cellId: 3,
+    firstNode: 0,
+    nodeCount: 2,
+    latE7: Int32Array.from([455000000, 455000500]),
+    lonE7: Int32Array.from([-736000000, -735999000]),
+    rowStart: Uint32Array.from([0, 2, 3]),
+    targets: Uint32Array.from([1, 2, 0]),
+    weights: Uint32Array.from([10, 20, 30]),
+    distsDm: Uint32Array.from([100, 200, 300]),
+    nameIds: Uint32Array.from([0, 1, 2]),
+    classes: Uint8Array.from([0, 0, 0]),
+    speeds: Uint8Array.from([50, 0, 90]),
+    // A two-lane approach, an untagged edge, and a three-lane one. Most roads
+    // are the middle case, which is why the column is jagged.
+    lanes: [[4 | 16, 64], null, [4, 16, 16 | 64]],
+    extLat: Int32Array.from([0, 0, 0]),
+    extLon: Int32Array.from([0, 0, 0]),
+    geomRefs: Uint32Array.from([0, 1, 2])
+  };
+  const decoded = decode(encode(cell));
+  const lanesOf = edge =>
+    Array.from(decoded.laneMasks.subarray(decoded.laneOffsets[edge], decoded.laneOffsets[edge + 1]));
+  assert.deepEqual(lanesOf(0), [20, 64], "left+through then right");
+  assert.deepEqual(lanesOf(1), [], "an untagged edge carries no lanes");
+  assert.deepEqual(lanesOf(2), [4, 16, 80]);
+  // Posted speeds share the same rows and must not be disturbed by the
+  // variable-length column sitting beside them.
+  assert.deepEqual([...decoded.speeds], [50, 0, 90]);
+});
+
+test("turn:lanes tags parse into per-direction movement bits", async () => {
+  const { wayLanes } = await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+  const LEFT = 4, THROUGH = 16, RIGHT = 64, SLIGHT_RIGHT = 32, REVERSE = 1;
+
+  // The shape OSM actually uses: one entry per lane, ";" for a lane that
+  // serves more than one movement.
+  assert.deepEqual(
+    wayLanes(tags([["turn:lanes", "left|through;right"]]), true).forward,
+    [LEFT, THROUGH | RIGHT]
+  );
+  // An empty entry is a lane with no movement tagged, not a missing lane.
+  assert.deepEqual(
+    wayLanes(tags([["turn:lanes", "left||right"]]), true).forward,
+    [LEFT, 0, RIGHT]
+  );
+  // Suffixed tags win, and each direction gets its own approach.
+  const twoWay = wayLanes(tags([
+    ["turn:lanes:forward", "through|right"],
+    ["turn:lanes:backward", "reverse;left"]
+  ]), false);
+  assert.deepEqual(twoWay.forward, [THROUGH, RIGHT]);
+  assert.deepEqual(twoWay.backward, [REVERSE | LEFT]);
+  // A one-way's unsuffixed tag describes its only direction; nothing flows
+  // backwards along it.
+  const oneWay = wayLanes(tags([["turn:lanes", "through|right"]]), true);
+  assert.deepEqual(oneWay.backward, []);
+  // Merges read as the gentle turns they are.
+  assert.deepEqual(
+    wayLanes(tags([["turn:lanes", "merge_to_right"]]), true).forward,
+    [SLIGHT_RIGHT]
+  );
+  // A lane count with no movements still says how many lanes there are.
+  assert.deepEqual(wayLanes(tags([["lanes", "3"]]), true).forward, [0, 0, 0]);
+  // Nonsense is dropped rather than guessed at.
+  assert.deepEqual(wayLanes(tags([["turn:lanes", "sideways|"]]), true).forward, [0, 0]);
+  assert.deepEqual(wayLanes(tags([]), true).forward, []);
+});

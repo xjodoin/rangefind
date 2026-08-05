@@ -3,6 +3,7 @@ package dev.rangefind.wayfind.nav
 import android.content.Context
 import androidx.annotation.StringRes
 import dev.rangefind.wayfind.R
+import dev.rangefind.wayfind.engine.LaneTurn
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Route
 import kotlin.math.abs
@@ -32,6 +33,10 @@ data class NavUpdate(
     val speedMps: Double,
     val speedLimitKmh: Int,
     val turnDelta: Double,
+    /** Lanes of the approach to the next maneuver, left to right. */
+    val lanes: List<Int>,
+    /** Which of those lanes lead where the route goes. */
+    val laneUsable: List<Boolean>,
     val offRoute: Boolean,
     val arrived: Boolean,
     val alternatives: List<NavAlternative>,
@@ -196,6 +201,11 @@ class NavigationCore(private val context: Context) {
 
         val offRoute = offRouteStrikes >= OFF_ROUTE_STRIKES
         val turnDelta = turnDeltaAt(route, next?.at)
+        // Lane guidance only means anything close to the junction it belongs
+        // to; further back it is a row of arrows about nothing yet, and it
+        // would sit on screen for kilometres of open road.
+        val lanes = if (toManeuver <= LANE_GUIDANCE_METERS) next?.lanes.orEmpty() else emptyList()
+        val laneUsable = usableLanes(lanes, turnDelta)
         val voice = when {
             arrived && !announcedArrival -> {
                 announcedArrival = true
@@ -228,6 +238,8 @@ class NavigationCore(private val context: Context) {
             speedMps = speedMps,
             speedLimitKmh = route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0,
             turnDelta = turnDelta,
+            lanes = lanes,
+            laneUsable = laneUsable,
             offRoute = offRoute,
             arrived = arrived,
             alternatives = liveAlternatives(point, remainingSeconds, match.crossTrackMeters),
@@ -321,6 +333,29 @@ class NavigationCore(private val context: Context) {
         }
     }
 
+    /**
+     * Which lanes of an approach lead where the route goes.
+     *
+     * A lane is usable when it allows the movement the route is about to
+     * make. Lanes tagged with no movement at all say only how many lanes
+     * there are, and marking some of those as wrong would be inventing
+     * guidance the map never carried — so when nothing matches, every lane
+     * is left unmarked rather than shown as forbidden.
+     */
+    private fun usableLanes(lanes: List<Int>, turnDelta: Double): List<Boolean> {
+        if (lanes.isEmpty()) return emptyList()
+        val wanted = when {
+            abs(turnDelta) > U_TURN_DEGREES -> LaneTurn.REVERSE
+            turnDelta <= -TURN_DEGREES -> LaneTurn.LEFT or LaneTurn.SHARP_LEFT
+            turnDelta <= -BEAR_DEGREES -> LaneTurn.SLIGHT_LEFT or LaneTurn.LEFT
+            turnDelta >= TURN_DEGREES -> LaneTurn.RIGHT or LaneTurn.SHARP_RIGHT
+            turnDelta >= BEAR_DEGREES -> LaneTurn.SLIGHT_RIGHT or LaneTurn.RIGHT
+            else -> LaneTurn.THROUGH
+        }
+        val matches = lanes.map { it and wanted != 0 }
+        return if (matches.any { it }) matches else lanes.map { false }
+    }
+
     /** Signed turn angle at a step boundary, for the maneuver glyph. */
     private fun turnDeltaAt(route: Route, at: Int?): Double {
         val index = at ?: return 0.0
@@ -372,5 +407,7 @@ class NavigationCore(private val context: Context) {
         private const val BEAR_DEGREES = 22.0
         private const val TURN_DEGREES = 60.0
         private const val U_TURN_DEGREES = 150.0
+        /** How close the maneuver must be before lane guidance is shown. */
+        private const val LANE_GUIDANCE_METERS = 700.0
     }
 }

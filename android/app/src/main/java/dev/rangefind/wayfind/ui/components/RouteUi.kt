@@ -55,6 +55,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.rangefind.wayfind.R
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import dev.rangefind.wayfind.engine.LaneTurn
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.nav.postsRectangularSpeedLimits
 import dev.rangefind.wayfind.engine.Route
@@ -364,6 +368,30 @@ fun NavigationOverlay(
             }
         }
 
+        // Lane guidance. Sits directly under the maneuver banner because that
+        // is already where the eye goes for the next instruction, and the two
+        // answer the same question one after the other: what happens next,
+        // and which lane it happens from.
+        val laneGuidanceLabel = stringResource(R.string.nav_lane_guidance)
+        nav?.takeIf { it.lanes.isNotEmpty() }?.let { current ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = topInset + 108.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
+                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                    .semantics { contentDescription = laneGuidanceLabel }
+            ) {
+                current.lanes.forEachIndexed { index, mask ->
+                    val usable = current.laneUsable.getOrElse(index) { false }
+                    LaneChip(mask = mask, usable = usable, fallback = current.turnDelta)
+                }
+            }
+        }
+
         // Current road + speed.
         nav?.let {
             Row(
@@ -585,6 +613,62 @@ private const val SPEEDING_TOLERANCE_KMH = 5
  * the app palette: a speed limit is a road sign, and drivers read it by shape
  * and color before they read the number.
  */
+/**
+ * One lane of the approach, drawn with the movements it allows.
+ *
+ * A lane the route can use is drawn solid; the rest are dimmed rather than
+ * hidden, because "there are four lanes and yours is the second" is the part
+ * a driver actually needs. A lane the map describes only by existing —
+ * no movement tagged — borrows the maneuver's own arrow, which is the
+ * honest best guess and is what the banner above already says.
+ */
+@Composable
+private fun LaneChip(mask: Int, usable: Boolean, fallback: Double) {
+    val tint = if (usable) MaterialTheme.colorScheme.onSurface
+    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .width(34.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                if (usable) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                else Color.Transparent
+            )
+            .padding(vertical = 5.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(1.dp)) {
+            // Two glyphs is all that fits at a glance; a lane allowing more
+            // movements than that is vanishingly rare and reads as clutter.
+            for (icon in laneIcons(mask, fallback).take(2)) {
+                Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(19.dp))
+            }
+        }
+    }
+}
+
+/** Arrows for a lane's movement bits, most-left movement first. */
+private fun laneIcons(mask: Int, fallback: Double): List<ImageVector> {
+    if (mask == 0) return listOf(maneuverIconForDelta(fallback))
+    val icons = mutableListOf<ImageVector>()
+    if (mask and LaneTurn.REVERSE != 0) icons += Icons.Filled.UTurnLeft
+    if (mask and (LaneTurn.SHARP_LEFT or LaneTurn.LEFT) != 0) icons += Icons.Filled.TurnLeft
+    if (mask and LaneTurn.SLIGHT_LEFT != 0) icons += Icons.Filled.TurnSlightLeft
+    if (mask and LaneTurn.THROUGH != 0) icons += Icons.Filled.Straight
+    if (mask and LaneTurn.SLIGHT_RIGHT != 0) icons += Icons.Filled.TurnSlightRight
+    if (mask and (LaneTurn.SHARP_RIGHT or LaneTurn.RIGHT) != 0) icons += Icons.Filled.TurnRight
+    return icons.ifEmpty { listOf(Icons.Filled.Straight) }
+}
+
+private fun maneuverIconForDelta(delta: Double): ImageVector = when {
+    abs(delta) > 150 -> Icons.Filled.UTurnLeft
+    delta <= -60 -> Icons.Filled.TurnLeft
+    delta <= -22 -> Icons.Filled.TurnSlightLeft
+    delta >= 60 -> Icons.Filled.TurnRight
+    delta >= 22 -> Icons.Filled.TurnSlightRight
+    else -> Icons.Filled.Straight
+}
+
 @Composable
 private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
     // The sign a driver actually sees out of the windscreen: a white plate in

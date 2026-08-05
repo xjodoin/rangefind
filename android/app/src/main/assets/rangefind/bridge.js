@@ -121,7 +121,10 @@ function trimRoute(route) {
       seconds: step.seconds,
       at: step.at ?? 0,
       // Posted limit in km/h; 0 when the way carries no maxspeed tag.
-      speedLimitKmh: step.speedLimitKmh ?? 0
+      speedLimitKmh: step.speedLimitKmh ?? 0,
+      // Movements allowed from each lane of the approach to this step's
+      // junction, left to right. Empty when the way carried no lane tags.
+      lanes: Array.isArray(step.lanes) ? step.lanes : []
     })),
     junctions: (route.junctions || []).map(j => ({
       kind: j.kind,

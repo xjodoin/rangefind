@@ -425,6 +425,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     const cellClasses = new Uint8Array(cellEdgeCount);
     const cellJunctions = new Uint8Array(cellEdgeCount);
     const cellSpeeds = new Uint8Array(cellEdgeCount);
+    // Lane movements per edge, in the edge's own travel direction. Jagged,
+    // and empty for the overwhelming majority of edges.
+    const cellLanes = new Array(cellEdgeCount);
     const extLat = new Int32Array(cellEdgeCount);
     const extLon = new Int32Array(cellEdgeCount);
     const geomRefs = new Uint32Array(cellEdgeCount);
@@ -444,6 +447,15 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         cellClasses[cursor] = edgeClassOf(edgeId);
         cellJunctions[cursor] = graph.edgeJunction ? graph.edgeJunction[edgeId] : 0;
         cellSpeeds[cursor] = graph.edgeSpeed ? graph.edgeSpeed[edgeId] : 0;
+        if (graph.laneOffsets && graph.laneBytes) {
+          const laneStart = graph.laneOffsets[edgeId];
+          const laneCount = graph.laneBytes[laneStart] || 0;
+          cellLanes[cursor] = laneCount
+            ? Array.from(graph.laneBytes.subarray(laneStart + 1, laneStart + 1 + laneCount))
+            : null;
+        } else {
+          cellLanes[cursor] = null;
+        }
         if (target < start || target >= end) {
           extLat[cursor] = latE7[target];
           extLon[cursor] = lonE7[target];
@@ -499,6 +511,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       nameIds,
       classes: cellClasses,
       speeds: cellSpeeds,
+      lanes: cellLanes,
       junctions: cellJunctions,
       extLat,
       extLon,

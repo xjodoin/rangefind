@@ -136,6 +136,18 @@ export async function openRouteGraphUrl(baseUrl, options = {}) {
   return engine;
 }
 
+/**
+ * A cell edge's lane movements, left to right, or an empty list when the way
+ * carried no lane tags. Each entry is a bit set of the turns that lane allows.
+ */
+function laneListOf(cell, edge) {
+  if (!cell || edge < 0 || !cell.laneOffsets || !cell.laneMasks) return [];
+  const start = cell.laneOffsets[edge];
+  const end = cell.laneOffsets[edge + 1];
+  if (!(end > start)) return [];
+  return Array.from(cell.laneMasks.subarray(start, end));
+}
+
 export async function openRouteGraph(options) {
   const io = options.io;
   if (!io?.readFile || !io?.readRange) throw new Error("openRouteGraph requires an io adapter with readFile and readRange.");
@@ -1157,6 +1169,10 @@ export async function openRouteGraph(options) {
       geometry.push([latE7 / 1e7, lonE7 / 1e7]);
     };
     if (chain.startMatch) pushPoint(chain.startMatch.snappedLatE7, chain.startMatch.snappedLonE7);
+    // The edge that ran into the junction currently being crossed; a step's
+    // lane guidance describes the approach, not the road being joined.
+    let previousCell = null;
+    let previousEdge = -1;
     for (const raw of rawEdges) {
       const cell = raw.cell;
       const edge = raw.edge;
@@ -1167,6 +1183,10 @@ export async function openRouteGraph(options) {
       // the maneuver. Reading the index after the push pointed part-way down
       // the new street instead, where the road is straight by definition.
       const edgeStartIndex = Math.max(0, geometry.length - 1);
+      const approachCell = previousCell;
+      const approachEdge = previousEdge;
+      previousCell = cell;
+      previousEdge = edge;
       for (let i = 0; i < points.length; i += 2) pushPoint(points[i], points[i + 1]);
       if (cell.junctions[edge]) {
         // Packed as kind + polylinePointIndex * 8 (signals often sit on
@@ -1208,11 +1228,17 @@ export async function openRouteGraph(options) {
         // `at` indexes the route geometry point where this step begins, so
         // clients can slice per-street geometry (e.g. road-name labels) and
         // read the turn angle onto it.
+        //
+        // Lane guidance belongs to the road being left, not the one being
+        // joined: "get in the left two lanes" is an instruction about the
+        // approach. So a step carries the lanes of the edge that ran into its
+        // junction, which is the last edge of the step before it.
         steps.push({
           name,
           meters,
           seconds,
           at: edgeStartIndex,
+          lanes: laneListOf(approachCell, approachEdge),
           limitMeters: new Map(speedLimitKmh ? [[speedLimitKmh, meters]] : [])
         });
       }
