@@ -1034,3 +1034,40 @@ test("the cycling profile prefers cycle infrastructure over arterials", async ()
   // Preference is not licence to invent a speed nobody rides at.
   assert.ok(bike.adjustSpeed(tags([["cycleway", "track"]]), 18) <= 20);
 });
+
+test("roads a rider or walker may not use are absent, not merely avoided", async () => {
+  const { PROFILES } = await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+  const { bike, foot, car } = PROFILES;
+
+  // Motorways and trunk roads are excluded by never being emitted, which is
+  // stronger than pricing them badly: no weighting mistake can put a cyclist
+  // on one, because the edge does not exist in that graph.
+  for (const highway of ["motorway", "motorway_link", "trunk", "trunk_link"]) {
+    const way = tags([["highway", highway]]);
+    assert.equal(bike.allowed(way), false, `${highway} must not exist for cycling`);
+    assert.equal(foot.allowed(way), false, `${highway} must not exist for walking`);
+    assert.equal(car.allowed(way), true, `${highway} is exactly where a car belongs`);
+    assert.ok(!(highway in bike.speeds), `${highway} must not be in the cycling speed table`);
+    assert.ok(!(highway in foot.speeds), `${highway} must not be in the walking speed table`);
+  }
+
+  // The dangerous case is the one the highway class does not reveal:
+  // motorroad=yes carries motorway rules onto an ordinary road.
+  const expressway = tags([["highway", "primary"], ["motorroad", "yes"]]);
+  assert.equal(bike.allowed(expressway), false);
+  assert.equal(foot.allowed(expressway), false);
+  assert.equal(car.allowed(expressway), true);
+  // Without it, the same road is an ordinary primary and perfectly usable.
+  const ordinary = tags([["highway", "primary"]]);
+  assert.equal(bike.allowed(ordinary), true);
+  assert.equal(foot.allowed(ordinary), true);
+
+  // An explicit permission outranks the ban: a bridge carrying a cycle track
+  // over an expressway says so on itself.
+  assert.equal(bike.allowed(tags([["highway", "primary"], ["motorroad", "yes"], ["bicycle", "yes"]])), true);
+  assert.equal(foot.allowed(tags([["highway", "primary"], ["motorroad", "yes"], ["foot", "yes"]])), true);
+  // And an explicit ban is still a ban.
+  assert.equal(bike.allowed(tags([["highway", "residential"], ["bicycle", "no"]])), false);
+  assert.equal(foot.allowed(tags([["highway", "residential"], ["foot", "no"]])), false);
+});

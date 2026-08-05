@@ -105,6 +105,18 @@ const FOOT_SPEEDS = {
 
 const ACCESS_DENIED = new Set(["no", "private", "delivery", "agricultural", "forestry", "military", "customers"]);
 
+/**
+ * An expressway that is not tagged as one.
+ *
+ * `motorroad=yes` carries motorway rules onto an ordinary highway class — no
+ * pedestrians, no bicycles — and nothing in `highway=primary` reveals it.
+ * Excluding motorway and trunk by class alone therefore misses exactly the
+ * roads a rider would be most alarmed to be sent down.
+ */
+function motorroad(tags) {
+  return tags.get("motorroad") === "yes";
+}
+
 // Fixed junction penalties in deciseconds, applied to every edge entering a
 // tagged node. Signals dominate systematic urban ETA error.
 const CAR_NODE_PENALTIES = { traffic_signals: 100, stop: 20, give_way: 10, level_crossing: 60, crossing_signals: 50 };
@@ -177,7 +189,10 @@ export const PROFILES = {
       if (!highway || !(highway in BIKE_SPEEDS)) return false;
       if (tags.get("area") === "yes") return false;
       const bicycle = tags.get("bicycle");
+      // An explicit permission outranks everything below: a bridge that
+      // carries a cycle track across an expressway says so on itself.
       if (bicycle != null) return !ACCESS_DENIED.has(bicycle) && bicycle !== "use_sidepath";
+      if (motorroad(tags)) return false;
       if (highway === "footway" || highway === "pedestrian") return false;
       const access = tags.get("access");
       if (access != null && ACCESS_DENIED.has(access)) return false;
@@ -207,6 +222,7 @@ export const PROFILES = {
       if (tags.get("area") === "yes") return false;
       const foot = tags.get("foot");
       if (foot != null) return !ACCESS_DENIED.has(foot);
+      if (motorroad(tags)) return false;
       if (highway === "cycleway") return true;
       const access = tags.get("access");
       if (access != null && ACCESS_DENIED.has(access)) return false;
