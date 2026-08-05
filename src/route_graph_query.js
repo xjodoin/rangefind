@@ -1161,6 +1161,12 @@ export async function openRouteGraph(options) {
       const cell = raw.cell;
       const edge = raw.edge;
       const points = edgePolyline(cell.geomRefs[edge], geometryByLeaf.get(raw.leaf));
+      // Where this edge joins the previous one, captured before its own
+      // points land: that junction is where a turn onto a new street
+      // actually happens, and it is the only point whose bearings describe
+      // the maneuver. Reading the index after the push pointed part-way down
+      // the new street instead, where the road is straight by definition.
+      const edgeStartIndex = Math.max(0, geometry.length - 1);
       for (let i = 0; i < points.length; i += 2) pushPoint(points[i], points[i + 1]);
       if (cell.junctions[edge]) {
         // Packed as kind + polylinePointIndex * 8 (signals often sit on
@@ -1200,12 +1206,13 @@ export async function openRouteGraph(options) {
         if (speedLimitKmh) last.limitMeters.set(speedLimitKmh, (last.limitMeters.get(speedLimitKmh) || 0) + meters);
       } else {
         // `at` indexes the route geometry point where this step begins, so
-        // clients can slice per-street geometry (e.g. road-name labels).
+        // clients can slice per-street geometry (e.g. road-name labels) and
+        // read the turn angle onto it.
         steps.push({
           name,
           meters,
           seconds,
-          at: Math.max(0, geometry.length - 1),
+          at: edgeStartIndex,
           limitMeters: new Map(speedLimitKmh ? [[speedLimitKmh, meters]] : [])
         });
       }

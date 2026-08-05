@@ -846,3 +846,66 @@ test("a reported heading prices turning around at the origin", async (t) => {
   const free = await engine.route({ from, to, geometry: false, fromHeading: 270, headingPenaltySeconds: 0 });
   assert.equal(free.seconds, plain.seconds, "a zero penalty restores the unbiased route");
 });
+
+test("step.at marks the junction a turn happens at, not a point down the street", async (t) => {
+  // A step's `at` is the geometry index where that street begins. Reading it
+  // after the first edge's points were appended put it part-way along the new
+  // street, where the road is straight by construction — so every maneuver
+  // arrow pointed straight ahead and spoken guidance said "continue" into
+  // ninety-degree turns. On a grid city the corners are unmistakable.
+  const graph = syntheticGraph(20, 18);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-step-at-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 48, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  const toRad = value => (value * Math.PI) / 180;
+  const bearing = (a, b) => {
+    const y = Math.sin(toRad(b[1] - a[1])) * Math.cos(toRad(b[0]));
+    const x = Math.cos(toRad(a[0])) * Math.sin(toRad(b[0])) -
+      Math.sin(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.cos(toRad(b[1] - a[1]));
+    return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+  };
+  const signedDelta = (from, to) => {
+    let delta = to - from;
+    while (delta > 180) delta -= 360;
+    while (delta < -180) delta += 360;
+    return delta;
+  };
+
+  const random = lcg(11);
+  let turnsSeen = 0;
+  let stepsSeen = 0;
+  for (let i = 0; i < 25; i++) {
+    const fromNode = Math.floor(random() * graph.nodeLat.length);
+    const toNode = Math.floor(random() * graph.nodeLat.length);
+    const from = { lat: graph.nodeLat[fromNode] / 1e7, lon: graph.nodeLon[fromNode] / 1e7 };
+    const to = { lat: graph.nodeLat[toNode] / 1e7, lon: graph.nodeLon[toNode] / 1e7 };
+    const route = await engine.route({ from, to });
+    if (!route.steps?.length || route.geometry.length < 3) continue;
+
+    // The first street is not turned onto; it is simply where the trip starts.
+    assert.equal(route.steps[0].at, 0, "the first step begins at the first point");
+
+    for (let s = 0; s < route.steps.length; s++) {
+      const at = route.steps[s].at;
+      assert.ok(Number.isInteger(at) && at >= 0, `step ${s} has an index`);
+      assert.ok(at < route.geometry.length, `step ${s} indexes inside the geometry`);
+      // Steps march forward through the polyline; a step that begins before
+      // its predecessor would make any slice of per-street geometry wrong.
+      if (s > 0) assert.ok(at >= route.steps[s - 1].at, `step ${s} does not go backwards`);
+      stepsSeen++;
+      if (at <= 0 || at >= route.geometry.length - 1) continue;
+      const delta = Math.abs(signedDelta(
+        bearing(route.geometry[at - 1], route.geometry[at]),
+        bearing(route.geometry[at], route.geometry[at + 1])
+      ));
+      if (delta > 45) turnsSeen++;
+    }
+  }
+
+  assert.ok(stepsSeen > 0, "expected the sample to produce steps");
+  // On a grid, changing street means turning a corner. Before the fix this
+  // count was zero for every route in the sample.
+  assert.ok(turnsSeen > 0, `expected real turns at step boundaries, saw ${turnsSeen}`);
+});
