@@ -37,7 +37,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import android.content.Context
 import dev.rangefind.wayfind.R
+import androidx.compose.material.icons.filled.DirectionsBike
+import androidx.compose.material.icons.filled.DirectionsCar
+import androidx.compose.material.icons.filled.DirectionsWalk
 import androidx.compose.material3.Switch
+import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.region.RegionEntry
 import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.ui.formatBytes
@@ -219,7 +223,23 @@ private fun RegionRow(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(entry.spec.label, style = MaterialTheme.typography.titleMedium)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(entry.spec.label, style = MaterialTheme.typography.titleMedium)
+                        // Three indexes cover Québec — one per way of
+                        // travelling — so the place name alone cannot tell
+                        // them apart on the row the user is about to download.
+                        Spacer(Modifier.width(8.dp))
+                        Icon(
+                            when (entry.spec.mode) {
+                                TravelMode.Car -> Icons.Filled.DirectionsCar
+                                TravelMode.Bike -> Icons.Filled.DirectionsBike
+                                TravelMode.Walk -> Icons.Filled.DirectionsWalk
+                            },
+                            contentDescription = stringResource(entry.spec.mode.labelRes),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
                     if (entry.active) {
                         Spacer(Modifier.width(8.dp))
                         Surface(

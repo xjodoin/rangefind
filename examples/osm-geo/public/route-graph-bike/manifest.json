@@ -1,0 +1,19 @@
+{
+  "format": "rfroutegraph-v1",
+  "root": "root.846b1b134469d1baab45169c.bin.gz",
+  "profile": "bike",
+  "nodes": 2139683,
+  "edges": 5938968,
+  "leaves": 8192,
+  "levels": [
+    4,
+    4,
+    4,
+    4,
+    4
+  ],
+  "buckets": [
+    "base"
+  ],
+  "shards": 1
+}

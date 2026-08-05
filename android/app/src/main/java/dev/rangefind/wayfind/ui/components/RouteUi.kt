@@ -58,7 +58,11 @@ import dev.rangefind.wayfind.R
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.material.icons.filled.DirectionsBike
+import androidx.compose.material.icons.filled.DirectionsCar
+import androidx.compose.material.icons.filled.DirectionsWalk
 import dev.rangefind.wayfind.engine.LaneTurn
+import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.nav.postsRectangularSpeedLimits
 import dev.rangefind.wayfind.engine.Route
@@ -80,10 +84,12 @@ fun DirectionsSheet(
     state: UiState,
     bottomInset: Dp,
     onSelectRoute: (Int) -> Unit,
+    onSelectMode: (TravelMode) -> Unit,
     onStart: () -> Unit,
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
+    val travelModeLabel = stringResource(R.string.mode_switch)
     SheetSurface(bottomInset = bottomInset) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -112,6 +118,61 @@ fun DirectionsSheet(
                     .size(22.dp)
                     .clickable { onClose() }
             )
+        }
+
+        // How the trip is made, above everything the trip says about itself.
+        // The choice changes the route rather than annotating it, so it reads
+        // first — and it sits at the top of the sheet, in the third of the
+        // screen a thumb reaches without shifting grip.
+        Spacer(Modifier.height(14.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .semantics { contentDescription = travelModeLabel }
+        ) {
+            for (mode in TravelMode.entries) {
+                val chosen = mode == state.mode
+                val usable = mode in state.modesAvailable
+                Surface(
+                    onClick = { onSelectMode(mode) },
+                    enabled = usable,
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (chosen) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                    modifier = Modifier
+                        .weight(1f)
+                        // Comfortably over the 48dp minimum: this is tapped
+                        // one-handed, often in motion.
+                        .height(54.dp)
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        val tint = when {
+                            chosen -> MaterialTheme.colorScheme.onPrimary
+                            usable -> MaterialTheme.colorScheme.onSurface
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+                        }
+                        Icon(
+                            travelModeIcon(mode),
+                            contentDescription = null,
+                            tint = tint,
+                            modifier = Modifier.size(21.dp)
+                        )
+                        Spacer(Modifier.width(7.dp))
+                        Text(
+                            stringResource(mode.labelRes),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = tint,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
         }
 
         when {
@@ -721,6 +782,12 @@ private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
             color = Color(0xFF14161D)
         )
     }
+}
+
+private fun travelModeIcon(mode: TravelMode): ImageVector = when (mode) {
+    TravelMode.Car -> Icons.Filled.DirectionsCar
+    TravelMode.Bike -> Icons.Filled.DirectionsBike
+    TravelMode.Walk -> Icons.Filled.DirectionsWalk
 }
 
 /** Highway plates have barely-rounded corners, not pill ends. */

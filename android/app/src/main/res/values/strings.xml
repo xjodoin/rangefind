@@ -48,6 +48,13 @@
         <item quantity="other">%1$d range requests · %2$s fetched</item>
     </plurals>
 
+    <!-- Travel modes -->
+    <string name="mode_drive">Drive</string>
+    <string name="mode_cycle">Cycle</string>
+    <string name="mode_walk">Walk</string>
+    <string name="mode_unavailable">No %1$s route index for this area</string>
+    <string name="mode_switch">Travel mode</string>
+
     <!-- Routing errors -->
     <string name="route_waiting_for_location">Waiting for your location</string>
     <string name="route_outside_coverage">This place is outside the area covered by the route map.</string>

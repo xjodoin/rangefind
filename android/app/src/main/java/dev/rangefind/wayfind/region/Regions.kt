@@ -3,12 +3,19 @@ package dev.rangefind.wayfind.region
 import android.content.Context
 import androidx.annotation.StringRes
 import dev.rangefind.wayfind.R
+import dev.rangefind.wayfind.nav.TravelMode
 
 /**
  * A route index the user can keep on the device. The label is a place name and
  * stays as authored; the note is prose, so it travels as a string resource.
  */
-data class RegionSpec(val id: String, val label: String, @StringRes val noteRes: Int)
+data class RegionSpec(
+    val id: String,
+    val label: String,
+    @StringRes val noteRes: Int,
+    /** Which way of travelling this index describes. */
+    val mode: TravelMode = TravelMode.Car
+)
 
 enum class RegionStatus { Absent, Downloading, Ready, Failed }
 
@@ -32,7 +39,12 @@ data class RegionEntry(
  */
 val REGION_CATALOG = listOf(
     RegionSpec("luxembourg", "Luxembourg", R.string.region_note_luxembourg),
-    RegionSpec("quebec", "Québec", R.string.region_note_quebec)
+    RegionSpec("quebec", "Québec", R.string.region_note_quebec),
+    // Walking and cycling are separate graphs, not the driving one filtered:
+    // a pedestrian crosses squares a car cannot enter, and a cyclist avoids
+    // roads a car belongs on. Each is its own download for that reason.
+    RegionSpec("quebec-foot", "Québec", R.string.region_note_quebec, TravelMode.Walk),
+    RegionSpec("quebec-bike", "Québec", R.string.region_note_quebec, TravelMode.Bike)
 )
 
 /**
@@ -72,6 +84,11 @@ class RegionPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_RECORD, false)
         set(value) = prefs.edit().putBoolean(KEY_RECORD, value).apply()
 
+    /** The way of travelling the user last chose. */
+    var travelMode: TravelMode
+        get() = TravelMode.ofProfile(prefs.getString(KEY_MODE, null))
+        set(value) = prefs.edit().putString(KEY_MODE, value.profile).apply()
+
     fun sourceUrlOf(id: String) = "$host/$id-index/"
 
     private companion object {
@@ -79,6 +96,7 @@ class RegionPreferences(context: Context) {
         const val KEY_ACTIVE = "active"
         const val KEY_CHOSEN = "chosen"
         const val KEY_RECORD = "recordTrips"
+        const val KEY_MODE = "travelMode"
         /** The emulator's alias for the development machine's loopback. */
         const val DEFAULT_HOST = "http://10.0.2.2:5185"
     }

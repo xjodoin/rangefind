@@ -129,6 +129,7 @@ class MainActivity : ComponentActivity() {
                     onDismissPlace = viewModel::dismissPlace,
                     onDirections = { viewModel.requestDirections() },
                     onSelectRoute = viewModel::selectRoute,
+                    onSelectMode = viewModel::setTravelMode,
                     onStartNavigation = viewModel::startNavigation,
                     onStopNavigation = viewModel::stopNavigation,
                     onExitDirections = viewModel::exitDirections,

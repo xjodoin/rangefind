@@ -58,6 +58,13 @@ data class NavUpdate(
  */
 class NavigationCore(private val context: Context) {
 
+    /**
+     * How the trip is being made. Every threshold below reads from this
+     * rather than assuming a car: the same numbers that keep a driver on
+     * their road would have a pedestrian rerouted for crossing the street.
+     */
+    var mode: TravelMode = TravelMode.Car
+
     private var trackers: List<RouteTracker> = emptyList()
     private var routes: List<Route> = emptyList()
     private var activeIndex = 0
@@ -135,7 +142,7 @@ class NavigationCore(private val context: Context) {
         val match = active.match(point, lastAlong) ?: return null
 
         // GPS bearing is unreliable at low speed; the road's own is better.
-        val moving = speedMps > 1.5
+        val moving = speedMps > mode.movingSpeedMps
         val heading = when {
             moving && hasBearing && gpsBearing != null -> gpsBearing
             // Off the line, the route's bearing describes a road the car is
@@ -143,7 +150,12 @@ class NavigationCore(private val context: Context) {
             match.crossTrackMeters > SNAP_TRUST_METERS && gpsBearing != null -> gpsBearing
             else -> match.bearing
         }
-        val headingWrong = speedMps > 2.0 && absBearingDelta(match.bearing, heading) > 110.0
+        // Going the wrong way down the road only means something for traffic
+        // that has a way to be on. Someone on foot turning to look at a shop
+        // window is not driving into oncoming cars.
+        val headingWrong = mode != TravelMode.Walk &&
+            speedMps > 2.0 &&
+            absBearingDelta(match.bearing, heading) > 110.0
 
         // How far the car still is from where the route ends. Needed before the
         // off-route test, not just for arrival.
@@ -155,14 +167,14 @@ class NavigationCore(private val context: Context) {
         // Leaving the line there is arriving, not straying, and rerouting a
         // driver who has already parked is worse than saying nothing — so
         // inside the destination's apron nothing counts as off-route.
-        val arriving = toDestination < ARRIVAL_APRON_METERS
+        val arriving = toDestination < mode.arrivalApronMeters
 
         // A trip that starts in a pedestrian zone or a car park begins tens of
         // metres from the nearest routable road, so a standstill can never be
         // off-route; only a wild distance overrides that.
         val off = !arriving && (
-            (match.crossTrackMeters > OFF_ROUTE_METERS && moving) ||
-                match.crossTrackMeters > OFF_ROUTE_HARD_METERS ||
+            (match.crossTrackMeters > mode.offRouteMeters && moving) ||
+                match.crossTrackMeters > mode.offRouteHardMeters ||
                 headingWrong
             )
         offRouteStrikes = if (off) offRouteStrikes + 1 else 0
@@ -194,17 +206,19 @@ class NavigationCore(private val context: Context) {
         // separates.
         val parked = arriving &&
             speedMps < PARKED_SPEED_MPS &&
-            match.crossTrackMeters > OFF_ROUTE_METERS
-        val arrived = geometric < ARRIVAL_METERS ||
-            toDestination < ARRIVAL_METERS ||
+            match.crossTrackMeters > mode.offRouteMeters
+        val arrived = geometric < mode.arrivalMeters ||
+            toDestination < mode.arrivalMeters ||
             parked
 
-        val offRoute = offRouteStrikes >= OFF_ROUTE_STRIKES
+        val offRoute = offRouteStrikes >= mode.offRouteStrikes
         val turnDelta = turnDeltaAt(route, next?.at)
         // Lane guidance only means anything close to the junction it belongs
         // to; further back it is a row of arrows about nothing yet, and it
         // would sit on screen for kilometres of open road.
-        val lanes = if (toManeuver <= LANE_GUIDANCE_METERS) next?.lanes.orEmpty() else emptyList()
+        val lanes = if (mode.showsRoadSigns && toManeuver <= LANE_GUIDANCE_METERS) {
+            next?.lanes.orEmpty()
+        } else emptyList()
         val laneUsable = usableLanes(lanes, turnDelta)
         val voice = when {
             arrived && !announcedArrival -> {
@@ -236,7 +250,10 @@ class NavigationCore(private val context: Context) {
             position = position,
             bearing = heading,
             speedMps = speedMps,
-            speedLimitKmh = route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0,
+            // Posted limits and lane markings are addressed to drivers.
+            speedLimitKmh = if (mode.showsRoadSigns) {
+                route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0
+            } else 0,
             turnDelta = turnDelta,
             lanes = lanes,
             laneUsable = laneUsable,
@@ -384,18 +401,6 @@ class NavigationCore(private val context: Context) {
          */
         const val SNAP_TRUST_METERS = 25.0
 
-        const val OFF_ROUTE_METERS = 45.0
-        /** Distance that means "off route" even at a standstill. */
-        const val OFF_ROUTE_HARD_METERS = 150.0
-        const val OFF_ROUTE_STRIKES = 3
-        const val ARRIVAL_METERS = 25.0
-        /**
-         * Radius around the end of the route inside which straying off the
-         * line is expected rather than wrong. Sized for a large store's car
-         * park, which is where this bites: the driver has reached the place
-         * they asked for, and the road network simply does not cover it.
-         */
-        const val ARRIVAL_APRON_METERS = 150.0
         /** Slow enough to be stationary rather than crawling. */
         const val PARKED_SPEED_MPS = 0.8
         /** How far off an alternate the car can be before it stops being one. */

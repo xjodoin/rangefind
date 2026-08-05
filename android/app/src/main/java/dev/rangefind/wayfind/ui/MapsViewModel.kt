@@ -22,6 +22,7 @@ import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.nav.NavUpdate
+import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.nav.TripRecorder
 import dev.rangefind.wayfind.nav.NavigationCore
 import kotlinx.coroutines.FlowPreview
@@ -67,7 +68,11 @@ data class UiState(
     val showRegions: Boolean = false,
     val recordTrips: Boolean = false,
     /** How many faults the driver has flagged on this drive. */
-    val issueMarks: Int = 0
+    val issueMarks: Int = 0,
+    /** Driving, cycling or walking. */
+    val mode: TravelMode = TravelMode.Car,
+    /** Modes this area actually has an index for. */
+    val modesAvailable: Set<TravelMode> = setOf(TravelMode.Car)
 ) {
     val activeRoute: Route?
         get() = routes?.let { bundle ->
@@ -117,7 +122,13 @@ class MapsViewModel(
             // A region kept on the device wins over the network base: the user
             // downloaded it precisely so routing would not depend on a server.
             val active = resolveActiveRegion()
-            val base = active?.let { regionServer.baseUrlFor(it) } ?: routeBase
+            val mode = regionPrefs.travelMode
+            core.mode = mode
+            _state.update { it.copy(mode = mode, modesAvailable = modesAvailable()) }
+            // The remembered mode decides the index, region or not. Opening
+            // the driving graph while the selector says Walk drew a driving
+            // route under a walking label, which is worse than either.
+            val base = routeBaseFor(mode)
             // Adopting a region changes which row reads as active.
             if (active != null) refreshRegions()
             runCatching { engine.init(searchBase, base) }
@@ -172,6 +183,7 @@ class MapsViewModel(
             current.copy(
                 regionHost = regionPrefs.host,
                 recordTrips = regionPrefs.recordTrips,
+                modesAvailable = modesAvailable(),
                 regions = REGION_CATALOG.map { spec ->
                     val existing = current.regions.firstOrNull { it.spec.id == spec.id }
                     if (downloads[spec.id]?.isActive == true && existing != null) {
@@ -199,6 +211,61 @@ class MapsViewModel(
      * the device is the better default — the network base is not reachable
      * from every device, and an index they already waited for always is.
      */
+    /**
+     * Where this mode's routing comes from.
+     *
+     * A downloaded region wins, as always. Otherwise the same host the
+     * regions are fetched from serves the network index, which keeps one
+     * setting behind all three modes rather than three that can disagree.
+     */
+    private fun routeBaseFor(mode: TravelMode): String {
+        val place = placeOfActiveRegion()
+        val id = place?.let { mode.regionId(it) }
+        if (id != null && regionStore.isReady(id)) return regionServer.baseUrlFor(id)
+        if (id != null) return regionPrefs.sourceUrlOf(id)
+        return if (mode == TravelMode.Car) routeBase else routeBase.trimEnd('/') + mode.suffix + "/"
+    }
+
+    /** The place behind the active region, with any mode suffix removed. */
+    private fun placeOfActiveRegion(): String? {
+        val active = regionPrefs.activeRegion ?: return null
+        return REGION_CATALOG.firstOrNull { it.id == active }
+            ?.let { spec -> spec.id.removeSuffix(spec.mode.suffix) }
+    }
+
+    /** Which modes this area can actually route, downloaded or served. */
+    private fun modesAvailable(): Set<TravelMode> {
+        val place = placeOfActiveRegion()
+            // Without a region the network base is the only source, and it
+            // publishes one index per profile alongside itself. Offering all
+            // three is right there; a mode that turns out to be missing
+            // reports it rather than being hidden before it is tried.
+            ?: return TravelMode.entries.toSet()
+        val downloaded = TravelMode.entries.filter { regionStore.isReady(it.regionId(place)) }
+        // Once a region is kept on the device, driving offline and walking
+        // only-when-online would be a trap. What is downloaded is what the
+        // selector offers, and the rest are visibly unavailable.
+        return if (downloaded.isEmpty()) TravelMode.entries.toSet() else downloaded.toSet()
+    }
+
+    /**
+     * Switch how the trip is made. The route index changes with it, and any
+     * route already on screen is recomputed: a walking line drawn from a
+     * driving graph would send somebody the wrong way down a dual carriageway.
+     */
+    fun setTravelMode(mode: TravelMode) {
+        if (mode == _state.value.mode) return
+        regionPrefs.travelMode = mode
+        core.mode = mode
+        _state.update { it.copy(mode = mode) }
+        viewModelScope.launch {
+            applyRouteBase(routeBaseFor(mode))
+            if (_state.value.selected != null && _state.value.sheet == SheetMode.Directions) {
+                requestDirections(_state.value.selected)
+            }
+        }
+    }
+
     private fun resolveActiveRegion(): String? {
         regionPrefs.activeRegion?.takeIf { regionStore.isReady(it) }?.let { return it }
         if (regionPrefs.hasChosenSource) return null
@@ -288,7 +355,11 @@ class MapsViewModel(
         regionPrefs.hasChosenSource = true
         refreshRegions()
         viewModelScope.launch {
-            applyRouteBase(id?.let { regionServer.baseUrlFor(it) } ?: routeBase)
+            // Adopting a region adopts its area, not its mode: the user picked
+            // a place to keep offline, and the mode they are travelling in is
+            // a separate choice they already made.
+            applyRouteBase(if (id != null) routeBaseFor(_state.value.mode) else routeBase)
+            _state.update { it.copy(modesAvailable = modesAvailable()) }
         }
     }
 

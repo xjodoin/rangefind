@@ -47,6 +47,13 @@
         <item quantity="other">%1$d requêtes de plage · %2$s téléchargés</item>
     </plurals>
 
+    <!-- Modes de déplacement -->
+    <string name="mode_drive">Voiture</string>
+    <string name="mode_cycle">Vélo</string>
+    <string name="mode_walk">Marche</string>
+    <string name="mode_unavailable">Aucun index %1$s pour cette zone</string>
+    <string name="mode_switch">Mode de déplacement</string>
+
     <!-- Erreurs de calcul d'itinéraire -->
     <string name="route_waiting_for_location">En attente de votre position</string>
     <string name="route_outside_coverage">Ce lieu se trouve en dehors de la zone couverte par la carte routière.</string>

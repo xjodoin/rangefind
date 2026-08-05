@@ -58,6 +58,7 @@ import dev.rangefind.wayfind.ui.components.AttributionChip
 import dev.rangefind.wayfind.ui.components.DirectionsSheet
 import dev.rangefind.wayfind.ui.components.NavigationOverlay
 import dev.rangefind.wayfind.ui.components.PlaceSheet
+import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.ui.components.RegionsSheet
 import dev.rangefind.wayfind.ui.components.ResultsSheet
 import dev.rangefind.wayfind.ui.components.SearchField
@@ -78,6 +79,7 @@ fun MapScreen(
     onDismissPlace: () -> Unit,
     onDirections: () -> Unit,
     onSelectRoute: (Int) -> Unit,
+    onSelectMode: (TravelMode) -> Unit,
     onStartNavigation: () -> Unit,
     onStopNavigation: () -> Unit,
     onExitDirections: () -> Unit,
@@ -266,6 +268,7 @@ fun MapScreen(
                         state = state,
                         bottomInset = insets.calculateBottomPadding(),
                         onSelectRoute = onSelectRoute,
+                        onSelectMode = onSelectMode,
                         onStart = onStartNavigation,
                         onClose = onExitDirections
                     )
@@ -332,6 +335,7 @@ fun MapScreen(
                                 state = state,
                                 bottomInset = 0.dp,
                                 onSelectRoute = onSelectRoute,
+                        onSelectMode = onSelectMode,
                                 onStart = onStartNavigation,
                                 onClose = onExitDirections
                             )
