@@ -35,6 +35,9 @@ test("OSM integration publishes the canonical Rangefind schema", () => {
   assert.equal(config.suggest.find(field => field.path === "aliases")?.weightPath, "population");
   assert.ok(config.geoCapsuleFields.includes("details"));
   assert.ok(config.facets.some(field => field.name === "wheelchair"));
+  assert.deepEqual(config.blockFilterFields, [
+    "category", "type", "population", "prominence", "location.lat", "location.lon"
+  ]);
   assert.ok(config.filterBitmapFacetValues.type.includes("cinema"));
   assert.deepEqual(config.meta.additional_sources, [{
     source: "Référentiel québécois des adresses (RQA)",

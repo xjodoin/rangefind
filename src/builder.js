@@ -3192,11 +3192,17 @@ function codeStoreDescriptorForPartitionWorkers(codes, config, filters = []) {
   const maxAuto = Math.max(1, Math.floor(Number(config.codeStoreWorkerMaxAutoCacheChunks || 64)));
   const cacheChunks = explicit || Math.min(maxAuto, totalChunks);
   const preloadMaxBytes = Math.max(0, Math.floor(Number(config.codeStoreWorkerPreloadMaxBytes ?? 1536 * 1024 * 1024)));
-  return preloadCodeStoreDescriptor({
+  const preloaded = preloadCodeStoreDescriptor({
     ...descriptor,
     fields,
     cacheChunks
-  }, preloadMaxBytes);
+  }, preloadMaxBytes, { bestEffort: true });
+  if (!preloaded.skippedFields?.length) return preloaded;
+  // A legacy or unusually wide code store may still exceed the shared-memory
+  // budget. Keep its per-worker random-read cache deliberately small so one
+  // missed preload cannot multiply several GiB by the reducer worker count.
+  const fallbackCacheChunks = Math.max(1, Math.floor(Number(config.codeStoreWorkerFallbackCacheChunks || 8)));
+  return { ...preloaded, cacheChunks: Math.min(preloaded.cacheChunks || cacheChunks, fallbackCacheChunks) };
 }
 
 function scanBatchDocs(config) {
@@ -3940,6 +3946,8 @@ async function reduceRuns(config, measured, runData, dirs) {
     bundleDfs,
     workerCodeStoreCacheChunks: workerCodesDescriptor?.cacheChunks || 0,
     workerCodeStorePreloadedBytes: workerCodesDescriptor?.preloadedBytes || 0,
+    workerCodeStorePreloadedFields: workerCodesDescriptor?.preloadedFields?.length || 0,
+    workerCodeStoreSkippedFields: workerCodesDescriptor?.skippedFields?.length || 0,
     workerStats: usePartitionWorkers ? partitionPool.stats() : [{
       worker: 0,
       tasks: runData.segments.length,
@@ -3980,6 +3988,8 @@ async function reduceRuns(config, measured, runData, dirs) {
     mergePolicy: stats.mergePolicy || null,
     workerCodeStoreCacheChunks: reduced.workerCodeStoreCacheChunks || 0,
     workerCodeStorePreloadedBytes: reduced.workerCodeStorePreloadedBytes || 0,
+    workerCodeStorePreloadedFields: reduced.workerCodeStorePreloadedFields || 0,
+    workerCodeStoreSkippedFields: reduced.workerCodeStoreSkippedFields || 0,
     workerStats: reduced.workerStats || [],
     reduceTimings: {
       ...(reduced.reduceTimings || {}),
@@ -4194,7 +4204,10 @@ async function buildQueryBundleIndex(config, measured, dirs, seeds, termDfs, sel
 // v9: address interpolation range keys use their own namespace.
 // v10: range keys put street/locality before their bucket so prefix sharding
 // distributes national corpora; v9 runs could retain oversized partitions.
-const BUILD_RESUME_SCHEMA_VERSION = 10;
+// v11: build-time facet columns use compact single-value cells. Old scan-stage
+// descriptors remain readable, but reusing them would retain the reducer's
+// 16-byte random-read index and defeat the bounded shared-memory fast path.
+const BUILD_RESUME_SCHEMA_VERSION = 11;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -4557,7 +4570,9 @@ export async function build({ configPath, update = false, compact = false }) {
       partition_reducer_credit_waits: reduced.reduceTimings.partitionScheduler?.creditWaits || 0,
       partition_reducer_oversized_partitions: reduced.reduceTimings.partitionScheduler?.oversizedPartitions || 0,
       partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
-      code_store_worker_preloaded_bytes: reduced.workerCodeStorePreloadedBytes || 0
+      code_store_worker_preloaded_bytes: reduced.workerCodeStorePreloadedBytes || 0,
+      code_store_worker_preloaded_fields: reduced.workerCodeStorePreloadedFields || 0,
+      code_store_worker_skipped_fields: reduced.workerCodeStoreSkippedFields || 0
     });
     const segmentManifest = await runResumableStage(config, telemetry, "segment-manifest", "segment-manifest", () => writeSegmentManifest(dirs.out, {
       config,
@@ -5041,6 +5056,8 @@ export async function build({ configPath, update = false, compact = false }) {
       partition_reducer_finish_mode: reduced.reduceTimings.partitionScheduler?.finishMode || "",
       code_store_worker_cache_chunks: reduced.workerCodeStoreCacheChunks || 0,
       code_store_worker_preloaded_bytes: reduced.workerCodeStorePreloadedBytes || 0,
+      code_store_worker_preloaded_fields: reduced.workerCodeStorePreloadedFields || 0,
+      code_store_worker_skipped_fields: reduced.workerCodeStoreSkippedFields || 0,
       segment_merge_fan_in: config.segmentMergeFanIn,
       segment_merge_tiers: reduced.mergeTiers.length,
       segment_partition_spool_bytes: reduced.partitionSpoolBytes || 0,

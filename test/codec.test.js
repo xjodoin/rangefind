@@ -79,6 +79,26 @@ test("posting segment codec round-trips postings and block filters", () => {
   assert.deepEqual(entry.blocks[0].filters.featured, { min: 1, max: 2 });
 });
 
+test("block filter summaries can select hot fields without removing exact doc values", () => {
+  const config = {
+    facets: [{ name: "category" }, { name: "wheelchair" }],
+    numbers: [{ name: "population" }, { name: "fee" }],
+    booleans: [{ name: "open" }],
+    blockFilterFields: ["category", "population"]
+  };
+  const dicts = {
+    category: { values: [{ value: "" }, { value: "cafe" }] },
+    wheelchair: { values: [{ value: "" }, { value: "yes" }] }
+  };
+  assert.deepEqual(buildBlockFilters(config, dicts), [
+    { name: "category", kind: "facet", words: 1 },
+    { name: "population", kind: "number", type: "int" }
+  ]);
+  assert.deepEqual(docValueFields(config, { _dicts: dicts }).map(field => field.name), [
+    "category", "wheelchair", "population", "fee", "open"
+  ]);
+});
+
 test("posting segment codec bucket-orders large sorted posting lists by impact", () => {
   const config = {
     facets: [],

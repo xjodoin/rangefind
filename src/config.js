@@ -98,10 +98,17 @@ export const DEFAULTS = {
   authorityRunFlushRecords: 5000,
   facetDictionaryPackBytes: 4 * 1024 * 1024,
   blockFilterMaxFacetWords: 64,
+  // Null keeps summaries for every eligible doc-value. Supplying field names
+  // limits only the advisory block/geo summaries; exact per-document filter
+  // verification remains available for every configured facet/value field.
+  blockFilterFields: null,
   codeStoreCacheDocs: 16384,
   codeStoreCacheChunks: 64,
+  codeStoreWriteBufferBytes: 1024 * 1024,
   codeStoreWorkerCacheChunks: 0,
   codeStoreWorkerMaxAutoCacheChunks: 64,
+  codeStoreWorkerFallbackCacheChunks: 8,
+  codeStoreWorkerPreloadMaxBytes: 1536 * 1024 * 1024,
   docLayoutSortChunkDocs: 100000,
   // Preloading the compressed document spool speeds small/medium builds, but
   // a multi-gigabyte preload creates a matching external-memory/RSS spike.
@@ -234,6 +241,9 @@ function applyIndexProfile(config, raw) {
   config.geoCapsuleFields = Array.isArray(config.geoCapsuleFields)
     ? [...new Set(config.geoCapsuleFields.map(String).map(field => field.trim()).filter(Boolean))]
     : [];
+  config.blockFilterFields = Array.isArray(config.blockFilterFields)
+    ? [...new Set(config.blockFilterFields.map(String).map(field => field.trim()).filter(Boolean))]
+    : null;
   if (config.geoCapsules && !config.geoCapsuleFields.length) {
     config.geoCapsuleFields = (config.display || [])
       .map(field => typeof field === "string" ? field : field?.name)

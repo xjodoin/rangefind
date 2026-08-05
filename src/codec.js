@@ -113,15 +113,16 @@ function normalizedNumberType(field) {
 
 export function buildBlockFilters(config, dicts) {
   const maxFacetWords = Math.max(0, Number(config.blockFilterMaxFacetWords ?? MAX_SUMMARY_FACET_WORDS));
+  const selected = Array.isArray(config.blockFilterFields) ? new Set(config.blockFilterFields) : null;
   return [
     ...config.facets.map(facet => ({
       name: facet.name,
       kind: "facet",
       words: Math.max(1, Math.ceil((dicts[facet.name]?.values?.length || 1) / 32))
-    })).filter(filter => filter.words <= maxFacetWords),
+    })).filter(filter => filter.words <= maxFacetWords && (!selected || selected.has(filter.name))),
     ...config.numbers.map(number => ({ name: number.name, kind: "number", type: normalizedNumberType(number) })),
     ...(config.booleans || []).map(boolean => ({ name: boolean.name, kind: "boolean", type: "boolean" }))
-  ];
+  ].filter(filter => !selected || selected.has(filter.name));
 }
 
 function addBit(words, value) {

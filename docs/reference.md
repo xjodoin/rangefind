@@ -529,6 +529,10 @@ production `static-large` profile; you rarely need to change these.
 | `scanWorkers` | `1` | Worker threads that parse/analyze documents. Set near `cores-2` for large builds. |
 | `builderWorkerCount` | `1` | Workers for doc-page, rank-map, and geo-leaf compression plus the reducer fallback. |
 | `partitionReducerWorkers` | `0` | Reduce-phase workers (`0` = `builderWorkerCount`). |
+| `blockFilterFields` | `null` | Optional doc-value names to include in posting/geo block summaries. Other fields remain exactly filterable and simply skip summary pruning. |
+| `codeStoreWriteBufferBytes` | `1048576` | Per-column sequential write buffer used while building the temporary code store. |
+| `codeStoreWorkerPreloadMaxBytes` | `1610612736` | Shared-memory budget for reducer doc-value columns. Hot fields are loaded best-effort in summary order. |
+| `codeStoreWorkerFallbackCacheChunks` | `8` | Per-worker cache cap when reducer columns cannot all be shared within the preload budget. |
 | `scanBatchDocs` | `128` | Documents per worker batch. |
 | `partitionReducerInFlightBytes` | `1 GiB` | Backpressure budget for the reducer. |
 | `builderMemoryBudgetBytes` | `0` | Advisory memory budget (0 = unbounded). |

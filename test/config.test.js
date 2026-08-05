@@ -20,6 +20,7 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.directorySortChunkEntries, 16384);
   assert.equal(config.builderWorkerCount, 1);
   assert.equal(config.partitionReducerWorkers, 0);
+  assert.equal(config.blockFilterFields, null);
   assert.equal(config.partitionReducerInFlightBytes, 1024 * 1024 * 1024);
   assert.equal(config.authorityRunFlushRecords, 5000);
   assert.equal(config.docPackSpoolPreloadMaxBytes, 256 * 1024 * 1024);
@@ -60,7 +61,10 @@ test("readConfig resolves input and output relative to the config file", async (
   assert.equal(config.postingDocRangeSize, 1024);
   assert.equal(config.postingDocRangeQuantizationBits, 8);
   assert.equal(config.codeStoreWorkerCacheChunks, 0);
+  assert.equal(config.codeStoreWriteBufferBytes, 1024 * 1024);
   assert.equal(config.codeStoreWorkerMaxAutoCacheChunks, 64);
+  assert.equal(config.codeStoreWorkerFallbackCacheChunks, 8);
+  assert.equal(config.codeStoreWorkerPreloadMaxBytes, 1536 * 1024 * 1024);
   assert.equal(config.segmentFlushDocs, 0);
   assert.equal(config.segmentFlushBytes, 0);
   assert.equal(config.segmentMergePolicy, "tiered-log");
@@ -123,6 +127,18 @@ test("readConfig keeps explicit overrides in static-large profile", async () => 
   assert.equal(config.typoMode, "off");
   assert.equal(config.typoMaxShardLookups, 4);
   assert.equal(config.codecs.mode, "auto");
+});
+
+test("readConfig normalizes selective block-filter fields", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rangefind-config-block-filters-"));
+  const configPath = join(dir, "rangefind.config.json");
+  await writeFile(configPath, JSON.stringify({
+    input: "docs.jsonl",
+    output: "public/search",
+    blockFilterFields: ["category", " category ", "year", ""]
+  }));
+  const config = await readConfig(configPath);
+  assert.deepEqual(config.blockFilterFields, ["category", "year"]);
 });
 
 test("getPath reads nested values, arrays, nulls, and fallbacks", () => {

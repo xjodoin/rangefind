@@ -42,7 +42,7 @@ test("field row pipeline wraps typed scan rows for all build field kinds", async
   try {
     const rows = createFieldRowPipeline(store, config, 3);
     assert.equal(rows.format, FIELD_ROW_PIPELINE_FORMAT);
-    assert.equal(rows.source, "rf-build-code-store-v1");
+    assert.equal(rows.source, "rf-build-code-store-v2");
     assert.equal(rows.fieldCount, 6);
     assert.equal(rows.facetFields, 2);
     assert.equal(rows.numericFields, 3);
@@ -53,11 +53,11 @@ test("field row pipeline wraps typed scan rows for all build field kinds", async
     assert.deepEqual(rows.chunk("year", 1, 2), [2025, null]);
     assert.deepEqual(rows.descriptor(), {
       format: FIELD_ROW_PIPELINE_FORMAT,
-      source: "rf-build-code-store-v1",
+      source: "rf-build-code-store-v2",
       total: 3,
       fields: [
-        { name: "tag", kind: "facet", type: "keyword", words: 1, bytesPerDoc: 16 },
-        { name: "section", kind: "facet", type: "keyword", words: 1, bytesPerDoc: 16 },
+        { name: "tag", kind: "facet", type: "keyword", words: 1, bytesPerDoc: 4 },
+        { name: "section", kind: "facet", type: "keyword", words: 1, bytesPerDoc: 4 },
         { name: "year", kind: "number", type: "int", words: 0, bytesPerDoc: 8 },
         { name: "published", kind: "number", type: "date", words: 0, bytesPerDoc: 8 },
         { name: "rating", kind: "number", type: "double", words: 0, bytesPerDoc: 8 },
@@ -68,4 +68,3 @@ test("field row pipeline wraps typed scan rows for all build field kinds", async
     store.close();
   }
 });
-

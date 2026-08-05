@@ -370,7 +370,7 @@ test("builder output is searchable through the range-based runtime", async (t) =
   assert.ok(manifest.stats.segment_terms > 0);
   assert.ok(manifest.stats.segment_postings > 0);
   assert.equal(manifest.field_rows.format, "rffieldrows-v1");
-  assert.equal(manifest.field_rows.source, "rf-build-code-store-v1");
+  assert.equal(manifest.field_rows.source, "rf-build-code-store-v2");
   assert.equal(manifest.field_rows.fields.length, 6);
   assert.equal(manifest.stats.field_row_format, "rffieldrows-v1");
   assert.equal(manifest.stats.field_row_fields, 6);

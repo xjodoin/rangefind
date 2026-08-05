@@ -246,6 +246,16 @@ buffer and a full compressed buffer for large partitions. The main thread still
 owns final directory assembly, which keeps range lookup deterministic while
 moving partition encoding off the main event loop.
 
+The temporary build code store uses four-byte facet cells: empty and
+single-valued rows are encoded inline, while only genuinely multi-valued rows
+use an overflow file. Sequential column writes are coalesced into bounded
+buffers. Reducer workers receive only the fields used by block summaries and
+share preloaded column buffers across worker threads; if the preload budget is
+too small, loading continues field by field and the remaining file-backed
+columns use a small per-worker cache. `blockFilterFields` can restrict summaries
+to high-value pruning columns without changing filter correctness because final
+matches are still checked against exact document values.
+
 Large posting lists whose doc ids are already sorted use impact-bucket ordering
 instead of a JavaScript comparator sort when the quantized impact range fits
 `postingImpactBucketOrderMaxBuckets`. This keeps impact-ordered block-max output

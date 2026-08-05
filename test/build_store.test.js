@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createCodeStore, openCodeStore } from "../src/build_store.js";
+import { CODE_STORE_FORMAT, createCodeStore, openCodeStore, preloadCodeStoreDescriptor } from "../src/build_store.js";
 
 test("file-backed build code store reads random values and chunks without heap arrays", () => {
   const root = mkdtempSync(join(tmpdir(), "rangefind-codes-"));
@@ -37,6 +37,13 @@ test("file-backed build code store reads random values and chunks without heap a
     store.set("featured", 3, true);
 
     assert.deepEqual(store.get("tags", 3), { codes: [1, 3] });
+    assert.equal(store.format, CODE_STORE_FORMAT);
+    const tagField = store.descriptor().fields.find(field => field.name === "tags");
+    assert.equal(tagField.bytesPerDoc, 4);
+    assert.equal(statSync(tagField.indexPath).size, 16);
+    // Only the multi-valued row uses overflow storage; empty and single-valued
+    // rows are represented entirely inside their four-byte index cell.
+    assert.equal(statSync(tagField.path).size, 12);
     assert.equal(store.get("year", 1), null);
     assert.equal(store.get("rating", 2), 2.25);
     assert.equal(store.get("featured", 1), false);
@@ -60,6 +67,41 @@ test("file-backed build code store reads random values and chunks without heap a
   }
 });
 
+test("code-store reader remains compatible with resumable v1 facet descriptors", () => {
+  const root = mkdtempSync(join(tmpdir(), "rangefind-codes-v1-"));
+  try {
+    const path = join(root, "tags.bin");
+    const indexPath = join(root, "tags.idx");
+    const data = Buffer.alloc(12);
+    data.writeUInt32LE(5, 0);
+    data.writeUInt32LE(2, 4);
+    data.writeUInt32LE(7, 8);
+    const index = Buffer.alloc(48);
+    index.writeBigUInt64LE(0n, 0);
+    index.writeBigUInt64LE(4n, 8);
+    index.writeBigUInt64LE(4n, 16);
+    index.writeBigUInt64LE(0n, 24);
+    index.writeBigUInt64LE(4n, 32);
+    index.writeBigUInt64LE(8n, 40);
+    writeFileSync(path, data);
+    writeFileSync(indexPath, index);
+    const store = openCodeStore({
+      format: "rf-build-code-store-v1",
+      total: 3,
+      cacheDocs: 2,
+      cacheChunks: 1,
+      fields: [{ name: "tags", kind: "facet", path, indexPath, bytesPerDoc: 16 }]
+    });
+    try {
+      assert.deepEqual(store.chunk("tags", 0, 3), [{ codes: [5] }, { codes: [] }, { codes: [2, 7] }]);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("field-selective code-store preload skips oversized fields without blocking smaller hot fields", () => {
   const root = mkdtempSync(join(tmpdir(), "rangefind-codes-selective-"));
   const config = {
@@ -73,7 +115,7 @@ test("field-selective code-store preload skips oversized fields without blocking
   });
   try {
     for (let doc = 0; doc < 4; doc++) {
-      store.set("large", doc, { codes: [1, 1, 1, 1] });
+      store.set("large", doc, { codes: [1, 2] });
       store.set("small", doc, { codes: [1] });
       store.set("latitude", doc, 45 + doc);
     }
@@ -85,12 +127,37 @@ test("field-selective code-store preload skips oversized fields without blocking
       assert.deepEqual(result.loadedFields, ["latitude"]);
       assert.deepEqual(result.skippedFields, ["large"]);
       assert.deepEqual(reopened.chunk("latitude", 0, 4), [45, 46, 47, 48]);
-      assert.deepEqual(reopened.get("large", 2), { codes: [1] });
+      assert.deepEqual(reopened.get("large", 2), { codes: [1, 2] });
     } finally {
       reopened.close();
     }
   } finally {
     store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("worker descriptor preload continues after an oversized field", () => {
+  const root = mkdtempSync(join(tmpdir(), "rangefind-codes-worker-preload-"));
+  try {
+    const largePath = join(root, "large.bin");
+    const smallPath = join(root, "small.bin");
+    writeFileSync(largePath, Buffer.alloc(64));
+    writeFileSync(smallPath, Buffer.alloc(8));
+    const descriptor = preloadCodeStoreDescriptor({
+      format: CODE_STORE_FORMAT,
+      total: 1,
+      fields: [
+        { name: "large", kind: "number", path: largePath, bytesPerDoc: 8 },
+        { name: "small", kind: "number", path: smallPath, bytesPerDoc: 8 }
+      ]
+    }, 16, { bestEffort: true });
+    assert.deepEqual(descriptor.preloadedFields, ["small"]);
+    assert.deepEqual(descriptor.skippedFields, ["large"]);
+    assert.equal(descriptor.preloadedBytes, 8);
+    assert.equal(descriptor.fields[0].sharedData, undefined);
+    assert.ok(descriptor.fields[1].sharedData instanceof SharedArrayBuffer);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
