@@ -577,6 +577,67 @@ export async function openRouteGraph(options) {
     return (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
   }
 
+  // The inverse of snap(): decode a physical segment's canonical
+  // polyline and interpolate along it by arc length. Useful on its own
+  // for rendering a snapped marker or replaying a matched trace, and
+  // required by the thread channel, whose records carry position as
+  // (segment, ratio) rather than coordinates.
+  async function locate(segment, ratio = 0) {
+    const parts = String(segment).split("/");
+    if (parts.length !== 3) {
+      throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment ids look like "leaf/polyline/direction"; got ${JSON.stringify(segment)}.`);
+    }
+    const leaf = Number(parts[0]);
+    const polyline = Number(parts[1]);
+    const direction = Number(parts[2]);
+    if (!Number.isInteger(leaf) || leaf < 0 || leaf >= root.leaves.length) {
+      throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment leaf ${parts[0]} is not in this graph.`);
+    }
+    if (!Number.isInteger(polyline) || polyline < 0 || (direction !== 0 && direction !== 1)) {
+      throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Bad segment id ${JSON.stringify(segment)}.`);
+    }
+    const geometryBlock = await loadCellGeometry(leaf);
+    if (polyline >= geometryBlock.polylines.length) {
+      throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment ${segment} does not exist in leaf ${leaf}.`);
+    }
+    const points = edgePolyline(polyline * 2 + direction, geometryBlock);
+    if (points.length < 2) {
+      throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment ${segment} has no geometry.`);
+    }
+    const clamped = Math.max(0, Math.min(1, Number(ratio) || 0));
+    // Interpolate by distance along the polyline, not by point index:
+    // vertices cluster on curves, so index interpolation would slide the
+    // marker toward every bend.
+    const scale = metersPerLatE7();
+    const cosLat = Math.cos(points[0] / 1e7 * Math.PI / 180);
+    const spans = [];
+    let total = 0;
+    for (let i = 0; i + 3 < points.length; i += 2) {
+      const dLat = (points[i + 2] - points[i]) * scale;
+      const dLon = (points[i + 3] - points[i + 1]) * scale * cosLat;
+      const span = Math.sqrt(dLat * dLat + dLon * dLon);
+      spans.push(span);
+      total += span;
+    }
+    if (total <= 0) return { lat: points[0] / 1e7, lon: points[1] / 1e7, segment, ratio: clamped };
+    let target = clamped * total;
+    for (let i = 0; i < spans.length; i++) {
+      if (target > spans[i] && i < spans.length - 1) {
+        target -= spans[i];
+        continue;
+      }
+      const t = spans[i] > 0 ? Math.max(0, Math.min(1, target / spans[i])) : 0;
+      const base = i * 2;
+      return {
+        lat: (points[base] + (points[base + 2] - points[base]) * t) / 1e7,
+        lon: (points[base + 1] + (points[base + 3] - points[base + 1]) * t) / 1e7,
+        segment,
+        ratio: clamped
+      };
+    }
+    return { lat: points[points.length - 2] / 1e7, lon: points[points.length - 1] / 1e7, segment, ratio: clamped };
+  }
+
   const snapCache = new Map();
   const defaultMaxSnapMeters = Number(options.maxSnapMeters ?? 250);
 
@@ -1870,5 +1931,5 @@ export async function openRouteGraph(options) {
     overlayCache.clear();
   }
 
-  return { root, route, matrix, itinerary, snap, stats: statsSnapshot, resetStats, clearCaches };
+  return { root, route, matrix, itinerary, snap, locate, stats: statsSnapshot, resetStats, clearCaches };
 }

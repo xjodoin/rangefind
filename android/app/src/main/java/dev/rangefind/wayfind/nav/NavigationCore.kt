@@ -31,10 +31,21 @@ data class NavUpdate(
     val position: LatLon,
     val bearing: Double,
     val speedMps: Double,
+    /**
+     * Direction of the road the route matched to, independent of any fused
+     * heading. The motion model needs a heading it did not itself produce.
+     */
+    val roadBearing: Double,
     val speedLimitKmh: Int,
     val turnDelta: Double,
     /** What the driver has to do next: turn, exit, merge or carry on. */
     val maneuver: Maneuver,
+    /**
+     * The road the next maneuver leads onto — past a slip road to the road it
+     * actually joins. The banner and the spoken instruction both read this,
+     * so they cannot disagree.
+     */
+    val maneuverTarget: String,
     /** Lanes of the approach to the next maneuver, left to right. */
     val lanes: List<Int>,
     /** Which of those lanes lead where the route goes. */
@@ -218,6 +229,12 @@ class NavigationCore(private val context: Context) {
         // Lane guidance only means anything close to the junction it belongs
         // to; further back it is a row of arrows about nothing yet, and it
         // would sit on screen for kilometres of open road.
+        val maneuverKind = maneuverOnto(route, stepIndex + 1, turnDelta)
+        val maneuverTarget = when (maneuverKind) {
+            Maneuver.Exit, Maneuver.Merge -> roadBeyondRamp(route, stepIndex + 1)
+                .ifBlank { next?.name.orEmpty() }
+            else -> next?.name.orEmpty()
+        }
         val lanes = if (mode.showsRoadSigns && toManeuver <= LANE_GUIDANCE_METERS) {
             next?.lanes.orEmpty()
         } else emptyList()
@@ -233,8 +250,8 @@ class NavigationCore(private val context: Context) {
                 meters = toManeuver,
                 nextName = next?.name.orEmpty(),
                 turnDelta = turnDelta,
-                maneuver = maneuverOnto(route, stepIndex + 1, turnDelta),
-                beyondName = roadBeyondRamp(route, stepIndex + 1)
+                maneuver = maneuverKind,
+                beyondName = maneuverTarget
             )
         }
 
@@ -259,12 +276,14 @@ class NavigationCore(private val context: Context) {
             position = position,
             bearing = heading,
             speedMps = speedMps,
+            roadBearing = match.bearing,
             // Posted limits and lane markings are addressed to drivers.
             speedLimitKmh = if (mode.showsRoadSigns) {
                 route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0
             } else 0,
             turnDelta = turnDelta,
-            maneuver = maneuverOnto(route, stepIndex + 1, turnDelta),
+            maneuver = maneuverKind,
+            maneuverTarget = maneuverTarget,
             lanes = lanes,
             laneUsable = laneUsable,
             offRoute = offRoute,

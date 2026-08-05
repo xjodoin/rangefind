@@ -277,9 +277,9 @@ default, because a guess is not a limit.
 ## Live traffic providers
 
 Live data enters through a generic, pluggable provider contract — a P2P
-mesh ([PulseMesh](pulsemesh.md) is the first design), a CDN-published
-delta sidecar, a municipal feed, or an in-memory loopback all implement
-the same interface:
+mesh ([PulseMesh](pulsemesh.md) is the first implementation, shipping in
+`src/pulsemesh/`), a CDN-published delta sidecar, a municipal feed, or an
+in-memory loopback all implement the same interface:
 
 ```js
 const provider = {

@@ -12,12 +12,17 @@ plugged in.
 This document is rangefind's adaptation of an externally drafted concept
 ("RangeFind PulseMesh", 2026-08). The architecture survives largely
 intact; the sections below note where this version deliberately differs
-and why. Status: **design** — the consumption side (provider contract,
-segment identity, live-metric search) is implemented and tested; the
-mesh itself is not. The wire-level implementation specification —
-byte layouts, topic grammar, bin tables, the deterministic aggregation
-algorithm, validation rules, state machines, and test vectors — is
-[pulsemesh-protocol.md](pulsemesh-protocol.md).
+and why. Status: **implemented** — the consumption side (provider
+contract, segment identity, live-metric search), the full protocol v1
+traffic channel (`src/pulsemesh/`), the js-libp2p wire transport and
+keeper (`src/pulsemesh/libp2p.js`, `scripts/pulsemesh_keeper.mjs`), and
+the phase-2 simulation are done, tested, and measured; all five protocol
+milestones (M1–M5) are complete. The wire-level implementation
+specification — byte layouts, topic grammar, bin tables, the
+deterministic aggregation algorithm, validation rules, state machines,
+and test vectors — is
+[pulsemesh-protocol.md](pulsemesh-protocol.md); measured results are in
+[pulsemesh-benchmarks.md](pulsemesh-benchmarks.md).
 
 The anonymous traffic layer described here is one of **two channels**
 sharing the same transport, cell vocabulary, segment identity and epoch
@@ -186,7 +191,58 @@ agreement. Congestion ratio = observed / static free-flow.
 | Aggregation bucket / retained buckets | 15 s / 8 |
 | Topic epoch / rotation overlap | 5 min / 30 s |
 | Anti-entropy interval | ~10 s jittered |
-| Crowd incident (3+ confirmations) | 5–10 min, ≤30 min unverified |
+| Crowd incident (score ≥ 3) | 5–30 min by type, quartered when measurably contradicted |
+
+### Manual reports (the Waze loop)
+
+Users tap to report crashes, hazards, road works, closures, mobile
+police, ice, poor visibility. Reports carry a type from a fixed
+taxonomy, a segment, and a position along it — no coordinates, no free
+text, no photos, no identity. Others confirm or refute the same
+`(segment, type)` key as they pass. Fixed speed cameras are absent by
+design: they are permanent road features and belong in the static
+index, not in an ephemeral mesh.
+
+**A report is a claim, not a measurement**, and that distinction is the
+whole design. A fabricated speed is constrained by physics — it has to
+survive a weighted median and a plausibility check. A fabricated crash
+is constrained by nothing. Worse, the corroboration minimum that
+protects speed aggregates does nothing here: reportIds are one-use
+random values with no identity behind them, so one device mints three
+of them in a second and has "three distinct reports".
+
+Two mechanisms close that, and only the second is load-bearing:
+
+- **Score is capped by distinct delivering peers** —
+  `score = min(raw, sources)`. Five records down one connection score
+  1. Reaching the display threshold costs three peer identities and
+  three connections, bounded further by per-peer and per-cell caps.
+- **Routing penalties require independent physical corroboration.** An
+  incident changes a route *only* when the same segment carries a speed
+  aggregate that independently shows congestion. A fake crash on a
+  flowing road changes no route, ever, because the claim must be
+  ratified by measurements the attacker does not control. The incident
+  channel borrows the speed channel's Sybil resistance instead of
+  needing its own. Informational types — police, visibility, animals —
+  never affect routing under any score, so faking them wins nothing
+  beyond display noise.
+
+The same anchor fixes the ordinary failure Waze has: an incident whose
+segment is measurably flowing has its TTL cut, so a cleared crash
+expires without anyone remembering to untag it.
+
+The honest limit: **incident display is best-effort and abusable at the
+margins; incident routing is not.** Blind tokens (phase 4) are what
+would make the first as sound as the second.
+
+Reporting is also the one place the reticent profile's protections are
+deliberately given up — a report is a precise, voluntary "I am here",
+published directly rather than through a forwarder so that peer
+counting means something. Users must be told that at the moment of
+reporting, and a forwarded, hint-weight path exists for those who would
+rather have the privacy than the weight. Police reporting is restricted
+in some jurisdictions; the signed bootstrap file carries the
+deployment's suppressed-type list, and clients must honour it.
 
 ### Route query privacy
 
@@ -240,7 +296,8 @@ a bounded audience, end-to-end confidentiality, and a run that ends:
 every property above, inverted. It is therefore a separate record type
 with a separate trust model, not a mode of this one.
 [pulsemesh-threads.md](pulsemesh-threads.md) is the specification;
-three things about it belong here.
+three things about it belong here. It is implemented and measured
+([benchmarks §9c](pulsemesh-benchmarks.md)).
 
 **What it reuses.** Transport, XYZ cells, the 5-minute topic rotation,
 epoch discipline, TTL philosophy, codec conventions, and — critically —
@@ -322,26 +379,37 @@ the record set and reports recovered-route fraction per gate.
 
 ## Phased plan
 
-1. **Loopback (no networking).** `createStaticLiveProvider` +
-   contributions synthesized from the demo's own simulated drive —
-   validates the full contribute→aggregate→route loop in one browser.
-   The engine work for this phase is done; milestones M1–M2 of
-   [pulsemesh-protocol.md](pulsemesh-protocol.md) implement it with
-   real protocol bytes.
-2. **Wire prototype.** js-libp2p simulation: churn, convergence time,
-   digest bandwidth by density, decoy/batch-size trade-offs, malformed/
-   replay/Sybil floods, clock skew. Produces measured defaults for the
-   constants above (protocol spec milestones M3–M4).
+1. **Loopback (no networking).** ✅ **Done.** `createStaticLiveProvider` +
+   contributions synthesized from a simulated drive — validates the full
+   contribute→aggregate→route loop in one process. Milestones M1–M2 of
+   [pulsemesh-protocol.md](pulsemesh-protocol.md) implement it with real
+   protocol bytes (`src/pulsemesh/`, `test/pulsemesh_*.test.js`).
+2. **Wire prototype.** ✅ **Done** (M3 + M4). The simulation
+   (`scripts/pulsemesh_sim.mjs`) measures churn, convergence time, digest
+   bandwidth by density, decoy/batch overhead, malformed/replay/Sybil
+   floods, and clock skew over the real modules; results and the
+   resulting tunable verdicts are in
+   [pulsemesh-benchmarks.md](pulsemesh-benchmarks.md). The js-libp2p
+   transport (`src/pulsemesh/libp2p.js`) binds the same `MeshNode` to
+   real sockets — GossipSub, sync streams, a runnable §12 keeper — with
+   two OS processes converging to byte-identical digests in
+   `test/pulsemesh_wire.test.js`. Browser transports (WebRTC/WSS) and
+   Circuit Relay are deployment wiring on the same adapter.
 3. **Corridor pilot.** A handful of commuter corridors with the mobile
    runtime as contributor and browsers as consumers; keeper nodes for
    sparsity; read-only mode default.
 4. **Credential service + private forwarding.** Blind-token issuance and
    the optional two-hop reporting mode, clearly labeled in product copy.
-5. **Threads.** The tracking channel, independent of phases 2–4 after
-   phase 1: its loopback milestone (T2 in
-   [pulsemesh-threads.md](pulsemesh-threads.md)) needs only the engine
-   and the crypto, and proves the local-ETA thesis with no networking.
-   Its pilot is a coarse-mode school run.
+5. **Threads.** ✅ **Done through T4.** The tracking channel is
+   implemented (`src/pulsemesh/thread_*.js`, exported as
+   `rangefind/pulsemesh/threads`): crypto and codecs byte-identical to
+   the [threads §16](pulsemesh-threads.md) vectors, the publisher and
+   subscriber, host-free catch-up, and the cross-channel contribution
+   rules. The local-ETA thesis is a test rather than a claim — a
+   subscriber's arrival estimate moves when a jam is injected into the
+   traffic channel, on the real OSM graph, with the subscriber sending
+   nothing. Its pilot (T5) is a coarse-mode school run and remains
+   open.
 
 ## Acceptance criteria (inherited, still binding)
 
@@ -349,7 +417,9 @@ the record set and reports recovered-route fraction per gate.
   corridor; contributions never contain coordinates or stable ids.
 - No accepted record outlives the receiver-enforced TTL; a departing
   node removes no replicated state; an empty region forgets.
-- A single peer can neither force a closure nor a reliable estimate.
+- A single peer can neither force a closure nor a reliable estimate,
+  **nor move a route with a manual report** — incident penalties are
+  gated on independent speed measurements.
 - **A contributor's route is not reconstructible from its
   contributions.** Absent from the original criteria, and the omission
   is what let cadence through: the record format was checked for
@@ -366,19 +436,33 @@ the record set and reports recovered-route fraction per gate.
 - Whether z15 is the right detail cell for dense downtowns (z16 halves
   the cell; measure in phase 2).
 - Cross-epoch handover during index republishes (overlap window length).
-- Bandwidth ceilings per zone under stadium-exit-grade density.
+- Bandwidth ceilings per zone under stadium-exit-grade density. Partially
+  measured: per-peer cost is flat in peer count but linear in contributor
+  density (7.6 / 30.6 / 109 KiB/min at 5 / 20 / 60 vehicles per zone), and
+  anti-entropy — not gossip — is 4–5× the bill. Shard-subset subscription
+  and a churn-gated digest exchange are the levers
+  ([benchmarks §5](pulsemesh-benchmarks.md)).
 - Whether a scheduled fleet's anonymous contributions leak anything
   about *deviations* from its published timetable, which is the one gap
   in the public-route argument that lets fleets contribute at all
   ([threads §10](pulsemesh-threads.md#10-rules-between-the-two-channels)).
-- Whether the reticent profile should simply be the only profile. The
-  argument for cadence is jam-detection latency; M5 measures it, and if
-  the gap is a bucket or two, there is no case for keeping a mode whose
-  only distinguishing property is that it leaks routes.
+- ~~Whether the reticent profile should simply be the only profile.~~
+  **Answered** ([benchmarks §8](pulsemesh-benchmarks.md)): it should be
+  the default. Cadence leaks 100% of a courier's driven route at low
+  density (anonymity set 1) and a median 38.5% even at 32 background
+  vehicles; reticence holds at 7.7% everywhere, worst case included. The
+  latency picture is mixed rather than a clean win — reticence is slower
+  at density 4, a tie at 12, faster at 32 — but cadence wins on latency
+  only in the regime where it also leaks the entire route, which is not
+  an argument for keeping it.
 - Jam onset under universal reticence: the first witness of a new jam
   has no company by construction. A surprise bypasses the company gate
-  for exactly this reason, but the onset-latency curve at low density
-  is unmeasured.
+  for exactly this reason. **Measured, and it is the profile's one real
+  weakness**: at 4 vehicles in the zone reticence took a median 84 s
+  against cadence's 31.5 s, converging by ~12 and reversing by ~32.
+  Candidate fixes to measure: keeper-supplied corroboration in sparse
+  regions, or relaxing `AGG_MIN_REPORTS` to the hint threshold for
+  surprise-flagged records specifically.
 - Whether keepers should also cache thread records opportunistically:
   same blind, TTL-bounded, padded-request store, no keys, and it would
   cover the sparse-audience case threads are weakest at.

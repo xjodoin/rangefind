@@ -378,6 +378,8 @@ fun NavigationOverlay(
     val offers = nav?.alternatives.orEmpty()
     val placeholder = stringResource(R.string.format_placeholder)
     val continueLabel = stringResource(R.string.nav_continue)
+    val exitLabel = stringResource(R.string.nav_exit_label)
+    val mergeLabel = stringResource(R.string.nav_merge_label)
 
     Box(Modifier.fillMaxSize()) {
 
@@ -417,8 +419,17 @@ fun NavigationOverlay(
                             color = MaterialTheme.colorScheme.onPrimary
                         )
                         Text(
-                            nav?.nextStepName?.ifBlank { nav.stepName }?.ifBlank { continueLabel }
-                                ?: continueLabel,
+                            // What the voice is about to say, verbatim. Falling
+                            // back to the road being driven on told a driver to
+                            // carry on down the motorway they were being told
+                            // to leave.
+                            nav?.maneuverTarget?.ifBlank {
+                                when (nav.maneuver) {
+                                    Maneuver.Exit -> exitLabel
+                                    Maneuver.Merge -> mergeLabel
+                                    else -> continueLabel
+                                }
+                            } ?: continueLabel,
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.86f),
                             maxLines = 1,

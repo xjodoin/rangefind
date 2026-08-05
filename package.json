@@ -92,6 +92,19 @@
       "node": "./src/route_graph_build.js",
       "default": "./src/node_only_entry.js"
     },
+    "./pulsemesh": {
+      "types": "./types/pulsemesh.d.ts",
+      "default": "./src/pulsemesh/index.js"
+    },
+    "./pulsemesh/threads": {
+      "types": "./types/pulsemesh-threads.d.ts",
+      "default": "./src/pulsemesh/threads.js"
+    },
+    "./pulsemesh/libp2p": {
+      "types": "./types/pulsemesh-libp2p.d.ts",
+      "node": "./src/pulsemesh/libp2p.js",
+      "default": "./src/node_only_entry.js"
+    },
     "./scoring-stats": {
       "types": "./types/scoring-stats.d.ts",
       "node": "./src/scoring_stats.js",
@@ -176,11 +189,18 @@
     "bench:osm-shards": "node scripts/osm_fixture.mjs jsonl --region=quebec --no-rqa && node scripts/osm_shard_bench.mjs --root=examples/osm-geo --shards=4",
     "bench:osm-geo:us": "node scripts/osm_us_bench.mjs",
     "bench:geo-builder": "node scripts/geo_builder_bench.mjs",
+    "bench:pulsemesh": "node scripts/pulsemesh_bench.mjs",
+    "bench:pulsemesh:sim": "node scripts/pulsemesh_sim.mjs --scenario=all",
+    "bench:pulsemesh:wire": "node scripts/pulsemesh_wire_bench.mjs",
+    "bench:pulsemesh:threads": "node scripts/pulsemesh_thread_bench.mjs",
+    "bench:pulsemesh:all": "node scripts/pulsemesh_bench.mjs && node scripts/pulsemesh_sim.mjs --scenario=all && node scripts/pulsemesh_wire_bench.mjs && node scripts/pulsemesh_thread_bench.mjs",
+    "demo:pulsemesh": "node scripts/pulsemesh_demo.mjs",
+    "pulsemesh:keeper": "node scripts/pulsemesh_keeper.mjs",
     "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
     "bench:frwiki:lucene-quality": "node scripts/frwiki_lucene_quality.mjs",
     "bench:frwiki:search-game": "node scripts/search_benchmark_game.mjs",
     "bench:frwiki:search-game-profile": "node scripts/search_benchmark_game_profile.mjs",
-    "check": "for f in bin/rangefind.js src/*.js src/integrations/osm/*.js src/integrations/osm/node/*.js scripts/*.mjs test/*.js dist/*.js examples/wiki-search/scripts/*.mjs examples/wiki-search/public/*.js examples/osm-geo/public/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
+    "check": "for f in bin/rangefind.js src/*.js src/pulsemesh/*.js src/integrations/osm/*.js src/integrations/osm/node/*.js scripts/*.mjs test/*.js dist/*.js examples/wiki-search/scripts/*.mjs examples/wiki-search/public/*.js examples/osm-geo/public/*.js; do [ -e \"$f\" ] && node --check \"$f\"; done",
     "check:seo": "node scripts/check_site_seo.mjs",
     "test": "node --test test/*.test.js",
     "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",
@@ -188,8 +208,42 @@
     "prepublishOnly": "npm run test:all"
   },
   "devDependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
+    "@chainsafe/libp2p-noise": "^16.1.5",
+    "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/identify": "^3.0.39",
+    "@libp2p/tcp": "^10.1.19",
     "esbuild": "^0.25.12",
+    "libp2p": "^2.10.0",
     "rangefind": "file:."
+  },
+  "peerDependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
+    "@chainsafe/libp2p-noise": "^16.1.5",
+    "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/identify": "^3.0.39",
+    "@libp2p/tcp": "^10.1.19",
+    "libp2p": "^2.10.0"
+  },
+  "peerDependenciesMeta": {
+    "@chainsafe/libp2p-gossipsub": {
+      "optional": true
+    },
+    "@chainsafe/libp2p-noise": {
+      "optional": true
+    },
+    "@chainsafe/libp2p-yamux": {
+      "optional": true
+    },
+    "@libp2p/identify": {
+      "optional": true
+    },
+    "@libp2p/tcp": {
+      "optional": true
+    },
+    "libp2p": {
+      "optional": true
+    }
   },
   "workspaces": [
     "packages/*",

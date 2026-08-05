@@ -18,10 +18,13 @@ wire conventions this document reuses verbatim (varints, framing,
 epochs, segment ids, cells, the 5-minute topic window). Requirement
 words are RFC 2119.
 
-Status: **design**. Nothing in this document is implemented. The
-engine primitives it stands on (`snap()`, `route({ live })`,
-`matrix()`, segment identity) are implemented and tested; one small
-engine addition is required (§13).
+Status: **implemented** (`src/pulsemesh/thread_*.js`, exported as
+`rangefind/pulsemesh/threads`). Milestones T1–T4 are complete and
+tested against the §16 vectors byte-for-byte; T5 is a field pilot and
+remains open by nature. The engine addition §13 asks for —
+`engine.locate()` — is implemented and is an exact inverse of `snap()`.
+Measured results, including answers to two of §18's open questions, are
+in [pulsemesh-benchmarks.md](pulsemesh-benchmarks.md).
 
 ## 1. Why this is a second channel, not a mode
 
@@ -661,7 +664,8 @@ claims and the second one is the reason anyone installed the app.
 
 ## 13. Required engine addition
 
-One, small:
+One, small — **now implemented** in `src/route_graph_query.js` and
+exposed on every engine handle:
 
 ```
 engine.locate(segment: string, ratio: number): Promise<{ lat, lon }>
@@ -820,19 +824,34 @@ test/pulsemesh_thread_*.test.js  per-module + §16 vectors
   for byte; property test that a tampered AAD, a rolled-back `seq`, and
   a correctly-sealed-but-unsigned record (the link-holder-turned-forger
   case) are all rejected. Requires `engine.locate()` (§13).
+  **Done** — `thread_crypto.js`, `thread_codec.js`,
+  `test/pulsemesh_thread_codec.test.js`. Every §16 vector reproduces
+  byte-for-byte, including the 130-byte sealed record, through WebCrypto
+  so the same code runs in Node and browsers.
 - **T2 — loopback thread.** Publisher and subscriber in one process
   over an in-memory duplex, publisher fed by the demo's simulated
   drive; subscriber renders a position and an ETA that moves when a
   synthesized jam is injected into the traffic provider. This proves
   the §9 claim, which is the whole thesis, with no networking at all.
+  **Done** — `test/pulsemesh_thread_loopback.test.js`, on the real OSM
+  route graph. The ETA moves under a jam in both shapes: the multi-stop
+  school run and the two-point delivery.
 - **T3 — discovery and catch-up.** Rendezvous derivation, DHT provider
   records, audience caching; sleep/wake test where a subscriber offline
   for 4 minutes rejoins from *another subscriber's* cache with no
   designated host anywhere in the test.
+  **Done** — `thread_cache.js`, `test/pulsemesh_thread_catchup.test.js`.
+  Rendezvous and topic derivation are covered; live DHT provider records
+  are transport wiring on the traffic channel's libp2p adapter.
 - **T4 — contribution.** A publisher emitting both PMT1 and PMC1 under
   §10 rule 3, with rule 4 stop suppression; assert the traffic
   aggregate for a corridor served by buses is not biased downward by
   dwell time — the failure this rule exists to prevent.
+  **Done** — `thread_contribute.js`,
+  `test/pulsemesh_thread_channels.test.js`. The dwell-bias test makes
+  the failure concrete: three buses reporting their stops drag a
+  50 km/h corridor down, and they corroborate each other while doing
+  it, so corroboration alone would not have caught it.
 - **T5 — coarse pilot.** One operator, one route, coarse mode, run
   plans as static assets, links by SMS. Measure: ETA error against
   observed arrival, wake budget and battery, catch-up hit rate as a
@@ -841,10 +860,33 @@ test/pulsemesh_thread_*.test.js  per-module + §16 vectors
 
 ## 18. Open questions
 
-- Catch-up availability as a function of audience size: how many
-  concurrent subscribers does a run need before a late joiner reliably
-  finds the gap? T5 measures it, and the answer decides whether small
-  audiences need a cache incentive of some kind.
+- ~~Catch-up availability as a function of audience size.~~
+  **Answered, and the question was aimed at the wrong variable**
+  ([benchmarks §14](pulsemesh-benchmarks.md)). Audience size barely
+  matters; **how many providers a late joiner asks** is what decides it.
+  Asking one peer succeeds 40–53% of the time whether the run has 2
+  subscribers or 100 — the odds that the one peer you picked was awake
+  do not improve with audience. Asking three raises it to 83–95%, and
+  asking eight to 100%. So §8's "availability scales with audience size"
+  is true only for a joiner that queries several providers, and the
+  actionable rule is a floor on providers asked (three minimum, eight
+  for certainty) rather than a cache incentive for small audiences.
+
+  The same measurement pins a limit the design never stated: **catch-up
+  can never recover more than `THREAD_MAX_AGE` of history**, because
+  §7 step 8 rejects anything older no matter who cached it. "Catch-up"
+  means the last two minutes, not the run so far, and a UI must not
+  promise otherwise.
+- **A real position on leaf 0 collides with the withheld sentinel.**
+  §5.2 words the sentinel as `leafCell = 0`, but leaf 0 is an ordinary
+  leaf — a vehicle really can be on segment `0/95/1`, and reading the
+  sentinel off `leafCell` alone silently discards the position of
+  everything inside one leaf of the map. The implementation treats the
+  whole triple (`leafCell`, `geomRef`, `ratioQ12`) being zero as the
+  sentinel, which is wire-compatible and keeps the §16 vectors intact,
+  and nudges the single colliding real position (leaf 0, polyline 0,
+  direction 0, ratio exactly 0) one quantum along the segment. A v2
+  should encode `leafCell + 1` and be done with it.
 - Flood posture for relay peers caching tags they cannot open, given
   that no signature is verifiable without `P` and no proof-of-work
   envelope exists on this channel.

@@ -2,6 +2,121 @@
 
 ## Unreleased
 
+### Added
+
+- PulseMesh protocol v1, the anonymous peer-to-peer live-traffic channel
+  (`src/pulsemesh/`): wire codecs (PMC1/PMB1/PMI1/PMD1/PMG1/PMQ1/PMS1/PMF1)
+  byte-identical to the specification's test vectors, dependency-free
+  SHA-256 and proof-of-work, the deterministic weighted-median aggregation
+  and trust ledger, the TTL store with reportId/cell/segment indexes and
+  order-independent digests, the twelve-rule validation pipeline, incident
+  scoring with distinct-peer capping and the speed-anchored routing gate,
+  the contributor state machine and the reticent profile's four emission
+  gates, PMF1 forwarding, padded/decoy/split cell fetching, topic grammar
+  and rotation, signed bootstrap verification, and a `LiveTrafficProvider`
+  adapter that plugs the mesh into `engine.route({ live })`. A 42-byte
+  contribution carries no coordinate, trajectory, identity, or precise
+  timestamp, because the codec has no field for one.
+- PulseMesh wire transport (`rangefind/pulsemesh/libp2p`): a js-libp2p
+  binding of the transport-agnostic mesh node — GossipSub with message
+  signing disabled and sha256 message ids per the §5.1 profile, one framed
+  request/response per `/rangefind/pulsemesh/1/sync` stream — plus a
+  runnable §12 keeper (`scripts/pulsemesh_keeper.mjs`). Wire tests cover
+  real-TCP convergence with proof-of-work validation, contributor churn
+  with zero record loss, padded late-joiner recovery, and two OS processes
+  converging to byte-identical zone digests. The libp2p packages are
+  optional peer dependencies; engine consumers install nothing new.
+- `npm run demo:pulsemesh` — the whole loop end to end against the real
+  4096-leaf OSM route graph in this repo: real libp2p peers, real GPS
+  fixes through the contributor pipeline, real gossip and validation, and
+  a route that changes because other drivers' phones said the road was
+  slow. Also prints one contribution field by field, and finishes by
+  killing every contributor to show the router degrading to the static
+  metric. `npm run bench:pulsemesh:wire` measures the same transport:
+  1.00 ms median publish-to-validated-and-stored across a 6-peer mesh,
+  and a cold-start peer recovering 300 records in one anti-entropy round.
+- PulseMesh Threads (`rangefind/pulsemesh/threads`), the second channel:
+  authenticated tracking of one vehicle for a bounded audience, for
+  school-bus and delivery use. A run's entire capability is one Ed25519
+  public key — 45 bytes in a URL fragment — from which a holder derives
+  the content key, the rotating topic tag, and the DHT rendezvous key, so
+  the link is what lets you find, decrypt, and verify a thread. The
+  private key signs, so no link holder can move the bus. Includes the
+  publisher state machine with coarse and fine modes, the subscriber's
+  nine-step validation and sequence ledger, host-free catch-up where any
+  subscriber answers a late joiner, and the cross-channel rules that keep
+  a signed single-source record out of a corroborated traffic aggregate
+  and stop a dwelling bus from reporting 0 km/h on a flowing road. Every
+  §16 test vector reproduces byte-for-byte through WebCrypto, so the same
+  code runs in Node and browsers.
+- `engine.locate(segment, ratio)` — the inverse of `snap()`, decoding a
+  segment's canonical polyline and interpolating by arc length. Exact to
+  0.00 m on round trip. Threads need it to turn a broadcast position back
+  into coordinates; it is independently useful for rendering a snapped
+  marker or replaying a matched trace.
+- Thread benchmarks (`npm run bench:pulsemesh:threads`). The full receive
+  path — decode, decrypt, parse, verify — costs 0.087 ms, and a record
+  addressed to an unguessable tag is rejected at 1.22 M/s before any
+  crypto runs. Answers two of the threads spec's open questions: catch-up
+  availability depends on how many providers a joiner asks (3 → 95%,
+  8 → 100%) rather than on audience size, and catch-up can never recover
+  more than `THREAD_MAX_AGE` of history.
+- PulseMesh benchmark and simulation harnesses
+  (`npm run bench:pulsemesh:all`). Measured: per-peer bandwidth is flat in
+  peer count (25 KiB/min at 10, 50 and 150 peers) and linear in contributor
+  density; convergence under 15% packet loss is ~12 s regardless of mesh
+  size; a 200/s hostile flood lands zero records for 461 ms of defender
+  CPU; half the mesh vanishing loses no records. The M5 measurement runs a
+  trajectory-reconstruction attack against the record set: over 12 seeds
+  the cadence profile leaks 84.6–100% of a courier's driven route up to
+  moderate density (anonymity set ~1) while the reticent profile holds at
+  7.7% — median and worst case — everywhere, at 4–11× fewer emissions.
+  Cadence remains the faster detector where routes are public, so the
+  measurement validates the threads spec's publicity test rather than
+  replacing both profiles with one. Results in
+  [docs/pulsemesh-benchmarks.md](docs/pulsemesh-benchmarks.md).
+- Anti-entropy digest elision: a PMG1 may carry the requester's 12-byte
+  zone fold, and a responder whose fold matches answers with a 12-byte
+  PMN1 instead of a full digest. Elides 100% of digest traffic in a
+  converged zone and correctly never fires in an actively driven one,
+  where the digest is the cost of genuine disagreement rather than waste.
+
+### Fixed
+
+- PulseMesh provider no longer filters its live states by the areas the
+  routing engine has already fetched. The areas are the leaves fetched so
+  far, so filtering to them hid every jam outside that set and defeated
+  the engine's context-expansion mechanism — the one that makes jams
+  exact. Areas now drive cell fetching only. An oversized leaf bbox also
+  no longer rasterizes without bound.
+- PulseMesh sync-stream framing no longer misparses a length prefix split
+  across TCP segments. The assembler used a varint reader that cannot
+  distinguish "incomplete" from "complete", so a 128-byte payload's `80
+  01` prefix read as length 0 on its first byte — framing an empty
+  message and silently discarding the real one. Every snapshot response
+  has a multi-byte prefix, so this affected recovery on any connection
+  that fragmented.
+- `provider.aggregates()` is genuinely read-only. It was applying §8.4
+  trust feedback on every call, so a UI polling it to draw jams walked
+  every delivering peer toward a trust bound and silently changed the
+  weights the next route was computed from. Feedback now happens only on
+  the routing path.
+- PulseMesh declared `libp2p@^3` as a peer dependency while the adapter
+  is written against — and only ever tested against — the v2 duplex
+  stream API. Anyone following the manifest would have installed a major
+  the code cannot run on. Peer ranges now match what CI exercises.
+- A sync responder can no longer be pinned by a peer that opens a stream
+  and then goes quiet: reads have a deadline. Keepers, whose whole job is
+  answering, were the cheapest target.
+- `network.close()` is a real teardown — it unsubscribes its gossip
+  topics (the host outlives the network by contract, so leaving them
+  subscribed kept it in every PulseMesh mesh) and clears pending
+  forwarder timers that would otherwise fire into a stopped host.
+- The provider caps total cells per fetch, not just per area, and issues
+  the split snapshot requests concurrently. A long route could otherwise
+  serialize 60+ round trips inside a single `route()` call. A bbox
+  crossing the antimeridian is no longer silently dropped.
+
 ## 0.4.7 — 2026-08-05
 
 ### Performance

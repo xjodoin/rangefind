@@ -4607,6 +4607,18 @@ function createOsmIndexConfig(options = {}) {
       { name: "fee", path: "details.fee" },
       { name: "access", path: "details.access" }
     ],
+    // These high-cardinality/high-frequency fields provide nearly all useful
+    // posting and geo pruning. The remaining OSM facets are still exact and
+    // searchable through their doc values, but no longer force reducer workers
+    // to scan ~6 GiB of mostly empty facet indexes for every posting block.
+    blockFilterFields: [
+      "category",
+      "type",
+      "population",
+      "prominence",
+      "location.lat",
+      "location.lon"
+    ],
     // Keep curated type bitmaps for broad/text lanes that cannot use spatial
     // category routing. Category-cell geo queries prove their type from the
     // cell's point ordinals and do not fetch this global bitmap.

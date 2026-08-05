@@ -737,7 +737,7 @@ class MapsViewModel(
 
         motion.onFix(
             location = location,
-            roadBearing = _state.value.nav?.bearing,
+            roadBearing = _state.value.nav?.roadBearing,
             compassBearing = heading.bearing,
             mode = _state.value.mode,
             nowMs = System.currentTimeMillis()

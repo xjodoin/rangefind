@@ -1071,3 +1071,37 @@ test("roads a rider or walker may not use are absent, not merely avoided", async
   assert.equal(bike.allowed(tags([["highway", "residential"], ["bicycle", "no"]])), false);
   assert.equal(foot.allowed(tags([["highway", "residential"], ["foot", "no"]])), false);
 });
+
+test("a car park you are being sent to is reachable, but not a shortcut", async () => {
+  const { PROFILES } = await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+  const { car } = PROFILES;
+
+  // How a shopping centre is tagged. "customers" means you may drive here if
+  // you are one — which is exactly what somebody being routed to the centre
+  // is. Reading it as a refusal made every aisle on the site invisible: no
+  // route in, nothing to say about which entrance, and a driver crossing the
+  // car park permanently off-route.
+  assert.equal(car.allowed(tags([["highway", "service"], ["service", "parking_aisle"], ["access", "customers"]])), true);
+  assert.equal(car.allowed(tags([["highway", "service"], ["access", "customers"]])), true);
+  assert.equal(car.allowed(tags([["highway", "service"], ["service", "drive-through"], ["access", "customers"]])), true);
+  assert.equal(car.allowed(tags([["highway", "unclassified"], ["access", "destination"]])), true);
+
+  // What is genuinely closed stays closed.
+  assert.equal(car.allowed(tags([["highway", "service"], ["service", "driveway"], ["access", "private"]])), false);
+  assert.equal(car.allowed(tags([["highway", "residential"], ["access", "no"]])), false);
+  assert.equal(car.allowed(tags([["highway", "service"], ["access", "delivery"]])), false);
+  assert.equal(car.allowed(tags([["highway", "service"], ["motor_vehicle", "no"]])), false);
+
+  // Reachable is not the same as worth driving through. A destination-only
+  // way is slowed so it never wins as a shortcut past a queue on the road
+  // outside, while still being available when it is the destination.
+  const { waySpeeds } = await import("../scripts/osm_road_graph.mjs");
+  const open = waySpeeds(tags([["highway", "service"]]), car).forward;
+  const restricted = waySpeeds(tags([["highway", "service"], ["access", "customers"]]), car).forward;
+  assert.ok(
+    restricted < open,
+    `a customers-only way at ${restricted} should be slower than an open one at ${open}`
+  );
+  assert.ok(restricted > 0, "slowed, not closed");
+});

@@ -103,7 +103,31 @@ const FOOT_SPEEDS = {
   road: 5
 };
 
-const ACCESS_DENIED = new Set(["no", "private", "delivery", "agricultural", "forestry", "military", "customers"]);
+const ACCESS_DENIED = new Set(["no", "private", "delivery", "agricultural", "forestry", "military"]);
+
+/**
+ * Access that permits reaching a place but not passing through it.
+ *
+ * `access=customers` is how a shopping centre's car park is tagged, and it
+ * says you may drive here if you are a customer — which is exactly what
+ * somebody being routed to that centre is. Treating it as a refusal made
+ * every aisle, drive-through and service road on the site invisible: the
+ * router could not deliver anyone into the car park, could not say which
+ * entrance to use, and a driver crossing it was permanently off-route.
+ *
+ * They are not through-routes either, so they are slowed rather than simply
+ * opened. A car park is reachable when it is where you are going, and
+ * unattractive as a shortcut past the queue on the boulevard.
+ */
+const ACCESS_DESTINATION_ONLY = new Set(["customers", "destination", "permit"]);
+
+function destinationOnly(tags) {
+  for (const key of ["motor_vehicle", "vehicle", "access"]) {
+    const value = tags.get(key);
+    if (value != null) return ACCESS_DESTINATION_ONLY.has(value);
+  }
+  return false;
+}
 
 /**
  * An expressway that is not tagged as one.
@@ -263,6 +287,9 @@ function parseMaxspeed(value) {
 }
 
 // Surfaces where posted class speeds are unrealistic for a car.
+/** How much a destination-only way is slowed, to keep it off through-routes. */
+const DESTINATION_ONLY_FACTOR = 0.35;
+
 const SLOW_SURFACES = new Set(["unpaved", "gravel", "fine_gravel", "dirt", "earth", "ground", "grass", "sand", "mud", "compacted", "pebblestone", "wood"]);
 const VERY_SLOW_SMOOTHNESS = new Set(["bad", "very_bad", "horrible", "very_horrible", "impassable"]);
 
@@ -337,7 +364,7 @@ export function wayLanes(tags, oneway) {
   };
 }
 
-function waySpeeds(tags, profile) {
+export function waySpeeds(tags, profile) {
   const base = profile.speeds[tags.get("highway")];
   let forward = base;
   let backward = base;
@@ -361,6 +388,10 @@ function waySpeeds(tags, profile) {
   if (profile.adjustSpeed) {
     forward = profile.adjustSpeed(tags, forward);
     backward = profile.adjustSpeed(tags, backward);
+  }
+  if (destinationOnly(tags)) {
+    forward = Math.max(3, forward * DESTINATION_ONLY_FACTOR);
+    backward = Math.max(3, backward * DESTINATION_ONLY_FACTOR);
   }
   // The posted limit is what a sign says; the modelled speed above also folds
   // in surface, smoothness and the profile cap, so the two must not be

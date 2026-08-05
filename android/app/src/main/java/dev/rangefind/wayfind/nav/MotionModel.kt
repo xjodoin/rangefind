@@ -157,9 +157,10 @@ class MotionModel {
         val fixSpeed = if (location.hasSpeed()) location.speed.toDouble() else 0.0
         return when {
             course != null && fixSpeed >= COURSE_TRUST_MPS -> course
-            roadBearing != null && fixSpeed >= ROAD_TRUST_MPS -> roadBearing
-            compassBearing != null -> compassBearing
+            // A vehicle is on a road, and the road's direction is steadier
+            // than a compass sitting in a metal box beside a phone charger.
             roadBearing != null -> roadBearing
+            compassBearing != null -> compassBearing
             else -> course
         }
     }
@@ -167,15 +168,25 @@ class MotionModel {
     /**
      * Rotates towards a heading no faster than the vehicle could turn.
      *
-     * Yaw rate falls away with speed — a car at a walking pace can spin on the
-     * spot, one at motorway speed changes direction slowly — so the limit is
-     * tied to it. This is what stops the view swinging about on a noisy fix
+     * Yaw rate falls away with speed: a car taking a corner at 30 km/h turns
+     * far faster than one changing lanes at 100. A stopped vehicle is the
+     * tightest case of all rather than the loosest — it is not turning, so
+     * anything claiming otherwise is the phone being handled or a course
+     * built from noise. The limit keeps the view from swinging on a bad fix
      * while still letting it come round a corner in time.
      */
     private fun steer(towards: Double?, elapsed: Double): Double {
         val target = towards ?: return bearing
-        val limit = if (speed < CRAWL_MPS) FREE_TURN_DEGREES_PER_SECOND
-        else min(FREE_TURN_DEGREES_PER_SECOND, TURN_RATE_CONSTANT / speed)
+        // Recorded drives spun the view up to 179°/s, all of it at walking
+        // pace, because a crawl was allowed to turn freely. A stopped car does
+        // not rotate at all — what moves at that point is the phone, or a
+        // satellite course made of noise — so the slowest case is the most
+        // tightly held, not the least.
+        val limit = when {
+            speed < STOPPED_MPS -> STOPPED_TURN_DEGREES_PER_SECOND
+            else -> (TURN_RATE_CONSTANT / max(speed, 1.5))
+                .coerceIn(MIN_TURN_DEGREES_PER_SECOND, MAX_TURN_DEGREES_PER_SECOND)
+        }
         val allowed = limit * elapsed
         val delta = bearingDelta(bearing, target)
         val step = if (abs(delta) <= allowed) delta else allowed * (if (delta < 0) -1.0 else 1.0)
@@ -202,9 +213,12 @@ class MotionModel {
         /** Above this a satellite course describes real movement. */
         const val COURSE_TRUST_MPS = 2.5
         const val ROAD_TRUST_MPS = 0.8
-        const val CRAWL_MPS = 2.0
+        const val STOPPED_MPS = 0.7
 
-        const val FREE_TURN_DEGREES_PER_SECOND = 180.0
+        /** A parked car's heading may drift, but it may not swing. */
+        const val STOPPED_TURN_DEGREES_PER_SECOND = 20.0
+        const val MIN_TURN_DEGREES_PER_SECOND = 12.0
+        const val MAX_TURN_DEGREES_PER_SECOND = 75.0
         /** Divided by speed: about 50°/s at 30 km/h, 14°/s at 100 km/h. */
         const val TURN_RATE_CONSTANT = 400.0
     }
