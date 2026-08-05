@@ -6,6 +6,8 @@ import dev.rangefind.wayfind.engine.Route
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * Records a drive to a file so a bad one can be examined afterwards.
@@ -25,25 +27,35 @@ class TripRecorder(context: Context) {
 
     private val root = File(context.filesDir, "traces")
     private var sink: File? = null
+    private var markCount = 0
 
     val isRecording: Boolean get() = sink != null
 
     /** Traces newest first; the drive that just went wrong is the first one. */
     fun traces(): List<File> =
-        root.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: emptyList()
+        root.listFiles()
+            ?.filter { it.isFile && it.extension == "jsonl" }
+            ?.sortedByDescending { it.lastModified() }
+            ?: emptyList()
 
     fun deleteAll() {
         root.deleteRecursively()
     }
 
-    fun start(route: Route?, startedAtMillis: Long) {
+    fun start(route: Route?, startedAtMillis: Long, environment: JSONObject? = null) {
         stop()
         root.mkdirs()
         prune()
+        markCount = 0
         val file = File(root, "trip-$startedAtMillis.jsonl")
         val header = JSONObject()
             .put("kind", "route")
             .put("at", startedAtMillis)
+            // Which build, which device, which index. A trace that cannot say
+            // what produced it can only be read as a guess.
+            .put("environment", environment ?: JSONObject())
+            .put("httpRequests", route?.httpRequests ?: 0)
+            .put("bytesFetched", route?.bytesFetched ?: 0L)
             .put("seconds", route?.seconds ?: 0.0)
             .put("distanceMeters", route?.distanceMeters ?: 0.0)
             .put("stepCount", route?.steps?.size ?: 0)
@@ -56,12 +68,26 @@ class TripRecorder(context: Context) {
                             .put("seconds", step.seconds)
                             .put("at", step.at)
                             .put("speedLimitKmh", step.speedLimitKmh)
+                            .put("lanes", JSONArray().apply { step.lanes.forEach { put(it) } })
                     )
                 }
             })
             .put("geometry", JSONArray().apply {
                 route?.geometry?.forEach { point ->
                     put(JSONArray().put(point.lat).put(point.lon))
+                }
+            })
+            // Signals, stops and crossings as the route reports them, so a
+            // complaint about what the map drew can be checked against it.
+            .put("junctions", JSONArray().apply {
+                route?.junctions?.forEach { junction ->
+                    put(
+                        JSONObject()
+                            .put("kind", junction.kind)
+                            .put("lat", junction.lat)
+                            .put("lon", junction.lon)
+                            .put("atMeters", junction.atMeters)
+                    )
                 }
             })
         runCatching {
@@ -98,14 +124,21 @@ class TripRecorder(context: Context) {
      * one that misbehaved. A mark turns that into a timestamp: whatever the
      * state machine believed at this instant is what needs explaining.
      */
-    fun mark(ordinal: Int, update: NavUpdate?, atMillis: Long) {
-        val file = sink ?: return
+    fun mark(ordinal: Int, update: NavUpdate?, atMillis: Long): File? {
+        val file = sink ?: return null
+        markCount = ordinal
+        // The screenshot is written by the surface that can see the map; the
+        // trace only promises where it will be. A mark stays readable if the
+        // capture fails, which matters more than the picture.
+        val shot = File(file.parentFile, "${file.nameWithoutExtension}-mark-$ordinal.png")
         val row = JSONObject()
             .put("kind", "mark")
             .put("at", atMillis)
             .put("ordinal", ordinal)
+            .put("screenshot", shot.name)
         if (update != null) row.put("nav", navJson(update))
         runCatching { file.appendText(row.toString() + "\n") }
+        return shot
     }
 
     private fun navJson(update: NavUpdate) = JSONObject()
@@ -138,6 +171,32 @@ class TripRecorder(context: Context) {
         runCatching { file.appendText(row.toString() + "\n") }
     }
 
+    /**
+     * A trace and its screenshots as one file to hand over.
+     *
+     * Sharing a JSONL and four PNGs separately means four chances to send the
+     * wrong set; a zip keeps a report whole. Rebuilt on demand rather than
+     * kept, since it is derivable from what is already on disk.
+     */
+    fun bundle(trace: File): File? {
+        if (!trace.isFile) return null
+        val zip = File(root, "${trace.nameWithoutExtension}.zip")
+        val shots = root.listFiles()
+            ?.filter { it.isFile && it.name.startsWith("${trace.nameWithoutExtension}-mark-") }
+            ?.sortedBy { it.name }
+            .orEmpty()
+        return runCatching {
+            ZipOutputStream(zip.outputStream().buffered()).use { out ->
+                for (file in listOf(trace) + shots) {
+                    out.putNextEntry(ZipEntry(file.name))
+                    file.inputStream().use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+            }
+            zip
+        }.getOrNull()
+    }
+
     fun stop(): File? {
         val file = sink
         sink = null
@@ -148,7 +207,13 @@ class TripRecorder(context: Context) {
     private fun prune() {
         val existing = traces()
         if (existing.size < MAX_TRACES) return
-        existing.drop(MAX_TRACES - 1).forEach { runCatching { it.delete() } }
+        for (trace in existing.drop(MAX_TRACES - 1)) {
+            // A trace's screenshots and bundle are part of it; leaving them
+            // behind would grow the directory the cap exists to bound.
+            root.listFiles()
+                ?.filter { it.name.startsWith(trace.nameWithoutExtension) }
+                ?.forEach { runCatching { it.delete() } }
+        }
     }
 
     private companion object {

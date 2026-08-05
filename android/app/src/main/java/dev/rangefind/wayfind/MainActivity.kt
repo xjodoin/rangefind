@@ -29,8 +29,10 @@ import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.ui.MapScreen
 import android.content.Intent
+import android.graphics.Bitmap
 import androidx.core.content.FileProvider
 import java.io.File
+import dev.rangefind.wayfind.ui.map.MapSnapshotter
 import dev.rangefind.wayfind.ui.MapsViewModel
 import dev.rangefind.wayfind.ui.SheetMode
 import dev.rangefind.wayfind.ui.theme.WayfindTheme
@@ -137,9 +139,9 @@ class MainActivity : ComponentActivity() {
                     onDeleteRegion = viewModel::deleteRegion,
                     onActivateRegion = viewModel::activateRegion,
                     onRecordTripsChange = viewModel::setRecordTrips,
-                    onMarkIssue = viewModel::markIssue,
+                    onMarkIssue = { captureMark(viewModel.markIssue()) },
                     hasTrace = viewModel.latestTrace() != null,
-                    onShareTrace = { shareTrace(viewModel.latestTrace()) },
+                    onShareTrace = { shareTrace(viewModel.latestBundle()) },
                     onLongPress = viewModel::dropPin,
                     onCenterChanged = { viewModel.mapCenter = it }
                 )
@@ -164,13 +166,38 @@ class MainActivity : ComponentActivity() {
             FileProvider.getUriForFile(this, "$packageName.traces", trace)
         }.getOrNull() ?: return
         val send = Intent(Intent.ACTION_SEND).apply {
-            type = "application/json"
+            type = "application/zip"
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, trace.name)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         runCatching {
             startActivity(Intent.createChooser(send, getString(R.string.diag_share_chooser)))
+        }
+    }
+
+
+    /**
+     * Captures the map the driver was looking at when they flagged a fault.
+     *
+     * Only the map: everything drawn over it is already in the trace as
+     * state, whereas the rendered roads, route line and junction icons exist
+     * nowhere else. Failure is silent — the mark's own line is already
+     * written, and a report without its picture beats no report.
+     */
+    private fun captureMark(target: File?) {
+        if (target == null) return
+        MapSnapshotter.snapshot { bitmap ->
+            if (bitmap == null) return@snapshot
+            // Off the main thread: a driver tapped this, and encoding a
+            // full-screen PNG is not something to do between frames.
+            Thread {
+                runCatching {
+                    target.outputStream().use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+                    }
+                }
+            }.start()
         }
     }
 

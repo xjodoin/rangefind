@@ -5,6 +5,7 @@ import android.location.Location
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import dev.rangefind.wayfind.BuildConfig
 import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.EngineInfo
 import dev.rangefind.wayfind.engine.LatLon
@@ -507,7 +508,7 @@ class MapsViewModel(
     fun startNavigation() {
         val greeting = core.start(_state.value.allRoutes, _state.value.activeRouteIndex)
         if (regionPrefs.recordTrips) {
-            recorder.start(_state.value.activeRoute, System.currentTimeMillis())
+            recorder.start(_state.value.activeRoute, System.currentTimeMillis(), environment())
         }
         _state.update { it.copy(sheet = SheetMode.Navigating, issueMarks = 0) }
         greeting?.let { _voice.tryEmit(it) }
@@ -535,12 +536,41 @@ class MapsViewModel(
      * the driver is driving, and anything that needs a decision from them
      * here is a worse idea than a single tap.
      */
-    fun markIssue() {
-        if (!recorder.isRecording) return
+    fun markIssue(): java.io.File? {
+        if (!recorder.isRecording) return null
         val ordinal = _state.value.issueMarks + 1
-        recorder.mark(ordinal, _state.value.nav, System.currentTimeMillis())
+        val shot = recorder.mark(ordinal, _state.value.nav, System.currentTimeMillis())
         _state.update { it.copy(issueMarks = ordinal) }
+        return shot
     }
+
+    /**
+     * What produced this trace: build, device, index and routing source. A
+     * report that cannot say which version and which index it came from can
+     * only be read as a guess about a build that may no longer exist.
+     */
+    private fun environment(): org.json.JSONObject {
+        val active = regionPrefs.activeRegion
+        return org.json.JSONObject()
+            .put("app", BuildConfig.VERSION_NAME)
+            .put("versionCode", BuildConfig.VERSION_CODE)
+            .put("buildType", BuildConfig.BUILD_TYPE)
+            .put("flavor", BuildConfig.FLAVOR)
+            .put("device", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            .put("android", android.os.Build.VERSION.RELEASE)
+            .put("sdk", android.os.Build.VERSION.SDK_INT)
+            .put("locale", java.util.Locale.getDefault().toLanguageTag())
+            .put("routeSource", active ?: "network")
+            .put("routeBytes", active?.let { regionStore.bytesOf(it) } ?: 0L)
+            .put("regionHost", regionPrefs.host)
+            .put("searchBase", searchBase)
+            .put("routingProfile", _state.value.info?.profile ?: org.json.JSONObject.NULL)
+            .put("routingAvailable", _state.value.info?.routing ?: false)
+            .put("routingError", _state.value.info?.routingError ?: org.json.JSONObject.NULL)
+    }
+
+    /** The newest trace and its screenshots, zipped for handing over. */
+    fun latestBundle(): java.io.File? = recorder.traces().firstOrNull()?.let { recorder.bundle(it) }
 
     /** The most recent finished trace, for sharing off the device. */
     fun latestTrace(): java.io.File? = recorder.traces().firstOrNull()

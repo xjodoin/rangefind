@@ -114,6 +114,7 @@ fun MapCanvas(
     // Style (re)load: day/night swap rebuilds every source and layer.
     LaunchedEffect(mapView, darkTheme) {
         mapView.getMapAsync { map ->
+            MapSnapshotter.attach(map)
             holder.map = map
             map.uiSettings.isAttributionEnabled = false
             map.uiSettings.isLogoEnabled = false
@@ -310,6 +311,37 @@ private fun advance(from: LatLon, bearing: Double, meters: Double): LatLon {
     val dLat = (meters * cos(radians)) / 111_320.0
     val dLon = (meters * sin(radians)) / (111_320.0 * cos(Math.toRadians(from.lat)).coerceAtLeast(0.01))
     return LatLon(from.lat + dLat, from.lon + dLon)
+}
+
+/**
+ * The live map, for anything outside the composition that needs to see what
+ * the driver saw. Only the rendered map goes through here: everything drawn
+ * over it — the maneuver banner, the speed, the lanes — is already written
+ * into the trace as state, and a picture of it would add nothing.
+ */
+object MapSnapshotter {
+    @Volatile
+    private var map: MapLibreMap? = null
+
+    internal fun attach(instance: MapLibreMap?) {
+        map = instance
+    }
+
+    /**
+     * Renders the map to a bitmap. MapLibre draws through a GL surface that
+     * neither a view-tree capture nor PixelCopy over the window reliably
+     * reaches — both come back with a blank hole where the roads were, which
+     * is the one part worth having.
+     */
+    fun snapshot(onReady: (android.graphics.Bitmap?) -> Unit) {
+        val instance = map
+        if (instance == null) {
+            onReady(null)
+            return
+        }
+        runCatching { instance.snapshot { bitmap -> onReady(bitmap) } }
+            .onFailure { onReady(null) }
+    }
 }
 
 private class MapHolder {
