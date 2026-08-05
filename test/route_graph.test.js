@@ -1003,3 +1003,34 @@ test("one intersection reports one junction, however many nodes describe it", as
   // The first junction of a drive has nothing to merge with.
   assert.equal(mergesWithPreviousJunction(null, SIGNAL, 455000000, -736000000), false);
 });
+
+test("the cycling profile prefers cycle infrastructure over arterials", async () => {
+  const { PROFILES } = await import("../scripts/osm_road_graph.mjs");
+  const bike = PROFILES.bike;
+  const tags = pairs => new Map(pairs);
+
+  // A cycleway has to be enough quicker than a main road to survive being
+  // longer. At a few percent apart, any cycleway that detours at all loses,
+  // and riders get sent down arterials to save seconds.
+  const cycleway = bike.speeds.cycleway;
+  const primary = bike.speeds.primary;
+  assert.ok(
+    cycleway >= primary * 1.5,
+    `a cycleway at ${cycleway} against a primary at ${primary} is not a preference`
+  );
+  assert.ok(bike.speeds.residential > bike.speeds.primary, "a quiet street beats an arterial");
+  assert.ok(bike.speeds.secondary > bike.speeds.primary, "and a smaller road beats a bigger one");
+
+  // Infrastructure painted on an ordinary road counts too — OSM records it on
+  // the road itself, which the profile used to read only for contraflow.
+  const plain = bike.adjustSpeed(tags([]), 15);
+  assert.equal(plain, 15, "a road with nothing tagged is unchanged");
+  assert.ok(bike.adjustSpeed(tags([["cycleway", "lane"]]), 15) > plain, "a marked lane is better");
+  assert.ok(bike.adjustSpeed(tags([["cycleway:right", "track"]]), 15) > plain, "so is one side of it");
+  assert.ok(bike.adjustSpeed(tags([["bicycle", "designated"]]), 15) > plain, "so is a designated way");
+  // "no" is a statement that there is none, and must not read as one.
+  assert.equal(bike.adjustSpeed(tags([["cycleway", "no"]]), 15), plain);
+  assert.equal(bike.adjustSpeed(tags([["cycleway", "none"]]), 15), plain);
+  // Preference is not licence to invent a speed nobody rides at.
+  assert.ok(bike.adjustSpeed(tags([["cycleway", "track"]]), 18) <= 20);
+});

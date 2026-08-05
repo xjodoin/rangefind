@@ -35,24 +35,53 @@ const CAR_SPEEDS = {
   road: 30
 };
 
+// Effective cycling speeds, not the speed a bicycle is capable of. A
+// segregated cycleway is ridden at a steady pace; the same effort on an
+// arterial is spent stopping, waiting and threading past traffic, and comes
+// out slower over the distance. Pricing that honestly is also what makes the
+// router prefer cycle infrastructure: with a cycleway only a shade quicker
+// than a primary road, any cycleway more than a few percent longer lost, and
+// riders were sent down main roads to save seconds.
 const BIKE_SPEEDS = {
   cycleway: 18,
-  primary: 16,
-  primary_link: 16,
-  secondary: 17,
-  secondary_link: 17,
-  tertiary: 17,
-  tertiary_link: 17,
-  unclassified: 17,
-  residential: 16,
   living_street: 14,
-  service: 14,
-  track: 12,
+  residential: 15,
+  unclassified: 15,
+  tertiary: 15,
+  tertiary_link: 15,
+  secondary: 13,
+  secondary_link: 13,
+  primary: 10,
+  primary_link: 10,
+  service: 12,
+  track: 11,
   path: 12,
-  footway: 8,
-  pedestrian: 8,
-  road: 15
+  footway: 6,
+  pedestrian: 6,
+  road: 14
 };
+
+/**
+ * Cycle infrastructure painted on an ordinary road.
+ *
+ * A residential street with a marked lane is a better ride than one without,
+ * and OSM says so on the road itself rather than as a separate way — which
+ * the profile previously read only to work out contraflow, never preference.
+ */
+const CYCLE_INFRASTRUCTURE = new Set([
+  "lane", "track", "opposite_lane", "opposite_track", "opposite",
+  "share_busway", "opposite_share_busway", "shared_lane", "sidepath",
+  "segregated", "crossing", "yes"
+]);
+
+function bikeInfrastructureFactor(tags) {
+  if (tags.get("bicycle") === "designated") return 1.2;
+  for (const key of ["cycleway", "cycleway:both", "cycleway:left", "cycleway:right"]) {
+    const value = tags.get(key);
+    if (value && CYCLE_INFRASTRUCTURE.has(value)) return 1.2;
+  }
+  return 1;
+}
 
 const FOOT_SPEEDS = {
   footway: 5,
@@ -153,6 +182,9 @@ export const PROFILES = {
       const access = tags.get("access");
       if (access != null && ACCESS_DENIED.has(access)) return false;
       return true;
+    },
+    adjustSpeed(tags, speed) {
+      return Math.min(20, speed * bikeInfrastructureFactor(tags));
     },
     oneway(tags) {
       if (tags.get("oneway:bicycle") === "no") return 0;
@@ -309,6 +341,10 @@ function waySpeeds(tags, profile) {
     const cap = profile.name === "car" ? 30 : profile.name === "bike" ? 8 : Infinity;
     forward = Math.min(forward, cap);
     backward = Math.min(backward, cap);
+  }
+  if (profile.adjustSpeed) {
+    forward = profile.adjustSpeed(tags, forward);
+    backward = profile.adjustSpeed(tags, backward);
   }
   // The posted limit is what a sign says; the modelled speed above also folds
   // in surface, smoothness and the profile cap, so the two must not be

@@ -1278,6 +1278,11 @@ export async function openRouteGraph(options) {
           meters,
           seconds,
           at: edgeStartIndex,
+          // The kind of road this step runs on, as an index into the root's
+          // class table. What a route is made of is otherwise invisible: a
+          // cycling profile that claims to prefer cycleways can only be
+          // checked against the classes it actually chose.
+          roadClass: cell.classes ? cell.classes[edge] : 0,
           lanes: laneListOf(approachCell, approachEdge),
           limitMeters: new Map(speedLimitKmh ? [[speedLimitKmh, meters]] : [])
         });
