@@ -53,6 +53,29 @@ function metersPerLatE7() {
   return EARTH_RADIUS_METERS * E7_RAD;
 }
 
+/**
+ * How close two junction markers of the same kind have to be before they are
+ * treated as the one intersection. Sized for the width of a signalised
+ * crossroads, and well under the gap between two intersections a driver would
+ * ever count separately.
+ */
+const JUNCTION_MERGE_METERS = 30;
+
+/**
+ * Whether a junction marker describes the same intersection as the last one
+ * reported. Same kind and close enough to be the far side of one crossroads
+ * rather than the next one along.
+ */
+export function mergesWithPreviousJunction(previous, kind, latE7, lonE7) {
+  if (!previous || previous.kind !== kind) return false;
+  return haversineMetersE7(
+    Math.round(previous.lat * 1e7),
+    Math.round(previous.lon * 1e7),
+    latE7,
+    lonE7
+  ) < JUNCTION_MERGE_METERS;
+}
+
 function haversineMetersE7(latA, lonA, latB, lonB) {
   const dLat = (latB - latA) * E7_RAD;
   const dLon = (lonB - lonA) * E7_RAD;
@@ -1196,12 +1219,29 @@ export async function openRouteGraph(options) {
         const pointCount = points.length / 2;
         const pointIndex = Math.min((packed - kind) / 8, pointCount - 1);
         const along = pointCount > 1 ? pointIndex / (pointCount - 1) : 1;
-        junctions.push({
+        // A wide intersection carries a signal node on each approach, and a
+        // crossing on each side of it — separate nodes in OSM, metres apart,
+        // all describing the one intersection a driver is about to cross.
+        // Reported as they are, the same junction is drawn two or three
+        // times over. Consecutive markers of the same kind that are within a
+        // few metres of each other are that one thing.
+        const previous = junctions[junctions.length - 1];
+        const lat = points[pointIndex * 2] / 1e7;
+        const lon = points[pointIndex * 2 + 1] / 1e7;
+        const duplicate = mergesWithPreviousJunction(
+          previous,
           kind,
-          lat: points[pointIndex * 2] / 1e7,
-          lon: points[pointIndex * 2 + 1] / 1e7,
-          atMeters: Math.round((distanceMeters + (cell.distsDm[edge] / 10) * along) * 10) / 10
-        });
+          points[pointIndex * 2],
+          points[pointIndex * 2 + 1]
+        );
+        if (!duplicate) {
+          junctions.push({
+            kind,
+            lat,
+            lon,
+            atMeters: Math.round((distanceMeters + (cell.distsDm[edge] / 10) * along) * 10) / 10
+          });
+        }
       }
       const meters = cell.distsDm[edge] / 10;
       const seconds = cellEdgeWeight(cell, edge, factors) / 10;

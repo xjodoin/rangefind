@@ -981,3 +981,25 @@ test("turn:lanes tags parse into per-direction movement bits", async () => {
   assert.deepEqual(wayLanes(tags([["turn:lanes", "sideways|"]]), true).forward, [0, 0]);
   assert.deepEqual(wayLanes(tags([]), true).forward, []);
 });
+
+test("one intersection reports one junction, however many nodes describe it", async () => {
+  // A wide signalised crossroads is tagged in OSM as a signal node on each
+  // approach, with a pedestrian crossing either side of it: separate nodes,
+  // metres apart, all describing the one intersection a driver is about to
+  // cross. Reported as they are, the map draws two sets of lights for it.
+  const { mergesWithPreviousJunction } = await import("../src/route_graph_query.js");
+  const at = (lat, lon, kind) => ({ lat, lon, kind });
+  const SIGNAL = 1, STOP = 2, CROSSING = 5;
+
+  // Roughly 9 m north of 45.5, -73.6: the far approach of one crossroads.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), SIGNAL, 455000800, -736000000), true);
+  // Crossings on either side of the same intersection, likewise.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, CROSSING), CROSSING, 455001500, -736000000), true);
+  // A different kind is a different thing, however close: a stop line beside
+  // a crossing is two facts about the road, not one drawn twice.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), STOP, 455000200, -736000000), false);
+  // Far enough apart to be the next intersection along, roughly 90 m.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), SIGNAL, 455008000, -736000000), false);
+  // The first junction of a drive has nothing to merge with.
+  assert.equal(mergesWithPreviousJunction(null, SIGNAL, 455000000, -736000000), false);
+});
