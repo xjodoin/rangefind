@@ -19,6 +19,14 @@ byte layouts, topic grammar, bin tables, the deterministic aggregation
 algorithm, validation rules, state machines, and test vectors — is
 [pulsemesh-protocol.md](pulsemesh-protocol.md).
 
+The anonymous traffic layer described here is one of **two channels**
+sharing the same transport, cell vocabulary, segment identity and epoch
+discipline. The second — authenticated tracking of a single vehicle for
+a bounded audience, for school-bus and delivery use cases — inverts
+almost every property below and is specified separately in
+[pulsemesh-threads.md](pulsemesh-threads.md). See
+[Second channel: threads](#second-channel-threads).
+
 ## Design rules
 
 1. **The static index is the shared truth.** Map packs, the route graph,
@@ -220,6 +228,46 @@ batching) lives behind `fetch()`. The engine contributes: epoch checks,
 confidence/age blending, closure semantics, corridor-exact search,
 graceful degradation, and the `result.live` application report.
 
+## Second channel: threads
+
+The traffic channel answers *"how fast is this road"* from many
+anonymous, corroborated, unlinkable reports. A second class of product
+asks the opposite question — *"where is this specific vehicle, and when
+does it reach my stop"* — for parents following a school bus or a
+recipient following a courier. That is a single authoritative publisher,
+a bounded audience, end-to-end confidentiality, and a run that ends:
+every property above, inverted. It is therefore a separate record type
+with a separate trust model, not a mode of this one.
+[pulsemesh-threads.md](pulsemesh-threads.md) is the specification;
+three things about it belong here.
+
+**What it reuses.** Transport, XYZ cells, the 5-minute topic rotation,
+epoch discipline, TTL philosophy, codec conventions, and — critically —
+the segment id: a thread reports position as `(segment, ratio)` from
+`snap()`, the same identity the router and the traffic aggregate speak.
+
+**Why it belongs in rangefind.** A thread carries position only. The
+arrival time is computed *on the subscriber's device*, by routing from
+that position to their stop under this channel's live metric
+(`matrix({ points, live })` over the planned order, already shipped —
+*not* `itinerary()`, which reorders stops). The publisher never
+learns which stop a subscriber cares about — unlike every server-side
+ETA, which necessarily knows each recipient's address. Neither channel
+is compelling alone; together they replace the tracking servers these
+products run today, where continuous child or courier positions sit in
+a vendor database indefinitely, joined to accounts.
+
+**Where the two must not touch.** Threads never feed traffic
+aggregates — a signed single-source record entering a corroborated
+aggregate would turn a fleet key into a traffic authority, the exact
+property this channel is built not to have. And a device publishing a
+thread must not also contribute anonymously for the same segment and
+bucket, or the two are trivially correlated and the anonymous
+contribution is de-anonymized by its own encrypted twin. That rule
+benches fleets, which would otherwise be the best sustained
+contributors in the design; whether a weaker rule survives timing
+analysis is the most valuable open question in either document.
+
 ## Phased plan
 
 1. **Loopback (no networking).** `createStaticLiveProvider` +
@@ -237,6 +285,11 @@ graceful degradation, and the `result.live` application report.
    sparsity; read-only mode default.
 4. **Credential service + private forwarding.** Blind-token issuance and
    the optional two-hop reporting mode, clearly labeled in product copy.
+5. **Threads.** The tracking channel, independent of phases 2–4 after
+   phase 1: its loopback milestone (T2 in
+   [pulsemesh-threads.md](pulsemesh-threads.md)) needs only the engine
+   and the crypto, and proves the local-ETA thesis with no networking.
+   Its pilot is a coarse-mode school run.
 
 ## Acceptance criteria (inherited, still binding)
 
@@ -258,3 +311,9 @@ graceful degradation, and the `result.live` application report.
   the cell; measure in phase 2).
 - Cross-epoch handover during index republishes (overlap window length).
 - Bandwidth ceilings per zone under stadium-exit-grade density.
+- Whether a fleet publishing a thread can also contribute anonymously
+  without becoming correlatable — the crossover question between the
+  two channels ([threads §10](pulsemesh-threads.md#10-rules-between-the-two-channels)).
+- Whether keepers and thread mailboxes are the same node profile; both
+  are blind, TTL-bounded stores answering padded requests, and an
+  operator running one would rather not run two.

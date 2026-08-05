@@ -246,9 +246,14 @@ class MapsViewModel(
                 ?.let { spec -> return spec.id.removeSuffix(spec.mode.suffix) }
         }
         val places = REGION_CATALOG.map { it.id.removeSuffix(it.mode.suffix) }.distinct()
-        // A place already downloaded for this very mode is the least
-        // surprising answer.
-        places.firstOrNull { regionStore.isReady(mode.regionId(it)) }?.let { return it }
+        // A place already downloaded for this very mode, and of those the one
+        // downloaded most recently. Taking the first in catalogue order sent
+        // a driver in Quebec at a Luxembourg index that happened to be listed
+        // above it and still on the device, which then refused every
+        // destination as outside its coverage.
+        places.filter { regionStore.isReady(mode.regionId(it)) }
+            .maxByOrNull { regionStore.updatedAt(mode.regionId(it)) }
+            ?.let { return it }
         // Otherwise the one most recently downloaded: catalogue order is an
         // authoring accident, and picking by it asked the host for a
         // Luxembourg cycling index that was never published.
@@ -407,6 +412,25 @@ class MapsViewModel(
                         ),
                         routes = null,
                         routeError = null
+                    )
+                }
+            }
+            .onFailure { error ->
+                // Failing silently left the previous index's coverage in place
+                // while the app claimed to be on the new one, so a destination
+                // well inside the new map could be refused as outside it. A
+                // switch that did not happen has to say so, and must not leave
+                // a boundary behind that no longer describes anything.
+                _state.update {
+                    it.copy(
+                        info = it.info?.copy(
+                            routing = false,
+                            routingError = error.message,
+                            routeBounds = null
+                        ),
+                        routes = null,
+                        routeError = error.message
+                            ?: context.getString(R.string.route_unavailable)
                     )
                 }
             }

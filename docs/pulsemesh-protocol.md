@@ -22,6 +22,15 @@ Status of each layer:
 | §2–§9 codecs, store, aggregation, provider adapter | specified here, unimplemented |
 | §10–§12 contributor/consumer/keeper behavior | specified here, unimplemented |
 | Blind tokens (proof type 2) | reserved, phase 4 |
+| Thread channel (PMT1/PMTP/PMP1/PMR1/PMM1) | separate spec, [pulsemesh-threads.md](pulsemesh-threads.md) |
+
+This document covers the **anonymous traffic channel** only. The
+authenticated tracking channel (school bus, delivery) reuses §1's
+conventions, §2's identifiers and §5.1's transport, but has its own
+records, trust model and topic namespace; it is specified in
+[pulsemesh-threads.md](pulsemesh-threads.md). The `PMT`, `PMP`, `PMR`
+and `PMM` magic prefixes are reserved for it and MUST be ignored (not
+treated as errors) by a traffic-only implementation.
 
 ## 1. Conventions
 
@@ -312,6 +321,11 @@ within ±4× of the defaults.
 - `topicWindow` — decimal `floor(unixSeconds / 300)`.
 - `shard` — decimal 0..15, of the record's z15 cell:
   `shard = SHA256(utf8("<x15>/<y15>"))[0] mod 16`.
+
+The path element after the protocol version is a z9 `zoneX`, i.e. a
+decimal number. The non-numeric element `t` is reserved for the thread
+channel's key-derived topics (`…/1/t/<epochPrefix16hex>/<tagHex16>`); a
+traffic-only implementation MUST NOT subscribe to it.
 
 A publisher emits each PMB1/PMI1 to the topic of its z15 cell's shard
 for the **current** window. Subscribers join current-window topics and,

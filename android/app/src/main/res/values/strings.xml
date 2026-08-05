@@ -86,6 +86,16 @@
     <string name="nav_bear_right_in_meters">In %1$d meters, bear right onto %2$s.</string>
     <string name="nav_uturn_now">Now, make a U-turn onto %1$s.</string>
     <string name="nav_uturn_in_meters">In %1$d meters, make a U-turn onto %2$s.</string>
+    <string name="nav_exit_now">Now, take the exit.</string>
+    <string name="nav_exit_in_meters">In %1$d meters, take the exit.</string>
+    <string name="nav_exit_onto_now">Now, take the exit onto %1$s.</string>
+    <string name="nav_exit_onto_in_meters">In %1$d meters, take the exit onto %2$s.</string>
+    <string name="nav_merge_now">Now, merge.</string>
+    <string name="nav_merge_in_meters">In %1$d meters, merge.</string>
+    <string name="nav_merge_onto_now">Now, merge onto %1$s.</string>
+    <string name="nav_merge_onto_in_meters">In %1$d meters, merge onto %2$s.</string>
+    <string name="nav_exit_label">Exit</string>
+    <string name="nav_merge_label">Merge</string>
     <string name="nav_rerouting">Rerouting.</string>
     <string name="nav_switching_route">Switching to the other route.</string>
 

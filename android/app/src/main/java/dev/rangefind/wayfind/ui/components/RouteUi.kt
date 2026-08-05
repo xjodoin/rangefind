@@ -62,7 +62,12 @@ import androidx.compose.material.icons.filled.DirectionsBike
 import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.DirectionsWalk
 import dev.rangefind.wayfind.engine.LaneTurn
+import androidx.compose.material.icons.filled.CallSplit
+import androidx.compose.material.icons.filled.MergeType
+import dev.rangefind.wayfind.nav.ItineraryLine
+import dev.rangefind.wayfind.nav.Maneuver
 import dev.rangefind.wayfind.nav.TravelMode
+import dev.rangefind.wayfind.nav.itineraryOf
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.nav.postsRectangularSpeedLimits
 import dev.rangefind.wayfind.engine.Route
@@ -293,7 +298,7 @@ fun DirectionsSheet(
 private fun StepsPreview(route: Route) {
     val context = LocalContext.current
     LazyColumn(Modifier.heightIn(max = 132.dp)) {
-        itemsIndexed(route.steps.take(12)) { index, step ->
+        itemsIndexed(itineraryOf(route) { i -> turnDeltaAtStep(route, i) }.take(12)) { _, line ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -301,21 +306,29 @@ private fun StepsPreview(route: Route) {
                     .padding(horizontal = 20.dp, vertical = 7.dp)
             ) {
                 Icon(
-                    maneuverIcon(route, index),
+                    itineraryIcon(route, line),
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(Modifier.width(14.dp))
                 Text(
-                    step.name.ifBlank { stringResource(R.string.directions_unnamed_road) },
+                    line.name.ifBlank {
+                        stringResource(
+                            when (line.maneuver) {
+                                Maneuver.Exit -> R.string.nav_exit_label
+                                Maneuver.Merge -> R.string.nav_merge_label
+                                else -> R.string.directions_unnamed_road
+                            }
+                        )
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    formatDistance(context, step.meters),
+                    formatDistance(context, line.meters),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -385,8 +398,12 @@ fun NavigationOverlay(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        if (route != null && nav != null) maneuverIcon(route, nav.stepIndex + 1)
-                        else Icons.Filled.Straight,
+                        when {
+                            nav?.maneuver == Maneuver.Exit -> Icons.Filled.CallSplit
+                            nav?.maneuver == Maneuver.Merge -> Icons.Filled.MergeType
+                            route != null && nav != null -> maneuverIcon(route, nav.stepIndex + 1)
+                            else -> Icons.Filled.Straight
+                        },
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(42.dp)
@@ -739,7 +756,9 @@ private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
             modifier = Modifier
-                .size(width = 48.dp, height = 56.dp)
+                // Wide enough for three digits: a 100 km/h limit was being
+                // clipped by the plate meant to display it.
+                .size(width = 56.dp, height = 56.dp)
                 .shadow(4.dp, SIGN_PLATE)
                 .background(Color.White, SIGN_PLATE)
                 .border(2.5.dp, Color(0xFF14161D), SIGN_PLATE)
@@ -759,8 +778,10 @@ private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
             Text(
                 limitKmh.toString(),
                 style = MaterialTheme.typography.headlineSmall,
-                fontSize = 27.sp,
+                fontSize = if (limitKmh >= 100) 23.sp else 27.sp,
                 lineHeight = 29.sp,
+                maxLines = 1,
+                softWrap = false,
                 fontWeight = FontWeight.Black,
                 color = Color(0xFF14161D)
             )
@@ -782,6 +803,26 @@ private fun SpeedLimitSign(limitKmh: Int, at: LatLon?) {
             color = Color(0xFF14161D)
         )
     }
+}
+
+/** The signed turn angle onto a step, the same way the maneuver glyph reads it. */
+private fun turnDeltaAtStep(route: Route, index: Int): Double {
+    val at = route.steps.getOrNull(index)?.at ?: return 0.0
+    val geometry = route.geometry
+    if (at <= 0 || at >= geometry.size - 1) return 0.0
+    return bearingDelta(
+        bearingDegrees(geometry[at - 1], geometry[at]),
+        bearingDegrees(geometry[at], geometry[at + 1])
+    )
+}
+
+private fun itineraryIcon(route: Route, line: ItineraryLine): ImageVector = when (line.maneuver) {
+    // A slip road curves gently whichever way it goes, so the arrow has to
+    // come from what the ramp does rather than from its geometry — otherwise
+    // leaving a motorway and joining one draw the same picture.
+    Maneuver.Exit -> Icons.Filled.CallSplit
+    Maneuver.Merge -> Icons.Filled.MergeType
+    else -> maneuverIcon(route, line.index)
 }
 
 private fun travelModeIcon(mode: TravelMode): ImageVector = when (mode) {

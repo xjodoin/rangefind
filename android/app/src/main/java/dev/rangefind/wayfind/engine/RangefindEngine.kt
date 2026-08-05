@@ -145,7 +145,13 @@ data class RouteStep(
      * right, as a bit set per lane. Empty when the road carried no lane tags;
      * a zero entry is a lane whose movements are unknown.
      */
-    val lanes: List<Int> = emptyList()
+    val lanes: List<Int> = emptyList(),
+    /**
+     * The kind of road this step runs on — "motorway", "motorway_link" and
+     * so on. A slip road is unnamed far more often than not, so its class is
+     * the only thing that says it is a ramp at all.
+     */
+    val roadClass: String = ""
 )
 
 /** Lane movement bits, matching the route index's own encoding. */

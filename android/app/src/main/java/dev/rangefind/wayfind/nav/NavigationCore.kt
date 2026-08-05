@@ -33,6 +33,8 @@ data class NavUpdate(
     val speedMps: Double,
     val speedLimitKmh: Int,
     val turnDelta: Double,
+    /** What the driver has to do next: turn, exit, merge or carry on. */
+    val maneuver: Maneuver,
     /** Lanes of the approach to the next maneuver, left to right. */
     val lanes: List<Int>,
     /** Which of those lanes lead where the route goes. */
@@ -226,7 +228,14 @@ class NavigationCore(private val context: Context) {
                 context.getString(R.string.nav_arrived)
             }
             offRoute -> null
-            else -> announcement(stepIndex, toManeuver, next?.name.orEmpty(), turnDelta)
+            else -> announcement(
+                stepIndex = stepIndex,
+                meters = toManeuver,
+                nextName = next?.name.orEmpty(),
+                turnDelta = turnDelta,
+                maneuver = maneuverOnto(route, stepIndex + 1, turnDelta),
+                beyondName = roadBeyondRamp(route, stepIndex + 1)
+            )
         }
 
         // Snapping the arrow to the route line is what keeps it steady on the
@@ -255,6 +264,7 @@ class NavigationCore(private val context: Context) {
                 route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0
             } else 0,
             turnDelta = turnDelta,
+            maneuver = maneuverOnto(route, stepIndex + 1, turnDelta),
             lanes = lanes,
             laneUsable = laneUsable,
             offRoute = offRoute,
@@ -264,13 +274,29 @@ class NavigationCore(private val context: Context) {
         )
     }
 
+    /** The first named road past a run of slip roads, which is where the ramp goes. */
+    private fun roadBeyondRamp(route: Route, from: Int): String {
+        var index = from
+        while (index < route.steps.size && route.steps[index].roadClass.endsWith("_link")) index++
+        return route.steps.getOrNull(index)?.name.orEmpty()
+    }
+
     private fun announcement(
         stepIndex: Int,
         meters: Double,
         nextName: String,
-        turnDelta: Double
+        turnDelta: Double,
+        maneuver: Maneuver,
+        beyondName: String
     ): String? {
-        if (nextName.isBlank()) return null
+        val ramp = maneuver == Maneuver.Exit || maneuver == Maneuver.Merge
+        // A slip road almost never has a name, and bailing on that left every
+        // motorway entrance and exit silent — the two instructions on a long
+        // drive a driver most needs spoken. A ramp is announced by what it is
+        // and where it leads, not by a name it does not have.
+        if (nextName.isBlank() && !ramp) return null
+        // Nothing to say about a road merely changing name underfoot.
+        if (maneuver == Maneuver.Continue && nextName.isBlank()) return null
         val threshold = ANNOUNCE_THRESHOLDS.firstOrNull { meters <= it }
         // The first instruction goes out as soon as the drive starts, however
         // far off the first maneuver is. Waiting for the 400 m threshold meant
@@ -284,14 +310,29 @@ class NavigationCore(private val context: Context) {
         announcedThreshold = threshold ?: Int.MAX_VALUE
         // "Now" only once the maneuver is genuinely at the windscreen; an
         // opening call from 2 km out still has to say how far.
-        return if (threshold != null && threshold <= IMMINENT_METERS) {
+        val imminent = threshold != null && threshold <= IMMINENT_METERS
+        val rounded = (meters / 50).roundToInt() * 50
+        if (ramp) {
+            val target = beyondName.ifBlank { nextName }
+            return when {
+                maneuver == Maneuver.Exit && target.isBlank() ->
+                    if (imminent) context.getString(R.string.nav_exit_now)
+                    else context.getString(R.string.nav_exit_in_meters, rounded)
+                maneuver == Maneuver.Exit ->
+                    if (imminent) context.getString(R.string.nav_exit_onto_now, target)
+                    else context.getString(R.string.nav_exit_onto_in_meters, rounded, target)
+                target.isBlank() ->
+                    if (imminent) context.getString(R.string.nav_merge_now)
+                    else context.getString(R.string.nav_merge_in_meters, rounded)
+                else ->
+                    if (imminent) context.getString(R.string.nav_merge_onto_now, target)
+                    else context.getString(R.string.nav_merge_onto_in_meters, rounded, target)
+            }
+        }
+        return if (imminent) {
             context.getString(nowPhraseFor(turnDelta), nextName)
         } else {
-            context.getString(
-                inMetersPhraseFor(turnDelta),
-                (meters / 50).roundToInt() * 50,
-                nextName
-            )
+            context.getString(inMetersPhraseFor(turnDelta), rounded, nextName)
         }
     }
 

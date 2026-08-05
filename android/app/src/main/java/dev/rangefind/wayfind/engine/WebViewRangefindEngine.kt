@@ -282,6 +282,7 @@ private fun JSONObject.toRoute(): Route {
                 meters = it.optDouble("meters"),
                 seconds = it.optDouble("seconds"),
                 at = it.optInt("at"),
+                roadClass = it.optString("roadClass", ""),
                 lanes = it.optJSONArray("lanes")?.let { array ->
                     List(array.length()) { index -> array.optInt(index) }
                 } ?: emptyList(),

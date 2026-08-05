@@ -85,6 +85,16 @@
     <string name="nav_bear_right_in_meters">Dans %1$d m\u00e8tres, serrez \u00e0 droite sur %2$s.</string>
     <string name="nav_uturn_now">Faites demi-tour sur %1$s.</string>
     <string name="nav_uturn_in_meters">Dans %1$d m\u00e8tres, faites demi-tour sur %2$s.</string>
+    <string name="nav_exit_now">Prenez la sortie.</string>
+    <string name="nav_exit_in_meters">Dans %1$d mètres, prenez la sortie.</string>
+    <string name="nav_exit_onto_now">Prenez la sortie vers %1$s.</string>
+    <string name="nav_exit_onto_in_meters">Dans %1$d mètres, prenez la sortie vers %2$s.</string>
+    <string name="nav_merge_now">Insérez-vous.</string>
+    <string name="nav_merge_in_meters">Dans %1$d mètres, insérez-vous.</string>
+    <string name="nav_merge_onto_now">Insérez-vous sur %1$s.</string>
+    <string name="nav_merge_onto_in_meters">Dans %1$d mètres, insérez-vous sur %2$s.</string>
+    <string name="nav_exit_label">Sortie</string>
+    <string name="nav_merge_label">Insertion</string>
     <string name="nav_rerouting">Recalcul de l\'itinéraire.</string>
     <string name="nav_switching_route">Passage à l\'autre itinéraire.</string>
 
