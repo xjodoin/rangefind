@@ -219,23 +219,54 @@ class MapsViewModel(
      * setting behind all three modes rather than three that can disagree.
      */
     private fun routeBaseFor(mode: TravelMode): String {
-        val place = placeOfActiveRegion()
-        val id = place?.let { mode.regionId(it) }
-        if (id != null && regionStore.isReady(id)) return regionServer.baseUrlFor(id)
-        if (id != null) return regionPrefs.sourceUrlOf(id)
+        val id = currentPlace(mode)?.let { mode.regionId(it) }
+        if (id != null) {
+            // Kept on the device wins. Otherwise the same host the regions are
+            // fetched from serves it, which is a setting the user can reach
+            // and correct — unlike the build's own default.
+            if (regionStore.isReady(id)) return regionServer.baseUrlFor(id)
+            return regionPrefs.sourceUrlOf(id)
+        }
         return if (mode == TravelMode.Car) routeBase else routeBase.trimEnd('/') + mode.suffix + "/"
     }
 
-    /** The place behind the active region, with any mode suffix removed. */
-    private fun placeOfActiveRegion(): String? {
-        val active = regionPrefs.activeRegion ?: return null
-        return REGION_CATALOG.firstOrNull { it.id == active }
-            ?.let { spec -> spec.id.removeSuffix(spec.mode.suffix) }
+    /**
+     * The area routing is about.
+     *
+     * The active region names it. With no region chosen the network is the
+     * source, and it still has to point somewhere: a place the device has
+     * already downloaded something for is the one the user is demonstrably
+     * interested in. Falling through to the build's own base instead sent a
+     * physical phone at the emulator's loopback alias, which resolves nowhere
+     * and times out as "no answer from the server".
+     */
+    private fun currentPlace(mode: TravelMode): String? {
+        regionPrefs.activeRegion?.let { active ->
+            REGION_CATALOG.firstOrNull { it.id == active }
+                ?.let { spec -> return spec.id.removeSuffix(spec.mode.suffix) }
+        }
+        val places = REGION_CATALOG.map { it.id.removeSuffix(it.mode.suffix) }.distinct()
+        // A place already downloaded for this very mode is the least
+        // surprising answer.
+        places.firstOrNull { regionStore.isReady(mode.regionId(it)) }?.let { return it }
+        // Otherwise the one most recently downloaded: catalogue order is an
+        // authoring accident, and picking by it asked the host for a
+        // Luxembourg cycling index that was never published.
+        return places
+            .mapNotNull { place ->
+                TravelMode.entries
+                    .map { regionStore.updatedAt(it.regionId(place)) }
+                    .maxOrNull()
+                    ?.takeIf { it > 0 }
+                    ?.let { place to it }
+            }
+            .maxByOrNull { it.second }
+            ?.first
     }
 
     /** Which modes this area can actually route, downloaded or served. */
     private fun modesAvailable(): Set<TravelMode> {
-        val place = placeOfActiveRegion()
+        val place = currentPlace(_state.value.mode)
             // Without a region the network base is the only source, and it
             // publishes one index per profile alongside itself. Offering all
             // three is right there; a mode that turns out to be missing
