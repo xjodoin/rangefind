@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.4.7 — 2026-08-05
+
+### Performance
+
+- National geo builds now preload hot code-store fields instead of falling
+  back to millions of tiny random reads when the complete store narrowly
+  exceeds its memory budget. OSM builds use a bounded 3 GiB complete-store
+  budget and a larger capsule-page cache.
+- Geo leaf gzip work uses the ordered builder worker pool, capsule page indexes
+  are preloaded and read in monotonic batches, and category-cell generation no
+  longer allocates per-leaf dedupe maps, joined keys, or one buffer per route.
+  Geo stages also report coordinate, leaf, external-sort, and merge progress.
+
 ### Added
 
 - Static routing and itinerary planning (`rangefind/route`, `rangefind/route/node`,
