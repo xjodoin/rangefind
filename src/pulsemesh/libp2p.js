@@ -14,9 +14,18 @@
 // packages are optional peer dependencies, loaded dynamically — engine
 // consumers that never touch the wire mesh install nothing.
 
-import { SYNC_PROTOCOL } from "./topics.js";
+import { BOND_PROTOCOL, SYNC_PROTOCOL } from "./topics.js";
+import { encodePMA1 } from "./codec.js";
+import { mintBond as mineBondProof } from "./bond.js";
 import { sha256 } from "./sha256.js";
 import { pushVarint } from "../binary.js";
+
+/** Browsers have no sockets to listen on, so the transport set differs. */
+function detectProfile() {
+  return typeof globalThis.window !== "undefined" && typeof globalThis.document !== "undefined"
+    ? "browser"
+    : "node";
+}
 
 const REQUEST_TIMEOUT_MS = 10_000;
 // A responder must not be pinnable by a peer that opens a stream and then
@@ -32,29 +41,81 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024;
  * keeps everything else). Pass `listen` multiaddrs and optional
  * `bootstrapPeers` to dial on start.
  */
-export async function createPulseMeshHost({ listen = ["/ip4/127.0.0.1/tcp/0"], bootstrapPeers = [] } = {}) {
-  const [{ createLibp2p }, { tcp }, { noise }, { yamux }, { identify }, { gossipsub }] = await Promise.all([
+export async function createPulseMeshHost({
+  listen = null,
+  bootstrapPeers = [],
+  // "node" — TCP, for keepers and servers. "browser" — WebSockets to
+  // reach keepers plus WebRTC for peer-to-peer, and Circuit Relay v2 for
+  // NAT traversal, which is the only combination a browser tab can use.
+  // Product copy never calls relayed traffic anonymous (§5.1).
+  profile = detectProfile(),
+  // Thread discovery (threads §4.2) needs content routing. Off by
+  // default: the traffic channel finds peers by zone and does not want
+  // the extra chatter.
+  dht = false
+} = {}) {
+  const browser = profile === "browser";
+  const [{ createLibp2p }, { noise }, { yamux }, { identify }, { gossipsub }] = await Promise.all([
     import("libp2p"),
-    import("@libp2p/tcp"),
     import("@chainsafe/libp2p-noise"),
     import("@chainsafe/libp2p-yamux"),
     import("@libp2p/identify"),
     import("@chainsafe/libp2p-gossipsub")
   ]);
+
+  const transports = [];
+  if (browser) {
+    const [{ webSockets }, { webRTC }, { circuitRelayTransport }] = await Promise.all([
+      import("@libp2p/websockets"),
+      import("@libp2p/webrtc"),
+      import("@libp2p/circuit-relay-v2")
+    ]);
+    // WebSockets reaches keepers over WSS; WebRTC carries browser↔browser
+    // once a relay has introduced them.
+    transports.push(webSockets(), webRTC(), circuitRelayTransport({ discoverRelays: 1 }));
+  } else {
+    const { tcp } = await import("@libp2p/tcp");
+    transports.push(tcp());
+  }
+
+  const services = {
+    identify: identify(),
+    pubsub: gossipsub({
+      globalSignaturePolicy: "StrictNoSign",
+      msgIdFn: message => sha256(message.data).subarray(0, 20),
+      allowPublishToZeroTopicPeers: true,
+      emitSelf: false
+    })
+  };
+  if (dht) {
+    const { kadDHT, passthroughMapper, removePrivateAddressesMapper } = await import("@libp2p/kad-dht");
+    const options = typeof dht === "object" ? dht : {};
+    // The default mapper strips private addresses, which is right for a
+    // public DHT and fatal on loopback or a LAN: peers connect happily
+    // and never enter each other's routing tables, so `provide` waits
+    // forever for closest peers that can never be found. `scope` picks
+    // the mapper explicitly rather than leaving it to a default that
+    // silently does nothing on the network you are testing on.
+    const scope = options.scope ?? "public";
+    services.dht = kadDHT({
+      // `clientMode` in the browser: a tab answers no routing queries but
+      // can still publish and resolve provider records.
+      clientMode: options.clientMode ?? browser,
+      protocol: options.protocol ?? "/rangefind/pulsemesh/kad/1",
+      peerInfoMapper: options.peerInfoMapper
+        ?? (scope === "public" ? removePrivateAddressesMapper : passthroughMapper),
+      ...(options.kadOptions || {})
+    });
+  }
+
   const host = await createLibp2p({
-    addresses: { listen },
-    transports: [tcp()],
+    // A browser cannot listen on a socket; it dials out and accepts
+    // relayed circuits.
+    addresses: { listen: listen ?? (browser ? ["/p2p-circuit", "/webrtc"] : ["/ip4/127.0.0.1/tcp/0"]) },
+    transports,
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    services: {
-      identify: identify(),
-      pubsub: gossipsub({
-        globalSignaturePolicy: "StrictNoSign",
-        msgIdFn: message => sha256(message.data).subarray(0, 20),
-        allowPublishToZeroTopicPeers: true,
-        emitSelf: false
-      })
-    }
+    services
   });
   for (const address of bootstrapPeers) {
     try {
@@ -138,7 +199,69 @@ function framed(payload) {
 export function createLibp2pNetwork(host) {
   let meshNode = null;
   const subscriptions = new Set();
-  const stats = { gossipIn: 0, gossipOut: 0, requests: 0, responses: 0, served: 0 };
+  const stats = { gossipIn: 0, gossipOut: 0, requests: 0, responses: 0, served: 0, bondsSent: 0, bondsReceived: 0 };
+
+  // §5.4 admission. `ownBondBytes` is set by mintBond() and then pushed
+  // to every peer we are connected to now or connect to later. Presenting
+  // is idempotent per peer — the receiver's registry just extends expiry.
+  let ownBondBytes = null;
+  const presentedTo = new Set();
+
+  const presentBond = async peerIdStr => {
+    if (!ownBondBytes || presentedTo.has(peerIdStr)) return;
+    const connection = host.getConnections().find(candidate => candidate.remotePeer.toString() === peerIdStr);
+    if (!connection) return;
+    presentedTo.add(peerIdStr);
+    try {
+      const stream = await connection.newStream(BOND_PROTOCOL);
+      await stream.sink((async function* () {
+        yield framed(ownBondBytes);
+      })());
+      stats.bondsSent++;
+      stream.close().catch(() => {});
+    } catch {
+      // The peer may not speak the bond protocol (older build, consumer
+      // profile); it will simply never accept our proofType-3 records,
+      // which is its right. Retry on the next connect event.
+      presentedTo.delete(peerIdStr);
+    }
+  };
+
+  const onPeerConnect = event => {
+    const peerIdStr = event.detail?.toString?.();
+    if (peerIdStr) presentBond(peerIdStr);
+  };
+
+  // One framed PMA1 per stream, no response. The peerId comes from the
+  // connection — the single input a sender cannot forge — and is the
+  // value the bond's seed is bound to.
+  const onBondStream = ({ stream, connection }) => {
+    const fromPeer = connection.remotePeer.toString();
+    let handled = false;
+    const deadline = setTimeout(() => {
+      stream.abort?.(new Error("PulseMesh bond read timed out."));
+    }, SERVE_TIMEOUT_MS);
+    if (typeof deadline.unref === "function") deadline.unref();
+    const assemble = frameAssembler(payload => {
+      if (handled || !meshNode) return;
+      handled = true;
+      stats.bondsReceived++;
+      meshNode.registerBond(payload, fromPeer, meshNode.clock());
+    });
+    (async () => {
+      try {
+        for await (const chunk of stream.source) {
+          assemble(chunk);
+          if (handled) break;
+        }
+      } catch {
+        // A malformed frame or an aborted stream registers nothing.
+      } finally {
+        clearTimeout(deadline);
+        stream.close?.().catch?.(() => {});
+      }
+    })();
+  };
 
   // "gossipsub:message", not "message". Both fire once per delivered
   // message, but only this one carries `propagationSource` — the peer
@@ -192,14 +315,17 @@ export function createLibp2pNetwork(host) {
   };
 
   host.services.pubsub.addEventListener("gossipsub:message", onGossip);
+  host.addEventListener("peer:connect", onPeerConnect);
   // Registration is async. Callers that announce readiness (a keeper
   // printing "listening") must await `ready` first, or a peer that dials
   // immediately has its first stream rejected. The rejection is caught
   // here rather than left floating: an unhandled one — from a duplicate
   // protocol registration, say — would take the process down.
   let registrationError = null;
-  const ready = Promise.resolve(host.handle(SYNC_PROTOCOL, onSyncStream))
-    .catch(error => { registrationError = error; });
+  const ready = Promise.all([
+    Promise.resolve(host.handle(SYNC_PROTOCOL, onSyncStream)),
+    Promise.resolve(host.handle(BOND_PROTOCOL, onBondStream))
+  ]).catch(error => { registrationError = error; });
   const scheduled = new Set();
 
   return {
@@ -210,6 +336,30 @@ export function createLibp2pNetwork(host) {
     register(node) {
       if (meshNode && meshNode !== node) throw new Error("One MeshNode per libp2p host.");
       meshNode = node;
+    },
+    /**
+     * §5.4: mines this host's admission bond for the current bucket and
+     * presents it to every connected peer (and, via peer:connect, every
+     * future one). Chunked — safe to call on a UI thread; meant for the
+     * background, once per BOND_LIFETIME, ideally while charging. Returns
+     * true when minted, false when the budget or signal ended the search.
+     */
+    async mintBond({ budgetMillis = null, signal = null, chunkMillis = 10 } = {}) {
+      if (!meshNode) throw new Error("register(node) before mintBond().");
+      const bond = await mineBondProof({
+        epoch32: meshNode.epoch32,
+        peerId: host.peerId.toString(),
+        constants: meshNode.constants,
+        nowMillis: meshNode.clock(),
+        budgetMillis,
+        signal,
+        chunkMillis
+      });
+      if (!bond) return false;
+      ownBondBytes = encodePMA1(bond);
+      presentedTo.clear();
+      await Promise.all(host.getPeers().map(peer => presentBond(peer.toString())));
+      return true;
     },
     subscribe(_nodeId, topic) {
       subscriptions.add(topic);
@@ -290,6 +440,7 @@ export function createLibp2pNetwork(host) {
      */
     async close() {
       host.services.pubsub.removeEventListener("gossipsub:message", onGossip);
+      host.removeEventListener("peer:connect", onPeerConnect);
       for (const timer of scheduled) clearTimeout(timer);
       scheduled.clear();
       for (const topic of subscriptions) {
@@ -302,6 +453,7 @@ export function createLibp2pNetwork(host) {
       subscriptions.clear();
       await ready;
       await host.unhandle(SYNC_PROTOCOL).catch(() => {});
+      await host.unhandle(BOND_PROTOCOL).catch(() => {});
       meshNode = null;
     }
   };

@@ -18,7 +18,6 @@ export interface PulseMeshConstants {
   TOPIC_OVERLAP: number;
   ANTI_ENTROPY_SECONDS: number;
   SHARDS: number;
-  POW_DIFFICULTY: number;
   EMIT_INTERVAL: number;
   RATE_SUSTAINED: number;
   RATE_BURST: number;
@@ -57,9 +56,18 @@ export interface PulseMeshConstants {
   INCIDENT_CELL_CAP: number;
   INCIDENT_PEER_RATE: number;
   INCIDENT_PEER_RATE_WINDOW: number;
-  INCIDENT_POW_MULTIPLIER: number;
   REFUTE_WEIGHT: number;
   CONTRADICTION_DECAY: number;
+  BOND_BIRTHDAY_BITS: number;
+  BOND_PAIR_DIFFICULTY: number;
+  BOND_LIFETIME: number;
+  BOND_OVERLAP: number;
+  BAN_MIN_SOURCES: number;
+  BAN_REMOTE_PENALTY: number;
+  BAN_PEER_RATE: number;
+  BAN_PEER_RATE_WINDOW: number;
+  BAN_TTL: number;
+  BAN_TARGET_CAP: number;
 }
 
 export declare const DEFAULT_CONSTANTS: Readonly<PulseMeshConstants>;
@@ -138,8 +146,82 @@ export interface EncodedRecord {
 
 export declare const MAGIC: Readonly<Record<string, string>>;
 export declare const PROOF_NONE: 0;
-export declare const PROOF_POW: 1;
+/** Value 1 was per-record proof-of-work in the drafts; burned, never reassigned. */
 export declare const PROOF_BLIND_TOKEN: 2;
+/** §5.4: proofless record vouched for by the delivering peer's bond. */
+export declare const PROOF_BOND: 3;
+
+// --- §5.4 identity bonds -------------------------------------------------
+
+export interface BondFields {
+  epochPrefix8: Uint8Array;
+  dayBucket: number;
+  birthdayBits: number;
+  pairDifficulty: number;
+  salt: number;
+  i: number;
+  j: number;
+}
+export declare const MAX_BIRTHDAY_BITS: 48;
+export declare function bondPhaseMillis(peerId: string, lifetimeSeconds: number): number;
+export declare function bondBucketForPeer(peerId: string, nowMillis: number, lifetimeSeconds: number): number;
+export declare function bondSeed(epoch32: Uint8Array, dayBucket: number, salt: number, peerId: string): Uint8Array;
+export declare function encodePMA1(bond: BondFields): Uint8Array;
+export declare function decodePMA1(bytes: Uint8Array): BondFields & { kind: "bond"; magic: "PMA1" };
+export declare function verifyBondProof(
+  seed32: Uint8Array, i: number, j: number, birthdayBits: number, pairDifficulty: number
+): boolean;
+export declare function solveBondProof(
+  seed32: Uint8Array,
+  birthdayBits: number,
+  pairDifficulty: number,
+  options?: {
+    chunkMillis?: number;
+    budgetMillis?: number | null;
+    signal?: AbortSignal | null;
+    yieldTo?: () => Promise<void>;
+    now?: () => number;
+    sliceIterations?: number;
+  }
+): Promise<{ i: number; j: number; hashes: number; tableBytes: number } | null>;
+export declare function mintBond(options: {
+  epoch32: Uint8Array;
+  peerId: string;
+  constants: Readonly<PulseMeshConstants>;
+  nowMillis?: number;
+  maxSalts?: number;
+  chunkMillis?: number;
+  budgetMillis?: number | null;
+  signal?: AbortSignal | null;
+  yieldTo?: () => Promise<void>;
+}): Promise<BondFields | null>;
+// --- §8.4 ban announcements ---------------------------------------------
+
+export declare const BAN_REASON_INVALID_RECORDS: 1;
+export interface BanAnnouncement {
+  kind: "ban";
+  magic: "PMX1";
+  epochPrefix8: Uint8Array;
+  targetHash16: Uint8Array;
+  reason: number;
+  timeBucket: number;
+  reportId: Uint8Array;
+}
+export declare function encodePMX1(fields: {
+  epochPrefix8: Uint8Array; targetHash16: Uint8Array; reason: number;
+  timeBucket: number; reportId: Uint8Array;
+}): Uint8Array;
+export declare function decodePMX1(bytes: Uint8Array): BanAnnouncement;
+/** The 16-byte handle PMX1 names — a hash, never the peerId itself. */
+export declare function banPeerHash16(peerId: string): Uint8Array;
+
+export declare function verifyBond(bond: BondFields, context: {
+  epoch32: Uint8Array;
+  previousEpoch32?: Uint8Array | null;
+  peerId: string;
+  constants: Readonly<PulseMeshConstants>;
+  nowMillis?: number;
+}): { ok: true; expiresMillis: number } | { ok: false; reason: string };
 export declare const POLARITY_REPORT: 1;
 export declare const POLARITY_CONFIRM: 2;
 export declare const POLARITY_REFUTE: 3;
@@ -166,16 +248,6 @@ export declare function decodeAny(bytes: Uint8Array): { kind: string; magic?: st
 export declare function segmentString(leafCell: number, geomRef: number): string;
 export declare function parseSegment(segment: string): { leafCell: number; geomRef: number };
 export declare function gossipMessageId(payload: Uint8Array): Uint8Array;
-export declare function verifyPow(
-  preimage: Uint8Array, epoch32: Uint8Array, nonce: Uint8Array, difficultyBits: number
-): boolean;
-export declare function minePow(
-  preimage: Uint8Array,
-  epoch32: Uint8Array,
-  difficultyBits: number,
-  options?: { startNonce?: number; maxIterations?: number }
-): { nonce: Uint8Array; iterations: number } | null;
-
 export declare function sha256(input: Uint8Array | number[]): Uint8Array;
 export declare function sha256Hex(input: Uint8Array | number[]): string;
 export declare function sha256Utf8(text: string): Uint8Array;
@@ -281,6 +353,9 @@ export declare class TrustLedger {
   constructor(options?: { constants?: Readonly<PulseMeshConstants>; clock?: () => number });
   get(peerId: string | null): number;
   penalizeValidation(peerId: string | null): void;
+  /** §8.4 corroborated remote testimony: bounded, clamped, never revokes. */
+  penalizeRemoteBan(peerId: string | null): void;
+  isFloored(peerId: string | null, nowMillis?: number): boolean;
   applyAggregateFeedback(aggregate: SegmentAggregate, entries: Array<StoreEntry<ContributionRecord>>): void;
 }
 
@@ -312,12 +387,17 @@ export declare function createValidator(options: {
 }): {
   validateContribution(
     payload: Uint8Array | ContributionRecord,
-    context?: { store?: PulseMeshStore | null; fromPeer?: string | null; topic?: unknown; nowMillis?: number }
+    context?: { store?: PulseMeshStore | null; fromPeer?: string | null; vouchPeer?: string | null; topic?: unknown; nowMillis?: number }
   ): ValidationResult<ContributionRecord>;
   validateIncident(
     payload: Uint8Array | IncidentRecord,
-    context?: { store?: PulseMeshStore | null; fromPeer?: string | null; topic?: unknown; nowMillis?: number }
+    context?: { store?: PulseMeshStore | null; fromPeer?: string | null; vouchPeer?: string | null; topic?: unknown; nowMillis?: number }
   ): ValidationResult<IncidentRecord>;
+  /** §8.4: gate for PMX1 testimony — bonded deliverers only, rate-bounded. */
+  validateBan(
+    payload: Uint8Array | BanAnnouncement,
+    context?: { fromPeer?: string | null; nowMillis?: number }
+  ): ValidationResult<BanAnnouncement>;
   constants: Readonly<PulseMeshConstants>;
 };
 
@@ -427,10 +507,10 @@ export declare function createContributor(options: {
   clock?: () => number;
   batteryLevel?: (() => number) | null;
   charging?: (() => boolean) | null;
-  powMaxIterations?: number;
+  suppressedTypes?: number[];
 }): {
   handleFix(fix: { lat?: number; lon?: number; speedMps?: number; courseDeg?: number; nowMillis?: number; [key: string]: unknown }): Promise<ContributorEmission>;
-  reportIncident(params: { type: number; polarity?: 1 | 2 | 3; incidentKey?: string | null; nowMillis?: number }):
+  reportIncident(params: { type: number; polarity?: 1 | 2 | 3; incidentKey?: string | null; nowMillis?: number; acknowledgedPublic?: boolean }):
     { emitted: boolean; reason?: string; record?: EncodedRecord };
   stats: { fixes: number; offRoad: number; suppressed: number; emitted: number; incidents: number };
 };
@@ -515,6 +595,8 @@ export declare class MeshNode {
     transport?: "wire" | "loopback";
     suppressedTypes?: number[];
     keeper?: boolean;
+    /** §11.6: no gossip membership, no publishing, no bond — pull-only via tick(). */
+    readOnly?: boolean;
   });
   readonly id: string;
   readonly epochHex: string;
@@ -526,12 +608,18 @@ export declare class MeshNode {
   readonly provider: PulseMeshProvider;
   readonly stats: {
     gossipAccepted: number; gossipDropped: number; dropsByRule: Record<string, number>;
+    bondsAccepted: number; bondsRejected: number;
+    bansForfeited: number; bansPublished: number; bansAccepted: number; bansCorroborated: number;
     snapshotsMerged: number; snapshotRecordsAccepted: number;
     antiEntropyRounds: number; cellsRequested: number; cellsWanted: number;
   };
   clock(): number;
   subscribeZones(zones: MeshCell[], nowMillis?: number): void;
   publishRecord(encoded: EncodedRecord, options?: { forwarder?: string | null; nowMillis?: number }): void;
+  /** §5.4: verifies a PMA1 from `fromPeer`'s live connection and marks the peer bonded. */
+  registerBond(payload: Uint8Array | BondFields, fromPeer: string, nowMillis?: number):
+    { ok: true; expiresMillis: number } | { ok: false; reason: string };
+  isBonded(peerId: string, nowMillis?: number): boolean;
   onGossip(topic: string, payload: Uint8Array, fromPeer: string, nowMillis?: number): void;
   onStream(payload: Uint8Array, fromPeer: string, nowMillis?: number): Uint8Array | null;
   fetchCells(wanted: MeshCell[], options?: { nowMillis?: number }): Promise<number>;

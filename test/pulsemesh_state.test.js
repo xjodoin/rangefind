@@ -14,7 +14,7 @@ import {
   incidentPenaltySeconds,
   scoreIncidentKey
 } from "../src/pulsemesh/incidents.js";
-import { decodePMC1, encodePMC1, encodePMD1, minePow } from "../src/pulsemesh/codec.js";
+import { PROOF_BOND, decodePMC1, encodePMC1, encodePMD1 } from "../src/pulsemesh/codec.js";
 import { sha256Utf8, toHex } from "../src/pulsemesh/sha256.js";
 
 const EPOCH32 = sha256Utf8("pulsemesh-test-vector");
@@ -148,7 +148,7 @@ test("store: dedup, TTL expiry, per-segment cap eviction", () => {
 test("validation: rules fire in order with the right numbers", () => {
   const nowMillis = 1754265600000;
   const random = lcg(13);
-  const constants = applyBootstrapConstants({ POW_DIFFICULTY: 8 });
+  const constants = applyBootstrapConstants({});
   const store = new PulseMeshStore({ constants, cellOf });
   const cellContext = leafCell => leafCell === 5
     ? {
@@ -157,20 +157,19 @@ test("validation: rules fire in order with the right numbers", () => {
         metersOf: () => 150
       }
     : null;
+  // Every delivering peer in this test holds a bond; rule 5's own
+  // accept/reject matrix is covered in pulsemesh_bond.test.js.
   const validator = createValidator({
-    constants, epoch32: EPOCH32, cellOf, cellContext, transport: "wire", clock: () => nowMillis
+    constants, epoch32: EPOCH32, cellOf, cellContext, transport: "wire",
+    isBonded: () => true, clock: () => nowMillis
   });
 
-  function build(overrides = {}, mine = true) {
+  function build(overrides = {}) {
     const fields = {
       epochPrefix8: PREFIX8, leafCell: 5, geomRef: 12, timeBucket: Math.floor(nowMillis / 15000),
       speedBin: 10, qualityBin: 7, meters: 150, ttlSeconds: 90, reportId: reportId(random),
-      proofType: 1, proof: new Uint8Array(8), ...overrides
+      proofType: PROOF_BOND, proof: new Uint8Array(0), ...overrides
     };
-    if (mine) {
-      const { preimage } = encodePMC1(fields);
-      fields.proof = minePow(preimage, EPOCH32, constants.POW_DIFFICULTY).nonce;
-    }
     return decodePMC1(encodePMC1(fields).bytes);
   }
 
@@ -225,12 +224,12 @@ test("validation: rules fire in order with the right numbers", () => {
 
 test("bootstrap constants clamp to ±4× and ignore fixed rows", () => {
   const merged = applyBootstrapConstants({
-    POW_DIFFICULTY: 8,           // 20/4 = 5 min, ok
+    BOND_BIRTHDAY_BITS: 24,      // 44/4 = 11 min, ok
     MAX_AGE_RECEIPT: 1000,       // > 45×4, ignored
     BUCKET_SECONDS: 60,          // fixed row, ignored
     SHARDS: 8                    // fixed row, ignored
   });
-  assert.equal(merged.POW_DIFFICULTY, 8);
+  assert.equal(merged.BOND_BIRTHDAY_BITS, 24);
   assert.equal(merged.MAX_AGE_RECEIPT, 45);
   assert.equal(merged.BUCKET_SECONDS, 15);
   assert.equal(merged.SHARDS, 16);

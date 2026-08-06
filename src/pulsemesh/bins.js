@@ -20,7 +20,6 @@ export const DEFAULT_CONSTANTS = Object.freeze({
   TOPIC_OVERLAP: 30,
   ANTI_ENTROPY_SECONDS: 10,
   SHARDS: 16,
-  POW_DIFFICULTY: 20,
   EMIT_INTERVAL: 15,
   RATE_SUSTAINED: 2,
   RATE_BURST: 40,
@@ -61,9 +60,31 @@ export const DEFAULT_CONSTANTS = Object.freeze({
   INCIDENT_CELL_CAP: 24,
   INCIDENT_PEER_RATE: 6,
   INCIDENT_PEER_RATE_WINDOW: 600,
-  INCIDENT_POW_MULTIPLIER: 4,
   REFUTE_WEIGHT: 2,
-  CONTRADICTION_DECAY: 4
+  CONTRADICTION_DECAY: 4,
+  // Identity bonds (§5.4). BOND_BIRTHDAY_BITS 44 is the phone-safe point
+  // measured in benchmarks §14.5: a 256 MiB table, ~2 s of desktop solve
+  // (~8 s phone, chunked, once per BOND_LIFETIME), verification three
+  // hashes. 48 (1 GiB) quarters the attacker's per-GPU parallelism again
+  // and is the right setting where miners are desktop-class.
+  BOND_BIRTHDAY_BITS: 44,
+  BOND_PAIR_DIFFICULTY: 0,
+  BOND_LIFETIME: 86400,
+  BOND_OVERLAP: 3600,
+  // Ban propagation (§8.4). Announcements are testimony, never verdicts:
+  // BAN_MIN_SOURCES distinct bonded deliverers must corroborate before a
+  // receiver applies BAN_REMOTE_PENALTY — once per corroborated target —
+  // to its local trust. Nothing is ever revoked on remote input: the
+  // penalty is sized so corroborated testimony plus ONE first-hand
+  // violation reaches the forfeiture floor (1000−375−500 ≤ 250), while
+  // testimony alone leaves an honest peer above it and recovering
+  // through the ledger's ordinary decay.
+  BAN_MIN_SOURCES: 3,
+  BAN_REMOTE_PENALTY: 375,
+  BAN_PEER_RATE: 4,
+  BAN_PEER_RATE_WINDOW: 600,
+  BAN_TTL: 86400,
+  BAN_TARGET_CAP: 256
 });
 
 // Rows a signed bootstrap may override (§3 "tunable" column), and only
@@ -71,7 +92,7 @@ export const DEFAULT_CONSTANTS = Object.freeze({
 const TUNABLE = new Set([
   "MAX_AGE_RECEIPT", "MAX_FUTURE_SKEW", "CONTRIB_TTL", "DISPLAY_MAX_AGE",
   "RETAINED_BUCKETS", "TOPIC_OVERLAP", "ANTI_ENTROPY_SECONDS",
-  "POW_DIFFICULTY", "EMIT_INTERVAL", "RATE_SUSTAINED", "RATE_BURST",
+  "EMIT_INTERVAL", "RATE_SUSTAINED", "RATE_BURST",
   "CELL_CONTRIB_CAP", "STORE_CONTRIB_CAP", "SEG_CONTRIB_CAP",
   "DECOY_FRACTION", "SPLIT_PEERS", "ENDPOINT_RINGS", "UNSUB_LINGER",
   "EPOCH_OVERLAP", "AGG_MIN_REPORTS",
@@ -80,7 +101,10 @@ const TUNABLE = new Set([
   "FORWARD_POOL", "FORWARD_MAX_DELAY", "FORWARD_RATE",
   "INCIDENT_SHOW_SCORE", "INCIDENT_HINT_SCORE", "INCIDENT_ANCHOR_RATIO",
   "INCIDENT_WINDOW", "INCIDENT_CELL_CAP", "INCIDENT_PEER_RATE",
-  "INCIDENT_POW_MULTIPLIER", "REFUTE_WEIGHT", "CONTRADICTION_DECAY"
+  "REFUTE_WEIGHT", "CONTRADICTION_DECAY",
+  "BOND_BIRTHDAY_BITS", "BOND_PAIR_DIFFICULTY", "BOND_LIFETIME", "BOND_OVERLAP",
+  "BAN_MIN_SOURCES", "BAN_REMOTE_PENALTY", "BAN_PEER_RATE", "BAN_PEER_RATE_WINDOW",
+  "BAN_TTL", "BAN_TARGET_CAP"
 ]);
 
 export function applyBootstrapConstants(overrides, base = DEFAULT_CONSTANTS) {

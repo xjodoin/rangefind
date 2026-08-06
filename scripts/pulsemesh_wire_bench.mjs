@@ -14,7 +14,7 @@
 import { performance } from "node:perf_hooks";
 import { DEFAULT_CONSTANTS, zoneOfDetailCell } from "../src/pulsemesh/bins.js";
 import { MeshNode } from "../src/pulsemesh/node.js";
-import { encodePMC1, encodePMG1, encodePMQ1, minePow } from "../src/pulsemesh/codec.js";
+import { PROOF_BOND, encodePMC1, encodePMG1, encodePMQ1 } from "../src/pulsemesh/codec.js";
 import { sha256Utf8, toHex } from "../src/pulsemesh/sha256.js";
 
 const args = Object.fromEntries(process.argv.slice(2).map(arg => {
@@ -38,7 +38,9 @@ try {
 const EPOCH_HEX = toHex(sha256Utf8("pulsemesh-wire-bench"));
 // 8-bit PoW: mining cost is measured separately in pulsemesh_bench.mjs;
 // here it must not dominate the transport measurement.
-const CONSTANTS = { ...DEFAULT_CONSTANTS, POW_DIFFICULTY: 8, RATE_SUSTAINED: 1e6, RATE_BURST: 1e6 };
+// BOND_BIRTHDAY_BITS 16 keeps the admission mint at ~1 ms; the bench
+// measures the wire, not the puzzle (bench:pulsemesh:bond measures that).
+const CONSTANTS = { ...DEFAULT_CONSTANTS, BOND_BIRTHDAY_BITS: 16, RATE_SUSTAINED: 1e6, RATE_BURST: 1e6 };
 const CELL = { x: 144 * 64 + 5, y: 180 * 64 + 9 };
 const ZONE = zoneOfDetailCell(CELL);
 const cellOf = record => (record.leafCell < 64 ? { x: CELL.x + (record.leafCell % 8), y: CELL.y } : null);
@@ -103,9 +105,18 @@ await waitFor(
   { label: "gossip mesh formation" }
 );
 
-// --- Pre-mine records so PoW is not in the measured window ----------------
+// --- §5.4 admission: every peer presents its bond before publishing ------
 
-const epoch32 = publisher.epoch32;
+for (const network of networks) {
+  if (!(await network.mintBond())) throw new Error("bond mint failed");
+}
+await waitFor(
+  () => nodes.every(node => node.stats.bondsAccepted >= PEERS - 1),
+  { label: "bonds exchanged across the mesh" }
+);
+
+// --- Prepare records (proofless — the bond carries the session) ----------
+
 const prepared = [];
 for (let i = 0; i < RECORDS; i++) {
   const reportId = new Uint8Array(16);
@@ -120,11 +131,9 @@ for (let i = 0; i < RECORDS; i++) {
     meters: 400,
     ttlSeconds: 90,
     reportId,
-    proofType: 1,
-    proof: new Uint8Array(8)
+    proofType: PROOF_BOND,
+    proof: new Uint8Array(0)
   };
-  const { preimage } = encodePMC1(fields);
-  fields.proof = minePow(preimage, epoch32, CONSTANTS.POW_DIFFICULTY).nonce;
   prepared.push(encodePMC1(fields));
 }
 

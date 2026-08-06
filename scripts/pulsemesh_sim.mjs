@@ -25,7 +25,7 @@ import { MeshNode } from "../src/pulsemesh/node.js";
 import { createContributor } from "../src/pulsemesh/contribute.js";
 import { createReticentProfile } from "../src/pulsemesh/reticent.js";
 import { aggregateSegment } from "../src/pulsemesh/aggregate.js";
-import { encodePMB1, encodePMC1, encodePMD1, decodePMC1, minePow } from "../src/pulsemesh/codec.js";
+import { PROOF_BOND, encodePMB1, encodePMC1, encodePMD1, decodePMC1 } from "../src/pulsemesh/codec.js";
 import { sha256Utf8, toHex } from "../src/pulsemesh/sha256.js";
 
 // --- CLI ------------------------------------------------------------------
@@ -371,12 +371,11 @@ function buildMesh({
   consumers = 10,
   vehicles = 10,
   profile = "cadence",
-  powDifficulty = 8,
   lossRate = 0.05,
   skewMs = 2000,
   latencyMeanMs = 60
 }) {
-  const constants = { ...DEFAULT_CONSTANTS, POW_DIFFICULTY: powDifficulty };
+  const constants = { ...DEFAULT_CONSTANTS };
   const network = new SimNetwork({ sim, rng, lossRate, latencyMeanMs });
   const tap = []; // ground truth for every published record
   const nodes = [];
@@ -437,7 +436,7 @@ function buildMesh({
         });
         node.publishRecord(result.record, { forwarder: result.forwarder, nowMillis: node.clock() });
       },
-      proofType: 1,
+      proofType: PROOF_BOND,
       clock: node.clock,
       constants,
       profile: reticent,
@@ -446,6 +445,14 @@ function buildMesh({
     });
     entry.contributor = contributor;
     cars.push(entry);
+  }
+  // §5.4: in the simulated mesh every peer has already presented its
+  // admission bond — the wire tests cover the exchange itself; here we
+  // model the steady state so validators accept proofType 3 hop-vouched
+  // records without simulating 256 MiB mints inside a virtual clock.
+  const everyone = [...nodes.map(n => n.id), ...cars.map(c => c.node.id)];
+  for (const node of nodes) {
+    for (const id of everyone) if (id !== node.id) node.bondedPeers.set(id, Number.MAX_SAFE_INTEGER);
   }
   return { constants, network, tap, consumerNodes, cars, nodes };
 }
@@ -635,8 +642,9 @@ async function runFlood({ peers = 10, vehicles = 6, hostilePerSecond = 200, minu
   const target = mesh.consumerNodes[0];
 
   // The attacker publishes through the real gossip path: malformed
-  // records, replays, missing/invalid PoW, and (the expensive case)
-  // records with VALID proof-of-work at full spam rate.
+  // records, replays, records delivered by an UNBONDED peer (rule 5),
+  // and — the worst case — proofless records from a peer that DID pay
+  // for a bond, which only the token bucket and the ledger then bound.
   const attacker = new MeshNode({
     id: "attacker",
     epochHex: EPOCH_HEX,
@@ -648,7 +656,9 @@ async function runFlood({ peers = 10, vehicles = 6, hostilePerSecond = 200, minu
     rng,
     transport: "wire"
   });
-  const epoch32 = attacker.epoch32;
+  // The bonded attacker paid its admission once; the unbonded one did
+  // not, and rule 5 rejects everything it delivers.
+  target.bondedPeers.set("attacker", Number.MAX_SAFE_INTEGER);
   let validSpam = null;
   const makeHostile = kind => {
     const fields = {
@@ -661,42 +671,40 @@ async function runFlood({ peers = 10, vehicles = 6, hostilePerSecond = 200, minu
       meters: SEGMENT_METERS,
       ttlSeconds: 90,
       reportId: Uint8Array.from({ length: 16 }, () => Math.floor(rng() * 256)),
-      proofType: 1,
-      proof: new Uint8Array(8)
+      proofType: PROOF_BOND,
+      proof: new Uint8Array(0)
     };
     switch (kind) {
       case "malformed":
         fields.speedBin = 200;
-        return encodePMC1(fields).bytes;
-      case "no-pow":
-        return encodePMC1(fields).bytes;
+        return { bytes: encodePMC1(fields).bytes, from: "attacker" };
+      case "unbonded":
+        return { bytes: encodePMC1(fields).bytes, from: "attacker-unbonded" };
       case "replay":
         if (!validSpam) return null;
-        return validSpam;
-      case "valid-pow": {
-        const { preimage } = encodePMC1(fields);
-        fields.proof = minePow(preimage, epoch32, mesh.constants.POW_DIFFICULTY).nonce;
+        return { bytes: validSpam, from: "attacker" };
+      case "bonded": {
         const bytes = encodePMC1(fields).bytes;
         validSpam = bytes;
-        return bytes;
+        return { bytes, from: "attacker" };
       }
     }
   };
-  const kinds = ["malformed", "no-pow", "replay", "valid-pow"];
+  const kinds = ["malformed", "unbonded", "replay", "bonded"];
   const endMs = scheduleWorld({ sim, mesh, rng, minutes });
   let hostileSent = 0;
   const attack = () => {
     if (sim.now >= endMs) return;
     for (let i = 0; i < hostilePerSecond; i++) {
-      const bytes = makeHostile(kinds[i % kinds.length]);
-      if (!bytes) continue;
+      const hostile = makeHostile(kinds[i % kinds.length]);
+      if (!hostile) continue;
       hostileSent++;
       // Deliver straight to the target's gossip handler on a legal topic,
       // batched exactly as a real publisher would send it.
       target.onGossip(
         `/rangefind/pulsemesh/1/${EPOCH_HEX.slice(0, 16)}/${world.zone.x}/${world.zone.y}/${Math.floor(sim.now / 1000 / 300)}/0`,
-        encodePMB1([bytes]),
-        "attacker",
+        encodePMB1([hostile.bytes]),
+        hostile.from,
         target.clock()
       );
     }
@@ -716,12 +724,12 @@ async function runFlood({ peers = 10, vehicles = 6, hostilePerSecond = 200, minu
   return {
     hostileSent,
     hostileAcceptedBeyondRateLimit: hostileStored,
-    hostileAcceptanceNote: "valid-PoW spam is bounded by the per-peer token bucket; everything else is rejected outright",
+    hostileAcceptanceNote: "bonded spam is bounded by the per-peer token bucket and forfeits the bond on a ledger ban; unbonded/malformed/replayed records are rejected outright",
     rateLimitCeiling: `${mesh.constants.RATE_SUSTAINED}/s sustained, burst ${mesh.constants.RATE_BURST}`,
     dropsByRule: target.stats.dropsByRule,
     honestAcceptedDuringAttack: target.stats.gossipAccepted - hostileStored,
     defenderCpuMsTotal: Math.round(cpuMs),
-    attackerPowCostPerRecordMs: "2^difficulty hashes each (see pulsemesh_bench.mjs)"
+    attackerAdmissionCost: "one §5.4 bond mint per identity per day (see bench:pulsemesh:bond)"
   };
 }
 

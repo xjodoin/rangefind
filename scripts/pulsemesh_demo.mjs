@@ -150,9 +150,10 @@ const cellContext = leafCell => (engine.root.leaves[leafCell]
   ? { polylineCount: 1 << 20, classOf: () => "secondary", metersOf: () => null }
   : null);
 
-// 8-bit PoW so the demo runs in seconds rather than minutes; production
-// is 20 (see docs/pulsemesh-benchmarks.md §2 for the cost curve).
-const constants = { ...DEFAULT_CONSTANTS, POW_DIFFICULTY: 8, EMIT_INTERVAL: 0.01 };
+// 24-bit bonds keep the once-per-peer admission mint at ~1 ms so the
+// demo runs in seconds; production is 44 — a 256 MiB table and ~2 s of
+// desktop background mint, once per day (benchmarks §14.5).
+const constants = { ...DEFAULT_CONSTANTS, BOND_BIRTHDAY_BITS: 24, EMIT_INTERVAL: 0.01 };
 
 const hosts = [];
 const networks = [];
@@ -208,6 +209,18 @@ await waitFor(
   { label: "gossip mesh formation" }
 );
 bullet("gossip mesh", "formed");
+
+// §5.4 admission: every contributor mints its identity bond once and
+// presents it to every peer. Records themselves carry no proof at all.
+const mintStarted = Date.now();
+for (const network of networks) {
+  if (!(await network.mintBond())) throw new Error("bond mint failed");
+}
+await waitFor(
+  () => nodes.every(node => node.stats.bondsAccepted >= PEER_COUNT - 1),
+  { label: "bonds exchanged" }
+);
+bullet("identity bonds", `minted + exchanged by all ${PEER_COUNT} peers in ${Date.now() - mintStarted} ms`);
 
 // --- 3. Vehicles report a jam ---------------------------------------------
 

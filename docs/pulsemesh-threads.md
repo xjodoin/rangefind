@@ -421,6 +421,20 @@ The link is a key, so discovery is a computation rather than an address
 lookup. All paths carry identical bytes; a thread neither knows nor
 cares which one reached a subscriber.
 
+**No admission bond on this channel.** The traffic channel's §5.4 bonds
+exist because its records are anonymous and proofless — the delivering
+peer must vouch. A thread record is the opposite: authenticated
+end-to-end by the thread key's signature and sealed to the audience, so
+*any* peer's delivery is verifiable and an unbonded relay is useful
+rather than a hole. A home viewer therefore follows a thread with zero
+bonds: a read-only traffic node (protocol §11.6) beside a plain
+subscription to the thread's derived topics — the `t` namespace the
+traffic validator ignores — verified per record by the subscriber.
+Covered by a real-TCP test (`§11.6 + threads` in
+`test/pulsemesh_wire.test.js`). Publishing a thread needs gossip, but
+still no bond: possession of the private seed is the admission, and a
+peer without it cannot produce one verifying byte.
+
 1. **Rendezvous + gossip (primary).** The subscriber derives
    `tag(window)` and `rendezvous` from `P` (§4.2), asks the DHT which
    peers provide that key, connects, and subscribes to the topic. The
@@ -822,6 +836,7 @@ src/pulsemesh/thread_consume.js  validation, seq ledger, staleness              
 src/pulsemesh/thread_cache.js    catch-up ring buffers, padded PMR1, admission caps  (§5.5, §8)
 src/pulsemesh/thread_eta.js      locate + fixed-order matrix arrival estimation      (§9)
 src/pulsemesh/thread_contribute.js  the rules between the two channels               (§10)
+src/pulsemesh/thread_discovery.js   DHT rendezvous: provide + findProviders          (§4.2, §8)
 src/pulsemesh/threads.js         public entry point (rangefind/pulsemesh/threads)
 scripts/pulsemesh_thread_bench.mjs  crypto, bandwidth, catch-up availability        (§15, §18)
 test/pulsemesh_thread_*.test.js  per-module + §16 vectors
@@ -847,9 +862,11 @@ test/pulsemesh_thread_*.test.js  per-module + §16 vectors
   records, audience caching; sleep/wake test where a subscriber offline
   for 4 minutes rejoins from *another subscriber's* cache with no
   designated host anywhere in the test.
-  **Done** — `thread_cache.js`, `test/pulsemesh_thread_catchup.test.js`.
-  Rendezvous and topic derivation are covered; live DHT provider records
-  are transport wiring on the traffic channel's libp2p adapter.
+  **Done** — `thread_cache.js`, `thread_discovery.js`,
+  `test/pulsemesh_thread_catchup.test.js`,
+  `test/pulsemesh_thread_discovery.test.js`. Includes live DHT
+  `provide`/`findProviders` on the derived rendezvous key: a second host
+  finds the publisher with nothing but the link.
 - **T4 — contribution.** A publisher emitting both PMT1 and PMC1 under
   §10 rule 3, with rule 4 stop suppression; assert the traffic
   aggregate for a corridor served by buses is not biased downward by
@@ -915,10 +932,9 @@ test/pulsemesh_thread_*.test.js  per-module + §16 vectors
 
 ## 19. Conformance checklist
 
-This implementation is conformant on every row below except the one
-marked `[~]`, which is honest about a piece that is not built yet. Boxes
-are ticked only where a test in `test/pulsemesh_thread_*.test.js` asserts
-the behaviour, not where the code merely looks right.
+This implementation is conformant on every row below. Boxes are ticked
+only where a test in `test/pulsemesh_thread_*.test.js` asserts the
+behaviour, not where the code merely looks right.
 
 - [x] Reproduces §16 byte-identically: key schedule from `P`, tag,
       rendezvous, link, signed preimage, sealed record.
@@ -934,12 +950,11 @@ the behaviour, not where the code merely looks right.
 - [x] Rejects: bad AEAD tag, missing or invalid signature, non-increasing
       `seq`, out-of-window `unixSeconds`, records past `notAfter`,
       unknown tags.
-- [~] Derivation of the tag, topic and rendezvous key from the link
-      alone is implemented and tested, and the link carries no host,
-      mailbox, or bootstrap address. **Live DHT provider lookup is not
-      implemented** — it is transport wiring on the traffic channel's
-      libp2p adapter, and until it lands a deployment must supply peers
-      by the ordinary bootstrap path.
+- [x] Discovers peers from the derived rendezvous key alone — no host,
+      mailbox, or bootstrap address in the link. Tag, topic and
+      rendezvous derivation plus live DHT `provide`/`findProviders` are
+      implemented in `src/pulsemesh/thread_discovery.js` and tested
+      end-to-end between two hosts.
 - [x] Every PMR1 padded to 4/8/16 tags with CSPRNG decoys; responders
       never distinguish unknown from empty tags.
 - [x] Thread records never enter a traffic aggregate.

@@ -80,7 +80,7 @@ if (!zones.length) fail("no zones to pin");
 const constants = {
   ...DEFAULT_CONSTANTS,
   STORE_CONTRIB_CAP: Number(args["store-cap"] || 1048576),
-  ...(args.pow ? { POW_DIFFICULTY: Number(args.pow) } : {})
+  ...(args["bond-bits"] ? { BOND_BIRTHDAY_BITS: Number(args["bond-bits"]) } : {})
 };
 
 // --- Host + node ----------------------------------------------------------
@@ -110,6 +110,11 @@ if (network.registrationError) {
   fail(`could not register ${"/rangefind/pulsemesh/1/sync"}: ${network.registrationError.message}`);
 }
 
+// §5.4: a keeper serves snapshots, and a snapshot's records are only as
+// good as the bond of the peer serving them — so a keeper without a bond
+// is a keeper nobody can use. Mint before announcing.
+if (!(await network.mintBond())) fail("could not mint the keeper's admission bond");
+
 console.log(JSON.stringify({
   event: "listening",
   peerId: host.peerId.toString(),
@@ -117,7 +122,7 @@ console.log(JSON.stringify({
   zones: zones.map(zone => `${zone.x}/${zone.y}`),
   epoch: epochHex.slice(0, 16),
   storeCap: constants.STORE_CONTRIB_CAP,
-  powDifficulty: constants.POW_DIFFICULTY
+  bondBits: constants.BOND_BIRTHDAY_BITS
 }));
 
 // Keepers never contribute; they sweep, refresh subscriptions across

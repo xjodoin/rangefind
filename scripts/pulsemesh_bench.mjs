@@ -10,16 +10,16 @@
 import { performance } from "node:perf_hooks";
 import { DEFAULT_CONSTANTS } from "../src/pulsemesh/bins.js";
 import {
+  PROOF_BOND,
   decodePMB1,
   decodePMC1,
   encodePMB1,
   encodePMC1,
   encodePMD1,
   encodePMQ1,
-  encodePMS1,
-  minePow,
-  verifyPow
+  encodePMS1
 } from "../src/pulsemesh/codec.js";
+import { bondSeed, solveBondProof, verifyBondProof } from "../src/pulsemesh/bond.js";
 import { sha256, sha256Utf8 } from "../src/pulsemesh/sha256.js";
 import { PulseMeshStore } from "../src/pulsemesh/store.js";
 import { aggregateSegment } from "../src/pulsemesh/aggregate.js";
@@ -82,7 +82,7 @@ function makeRecordFields(overrides = {}) {
   const decode = bench(() => decodePMC1(encoded.bytes));
   const batchDecode = bench(() => decodePMB1(batch), { iterations: 5000 });
   report("codec", {
-    "PMC1 size (proofType 0 / PoW)": `${encoded.bytes.length} / ${encoded.bytes.length + 8} bytes`,
+    "PMC1 size (proofless, §5.4 bonds)": `${encoded.bytes.length} bytes`,
     "PMB1(16) size": `${batch.length} bytes`,
     "encode PMC1": `${Math.round(encode.opsPerSec).toLocaleString()} ops/s (${encode.usPerOp.toFixed(2)} µs)`,
     "decode PMC1": `${Math.round(decode.opsPerSec).toLocaleString()} ops/s (${decode.usPerOp.toFixed(2)} µs)`,
@@ -90,46 +90,34 @@ function makeRecordFields(overrides = {}) {
   });
 }
 
-// --- SHA-256 and proof of work ------------------------------------------
+// --- SHA-256 and bond admission (§5.4) ----------------------------------
 
 {
-  const message = new Uint8Array(81); // preimage(41) + epoch(32) + nonce(8)
+  const message = new Uint8Array(81);
   const hash = bench(() => sha256(message), { iterations: 200000 });
-  const hashesPerSec = hash.opsPerSec;
 
-  // Real mining runs at a few difficulties for measured (not extrapolated)
-  // cost, then the 2^d model extends to production difficulties.
-  const mineRows = {};
-  for (const difficulty of [8, 12, 16]) {
+  // Bond solve at small tables for a measured (not extrapolated) curve;
+  // bench:pulsemesh:bond measures the production sizes (44/48).
+  const solveRows = {};
+  for (const bits of [24, 28, 32]) {
     const times = [];
-    let iterations = 0;
-    for (let i = 0; i < (difficulty >= 16 ? 3 : 10); i++) {
-      const fields = makeRecordFields();
-      const { preimage } = encodePMC1(fields);
+    for (let run = 0; run < (bits >= 32 ? 3 : 8); run++) {
+      const seed = bondSeed(EPOCH32, 20000 + run, 0, `bench-${bits}`);
       const start = performance.now();
-      const mined = minePow(preimage, EPOCH32, difficulty);
+      await solveBondProof(seed, bits, 0, { chunkMillis: 50 });
       times.push(performance.now() - start);
-      iterations += mined.iterations;
     }
     const mean = times.reduce((a, b) => a + b, 0) / times.length;
-    mineRows[`mine at ${difficulty} bits (measured mean)`] = `${mean.toFixed(1)} ms`;
+    solveRows[`bond solve at B=${bits} (measured mean)`] = `${mean.toFixed(1)} ms`;
   }
-  const verifyBench = bench(
-    (() => {
-      const fields = makeRecordFields();
-      const { preimage } = encodePMC1(fields);
-      const nonce = minePow(preimage, EPOCH32, 8).nonce;
-      return () => verifyPow(preimage, EPOCH32, nonce, 8);
-    })(),
-    { iterations: 100000 }
-  );
-  report("proof-of-work", {
-    "sha256 (81-byte message)": `${Math.round(hashesPerSec).toLocaleString()} hashes/s`,
-    ...mineRows,
-    "projected mine at 20 bits (2^20 hashes)": `${(2 ** 20 / hashesPerSec).toFixed(2)} s`,
-    "projected mine at 24 bits (incidents)": `${(2 ** 24 / hashesPerSec).toFixed(1)} s`,
-    "verify (any difficulty)": `${Math.round(verifyBench.opsPerSec).toLocaleString()} ops/s (${verifyBench.usPerOp.toFixed(2)} µs)`,
-    "attacker/defender cost ratio at 20 bits": `${Math.round(2 ** 20).toLocaleString()}:1 hashes`
+  const verifySeed = bondSeed(EPOCH32, 20000, 0, "bench-verify");
+  const solved = await solveBondProof(verifySeed, 24, 0);
+  const verifyBench = bench(() => verifyBondProof(verifySeed, solved.i, solved.j, 24, 0), { iterations: 100000 });
+  report("bond admission (§5.4)", {
+    "sha256 (81-byte message)": `${Math.round(hash.opsPerSec).toLocaleString()} hashes/s`,
+    ...solveRows,
+    "verify (any table size)": `${Math.round(verifyBench.opsPerSec).toLocaleString()} ops/s (${verifyBench.usPerOp.toFixed(2)} µs)`,
+    "amortization": "one mint per peer per day; records carry no proof at all"
   });
 }
 
@@ -143,20 +131,19 @@ function makeRecordFields(overrides = {}) {
   const records = Array.from({ length: 2000 }, () => decodePMC1(encodePMC1(makeRecordFields({ speedBin: 10 })).bytes));
   const validate = bench(i => validator.validateContribution(records[i % records.length], { fromPeer: "p" }), { iterations: 100000 });
 
-  // With PoW verification (the wire path).
-  const powConstants = { ...constants, POW_DIFFICULTY: 8 };
-  const powValidator = createValidator({ constants: powConstants, epoch32: EPOCH32, cellOf, cellContext, transport: "wire" });
-  const powRecords = records.slice(0, 200).map(record => {
-    const fields = makeRecordFields({ speedBin: 10, proofType: 1 });
-    const { preimage } = encodePMC1(fields);
-    fields.proof = minePow(preimage, EPOCH32, 8).nonce;
-    return decodePMC1(encodePMC1(fields).bytes);
+  // The wire path: proofType 3, the delivering peer's bond looked up per
+  // record (a Map hit — the bond itself was verified once at admission).
+  const wireValidator = createValidator({
+    constants, epoch32: EPOCH32, cellOf, cellContext, transport: "wire",
+    isBonded: () => true
   });
-  const validatePow = bench(i => powValidator.validateContribution(powRecords[i % powRecords.length], { fromPeer: "p" }), { iterations: 50000 });
+  const bondRecords = records.slice(0, 200).map(() =>
+    decodePMC1(encodePMC1(makeRecordFields({ speedBin: 10, proofType: PROOF_BOND })).bytes));
+  const validateWire = bench(i => wireValidator.validateContribution(bondRecords[i % bondRecords.length], { fromPeer: "p" }), { iterations: 100000 });
   report("validation", {
     "rules 1–12, no proof (loopback)": `${Math.round(validate.opsPerSec).toLocaleString()} records/s`,
-    "rules 1–12 + PoW verify (wire)": `${Math.round(validatePow.opsPerSec).toLocaleString()} records/s`,
-    "flood-defense budget (1 core)": `${Math.round(validatePow.opsPerSec).toLocaleString()} hostile records/s rejected at line rate`
+    "rules 1–12, bonded wire (proofType 3)": `${Math.round(validateWire.opsPerSec).toLocaleString()} records/s`,
+    "flood-defense budget (1 core)": `${Math.round(validateWire.opsPerSec).toLocaleString()} hostile records/s rejected at line rate`
   });
 }
 

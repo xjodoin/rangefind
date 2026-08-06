@@ -11,6 +11,10 @@ import { utf8Bytes } from "./codec.js";
 
 export const TOPIC_PREFIX = "/rangefind/pulsemesh/1";
 export const SYNC_PROTOCOL = "/rangefind/pulsemesh/1/sync";
+// §5.4: one framed PMA1 per stream, no response. Its own protocol rather
+// than a sync message so a peer can present its bond before it has
+// anything to say.
+export const BOND_PROTOCOL = "/rangefind/pulsemesh/1/bond";
 
 export function shardOfCell(cell) {
   return sha256(utf8Bytes(`${cell.x}/${cell.y}`))[0] % 16;

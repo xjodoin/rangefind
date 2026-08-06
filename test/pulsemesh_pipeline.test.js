@@ -88,24 +88,24 @@ test("contributor: incident reports come only from the reporter's own position",
   // disclosure, so "tell the user it is public and locating" cannot be
   // satisfied by a settings page nobody read.
   assert.equal(
-    contributor.reportIncident({ type: 1 }).reason,
+    (await contributor.reportIncident({ type: 1 })).reason,
     "disclosure-not-acknowledged"
   );
-  assert.equal(report({ type: 1 }).reason, "no-position", "no snap match, no report");
+  assert.equal((await report({ type: 1 })).reason, "no-position", "no snap match, no report");
   await contributor.handleFix({ match: goodMatch(), speedMps: 10 });
-  const filed = report({ type: 1 });
+  const filed = await report({ type: 1 });
   assert.ok(filed.emitted);
   const decoded = decodeAny(filed.record.bytes);
   assert.equal(decoded.segment, "5/6/0");
   assert.equal(decoded.ratioQ12, Math.round(0.4 * 4095));
-  assert.equal(report({ type: 1 }).reason, "rate", "one per (type, 5 min)");
+  assert.equal((await report({ type: 1 })).reason, "rate", "one per (type, 5 min)");
   tick(5 * 60 * 1000 + 1000);
   await contributor.handleFix({ match: goodMatch(), speedMps: 10 });
-  assert.ok(report({ type: 1 }).emitted);
-  assert.equal(report({ type: 99 }).reason, "unknown-type");
-  assert.equal(report({ type: 1, polarity: 2 }).reason, "no-incident", "confirm needs an incident key");
-  assert.ok(report({ type: 2, polarity: 2, incidentKey: "k1" }).emitted);
-  assert.equal(report({ type: 2, polarity: 3, incidentKey: "k1" }).reason, "already-answered");
+  assert.ok((await report({ type: 1 })).emitted);
+  assert.equal((await report({ type: 99 })).reason, "unknown-type");
+  assert.equal((await report({ type: 1, polarity: 2 })).reason, "no-incident", "confirm needs an incident key");
+  assert.ok((await report({ type: 2, polarity: 2, incidentKey: "k1" })).emitted);
+  assert.equal((await report({ type: 2, polarity: 3, incidentKey: "k1" })).reason, "already-answered");
 });
 
 test("contributor honours the deployment's suppressed incident types on emit", async () => {
@@ -115,10 +115,10 @@ test("contributor honours the deployment's suppressed incident types on emit", a
   const { contributor } = makeContributor({ suppressedTypes: [5] });
   await contributor.handleFix({ match: goodMatch(), speedMps: 10 });
   assert.equal(
-    contributor.reportIncident({ type: 5, acknowledgedPublic: true }).reason,
+    (await contributor.reportIncident({ type: 5, acknowledgedPublic: true })).reason,
     "suppressed-by-policy"
   );
-  assert.ok(contributor.reportIncident({ type: 1, acknowledgedPublic: true }).emitted);
+  assert.ok((await contributor.reportIncident({ type: 1, acknowledgedPublic: true })).emitted);
 });
 
 test("reticent gates: place, surprise, company, forwarding rotation", () => {

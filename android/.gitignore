@@ -12,3 +12,4 @@ captures/
 app/src/main/assets/rangefind/runtime.browser.js
 app/src/main/assets/rangefind/osm.browser.js
 app/src/main/assets/rangefind/route.browser.js
+app/src/main/assets/rangefind/pulsemesh.mobile.js

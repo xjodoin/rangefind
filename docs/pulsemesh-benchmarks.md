@@ -33,13 +33,13 @@ differ elsewhere; the ratios and the scaling shapes are the point.
 
 | Operation | Result |
 | --- | --- |
-| PMC1 encoded size | **42 bytes** (50 with a PoW nonce) |
+| PMC1 encoded size | **42 bytes** (proofless — §5.4 bonds carry admission) |
 | PMB1 batch of 16 | 688 bytes |
 | encode PMC1 | 2.95 M ops/s (0.34 µs) |
 | decode PMC1 | 3.34 M ops/s (0.30 µs) |
 | decode PMB1(16) | 6.15 M records/s |
 | SHA-256 (81-byte message) | 1.81 M hashes/s |
-| PoW verify | 1.46 M ops/s (0.69 µs) |
+| bond verify (once per session, any table size) | 1.0 M ops/s (1.0 µs) |
 | weighted median, n = 3 | 3.24 M segments/s (0.31 µs) |
 | weighted median, n = 8 | 1.82 M segments/s |
 | weighted median, n = 64 | 257 k segments/s (3.89 µs) |
@@ -62,46 +62,115 @@ says the default is set for keepers, not handsets; a mobile client should
 lower it (it is tunable) to the corridor it actually routes over — a few
 thousand records, single-digit MB.
 
-## 2. Proof-of-work economics
+## 2. Proof-of-work economics (historical)
+
+> **Removed from the protocol.** Per-record proof-of-work was deleted
+> when §5.4 identity bonds replaced it as the only wire admission
+> (proofType 1 is burned). This section stays as the measurement record
+> that motivated the change; nothing in it describes the current wire.
 
 | Difficulty | Mining cost (measured) | Verify cost |
 | --- | --- | --- |
 | 8 bits | 0.2 ms | 0.69 µs |
 | 12 bits | 2.7 ms | 0.69 µs |
 | 16 bits | 40 ms | 0.69 µs |
-| 20 bits (`POW_DIFFICULTY`) | ~0.6 s projected | 0.69 µs |
-| 24 bits (incidents) | ~9.5 s projected | 0.69 µs |
+| 18 bits | 246 ms mean / 897 ms max | 0.69 µs |
+| 20 bits (`POW_DIFFICULTY`) | 719 ms mean / 1.87 s max | 0.69 µs |
+| 22 bits | 4.50 s mean / 7.82 s max | 0.69 µs |
+| 24 bits (incidents) | 10.0 s mean / 17.2 s max | 0.69 µs |
 
-Mining is measured at 8/12/16 bits and projected to production
-difficulties by the 2^d model, which the measured points confirm (each
-4-bit step costs ~16×).
+Mining at 8/12/16 bits comes from §1; the 18–24 bit rows are measured
+directly by `bench:pulsemesh:bond` and confirm the 2^d model (each 4-bit
+step costs ~16×). The **max** column matters as much as the mean: nonce
+search is geometric, so the tail is long and a mean hides it.
 
 The asymmetry is the defense: **~1 M hashes to create a record, one hash
-to reject it**. At 20 bits an honest contributor spends about half a
-second of one core per emission — acceptable against a 15 s cadence, and
-nearly free under the reticent profile's much lower emission rate. An
-attacker pays the same half-second per forged record while a defender
-rejects 1.46 M/s.
+to reject it**. At 20 bits an honest contributor spends ~0.7 s of one
+core per emission here and ~2.9 s on a phone — acceptable against a 15 s
+cadence, and amortising to 1.4–2.5% of one core under the reticent
+profile's much lower emission rate (§8). An attacker pays the same per
+forged record while a defender rejects 1.46 M/s.
 
-The 24-bit incident difficulty costs a reporter ~9 s. That is a
-deliberately felt cost for a claim that nothing physical constrains, and
+The 24-bit incident difficulty costs a reporter 10 s on this desktop and
+~40 s on a phone — see §14, which measures what that does to the UI
+thread and what it takes to survive it. That is a deliberately felt cost
+for a claim that nothing physical constrains, and
 it is still only a speed bump — the protocol's own §8.5 distinct-peer cap
 and speed anchor are the actual defense, and they are verified by the
 conformance tests rather than benchmarked here: a fabricated incident on
 a flowing road produces a zero penalty at any score, so there is no
 throughput number to report.
 
+## 2b. RLN measured against proof-of-work (historical)
+
+The design concedes proof-of-work is a fallback and names blind tokens as
+the recommended Sybil control — with a credential issuer as the honest
+cost, the first per-user server in the whole story. RLN (rate-limiting
+nullifiers, as used by Waku) looked like it might dodge that issuer
+entirely, so it was measured rather than argued. Same machine, same run,
+against the PoW baseline above:
+
+| | Proof-of-work (20 bits) | RLN (tree depth 20) |
+| --- | --- | --- |
+| Prove / mine | 579 ms* | **235 ms** — 2.5× faster |
+| **Verify** | **0.69 µs** | 6.3 ms — **9,130× slower** |
+| Proof size | **8 bytes** | 1,250 bytes |
+| Record on the wire | **50 bytes** | 1,292 bytes — 26× |
+| Client artifacts | **none** | 5.7 MB of wasm + zkey |
+| Rate limiting | per-connection token bucket | **per-identity, cryptographic** |
+
+\* This run's PoW sample. Nonce search is geometric, so single-run means
+scatter widely; §2's table gives 719 ms over more samples. The comparison
+holds either way — the axis RLN loses on is verification, by four orders
+of magnitude.
+
+**RLN wins the comparison I said would decide it, and loses on
+everything else.** Proving is 2.5× cheaper, which was the number I asked
+for. But three consequences make it unusable here:
+
+1. **It breaks the flood defence.** One core rejects 1.45 M hostile PoW
+   records per second and 159 RLN ones. An attacker who cannot produce a
+   valid proof still forces the verifier to *run* the verification to
+   find out, so garbage proofs at 159/s saturate a core — a DoS vector
+   proof-of-work simply does not have.
+2. **It does not fit the wire format.** A 1,250-byte proof puts the
+   record at 1,292 bytes against a `MAX_RECORD_BYTES` of 96, and would
+   take per-peer bandwidth from a measured 25.5 KiB/min to roughly
+   660 KiB/min. The 42-byte record is load-bearing for the whole
+   bandwidth story.
+3. **It does not remove the issuer.** This was the actual hypothesis, and
+   it is false: `verifyProof` checks a Merkle root, so every verifier
+   needs the current membership set of registered identities, and
+   somebody maintains it. rlnjs ships exactly two registries — an
+   in-memory one and a chain-backed one. RLN relocates the credential
+   issuer onto a registry or a blockchain; it does not delete it.
+
+**Verdict: proof-of-work stays.** The one thing RLN offers that we
+genuinely lack is *per-identity* rate limiting — our token bucket is
+per-connection, so it bounds a peer rather than a person — but that
+property costs a 26× record, a 9,000× verification, a 5.7 MB client
+download, and a registry. Blind tokens (phase 4) remain the better route
+to the same property.
+
+Reproduce: `npm i -D rlnjs`, then prove with `RLNProver` against
+`getDefaultRLNParams(20)`. Note the Semaphore v3 API rlnjs depends on —
+the RLN identity secret is `identity.secret` and its commitment is
+`calculateIdentityCommitment(secret)`, not the Semaphore commitment. The
+dependency is not kept in this repo: it was an experiment with a negative
+result.
+
 ## 3. Validation throughput
 
 | Path | Throughput |
 | --- | --- |
-| rules 1–12, no proof (loopback) | 12.3 M records/s |
-| rules 1–12 + PoW verify (wire) | **1.24 M records/s** |
+| rules 1–12, no proof (loopback) | 13.9 M records/s |
+| rules 1–12, bonded wire (proofType 3) | **12.7 M records/s** |
 
-One core rejects 1.24 million hostile records per second. A flood that
-saturates this needs to *produce* 1.24 M records/s, each costing ~1 M
-hashes — about 10^12 hashes/s, or roughly the output of a small ASIC
-farm, to inconvenience one phone. This is the ratio that makes a
+The wire path got 10× faster when per-record PoW verification became a
+bond-set lookup: one core now rejects 12.7 million hostile records per
+second, and the only way to be *accepted* at all is to have paid a §5.4
+mint for the delivering identity — which a ledger ban then forfeits.
+This is the ratio that makes a
 leaderless mesh defensible without an authority.
 
 ## 4. Convergence
@@ -501,6 +570,77 @@ listener, and its arrival estimate is computed entirely locally from a
 broadcast position. That is the property no server-side ETA can have,
 and it now has a test rather than a paragraph.
 
+## 9d. In a browser
+
+`npm run build:osm-demo` ships PulseMesh to the browser as three bundles,
+split so a page pays only for what it uses:
+
+| Bundle | Size | What it is |
+| --- | --- | --- |
+| `pulsemesh.browser.js` | **106 KB** | codecs, store, aggregation, validation, incidents, the provider — everything except transport |
+| `pulsemesh-threads.browser.js` | **46 KB** | the thread channel; WebCrypto only, no polyfill |
+| `pulsemesh-libp2p.browser.js` | **2.5 MB** | the libp2p transport, loaded on demand |
+
+The 24× gap between the core and the transport is why they are separate
+entry points. A page that consumes live traffic from peers it already has
+never loads the third bundle at all, and the core has no static import
+that could drag it in.
+
+Getting there required moving bootstrap signature verification off
+`node:crypto` and onto the same WebCrypto Ed25519 path the thread channel
+uses. That was worth doing regardless: one implementation now covers
+Node, browsers, and mobile hosts, and neither browser bundle references a
+Node built-in.
+
+**Verified in a real browser**, not asserted: with the OSM demo served
+locally, three simulated vehicles published 45 contributions through the
+real contributor pipeline into an in-tab mesh, the consumer validated and
+stored all 45, aggregated 15 segments, and the router applied 26 edge
+adjustments — moving the route off the jammed stretch completely (100% of
+it used before, 0% after) and the ETA from 9.3 to 14.7 minutes. No
+console errors, and no server involved in any of it.
+
+`examples/osm-geo/public/pulsemesh-demo.js` runs in either of two modes.
+`local` puts the peers inside the tab, so the demo works from a static
+host with no infrastructure. `?keeper=<multiaddr>` joins the real mesh
+over WebSockets instead, and falls back to `local` — with the reason
+surfaced — when the keeper is unreachable, because a keeper being down
+must never break the page.
+
+## 9e. On a phone
+
+`rangefind/pulsemesh/mobile` is the app-side contributor the design
+counts on: browsers lose `watchPosition` when backgrounded, so the phone
+is where sustained observations actually come from
+([pulsemesh.md delta 4](pulsemesh.md)). It bundles to **102 KB** with no
+transport — a host wires in whatever network it has, and the pipeline
+runs locally without one.
+
+Three behaviours are pinned by tests rather than left to an integrator:
+
+- **Contribution is off unless the app asks for it.** A phone that reads
+  traffic must never start publishing where its owner drives because a
+  library defaulted it on. `setContributing(true)` is an explicit act.
+- **A low battery stops it.** §10.1 rule 5: below 20% and not charging,
+  emission pauses. A traffic layer that flattens a phone loses that
+  contributor permanently.
+- **The reticent profile is the mobile default** rather than an opt-in,
+  because a phone's owner did not sign up to publish a trajectory.
+
+It is wired into the Android app (`android/`): the engine interface gained
+`pulseMeshStatus`, `setContributing` and `offerLocation`; the WebView
+bridge exposes a `pulseMesh` method; `MapsViewModel` feeds every
+`LocationManager` fix through it and routes under the live metric when
+the mesh has anything to say. The Kotlin compiles clean.
+
+One thing the integration made obvious, and which is worth stating
+because it is easy to get wrong: **every peer must validate against the
+same constants**. An early version of the test gave the contributing
+phone a lower proof-of-work difficulty than the reading phone, and every
+record failed rule 5 — correct behaviour, and exactly why §4.7 puts the
+tunables inside a *signed* bootstrap rather than leaving them to each
+client.
+
 ## 10. What this replaces
 
 The per-peer flat-cost result (§5) is what makes the mesh an alternative
@@ -557,8 +697,6 @@ formation included.
 
 | Constant | Default | Verdict |
 | --- | --- | --- |
-| `POW_DIFFICULTY` | 20 | keep — ~0.6 s to mine, 0.69 µs to verify, 10^6:1 asymmetry |
-| `INCIDENT_POW_MULTIPLIER` | +4 | keep — ~9 s per claim is a felt cost, and §8.5 carries the real defense |
 | `RATE_SUSTAINED` / `RATE_BURST` | 2/s / 40 | keep — bounds a valid-PoW flooder to an honest peer's ceiling |
 | `STORE_CONTRIB_CAP` | 262 144 | **lower on mobile** — ~1.1 KB/record makes the default ~290 MB |
 | `AGG_MIN_REPORTS` | 3 | keep for aggregates; **consider 2 for surprise-flagged records** to close the sparse-onset gap (§8) |
@@ -566,6 +704,8 @@ formation included.
 | `ANTI_ENTROPY_SECONDS` | 10 | **do not back it off** (§5) — gate the digest content on a zone fold instead |
 | `THREAD_MAX_AGE` | 120 s | keep, but it silently caps catch-up at two minutes (§9c) |
 | providers asked per catch-up | unspecified | **specify a floor of 3, prefer 8** (§9c) |
+| `BOND_BIRTHDAY_BITS` | 44 | keep — 256 MiB table, 1.8 s desktop mint, 96 solvers/24 GiB GPU (§14.5); raise to 48 only where miners are desktop-class |
+| ~~`POW_DIFFICULTY`~~ / ~~`INCIDENT_POW_MULTIPLIER`~~ | — | **removed with per-record PoW** — §5.4 bonds are the only admission; incidents publish at the tap |
 
 ## 13. Defects these measurements and the conformance audit found
 
@@ -675,3 +815,202 @@ published to everyone else.
 The pattern in 1, 2 and 9 is the same: a constant defined, a mechanism
 specified, and nothing calling it. Grepping for each §3 constant's use
 sites found all three, and is worth repeating after any protocol change.
+
+## 14. Is there a lighter puzzle than proof of work?
+
+> Sections 14.1–14.4 are the investigation that ran while per-record
+> proof-of-work was still on the wire; §14.5 is where it ends. The
+> outcome shipped: per-record PoW is **removed** (proofType 1 burned),
+> §5.4 bonds are the only admission, and read-only consumers (§11.6)
+> need no admission at all.
+
+`bench:pulsemesh:bond`. Two candidates were measured rather than argued,
+after a survey of the alternatives the literature offers. One of them
+was my own proposal and the measurement refuted it.
+
+### 14.1 What the survey ruled out before measuring
+
+Under this protocol's constraints — no issuer, every peer verifies
+strangers' records at line rate, 42-byte records, must work on a phone
+on an empty road — the shape of the field is stark:
+
+| Approach | Needs an issuer? | Verify | Size | Works when sparse? |
+| --- | --- | --- | --- | --- |
+| PoW (this protocol, §5.3) | no | 0.69 µs | 0 B beyond the nonce | yes |
+| RLN (measured, §2b) | yes, a registry | 6.3 ms | 26× | yes |
+| ARC / anonymous credentials | yes, *privately* verifiable | 740 µs | 288 B | yes |
+| Blind-RSA Privacy Pass | yes | ~30 µs | 256 B | yes |
+| VDF (Wesolowski/Pietrzak) | RSA setup, or slow class groups | ~ms | 100s of B | yes |
+| Proof-of-Location (witness quorum) | no | cheap | signatures | **no** |
+| Proof-of-Stake | a chain and capital | cheap | small | yes |
+| Hardware attestation | yes, Google/Apple roots | ~ms | ~KB | yes |
+
+Everything cheaper than PoW buys its cheapness with an issuer. ARC is
+the strongest of them and still disqualified: it is *privately*
+verifiable, so issuer and verifier share a key — in a mesh where every
+peer verifies, every peer could mint. Proof-of-Location inverts our
+availability, needing peer density precisely where a hazard report
+matters most, and is privacy-hostile in a way that fights §10.2 head on.
+
+**A kinematic admission tier was designed and abandoned before it was
+built.** The idea was to price movement rather than CPU: require a
+contributor's trajectory to snap to roads and be traversable in the
+elapsed time, verified with the route graph we already ship. It cannot
+work here. PMC1 carries no contributor identity — `reportId` is 16 fresh
+random bytes per record — so successive records are unlinkable by
+construction, and trajectory checking needs exactly the linkage §10.2
+exists to prevent. A per-epoch pseudonym would restore the linkage and be
+a trip identifier in all but name. Separately, the static half of the
+idea is already rule 10–12, and the road graph is public, so map
+plausibility costs a remote attacker nothing.
+
+### 14.2 Memory-hard PoW: measured, and refuted
+
+SHA-256 PoW parallelises perfectly, so an attacker's throughput scales
+with cores while the honest phone pays retail. An asymmetric memory-hard
+puzzle should cap that: Momentum-style, a B-bit birthday collision over a
+table of ~2^(B/2) entries, expensive and memory-bound to solve, three
+hashes to verify.
+
+| B | Solve | Table | Verify | Solvers in 24 GiB | in 256 GiB |
+| --- | --- | --- | --- | --- | --- |
+| 24 | 1.0 ms | 256 KiB | 0.93 µs | 98,304 | 1,048,576 |
+| 28 | 6.2 ms | 1.0 MiB | 0.88 µs | 24,576 | 262,144 |
+| 32 | 28.3 ms | 4.0 MiB | 0.87 µs | 6,144 | 65,536 |
+| 36 | 196 ms | 16.0 MiB | 0.91 µs | 1,536 | 16,384 |
+| 40 | 505 ms | 64.0 MiB | 0.87 µs | 384 | 4,096 |
+
+The verification asymmetry holds beautifully — ~0.9 µs at every size,
+within noise of the 0.69 µs SHA-256 path. The Sybil cap does not. B=40
+matches the current puzzle's cost (505 ms vs 719 ms) and still leaves a
+single consumer GPU room for 384 concurrent solvers and a rented box
+4,096. Memory only binds once core count exceeds RAM÷table, which is true
+of a GPU's shader array and false of every CPU farm an attacker would
+actually rent.
+
+Measured thread scale-up, at costs matched so the comparison is fair:
+
+| Workers | SHA-256 (d=18) | Momentum (B=32) |
+| --- | --- | --- |
+| 1 | 6.0/s (1.00×) | 33.3/s (1.00×) |
+| 4 | 21.3/s (3.56×) | 135.3/s (4.06×) |
+| 8 | 31.3/s (5.22×) | 248.3/s (**7.45×**) |
+
+The memory-hard puzzle scales *better* across threads than SHA-256 — a
+4 MiB table lives in cache, so it never touches the memory bottleneck it
+was chosen for. **Rejected.** At table sizes a phone can afford, memory
+hardness caps nothing; at sizes that would cap something, no phone can
+mine at all.
+
+### 14.3 The defect the search actually found
+
+The real problem was never the puzzle's cost. It was that `minePow` is
+synchronous and never yields:
+
+| | Desktop (3.5 M hash/s) | Phone (~4× slower) |
+| --- | --- | --- |
+| d=20 contribution, mean | 719 ms | ~2.9 s |
+| d=20 contribution, max seen | 1.87 s | ~7.5 s |
+| d=24 incident, mean | 10.0 s | ~40 s |
+| d=24 incident, max seen | 17.2 s | ~69 s |
+| `powMaxIterations` = 1<<26 worst case | 19.1 s | ~76 s |
+
+Every one of those is an unbroken block. A driver taps "hazard ahead"
+and the map freezes for forty seconds. The old `powMaxIterations` cap
+made this worse by being device-relative: the same 67 M iterations meant
+19 s on a laptop and 76 s on a phone.
+
+`minePowChunked` mines in adaptively-sized slices that yield to the event
+loop, bounded by a wall-clock budget rather than an iteration count so
+the setting means the same thing on every device:
+
+| Difficulty | Synchronous | Chunked | Cost | Longest block |
+| --- | --- | --- | --- | --- |
+| 20 | 474 ms | 475 ms | +0.2% | **12.5 ms** |
+| 22 | 4.81 s | 4.84 s | +0.5% | **13.6 ms** |
+
+A 38× and 354× reduction in the longest block for under 1% of
+throughput. The contributor now uses it on both paths, which makes
+`reportIncident` async. Total time to publish is unchanged — a hazard
+report still takes ~40 s of phone CPU at d=24, and that is the finding
+that outlives this section: **`INCIDENT_POW_MULTIPLIER: 4` is 16× the
+work and deserves re-examination**, because a hazard report forty seconds
+late is a much weaker signal than one issued at the tap.
+
+### 14.4 Where this leaves §5.3
+
+Proof of work stays as the bootstrap and fallback. Nothing surveyed
+removes the issuer and keeps microsecond verification, and the one axis
+where PoW is genuinely weak — parallel farming — is not fixable by a
+memory-hard puzzle at phone-affordable *per-record* sizes. What changed
+here: mining is no longer allowed to block the caller, and the tail of
+the mining distribution is now measured rather than modelled from its
+mean. §14.5 then takes the layer question seriously: charging the
+identity instead of the record makes the memory-hard result invert.
+
+### 14.5 The refutation inverts: identity bonds
+
+§14.2 rejected memory-hard PoW *at record cadence* — and the qualifier
+turned out to be the finding. The table there had to be phone-affordable
+per emission, which makes it cache-sized, which is why RAM bound
+nothing. One mint per peer per day (§5.4 identity bonds) can afford a
+table three orders of magnitude larger. Same primitive, measured at bond
+scale:
+
+| B | Solve (desktop) | Phone (~4×) | Table | Verify | Solvers in 24 GiB GPU | in 256 GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 40 | 0.2 s | ~1 s | 64 MiB | 0.93 µs | 384 | 4,096 |
+| **44 (default)** | **1.8 s** | **~7 s** | **256 MiB** | **0.89 µs** | **96** | **1,024** |
+| 48 (cap) | 11.7 s | ~47 s | 1 GiB | 0.87 µs | 24 | 256 |
+
+Verification stays at three hashes — ~0.9 µs at every size, and paid
+once per session rather than per record. The attacker's per-GPU
+parallelism at the default is 96 concurrent solvers, against ~98,000 at
+the cache-sized tables per-record mining forces. (Honest cap on the
+claim, §5.4: Momentum admits van Oorschot–Wiener time–memory tradeoffs,
+so 96 is an upper estimate of the constraint; corroboration and the
+speed anchor remain the actual defense.)
+
+What the record path stops paying once a bond carries the session:
+
+| | Per-record PoW (§5.3) | Bonded (§5.4) |
+| --- | --- | --- |
+| Per contribution | 319 ms here, ~2.9 s phone | **0** |
+| Per incident report | 5.1 s here, ~40 s phone, after the tap | **0 — publishes at the tap** |
+| Record on the wire | 50 B | **42 B** |
+| Verify per record | 0.69 µs | none (bond once per session) |
+| Cadence, 30-min commute | 38 s of core | one background mint/day |
+| Ban evasion cost | free (new keypair) | **a re-mint per forfeiting receiver** |
+
+The last row is the structural point — stated with its honest scope.
+Every sanction in §6/§8 attaches to a peer; per-record PoW attached cost
+to records while peers stayed free, so a ban cost its target nothing. A
+bond is the first artifact a ban actually forfeits — slashing without
+stake — but the trust ledger is local by design, so first-hand
+forfeiture bites at one receiver and spreads only as §8.4's corroborated
+PMX1 testimony, which lowers weight elsewhere and never revokes. And the
+Sybil bound is **throughput, not capacity**: the GPU-solver counts above
+cap *concurrency*, while a bond lives a day — one desktop core mints
+~66,000 default-difficulty bonds per day (~1.3 s each), so 1,000 Sybil
+identities cost ~22 core-minutes. A toll, not a wall; corroboration,
+plausibility, and the speed anchor remain the defense. One further
+unmeasured caveat: salt-grinding with narrowed scan windows is itself a
+time-memory tradeoff avenue against the Momentum table bound, on top of
+the van Oorschot–Wiener route already noted — neither has an attack
+implementation here, so the RAM numbers are upper estimates twice over.
+It does resolve §14.3's open question about `INCIDENT_POW_MULTIPLIER`:
+under bonds the multiplier's 16× tax leaves the incident path entirely
+instead of being re-tuned.
+
+Deployment status: bonds are the protocol. Per-record PoW is removed
+(proofType 1 burned, §5.3), every wire record is proofType 3, keepers
+mint at startup, the simulator models the all-bonded steady state, and
+the wire tests cover mint → PMA1 → verification against the connection
+peerId → rule-5 rejection of unbonded deliverers. Consumers that never
+publish run read-only (§11.6): no bond, no gossip membership, pull-only
+convergence — covered by its own real-TCP test. Open measurement: the
+mint on real phone hardware — the ~7 s phone estimate above is the ×4
+scaling rule, not a measurement, and a 256 MiB transient table on a
+mid-range Android WebView is exactly the kind of claim §9e exists to
+test rather than assume. `bench:pulsemesh:bond` reproduces the numbers
+here.

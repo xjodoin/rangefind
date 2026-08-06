@@ -19,7 +19,16 @@ export declare function createPulseMeshHost(options?: {
  * itself stays the caller's job.
  */
 export declare function createLibp2pNetwork(host: Libp2pLike): MeshNetwork & {
-  stats: { gossipIn: number; gossipOut: number; requests: number; responses: number; served: number };
+  stats: {
+    gossipIn: number; gossipOut: number; requests: number; responses: number; served: number;
+    bondsSent: number; bondsReceived: number;
+  };
+  /**
+   * §5.4: mines this host's admission bond (chunked, background-safe) and
+   * presents it to every current and future peer. Resolves true when
+   * minted; false when the budget or signal ended the search.
+   */
+  mintBond(options?: { budgetMillis?: number | null; signal?: AbortSignal | null; chunkMillis?: number }): Promise<boolean>;
   close(): Promise<void>;
 };
 

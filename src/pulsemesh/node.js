@@ -15,7 +15,7 @@
 //   network.request(fromId, toId, payload) -> bytes  // sync stream
 //   network.peersOf(nodeId) -> peerId[]
 
-import { DEFAULT_CONSTANTS, detailCellKey, topicWindowFromMillis } from "./bins.js";
+import { DEFAULT_CONSTANTS, detailCellKey, timeBucketFromMillis, topicWindowFromMillis } from "./bins.js";
 import {
   MAGIC,
   decodeAny,
@@ -25,8 +25,13 @@ import {
   encodePMG1,
   encodePMN1,
   encodePMQ1,
-  encodePMS1
+  encodePMS1,
+  decodePMA1,
+  encodePMX1,
+  BAN_REASON_INVALID_RECORDS,
+  utf8Bytes
 } from "./codec.js";
+import { verifyBond } from "./bond.js";
 import { PulseMeshStore } from "./store.js";
 import { TrustLedger } from "./aggregate.js";
 import { createValidator } from "./validate.js";
@@ -34,8 +39,16 @@ import { createForwardHandler } from "./forward.js";
 import { createPulseMeshProvider } from "./provider.js";
 import { scoreIncidentKey } from "./incidents.js";
 import { buildCellRequests, buildDecoyPool, corridorCells, diffDigest } from "./sync.js";
-import { parseTopic, topicForCell, topicsForZones, windowAcceptable } from "./topics.js";
-import { fromHex } from "./sha256.js";
+import { parseTopic, topicForCell, topicName, topicsForZones, windowAcceptable } from "./topics.js";
+import { fromHex, sha256, toHex } from "./sha256.js";
+import { signThread, verifyThread } from "./thread_crypto.js";
+
+const BAN_HASH_TAG = "rangefind-ban-v1:";
+
+/** The 16-byte peer handle a PMX1 names — never the peerId itself. */
+export function banPeerHash16(peerId) {
+  return sha256(utf8Bytes(BAN_HASH_TAG + String(peerId))).subarray(0, 16);
+}
 
 function foldsEqual(a, b) {
   for (let i = 0; i < 8; i++) if (a[i] !== b[i]) return false;
@@ -56,7 +69,15 @@ export class MeshNode {
     rng = Math.random,
     transport = "wire",
     suppressedTypes = [],
-    keeper = false
+    keeper = false,
+    // §11.6 read-only consumers: no gossip membership, no publishing, no
+    // §5.4 bond — the node pulls everything it shows through the padded
+    // sync path (PMG1 digests → PMQ1 cell fetches → PMS1 snapshots) from
+    // bonded peers on tick(). This is the browser-at-home mode: a peer
+    // that will never contribute should not pay a 256 MiB mint, and it
+    // should not sit in the gossip mesh as a relay whose deliveries
+    // every bonded receiver would ignore.
+    readOnly = false
   }) {
     this.id = id;
     this.epochHex = epochHex;
@@ -69,6 +90,7 @@ export class MeshNode {
     this.clock = clock;
     this.rng = rng;
     this.keeper = keeper;
+    this.readOnly = readOnly;
     // §11.5 consumer overlap: for EPOCH_OVERLAP after handover a consumer
     // also subscribes to, and accepts, the previous epoch's topics. It
     // emits on the current epoch only — contributors switch immediately.
@@ -76,15 +98,29 @@ export class MeshNode {
     this.epochOverlapUntil = previousEpochHex ? clock() + constants.EPOCH_OVERLAP * 1000 : null;
     this.trust = new TrustLedger({ constants, clock });
     this.store = new PulseMeshStore({ constants, cellOf, trustOf: peer => this.trust.get(peer) });
+    // §5.4: peers whose admission bond this node has verified, and until
+    // when. The validator consults it for proofType 3; the transport
+    // fills it via registerBond.
+    this.bondedPeers = new Map(); // peerId -> expiresMillis
+    // §8.4 forfeiture and propagation. `locallyBanned` holds first-hand
+    // revocations (peerId -> untilMillis). `banLedger` holds remote
+    // testimony (targetHashHex -> { accusers, firstMillis, corroborated,
+    // appliedTo }); it can lower a peer's trust weight, never revoke.
+    this.locallyBanned = new Map();
+    this.banLedger = new Map();
+    this.banReportIds = new Map();   // reportIdHex -> millis, replay window
+    this.peerHashIndex = new Map();  // banPeerHash16 hex -> peerId
+    this.previousEpoch32 = previousEpochHex ? fromHex(previousEpochHex) : null;
     this.validator = createValidator({
       constants,
       epoch32: this.epoch32,
-      previousEpoch32: previousEpochHex ? fromHex(previousEpochHex) : null,
+      previousEpoch32: this.previousEpoch32,
       previousEpochUntilMillis: this.epochOverlapUntil,
       cellOf,
       cellContext,
       transport,
       suppressedTypes,
+      isBonded: peerId => this.isBonded(peerId),
       clock
     });
     this.forwarder = createForwardHandler({
@@ -115,6 +151,8 @@ export class MeshNode {
     this.visitedCells = new Map(); // key -> cell, for the decoy pool
     this.stats = {
       gossipAccepted: 0, gossipDropped: 0, dropsByRule: {},
+      bondsAccepted: 0, bondsRejected: 0,
+      bansForfeited: 0, bansPublished: 0, bansAccepted: 0, bansCorroborated: 0,
       snapshotsMerged: 0, snapshotRecordsAccepted: 0,
       antiEntropyRounds: 0, antiEntropyElided: 0, antiEntropyAgreed: 0,
       cellsRequested: 0, cellsWanted: 0
@@ -131,6 +169,13 @@ export class MeshNode {
 
   subscribeZones(zones, nowMillis = this.clock()) {
     this.zones = zones;
+    // §11.6: a read-only node tracks its zones — tick() targets its
+    // anti-entropy pulls and the provider its cell fetches with them —
+    // but never joins a gossip topic. Joining would make it a mesh
+    // relay, and rule 5 has every bonded receiver ignore what an
+    // unbonded relay delivers, so its membership would only punch holes
+    // in other peers' delivery paths.
+    if (this.readOnly) return;
     const wanted = new Set(topicsForZones({
       epochPrefix16hex: this.epochPrefix16hex,
       zones,
@@ -181,6 +226,7 @@ export class MeshNode {
 
   /** Publishes one encoded PMC1 (as a PMB1 of 1) or PMI1 to its topic. */
   publishRecord(encoded, { forwarder = null, nowMillis = this.clock() } = {}) {
+    if (this.readOnly) throw new Error("A read-only PulseMesh node never publishes (§11.6).");
     const record = decodeAny(encoded.bytes);
     const payload = record.kind === "contribution" ? encodePMB1([encoded.bytes]) : encoded.bytes;
     if (forwarder != null) {
@@ -244,6 +290,67 @@ export class MeshNode {
     return scored ? scored.score : 0;
   }
 
+  // --- Admission bonds (§5.4) -------------------------------------------
+
+  /**
+   * Verifies a PMA1 presented by `fromPeer` and, when valid, marks the
+   * peer bonded until the bond's bucket (plus overlap) ends. The peerId
+   * MUST come from the live connection — it is the one input the sender
+   * cannot choose, and the entire binding rests on it.
+   */
+  registerBond(payload, fromPeer, nowMillis = this.clock()) {
+    // A forfeited peer is refused before its bytes are even decoded —
+    // re-admission costs a fresh mint in a fresh bucket, not a retry.
+    const bannedUntil = this.locallyBanned.get(fromPeer);
+    if (bannedUntil != null) {
+      if (nowMillis < bannedUntil) {
+        this.stats.bondsRejected++;
+        return { ok: false, reason: "bond forfeited here until its bucket ends" };
+      }
+      this.locallyBanned.delete(fromPeer);
+    }
+    let bond;
+    try {
+      bond = payload instanceof Uint8Array ? decodePMA1(payload) : payload;
+    } catch (error) {
+      this.stats.bondsRejected++;
+      return { ok: false, reason: error.message };
+    }
+    const verdict = verifyBond(bond, {
+      epoch32: this.epoch32,
+      previousEpoch32: this.previousEpoch32,
+      peerId: fromPeer,
+      constants: this.constants,
+      nowMillis
+    });
+    if (!verdict.ok) {
+      this.stats.bondsRejected++;
+      return verdict;
+    }
+    const existing = this.bondedPeers.get(fromPeer);
+    this.bondedPeers.set(fromPeer, Math.max(existing ?? 0, verdict.expiresMillis));
+    this.stats.bondsAccepted++;
+    const hashHex = toHex(banPeerHash16(fromPeer));
+    this.peerHashIndex.set(hashHex, fromPeer);
+    // Testimony that arrived before we met this peer applies on arrival.
+    const entry = this.banLedger.get(hashHex);
+    if (entry && entry.corroborated && !entry.appliedTo.has(fromPeer)) {
+      this.trust.penalizeRemoteBan(fromPeer);
+      entry.appliedTo.add(fromPeer);
+    }
+    return verdict;
+  }
+
+  isBonded(peerId, nowMillis = this.clock()) {
+    const expires = this.bondedPeers.get(peerId);
+    if (expires == null) return false;
+    if (nowMillis >= expires) {
+      this.bondedPeers.delete(peerId);
+      return false;
+    }
+    return true;
+  }
+
   // --- Gossip receipt (§6) ----------------------------------------------
 
   onGossip(topicName, payload, fromPeer, nowMillis = this.clock()) {
@@ -263,6 +370,8 @@ export class MeshNode {
       for (const record of message.records) this.#acceptContribution(record, fromPeer, topic, nowMillis);
     } else if (message.kind === "incident") {
       this.#acceptIncident(message, fromPeer, topic, nowMillis);
+    } else if (message.kind === "ban") {
+      this.#acceptBan(message, fromPeer, nowMillis);
     } else {
       this.#drop("unexpected-" + (message.magic || message.kind));
     }
@@ -271,19 +380,29 @@ export class MeshNode {
   #acceptContribution(record, fromPeer, topic, nowMillis) {
     const verdict = this.validator.validateContribution(record, { store: this.store, fromPeer, topic, nowMillis });
     if (!verdict.ok) {
-      if (verdict.trustPenalty) this.trust.penalizeValidation(fromPeer);
+      if (verdict.trustPenalty) {
+        this.trust.penalizeValidation(fromPeer);
+        this.#maybeForfeit(fromPeer, nowMillis);
+      }
       this.#drop(`rule${verdict.rule}`);
       return;
     }
     const result = this.store.addContribution(record, { nowMillis, deliveredBy: fromPeer });
-    if (result.added) this.stats.gossipAccepted++;
-    else this.#drop(result.reason);
+    if (result.added) {
+      this.stats.gossipAccepted++;
+      // Optional tap for gateways (LoRa bridges §16): fires only for
+      // records that passed every rule and entered the store.
+      this.onRecordAccepted?.(record, { fromPeer, nowMillis });
+    } else this.#drop(result.reason);
   }
 
   #acceptIncident(record, fromPeer, topic, nowMillis) {
     const verdict = this.validator.validateIncident(record, { store: this.store, fromPeer, topic, nowMillis });
     if (!verdict.ok) {
-      if (verdict.trustPenalty) this.trust.penalizeValidation(fromPeer);
+      if (verdict.trustPenalty) {
+        this.trust.penalizeValidation(fromPeer);
+        this.#maybeForfeit(fromPeer, nowMillis);
+      }
       this.#drop(`rule${verdict.rule}`);
       return;
     }
@@ -292,13 +411,113 @@ export class MeshNode {
       deliveredBy: fromPeer,
       scoreOf: key => this.#scoreOf(key, nowMillis)
     });
-    if (result.added) this.stats.gossipAccepted++;
-    else this.#drop(result.reason);
+    if (result.added) {
+      this.stats.gossipAccepted++;
+      this.onRecordAccepted?.(record, { fromPeer, nowMillis });
+    } else this.#drop(result.reason);
   }
 
   #drop(reason) {
     this.stats.gossipDropped++;
     this.stats.dropsByRule[reason] = (this.stats.dropsByRule[reason] || 0) + 1;
+  }
+
+  // --- §8.4 forfeiture and ban propagation -------------------------------
+
+  /**
+   * First-hand evidence only: called after a provable validation failure
+   * (rules 10–12) has just been penalized. When the peer's trust reaches
+   * the floor, its bond is revoked here, re-registration is refused for
+   * the bond's remaining lifetime, and a PMX1 announcement goes out —
+   * testimony for other peers to corroborate, never a verdict they must
+   * accept.
+   */
+  #maybeForfeit(fromPeer, nowMillis) {
+    if (fromPeer == null || this.locallyBanned.has(fromPeer)) return;
+    if (!this.trust.isFloored(fromPeer, nowMillis)) return;
+    const until = this.bondedPeers.get(fromPeer)
+      ?? nowMillis + this.constants.BOND_LIFETIME * 1000;
+    this.bondedPeers.delete(fromPeer);
+    this.locallyBanned.set(fromPeer, until);
+    this.stats.bansForfeited++;
+    this.#publishBan(fromPeer, nowMillis);
+  }
+
+  #publishBan(fromPeer, nowMillis) {
+    if (this.readOnly || !this.zones.length) return;
+    const targetHash16 = banPeerHash16(fromPeer);
+    const reportId = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(reportId);
+    const bytes = encodePMX1({
+      epochPrefix8: this.epochPrefix8,
+      targetHash16,
+      reason: BAN_REASON_INVALID_RECORDS,
+      timeBucket: timeBucketFromMillis(nowMillis),
+      reportId
+    });
+    // One deterministic shard per zone: everyone subscribed to the zone
+    // holds all its shards, so one topic reaches them all.
+    const shard = targetHash16[0] % this.constants.SHARDS;
+    const window = topicWindowFromMillis(nowMillis);
+    for (const zone of this.zones) {
+      this.network.publish(topicName({
+        epochPrefix16hex: this.epochPrefix16hex,
+        zoneX: zone.x,
+        zoneY: zone.y,
+        window,
+        shard
+      }), bytes, this.id);
+    }
+    this.stats.bansPublished++;
+  }
+
+  /**
+   * Remote testimony. Corroboration by BAN_MIN_SOURCES distinct bonded
+   * deliverers lowers the target's local trust weight — bounded, and
+   * recoverable through the ledger's ordinary decay. It never revokes:
+   * three colluding bonds can make a mesh distrust an honest peer's
+   * weight for a while, which is the designed cost ceiling of defamation
+   * here; they cannot silence it.
+   */
+  #acceptBan(record, fromPeer, nowMillis) {
+    const idHex = toHex(record.reportId);
+    for (const [id, seen] of this.banReportIds) {
+      if (nowMillis - seen > this.constants.BAN_TTL * 1000) this.banReportIds.delete(id);
+    }
+    if (this.banReportIds.has(idHex)) { this.#drop("banReplay"); return; }
+    const verdict = this.validator.validateBan(record, { fromPeer, nowMillis });
+    if (!verdict.ok) { this.#drop(`banRule${verdict.rule}`); return; }
+    this.banReportIds.set(idHex, nowMillis);
+    const hashHex = toHex(record.targetHash16);
+    if (hashHex === toHex(banPeerHash16(this.id))) return; // testimony about us decides nothing here
+    let entry = this.banLedger.get(hashHex);
+    if (!entry) {
+      if (this.banLedger.size >= this.constants.BAN_TARGET_CAP) {
+        let oldestKey = null;
+        let oldestAt = Infinity;
+        for (const [key, candidate] of this.banLedger) {
+          if (candidate.firstMillis < oldestAt) { oldestAt = candidate.firstMillis; oldestKey = key; }
+        }
+        if (oldestKey) this.banLedger.delete(oldestKey);
+      }
+      entry = { accusers: new Map(), firstMillis: nowMillis, corroborated: false, appliedTo: new Set() };
+      this.banLedger.set(hashHex, entry);
+    }
+    for (const [accuser, at] of entry.accusers) {
+      if (nowMillis - at > this.constants.BAN_TTL * 1000) entry.accusers.delete(accuser);
+    }
+    entry.accusers.set(fromPeer ?? "local", nowMillis);
+    this.stats.bansAccepted++;
+    if (entry.accusers.size < this.constants.BAN_MIN_SOURCES) return;
+    if (!entry.corroborated) {
+      entry.corroborated = true;
+      this.stats.bansCorroborated++;
+    }
+    const target = this.peerHashIndex.get(hashHex);
+    if (target && !entry.appliedTo.has(target)) {
+      this.trust.penalizeRemoteBan(target);
+      entry.appliedTo.add(target);
+    }
   }
 
   // --- Sync stream server (§4.5) ----------------------------------------
@@ -430,13 +649,17 @@ export class MeshNode {
     let accepted = 0;
     for (const cell of snapshot.cells) {
       for (const record of cell.records) {
-        const verdict = this.validator.validateContribution(record, { store: this.store, fromPeer: null, nowMillis });
+        // fromPeer null skips the rate limiter (a snapshot is one pulled
+        // response, not a stream to throttle), but the §5.4 vouch is the
+        // provider: a proofless record in a snapshot is only as good as
+        // the bond of the peer serving it.
+        const verdict = this.validator.validateContribution(record, { store: this.store, fromPeer: null, vouchPeer: fromPeer, nowMillis });
         if (!verdict.ok) continue;
         const result = this.store.addContribution(record, { nowMillis, deliveredBy: fromPeer });
         if (result.added) accepted++;
       }
       for (const record of cell.incidents) {
-        const verdict = this.validator.validateIncident(record, { store: this.store, fromPeer: null, nowMillis });
+        const verdict = this.validator.validateIncident(record, { store: this.store, fromPeer: null, vouchPeer: fromPeer, nowMillis });
         if (!verdict.ok) continue;
         const result = this.store.addIncident(record, {
           nowMillis,
@@ -570,7 +793,7 @@ export function createLoopbackNetwork({ clock = Date.now } = {}) {
   };
 }
 
-// --- §4.6 signed bootstrap ------------------------------------------------
+// --- §4.7 signed bootstrap ------------------------------------------------
 
 /**
  * Canonical JSON: UTF-8, object keys sorted lexicographically at every
@@ -586,14 +809,15 @@ export function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-const ED25519_SPKI_PREFIX = "302a300506032b6570032100";
-const ED25519_PKCS8_PREFIX = "302e020100300506032b657004220420";
-
 /**
- * Verifies mesh-bootstrap.json (Node hosts; browsers use WebCrypto with
- * the same canonical bytes). A bootstrap whose key or signature does not
- * verify MUST be discarded and the mesh treated as unavailable — the
- * router keeps working on the static metric by contract.
+ * Verifies mesh-bootstrap.json. Ed25519 through WebCrypto, the same path
+ * the thread channel uses, so one implementation covers Node, browsers,
+ * and mobile hosts — and a browser bundle of this module pulls in no
+ * Node built-ins.
+ *
+ * A bootstrap whose key or signature does not verify MUST be discarded
+ * and the mesh treated as unavailable; the router keeps working on the
+ * static metric by contract.
  */
 export async function verifyBootstrap(bootstrap, expectedPublicKeyHex) {
   if (!bootstrap || bootstrap.format !== "pulsemesh-bootstrap-v1") return { ok: false, reason: "format" };
@@ -601,24 +825,16 @@ export async function verifyBootstrap(bootstrap, expectedPublicKeyHex) {
   if (bootstrap.publicKey !== expectedPublicKeyHex) return { ok: false, reason: "unexpected key" };
   const { signature, ...unsigned } = bootstrap;
   if (!/^[0-9a-f]{128}$/.test(signature || "")) return { ok: false, reason: "signature shape" };
-  const { createPublicKey, verify } = await import("node:crypto");
-  const key = createPublicKey({
-    key: Buffer.from(ED25519_SPKI_PREFIX + bootstrap.publicKey, "hex"),
-    format: "der",
-    type: "spki"
-  });
-  const ok = verify(null, Buffer.from(canonicalJson(unsigned), "utf8"), key, Buffer.from(signature, "hex"));
+  const ok = await verifyThread(
+    utf8Bytes(canonicalJson(unsigned)),
+    fromHex(signature),
+    fromHex(bootstrap.publicKey)
+  );
   return ok ? { ok: true } : { ok: false, reason: "bad signature" };
 }
 
 /** Signs a bootstrap object with a raw 32-byte Ed25519 seed (tests, ops). */
 export async function signBootstrap(unsigned, privateSeedHex) {
-  const { createPrivateKey, sign } = await import("node:crypto");
-  const key = createPrivateKey({
-    key: Buffer.from(ED25519_PKCS8_PREFIX + privateSeedHex, "hex"),
-    format: "der",
-    type: "pkcs8"
-  });
-  const signature = sign(null, Buffer.from(canonicalJson(unsigned), "utf8"), key);
-  return { ...unsigned, signature: signature.toString("hex") };
+  const signature = await signThread(utf8Bytes(canonicalJson(unsigned)), fromHex(privateSeedHex));
+  return { ...unsigned, signature: toHex(signature) };
 }

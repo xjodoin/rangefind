@@ -336,7 +336,7 @@ test("signed bootstrap verifies and rejects tampering", async () => {
     format: "pulsemesh-bootstrap-v1",
     epoch: "f".repeat(64),
     previousEpoch: null,
-    constants: { POW_DIFFICULTY: 18 },
+    constants: { BOND_BIRTHDAY_BITS: 24 },
     incidentPolicy: { suppressedTypes: [5] },
     bootstrapPeers: [],
     relays: [],
@@ -346,7 +346,7 @@ test("signed bootstrap verifies and rejects tampering", async () => {
   const signed = await signBootstrap(unsigned, seed);
   assert.deepEqual(await verifyBootstrap(signed, publicRaw), { ok: true });
 
-  const tampered = { ...signed, constants: { POW_DIFFICULTY: 1 } };
+  const tampered = { ...signed, constants: { BOND_BIRTHDAY_BITS: 11 } };
   assert.equal((await verifyBootstrap(tampered, publicRaw)).ok, false, "tampered constants fail");
   assert.equal((await verifyBootstrap(signed, "00".repeat(32))).ok, false, "unexpected key fails");
 

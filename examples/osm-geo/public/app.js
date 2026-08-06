@@ -8,6 +8,7 @@ import {
   suggestOsmQuery
 } from "./osm.browser.js";
 import { openRouteGraphUrl } from "./route.browser.js";
+import { createPulseMeshDemo } from "./pulsemesh-demo.js";
 import { geometryFeatureBounds, resultGeometryFeature } from "./result_geometry.js";
 
 const queryInput = document.querySelector("#queryInput");
@@ -2206,10 +2207,75 @@ function fitRoutePlan() {
 // --- Route computation -----------------------------------------------------
 
 function departureParams() {
-  if (routeBucketNames.length < 2) return {};
-  if (departureChoice === "peak") return { bucket: routeBucketNames[1] };
-  if (departureChoice === "base") return { bucket: routeBucketNames[0] };
-  return { departureTime: new Date() };
+  const live = pulseMesh?.provider() ?? null;
+  // Every route call in this file spreads departureParams(), so attaching
+  // the live provider here reaches point-to-point routes, alternatives,
+  // itineraries and navigation reroutes alike. When the mesh is off, or
+  // has no data, this is simply absent and the router runs static — which
+  // is the whole degradation contract.
+  const liveParams = live ? { live } : {};
+  if (routeBucketNames.length < 2) return liveParams;
+  if (departureChoice === "peak") return { ...liveParams, bucket: routeBucketNames[1] };
+  if (departureChoice === "base") return { ...liveParams, bucket: routeBucketNames[0] };
+  return { ...liveParams, departureTime: new Date() };
+}
+
+// --- PulseMesh -------------------------------------------------------------
+//
+// Live traffic with no traffic server: peers gossip 42-byte contributions,
+// every subscriber recomputes the same weighted-median aggregate, and the
+// router consumes it through the ordinary LiveTrafficProvider contract.
+// See docs/pulsemesh.md.
+
+let pulseMesh = null;
+
+async function togglePulseMesh(on) {
+  if (!routeEngine) return null;
+  if (!on) {
+    if (pulseMesh) await pulseMesh.stop();
+    pulseMesh = null;
+    return null;
+  }
+  if (!pulseMesh) {
+    pulseMesh = createPulseMeshDemo({
+      engine: routeEngine,
+      // A keeper multiaddr in the URL joins the real mesh; without one the
+      // demo runs peers inside this tab so it works on any static host.
+      mode: new URLSearchParams(location.search).get("keeper") ? "keeper" : "local",
+      keeperAddress: new URLSearchParams(location.search).get("keeper")
+    });
+    await pulseMesh.start();
+  }
+  return pulseMesh;
+}
+
+/**
+ * Reports the jam the active route is driving into, then re-routes. The
+ * contributions are made by simulated vehicles in local mode; on a real
+ * mesh this is what other drivers' phones would already have said.
+ */
+async function reportPulseMeshJam() {
+  const active = routePlan?.candidates?.[routePlan.active];
+  if (!pulseMesh || !active?.edges?.length) return null;
+  pulseMesh.followRoute(active);
+  const segments = active.edges
+    .slice(Math.floor(active.edges.length * 0.3), Math.floor(active.edges.length * 0.3) + 15)
+    .map(edge => edge.segment);
+  const published = await pulseMesh.simulateJam(segments);
+  return { published, ...pulseMesh.refreshState() };
+}
+
+if (typeof window !== "undefined") {
+  // Exposed so the page (and anyone poking at the console) can drive the
+  // mesh without this module owning any UI.
+  window.rangefindPulseMesh = {
+    enable: () => togglePulseMesh(true),
+    disable: () => togglePulseMesh(false),
+    report: reportPulseMeshJam,
+    state: () => pulseMesh?.refreshState() ?? null,
+    jams: () => pulseMesh?.jammedSegments() ?? [],
+    get mode() { return pulseMesh?.mode ?? null; }
+  };
 }
 
 function clearCorridorResults() {

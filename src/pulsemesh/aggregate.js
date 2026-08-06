@@ -155,6 +155,22 @@ export class TrustLedger {
   }
 
   /**
+   * §8.4 corroborated remote testimony: a bounded penalty, clamped at
+   * TRUST_MIN like everything else. Deliberately weaker than first-hand
+   * evidence — remote input can floor a peer's *weight*, never revoke
+   * its bond; revocation is reserved for what this node saw itself.
+   */
+  penalizeRemoteBan(peerId) {
+    this.#adjust(peerId, -this.constants.BAN_REMOTE_PENALTY);
+  }
+
+  /** True when the peer sits at the floor — the §8.4 forfeiture trigger. */
+  isFloored(peerId, nowMillis = this.clock()) {
+    void nowMillis;
+    return this.get(peerId) <= this.constants.TRUST_MIN;
+  }
+
+  /**
    * Post-aggregate feedback: +25 for landing within ±1 bin of an n ≥ 3
    * aggregate (at most one credit per aggregate per peer), −100 for ≥ 3
    * bins away.

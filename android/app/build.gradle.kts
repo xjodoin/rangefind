@@ -75,7 +75,7 @@ android {
 // (npm run build:browser) instead of checking copies into the app module.
 val syncRangefindBundles by tasks.registering(Copy::class) {
     from(rootProject.file("../dist")) {
-        include("runtime.browser.js", "osm.browser.js", "route.browser.js")
+        include("runtime.browser.js", "osm.browser.js", "route.browser.js", "pulsemesh.mobile.js")
     }
     into(layout.projectDirectory.dir("src/main/assets/rangefind"))
 }

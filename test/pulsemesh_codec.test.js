@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { performance } from "node:perf_hooks";
 import {
   MAGIC,
   decodeAny,
@@ -21,10 +22,10 @@ import {
   encodePMS1,
   gossipMessageId,
   leadingZeroBits,
-  minePow,
   parseSegment,
   segmentString,
-  verifyPow
+  encodePMA1,
+  decodePMA1
 } from "../src/pulsemesh/codec.js";
 import { fromHex, sha256, sha256Utf8, toHex } from "../src/pulsemesh/sha256.js";
 import { activeWindows, parseTopic, shardOfCell, topicForCell, topicName, windowAcceptable } from "../src/pulsemesh/topics.js";
@@ -49,8 +50,8 @@ test("§13.1 contribution record encodes byte-identically", () => {
     meters: 184,
     ttlSeconds: 90,
     reportId: sha256Utf8("report").slice(0, 16),
-    proofType: 1,
-    proof: fromHex("000000000000e6d4")
+    proofType: 3,
+    proof: new Uint8Array(0)
   });
   assert.equal(
     toHex(preimage),
@@ -58,13 +59,9 @@ test("§13.1 contribution record encodes byte-identically", () => {
   );
   assert.equal(
     toHex(bytes),
-    "504d4331f44796c8cc1f3fa7ed18f5068090e2370706b8015a845e91831319e89c4d656bdb80c278ac0108000000000000e6d4"
+    "504d4331f44796c8cc1f3fa7ed18f5068090e2370706b8015a845e91831319e89c4d656bdb80c278ac0300"
   );
-  assert.ok(verifyPow(preimage, EPOCH32, fromHex("000000000000e6d4"), 16), "vector PoW verifies at difficulty 16");
-  assert.equal(
-    toHex(sha256(Uint8Array.from([...preimage, ...EPOCH32, ...fromHex("000000000000e6d4")]))),
-    "0000c8ff4d3d25b2f2c430481bfd05b76b938aa1ac8bc6aff223c290c488c688"
-  );
+  assert.equal(bytes.length, 43, "a bonded record is 43 bytes on the wire");
 
   const decoded = decodePMC1(bytes);
   assert.equal(decoded.segment, "3181/442/1");
@@ -86,14 +83,14 @@ test("§13.4 incident record encodes byte-identically", () => {
     polarity: 1,
     ttlSeconds: 1800,
     reportId: sha256Utf8("incident").slice(0, 16),
-    proofType: 1,
-    proof: fromHex("000000000001731c")
+    proofType: 3,
+    proof: new Uint8Array(0)
   });
   assert.equal(
     toHex(bytes),
-    "504d4931f44796c8cc1f3fa7ed18f50680108090e2370501880ed4191834714542dcf3e5d8a6ab386c9b0108000000000001731c"
+    "504d4931f44796c8cc1f3fa7ed18f50680108090e2370501880ed4191834714542dcf3e5d8a6ab386c9b0300"
   );
-  assert.ok(verifyPow(preimage, EPOCH32, fromHex("000000000001731c"), 16));
+  assert.ok(preimage.length > 0);
   const decoded = decodePMI1(bytes);
   assert.equal(decoded.type, 5);
   assert.equal(decoded.polarity, 1);
@@ -101,15 +98,6 @@ test("§13.4 incident record encodes byte-identically", () => {
   assert.equal(decoded.ttlSeconds, 1800);
 });
 
-test("sequential mining reproduces the spec nonces", () => {
-  const record = encodePMC1({
-    epochPrefix8: PREFIX8, leafCell: 3181, geomRef: 885, timeBucket: 116951040,
-    speedBin: 7, qualityBin: 6, meters: 184, ttlSeconds: 90,
-    reportId: sha256Utf8("report").slice(0, 16), proofType: 1, proof: fromHex("000000000000e6d4")
-  });
-  const mined = minePow(record.preimage, EPOCH32, 16);
-  assert.equal(toHex(mined.nonce), "000000000000e6d4");
-});
 
 test("trailing bytes are a validation failure everywhere", () => {
   const { bytes } = encodePMC1({
@@ -240,4 +228,16 @@ test("segment string and wire forms convert both ways", () => {
   assert.equal(segmentString(3181, 885), "3181/442/1");
   assert.deepEqual(parseSegment("3181/442/1"), { leafCell: 3181, geomRef: 885 });
   assert.throws(() => parseSegment("3181/442"), /Bad segment/);
+});
+
+test("§13.6 admission bond encodes byte-identically", () => {
+  const bytes = encodePMA1({
+    epochPrefix8: PREFIX8, dayBucket: 20654, birthdayBits: 44,
+    pairDifficulty: 0, salt: 0, i: 0xdeadbeef, j: 17
+  });
+  assert.equal(toHex(bytes), "504d4131f44796c8cc1f3fa7aea1012c0000deadbeef00000011");
+  assert.equal(bytes.length, 26, "a bond is 26 bytes, presented once per session");
+  const decoded = decodePMA1(bytes);
+  assert.equal(decoded.dayBucket, 20654);
+  assert.equal(decoded.birthdayBits, 44);
 });

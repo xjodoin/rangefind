@@ -96,9 +96,17 @@
       "types": "./types/pulsemesh.d.ts",
       "default": "./src/pulsemesh/index.js"
     },
+    "./pulsemesh/mobile": {
+      "types": "./types/pulsemesh-mobile.d.ts",
+      "default": "./src/pulsemesh/mobile.js"
+    },
     "./pulsemesh/threads": {
       "types": "./types/pulsemesh-threads.d.ts",
       "default": "./src/pulsemesh/threads.js"
+    },
+    "./pulsemesh/lora": {
+      "types": "./types/pulsemesh-lora.d.ts",
+      "default": "./src/pulsemesh/lora.js"
     },
     "./pulsemesh/libp2p": {
       "types": "./types/pulsemesh-libp2p.d.ts",
@@ -154,7 +162,7 @@
   ],
   "scripts": {
     "build:browser": "node scripts/build_browser_bundle.mjs",
-    "build:osm-demo": "npm run build:browser && cp dist/runtime.browser.js dist/osm.browser.js dist/route.browser.js examples/osm-geo/public/",
+    "build:osm-demo": "npm run build:browser && cp dist/runtime.browser.js dist/osm.browser.js dist/route.browser.js dist/pulsemesh.browser.js dist/pulsemesh-libp2p.browser.js examples/osm-geo/public/",
     "setup:osm-demo-route": "node scripts/osm_demo_route_setup.mjs",
     "build:element": "node scripts/build_element_bundle.mjs",
     "build:example": "node scripts/build_browser_bundle.mjs && node bin/rangefind.js build --config examples/basic/rangefind.config.json && cp dist/runtime.browser.js examples/basic/public/runtime.browser.js",
@@ -192,8 +200,9 @@
     "bench:pulsemesh": "node scripts/pulsemesh_bench.mjs",
     "bench:pulsemesh:sim": "node scripts/pulsemesh_sim.mjs --scenario=all",
     "bench:pulsemesh:wire": "node scripts/pulsemesh_wire_bench.mjs",
+    "bench:pulsemesh:bond": "node scripts/pulsemesh_bond_bench.mjs",
     "bench:pulsemesh:threads": "node scripts/pulsemesh_thread_bench.mjs",
-    "bench:pulsemesh:all": "node scripts/pulsemesh_bench.mjs && node scripts/pulsemesh_sim.mjs --scenario=all && node scripts/pulsemesh_wire_bench.mjs && node scripts/pulsemesh_thread_bench.mjs",
+    "bench:pulsemesh:all": "node scripts/pulsemesh_bench.mjs && node scripts/pulsemesh_sim.mjs --scenario=all && node scripts/pulsemesh_wire_bench.mjs && node scripts/pulsemesh_thread_bench.mjs && node scripts/pulsemesh_bond_bench.mjs",
     "demo:pulsemesh": "node scripts/pulsemesh_demo.mjs",
     "pulsemesh:keeper": "node scripts/pulsemesh_keeper.mjs",
     "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
@@ -211,10 +220,15 @@
     "@chainsafe/libp2p-gossipsub": "^14.1.2",
     "@chainsafe/libp2p-noise": "^16.1.5",
     "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/circuit-relay-v2": "^3.2.24",
     "@libp2p/identify": "^3.0.39",
+    "@libp2p/kad-dht": "^14.2.15",
     "@libp2p/tcp": "^10.1.19",
+    "@libp2p/webrtc": "^5.2.24",
+    "@libp2p/websockets": "^9.2.19",
     "esbuild": "^0.25.12",
     "libp2p": "^2.10.0",
+    "multiformats": "^13.4.2",
     "rangefind": "file:."
   },
   "peerDependencies": {

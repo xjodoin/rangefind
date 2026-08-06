@@ -32,7 +32,34 @@ interface RangefindEngine {
         fromHeading: Double? = null
     ): RouteBundle
     suspend fun snap(point: LatLon): SnapPoint?
+
+    /**
+     * Live traffic (PulseMesh). The phone is the contributor the design
+     * counts on — background location is what a browser tab cannot offer —
+     * but publishing where you drive is a decision, so it stays off until
+     * [setContributing] turns it on.
+     */
+    suspend fun pulseMeshStatus(): PulseMeshStatus
+    suspend fun setContributing(enabled: Boolean): PulseMeshStatus
+    /** One GPS fix through the contributor pipeline. */
+    suspend fun offerLocation(point: LatLon, speedMps: Double?, courseDeg: Double?): PulseMeshStatus
 }
+
+/**
+ * What the mesh is doing right now. [contributing] false means this phone
+ * only reads traffic; [suppressed] counts fixes the protocol's own gates
+ * declined to publish, which is the normal case under the reticent profile.
+ */
+data class PulseMeshStatus(
+    val available: Boolean,
+    val contributing: Boolean = false,
+    val epoch: String = "",
+    val fixes: Int = 0,
+    val emitted: Int = 0,
+    val suppressed: Int = 0,
+    val lastReason: String? = null,
+    val error: String? = null
+)
 
 data class LatLon(val lat: Double, val lon: Double)
 

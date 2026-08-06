@@ -32,13 +32,16 @@ export {
 export {
   MAGIC,
   PROOF_BLIND_TOKEN,
+  PROOF_BOND,
   PROOF_NONE,
-  PROOF_POW,
   POLARITY_CONFIRM,
   POLARITY_REFUTE,
   POLARITY_REPORT,
+  BAN_REASON_INVALID_RECORDS,
   decodeAny,
+  decodePMA1,
   decodePMB1,
+  decodePMX1,
   decodePMC1,
   decodePMD1,
   decodePMF1,
@@ -47,7 +50,9 @@ export {
   decodePMQ1,
   decodePMS1,
   encodePMB1,
+  encodePMA1,
   encodePMC1,
+  encodePMX1,
   encodePMD1,
   encodePMF1,
   encodePMG1,
@@ -55,13 +60,22 @@ export {
   encodePMQ1,
   encodePMS1,
   gossipMessageId,
-  minePow,
   parseSegment,
-  segmentString,
-  verifyPow
+  segmentString
 } from "./codec.js";
 
 export { sha256, sha256Hex, sha256Utf8, fromHex, toHex } from "./sha256.js";
+
+export {
+  MAX_BIRTHDAY_BITS,
+  bondBucketForPeer,
+  bondPhaseMillis,
+  bondSeed,
+  mintBond,
+  solveBondProof,
+  verifyBond,
+  verifyBondProof
+} from "./bond.js";
 
 export {
   SYNC_PROTOCOL,
@@ -92,6 +106,7 @@ export { createForwardHandler } from "./forward.js";
 export { buildCellRequests, buildDecoyPool, corridorCells, diffDigest, requestOverhead } from "./sync.js";
 export {
   MeshNode,
+  banPeerHash16,
   canonicalJson,
   createLoopbackNetwork,
   signBootstrap,

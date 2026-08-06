@@ -13,6 +13,7 @@ import {
   suggestOsmQuery
 } from "./osm.browser.js";
 import { openRouteGraphUrl } from "./route.browser.js";
+import { createMobileMesh } from "./pulsemesh.mobile.js";
 
 const ROUTE_PROBE_TIMEOUT_MS = 6000;
 const MANIFEST_CACHE_PREFIX = "rangefind.manifest:";
@@ -185,6 +186,35 @@ function routingInfo() {
   };
 }
 
+// --- PulseMesh -------------------------------------------------------------
+//
+// The phone is the contributor the design counts on: it has background
+// location and a screen that can be off, which is exactly what a browser
+// tab cannot offer. Contribution stays off until the user turns it on —
+// publishing where you drive is a decision, not a default.
+
+let mesh = null;
+let meshError = null;
+
+async function ensureMesh() {
+  if (mesh || !routeEngine) return mesh;
+  try {
+    mesh = await createMobileMesh({
+      engine: routeEngine,
+      // No network yet: the app collects and consumes locally until a
+      // transport is configured. Everything else — snap, gates, PoW,
+      // validation, aggregation — is already the real pipeline.
+      network: null,
+      id: "android",
+      profile: "reticent"
+    });
+    meshError = null;
+  } catch (error) {
+    meshError = String(error?.message || error);
+  }
+  return mesh;
+}
+
 const handlers = {
   async init({ searchBase, routeBase }) {
     searchUnavailable = null;
@@ -296,10 +326,14 @@ const handlers = {
 
   async route({ from, to, alternatives, departureTime, fromHeading }) {
     if (!routeEngine) throw new Error(routeUnavailable || "Routing unavailable");
+    // Live traffic when the mesh has any, the static metric otherwise —
+    // the router's degradation contract means this needs no branch.
+    const live = mesh?.provider() ?? null;
     const result = await routeEngine.route({
       from,
       to,
       alternatives: alternatives || 0,
+      ...(live ? { live } : {}),
       ...(departureTime ? { departureTime } : {}),
       // Only sent while actually moving: a heading from a standing vehicle is
       // noise, and biasing the snap with it would invent a U-turn penalty for
@@ -309,6 +343,27 @@ const handlers = {
     return {
       primary: trimRoute(result),
       alternatives: (result.alternatives || []).map(trimRoute)
+    };
+  },
+
+  /**
+   * Live-traffic state and control. `enable` turns contribution on or off;
+   * `location` feeds one GPS fix through the contributor pipeline. Called
+   * from Kotlin as the location provider produces fixes.
+   */
+  async pulseMesh({ action, lat, lon, speedMps, courseDeg, enabled }) {
+    const active = await ensureMesh();
+    if (!active) return { available: false, error: meshError || "no route index" };
+    if (action === "enable") active.setContributing(Boolean(enabled));
+    if (action === "location" && Number.isFinite(lat) && Number.isFinite(lon)) {
+      await active.onLocation({ lat, lon, speedMps, courseDeg });
+    }
+    return {
+      available: true,
+      contributing: active.contributing,
+      epoch: active.epoch.slice(0, 16),
+      threadsAvailable: active.host.threadsAvailable,
+      stats: { ...active.stats }
     };
   },
 

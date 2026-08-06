@@ -18,16 +18,24 @@ export const MAGIC = Object.freeze({
   PMQ1: "PMQ1",
   PMS1: "PMS1",
   PMF1: "PMF1",
-  PMN1: "PMN1"
+  PMN1: "PMN1",
+  PMA1: "PMA1",
+  PMX1: "PMX1"
 });
 
 // Reserved for the thread channel (pulsemesh-threads.md); a traffic-only
 // implementation must ignore these, not error on them (§1).
 export const RESERVED_MAGIC_PREFIXES = Object.freeze(["PMT", "PMP", "PMR", "PMM"]);
 
-export const PROOF_NONE = 0;
-export const PROOF_POW = 1;
+// Proof registry (§5.3). Value 1 was per-record proof-of-work in the
+// drafts; §5.4 bonds made it redundant and the value stays burned so no
+// old capture can ever validate.
+export const PROOF_NONE = 0;        // loopback/local only, never on the wire
 export const PROOF_BLIND_TOKEN = 2; // reserved, phase 4
+// §5.4 identity bonds: the record carries no proof at all — the
+// *delivering peer's* session bond vouches for it, so the admission cost
+// is one bond per peer per day instead of a proof per record.
+export const PROOF_BOND = 3;
 
 const encoderScratch = new TextEncoder();
 
@@ -458,6 +466,8 @@ export function decodeAny(bytes) {
     case MAGIC.PMS1: return decodePMS1(bytes);
     case MAGIC.PMF1: return decodePMF1(bytes);
     case MAGIC.PMN1: return decodePMN1(bytes);
+    case MAGIC.PMA1: return decodePMA1(bytes);
+    case MAGIC.PMX1: return decodePMX1(bytes);
     default: return { kind: "unknown", magic };
   }
 }
@@ -468,7 +478,7 @@ export function gossipMessageId(payload) {
   return sha256(payload).subarray(0, 20);
 }
 
-// --- §5.3 proof of work --------------------------------------------------
+// --- bit utilities shared with the §5.4 bond puzzle ----------------------
 
 export function leadingZeroBits(bytes) {
   let bits = 0;
@@ -482,49 +492,81 @@ export function leadingZeroBits(bytes) {
   return bits;
 }
 
-function powMessage(preimage, epoch32, nonce) {
-  const message = new Uint8Array(preimage.length + 32 + 8);
-  message.set(preimage, 0);
-  message.set(epoch32, preimage.length);
-  message.set(nonce, preimage.length + 32);
-  return message;
+// --- §8.4 ban announcement (PMX1) ---------------------------------------
+//
+// Gossiped when a peer's bond is forfeited on FIRST-HAND evidence (a
+// trust-floor from provable validation failures). The target travels as
+// a peerId hash, never the id itself; receivers match it against peers
+// they have actually met. An announcement is testimony, not a verdict —
+// receivers apply corroborated announcements as a trust penalty only,
+// and revocation always requires their own first-hand evidence.
+
+export const BAN_REASON_INVALID_RECORDS = 1;
+
+export function encodePMX1({ epochPrefix8, targetHash16, reason, timeBucket, reportId }) {
+  const out = [];
+  pushMagic(out, MAGIC.PMX1);
+  if (epochPrefix8.length !== 8) throw new Error("epochPrefix8 must be 8 bytes.");
+  pushBytes(out, epochPrefix8);
+  if (targetHash16.length !== 16) throw new Error("targetHash16 must be 16 bytes.");
+  pushBytes(out, targetHash16);
+  out.push(reason & 0xff);
+  pushVarint(out, timeBucket);
+  if (reportId.length !== 16) throw new Error("reportId must be 16 bytes.");
+  pushBytes(out, reportId);
+  return Uint8Array.from(out);
 }
 
-export function verifyPow(preimage, epoch32, nonce, difficultyBits, hash = sha256) {
-  if (epoch32.length !== 32) throw new Error("epoch32 must be the full 32-byte epoch.");
-  if (nonce.length !== 8) return false;
-  return leadingZeroBits(hash(powMessage(preimage, epoch32, nonce))) >= difficultyBits;
+export function decodePMX1(bytes) {
+  const state = { pos: 0 };
+  expectMagic(bytes, state, MAGIC.PMX1);
+  const epochPrefix8 = readBytes(bytes, state, 8);
+  const targetHash16 = readBytes(bytes, state, 16);
+  const reason = readU8(bytes, state);
+  const timeBucket = readBoundedVarint(bytes, state);
+  const reportId = readBytes(bytes, state, 16);
+  assertNoTrailing(bytes, state, "PMX1 ban announcement");
+  return { kind: "ban", magic: MAGIC.PMX1, epochPrefix8, targetHash16, reason, timeBucket, reportId };
 }
 
-/**
- * Mines an 8-byte big-endian nonce satisfying the difficulty, counting up
- * from `startNonce`. Returns { nonce, iterations } or null when
- * `maxIterations` is exhausted (the caller decides whether to retry with a
- * fresh reportId or give up — mining must never block a UI thread
- * indefinitely).
- */
-export function minePow(preimage, epoch32, difficultyBits, { startNonce = 0, maxIterations = Infinity, hash = sha256 } = {}) {
-  if (epoch32.length !== 32) throw new Error("epoch32 must be the full 32-byte epoch.");
-  const message = powMessage(preimage, epoch32, new Uint8Array(8));
-  const nonceOffset = preimage.length + 32;
-  let low = startNonce >>> 0;
-  let high = Math.floor(startNonce / 0x100000000) >>> 0;
-  for (let iterations = 1; iterations <= maxIterations; iterations++) {
-    message[nonceOffset] = (high >>> 24) & 0xff;
-    message[nonceOffset + 1] = (high >>> 16) & 0xff;
-    message[nonceOffset + 2] = (high >>> 8) & 0xff;
-    message[nonceOffset + 3] = high & 0xff;
-    message[nonceOffset + 4] = (low >>> 24) & 0xff;
-    message[nonceOffset + 5] = (low >>> 16) & 0xff;
-    message[nonceOffset + 6] = (low >>> 8) & 0xff;
-    message[nonceOffset + 7] = low & 0xff;
-    if (leadingZeroBits(hash(message)) >= difficultyBits) {
-      return { nonce: message.slice(nonceOffset), iterations };
-    }
-    low = (low + 1) >>> 0;
-    if (low === 0) high = (high + 1) >>> 0;
+// --- §5.4 identity bond admission (PMA1) --------------------------------
+//
+// A bond is presented once per session on its own stream, never inside a
+// record, so its size is irrelevant to MAX_RECORD_BYTES. The peerId it
+// binds is deliberately absent from the wire form: the verifier takes it
+// from the connection, which is the only place it cannot be lied about.
+
+export function encodePMA1({ epochPrefix8, dayBucket, birthdayBits, pairDifficulty, salt, i, j }) {
+  const out = [];
+  pushMagic(out, MAGIC.PMA1);
+  if (epochPrefix8.length !== 8) throw new Error("epochPrefix8 must be 8 bytes.");
+  pushBytes(out, epochPrefix8);
+  pushVarint(out, dayBucket);
+  out.push(birthdayBits & 0xff);
+  out.push(pairDifficulty & 0xff);
+  out.push(salt & 0xff);
+  for (const nonce of [i, j]) {
+    out.push((nonce >>> 24) & 0xff, (nonce >>> 16) & 0xff, (nonce >>> 8) & 0xff, nonce & 0xff);
   }
-  return null;
+  return Uint8Array.from(out);
+}
+
+export function decodePMA1(bytes) {
+  const state = { pos: 0 };
+  expectMagic(bytes, state, MAGIC.PMA1);
+  const epochPrefix8 = readBytes(bytes, state, 8);
+  const dayBucket = readBoundedVarint(bytes, state);
+  const birthdayBits = readU8(bytes, state);
+  const pairDifficulty = readU8(bytes, state);
+  const salt = readU8(bytes, state);
+  const readU32 = () => {
+    const raw = readBytes(bytes, state, 4);
+    return ((raw[0] << 24) | (raw[1] << 16) | (raw[2] << 8) | raw[3]) >>> 0;
+  };
+  const i = readU32();
+  const j = readU32();
+  assertNoTrailing(bytes, state, "PMA1 bond");
+  return { kind: "bond", magic: MAGIC.PMA1, epochPrefix8, dayBucket, birthdayBits, pairDifficulty, salt, i, j };
 }
 
 export function utf8Bytes(text) {

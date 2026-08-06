@@ -11,6 +11,7 @@ import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.EngineInfo
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Place
+import dev.rangefind.wayfind.engine.PulseMeshStatus
 import dev.rangefind.wayfind.engine.RangefindEngine
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.engine.RouteBundle
@@ -78,7 +79,15 @@ data class UiState(
     /** Driving, cycling or walking. */
     val mode: TravelMode = TravelMode.Car,
     /** Modes this area actually has an index for. */
-    val modesAvailable: Set<TravelMode> = setOf(TravelMode.Car)
+    val modesAvailable: Set<TravelMode> = setOf(TravelMode.Car),
+    /**
+     * Whether this phone publishes anonymous speed observations. Off by
+     * default: reading live traffic costs the user nothing, contributing
+     * publishes where they drove, and that is a choice they make rather
+     * than one an app makes for them.
+     */
+    val contributingTraffic: Boolean = false,
+    val pulseMesh: PulseMeshStatus? = null
 ) {
     val activeRoute: Route?
         get() = routes?.let { bundle ->
@@ -779,10 +788,38 @@ class MapsViewModel(
         locationJob = null
     }
 
+    /**
+     * Feeds one fix to the live-traffic mesh. The protocol decides whether
+     * anything is published — a phone under the reticent profile emits only
+     * observations that surprise the current expectation, and only when
+     * others are already reporting the same road. Failures are swallowed:
+     * live traffic is best-effort, and the router works without it.
+     */
+    private fun offerToPulseMesh(location: Location, point: LatLon) {
+        if (!_state.value.contributingTraffic) return
+        viewModelScope.launch {
+            val status = engine.offerLocation(
+                point = point,
+                speedMps = if (location.hasSpeed()) location.speed.toDouble() else null,
+                courseDeg = if (location.hasBearing()) location.bearing.toDouble() else null
+            )
+            _state.update { it.copy(pulseMesh = status) }
+        }
+    }
+
+    /** Turns contribution on or off. Off is the default and the safe state. */
+    fun setContributingTraffic(enabled: Boolean) {
+        viewModelScope.launch {
+            val status = engine.setContributing(enabled)
+            _state.update { it.copy(contributingTraffic = status.contributing, pulseMesh = status) }
+        }
+    }
+
     private fun onLocation(location: Location) {
         val point = LatLon(location.latitude, location.longitude)
         travel.onFix(point, System.currentTimeMillis())
         _state.update { it.copy(userLocation = point) }
+        offerToPulseMesh(location, point)
         if (_state.value.sheet != SheetMode.Navigating) return
 
         motion.onFix(

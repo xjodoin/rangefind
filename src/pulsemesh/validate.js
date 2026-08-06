@@ -6,7 +6,7 @@
 
 import { DEFAULT_CONSTANTS, MAX_SPEED_BIN, bucketAgeSeconds, bucketStartMillis } from "./bins.js";
 import { INCIDENT_TYPES } from "./incidents.js";
-import { MAGIC, PROOF_POW, decodePMC1, decodePMI1, verifyPow } from "./codec.js";
+import { BAN_REASON_INVALID_RECORDS, MAGIC, PROOF_BOND, decodePMC1, decodePMI1, decodePMX1 } from "./codec.js";
 import { shardOfCell } from "./topics.js";
 import { toHex } from "./sha256.js";
 
@@ -43,7 +43,10 @@ function fail(rule, reason, { trustPenalty = false } = {}) {
  * - transport: "wire" (default) rejects proofType 0; "loopback" accepts
  *   it, for phase-1 tests and the demo (§4.1).
  * - suppressedTypes: incidentPolicy.suppressedTypes from the signed
- *   bootstrap (§4.6, §10.4).
+ *   bootstrap (§4.7, §10.4).
+ * - isBonded(peerId): §5.4 — whether the peer holds a live admission
+ *   bond. When absent, proofType 3 is rejected on the wire: a mesh that
+ *   has not deployed bonds must not accept proofless records.
  */
 export function createValidator({
   constants = DEFAULT_CONSTANTS,
@@ -54,6 +57,7 @@ export function createValidator({
   cellContext = null,
   transport = "wire",
   suppressedTypes = [],
+  isBonded = null,
   clock = Date.now
 } = {}) {
   if (!epoch32 || epoch32.length !== 32) throw new Error("Validator requires the full 32-byte epoch.");
@@ -96,6 +100,21 @@ export function createValidator({
     return true;
   }
 
+  // §8.4 ban-announcement rate: BAN_PEER_RATE per BAN_PEER_RATE_WINDOW
+  // per delivering peer — testimony is cheap to relay, so its volume is
+  // bounded the same way incidents are.
+  const banRates = new Map(); // peerId -> [acceptMillis...]
+  function takeBanToken(peerId, nowMillis) {
+    if (peerId == null) return true;
+    const windowMs = constants.BAN_PEER_RATE_WINDOW * 1000;
+    let times = banRates.get(peerId);
+    if (!times) { times = []; banRates.set(peerId, times); }
+    while (times.length && nowMillis - times[0] > windowMs) times.shift();
+    if (times.length >= constants.BAN_PEER_RATE) return false;
+    times.push(nowMillis);
+    return true;
+  }
+
   function takeIncidentToken(peerId, nowMillis) {
     if (peerId == null) return true;
     const windowMs = constants.INCIDENT_PEER_RATE_WINDOW * 1000;
@@ -107,14 +126,20 @@ export function createValidator({
     return true;
   }
 
-  function checkProof(record, isIncident) {
-    if (record.proofType === PROOF_POW) {
-      const epoch = epochPrefixMatches(record.epochPrefix8);
-      const difficulty = constants.POW_DIFFICULTY + (isIncident ? constants.INCIDENT_POW_MULTIPLIER : 0);
-      if (!verifyPow(record.preimage, epoch, record.proof, difficulty)) {
-        return fail(5, "invalid proof of work");
-      }
-      return null;
+  function checkProof(record, vouchPeer) {
+    if (record.proofType === PROOF_BOND) {
+      // §5.4: the record is proofless; the delivering peer's session bond
+      // vouches for it, hop by hop — the same hop the trust ledger
+      // penalizes and rule 7 rate-limits, which is the realignment bonds
+      // exist for. A null vouchPeer is a locally produced record: our own
+      // contributor minted it, nothing external is vouching or needs to.
+      if (record.proof && record.proof.length !== 0) return fail(5, "proofType 3 carries no proof bytes");
+      if (vouchPeer == null) return null;
+      // The loopback transport is one trusted process; there is no
+      // stranger to admit, so requiring a bond would only test the mock.
+      if (transport === "loopback") return null;
+      if (isBonded && isBonded(vouchPeer)) return null;
+      return fail(5, "delivering peer holds no admission bond");
     }
     if (record.proofType === 0 && transport === "loopback") return null;
     return fail(5, `proofType ${record.proofType} rejected on this transport`);
@@ -166,7 +191,7 @@ export function createValidator({
    * gossip arrivals (rule 8). Returns { ok: true, record } or a §6
    * failure with its rule number.
    */
-  function validateContribution(payload, { store = null, fromPeer = null, topic = null, nowMillis = clock() } = {}) {
+  function validateContribution(payload, { store = null, fromPeer = null, vouchPeer = fromPeer, topic = null, nowMillis = clock() } = {}) {
     let record;
     try {
       record = payload instanceof Uint8Array ? decodePMC1(payload) : payload;
@@ -184,7 +209,7 @@ export function createValidator({
     if (bucketStartMillis(record.timeBucket) > nowMillis + constants.MAX_FUTURE_SKEW * 1000) {
       return fail(4, "record from the future");
     }
-    const proofFailure = checkProof(record, false);
+    const proofFailure = checkProof(record, vouchPeer);
     if (proofFailure) return proofFailure;
     if (store && store.hasReport(toHex(record.reportId))) return fail(6, "replayed reportId");
     if (!takeToken(fromPeer, nowMillis)) return fail(7, "per-peer rate exceeded");
@@ -196,7 +221,7 @@ export function createValidator({
   }
 
   /** Validates one PMI1 (§6 with the incident-specific rows of rule 3/5/7). */
-  function validateIncident(payload, { store = null, fromPeer = null, topic = null, nowMillis = clock() } = {}) {
+  function validateIncident(payload, { store = null, fromPeer = null, vouchPeer = fromPeer, topic = null, nowMillis = clock() } = {}) {
     let record;
     try {
       record = payload instanceof Uint8Array ? decodePMI1(payload) : payload;
@@ -218,7 +243,7 @@ export function createValidator({
     if (bucketStartMillis(record.timeBucket) > nowMillis + constants.MAX_FUTURE_SKEW * 1000) {
       return fail(4, "record from the future");
     }
-    const proofFailure = checkProof(record, true);
+    const proofFailure = checkProof(record, vouchPeer);
     if (proofFailure) return proofFailure;
     if (store && store.hasReport(toHex(record.reportId))) return fail(6, "replayed reportId");
     if (!takeToken(fromPeer, nowMillis)) return fail(7, "per-peer rate exceeded");
@@ -230,5 +255,33 @@ export function createValidator({
     return { ok: true, record };
   }
 
-  return { validateContribution, validateIncident, constants };
+  /**
+   * §8.4: one PMX1 ban announcement. Testimony, not a verdict — this
+   * only decides whether the bytes are worth counting; what a
+   * corroborated count *does* is the node's decision, and it is never
+   * revocation. Only bonded deliverers may testify: an accusation must
+   * cost its bearer an admission.
+   */
+  function validateBan(payload, { fromPeer = null, nowMillis = clock() } = {}) {
+    let record;
+    try {
+      record = payload instanceof Uint8Array ? decodePMX1(payload) : payload;
+    } catch (error) {
+      return fail(1, error.message);
+    }
+    if (!epochPrefixMatches(record.epochPrefix8, nowMillis)) return fail(2, "unknown epoch");
+    if (record.reason !== BAN_REASON_INVALID_RECORDS) return fail(3, "unknown ban reason");
+    const age = bucketAgeSeconds(record.timeBucket, nowMillis);
+    if (age > constants.BAN_TTL) return fail(4, "ban announcement expired");
+    if (bucketStartMillis(record.timeBucket) > nowMillis + constants.MAX_FUTURE_SKEW * 1000) {
+      return fail(4, "ban announcement from the future");
+    }
+    if (fromPeer != null && !(isBonded && isBonded(fromPeer))) {
+      return fail(5, "ban testimony from an unbonded deliverer");
+    }
+    if (!takeBanToken(fromPeer, nowMillis)) return fail(7, "per-peer ban rate exceeded");
+    return { ok: true, record };
+  }
+
+  return { validateContribution, validateIncident, validateBan, constants };
 }

@@ -11,7 +11,7 @@ aggregates from identical contribution sets.
 
 Requirement words **MUST**, **MUST NOT**, **SHOULD**, **MAY** are used
 in the RFC 2119 sense. Constants marked *(tunable)* may be overridden by
-the signed bootstrap file (§4.6); everything else is fixed for protocol
+the signed bootstrap file (§4.7); everything else is fixed for protocol
 version 1.
 
 Status of each layer:
@@ -51,7 +51,7 @@ treated as errors) by a traffic-only implementation.
   continuation. No zigzag anywhere in this protocol (all fields are
   non-negative by construction).
 - **u8** — one raw byte. Multi-byte fixed-width integers appear only in
-  the PoW nonce (8 bytes, big-endian).
+  the PMA1 bond nonces (u32, big-endian).
 - **bytes(n)** — n raw bytes, no length prefix.
 - All hashes are SHA-256. "hex" means lowercase hexadecimal.
 - Every wire object begins with a 4-byte ASCII magic and is
@@ -197,7 +197,6 @@ Two deliberate absences:
 | `TOPIC_OVERLAP` | 30 s | yes | dual-subscribe window around rotation |
 | `ANTI_ENTROPY_SECONDS` | 10 s ± 3 jitter | yes | digest exchange interval |
 | `SHARDS` | 16 | no | topic shards per zone |
-| `POW_DIFFICULTY` | 20 bits | yes | proof-of-work leading zero bits |
 | `EMIT_INTERVAL` | 15 s | yes | min seconds between emissions per device |
 | `RATE_SUSTAINED` | 2 rec/s | yes | per-peer sustained acceptance rate |
 | `RATE_BURST` | 40 | yes | per-peer burst bucket |
@@ -243,9 +242,18 @@ Incident constants (§4.3, §8.5, §10.4):
 | `INCIDENT_TTL_MIN` | 300 s | no | floor on any incident lifetime |
 | `INCIDENT_CELL_CAP` | 24 | yes | distinct live incidents stored per z15 cell |
 | `INCIDENT_PEER_RATE` | 6 / 10 min | yes | incidents accepted per delivering peer |
-| `INCIDENT_POW_MULTIPLIER` | +4 bits | yes | PoW difficulty above `POW_DIFFICULTY` |
 | `REFUTE_WEIGHT` | 2 | yes | score cost of one refutation |
 | `CONTRADICTION_DECAY` | 4× | yes | TTL shortening when the speed aggregate disagrees |
+| `BOND_BIRTHDAY_BITS` | 44 (cap 48) | yes | §5.4 bond birthday space; sets the mining table size |
+| `BOND_PAIR_DIFFICULTY` | 0 | yes | extra leading-zero bits on the bond pair hash |
+| `BOND_LIFETIME` | 86400 s | yes | validity bucket of one bond |
+| `BOND_OVERLAP` | 3600 s | yes | grace after a bond bucket ends |
+| `BAN_MIN_SOURCES` | 3 | yes | distinct bonded deliverers before remote testimony applies (§8.4) |
+| `BAN_REMOTE_PENALTY` | 375 | yes | one-shot trust penalty per corroborated ban target |
+| `BAN_PEER_RATE` | 4 / 10 min | yes | PMX1 accepted per delivering peer |
+| `BAN_PEER_RATE_WINDOW` | 600 s | yes | window of the above |
+| `BAN_TTL` | 86400 s | yes | lifetime of ban testimony and its accusers |
+| `BAN_TARGET_CAP` | 256 | yes | distinct ban targets tracked per node |
 
 ## 4. Wire formats
 
@@ -267,7 +275,7 @@ layer frames them).
 | 8 | meters | varint | static segment length, rounded; 0 = unknown |
 | 9 | ttlSeconds | u8 | 1..90; receiver clamps to `CONTRIB_TTL` |
 | 10 | reportId | bytes(16) | CSPRNG, one use, never reused |
-| 11 | proofType | u8 | 0 none, 1 PoW, 2 blind token (reserved) |
+| 11 | proofType | u8 | §5.3 registry; 3 (bond-vouched) on the wire |
 | 12 | proofLen | varint | |
 | 13 | proof | bytes(proofLen) | §5.3 |
 
@@ -316,10 +324,10 @@ stable id would be a linkable handle and because different reporters
 must be able to corroborate without having seen each other's records.
 Scoring is §8.5.
 
-The PoW difficulty for PMI1 is `POW_DIFFICULTY + INCIDENT_POW_MULTIPLIER`.
 An incident is a *claim*, not a measurement — nothing about the physical
-world constrains it the way a plausible speed constrains a PMC1 — so it
-should cost more to assert. This is a speed bump, not a defense; §8.5
+world constrains it the way a plausible speed constrains a PMC1. What
+bounds it is the per-peer incident rate (rule 7), the cell cap, and the
+delivering peer's bond on the line. These are speed bumps, not a defense; §8.5
 carries the actual defense.
 
 **A mesh incident never produces `closed: true`** in protocol v1 (§9);
@@ -393,7 +401,19 @@ Snapshots carry **raw contributions, not aggregates**: the merge is a
 set union keyed by reportId, and every subscriber recomputes aggregates
 locally (§8) — this is what makes the aggregate consensus-free.
 
-### 4.6 mesh-bootstrap.json
+### 4.6 PMX1 — ban announcement
+
+```
+PMX1 ‖ epochPrefix8(8) ‖ targetHash16(16) ‖ reason(u8) ‖
+timeBucket(varint) ‖ reportId(16)
+```
+
+49 bytes. `targetHash16 = SHA256("rangefind-ban-v1:" ‖ utf8(peerId))[0..15]`
+— the peerId itself never travels. `reason` 1 = provable invalid records
+(rules 10–12); other values reserved and rejected. Semantics are §8.4:
+testimony to corroborate, never a verdict to obey.
+
+### 4.7 mesh-bootstrap.json
 
 Published on the static CDN next to the route-graph root, re-published
 with each epoch:
@@ -403,7 +423,7 @@ with each epoch:
   "format": "pulsemesh-bootstrap-v1",
   "epoch": "<64 hex — MUST equal the route-graph root sourceHash>",
   "previousEpoch": "<64 hex or null>",
-  "constants": { "POW_DIFFICULTY": 20, "MAX_AGE_RECEIPT": 45 },
+  "constants": { "BOND_BIRTHDAY_BITS": 44, "MAX_AGE_RECEIPT": 45 },
   "incidentPolicy": { "suppressedTypes": [5] },
   "bootstrapPeers": ["/dns4/…/tcp/443/wss/p2p/12D3Koo…"],
   "relays": ["/dns4/…/p2p/12D3Koo…"],
@@ -464,21 +484,108 @@ within `TOPIC_OVERLAP` of a rotation boundary, the next window's
 topics too. Messages arriving on a topic whose window differs from the
 current or adjacent window MUST be dropped.
 
-### 5.3 Proof of work (proofType 1)
+### 5.3 Proof registry
 
-`proof` is an 8-byte big-endian nonce. Requirement:
+| proofType | Meaning | Wire status |
+| --- | --- | --- |
+| 0 | none | loopback/local only; receivers MUST reject it on the wire |
+| 1 | *burned* | was per-record proof-of-work in the drafts; removed when §5.4 made it redundant — the value MUST never be reassigned, so no pre-removal capture can validate |
+| 2 | blind token | reserved for phase 4; receivers MUST reject it until then |
+| 3 | §5.4 bond-vouched | the only proofType valid on the wire |
+
+The drafts charged every record ~1M hashes of proof-of-work. The
+measurements that killed it are recorded in
+[benchmarks §14](pulsemesh-benchmarks.md): mining blocked the caller
+(~40 s per incident on a phone), farms parallelised it linearly, and —
+decisive — it charged disposable records while every defense in §6/§8
+punishes *peers*, which were free. §5.4 charges the peer.
+
+### 5.4 Identity bonds (proofType 3)
+
+Per-record PoW misaligns cost with defense: every §6/§8 sanction —
+trust penalties, rate limits, `min(raw, sources)` — attaches to a *peer*,
+while the proof cost attaches to disposable *records*, and peer
+identities are free to mint. A bond charges the thing the defenses
+punish.
+
+A bond is one PMA1 presented per session on
+`/rangefind/pulsemesh/1/bond` (one framed message, no response):
 
 ```
-SHA256( preimage ‖ epoch32 ‖ nonce )
+PMA1 ‖ epochPrefix8(8) ‖ dayBucket(varint) ‖ birthdayBits(u8) ‖
+pairDifficulty(u8) ‖ salt(u8) ‖ i(u32be) ‖ j(u32be)
 ```
 
-has ≥ `POW_DIFFICULTY` leading zero bits, where `epoch32` is the full
-32-byte binary epoch (so a prefix collision cannot transplant proofs
-across epochs) and `preimage` is defined per record type. The expected
-cost at difficulty 20 is ~1M hashes (well under a second of one mobile
-core, per ~15 s emission). Verification is one hash. Blind tokens
-(proofType 2) will replace PoW in phase 4 with the same envelope;
-until then receivers MUST reject proofType 2.
+Requirement: `i ≠ j`, `birthday(i) == birthday(j)` over
+`birthdayBits` of `SHA256(seed ‖ nonce)`, and
+`SHA256(seed ‖ i ‖ j)` has ≥ `pairDifficulty` leading zero bits, where
+
+```
+seed = SHA256( "rangefind-bond-v1" ‖ epoch32 ‖ dayBucket(8B be) ‖
+               salt(1B) ‖ utf8(peerId) )
+```
+
+The verifier takes `peerId` from the live connection — the one input a
+sender cannot choose — so a captured bond is worthless to any other
+peer. `dayBucket = floor((now − phase) / BOND_LIFETIME)` where
+`phase = SHA256("rangefind-bond-phase-v1" ‖ utf8(peerId))[0..5] mod
+BOND_LIFETIME` — the per-peer phase staggers rollovers uniformly across
+the lifetime, because an unphased `floor(now / BOND_LIFETIME)` would
+expire every bond on earth at the same UTC instant and synchronize a
+global re-mint storm once a day. A bond is accepted until its bucket
+ends plus `BOND_OVERLAP`. `salt` exists because a birthday
+window is collision-free with probability ~e⁻⁸: the miner retries at
+salt+1 rather than failing forever, and salt-grinding buys nothing
+because every salt is an independent instance of the same expected cost.
+
+Solving needs a table of ~2^(birthdayBits/2) entries; verification is
+three hashes at any table size (~1 µs measured). The parameters are set
+so the table is large enough that RAM, not cores, bounds a farm —
+benchmarks §14.5 measures 96 concurrent solvers in a 24 GiB GPU at the
+default `BOND_BIRTHDAY_BITS` 44 (256 MiB), against ~98,000 at the
+cache-sized tables per-record mining would force. Known limit, stated
+rather than hidden: Momentum-style puzzles admit time–memory tradeoffs
+(van Oorschot–Wiener), so those counts are an upper estimate of the
+attacker's constraint, and §8's corroboration and speed anchor remain
+the actual defense. Minting MUST NOT block its host's thread — the
+solver yields between adaptively-sized slices and honours a wall-clock
+budget and an abort signal — and SHOULD run in the background, once per
+`BOND_LIFETIME`, ideally while charging.
+
+Records are proofType 3 with an empty proof: 42 bytes on the wire,
+emission and incident reports instant, and rule 5 accepts them iff the
+*delivering* peer holds a live bond — hop-by-hop vouching, matching the
+hop-based trust ledger, with the snapshot provider vouching for
+snapshot records. A trust-floor from first-hand evidence forfeits the
+bond *at that receiver* and spreads as corroborated testimony (§8.4) —
+re-entry costs a re-mint per forfeiting receiver, which is a deterrent
+per-record proofs never were, though not a global one: the ledger stays
+local by design. Peers that relay (gossip mesh members, keepers,
+forwarders) need bonds for records they deliver; a consumer that never
+publishes needs none and SHOULD run read-only (§11.6).
+
+Honest sizing: a bond is a **toll, not a wall**. The mint is
+throughput-bound, not concurrency-bound — one desktop core produces
+~66,000 default-difficulty bonds per day (measured; `bench:pulsemesh:bond`)
+— so identities remain cheap in absolute terms. What bonds buy is that
+every §6/§8 sanction now lands on something that cost real work and
+must be re-paid after forfeiture, and that the flood path collapses to
+a Map lookup. Corroboration, plausibility, and the speed anchor remain
+the actual defense; §8.4's testimony narrows the window in which a
+burned identity is useful elsewhere.
+
+Constants (all bootstrap-tunable): `BOND_BIRTHDAY_BITS` 44 (hard cap 48
+— above it the 48-bit birthday extraction truncates),
+`BOND_PAIR_DIFFICULTY` 0, `BOND_LIFETIME` 86 400 s, `BOND_OVERLAP`
+3 600 s.
+
+Status: implemented and wire-tested (mint → PMA1 over TCP → verify
+against the connection peerId → proofless records accepted, unbonded
+peers dropped by rule 5), and it is the only wire admission — the
+per-record fallback is gone. Open measurement: the mint on real phone
+hardware; the ~8 s phone figure is the ×4 scaling rule, and a phone that
+cannot afford the default table contributes through a §4.5 forwarder or
+consumes read-only until the deployment lowers `BOND_BIRTHDAY_BITS`.
 
 ## 6. Validation pipeline
 
@@ -497,9 +604,11 @@ context.
    `INCIDENT_TTL_MIN` and the type's default TTL.
 4. Time: `age ≤ MAX_AGE_RECEIPT`; bucket start not more than
    `MAX_FUTURE_SKEW` in the future.
-5. Proof: proofType 1 with valid PoW at the bootstrap difficulty —
-   plus `INCIDENT_POW_MULTIPLIER` for PMI1 (proofType 0 and 2 rejected
-   on the wire).
+5. Proof: proofType 3 with an empty proof, from a delivering peer
+   holding a live §5.4 bond (locally produced records vouch for
+   themselves; the snapshot provider vouches for snapshot records).
+   Everything else is rejected on the wire; on the loopback transport
+   proofTypes 0 and 3 are trusted, there being no stranger to admit.
 6. Replay: reportId not already in the store (the store *is* the dedup
    window — reportIds live exactly as long as their records).
 7. Rate: per-remote-peer token bucket (`RATE_SUSTAINED`, `RATE_BURST`);
@@ -614,15 +723,48 @@ The aggregate's representative speed is the bin midpoint (§2.5);
 `observedAt = newestBucket × 15000`; `meters` = the plurality value of
 the contributions' nonzero `meters` fields (ties → smallest), else 0.
 
-### 8.4 Trust ledger (local, never gossiped)
+### 8.4 Trust ledger, forfeiture, and ban testimony
 
-Per remote peer, milli-integer clamped [250, 2000], start 1000:
-**+25** when a peer's contribution lands within ±1 bin of a later
-aggregate with `n ≥ 3` (at most one credit per aggregate); **−100**
-when ≥ 3 bins away from such an aggregate; **−500** for any rule 10–11
-validation failure; decay 1% of the distance back toward 1000 per
-minute. Trust shapes weights and local peer ranking only — it is a
-Sybil *damper*, not the Sybil defense (that is the proof layer).
+**The ledger's values are local and never gossiped.** Per remote peer,
+milli-integer clamped [250, 2000], start 1000: **+25** when a peer's
+contribution lands within ±1 bin of a later aggregate with `n ≥ 3` (at
+most one credit per aggregate); **−100** when ≥ 3 bins away from such
+an aggregate; **−500** for any rule 10–11 validation failure; **−375**
+(`BAN_REMOTE_PENALTY`) once per corroborated remote ban target (below);
+decay 1% of the distance back toward 1000 per minute. Trust shapes
+weights and local peer ranking — it is a Sybil *damper*, not the Sybil
+defense (that is admission, §5.4, plus corroboration).
+
+**Forfeiture (first-hand only).** When a peer's trust reaches the floor
+through **provable** validation failures — rules 10–12, each verifiable
+against the receiver's own static leaf data — the receiver revokes the
+peer's §5.4 bond, refuses re-registration for the bond's remaining
+lifetime, and rejects its subsequent proofless records under rule 5.
+Re-admission costs a fresh mint in a fresh bucket. Nothing weaker than
+first-hand evidence may trigger this: record delivery is deliberately
+unattributable beyond one hop (StrictNoSign, anonymous records), so
+misbehavior is not transferable proof, and any scheme that revoked on
+another peer's word would be a defamation primitive.
+
+**Ban testimony (PMX1).** On forfeiture the receiver MAY gossip one
+PMX1 naming the target by `banPeerHash16` (a tagged SHA-256 prefix,
+never the peerId) to one deterministic shard per subscribed zone.
+Receivers treat announcements as testimony: accepted only from bonded
+deliverers, deduplicated by reportId, rate-limited per deliverer
+(`BAN_PEER_RATE`/`BAN_PEER_RATE_WINDOW`), capped at `BAN_TARGET_CAP`
+targets, expiring after `BAN_TTL`. When `BAN_MIN_SOURCES` **distinct
+deliverers** corroborate a target, the receiver applies
+`BAN_REMOTE_PENALTY` to that peer's local trust — once per corroborated
+target, and that is all: corroborated testimony **never revokes**.
+
+The arithmetic is deliberate: testimony alone leaves an honest peer at
+625 — down-weighted, still heard, recovering by decay — while testimony
+plus a *single* first-hand provable violation reaches the floor
+(1000 − 375 − 500 ≤ 250) and forfeits. The designed ceiling of
+defamation is therefore three colluding bond mints to make a mesh
+temporarily distrust an honest peer's weight; silencing it is
+structurally out of reach, because silencing always requires the
+victim's own receivers to catch it lying about the map.
 
 ### 8.5 Incident scoring
 
@@ -773,9 +915,10 @@ State machine per GPS fix (target cadence 1 Hz):
    parking).
 5. **Cadence**: at most one PMC1 per `EMIT_INTERVAL` per device, on the
    segment where the most recent qualifying fix lies. Fresh CSPRNG
-   reportId per record; compute PoW; publish as PMB1 to the segment's
-   topic. Battery guard: contribution SHOULD pause below 20% battery
-   unless charging.
+   reportId per record; publish as PMB1 to the segment's topic — the
+   record is proofless; the session bond (§5.4) is the admission.
+   Battery guard: contribution SHOULD pause below 20% battery unless
+   charging.
 6. **Never** in any record: raw coordinates, previous/next segment,
    device or session identifiers, precise timestamps (the 15 s bucket
    is the resolution). This is enforced by the codec having no fields
@@ -906,8 +1049,9 @@ segment and `ratioQ12` come from `snap()` on the current fix, so a
 report can only be filed for where the reporter actually is — there is
 no "report ahead" or "report anywhere on the map" affordance, and an
 implementation MUST NOT offer one. A user with no snap match (rule 1,
-OFF_ROAD) cannot report. PoW at the incident difficulty (§4.3), fresh
-reportId, published directly rather than forwarded (§8.5).
+OFF_ROAD) cannot report. Fresh reportId, proofless under the session
+bond — a hazard report publishes at the tap — and published directly
+rather than forwarded (§8.5).
 
 **Confirm and refute.** When a consumer traverses a segment carrying a
 live displayed incident, it MAY prompt once ("still there?") and emit
@@ -941,7 +1085,7 @@ Consequently:
 **Jurisdiction.** Police reporting (type 5) is restricted or unlawful
 in some jurisdictions, and its legality is not the protocol's judgment
 to make. The signed bootstrap file therefore carries an
-`incidentPolicy` object (§4.6) listing types that clients MUST NOT emit
+`incidentPolicy` object (§4.7) listing types that clients MUST NOT emit
 or display in a given deployment. A client MUST honour it, and MUST
 drop received records of a suppressed type rather than merely hiding
 them. Deployments differ; the protocol stays neutral and the operator
@@ -985,6 +1129,39 @@ persistence beyond the TTL.
    Everything downstream (context expansion, shortcut suppression,
    exactness, degradation) is the engine's implemented behavior.
 
+### 11.6 Read-only consumers
+
+A client that will never contribute — a browser at home, a dashboard, a
+router that only wants to *see* traffic — SHOULD run read-only:
+
+- **No §5.4 bond.** Admission gates publishing and delivering; a peer
+  that does neither has nothing to be admitted to. The mint's memory and
+  CPU cost is never paid.
+- **No gossip membership.** A read-only peer MUST NOT subscribe to
+  traffic topics: as a mesh member it would relay records, and rule 5
+  has every bonded receiver ignore what an unbonded deliverer hands
+  them, so its membership would only punch holes in other peers'
+  delivery paths.
+- **Pull everything.** It tracks its zones and, on each maintenance
+  tick, runs the ordinary anti-entropy pull (§11.4): PMG1 digest →
+  PMQ1 cell fetches through the padded/decoy/split path (§11.3) → PMS1
+  snapshots, vouched by the serving peer's bond. Freshness is bounded
+  by the tick interval (`ANTI_ENTROPY_SECONDS`) instead of gossip
+  latency — seconds, not milliseconds, which is the right trade for a
+  viewer.
+- It never publishes; `publishRecord` is an error in this mode.
+
+Read-only is a client mode, not a wire construct: a serving peer cannot
+tell a read-only consumer from any other sync requester, which is also
+why the padded fetch path applies unchanged.
+
+The thread channel is unaffected by this mode's restrictions: thread
+records are authenticated end-to-end by the thread key
+([threads §8](pulsemesh-threads.md)), so a read-only client MAY
+subscribe to thread topics (the reserved `t` namespace this validator
+ignores) and verify updates itself — no bond is involved on that
+channel in either direction.
+
 ## 12. Keeper nodes
 
 A keeper is a headless peer pinned to configured zones: same store,
@@ -1016,15 +1193,12 @@ Preimage (41 bytes):
 845e91831319e89c4d656bdb80c278ac
 ```
 
-PoW at difficulty 16 (test difficulty; production default 20): nonce
-`000000000000e6d4`, digest
-`0000c8ff4d3d25b2f2c430481bfd05b76b938aa1ac8bc6aff223c290c488c688`.
-
-Full record (51 bytes): preimage ‖ `01` ‖ `08` ‖ nonce:
+Full record (43 bytes): preimage ‖ `03` ‖ `00` (proofType 3, empty
+proof — the delivering peer's §5.4 bond is the admission):
 
 ```
 504d4331f44796c8cc1f3fa7ed18f5068090e2370706b8015a845e91831319e8
-9c4d656bdb80c278ac0108000000000000e6d4
+9c4d656bdb80c278ac0300
 ```
 
 ### 13.2 Topic
@@ -1070,16 +1244,11 @@ Preimage (42 bytes):
 d4191834714542dcf3e5d8a6ab386c9b
 ```
 
-PoW at difficulty 16 (test difficulty; production is
-`POW_DIFFICULTY + INCIDENT_POW_MULTIPLIER`): nonce
-`000000000001731c`, digest
-`00009229aff2876efb1697da51a3872513a2236ea653ca55a5ed5c6cf1d5ae58`.
-
-Full record (52 bytes): preimage ‖ `01` ‖ `08` ‖ nonce:
+Full record (44 bytes): preimage ‖ `03` ‖ `00`:
 
 ```
 504d4931f44796c8cc1f3fa7ed18f50680108090e2370501880ed41918347145
-42dcf3e5d8a6ab386c9b0108000000000001731c
+42dcf3e5d8a6ab386c9b0300
 ```
 
 ### 13.5 Incident scoring
@@ -1106,12 +1275,38 @@ If that segment's speed aggregate then reports a congestion ratio of
 `CONTRADICTION_DECAY`, and — for an anchored-penalty type — its routing
 penalty is 0 throughout regardless of score.
 
+### 13.6 Admission bond (PMA1)
+
+Epoch as §13.1, dayBucket 20654, birthdayBits 44, pairDifficulty 0,
+salt 0, nonces i = 0xdeadbeef, j = 17 (26 bytes):
+
+```
+504d4131 f44796c8cc1f3fa7 aea101 2c 00 00 deadbeef 00000011
+```
+
+The peerId is deliberately absent: the verifier reconstructs the seed
+from the live connection's peerId, which is the one input the sender
+cannot choose.
+
+### 13.7 Ban announcement (PMX1)
+
+Epoch as §13.1, target peerId `"mallory"`
+(`targetHash16 = 9abd8d8bd822902b32829378155defd5`), reason 1,
+timeBucket 116951040, reportId `SHA256("ban-report")[0..15]` (49 bytes):
+
+```
+504d5831 f44796c8cc1f3fa7 9abd8d8bd822902b32829378155defd5 01
+8090e237 6162a03e27bff22f763b2dd057c463b4
+```
+
 ## 14. Repository layout and milestones
 
 ```
 src/pulsemesh/index.js       public entry point (rangefind/pulsemesh)
-src/pulsemesh/sha256.js      dependency-free SHA-256 for PoW, shards, msg ids     (§1, §5.3)
-src/pulsemesh/codec.js       PMC1/PMB1/PMI1/PMD1/PMG1/PMN1/PMQ1/PMS1/PMF1 + PoW   (§4, §5.3)
+src/pulsemesh/sha256.js      dependency-free SHA-256 for bonds, shards, msg ids   (§1, §5.4)
+src/pulsemesh/codec.js       PMC1/PMB1/PMI1/PMD1/PMG1/PMN1/PMQ1/PMS1/PMF1/PMA1/PMX1 (§4, §5.3, §5.4, §8.4)
+src/pulsemesh/bond.js        identity bonds: seed, chunked mint, 3-hash verify     (§5.4)
+src/pulsemesh/lora.js        LoRa profile, phone transport, bonded bridge          (§16, pulsemesh-lora.md)
 src/pulsemesh/bins.js        speed/quality bins, FRESHNESS + Q tables, cells      (§2, §8.1)
 src/pulsemesh/store.js       TTL store, three indexes, eviction, digests, folds   (§4.4, §7)
 src/pulsemesh/aggregate.js   weighted median, confidence, trust ledger            (§8)
@@ -1125,6 +1320,7 @@ src/pulsemesh/incidents.js   type table, scoring, contradiction decay, policy   
 src/pulsemesh/forward.js     PMF1 accept/validate/hold/republish                  (§4.5)
 src/pulsemesh/node.js        transport-agnostic node, epoch overlap, keeper       (§5.1, §11, §12)
 src/pulsemesh/libp2p.js      js-libp2p binding: GossipSub + sync streams          (§5.1)
+src/pulsemesh/mobile.js      app-side contributor: fixes → snap → gates → emit    (§10.1, pulsemesh.md delta 4)
 src/pulsemesh/thread_*.js    the thread channel (pulsemesh-threads.md §17)
 src/pulsemesh/threads.js     thread entry point (rangefind/pulsemesh/threads)
 scripts/pulsemesh_sim.mjs        phase-2 simulation harness                       (M4, M5)
@@ -1159,7 +1355,7 @@ Milestones, each independently testable with `node --test`:
   MeshNode to a libp2p host (GossipSub StrictNoSign with sha256 message
   ids, one framed request/response per sync stream);
   `scripts/pulsemesh_keeper.mjs` is the §12 keeper as a runnable process;
-  `test/pulsemesh_wire.test.js` covers real-TCP convergence with PoW
+  `test/pulsemesh_wire.test.js` covers real-TCP convergence with bond
   validation, contributor churn with zero record loss, padded
   late-joiner recovery, and a keeper child process converging with a
   contributor parent to byte-identical zone digests.
@@ -1167,7 +1363,7 @@ Milestones, each independently testable with `node --test`:
   mock transports with configurable density/churn/latency/clock-skew;
   measured outputs: convergence time to identical aggregates, digest
   bandwidth per peer per minute vs density, decoy/batch overhead,
-  flood resilience (malformed/replayed/Sybil load vs PoW difficulty).
+  flood resilience (malformed/replayed/unbonded/bonded hostile load).
   These measurements finalize the §3 tunables.
   **Done** — `scripts/pulsemesh_sim.mjs`; results and the resulting
   tunable verdicts in [pulsemesh-benchmarks.md](pulsemesh-benchmarks.md).
@@ -1219,7 +1415,25 @@ a test asserts it rather than where the code merely looks right.
 - [x] Encodes/decodes every §4 format byte-identically to the §13
       vectors; rejects trailing bytes and oversized records.
 - [x] Enforces validation rules 1–9 unconditionally and 10–12 when the
-      leaf cell is available; proofType 0/2 never accepted on the wire.
+      leaf cell is available; proofTypes 0/1/2 never accepted on the wire.
+- [x] §5.4 bonds: PMA1 verified against the connection's peerId only; a
+      bond replayed by another peer is rejected; proofType 3 accepted
+      solely from a bonded deliverer (gossip, forward, and snapshot
+      vouching paths); rejected outright where bonds are undeployed;
+      mint is sliced and abortable. proofType 1 is burned and never
+      accepted.
+- [x] §11.6 read-only: joins no gossip topic, never publishes, mints no
+      bond, and converges through the padded pull path alone (covered by
+      a real-TCP wire test).
+- [x] §8.4 forfeiture: the trust floor from first-hand rule 10–12
+      evidence revokes the bond, refuses re-registration for its
+      remaining lifetime, and publishes PMX1; refusal lapses with the
+      bucket. Bond rollovers are phase-staggered per peer.
+- [x] §8.4 testimony: PMX1 accepted only from bonded deliverers,
+      deduplicated, rate-limited, and capped; `BAN_MIN_SOURCES` distinct
+      deliverers apply `BAN_REMOTE_PENALTY` exactly once per target; no
+      remote input ever revokes a bond, and a corroborated-but-honest
+      peer's records remain accepted.
 - [x] Never accepts a record on a rule-12 denied class, whatever the
       sender claims.
 - [x] Store: reportId dedup, TTL expiry (senders can only shorten),
@@ -1253,3 +1467,12 @@ a test asserts it rather than where the code merely looks right.
 - [x] Router behavior under mesh failure = static routing (this is
       already guaranteed by the engine, but must not be broken by the
       adapter throwing synchronously outside `fetch`).
+
+## 16. Transport profiles (LoRa)
+
+The mesh is transport-agnostic by construction — the network interface
+is five verbs — and [pulsemesh-lora.md](pulsemesh-lora.md) specifies the
+first non-IP profile: gossip-only over Meshtastic-class LoRa radios,
+joined to the IP mesh by §5.4-bonded bridges that validate before they
+vouch. The profile is expressed entirely as a signed bootstrap within
+the §3 tunable envelope; no wire format changes.

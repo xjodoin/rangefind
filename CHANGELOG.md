@@ -7,7 +7,7 @@
 - PulseMesh protocol v1, the anonymous peer-to-peer live-traffic channel
   (`src/pulsemesh/`): wire codecs (PMC1/PMB1/PMI1/PMD1/PMG1/PMQ1/PMS1/PMF1)
   byte-identical to the specification's test vectors, dependency-free
-  SHA-256 and proof-of-work, the deterministic weighted-median aggregation
+  SHA-256, the deterministic weighted-median aggregation
   and trust ledger, the TTL store with reportId/cell/segment indexes and
   order-independent digests, the twelve-rule validation pipeline, incident
   scoring with distinct-peer capping and the speed-anchored routing gate,
@@ -22,7 +22,7 @@
   signing disabled and sha256 message ids per the §5.1 profile, one framed
   request/response per `/rangefind/pulsemesh/1/sync` stream — plus a
   runnable §12 keeper (`scripts/pulsemesh_keeper.mjs`). Wire tests cover
-  real-TCP convergence with proof-of-work validation, contributor churn
+  real-TCP convergence with full wire validation, contributor churn
   with zero record loss, padded late-joiner recovery, and two OS processes
   converging to byte-identical zone digests. The libp2p packages are
   optional peer dependencies; engine consumers install nothing new.
@@ -81,7 +81,119 @@
   converged zone and correctly never fires in an actively driven one,
   where the digest is the cost of genuine disagreement rather than waste.
 
+- PulseMesh in the browser and on a phone. `npm run build:browser` now
+  emits `pulsemesh.browser.js` (106 KB — codecs, store, aggregation,
+  validation, provider), `pulsemesh-threads.browser.js` (46 KB), and the
+  libp2p transport as a separate 2.5 MB entry point loaded on demand, so
+  a page that consumes live traffic never pays for a transport it does
+  not use. The OSM demo (`examples/osm-geo`) can run a mesh in-tab with
+  no infrastructure, or join a real one with `?keeper=<multiaddr>`;
+  verified live in a browser, where 45 gossiped contributions moved a
+  route off a jammed stretch entirely.
+- `rangefind/pulsemesh/mobile` — the app-side contributor, wired into the
+  Android app through the WebView bridge, the engine interface and the
+  location feed. Contribution is off unless explicitly enabled, pauses
+  below 20% battery unless charging, and defaults to the reticent
+  profile, because a phone's owner did not sign up to publish a
+  trajectory.
+- Thread discovery over the DHT (`thread_discovery.js`): `provide` and
+  `findProviders` on the rendezvous key derived from the link, so a
+  subscriber finds the thread's peers with no host, mailbox, or bootstrap
+  address anywhere in the capability. Closes the last open row of the
+  threads conformance checklist. Every DHT call is deadline-bounded — the
+  underlying `provide` waits on closest peers that a small mesh may never
+  supply, and a publisher cannot stop publishing because a routing table
+  is thin.
+- Bootstrap signature verification moved from `node:crypto` to the same
+  WebCrypto Ed25519 path the thread channel uses, so one implementation
+  covers Node, browsers and mobile — and neither browser bundle
+  references a Node built-in.
+
+### Added (identity bonds)
+
+- PulseMesh identity bonds (§5.4, `src/pulsemesh/bond.js`): a per-peer,
+  per-day memory-hard admission proof that moves the anti-Sybil cost off
+  the record path. The misalignment it fixes: every defense punishes a
+  peer — trust ledger, rate limits, `min(raw, sources)` — while
+  proof-of-work charged disposable records, and peer identities were
+  free, so a ban cost its target nothing. A bond (Momentum birthday
+  puzzle; 256 MiB table, ~2 s desktop mint, three-hash ~0.9 µs verify at
+  the default `BOND_BIRTHDAY_BITS` 44) is presented once per session as
+  PMA1 on `/rangefind/pulsemesh/1/bond`, bound to the connection's
+  peerId. Records from bonded peers are proofless (proofType 3):
+  contributions and hazard reports publish at the tap, the record
+  returns to 42 bytes, and a trust-ledger ban forfeits the bond. The
+  memory-hardness refuted at record cadence (benchmarks §14.2) inverts
+  at identity cadence: the once-daily table is large enough that a
+  24 GiB GPU fits 96 concurrent solvers instead of ~98,000 (§14.5).
+  `network.mintBond()` mines chunked/abortable and auto-presents to
+  every current and future peer; validator rule 5 accepts proofType 3
+  iff the delivering peer (gossip, forward, or snapshot provider) holds
+  a live bond. Bonds are the ONLY wire admission: per-record
+  proof-of-work is removed outright (the protocol is experimental with
+  no deployed legacy) — `minePow`/`minePowChunked`/`verifyPow`,
+  `POW_DIFFICULTY` and `INCIDENT_POW_MULTIPLIER` are gone, proofType 1
+  is burned and never accepted, keepers mint at startup, and the §13
+  wire vectors are proofless (a PMC1 is 43 bytes framed, PMA1 is 26).
+
+- PulseMesh over LoRa (§16, `rangefind/pulsemesh/lora`): the mesh's
+  first non-IP transport — Meshtastic-class radios, where the 42-byte
+  record designed for privacy turns out to be exactly what a duty-cycled
+  0.3–20 kbps channel needs (five contributions per 237-byte frame).
+  `createLoraNetwork` implements the five-verb MeshNetwork over a duck
+  radio: gossip-only by construction (the sync family cannot fit),
+  topics derived from record cells (the RF footprint is the scope),
+  spoofable radio senders admitted as rate-limited `lora:` pseudo-peers,
+  and an airtime scheduler that buys incidents before thread updates
+  before statistics inside a bytes-per-minute budget. `createLoraBridge`
+  joins a radio segment to the IP mesh by §5.4 hop-vouching: it
+  validates every record off the air against its own static map and
+  republishes survivors under its own bond — the IP side never knows
+  LoRa exists — while shuttling sealed thread frames it cannot read
+  (uplink always; downlink for operator-held links), downlinking
+  accepted incidents, and muting provably-lying radio senders. Tested
+  against simulated radio physics; the real Meshtastic binding is a
+  documented ~20-line shim (docs/pulsemesh-lora.md). MeshNode gained an
+  `onRecordAccepted` tap for gateways.
+
+- PulseMesh ban forfeiture and propagation (§8.4): a trust floor
+  reached through first-hand provable evidence (rules 10–12) revokes
+  the delivering peer's bond, refuses re-registration for the bond's
+  remaining lifetime, and gossips a 49-byte PMX1 naming the peer by
+  hash. Remote receivers treat announcements as testimony — accepted
+  only from bonded deliverers, deduplicated, rate-limited, capped —
+  and at `BAN_MIN_SOURCES` distinct corroborators apply one bounded
+  trust penalty (`BAN_REMOTE_PENALTY`), sized so testimony alone
+  down-weights but never revokes, while testimony plus a single
+  first-hand violation forfeits (1000−375−500 ≤ 250). Bond rollovers
+  are now phase-staggered per peer (an unphased bucket expired every
+  bond on earth at the same UTC instant). Docs corrected alongside:
+  forfeiture is per-receiver (the ledger is local by design) and the
+  Sybil bound is throughput (~66k mints/core-day), not GPU-slot
+  capacity — bonds are a toll; corroboration is the defense.
+
+- PulseMesh read-only consumer mode (§11.6): `MeshNode({ readOnly })`
+  and `createMobileMesh({ readOnly })` consume without a bond and
+  without gossip membership — the browser-at-home mode. A read-only
+  node tracks zones, never subscribes, never publishes (it throws), and
+  converges through the padded anti-entropy pull path (PMG1 → PMQ1 →
+  PMS1) against bonded peers on tick(); a real-TCP wire test proves
+  bondless convergence to a byte-identical zone digest. Staying out of
+  the gossip mesh is load-bearing: an unbonded relay's deliveries would
+  be ignored by every bonded receiver, so joining would only punch
+  holes in other peers' delivery paths. The thread channel is fully
+  available in this mode: thread records are authenticated end-to-end by
+  the thread key, so a read-only home viewer subscribes to the derived
+  thread topics and verifies updates itself, with zero bonds in either
+  direction (proven by a real-TCP test).
+
 ### Fixed
+
+- (superseded) The draft per-record proof-of-work was first made
+  non-blocking (`minePowChunked`, sliced mining with a wall-clock
+  budget), then removed entirely with the rest of per-record PoW when
+  §5.4 bonds landed; the sliced-mining technique lives on in the bond
+  solver, which never blocks its host's thread.
 
 - PulseMesh provider no longer filters its live states by the areas the
   routing engine has already fetched. The areas are the leaves fetched so

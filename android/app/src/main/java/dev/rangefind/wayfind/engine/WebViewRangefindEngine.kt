@@ -219,6 +219,49 @@ class WebViewRangefindEngine(context: Context) : RangefindEngine {
         )
     }
 
+    override suspend fun pulseMeshStatus(): PulseMeshStatus =
+        callPulseMesh(JSONObject().put("action", "status"))
+
+    override suspend fun setContributing(enabled: Boolean): PulseMeshStatus =
+        callPulseMesh(JSONObject().put("action", "enable").put("enabled", enabled))
+
+    override suspend fun offerLocation(
+        point: LatLon,
+        speedMps: Double?,
+        courseDeg: Double?
+    ): PulseMeshStatus = callPulseMesh(
+        JSONObject()
+            .put("action", "location")
+            .put("lat", point.lat)
+            .put("lon", point.lon)
+            .apply {
+                speedMps?.let { put("speedMps", it) }
+                courseDeg?.let { put("courseDeg", it) }
+            }
+    )
+
+    /**
+     * Live traffic must never take the app down with it: a mesh that is
+     * unavailable is the ordinary case (no route index yet, an unsupported
+     * host), and the router keeps working on the static metric regardless.
+     */
+    private suspend fun callPulseMesh(args: JSONObject): PulseMeshStatus = runCatching {
+        val payload = call("pulseMesh", args)
+        val stats = payload.optJSONObject("stats")
+        PulseMeshStatus(
+            available = payload.optBoolean("available"),
+            contributing = payload.optBoolean("contributing"),
+            epoch = payload.optString("epoch"),
+            fixes = stats?.optInt("fixes") ?: 0,
+            emitted = stats?.optInt("emitted") ?: 0,
+            suppressed = stats?.optInt("suppressed") ?: 0,
+            lastReason = stats?.optString("lastReason")?.takeIf { it.isNotEmpty() && it != "null" },
+            error = payload.optString("error").takeIf { it.isNotEmpty() }
+        )
+    }.getOrElse { error ->
+        PulseMeshStatus(available = false, error = error.message)
+    }
+
 }
 
 private fun JSONObject.toRoutingInfo() = RoutingInfo(

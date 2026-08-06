@@ -12,7 +12,7 @@ import {
   timeBucketFromMillis
 } from "./bins.js";
 import { INCIDENT_TYPES } from "./incidents.js";
-import { PROOF_POW, encodePMC1, encodePMI1, minePow, parseSegment } from "./codec.js";
+import { PROOF_BOND, encodePMC1, encodePMI1, parseSegment } from "./codec.js";
 
 function defaultRandomBytes(length) {
   const bytes = new Uint8Array(length);
@@ -31,7 +31,10 @@ function defaultRandomBytes(length) {
  *   reticent.js (§10.2).
  * - metersOf(segKey): static segment length for field 8.
  * - classOf(segKey): highway class, feeding the reticent place gate.
- * - proofType: PROOF_POW on any network transport; 0 only in loopback.
+ * - proofType: PROOF_BOND (the default) on any network transport — the
+ *   record carries no proof; the transport's §5.4 admission bond vouches
+ *   for it, so emission and incident reports are instant. 0 only in
+ *   loopback.
  * - batteryLevel(): 0..1 or null; contribution pauses below 20% unless
  *   charging().
  */
@@ -44,12 +47,11 @@ export function createContributor({
   profile = "cadence",
   metersOf = null,
   classOf = null,
-  proofType = PROOF_POW,
+  proofType = PROOF_BOND,
   randomBytes = defaultRandomBytes,
   clock = Date.now,
   batteryLevel = null,
   charging = null,
-  powMaxIterations = 1 << 26,
   suppressedTypes = []
 } = {}) {
   const suppressed = new Set(suppressedTypes);
@@ -86,12 +88,6 @@ export function createContributor({
       proofType,
       proof: new Uint8Array(0)
     };
-    if (proofType === PROOF_POW) {
-      const { preimage } = encodePMC1(fields);
-      const mined = minePow(preimage, epoch32, constants.POW_DIFFICULTY, { maxIterations: powMaxIterations });
-      if (!mined) return null;
-      fields.proof = mined.nonce;
-    }
     return encodePMC1(fields);
   }
 
@@ -163,7 +159,6 @@ export function createContributor({
     }
 
     const encoded = buildRecord({ segKey, leafCell, geomRef, speedBin, qualityBin, nowMillis });
-    if (!encoded) return skip("pow-budget");
     lastEmitMillis = nowMillis;
     stats.emitted++;
     const result = { emitted: true, record: encoded, forwarder, segKey, speedBin };
@@ -233,13 +228,6 @@ export function createContributor({
       proofType,
       proof: new Uint8Array(0)
     };
-    if (proofType === PROOF_POW) {
-      const { preimage } = encodePMI1(fields);
-      const difficulty = constants.POW_DIFFICULTY + constants.INCIDENT_POW_MULTIPLIER;
-      const mined = minePow(preimage, epoch32, difficulty, { maxIterations: powMaxIterations });
-      if (!mined) return { emitted: false, reason: "pow-budget" };
-      fields.proof = mined.nonce;
-    }
     if (polarity === 1) incidentEmits.set(type, nowMillis);
     else answeredIncidents.add(incidentKey);
     // A reticent contributor that reports must suppress measurements in

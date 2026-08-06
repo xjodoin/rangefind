@@ -118,6 +118,12 @@ No global pluggable-cost router is claimed or needed.
 
 ### 4. Platform reality: browsers read, apps write
 
+*Implemented.* `rangefind/pulsemesh` bundles for the browser at 106 KB
+with the transport split into a separate 2.5 MB entry point loaded on
+demand; `rangefind/pulsemesh/mobile` is the app-side contributor, wired
+into the Android app. Measured in
+[benchmarks §9d and §9e](pulsemesh-benchmarks.md).
+
 Backgrounded browser tabs lose `watchPosition`; screen-off ends
 reporting. Web clients are therefore treated as **consumers** (and
 foreground contributors at best). The realistic sustained contributor is
@@ -133,9 +139,98 @@ unlinkable to issuance) are the recommended Sybil control. That issuer
 is the first non-static, per-user server in the rangefind story. It sees
 that an eligible client obtained a token batch — never which segment a
 token was spent on — but it exists, and product copy must say so. The
-fallback stack (proof-of-work, rate limits, corroboration minimums,
+fallback stack (identity bonds, rate limits, corroboration minimums,
 plausibility, peer scoring) trades weaker Sybil resistance for zero new
 services.
+
+**RLN was measured as an alternative and rejected**
+([benchmarks §2b](pulsemesh-benchmarks.md)). Rate-limiting nullifiers
+looked like they might supply anonymous rate limiting with no issuer at
+all. Proving is genuinely 2.5× cheaper than proof-of-work (235 ms
+against that run's 579 ms PoW sample), but verification is 9,130× more expensive — turning the
+flood defence from 1.45 M rejected records per second into 159 — the
+proof is 1,250 bytes against a 96-byte record cap, and the hypothesis
+itself is false: verification checks a Merkle root, so a maintained
+membership registry is required. RLN moves the issuer onto a registry or
+a chain rather than removing it. Blind tokens remain the better route to
+per-identity rate limiting, and the concession above stands as written.
+
+**Memory-hard proof-of-work was measured as an alternative and rejected**
+([benchmarks §14](pulsemesh-benchmarks.md)). Proof-of-work's real
+weakness here is not its cost — under the reticent profile it amortises
+to 1.4–2.5% of one core — but that SHA-256 parallelises perfectly, so a
+farm scales linearly while the honest phone pays retail. A Momentum-style
+birthday puzzle should have capped that, being memory-bound to solve and
+three hashes to verify. The verification asymmetry held (0.9 µs at every
+size); the Sybil cap did not. At the table size that matches the current
+puzzle's cost, 64 MiB, a single consumer GPU still fits 384 concurrent
+solvers and a rented box 4,096 — and at 4 MiB the table lives in cache,
+where the measured thread scale-up is *better* than SHA-256's. Memory
+binds only when core count exceeds RAM÷table, which is true of a GPU's
+shader array and false of any CPU farm an attacker would rent.
+
+A kinematic admission tier — pricing physically plausible movement over
+the route graph rather than CPU — was designed and abandoned before it
+was built, for a reason worth recording: PMC1 carries no contributor
+identity, so successive records are unlinkable by construction, and
+trajectory checking needs exactly the linkage §10.2 exists to prevent.
+The static half of the idea is already validation rules 10–12, and the
+road graph is public, so map plausibility costs a remote attacker
+nothing.
+
+What the search did find is that mining was blocking the caller's
+thread — ~40 s on a phone at the incident difficulty, exactly when the
+driver has just tapped "hazard ahead". Mining is now sliced
+(`minePowChunked`), which costs under 1% of throughput and cuts the
+longest unbroken block from seconds to ~13 ms.
+
+**Identity bonds (§5.4) came out of taking that refutation seriously, and then replaced proof-of-work entirely**
+([benchmarks §14.5](pulsemesh-benchmarks.md)). The deeper misalignment
+was that every defense punishes a peer — trust ledger, rate limits,
+`min(raw, sources)` — while proof-of-work charged disposable records,
+and peer identities were free. A bond flips the charge to the identity:
+one memory-hard admission proof per peer per day (Momentum birthday
+puzzle, 256 MiB table at the default, ~2 s desktop mint, three-hash
+verification), presented once per session and bound to the connection's
+peerId. Records from bonded peers are proofless (proofType 3): the
+42-byte record returns, contributions and hazard reports publish at the
+tap, and — the structural win — a trust-ledger ban forfeits the bond,
+so ban evasion finally costs something. And the memory-hardness that
+failed at record cadence works at identity cadence: the once-daily table
+can be 256 MiB, where a 24 GiB GPU fits 96 concurrent solvers instead of
+the ~98,000 that cache-sized per-record tables allowed. Implemented and
+wire-tested — and since this protocol has no deployed legacy to carry,
+per-record proof-of-work was then deleted outright rather than kept as a
+fallback: proofType 1 is burned, every wire record is proofType 3, and
+the §3 PoW constants are gone. Two client modes remain. A *contributor*
+mints its bond once a day in the background. A *read-only consumer*
+(§11.6) — the browser at home that only wants to see traffic — mints
+nothing and joins no gossip topic: it pulls digests, cells and snapshots
+over the padded sync path from bonded peers on its maintenance tick,
+which also keeps it from becoming an unbonded relay that rule 5 would
+have everyone ignore. Blind tokens (phase 4) remain the path to
+per-identity rate limiting *across* sessions; bonds deliver the
+per-session version with zero new services.
+
+Three corrections and one addition followed from re-examining the
+claims (2026-08-06). Corrected: the Sybil bound is throughput, not
+capacity — one core mints ~66k bonds/day, so admission is a toll and
+corroboration remains the defense; "a ban forfeits the bond" holds at
+the receiver that saw the evidence, because the trust ledger is local
+by design; and bond buckets originally all rolled over at the same UTC
+instant — now staggered by a per-peer phase hash. Added: **ban
+propagation** ([protocol §8.4](pulsemesh-protocol.md)) as corroborated
+testimony, engineered so it cannot become a defamation primitive.
+First-hand provable evidence (rules 10–12, checkable against anyone's
+own static map data) forfeits a bond and emits a 49-byte PMX1 naming
+the peer only by hash. Remote receivers count testimony from bonded
+deliverers, and at three distinct corroborators apply one bounded
+trust penalty — down-weighting, never revoking, recoverable by decay.
+The arithmetic is the contract: testimony alone leaves an honest peer
+heard; testimony plus one first-hand violation forfeits. Three
+colluding mints can make a mesh temporarily distrust an honest peer;
+silencing it requires catching it lying about the map, which an honest
+peer never does.
 
 ## Architecture summary
 
