@@ -118,6 +118,7 @@
     </plurals>
     <string name="region_reading_manifest">Reading index manifest…</string>
     <string name="region_ready">%1$s · updated %2$s</string>
+    <string name="region_stale">%1$s · a newer index is published</string>
     <string name="region_download_failed">Download failed</string>
     <string name="region_host_unreachable">Can\'t reach %1$s — check that the index server is running and that this device is on the same network</string>
     <string name="region_note_luxembourg">Small test extract</string>

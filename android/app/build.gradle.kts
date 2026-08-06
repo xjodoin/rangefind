@@ -120,4 +120,7 @@ dependencies {
     // Navigation decisions that are pure logic — backoff, geometry, phrasing —
     // are worth testing off-device, where a road test cannot reach them.
     testImplementation("junit:junit:4.13.2")
+    // android.jar's org.json is a stub that returns null for everything, so a
+    // parser tested against it is not tested at all.
+    testImplementation("org.json:json:20240303")
 }

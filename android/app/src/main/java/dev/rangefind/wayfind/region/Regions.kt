@@ -27,7 +27,13 @@ data class RegionEntry(
     val total: Int = 0,
     val updatedAt: Long = 0,
     val error: String? = null,
-    val active: Boolean = false
+    val active: Boolean = false,
+    /**
+     * The server is publishing a different index than the one stored here.
+     * Only ever set from an answer actually received: unreachable is unknown,
+     * and an offline phone must not be told its offline region is stale.
+     */
+    val stale: Boolean = false
 ) {
     val progress: Float get() = if (total <= 0) 0f else done.toFloat() / total
 }

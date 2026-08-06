@@ -183,11 +183,40 @@ class MapsViewModel(
 
     fun showRegions(show: Boolean) {
         _state.update { it.copy(showRegions = show) }
+        // Opening the sheet is when the answer is worth having and when the
+        // user is looking at the place it would be shown.
+        if (show) checkForRegionUpdates()
     }
 
     fun setRegionHost(host: String) {
         regionPrefs.host = host
         refreshRegions()
+        checkForRegionUpdates()
+    }
+
+    /**
+     * Asks the server whether the regions kept here are still the ones it
+     * publishes.
+     *
+     * Packs are content-addressed, so this is one small request per region and
+     * an exact answer — not a heuristic about dates. Anything that fails is
+     * left alone: a region that cannot be checked is not stale, it is
+     * unchecked, and the difference matters most exactly when the phone is
+     * offline and that region is all it has.
+     */
+    fun checkForRegionUpdates() {
+        viewModelScope.launch {
+            val stale = mutableSetOf<String>()
+            for (spec in REGION_CATALOG) {
+                if (!regionStore.isReady(spec.id)) continue
+                val stored = regionStore.storedRoot(spec.id) ?: continue
+                val published = regionStore.publishedRoot(regionPrefs.sourceUrlOf(spec.id)) ?: continue
+                if (published != stored) stale += spec.id
+            }
+            _state.update { current ->
+                current.copy(regions = current.regions.map { it.copy(stale = it.spec.id in stale) })
+            }
+        }
     }
 
     private fun refreshRegions() {
@@ -207,7 +236,11 @@ class MapsViewModel(
                             status = RegionStatus.Ready,
                             bytes = regionStore.bytesOf(spec.id),
                             updatedAt = regionStore.updatedAt(spec.id),
-                            active = spec.id == active
+                            active = spec.id == active,
+                            // Carried over rather than recomputed: the check is
+                            // a network round trip, and this runs on every
+                            // state change.
+                            stale = existing?.stale == true
                         )
                     } else {
                         RegionEntry(spec = spec, status = RegionStatus.Absent, error = existing?.error)

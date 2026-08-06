@@ -309,7 +309,11 @@ private fun RegionRow(
                     RegionAction(
                         Icons.Filled.Refresh,
                         stringResource(R.string.region_action_refresh),
-                        onPreload
+                        onPreload,
+                        // The one control that resolves a stale region, so it
+                        // stops being just another grey icon when it matters.
+                        tint = if (entry.stale) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.width(6.dp))
                     RegionAction(
@@ -345,7 +349,8 @@ private fun RegionRow(
 private fun RegionAction(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    tint: androidx.compose.ui.graphics.Color? = null
 ) {
     Surface(
         onClick = onClick,
@@ -356,7 +361,7 @@ private fun RegionAction(
             Icon(
                 icon,
                 contentDescription = label,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                tint = tint ?: MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(20.dp)
             )
         }
@@ -371,8 +376,14 @@ private fun RegionEntry.statusLine(context: Context): String = when (status) {
         )
         else context.getString(R.string.region_reading_manifest)
     RegionStatus.Ready -> {
-        val stamp = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(updatedAt))
-        context.getString(R.string.region_ready, formatBytes(context, bytes), stamp)
+        // A stored region that no longer matches what the server publishes is
+        // the more useful thing to say than the date it was fetched — the date
+        // reads as reassurance while the index underneath it is out of date.
+        if (stale) context.getString(R.string.region_stale, formatBytes(context, bytes))
+        else {
+            val stamp = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(updatedAt))
+            context.getString(R.string.region_ready, formatBytes(context, bytes), stamp)
+        }
     }
     RegionStatus.Failed -> error ?: context.getString(R.string.region_download_failed)
 }

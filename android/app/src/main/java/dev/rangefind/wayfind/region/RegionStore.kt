@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -30,6 +31,47 @@ class RegionStore(context: Context) {
         directoryOf(id).walkTopDown().filter { it.isFile }.sumOf { it.length() }
 
     fun updatedAt(id: String): Long = File(directoryOf(id), "manifest.json").lastModified()
+
+    /**
+     * The index a stored region actually holds.
+     *
+     * Packs are content-addressed, so the root's filename *is* the version:
+     * rebuild the index from corrected data and the name changes. Until this
+     * existed, [isReady] answering "the manifest file is present" was the whole
+     * of the freshness check, and a region downloaded once was used forever.
+     * A fix to the routing costs shipped to the server and simply never
+     * reached a phone that had the region kept offline — silently, since
+     * nothing compared the two.
+     */
+    fun storedRoot(id: String): String? {
+        val manifest = File(directoryOf(id), "manifest.json")
+        if (!manifest.isFile) return null
+        return runCatching { rootOf(manifest.readText()) }.getOrNull()
+    }
+
+    /**
+     * The index the server is publishing now, or null when it cannot be asked.
+     *
+     * Null means unknown, never stale: a phone out of signal must not be told
+     * its offline region is out of date, which is the one moment that region
+     * is the only thing it has.
+     */
+    suspend fun publishedRoot(baseUrl: String): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = URL(URL(baseUrl), "manifest.json")
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 8_000
+                readTimeout = 8_000
+                requestMethod = "GET"
+            }
+            try {
+                if (connection.responseCode !in 200..299) return@runCatching null
+                rootOf(connection.inputStream.bufferedReader().readText())
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrNull()
+    }
 
     fun delete(id: String) {
         directoryOf(id).deleteRecursively()
@@ -113,8 +155,12 @@ class RegionStore(context: Context) {
         }
     }
 
-    private companion object {
-        const val DOWNLOAD_ATTEMPTS = 3
-        const val RETRY_BACKOFF_MS = 400L
+    companion object {
+        private const val DOWNLOAD_ATTEMPTS = 3
+        private const val RETRY_BACKOFF_MS = 400L
+
+        /** The root pack named by a route-graph manifest, or null if it names none. */
+        fun rootOf(manifestJson: String): String? =
+            runCatching { JSONObject(manifestJson).optString("root").ifBlank { null } }.getOrNull()
     }
 }
