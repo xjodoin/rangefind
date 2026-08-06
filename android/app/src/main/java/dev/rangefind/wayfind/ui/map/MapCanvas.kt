@@ -776,7 +776,25 @@ private fun rememberMapViewWithLifecycle(): MapView {
             RenderCadence.onFrame(SystemClock.elapsedRealtimeNanos())
         }
         mapView.addOnDidFinishRenderingFrameListener(listener)
-        onDispose { mapView.removeOnDidFinishRenderingFrameListener(listener) }
+
+        // The display's own vsync, as a floor. MapLibre's callback is silent
+        // on some devices, and a run that counted nothing looks identical to a
+        // run that was perfectly smooth.
+        val choreographer = android.view.Choreographer.getInstance()
+        var vsyncing = true
+        val vsync = object : android.view.Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                RenderCadence.onVsync(SystemClock.elapsedRealtimeNanos())
+                if (vsyncing) choreographer.postFrameCallback(this)
+            }
+        }
+        choreographer.postFrameCallback(vsync)
+
+        onDispose {
+            vsyncing = false
+            choreographer.removeFrameCallback(vsync)
+            mapView.removeOnDidFinishRenderingFrameListener(listener)
+        }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current

@@ -395,15 +395,32 @@ class MapsViewModel(
                     regionPrefs.activeRegion = id
                 }
                 refreshRegions()
-                // A refresh of the region already in use must be picked up, or
-                // routing keeps answering from the copy that was just replaced.
-                if (regionPrefs.activeRegion == id) applyRouteBase(regionServer.baseUrlFor(id))
+                // Re-point routing at whatever is now the best answer.
+                //
+                // This used to fire only when the finished region was the
+                // active one, which meant a download made while "use the
+                // network index" is selected changed nothing: routing kept the
+                // base it started with. On a phone that base is the build's
+                // own default — the emulator's loopback alias — so a driver
+                // who had just waited for a 78 MB download still got "no
+                // answer from the server" for every destination, with the
+                // index they were waiting for sitting on the device unused.
+                applyRouteBase(routeBaseFor(_state.value.mode))
             }.onFailure { error ->
                 downloads.remove(id)
-                regionStore.delete(id)
+                // Whatever was already installed stays installed. `install`
+                // downloads into a staging directory and swaps it in only once
+                // every file has landed, precisely so a failed refresh cannot
+                // cost the user the copy they had — and then deleting it here
+                // threw that away anyway. A refresh that fails over a flaky
+                // connection must not leave a driver with no offline region at
+                // all, which is the state they are least able to recover from.
                 updateRegion(id) {
                     it.copy(status = RegionStatus.Failed, error = describeFailure(error, source))
                 }
+                // The row's status is recomputed from what is on disk, so a
+                // region that survived reports itself ready again.
+                refreshRegions()
             }
         }
     }

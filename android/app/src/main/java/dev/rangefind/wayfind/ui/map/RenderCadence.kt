@@ -55,6 +55,17 @@ object RenderCadence {
     private var running = false
     private var moving = false
     private val pushes = mutableListOf<Double>()
+    /**
+     * Whether the map's own frame callback has ever fired.
+     *
+     * MapLibre's OnDidFinishRenderingFrame arrives thousands of times a run on
+     * an emulator and not once on a Pixel 10 Pro, which is a fine way to
+     * measure nothing at all on the only hardware that matters. So the display
+     * pipeline's own vsync is used instead wherever the map's callback is
+     * silent — a frame the compositor presented is the frame the driver saw,
+     * which is the thing being asked about anyway.
+     */
+    private var mapFrameSeen = false
     private var movingNs = 0L
     private var movingSinceNs = 0L
 
@@ -70,6 +81,7 @@ object RenderCadence {
             startedNs = nowNs
             running = true
             moving = false
+            mapFrameSeen = false
             movingNs = 0L
             movingSinceNs = 0L
             pushes.clear()
@@ -85,6 +97,15 @@ object RenderCadence {
      * thread, and if that is where the hundred milliseconds go it will show
      * here rather than in an argument.
      */
+    /**
+     * A frame the display pipeline presented. Ignored while the map's own
+     * callback is working, so the two are never counted together.
+     */
+    fun onVsync(nowNs: Long) {
+        synchronized(lock) { if (mapFrameSeen) return }
+        onFrameInternal(nowNs)
+    }
+
     fun onStylePush(millis: Double) {
         synchronized(lock) { if (running && moving) pushes += millis }
     }
@@ -123,6 +144,11 @@ object RenderCadence {
      * not a drive.
      */
     fun onFrame(nowNs: Long) {
+        synchronized(lock) { if (running && moving) mapFrameSeen = true }
+        onFrameInternal(nowNs)
+    }
+
+    private fun onFrameInternal(nowNs: Long) {
         synchronized(lock) {
             if (!running || !moving) return
             frames++
@@ -209,6 +235,7 @@ object RenderCadence {
             .put("settledGapWorstMs", (BUCKETS - 1 downTo 0).firstOrNull { settledGaps[it] > 0 } ?: 0)
             .put("settledDroppedPercent",
                 if (settled == 0) 0.0 else String.format("%.1f", 100.0 * settledOver33 / settled).toDouble())
+            .put("frameSource", if (mapFrameSeen) "map" else "vsync")
             .put("stylePushes", pushes.size)
             .put("stylePushP50Ms", pushes.sorted().getOrElse(pushes.size / 2) { 0.0 }.toInt())
             .put("stylePushP95Ms", pushes.sorted().getOrElse((pushes.size * 95) / 100) { 0.0 }.toInt())
