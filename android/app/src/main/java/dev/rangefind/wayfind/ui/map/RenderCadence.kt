@@ -37,6 +37,16 @@ object RenderCadence {
 
     private val lock = Any()
     private val gaps = IntArray(BUCKETS)
+    /**
+     * The same histogram, but only for frames once the drive has settled.
+     *
+     * A map that hitches for the first few seconds is loading its style and
+     * its first tiles, which every map does and no driver is bothered by. A
+     * map that hitches at minute three is stuttering. Reported apart, because
+     * one of those is a bug and the other is a map starting up, and a single
+     * figure covering both says nothing about either.
+     */
+    private val settledGaps = IntArray(BUCKETS)
     private var frames = 0L
     private var updates = 0L
     private var lastFrameNs = 0L
@@ -52,6 +62,7 @@ object RenderCadence {
     fun start(nowNs: Long) {
         synchronized(lock) {
             gaps.fill(0)
+            settledGaps.fill(0)
             frames = 0
             updates = 0
             lastFrameNs = 0
@@ -120,6 +131,8 @@ object RenderCadence {
                 if (gapMs > worstGapMs) worstGapMs = gapMs
                 val bucket = gapMs.toInt().coerceIn(0, BUCKETS - 1)
                 gaps[bucket]++
+                val movedFor = movingNs + (if (movingSinceNs != 0L) nowNs - movingSinceNs else 0L)
+                if (movedFor > SETTLE_NS) settledGaps[bucket]++
             }
             lastFrameNs = nowNs
         }
@@ -165,6 +178,18 @@ object RenderCadence {
         // three were, which is where a moving map stops reading as motion.
         val over33 = (33 until BUCKETS).sumOf { gaps[it] }
         val over66 = (66 until BUCKETS).sumOf { gaps[it] }
+        val settled = settledGaps.sum()
+        val settledOver33 = (33 until BUCKETS).sumOf { settledGaps[it] }
+        fun settledPercentile(fraction: Double): Int {
+            if (settled == 0) return 0
+            val target = (settled * fraction).toInt().coerceAtLeast(1)
+            var seen = 0
+            settledGaps.forEachIndexed { ms, count ->
+                seen += count
+                if (seen >= target) return ms
+            }
+            return BUCKETS - 1
+        }
 
         JSONObject()
             .put("frames", frames)
@@ -179,6 +204,11 @@ object RenderCadence {
             .put("framesOver33Ms", over33)
             .put("framesOver66Ms", over66)
             .put("droppedPercent", String.format("%.1f", 100.0 * over33 / counted).toDouble())
+            .put("settledFrames", settled)
+            .put("settledGapP95Ms", settledPercentile(0.95))
+            .put("settledGapWorstMs", (BUCKETS - 1 downTo 0).firstOrNull { settledGaps[it] > 0 } ?: 0)
+            .put("settledDroppedPercent",
+                if (settled == 0) 0.0 else String.format("%.1f", 100.0 * settledOver33 / settled).toDouble())
             .put("stylePushes", pushes.size)
             .put("stylePushP50Ms", pushes.sorted().getOrElse(pushes.size / 2) { 0.0 }.toInt())
             .put("stylePushP95Ms", pushes.sorted().getOrElse((pushes.size * 95) / 100) { 0.0 }.toInt())
@@ -187,4 +217,7 @@ object RenderCadence {
 
     /** Below this the map is not really moving, so neither is the measurement. */
     private const val MOVING_MPS = 2.0
+
+    /** Moving time a map is allowed to spend loading before it counts as settled. */
+    private const val SETTLE_NS = 15_000_000_000L
 }
