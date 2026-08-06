@@ -1004,6 +1004,47 @@ test("one intersection reports one junction, however many nodes describe it", as
   assert.equal(mergesWithPreviousJunction(null, SIGNAL, 455000000, -736000000), false);
 });
 
+test("one intersection costs one wait, however many nodes describe it", async () => {
+  // The cost counterpart of the junction merge above, and the one that was
+  // missing. A divided boulevard carries a signal on each carriageway and a
+  // pedestrian crossing on each arm; charged in turn, crossing one road cost
+  // two or three signal waits. In Rosemère that priced the twelve metres of
+  // Chemin de la Grande-Côte between Boulevard Labelle's carriageways at
+  // twenty-six seconds, and the router answered by leaving the road, running
+  // a hundred metres up the boulevard and coming back — a detour on a road
+  // the driver could see was straight.
+  const { chargeEachIntersectionOnce } = await import("../scripts/osm_road_graph.mjs");
+  const SIGNAL = 1, CROSSING = 5;
+  const quiet = () => {};
+
+  // Four nodes of one intersection: a signal on each carriageway of a divided
+  // road, and a crossing beside each. Spread over about 20 m.
+  const ids = new Float64Array([1, 2, 3, 4]);
+  const lat = new Int32Array([455000000, 455000900, 455001800, 455000400]);
+  const lon = new Int32Array([-736000000, -736000000, -736000000, -736000000]);
+  const penalty = new Uint16Array([100, 100, 50, 50]);
+  const kind = new Uint8Array([SIGNAL, SIGNAL, CROSSING, CROSSING]);
+  chargeEachIntersectionOnce(ids, lat, lon, penalty, kind, quiet);
+
+  const charged = [...penalty].filter(value => value > 0);
+  assert.deepEqual(charged, [100], "one intersection should cost one signal wait");
+  // The heaviest node is the one kept: a driver waits for the light, not for
+  // whichever node the scan reached first.
+  assert.equal(penalty[0], 100);
+
+  // The next intersection along is its own charge, not part of this one.
+  const farIds = new Float64Array([1, 2]);
+  const farLat = new Int32Array([455000000, 455008000]);   // ~90 m apart
+  const farLon = new Int32Array([-736000000, -736000000]);
+  const farPenalty = new Uint16Array([100, 100]);
+  chargeEachIntersectionOnce(farIds, farLat, farLon, farPenalty, new Uint8Array([SIGNAL, SIGNAL]), quiet);
+  assert.deepEqual([...farPenalty], [100, 100], "separate intersections each cost a wait");
+
+  // Kind codes are the query layer's business and must survive untouched, or
+  // the map stops drawing lights it should draw.
+  assert.deepEqual([...kind], [SIGNAL, SIGNAL, CROSSING, CROSSING]);
+});
+
 test("the cycling profile prefers cycle infrastructure over arterials", async () => {
   const { PROFILES } = await import("../scripts/osm_road_graph.mjs");
   const bike = PROFILES.bike;

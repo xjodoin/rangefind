@@ -147,6 +147,75 @@ const CAR_NODE_PENALTIES = { traffic_signals: 100, stop: 20, give_way: 10, level
 const BIKE_NODE_PENALTIES = { traffic_signals: 80, stop: 15, give_way: 5, level_crossing: 40, crossing_signals: 40 };
 const FOOT_NODE_PENALTIES = { traffic_signals: 60, level_crossing: 30, crossing_signals: 20 };
 
+/**
+ * Collapses the tagged nodes of one intersection into one charge.
+ *
+ * Penalties are read off individual nodes, and a wide intersection carries
+ * several: a divided highway has a signal on each carriageway, and a signalised
+ * junction has a pedestrian crossing on each arm. All of them are one red
+ * light to a driver, but the cost model charged each in turn, so crossing one
+ * boulevard cost two or three signal waits.
+ *
+ * That is not a rounding error, it inverts routes. Chemin de la Grande-Côte
+ * crosses Boulevard Labelle at grade in Rosemère; the twelve-metre segment
+ * between the carriageways priced out at twenty-six seconds, and the router
+ * preferred to leave the road, run a hundred metres up the boulevard and come
+ * back — a detour a driver on a straight road watched it propose. The detour
+ * does not avoid the wait; it just passed fewer tagged nodes.
+ *
+ * The query layer already merges junction *markers* within thirty metres for
+ * display, on the same reasoning and the same radius. This applies it to the
+ * cost, in rank order so the signal is the one that gets charged and the
+ * crossings beside it fall in behind it. Kind codes are left alone: what is
+ * drawn on the map is the query layer's business.
+ */
+export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kindCode, log) {
+  const MERGE_METERS = 30;
+  const charged = [];
+  const grid = new Map();
+  // Cell side comfortably over the merge radius, so a neighbour can only be in
+  // this cell or one adjacent to it.
+  const CELL_E7 = 5000;
+  const key = (cx, cy) => `${cx},${cy}`;
+
+  const candidates = [];
+  for (let i = 0; i < penaltyDs.length; i++) if (penaltyDs[i] > 0) candidates.push(i);
+  // Heaviest first: the signal becomes the intersection's charge, not whichever
+  // crossing happened to be scanned first.
+  candidates.sort((a, b) => penaltyDs[b] - penaltyDs[a] || usedIds[a] - usedIds[b]);
+
+  let merged = 0;
+  for (const index of candidates) {
+    const lat = latE7[index];
+    const lon = lonE7[index];
+    const cx = Math.floor(lat / CELL_E7);
+    const cy = Math.floor(lon / CELL_E7);
+    let absorbed = false;
+    for (let dx = -1; dx <= 1 && !absorbed; dx++) {
+      for (let dy = -1; dy <= 1 && !absorbed; dy++) {
+        const bucket = grid.get(key(cx + dx, cy + dy));
+        if (!bucket) continue;
+        for (const other of bucket) {
+          if (haversineMetersE7(lat, lon, latE7[other], lonE7[other]) < MERGE_METERS) {
+            absorbed = true;
+            break;
+          }
+        }
+      }
+    }
+    if (absorbed) {
+      penaltyDs[index] = 0;
+      merged++;
+      continue;
+    }
+    const cell = key(cx, cy);
+    if (!grid.has(cell)) grid.set(cell, []);
+    grid.get(cell).push(index);
+    charged.push(index);
+  }
+  log(`junction penalties: ${charged.length} intersections charged, ${merged} duplicate nodes absorbed`);
+}
+
 function nodePenaltyDs(profile, tags) {
   if (!tags) return 0;
   const table = profile.nodePenalties;
@@ -654,6 +723,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
       }
     }
   });
+
+  chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kindCode, log);
 
   // Graph nodes are junctions with a known coordinate, numbered by sorted id.
   const nodeIndex = new Map();
