@@ -26,7 +26,12 @@ adapted to range-addressed static objects:
    oneway and adds footways/paths/steps. All profiles degrade speeds on
    unpaved surfaces and bad smoothness, and fold junction penalties
    (traffic signals, stop, give-way, level crossings) into the edges
-   entering the tagged node. Each edge carries its highway-class code for
+   entering the tagged node. One intersection is charged once, however
+   many nodes describe it: a divided road carries a signal on each
+   carriageway and a signalised junction a crossing on each arm, all of
+   them one red light to a driver. Tagged nodes within 30 m of one already
+   charged are absorbed into it, heaviest first, so the signal is what gets
+   paid for and the crossings beside it fall in behind. Each edge carries its highway-class code for
    the time-bucket metrics below. Turn
    restrictions (`type=restriction` relations with a single via node,
    `no_*`/`only_*`, `except` handling, u-turn semantics) are compiled into
@@ -355,9 +360,15 @@ metric-exact rerouting remains a hosted-service capability.
   depth limit); without them, chains deeper than 3 restricted junctions
   are truncated. Turn restrictions apply to the car profile.
 - Turn costs are heuristic bands by turn geometry, not measured
-  per-junction delays; junction penalties are fixed per node type. At
-  snapped endpoints the turn-cost share of a partial edge is
-  ratio-scaled with the rest of its weight.
+  per-junction delays; junction penalties are fixed per node type, and
+  charged once per intersection rather than once per tagged node. On
+  Québec that merge absorbs roughly half the penalised nodes (car
+  53,681 of 114,564; foot 45,333 against only 11,818 intersections
+  charged). Summing them instead priced crossing a divided boulevard at
+  two or three signal waits, which was enough to route a car around a
+  junction rather than straight through it. At snapped endpoints the
+  turn-cost share of a partial edge is ratio-scaled with the rest of its
+  weight.
 - Bucket factors scale whole edge weights, including the folded junction
   penalty and turn-cost portions.
 - `liveWeights` re-ranks computed candidates; it does not re-run the
