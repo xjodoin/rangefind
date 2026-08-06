@@ -2,6 +2,7 @@ package dev.rangefind.wayfind.ui
 
 import android.content.Context
 import android.location.Location
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -25,6 +26,7 @@ import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.region.RegionStore
 import dev.rangefind.wayfind.nav.NavUpdate
 import dev.rangefind.wayfind.nav.TravelMode
+import dev.rangefind.wayfind.ui.map.RenderCadence
 import dev.rangefind.wayfind.nav.TripRecorder
 import dev.rangefind.wayfind.nav.NavigationCore
 import kotlinx.coroutines.FlowPreview
@@ -648,10 +650,21 @@ class MapsViewModel(
         greeting?.let { _voice.tryEmit(it) }
     }
 
+    /**
+     * Files how the map actually performed, before the trace is closed. A
+     * drive that felt choppy and one that did not now differ by a number
+     * rather than by a recollection.
+     */
+    private fun recordRenderCadence() {
+        val summary = RenderCadence.snapshot(SystemClock.elapsedRealtimeNanos()) ?: return
+        recorder.renderSummary(summary, System.currentTimeMillis())
+    }
+
     fun stopNavigation() {
         heading.stop()
         motion.reset()
         recorder.note("stopped-by-user", atMillis = System.currentTimeMillis())
+        recordRenderCadence()
         recorder.stop()
         core.stop()
         _state.update { it.copy(sheet = SheetMode.Directions, nav = null, rerouting = false) }
@@ -756,6 +769,7 @@ class MapsViewModel(
 
         if (update.arrived) {
             recorder.note("arrived", atMillis = System.currentTimeMillis())
+            recordRenderCadence()
             recorder.stop()
             core.stop()
             // Stopping the state machine is not finishing the drive: without

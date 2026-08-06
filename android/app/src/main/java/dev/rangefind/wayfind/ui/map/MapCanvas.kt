@@ -6,6 +6,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.location.Location
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -433,6 +434,7 @@ private class MapHolder {
     fun pushVehicle(position: LatLon, bearing: Double, speedMps: Double) {
         if (!vehicleReady) return
         val map = map ?: return
+        RenderCadence.onVehicleUpdate(speedMps, SystemClock.elapsedRealtimeNanos())
         runCatching {
             map.locationComponent.forceLocationUpdate(
                 Location("wayfind").apply {
@@ -460,6 +462,8 @@ private class MapHolder {
     fun setFollowing(following: Boolean, viewportHeightPx: Int) {
         this.following = following
         if (viewportHeightPx > 0) this.viewportHeightPx = viewportHeightPx
+        if (following) RenderCadence.start(SystemClock.elapsedRealtimeNanos())
+        else RenderCadence.stop()
         applyFollow()
     }
 
@@ -761,6 +765,16 @@ private fun rememberMapViewWithLifecycle(): MapView {
     val mapView = remember {
         MapLibre.getInstance(context)
         MapView(context).apply { onCreate(null) }
+    }
+
+    // Every presented frame is timed, so a drive can say whether the map was
+    // dropping frames or only being given a new position once a second.
+    DisposableEffect(mapView) {
+        val listener = MapView.OnDidFinishRenderingFrameListener { _, _, _ ->
+            RenderCadence.onFrame(SystemClock.elapsedRealtimeNanos())
+        }
+        mapView.addOnDidFinishRenderingFrameListener(listener)
+        onDispose { mapView.removeOnDidFinishRenderingFrameListener(listener) }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current

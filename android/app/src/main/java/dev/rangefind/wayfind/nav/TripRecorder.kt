@@ -160,6 +160,22 @@ class TripRecorder(context: Context) {
         .put("arrived", update.arrived)
         .put("voice", update.voice ?: JSONObject.NULL)
 
+    /**
+     * How the map performed over the drive, written once at the end.
+     *
+     * The counterpart to the fix rows: those say what the app decided, this
+     * says whether the screen kept up with it. Read together they separate a
+     * renderer that stutters from a position that only moves once a second.
+     */
+    fun renderSummary(summary: JSONObject, atMillis: Long) {
+        val file = sink ?: return
+        val row = JSONObject()
+            .put("kind", "render")
+            .put("at", atMillis)
+            .put("render", summary)
+        runCatching { file.appendText(row.toString() + "\n") }
+    }
+
     /** Note something the caller did, so the trace explains its own gaps. */
     fun note(event: String, detail: String? = null, atMillis: Long) {
         val file = sink ?: return
