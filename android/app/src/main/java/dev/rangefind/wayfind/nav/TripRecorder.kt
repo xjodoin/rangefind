@@ -153,6 +153,9 @@ class TripRecorder(context: Context) {
         .put("metersToManeuver", update.metersToManeuver)
         .put("remainingMeters", update.remainingMeters)
         .put("remainingSeconds", update.remainingSeconds)
+        // Why the arrow was where it was, not just where it ended up.
+        .put("crossTrackMeters", update.crossTrackMeters)
+        .put("distanceAlongMeters", update.distanceAlongMeters)
         .put("turnDelta", update.turnDelta)
         .put("speedLimitKmh", update.speedLimitKmh)
         .put("heading", update.bearing)

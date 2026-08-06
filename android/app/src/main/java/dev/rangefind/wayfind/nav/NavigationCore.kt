@@ -32,6 +32,17 @@ data class NavUpdate(
     val bearing: Double,
     val speedMps: Double,
     /**
+     * How far the fix sat from the route line, and how far along the route the
+     * match landed. Neither drives anything on screen; both go into the trace.
+     *
+     * A drawn position that leapt was unattributable without them: the trace
+     * recorded where the arrow ended up, not why. A jump with the cross-track
+     * steady is the projection hopping, a jump with the distance-along going
+     * backwards is a rescan, and the two want opposite fixes.
+     */
+    val crossTrackMeters: Double,
+    val distanceAlongMeters: Double,
+    /**
      * Direction of the road the route matched to, independent of any fused
      * heading. The motion model needs a heading it did not itself produce.
      */
@@ -284,6 +295,8 @@ class NavigationCore(private val context: Context) {
             position = position,
             bearing = heading,
             speedMps = speedMps,
+            crossTrackMeters = match.crossTrackMeters,
+            distanceAlongMeters = match.distanceAlong,
             roadBearing = match.bearing,
             // Posted limits and lane markings are addressed to drivers.
             speedLimitKmh = if (mode.showsRoadSigns) {

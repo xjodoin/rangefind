@@ -78,6 +78,7 @@ function report(path) {
 
   const gaps = [];
   const groups = { snapped: [], raw: [], flip: [] };
+  const leaps = [];
   let previous = null;
 
   for (const fix of fixes) {
@@ -98,7 +99,21 @@ function report(path) {
             { lat: fix.nav.shownLat, lon: fix.nav.shownLon }
           );
           const key = before !== now ? "flip" : now ? "raw" : "snapped";
-          groups[key].push(moved - speed * dt);
+          const excess = moved - speed * dt;
+          groups[key].push(excess);
+          // A leap wants explaining, and the two explanations want opposite
+          // fixes: a steady cross-track means the projection hopped along the
+          // line, a distance-along that went backwards means the match was
+          // lost and rescanned from the start.
+          if (excess > 5 && fix.nav.crossTrackMeters !== undefined) {
+            leaps.push({
+              excess,
+              crossTrack: fix.nav.crossTrackMeters,
+              crossTrackWas: previous.nav.crossTrackMeters,
+              alongDelta: fix.nav.distanceAlongMeters - previous.nav.distanceAlongMeters,
+              road: fix.nav.stepName || "?"
+            });
+          }
         }
       }
     }
@@ -125,6 +140,20 @@ function report(path) {
           `max ${Math.max(...values).toFixed(1).padStart(6)}m`
       );
     }
+  }
+
+  if (leaps.length) {
+    console.log(`  arrow leaps (>5 m beyond what the car could travel):`);
+    for (const leap of leaps.slice(0, 8)) {
+      const cause = leap.alongDelta < -5 ? "match rescanned"
+        : Math.abs(leap.crossTrack - leap.crossTrackWas) < 3 ? "projection hopped"
+        : "drifted off the line";
+      console.log(
+        `    ${leap.excess.toFixed(1).padStart(5)}m  cross-track ${leap.crossTrackWas?.toFixed(0)}→${leap.crossTrack?.toFixed(0)}m  ` +
+          `along ${leap.alongDelta >= 0 ? "+" : ""}${leap.alongDelta.toFixed(0)}m  ${cause}  ${leap.road.slice(0, 22)}`
+      );
+    }
+    if (leaps.length > 8) console.log(`    … and ${leaps.length - 8} more`);
   }
 
   if (render?.render) {
