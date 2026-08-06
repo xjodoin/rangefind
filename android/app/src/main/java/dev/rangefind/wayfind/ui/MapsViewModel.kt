@@ -638,9 +638,6 @@ class MapsViewModel(
 
     // ---- navigation ---------------------------------------------------
 
-    /** The pose right now, carried forward since the last fix. */
-    fun currentPose(nowMs: Long): MotionModel.Pose? = motion.pose(nowMs)
-
     fun startNavigation() {
         heading.start()
         val greeting = core.start(_state.value.allRoutes, _state.value.activeRouteIndex)

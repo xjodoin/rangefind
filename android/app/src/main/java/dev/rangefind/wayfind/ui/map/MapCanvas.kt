@@ -2,13 +2,17 @@ package dev.rangefind.wayfind.ui.map
 
 import android.content.Context
 import android.graphics.RectF
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.location.Location
+import androidx.core.content.ContextCompat
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
@@ -17,8 +21,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.LatLon
-import dev.rangefind.wayfind.nav.MotionModel
 import dev.rangefind.wayfind.engine.RouteJunction
 import dev.rangefind.wayfind.ui.SheetMode
 import dev.rangefind.wayfind.ui.formatDuration
@@ -30,6 +34,10 @@ import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.geometry.LatLngBounds
+import org.maplibre.android.location.LocationComponentActivationOptions
+import org.maplibre.android.location.LocationComponentOptions
+import org.maplibre.android.location.modes.CameraMode
+import org.maplibre.android.location.modes.RenderMode
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
@@ -43,8 +51,6 @@ import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.LineString
 import org.maplibre.geojson.Point
-import kotlin.math.cos
-import kotlin.math.sin
 
 const val STYLE_DAY = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
 const val STYLE_NIGHT = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
@@ -59,12 +65,9 @@ private const val SRC_STOP = "rf-src-stop"
 private const val SRC_CROSSING = "rf-src-crossing"
 private const val SRC_PUCK = "rf-src-puck"
 private const val SRC_ORIGIN = "rf-src-origin"
-private const val SRC_NAV = "rf-src-nav"
 
 private const val LYR_RESULTS = "rf-lyr-results"
 private const val LYR_ALT = "rf-lyr-alt"
-private const val LYR_NAV = "rf-lyr-nav"
-private const val IMG_NAV = "rf-nav-arrow"
 
 /** Up to three candidates: the fastest plus two alternates. */
 private val SRC_LABEL = listOf("rf-src-label-0", "rf-src-label-1", "rf-src-label-2")
@@ -74,15 +77,17 @@ private val IMG_LABEL = listOf("rf-label-0", "rf-label-1", "rf-label-2")
 /** Rangefind ink — the glyph punched out of the amber destination marker. */
 private const val INK = 0xFF14161D.toInt()
 
-/** Per-frame fraction of the remaining distance to the newest fix. */
-private const val FOLLOW_EASE = 0.12
 /**
- * Gentler still, for a source that is already continuous: with the motion
- * model carrying the vehicle between fixes, the only step left to absorb is
- * the correction each fix applies, and easing hard would reintroduce the lag
- * the model exists to remove.
+ * How much of the viewport sits above the vehicle while following, as a
+ * fraction of its height. Driving is a forward-looking activity: what is
+ * behind the car has already been dealt with.
+ *
+ * Camera padding centres the target in what is left, so this puts the vehicle
+ * two thirds of the way down — low enough that the view is mostly road ahead,
+ * high enough to stay clear of the speed readout and the road-name chip, which
+ * sit above the sheet at the bottom of the screen.
  */
-private const val SETTLED_EASE = 0.22
+private const val FOLLOW_TOP_PADDING = 0.32
 
 @Composable
 fun MapCanvas(
@@ -95,8 +100,6 @@ fun MapCanvas(
     onResultTapped: (Int) -> Unit,
     onRouteTapped: (Int) -> Unit,
     onLongPress: (LatLon) -> Unit,
-    /** The vehicle's pose right now, carried forward since the last fix. */
-    poseAt: ((Long) -> MotionModel.Pose?)? = null,
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current.density
@@ -135,6 +138,9 @@ fun MapCanvas(
             map.setStyle(if (darkTheme) STYLE_NIGHT else STYLE_DAY) { style ->
                 holder.style = style
                 installLayers(style, palette, density)
+                // The vehicle belongs to MapLibre once the style is up; it
+                // draws and animates it, and needs the style to attach to.
+                holder.attachVehicle(appContext, palette, darkTheme)
                 holder.ready = true
                 // Replay whatever the app knows now: a fix or a route that
                 // arrived while the style was still loading would otherwise
@@ -253,14 +259,22 @@ fun MapCanvas(
     // fix rate. Location lands about once a second: easing the camera over
     // 900 ms while the puck's map position is set discretely made the map
     // glide and the arrow teleport. Both now advance together every frame.
+    // Following is handed to MapLibre's own location component rather than
+    // driven from here. A per-frame moveCamera from the Compose frame clock
+    // pushes updates at whatever rate the composition runs, independent of
+    // the map's render loop, which is the shape of stutter the renderer's own
+    // docs warn about — frames queued faster than they can be presented. The
+    // component animates the vehicle and the camera on its own schedule, so
+    // the app's job shrinks to saying where the vehicle is.
     LaunchedEffect(state.sheet == SheetMode.Navigating) {
-        if (state.sheet != SheetMode.Navigating) {
-            holder.resetFollow()
-            return@LaunchedEffect
-        }
-        while (true) {
-            withFrameNanos { holder.stepFollow() }
-        }
+        holder.setFollowing(state.sheet == SheetMode.Navigating, mapView.height)
+    }
+
+    // One update per fix. MapLibre interpolates between them, which is what
+    // the frame loop was trying to do by hand.
+    LaunchedEffect(state.nav?.position, state.nav?.bearing) {
+        val nav = state.nav ?: return@LaunchedEffect
+        holder.pushVehicle(nav.position, nav.bearing, nav.speedMps)
     }
 
     // Camera: center a selected place when there is no route on screen.
@@ -315,14 +329,6 @@ fun MapCanvas(
     }
 }
 
-/** Moves a point [meters] along [bearing] — used to bias the follow camera. */
-private fun advance(from: LatLon, bearing: Double, meters: Double): LatLon {
-    val radians = Math.toRadians(bearing)
-    val dLat = (meters * cos(radians)) / 111_320.0
-    val dLon = (meters * sin(radians)) / (111_320.0 * cos(Math.toRadians(from.lat)).coerceAtLeast(0.01))
-    return LatLon(from.lat + dLat, from.lon + dLon)
-}
-
 /**
  * The live map, for anything outside the composition that needs to see what
  * the driver saw. Only the rendered map goes through here: everything drawn
@@ -360,83 +366,121 @@ private class MapHolder {
     var ready = false
     var listenersBound = false
 
-    /** Eased follow state, advanced once per frame while navigating. */
-    private var followLat = Double.NaN
-    private var followLon = Double.NaN
-    private var followBearing = 0.0
+    private var vehicleReady = false
+    private var following = false
+    private var viewportHeightPx = 0
 
     fun resetFollow() {
-        followLat = Double.NaN
-        followLon = Double.NaN
+        runCatching { map?.locationComponent?.cameraMode = CameraMode.NONE }
     }
 
     /**
-     * Moves the puck and the camera a fraction of the way toward the newest
-     * fix. A fraction per frame gives an ease-out that never overshoots and
-     * needs no animation bookkeeping when the target changes mid-flight.
+     * Hands the vehicle to MapLibre's location component.
+     *
+     * Activated with no location engine of its own: the positions come from
+     * the app's motion model, which knows about the route, the mode and which
+     * fixes to believe. What the component contributes is the drawing and the
+     * camera — animated natively, in step with the renderer.
+     *
+     * Called again on every style load, because a new style is a new set of
+     * layers and the component's own layers went with the old one. Whatever
+     * the drive was doing is reapplied afterwards rather than reset.
      */
-    fun stepFollow(poseAt: ((Long) -> MotionModel.Pose?)? = null) {
-        val style = style ?: return
+    @SuppressLint("MissingPermission")
+    fun attachVehicle(context: Context, palette: MapPalette, night: Boolean) {
         val map = map ?: return
-        val nav = latest?.nav ?: return
-        if (!ready || !style.isFullyLoaded) return
-
-        // Where the vehicle is this frame, not where it was when the last fix
-        // landed. The model carries it forward continuously, so what remains
-        // here is absorbing the step each fix's correction makes.
-        val pose = poseAt?.invoke(System.currentTimeMillis())
-        val targetLat = pose?.position?.lat ?: nav.position.lat
-        val targetLon = pose?.position?.lon ?: nav.position.lon
-        val targetBearing = pose?.bearing ?: nav.bearing
-        val ease = if (pose != null) SETTLED_EASE else FOLLOW_EASE
-
-        if (followLat.isNaN()) {
-            followLat = targetLat
-            followLon = targetLon
-            followBearing = targetBearing
-        } else {
-            followLat += (targetLat - followLat) * ease
-            followLon += (targetLon - followLon) * ease
-            val delta = (targetBearing - followBearing + 540.0) % 360.0 - 180.0
-            followBearing = (followBearing + delta * ease + 360.0) % 360.0
-        }
-
-        style.setSource(
-            SRC_NAV,
-            FeatureCollection.fromFeatures(
-                listOf(Feature.fromGeometry(Point.fromLngLat(followLon, followLat)))
-            )
-        )
-        style.getLayerAs<SymbolLayer>(LYR_NAV)
-            ?.setProperties(PropertyFactory.iconRotate(followBearing.toFloat()))
-
-        // Zoom tightens as speed drops, and the camera targets a point ahead
-        // of the puck so the driver sits low on screen with the road ahead
-        // filling the view.
-        val speedKmh = (pose?.speedMps ?: nav.speedMps) * 3.6
-        val zoom = when {
-            speedKmh < 25 -> 18.1
-            speedKmh < 65 -> 17.3
-            else -> 16.5
-        }
-        val leadMeters = when {
-            speedKmh < 25 -> 85.0
-            speedKmh < 65 -> 150.0
-            else -> 240.0
-        }
-        val target = advance(LatLon(followLat, followLon), followBearing, leadMeters)
-        // Moving rather than animating: this *is* the animation, so a second
-        // easing on top would fight it.
-        map.moveCamera(
-            CameraUpdateFactory.newCameraPosition(
-                CameraPosition.Builder()
-                    .target(LatLng(target.lat, target.lon))
-                    .zoom(zoom)
-                    .bearing(followBearing)
-                    .tilt(58.0)
+        val style = style ?: return
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) return
+        runCatching {
+            // No tint: the puck is a chevron with a white outline over a
+            // shadow, and a tint colour would flatten all three into one.
+            val options = LocationComponentOptions.builder(context)
+                .gpsDrawable(
+                    if (night) R.drawable.wayfind_nav_puck_night
+                    else R.drawable.wayfind_nav_puck
+                )
+                .accuracyColor(palette.puckHalo.toArgb())
+                .accuracyAlpha(0.28f)
+                // A pan mid-drive moves the camera's focus rather than
+                // dropping the follow, so a glance up the road doesn't end
+                // with the map stranded behind the car.
+                .trackingGesturesManagement(true)
+                .build()
+            map.locationComponent.activateLocationComponent(
+                LocationComponentActivationOptions.builder(context, style)
+                    .locationComponentOptions(options)
+                    .useDefaultLocationEngine(false)
                     .build()
             )
-        )
+            vehicleReady = true
+            applyFollow()
+        }
+    }
+
+    /** Where the vehicle is, once per fix; the component animates between. */
+    @SuppressLint("MissingPermission")
+    fun pushVehicle(position: LatLon, bearing: Double, speedMps: Double) {
+        if (!vehicleReady) return
+        val map = map ?: return
+        runCatching {
+            map.locationComponent.forceLocationUpdate(
+                Location("wayfind").apply {
+                    latitude = position.lat
+                    longitude = position.lon
+                    this.bearing = bearing.toFloat()
+                    speed = speedMps.toFloat()
+                    time = System.currentTimeMillis()
+                }
+            )
+            // Zoom tightens as speed drops, so the view holds roughly the same
+            // stretch of road ahead whatever the pace.
+            val speedKmh = speedMps * 3.6
+            map.locationComponent.zoomWhileTracking(
+                when {
+                    speedKmh < 25 -> 17.6
+                    speedKmh < 65 -> 16.9
+                    else -> 16.2
+                }
+            )
+        }
+    }
+
+    /** Turns following on for a drive and off again afterwards. */
+    fun setFollowing(following: Boolean, viewportHeightPx: Int) {
+        this.following = following
+        if (viewportHeightPx > 0) this.viewportHeightPx = viewportHeightPx
+        applyFollow()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun applyFollow() {
+        if (!vehicleReady) return
+        val map = map ?: return
+        runCatching {
+            map.locationComponent.isLocationComponentEnabled = following
+            if (following) {
+                // Heading-up, tilted, with the vehicle low in frame so the
+                // view is mostly the road ahead rather than the road behind.
+                map.locationComponent.renderMode = RenderMode.GPS
+                map.locationComponent.cameraMode = CameraMode.TRACKING_GPS
+                map.locationComponent.tiltWhileTracking(58.0)
+                // Padding shrinks the region the camera centres in, so a tall
+                // top padding is what puts the car near the bottom edge.
+                if (viewportHeightPx > 0) {
+                    map.locationComponent.paddingWhileTracking(
+                        doubleArrayOf(0.0, viewportHeightPx * FOLLOW_TOP_PADDING, 0.0, 0.0)
+                    )
+                }
+            } else {
+                map.locationComponent.cameraMode = CameraMode.NONE
+                map.locationComponent.cancelPaddingWhileTrackingAnimation()
+                runCatching { map.setPadding(0, 0, 0, 0) }
+            }
+        }
     }
 
     /** Most recent app state, replayed whenever a new style finishes loading. */
@@ -576,7 +620,9 @@ private class MapHolder {
             )
         }
 
-        // Parked: a plain dot. Driving: a chevron aimed down the road.
+        // Parked: a plain dot from this layer. Driving: the vehicle belongs to
+        // MapLibre's location component, so this source empties and gets out
+        // of its way.
         val browsing = if (navigating) null else state.userLocation
         style.setSource(
             SRC_PUCK,
@@ -584,11 +630,6 @@ private class MapHolder {
                 listOfNotNull(browsing?.let { Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)) })
             )
         )
-        // While driving, the arrow is owned by the frame loop; writing it here
-        // at the fix rate would reintroduce exactly the jump it removes.
-        if (!navigating) {
-            style.setSource(SRC_NAV, FeatureCollection.fromFeatures(emptyList()))
-        }
     }
 }
 
@@ -609,7 +650,7 @@ private fun Style.setLine(id: String, lines: List<List<LatLon>>) {
 private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     (listOf(
         SRC_ALT, SRC_ROUTE, SRC_TRAVELED, SRC_RESULTS, SRC_DESTINATION,
-        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN, SRC_NAV
+        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN
     ) + SRC_LABEL).forEach { id ->
         if (style.getSource(id) == null) {
             style.addSource(GeoJsonSource(id, FeatureCollection.fromFeatures(emptyList())))
@@ -617,7 +658,6 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     }
 
     style.addImage(MapIcons.DESTINATION, MapIcons.pin(palette.destination.toArgb(), INK, density))
-    style.addImage(IMG_NAV, MapIcons.navArrow(palette.puck.toArgb(), 0xFFFFFFFF.toInt(), density))
     style.addImage(MapIcons.SIGNAL, MapIcons.signal(density))
     style.addImage(MapIcons.STOP, MapIcons.stop(density))
     style.addImage(MapIcons.CROSSING, MapIcons.crossing(density))
@@ -704,19 +744,6 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
             PropertyFactory.circleColor(palette.puck.toArgb()),
             PropertyFactory.circleStrokeWidth(3.5f),
             PropertyFactory.circleStrokeColor(0xFFFFFFFF.toInt())
-        )
-    )
-
-    // While driving the puck becomes a chevron pointing where the car is
-    // heading. Rotation aligns to the map, so it stays truthful even if the
-    // driver spins the view away from the direction of travel.
-    style.addLayer(
-        SymbolLayer(LYR_NAV, SRC_NAV).withProperties(
-            PropertyFactory.iconImage(IMG_NAV),
-            PropertyFactory.iconAllowOverlap(true),
-            PropertyFactory.iconIgnorePlacement(true),
-            PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_MAP),
-            PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_MAP)
         )
     )
 }
