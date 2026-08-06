@@ -6,6 +6,7 @@ import dev.rangefind.wayfind.R
 import dev.rangefind.wayfind.engine.LaneTurn
 import dev.rangefind.wayfind.engine.LatLon
 import dev.rangefind.wayfind.engine.Route
+import dev.rangefind.wayfind.engine.speedLimitAt
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -299,8 +300,16 @@ class NavigationCore(private val context: Context) {
             distanceAlongMeters = match.distanceAlong,
             roadBearing = match.bearing,
             // Posted limits and lane markings are addressed to drivers.
+            //
+            // Read at the car's position along the route, not from the step it
+            // is in. A street is not a limit: an autoroute drops through an
+            // interchange and climbs back without changing its name, and the
+            // step's single number is whichever limit covers most of it — so
+            // the sign read 100 while the driver was in the 70.
             speedLimitKmh = if (mode.showsRoadSigns) {
-                route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0
+                route.speedLimitAt(match.distanceAlong)
+                    .takeIf { it > 0 }
+                    ?: route.steps.getOrNull(stepIndex)?.speedLimitKmh ?: 0
             } else 0,
             turnDelta = turnDelta,
             maneuver = maneuverKind,

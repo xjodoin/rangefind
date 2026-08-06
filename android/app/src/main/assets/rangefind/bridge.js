@@ -131,6 +131,14 @@ function trimRoute(route) {
       // not, and its class is the only thing that says what it is.
       roadClass: routeEngine?.root?.classes?.[step.roadClass] || ""
     })),
+    // Where the posted limit changes, as a step function over distance
+    // travelled. A step is one street and a street routinely carries several
+    // limits, so a single number per step shows the wrong one for however much
+    // of the street disagrees with it.
+    speedLimits: (route.speedLimits || []).map(entry => ({
+      atMeters: entry.atMeters,
+      limitKmh: entry.limitKmh
+    })),
     junctions: (route.junctions || []).map(j => ({
       kind: j.kind,
       lat: j.lat,

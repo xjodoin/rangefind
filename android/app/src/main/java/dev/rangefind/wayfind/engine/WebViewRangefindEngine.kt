@@ -340,6 +340,12 @@ private fun JSONObject.toRoute(): Route {
                 atMeters = it.optDouble("atMeters")
             )
         },
+        speedLimits = optJSONArray("speedLimits").map {
+            SpeedLimitChange(
+                atMeters = it.optDouble("atMeters"),
+                limitKmh = it.optInt("limitKmh")
+            )
+        },
         httpRequests = optJSONObject("stats")?.optInt("httpRequests") ?: 0,
         bytesFetched = optJSONObject("stats")?.optLong("bytesFetched") ?: 0L
     )

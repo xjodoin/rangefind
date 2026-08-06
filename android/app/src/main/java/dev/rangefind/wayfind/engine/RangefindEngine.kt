@@ -201,15 +201,38 @@ data class RouteJunction(
     val atMeters: Double
 )
 
+/**
+ * A posted limit and the distance along the route where it takes effect.
+ *
+ * Limits belong to distance rather than to steps because a street is not a
+ * limit: an autoroute drops through an interchange and climbs back without
+ * ever changing its name, and one number for the whole street is the wrong
+ * number for however much of it disagrees.
+ */
+data class SpeedLimitChange(val atMeters: Double, val limitKmh: Int)
+
 data class Route(
     val seconds: Double,
     val distanceMeters: Double,
     val geometry: List<LatLon>,
     val steps: List<RouteStep>,
     val junctions: List<RouteJunction>,
+    val speedLimits: List<SpeedLimitChange>,
     val httpRequests: Int,
     val bytesFetched: Long
 )
+
+/** The posted limit in force [meters] into the trip, 0 where none is known. */
+fun Route.speedLimitAt(meters: Double): Int {
+    // The last change at or before this point. Routes carry a handful of
+    // these, so a scan is honest and a binary search would be decoration.
+    var answer = 0
+    for (change in speedLimits) {
+        if (change.atMeters > meters) break
+        answer = change.limitKmh
+    }
+    return answer
+}
 
 data class RouteBundle(val primary: Route, val alternatives: List<Route>)
 

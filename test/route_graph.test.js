@@ -1194,3 +1194,69 @@ test("conditional speed limits are read the way they are actually tagged", async
     assert.equal(parseConditionalMaxspeed(unknown), null, `should refuse: ${unknown}`);
   }
 });
+
+test("a posted limit that changes mid-street is reported where it changes", async (t) => {
+  // One street, three limits: the shape of an autoroute that drops through an
+  // interchange and climbs back. Reported per step, this is a single number —
+  // the one covering the most metres — so the sign reads 90 while the driver
+  // is in the 70. Reported over distance, it is three answers in the right
+  // places, and the app can ask which one applies where the car actually is.
+  const graph = syntheticGraph(12, 3);
+  // Every edge on one name, so the whole route collapses into one step and the
+  // per-step answer has nowhere left to hide.
+  graph.edgeName = Uint32Array.from(graph.edgeName, () => 1);
+  graph.edgeSpeed = Uint8Array.from(graph.edgeFrom, (_, i) => {
+    const third = Math.floor((i / graph.edgeFrom.length) * 3);
+    return third === 1 ? 70 : 90;
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-limits-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 24, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  const from = { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 };
+  const last = graph.nodeLat.length - 1;
+  const to = { lat: graph.nodeLat[last] / 1e7, lon: graph.nodeLon[last] / 1e7 };
+  const route = await engine.route({ from, to });
+
+  assert.ok(Array.isArray(route.speedLimits), "a route reports where its limits change");
+  assert.ok(route.speedLimits.length >= 1, "at least one limit entry");
+  assert.equal(route.speedLimits[0].atMeters, 0, "the first entry starts at the trip's start");
+
+  // Entries march forward and never repeat a limit back to back, or the app
+  // would be told the limit changed when it did not.
+  for (let i = 1; i < route.speedLimits.length; i++) {
+    assert.ok(
+      route.speedLimits[i].atMeters > route.speedLimits[i - 1].atMeters,
+      "limit changes are ordered by distance"
+    );
+    assert.notEqual(
+      route.speedLimits[i].limitKmh,
+      route.speedLimits[i - 1].limitKmh,
+      "consecutive entries differ, or the run was not collapsed"
+    );
+  }
+
+  // The limit in force at a distance is the last entry at or before it, which
+  // is the lookup the app performs. Every edge's own limit must agree with it,
+  // because that is the whole promise being made.
+  const limitAt = (meters) => {
+    let answer = 0;
+    for (const entry of route.speedLimits) {
+      if (entry.atMeters <= meters + 1e-6) answer = entry.limitKmh;
+      else break;
+    }
+    return answer;
+  };
+  let travelled = 0;
+  for (const edge of route.edges) {
+    // Mid-edge, so the reading is unambiguous at a boundary.
+    assert.equal(
+      limitAt(travelled + edge.meters / 2),
+      edge.speedLimitKmh,
+      `the limit at ${Math.round(travelled)} m should match the edge under it`
+    );
+    travelled += edge.meters;
+  }
+});

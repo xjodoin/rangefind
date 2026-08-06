@@ -1350,8 +1350,29 @@ export async function openRouteGraph(options) {
       }
     }
     if (chain.endMatch) pushPoint(chain.endMatch.snappedLatE7, chain.endMatch.snappedLonE7);
+    // Where the posted limit changes along the route, as a step function over
+    // distance travelled.
+    //
+    // A step is a stretch of road with one name, and a road with one name
+    // routinely carries several limits: an autoroute drops 100 to 70 through
+    // an interchange and climbs back, all of it "Autoroute 640". Reporting a
+    // single limit per step means reporting the one that covers most of it,
+    // so the sign reads 100 while the driver is doing 70 past a camera. The
+    // edges already know better; this is only a matter of saying so.
+    const speedLimits = [];
+    let limitAt = 0;
+    for (const edge of edges) {
+      const last = speedLimits[speedLimits.length - 1];
+      if (!last || last.limitKmh !== edge.speedLimitKmh) {
+        speedLimits.push({ atMeters: limitAt, limitKmh: edge.speedLimitKmh });
+      }
+      limitAt += edge.meters;
+    }
+
     // A step can span several posted limits; report the one covering the most
-    // of it, which is what the driver is under for most of the street.
+    // of it, which is what the driver is under for most of the street. Kept
+    // for the itinerary list, where one number per street is the right answer
+    // and there is no position to be more precise about.
     for (const step of steps) {
       let best = 0;
       let bestMeters = 0;
@@ -1367,6 +1388,7 @@ export async function openRouteGraph(options) {
     response.distanceMeters = distanceMeters;
     response.geometry = geometry;
     response.steps = steps;
+    response.speedLimits = speedLimits;
     response.edges = edges;
     response.junctions = junctions;
     // Recompute the exact unpenalized total from seeds plus raw edges; for
