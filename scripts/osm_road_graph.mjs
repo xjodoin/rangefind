@@ -355,6 +355,94 @@ function parseMaxspeed(value) {
   return match[2] ? speed * 1.609344 : speed;
 }
 
+/**
+ * A speed limit that only applies at certain times, as OSM records it.
+ *
+ * School zones are the reason this exists: a road posted 50 that drops to 30
+ * on school-day mornings is one road with two limits, and showing the driver
+ * the wrong one at 8am is showing them the wrong one at exactly the moment
+ * the limit is there for.
+ *
+ * The tagging is inconsistent in the wild. Across Québec the same idea is
+ * written four ways — `30 @ Mo-Fr 07:00-19:00`, `30 @ (Sep-Jun AND Mo-Fr
+ * 07:00-17:00)`, `30 @ (Sep-Jun: Mo-Fr 07:00-17:00)` and a bare
+ * `30 @ (07:00-21:00)` — two of which are not valid opening-hours syntax at
+ * all. So this parses the shape that is actually used rather than the shape
+ * the wiki specifies, and returns null on anything it does not recognise
+ * instead of guessing a limit into existence.
+ *
+ * Returns `{ speedKmh, days, startMinute, endMinute, monthStart, monthEnd }`,
+ * where `days` is a 7-bit mask from Monday and the month range is inclusive
+ * and may wrap (Sep-Jun is a school year, not an error).
+ */
+export function parseConditionalMaxspeed(value) {
+  if (!value) return null;
+  const text = String(value).trim();
+  const at = text.indexOf("@");
+  if (at < 0) return null;
+
+  const speedKmh = parseMaxspeed(text.slice(0, at));
+  if (!speedKmh) return null;
+
+  // Parentheses are optional in the wild, and so are the separators inside.
+  let condition = text.slice(at + 1).trim().replace(/^\(|\)$/g, "").trim();
+  if (!condition) return null;
+
+  const time = condition.match(/(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/);
+  if (!time) return null;
+  const startMinute = Number(time[1]) * 60 + Number(time[2]);
+  const endMinute = Number(time[3]) * 60 + Number(time[4]);
+  if (!(startMinute < endMinute)) return null;
+
+  const before = condition.slice(0, time.index);
+  const days = parseDayRange(before);
+  const months = parseMonthRange(before);
+
+  return {
+    speedKmh: Math.round(speedKmh),
+    // No day range means every day, which is what a bare time range says.
+    days: days ?? 0b1111111,
+    startMinute,
+    endMinute,
+    monthStart: months ? months.start : 1,
+    monthEnd: months ? months.end : 12
+  };
+}
+
+const DAY_NAMES = ["mo", "tu", "we", "th", "fr", "sa", "su"];
+const MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** `Mo-Fr` or `Mo,We,Fr` to a 7-bit mask from Monday, or null if absent. */
+function parseDayRange(text) {
+  const lower = text.toLowerCase();
+  const range = lower.match(/\b(mo|tu|we|th|fr|sa|su)\s*-\s*(mo|tu|we|th|fr|sa|su)\b/);
+  if (range) {
+    const from = DAY_NAMES.indexOf(range[1]);
+    const to = DAY_NAMES.indexOf(range[2]);
+    let mask = 0;
+    // Ranges may wrap the week (Fr-Mo is a weekend, not nothing).
+    for (let i = from; ; i = (i + 1) % 7) {
+      mask |= 1 << i;
+      if (i === to) break;
+    }
+    return mask;
+  }
+  const singles = lower.match(/\b(mo|tu|we|th|fr|sa|su)\b/g);
+  if (!singles) return null;
+  return singles.reduce((mask, day) => mask | (1 << DAY_NAMES.indexOf(day)), 0);
+}
+
+/** `Sep-Jun` to inclusive 1-based months, or null if absent. */
+function parseMonthRange(text) {
+  const lower = text.toLowerCase();
+  const range = lower.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s*-\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/);
+  if (!range) return null;
+  return {
+    start: MONTH_NAMES.indexOf(range[1]) + 1,
+    end: MONTH_NAMES.indexOf(range[2]) + 1
+  };
+}
+
 // Surfaces where posted class speeds are unrealistic for a car.
 /** How much a destination-only way is slowed, to keep it off through-routes. */
 const DESTINATION_ONLY_FACTOR = 0.35;

@@ -1146,3 +1146,51 @@ test("a car park you are being sent to is reachable, but not a shortcut", async 
   );
   assert.ok(restricted > 0, "slowed, not closed");
 });
+
+test("conditional speed limits are read the way they are actually tagged", async () => {
+  const { parseConditionalMaxspeed } = await import("../scripts/osm_road_graph.mjs");
+
+  // The four syntaxes Québec actually uses for the same idea. Two of them are
+  // not valid opening-hours syntax, which is why this parses what is written
+  // rather than what the wiki specifies.
+  const monToFri = 0b0011111;
+  assert.deepEqual(parseConditionalMaxspeed("30 @ Mo-Fr 07:00-19:00"), {
+    speedKmh: 30, days: monToFri, startMinute: 420, endMinute: 1140, monthStart: 1, monthEnd: 12
+  });
+  assert.deepEqual(parseConditionalMaxspeed("30 @ (Sep-Jun AND Mo-Fr 07:00-17:00)"), {
+    speedKmh: 30, days: monToFri, startMinute: 420, endMinute: 1020, monthStart: 9, monthEnd: 6
+  });
+  assert.deepEqual(parseConditionalMaxspeed("30 @ (Sep-Jun: Mo-Fr 07:00-17:00)"), {
+    speedKmh: 30, days: monToFri, startMinute: 420, endMinute: 1020, monthStart: 9, monthEnd: 6
+  });
+  // No day range means every day, which is what a bare time range says.
+  assert.deepEqual(parseConditionalMaxspeed("30 @ (07:00-21:00)"), {
+    speedKmh: 30, days: 0b1111111, startMinute: 420, endMinute: 1260, monthStart: 1, monthEnd: 12
+  });
+
+  // Sep-Jun is a school year, not a mistake: the range wraps the new year and
+  // must survive as written rather than being normalised into nothing.
+  const school = parseConditionalMaxspeed("30 @ (Sep-Jun AND Mo-Fr 07:00-17:00)");
+  assert.equal(school.monthStart, 9);
+  assert.equal(school.monthEnd, 6);
+
+  // A day range may wrap the week too.
+  assert.equal(parseConditionalMaxspeed("30 @ Fr-Mo 07:00-19:00").days, 0b1110001);
+  assert.equal(parseConditionalMaxspeed("30 @ Mo,We,Fr 07:00-19:00").days, 0b0010101);
+
+  // Anything not understood keeps the posted limit rather than inventing one.
+  // A limit the app made up is worse than no limit: the driver learns to
+  // distrust the sign, and then it is worthless when it is right.
+  for (const unknown of [
+    "",
+    null,
+    "wet 80",                 // condition is weather, not time
+    "30 @ flashing",          // depends on a beacon we cannot see
+    "30 @ (May 15-Oct 15)",   // seasonal, no time of day
+    "@ Mo-Fr 07:00-19:00",    // no speed
+    "30 @ Mo-Fr",             // no times
+    "30 @ Mo-Fr 19:00-07:00"  // reversed; overnight windows are not modelled
+  ]) {
+    assert.equal(parseConditionalMaxspeed(unknown), null, `should refuse: ${unknown}`);
+  }
+});
