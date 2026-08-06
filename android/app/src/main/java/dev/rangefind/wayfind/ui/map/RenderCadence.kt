@@ -44,6 +44,7 @@ object RenderCadence {
     private var startedNs = 0L
     private var running = false
     private var moving = false
+    private val pushes = mutableListOf<Double>()
     private var movingNs = 0L
     private var movingSinceNs = 0L
 
@@ -60,7 +61,21 @@ object RenderCadence {
             moving = false
             movingNs = 0L
             movingSinceNs = 0L
+            pushes.clear()
         }
+    }
+
+    /**
+     * How long one push of app state into the map's sources took.
+     *
+     * The frame gaps say the renderer stalls; they cannot say what stalled it.
+     * This is the obvious candidate measured rather than assumed: every fix
+     * rewrites the route geometry and half a dozen other sources on the main
+     * thread, and if that is where the hundred milliseconds go it will show
+     * here rather than in an argument.
+     */
+    fun onStylePush(millis: Double) {
+        synchronized(lock) { if (running && moving) pushes += millis }
     }
 
     fun stop() {
@@ -164,6 +179,10 @@ object RenderCadence {
             .put("framesOver33Ms", over33)
             .put("framesOver66Ms", over66)
             .put("droppedPercent", String.format("%.1f", 100.0 * over33 / counted).toDouble())
+            .put("stylePushes", pushes.size)
+            .put("stylePushP50Ms", pushes.sorted().getOrElse(pushes.size / 2) { 0.0 }.toInt())
+            .put("stylePushP95Ms", pushes.sorted().getOrElse((pushes.size * 95) / 100) { 0.0 }.toInt())
+            .put("stylePushMaxMs", (pushes.maxOrNull() ?: 0.0).toInt())
     }
 
     /** Below this the map is not really moving, so neither is the measurement. */

@@ -503,7 +503,9 @@ private class MapHolder {
     fun flush() {
         val state = latest ?: return
         val palette = palette ?: return
+        val started = System.nanoTime()
         pushAll(state, palette)
+        RenderCadence.onStylePush((System.nanoTime() - started) / 1_000_000.0)
     }
 
     fun pushAll(state: UiState, palette: MapPalette) {
