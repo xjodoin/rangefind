@@ -2,11 +2,6 @@ package dev.rangefind.wayfind.ui.map
 
 import android.content.Context
 import android.graphics.RectF
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -14,14 +9,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.foundation.Canvas
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.viewinterop.AndroidView
@@ -70,9 +59,12 @@ private const val SRC_STOP = "rf-src-stop"
 private const val SRC_CROSSING = "rf-src-crossing"
 private const val SRC_PUCK = "rf-src-puck"
 private const val SRC_ORIGIN = "rf-src-origin"
+private const val SRC_NAV = "rf-src-nav"
 
 private const val LYR_RESULTS = "rf-lyr-results"
 private const val LYR_ALT = "rf-lyr-alt"
+private const val LYR_NAV = "rf-lyr-nav"
+private const val IMG_NAV = "rf-nav-arrow"
 
 /** Up to three candidates: the fastest plus two alternates. */
 private val SRC_LABEL = listOf("rf-src-label-0", "rf-src-label-1", "rf-src-label-2")
@@ -91,13 +83,6 @@ private const val FOLLOW_EASE = 0.12
  * the model exists to remove.
  */
 private const val SETTLED_EASE = 0.22
-
-/**
- * How far down the screen the vehicle sits while navigating. Low enough that
- * the road ahead fills the view, and fixed so the arrow can be drawn there
- * rather than re-uploaded to the map every frame.
- */
-const val NAV_FOCUS_FRACTION = 0.72f
 
 @Composable
 fun MapCanvas(
@@ -130,27 +115,11 @@ fun MapCanvas(
 
     val mapView = rememberMapViewWithLifecycle()
 
-    BoxWithConstraints(modifier) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { mapView },
-            update = { }
-        )
-
-        // The vehicle, drawn where the camera is focused rather than pushed
-        // into the map as a symbol sixty times a second. Because the camera
-        // holds the vehicle's own heading, "ahead" is always up the screen, so
-        // this never rotates — the map turns underneath it. Nothing here runs
-        // per frame; it is a static composable over a moving map.
-        if (state.sheet == SheetMode.Navigating && state.nav != null) {
-            NavigationArrow(
-                palette = palette,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .offset(y = maxHeight * NAV_FOCUS_FRACTION - NAV_ARROW_SIZE / 2)
-            )
-        }
-    }
+    AndroidView(
+        modifier = modifier,
+        factory = { mapView },
+        update = { }
+    )
 
     // Style (re)load: day/night swap rebuilds every source and layer.
     LaunchedEffect(mapView, darkTheme) {
@@ -432,38 +401,39 @@ private class MapHolder {
             followBearing = (followBearing + delta * ease + 360.0) % 360.0
         }
 
-        // Nothing is written to the map's own sources here, and that is the
-        // point. Rebuilding a GeoJSON source and setting a symbol property
-        // sixty times a second sends two JNI round trips per frame and asks
-        // the renderer to re-place a symbol each time — collision detection
-        // and all — which it cannot keep up with, and the arrow stutters.
-        //
-        // The camera tracks the vehicle exactly, so the vehicle does not move
-        // across the screen at all: the map moves beneath it. The arrow is
-        // therefore drawn once, in Compose, at the focal point, and the only
-        // per-frame work left is the camera itself.
+        style.setSource(
+            SRC_NAV,
+            FeatureCollection.fromFeatures(
+                listOf(Feature.fromGeometry(Point.fromLngLat(followLon, followLat)))
+            )
+        )
+        style.getLayerAs<SymbolLayer>(LYR_NAV)
+            ?.setProperties(PropertyFactory.iconRotate(followBearing.toFloat()))
+
+        // Zoom tightens as speed drops, and the camera targets a point ahead
+        // of the puck so the driver sits low on screen with the road ahead
+        // filling the view.
         val speedKmh = (pose?.speedMps ?: nav.speedMps) * 3.6
         val zoom = when {
             speedKmh < 25 -> 18.1
             speedKmh < 65 -> 17.3
             else -> 16.5
         }
-        // Padding moves the focal point down the screen so the road ahead
-        // fills the view — the same framing the old lead-distance trick gave,
-        // but expressed as a place on the screen, which is what makes the
-        // arrow's position predictable enough to draw in Compose.
-        val height = map.height
-        val topPad = if (height > 0) (2.0 * NAV_FOCUS_FRACTION - 1.0) * height else 0.0
+        val leadMeters = when {
+            speedKmh < 25 -> 85.0
+            speedKmh < 65 -> 150.0
+            else -> 240.0
+        }
+        val target = advance(LatLon(followLat, followLon), followBearing, leadMeters)
         // Moving rather than animating: this *is* the animation, so a second
         // easing on top would fight it.
         map.moveCamera(
             CameraUpdateFactory.newCameraPosition(
                 CameraPosition.Builder()
-                    .target(LatLng(followLat, followLon))
+                    .target(LatLng(target.lat, target.lon))
                     .zoom(zoom)
                     .bearing(followBearing)
                     .tilt(58.0)
-                    .padding(0.0, topPad.coerceAtLeast(0.0), 0.0, 0.0)
                     .build()
             )
         )
@@ -614,6 +584,11 @@ private class MapHolder {
                 listOfNotNull(browsing?.let { Feature.fromGeometry(Point.fromLngLat(it.lon, it.lat)) })
             )
         )
+        // While driving, the arrow is owned by the frame loop; writing it here
+        // at the fix rate would reintroduce exactly the jump it removes.
+        if (!navigating) {
+            style.setSource(SRC_NAV, FeatureCollection.fromFeatures(emptyList()))
+        }
     }
 }
 
@@ -634,7 +609,7 @@ private fun Style.setLine(id: String, lines: List<List<LatLon>>) {
 private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     (listOf(
         SRC_ALT, SRC_ROUTE, SRC_TRAVELED, SRC_RESULTS, SRC_DESTINATION,
-        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN
+        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN, SRC_NAV
     ) + SRC_LABEL).forEach { id ->
         if (style.getSource(id) == null) {
             style.addSource(GeoJsonSource(id, FeatureCollection.fromFeatures(emptyList())))
@@ -642,6 +617,7 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     }
 
     style.addImage(MapIcons.DESTINATION, MapIcons.pin(palette.destination.toArgb(), INK, density))
+    style.addImage(IMG_NAV, MapIcons.navArrow(palette.puck.toArgb(), 0xFFFFFFFF.toInt(), density))
     style.addImage(MapIcons.SIGNAL, MapIcons.signal(density))
     style.addImage(MapIcons.STOP, MapIcons.stop(density))
     style.addImage(MapIcons.CROSSING, MapIcons.crossing(density))
@@ -733,6 +709,16 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
 
     // While driving the puck becomes a chevron pointing where the car is
     // heading. Rotation aligns to the map, so it stays truthful even if the
+    // driver spins the view away from the direction of travel.
+    style.addLayer(
+        SymbolLayer(LYR_NAV, SRC_NAV).withProperties(
+            PropertyFactory.iconImage(IMG_NAV),
+            PropertyFactory.iconAllowOverlap(true),
+            PropertyFactory.iconIgnorePlacement(true),
+            PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_MAP),
+            PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_MAP)
+        )
+    )
 }
 
 @Composable
@@ -759,48 +745,4 @@ private fun rememberMapViewWithLifecycle(): MapView {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     return mapView
-}
-
-
-/** How big the navigating vehicle reads on screen. */
-private val NAV_ARROW_SIZE = 46.dp
-
-/**
- * The vehicle while navigating.
- *
- * Drawn in Compose rather than as a map symbol because it never moves: the
- * camera is locked to the vehicle, so what changes underneath is the map. A
- * symbol would have to be re-uploaded and re-placed every frame to stay in
- * the same spot, which is what made the old arrow stutter.
- */
-@Composable
-private fun NavigationArrow(palette: MapPalette, modifier: Modifier = Modifier) {
-    val fill = palette.puck
-    val halo = palette.puckHalo
-    Canvas(modifier.size(NAV_ARROW_SIZE)) {
-        val w = size.width
-        val h = size.height
-        // A chevron with a notched tail, so the direction reads instantly at
-        // a glance rather than as a symmetrical blob.
-        val body = Path().apply {
-            moveTo(w * 0.5f, h * 0.06f)
-            lineTo(w * 0.92f, h * 0.94f)
-            lineTo(w * 0.5f, h * 0.72f)
-            lineTo(w * 0.08f, h * 0.94f)
-            close()
-        }
-        drawCircle(halo.copy(alpha = 0.55f), radius = w * 0.46f)
-        drawPath(body, Color.White)
-        drawPath(body, fill, style = Stroke(width = w * 0.09f))
-        drawPath(
-            Path().apply {
-                moveTo(w * 0.5f, h * 0.20f)
-                lineTo(w * 0.80f, h * 0.86f)
-                lineTo(w * 0.5f, h * 0.68f)
-                lineTo(w * 0.20f, h * 0.86f)
-                close()
-            },
-            fill
-        )
-    }
 }
