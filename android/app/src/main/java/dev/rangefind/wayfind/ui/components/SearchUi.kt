@@ -329,9 +329,14 @@ fun PlaceSheet(
 
         // Search and the basemap are worldwide; the route graph is not. Say so
         // here rather than letting the user press a button that cannot work.
+        // A region built by an older version reports itself with a marker
+        // rather than a sentence, so the reason reaches the driver in their
+        // own language and says what to do about it.
+        val outdatedRegion = stringResource(R.string.region_outdated_note)
         val note = when {
             routingReady -> null
             outsideCoverage -> stringResource(R.string.place_outside_coverage_note)
+            state.info?.routingError == "region-outdated" -> outdatedRegion
             else -> state.info?.routingError
         }
         if (note != null) {

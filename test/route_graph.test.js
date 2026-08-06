@@ -1260,3 +1260,66 @@ test("a posted limit that changes mid-street is reported where it changes", asyn
     travelled += edge.meters;
   }
 });
+
+test("a conditional limit survives the index and says when it applies", async (t) => {
+  const graph = syntheticGraph(10, 3);
+  graph.edgeName = Uint32Array.from(graph.edgeName, () => 1);
+  graph.edgeSpeed = Uint8Array.from(graph.edgeFrom, () => 50);
+  // A school-hours window on the middle third, the way an extract would carry
+  // it: the posted limit stays 50 and the conditional rides beside it.
+  graph.condRules = [
+    { speedKmh: 30, days: 0b0011111, startMinute: 7 * 60, endMinute: 17 * 60, monthStart: 9, monthEnd: 6 }
+  ];
+  graph.edgeCond = Uint8Array.from(graph.edgeFrom, (_, i) =>
+    Math.floor((i / graph.edgeFrom.length) * 3) === 1 ? 1 : 0
+  );
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-cond-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 24, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  assert.equal(engine.root.condRules.length, 1, "the root carries the window");
+  assert.equal(engine.root.condRules[0].speedKmh, 30);
+  assert.equal(engine.root.condRules[0].monthStart, 9, "a school year starts in September");
+  assert.equal(engine.root.condRules[0].monthEnd, 6, "and ends in June, wrapping the new year");
+
+  const from = { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 };
+  const last = graph.nodeLat.length - 1;
+  const to = { lat: graph.nodeLat[last] / 1e7, lon: graph.nodeLon[last] / 1e7 };
+  const route = await engine.route({ from, to });
+
+  const conditioned = route.speedLimits.filter(entry => entry.conditional);
+  assert.ok(conditioned.length >= 1, "the route reports where a conditional limit begins");
+  const entry = conditioned[0];
+  assert.equal(entry.limitKmh, 50, "the posted limit is still the posted limit");
+  assert.equal(entry.conditional.limitKmh, 30, "and the conditional one rides beside it");
+  assert.equal(entry.conditional.startMinute, 420);
+  assert.equal(entry.conditional.endMinute, 1020);
+
+  // The index must not resolve the window itself. It is static and the answer
+  // depends on the clock, so an index that picked one would be wrong for
+  // every hour it was not rebuilt in.
+  assert.notEqual(entry.limitKmh, entry.conditional.limitKmh);
+
+  // An arrival time is a promise, so the hours spent at the lower limit have
+  // to be in it. The route is otherwise identical — 757 edges in a province
+  // cannot change which way is quickest — so only the clock moves the number.
+  const schoolMorning = await engine.route({ from, to, departAt: "2026-10-08T08:15:00" });
+  const sameEvening = await engine.route({ from, to, departAt: "2026-10-08T20:15:00" });
+  const summer = await engine.route({ from, to, departAt: "2026-07-08T08:15:00" });
+  const saturday = await engine.route({ from, to, departAt: "2026-10-10T08:15:00" });
+
+  assert.ok(
+    schoolMorning.seconds > sameEvening.seconds,
+    `a school morning (${schoolMorning.seconds.toFixed(1)}s) should cost more than the same evening (${sameEvening.seconds.toFixed(1)}s)`
+  );
+  assert.ok(schoolMorning.conditionalDelaySeconds > 0, "and say how much of it was the zone");
+  assert.equal(summer.seconds, sameEvening.seconds, "July is not the school year");
+  assert.equal(saturday.seconds, sameEvening.seconds, "Saturday is not a school day");
+  assert.equal(
+    (await engine.route({ from, to })).seconds,
+    sameEvening.seconds,
+    "with no departure given, the posted limit stands"
+  );
+});

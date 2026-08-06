@@ -137,7 +137,10 @@ function trimRoute(route) {
     // of the street disagrees with it.
     speedLimits: (route.speedLimits || []).map(entry => ({
       atMeters: entry.atMeters,
-      limitKmh: entry.limitKmh
+      limitKmh: entry.limitKmh,
+      // A window the limit drops inside, answered against the device clock
+      // rather than here: the index is static and cannot know the hour.
+      conditional: entry.conditional || null
     })),
     junctions: (route.junctions || []).map(j => ({
       kind: j.kind,
@@ -243,9 +246,18 @@ const handlers = {
         routeEngine = await openRouteGraphUrl(routeBase);
       } catch (err) {
         const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
+        const message = String(err?.message || err);
+        // A stored region built by an older version reads as a version error,
+        // which is true and useless: the driver cannot act on a version
+        // number. The fix is always the same and is one tap away, so say
+        // that instead. The marker lets the app show it in the user's
+        // language rather than parsing this sentence.
+        const outdated = /Unsupported route graph|re-run the extractor/i.test(message);
         routeUnavailable = timedOut
           ? `No answer from ${routeBase}`
-          : String(err?.message || err);
+          : outdated
+            ? "region-outdated"
+            : message;
       }
     } else {
       routeUnavailable = "No route index configured";
@@ -343,6 +355,12 @@ const handlers = {
       alternatives: alternatives || 0,
       ...(live ? { live } : {}),
       ...(departureTime ? { departureTime } : {}),
+      // Which limit is in force is a question about the sign the driver will
+      // be looking at, so it is answered on the device's own clock and in the
+      // device's own timezone. A server's idea of the hour is the wrong hour
+      // for anyone who is not standing next to it, and a phone that has
+      // crossed a timezone is right about which one it is in.
+      departAt: new Date().toISOString(),
       // Only sent while actually moving: a heading from a standing vehicle is
       // noise, and biasing the snap with it would invent a U-turn penalty for
       // a driver who is free to pull away in either direction.

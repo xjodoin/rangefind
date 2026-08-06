@@ -24,13 +24,13 @@ export const ROUTE_ROOT_MAGIC = [0x52, 0x46, 0x52, 0x54]; // RFRT
 export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
-const ROOT_VERSION = 3;
-const CELL_VERSION = 6;
+const ROOT_VERSION = 4;
+const CELL_VERSION = 7;
 // v5 cells carry no lane column. A published index is a large download that
-// somebody already has on a phone, so a reader that can only read the newest
-// cell would strand it; lane guidance simply stays empty until the index is
-// rebuilt.
-const MIN_READABLE_CELL_VERSION = 5;
+// A reader requires the version it was built for. Carrying older shapes means
+// a branch per field per version, and every one of those is a place to read a
+// byte that is really the next field. Rebuild and republish instead — the
+// index is derived data, and reproducing it is a command.
 const OVERLAY_VERSION = 1;
 const GEOMETRY_VERSION = 1;
 
@@ -142,6 +142,12 @@ export function encodeRouteCell(cell) {
       // apart from the weight, which also folds in surface and junction
       // penalties and so cannot be read back as a legal limit.
       pushVarint(out, cell.speeds ? cell.speeds[e] : 0);
+      // A limit that only applies at certain hours, as a 1-based index into
+      // the root's table of conditional windows. School zones are why: a road
+      // posted 50 that drops to 30 on school mornings is one road with two
+      // limits, and the sign must show whichever is in force. Zero is "always
+      // the posted one", which is nearly every edge and costs one byte.
+      pushVarint(out, cell.condRules ? cell.condRules[e] : 0);
       // Lane movements for this edge, left to right. Jagged because most
       // edges have none: an untagged edge costs the single zero that says so.
       const lanes = cell.lanes ? cell.lanes[e] : null;
@@ -165,7 +171,7 @@ export function decodeRouteCell(bytes) {
   assertMagic(bytes, ROUTE_CELL_MAGIC, "Invalid Rangefind route cell block.");
   const state = { pos: ROUTE_CELL_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version > CELL_VERSION || version < MIN_READABLE_CELL_VERSION) {
+  if (version !== CELL_VERSION) {
     throw new Error(`Unsupported route cell version ${version}.`);
   }
   const hasLanes = version >= 6;
@@ -192,6 +198,7 @@ export function decodeRouteCell(bytes) {
   const classes = new Uint8Array(edgeCount);
   const junctions = new Uint8Array(edgeCount);
   const speeds = new Uint8Array(edgeCount);
+  const condRules = new Uint8Array(edgeCount);
   const laneOffsets = new Uint32Array(edgeCount + 1);
   const laneMasks = [];
   const extLat = new Int32Array(edgeCount);
@@ -210,6 +217,7 @@ export function decodeRouteCell(bytes) {
       classes[cursor] = readVarint(bytes, state);
       junctions[cursor] = readVarint(bytes, state);
       speeds[cursor] = readVarint(bytes, state);
+      condRules[cursor] = readVarint(bytes, state);
       if (hasLanes) {
         const laneCount = readVarint(bytes, state);
         for (let i = 0; i < laneCount; i++) laneMasks.push(readVarint(bytes, state));
@@ -227,7 +235,7 @@ export function decodeRouteCell(bytes) {
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
   return {
     cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm,
-    nameIds, classes, junctions, speeds,
+    nameIds, classes, junctions, speeds, condRules,
     laneOffsets, laneMasks: Uint8Array.from(laneMasks),
     extLat, extLon, geomRefs
   };
@@ -450,6 +458,19 @@ export function encodeRouteRoot(root) {
   pushUtf8(out, root.profile || "car");
   pushVarint(out, (root.classes || []).length);
   for (const name of root.classes || []) pushUtf8(out, name);
+  // Conditional speed windows, shared by every cell. A province uses a
+  // handful, so naming one from an edge costs a byte and the windows
+  // themselves are written once.
+  const condRules = root.condRules || [];
+  pushVarint(out, condRules.length);
+  for (const rule of condRules) {
+    pushVarint(out, rule.speedKmh & 0xff);
+    pushVarint(out, rule.days & 0x7f);
+    pushVarint(out, rule.startMinute);
+    pushVarint(out, rule.endMinute);
+    pushVarint(out, rule.monthStart);
+    pushVarint(out, rule.monthEnd);
+  }
   const buckets = root.buckets || [{ name: "base", rules: [], factors: [] }];
   pushVarint(out, buckets.length);
   for (const bucket of buckets) {
@@ -513,6 +534,18 @@ export function decodeRouteRoot(bytes) {
   const classCount = readVarint(bytes, state);
   const classes = [];
   for (let i = 0; i < classCount; i++) classes.push(readUtf8(bytes, state));
+  const condRuleCount = readVarint(bytes, state);
+  const condRules = [];
+  for (let i = 0; i < condRuleCount; i++) {
+    condRules.push({
+      speedKmh: readVarint(bytes, state),
+      days: readVarint(bytes, state),
+      startMinute: readVarint(bytes, state),
+      endMinute: readVarint(bytes, state),
+      monthStart: readVarint(bytes, state),
+      monthEnd: readVarint(bytes, state)
+    });
+  }
   const bucketCount = readVarint(bytes, state);
   const buckets = [];
   for (let i = 0; i < bucketCount; i++) {
@@ -579,6 +612,7 @@ export function decodeRouteRoot(bytes) {
     levelFanouts,
     profile,
     classes,
+    condRules,
     buckets,
     shards,
     leaves,

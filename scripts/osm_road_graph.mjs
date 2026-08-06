@@ -559,11 +559,54 @@ export function waySpeeds(tags, profile) {
   const postedBackward = profile.speedTags
     ? (parseMaxspeed(tags.get("maxspeed:backward")) || postedShared) : 0;
 
+  // A limit that only applies at certain times travels beside the posted one
+  // rather than replacing it: the driver needs to be shown whichever is in
+  // force, and the router needs to cost the road differently at those hours.
+  const conditional = profile.speedTags
+    ? parseConditionalMaxspeed(tags.get("maxspeed:conditional"))
+    : null;
+
   return {
     forward: Math.min(forward, profile.maxSpeedKmh),
     backward: Math.min(backward, profile.maxSpeedKmh),
     postedForward: Math.min(postedForward || 0, 255),
-    postedBackward: Math.min(postedBackward || 0, 255)
+    postedBackward: Math.min(postedBackward || 0, 255),
+    // Only a limit that actually drops is worth carrying. A conditional that
+    // matches or exceeds the posted one changes nothing and would cost a rule
+    // slot and a byte per edge to say so.
+    conditional: conditional && conditional.speedKmh < (postedShared || Infinity)
+      ? conditional
+      : null
+  };
+}
+
+/**
+ * Distinct conditional rules, so an edge can name one in a byte.
+ *
+ * A whole province shares a handful of these — Québec's 105 conditional ways
+ * use four distinct windows between them — so a table plus a per-edge index
+ * costs almost nothing next to repeating the window on every edge.
+ */
+export function makeConditionalTable() {
+  const rules = [];
+  const byKey = new Map();
+  return {
+    rules,
+    /** 0 means "no conditional limit"; anything else is a 1-based rule. */
+    idFor(conditional) {
+      if (!conditional) return 0;
+      const key = [
+        conditional.speedKmh, conditional.days, conditional.startMinute,
+        conditional.endMinute, conditional.monthStart, conditional.monthEnd
+      ].join(":");
+      let id = byKey.get(key);
+      if (id == null) {
+        rules.push(conditional);
+        id = rules.length;
+        byKey.set(key, id);
+      }
+      return id;
+    }
   };
 }
 
@@ -714,6 +757,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // marks them as graph nodes for free.
   const refSpool = new GrowFloat64();
   const junctionSpool = new GrowFloat64();
+  // Distinct conditional windows, shared across the whole extract. Declared
+  // with the way spool because the way pass is what fills it.
+  const conditionalTable = makeConditionalTable();
   const ways = [];
   const names = [""];
   const nameIds = new Map([["", 0]]);
@@ -751,6 +797,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
         speedBwd: speeds.backward,
         postedFwd: speeds.postedForward,
         postedBwd: speeds.postedBackward,
+        condRule: conditionalTable.idFor(speeds.conditional),
         oneway: profile.oneway(tags),
         lanes: wayLanes(tags, profile.oneway(tags)),
         nameId,
@@ -836,6 +883,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
   const edgeClass = [];
   const edgeJunction = [];
   const edgeSpeed = [];
+  const edgeCond = [];
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
   const geomScratch = [];
@@ -843,7 +891,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // none, so an empty list costs the single byte that says so.
   const laneOffsets = [0];
   const laneBytes = new GrowUint8();
-  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, postedKmh, lanes, points, reversed) => {
+  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, postedKmh, condRule, lanes, points, reversed) => {
     edgeFrom.push(from);
     edgeTo.push(to);
     edgeWeightDs.push(weightDs);
@@ -853,6 +901,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeClass.push(classCode);
     edgeJunction.push(junctionKind);
     edgeSpeed.push(postedKmh || 0);
+    edgeCond.push(condRule || 0);
     geomScratch.length = 0;
     // Interior polyline points only, zigzag-delta E7 from the from-node.
     const interior = points.length - 2;
@@ -941,14 +990,14 @@ export function extractRoadGraph(pbfPath, options = {}) {
       if (way.oneway >= 0) {
         const junction = pick(kindCode[used], lastIndex);
         const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedFwd * 1000) / 3600)) * 10) + penaltyDs[used] + segPenalty);
-        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, way.postedFwd, way.lanes.forward, segment, false);
+        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, way.postedFwd, way.condRule, way.lanes.forward, segment, false);
       }
       if (way.oneway <= 0) {
         const junction = pick(fromKind, lastIndex);
         // Reversed polyline: mirror the point index.
         const mirrored = junction.kind ? { kind: junction.kind, index: lastIndex - junction.index } : junction;
         const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedBwd * 1000) / 3600)) * 10) + fromPenalty + segPenalty);
-        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, way.postedBwd, way.lanes.backward, segment, true);
+        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, way.postedBwd, way.condRule, way.lanes.backward, segment, true);
       }
       fromNode = graphNode;
       fromPenalty = penaltyDs[used];
@@ -984,6 +1033,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeClass,
     edgeJunction,
     edgeSpeed,
+    edgeCond,
     geomOffsets,
     geomBytes,
     laneOffsets,
@@ -1005,13 +1055,15 @@ export function extractRoadGraph(pbfPath, options = {}) {
       edgeClass: Uint8Array.from(expanded.edgeClass),
       edgeJunction: Uint8Array.from(expanded.edgeJunction),
       edgeSpeed: Uint8Array.from(expanded.edgeSpeed),
+      edgeCond: Uint8Array.from(expanded.edgeCond || []),
       geomOffsets: Uint32Array.from(expanded.geomOffsets),
       geomBytes: Uint8Array.from(expanded.geomBytes.view()),
       laneOffsets: Uint32Array.from(expanded.laneOffsets),
       laneBytes: Uint8Array.from(expanded.laneBytes.view()),
       names,
       profile: profile.name,
-      classes: classTable
+      classes: classTable,
+      condRules: conditionalTable.rules
     }, log);
   }
 
@@ -1026,13 +1078,15 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeClass: Uint8Array.from(edgeClass),
     edgeJunction: Uint8Array.from(edgeJunction),
     edgeSpeed: Uint8Array.from(edgeSpeed),
+    edgeCond: Uint8Array.from(edgeCond),
     laneOffsets: Uint32Array.from(laneOffsets),
     laneBytes: Uint8Array.from(laneBytes.view()),
     geomOffsets: Uint32Array.from(geomOffsets),
     geomBytes: Uint8Array.from(geomBytes.view()),
     names,
     profile: profile.name,
-    classes: classTable
+    classes: classTable,
+    condRules: conditionalTable.rules
   }, log);
 }
 
@@ -1045,6 +1099,7 @@ export function applyTurnRestrictions(context) {
   const edgeClass = context.edgeClass || null;
   const edgeJunction = context.edgeJunction || null;
   const edgeSpeed = context.edgeSpeed || null;
+  const edgeCond = context.edgeCond || null;
   if (!restrictions.length) return;
 
   const copyEdgeTo = (source, from, toOverride) => {
@@ -1057,6 +1112,7 @@ export function applyTurnRestrictions(context) {
     if (edgeClass) edgeClass.push(edgeClass[source]);
     if (edgeJunction) edgeJunction.push(edgeJunction[source]);
     if (edgeSpeed) edgeSpeed.push(edgeSpeed[source]);
+    if (edgeCond) edgeCond.push(edgeCond[source]);
     const start = geomOffsets[source];
     const end = geomOffsets[source + 1];
     geomBytes.ensure(end - start);
@@ -1297,7 +1353,7 @@ export function expandTurnCosts(context, turnCosts) {
   const {
     restrictions, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass, edgeJunction,
-    edgeSpeed, geomOffsets, geomBytes, laneOffsets, laneBytes, log
+    edgeSpeed, edgeCond, geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
   const edgeCount = edgeFrom.length;
   const nodeCount = nodeLat.length;
@@ -1416,6 +1472,7 @@ export function expandTurnCosts(context, turnCosts) {
   const newClass = [];
   const newJunction = [];
   const newSpeed = [];
+  const newCond = [];
   const newGeomOffsets = [0];
   const newGeomBytes = new GrowUint8();
   const newLaneOffsets = [0];
@@ -1438,6 +1495,7 @@ export function expandTurnCosts(context, turnCosts) {
       newClass.push(edgeClass[out]);
       newJunction.push(edgeJunction ? edgeJunction[out] : 0);
       newSpeed.push(edgeSpeed ? edgeSpeed[out] : 0);
+      newCond.push(edgeCond ? edgeCond[out] : 0);
       const start = geomOffsets[out];
       const end = geomOffsets[out + 1];
       newGeomBytes.ensure(end - start);
@@ -1469,6 +1527,7 @@ export function expandTurnCosts(context, turnCosts) {
     edgeClass: newClass,
     edgeJunction: newJunction,
     edgeSpeed: newSpeed,
+    edgeCond: newCond,
     geomOffsets: newGeomOffsets,
     geomBytes: newGeomBytes,
     laneOffsets: newLaneOffsets,
@@ -1580,6 +1639,7 @@ function filterLargestScc(graph, log) {
   const edgeClass = [];
   const edgeJunction = [];
   const edgeSpeed = [];
+  const edgeCond = [];
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
   const laneOffsets = [0];
@@ -1596,6 +1656,7 @@ function filterLargestScc(graph, log) {
     edgeClass.push(graph.edgeClass[i]);
     edgeJunction.push(graph.edgeJunction[i]);
     edgeSpeed.push(graph.edgeSpeed ? graph.edgeSpeed[i] : 0);
+    edgeCond.push(graph.edgeCond ? graph.edgeCond[i] : 0);
     const start = graph.geomOffsets[i];
     const end = graph.geomOffsets[i + 1];
     geomBytes.ensure(end - start);
@@ -1625,13 +1686,15 @@ function filterLargestScc(graph, log) {
     edgeClass: Uint8Array.from(edgeClass),
     edgeJunction: Uint8Array.from(edgeJunction),
     edgeSpeed: Uint8Array.from(edgeSpeed),
+    edgeCond: Uint8Array.from(edgeCond),
     laneOffsets: Uint32Array.from(laneOffsets),
     laneBytes: Uint8Array.from(laneBytes.view()),
     geomOffsets: Uint32Array.from(geomOffsets),
     geomBytes: Uint8Array.from(geomBytes.view()),
     names: graph.names,
     profile: graph.profile,
-    classes: graph.classes
+    classes: graph.classes,
+    condRules: graph.condRules || []
   };
 }
 
@@ -1648,6 +1711,7 @@ export function writeRoadGraph(path, graph) {
     ["edgeClass", graph.edgeClass],
     ["edgeJunction", graph.edgeJunction],
     ["edgeSpeed", graph.edgeSpeed],
+    ["edgeCond", graph.edgeCond],
     ["laneOffsets", graph.laneOffsets],
     ["laneBytes", graph.laneBytes],
     ["geomOffsets", graph.geomOffsets],
@@ -1655,7 +1719,11 @@ export function writeRoadGraph(path, graph) {
     ["namesBytes", namesBytes]
   ];
   const header = {
-    format: "rfroutesrc-v5",
+    format: "rfroutesrc-v6",
+    // The distinct conditional windows an edge's condRule indexes into. A
+    // whole province shares a handful, so they ride in the header rather than
+    // being repeated per edge.
+    condRules: graph.condRules || [],
     nodes: graph.nodeLat.length,
     edges: graph.edgeFrom.length,
     profile: graph.profile || "car",
@@ -1681,8 +1749,12 @@ export async function readRoadGraph(path) {
   const bytes = readFileSync(path);
   const newline = bytes.indexOf(0x0a);
   const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
-  if (header.format !== "rfroutesrc-v5") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
-  const graph = { profile: header.profile || "car", classes: header.classes || [] };
+  if (header.format !== "rfroutesrc-v6") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
+  const graph = {
+    profile: header.profile || "car",
+    classes: header.classes || [],
+    condRules: header.condRules || []
+  };
   let offset = newline + 1;
   for (const section of header.sections) {
     const slice = bytes.subarray(offset, offset + section.bytes);

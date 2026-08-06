@@ -1229,7 +1229,44 @@ export async function openRouteGraph(options) {
     return { items, startMatch, endMatch };
   }
 
-  async function finishRoute(response, chain, sameEdgeUsed, bucket, factors, wantNames) {
+  /**
+   * Whether a conditional window covers a moment.
+   *
+   * [at] is `{ month, weekday, minute }` — weekday from Monday as 0. Months
+   * are inclusive and may wrap, because a school year runs September to June
+   * and reading that as a plain low-to-high span makes it empty.
+   */
+  /**
+   * When the trip starts, for answering conditional windows.
+   *
+   * Taken from the caller rather than the server's clock: the limit that
+   * matters is the one on the sign the driver will be looking at, in their
+   * timezone, at the hour they get there. `departAt` is an ISO local datetime
+   * or a Date; absent, the answer is simply the posted limit throughout.
+   */
+  function departureMoment(params) {
+    const raw = params?.departAt;
+    if (!raw) return null;
+    const when = raw instanceof Date ? raw : new Date(raw);
+    if (Number.isNaN(when.getTime())) return null;
+    return {
+      month: when.getMonth() + 1,
+      // getDay is 0=Sunday; the mask counts from Monday.
+      weekday: (when.getDay() + 6) % 7,
+      minute: when.getHours() * 60 + when.getMinutes()
+    };
+  }
+
+  function conditionalApplies(rule, at) {
+    const inMonths = rule.monthStart <= rule.monthEnd
+      ? at.month >= rule.monthStart && at.month <= rule.monthEnd
+      : at.month >= rule.monthStart || at.month <= rule.monthEnd;
+    if (!inMonths) return false;
+    if (((rule.days >> at.weekday) & 1) === 0) return false;
+    return at.minute >= rule.startMinute && at.minute < rule.endMinute;
+  }
+
+  async function finishRoute(response, chain, sameEdgeUsed, bucket, factors, wantNames, departure = null) {
     const rawEdges = sameEdgeUsed ? [] : await unpackChain(chain.items, bucket, factors);
     // Geometry blocks for exactly the leaves the route passes through, in
     // one parallel wave alongside the names sidecar.
@@ -1241,6 +1278,7 @@ export async function openRouteGraph(options) {
     const geometryByLeaf = new Map(geometryLeaves.map((leaf, i) => [leaf, geometryBlocks[i]]));
     const geometry = [];
     let distanceMeters = 0;
+    let conditionalDelaySeconds = 0;
     const steps = [];
     const edges = [];
     // Junctions the route passes through (traffic signals, stop signs,
@@ -1305,19 +1343,36 @@ export async function openRouteGraph(options) {
         }
       }
       const meters = cell.distsDm[edge] / 10;
-      const seconds = cellEdgeWeight(cell, edge, factors) / 10;
+      let seconds = cellEdgeWeight(cell, edge, factors) / 10;
       distanceMeters += meters;
       // Posted limit in km/h, 0 when the way carried no maxspeed tag. This is
       // the sign, not the modelled speed: `seconds` also absorbs surface
       // degradation and junction penalties.
       const speedLimitKmh = cell.speeds ? cell.speeds[edge] : 0;
+      // A window this edge's limit drops inside, if it has one. Carried out
+      // rather than resolved here: the index is static and the answer depends
+      // on the clock, so only the caller can say which limit is in force.
+      const condRule = cell.condRules ? cell.condRules[edge] : 0;
+      // A school zone in force costs the time it actually costs. The search
+      // itself is left alone: 757 edges in 4.7 million cannot change which
+      // way is quickest, but they can make the arrival time wrong by the
+      // seconds a driver spends at 30 instead of 50, and an ETA is a promise.
+      if (condRule && departure) {
+        const rule = (root.condRules || [])[condRule - 1];
+        if (rule && conditionalApplies(rule, departure) && speedLimitKmh > rule.speedKmh) {
+          const slowed = seconds * (speedLimitKmh / rule.speedKmh);
+          conditionalDelaySeconds += slowed - seconds;
+          seconds = slowed;
+        }
+      }
       edges.push({
         leaf: raw.leaf,
         edge,
         segment: edgeSegmentId(cell, edge),
         seconds,
         meters,
-        speedLimitKmh
+        speedLimitKmh,
+        condRule
       });
       const name = names ? names[cell.nameIds[edge]] || "" : "";
       const last = steps[steps.length - 1];
@@ -1361,10 +1416,27 @@ export async function openRouteGraph(options) {
     // edges already know better; this is only a matter of saying so.
     const speedLimits = [];
     let limitAt = 0;
+    const condRuleTable = root.condRules || [];
     for (const edge of edges) {
       const last = speedLimits[speedLimits.length - 1];
-      if (!last || last.limitKmh !== edge.speedLimitKmh) {
-        speedLimits.push({ atMeters: limitAt, limitKmh: edge.speedLimitKmh });
+      if (!last || last.limitKmh !== edge.speedLimitKmh || last.condRule !== edge.condRule) {
+        const rule = edge.condRule ? condRuleTable[edge.condRule - 1] : null;
+        speedLimits.push({
+          atMeters: limitAt,
+          limitKmh: edge.speedLimitKmh,
+          condRule: edge.condRule,
+          // The window spelled out, so a client never needs the root's table.
+          conditional: rule
+            ? {
+                limitKmh: rule.speedKmh,
+                days: rule.days,
+                startMinute: rule.startMinute,
+                endMinute: rule.endMinute,
+                monthStart: rule.monthStart,
+                monthEnd: rule.monthEnd
+              }
+            : null
+        });
       }
       limitAt += edge.meters;
     }
@@ -1399,6 +1471,14 @@ export async function openRouteGraph(options) {
       const seedB = Math.round(bucketWeight(chain.endMatch.weight, chain.endMatch.classCode, factors) * chain.endMatch.ratio);
       const edgeDs = rawEdges.reduce((sum, raw) => sum + cellEdgeWeight(raw.cell, raw.edge, factors), 0);
       response.seconds = (seedF + edgeDs + seedB) / 10;
+    }
+    // Last, because the recompute above replaces the total outright. Time
+    // spent at a school-zone limit is added on top rather than searched with:
+    // 757 edges in 4.7 million cannot change which way is quickest, but they
+    // can certainly make an arrival time wrong.
+    if (conditionalDelaySeconds > 0) {
+      response.seconds += conditionalDelaySeconds;
+      response.conditionalDelaySeconds = conditionalDelaySeconds;
     }
     return response;
   }
@@ -1584,7 +1664,10 @@ export async function openRouteGraph(options) {
           }
         }
       }
-      await finishRoute(response, chain, sameEdgeUsed, bucket, factors, params.names !== false);
+      await finishRoute(
+        response, chain, sameEdgeUsed, bucket, factors, params.names !== false,
+        departureMoment(params)
+      );
       response.stats = statsSnapshot();
       return response;
     };

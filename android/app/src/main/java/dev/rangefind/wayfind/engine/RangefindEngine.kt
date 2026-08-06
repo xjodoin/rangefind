@@ -209,7 +209,44 @@ data class RouteJunction(
  * ever changing its name, and one number for the whole street is the wrong
  * number for however much of it disagrees.
  */
-data class SpeedLimitChange(val atMeters: Double, val limitKmh: Int)
+data class SpeedLimitChange(
+    val atMeters: Double,
+    val limitKmh: Int,
+    /** A lower limit that applies only at certain times, or null. */
+    val conditional: ConditionalLimit? = null
+)
+
+/**
+ * A limit in force only during a window — a school zone, in practice.
+ *
+ * The index cannot resolve this: it is static, and which limit applies
+ * depends on the clock. So the window travels to the client and is answered
+ * against the device's own local time, which is also the only clock that
+ * agrees with the sign the driver is looking at.
+ *
+ * [days] is a 7-bit mask from Monday. The month range is inclusive and may
+ * wrap, because a school year runs September to June.
+ */
+data class ConditionalLimit(
+    val limitKmh: Int,
+    val days: Int,
+    val startMinute: Int,
+    val endMinute: Int,
+    val monthStart: Int,
+    val monthEnd: Int
+) {
+    fun appliesAt(time: java.time.LocalDateTime): Boolean {
+        val month = time.monthValue
+        val inMonths = if (monthStart <= monthEnd) month in monthStart..monthEnd
+        // September to June is one range that crosses the new year, not two.
+        else month >= monthStart || month <= monthEnd
+        if (!inMonths) return false
+        // DayOfWeek is 1=Monday, and the mask counts from Monday too.
+        if ((days shr (time.dayOfWeek.value - 1)) and 1 == 0) return false
+        val minute = time.hour * 60 + time.minute
+        return minute in startMinute until endMinute
+    }
+}
 
 data class Route(
     val seconds: Double,
@@ -222,16 +259,28 @@ data class Route(
     val bytesFetched: Long
 )
 
-/** The posted limit in force [meters] into the trip, 0 where none is known. */
-fun Route.speedLimitAt(meters: Double): Int {
+/**
+ * The limit in force [meters] into the trip, 0 where none is known.
+ *
+ * [now] decides conditional limits. A school zone posted 50 that drops to 30
+ * on school mornings is 30 at 08:15 on a Tuesday in October and 50 at the
+ * same hour in July, and the sign has to say which.
+ */
+fun Route.speedLimitAt(
+    meters: Double,
+    now: java.time.LocalDateTime = java.time.LocalDateTime.now()
+): Int {
     // The last change at or before this point. Routes carry a handful of
     // these, so a scan is honest and a binary search would be decoration.
-    var answer = 0
+    var answer: SpeedLimitChange? = null
     for (change in speedLimits) {
         if (change.atMeters > meters) break
-        answer = change.limitKmh
+        answer = change
     }
-    return answer
+    val change = answer ?: return 0
+    val conditional = change.conditional
+    return if (conditional != null && conditional.appliesAt(now)) conditional.limitKmh
+    else change.limitKmh
 }
 
 data class RouteBundle(val primary: Route, val alternatives: List<Route>)

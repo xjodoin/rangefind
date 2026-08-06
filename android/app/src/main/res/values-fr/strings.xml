@@ -118,6 +118,7 @@
     <string name="region_reading_manifest">Lecture du manifeste de l\'index…</string>
     <string name="region_ready">%1$s · mis à jour le %2$s</string>
     <string name="region_stale">%1$s · un index plus récent est publié</string>
+    <string name="region_outdated_note">Cette région hors ligne date d’une version antérieure. Actualisez-la pour calculer un trajet.</string>
     <string name="region_download_failed">Échec du téléchargement</string>
     <string name="region_host_unreachable">Impossible de joindre %1$s — vérifiez que le serveur d\'index fonctionne et que cet appareil est sur le même réseau</string>
     <string name="region_note_luxembourg">Petit extrait de test</string>

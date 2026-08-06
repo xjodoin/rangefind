@@ -425,6 +425,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     const cellClasses = new Uint8Array(cellEdgeCount);
     const cellJunctions = new Uint8Array(cellEdgeCount);
     const cellSpeeds = new Uint8Array(cellEdgeCount);
+    const cellCondRules = new Uint8Array(cellEdgeCount);
     // Lane movements per edge, in the edge's own travel direction. Jagged,
     // and empty for the overwhelming majority of edges.
     const cellLanes = new Array(cellEdgeCount);
@@ -447,6 +448,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         cellClasses[cursor] = edgeClassOf(edgeId);
         cellJunctions[cursor] = graph.edgeJunction ? graph.edgeJunction[edgeId] : 0;
         cellSpeeds[cursor] = graph.edgeSpeed ? graph.edgeSpeed[edgeId] : 0;
+        cellCondRules[cursor] = graph.edgeCond ? graph.edgeCond[edgeId] : 0;
         if (graph.laneOffsets && graph.laneBytes) {
           const laneStart = graph.laneOffsets[edgeId];
           const laneCount = graph.laneBytes[laneStart] || 0;
@@ -511,6 +513,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       nameIds,
       classes: cellClasses,
       speeds: cellSpeeds,
+      condRules: cellCondRules,
       lanes: cellLanes,
       junctions: cellJunctions,
       extLat,
@@ -630,6 +633,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     edgeCount,
     levelFanouts,
     profile: graph.profile || "car",
+    condRules: graph.condRules || [],
     classes,
     buckets,
     shards,
@@ -659,6 +663,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     format: ROUTE_GRAPH_FORMAT,
     root: rootFile,
     profile: graph.profile || "car",
+    condRules: graph.condRules || [],
     nodes: nodeCount,
     edges: edgeCount,
     leaves: leaves.length,
@@ -671,6 +676,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   for (const graphs of overlays) for (const overlay of graphs.values()) overlayNodes += overlay.nodes.length;
   const summary = {
     profile: graph.profile || "car",
+    condRules: graph.condRules || [],
     nodes: nodeCount,
     edges: edgeCount,
     leaves: leaves.length,

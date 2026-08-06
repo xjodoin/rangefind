@@ -343,7 +343,17 @@ private fun JSONObject.toRoute(): Route {
         speedLimits = optJSONArray("speedLimits").map {
             SpeedLimitChange(
                 atMeters = it.optDouble("atMeters"),
-                limitKmh = it.optInt("limitKmh")
+                limitKmh = it.optInt("limitKmh"),
+                conditional = it.optJSONObject("conditional")?.let { c ->
+                    ConditionalLimit(
+                        limitKmh = c.optInt("limitKmh"),
+                        days = c.optInt("days"),
+                        startMinute = c.optInt("startMinute"),
+                        endMinute = c.optInt("endMinute"),
+                        monthStart = c.optInt("monthStart"),
+                        monthEnd = c.optInt("monthEnd")
+                    )
+                }
             )
         },
         httpRequests = optJSONObject("stats")?.optInt("httpRequests") ?: 0,
