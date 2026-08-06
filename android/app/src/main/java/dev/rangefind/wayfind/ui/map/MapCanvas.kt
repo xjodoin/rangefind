@@ -68,6 +68,8 @@ private const val SRC_ORIGIN = "rf-src-origin"
 
 private const val LYR_RESULTS = "rf-lyr-results"
 private const val LYR_ALT = "rf-lyr-alt"
+/** Topmost layer this file installs; the vehicle goes above it. */
+private const val LYR_PUCK = "rf-lyr-puck"
 
 /** Up to three candidates: the fastest plus two alternates. */
 private val SRC_LABEL = listOf("rf-src-label-0", "rf-src-label-1", "rf-src-label-2")
@@ -409,6 +411,11 @@ private class MapHolder {
                 // dropping the follow, so a glance up the road doesn't end
                 // with the map stranded behind the car.
                 .trackingGesturesManagement(true)
+                // Above everything this file draws. Left to itself the
+                // component sits under the route, and since the route line
+                // ends exactly at the vehicle, it lands right down the middle
+                // of the chevron and cuts it in half.
+                .layerAbove(LYR_PUCK)
                 .build()
             map.locationComponent.activateLocationComponent(
                 LocationComponentActivationOptions.builder(context, style)
@@ -739,7 +746,7 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
         )
     )
     style.addLayer(
-        CircleLayer("rf-lyr-puck", SRC_PUCK).withProperties(
+        CircleLayer(LYR_PUCK, SRC_PUCK).withProperties(
             PropertyFactory.circleRadius(8f),
             PropertyFactory.circleColor(palette.puck.toArgb()),
             PropertyFactory.circleStrokeWidth(3.5f),
