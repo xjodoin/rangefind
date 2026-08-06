@@ -116,4 +116,8 @@ dependencies {
     implementation("androidx.compose.material3:material3-window-size-class")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // Navigation decisions that are pure logic — backoff, geometry, phrasing —
+    // are worth testing off-device, where a road test cannot reach them.
+    testImplementation("junit:junit:4.13.2")
 }

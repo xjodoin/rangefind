@@ -29,6 +29,8 @@ import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.ui.map.RenderCadence
 import dev.rangefind.wayfind.nav.TripRecorder
 import dev.rangefind.wayfind.nav.NavigationCore
+import dev.rangefind.wayfind.nav.RerouteLimiter
+import dev.rangefind.wayfind.nav.TravelHeading
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -120,6 +122,8 @@ class MapsViewModel(
     // carries the vehicle between them and decides how far each sample is
     // allowed to move the estimate.
     private val motion = MotionModel()
+    private val rerouteLimiter = RerouteLimiter()
+    private val travel = TravelHeading()
     private val heading = HeadingSensor(context)
     private var suppressSuggestFor: String? = null
 
@@ -642,6 +646,8 @@ class MapsViewModel(
 
     fun startNavigation() {
         heading.start()
+        rerouteLimiter.reset()
+        travel.reset()
         val greeting = core.start(_state.value.allRoutes, _state.value.activeRouteIndex)
         if (regionPrefs.recordTrips) {
             recorder.start(_state.value.activeRoute, System.currentTimeMillis(), environment())
@@ -742,6 +748,7 @@ class MapsViewModel(
 
     private fun onLocation(location: Location) {
         val point = LatLon(location.latitude, location.longitude)
+        travel.onFix(point, System.currentTimeMillis())
         _state.update { it.copy(userLocation = point) }
         if (_state.value.sheet != SheetMode.Navigating) return
 
@@ -790,28 +797,47 @@ class MapsViewModel(
         if (update.offRoute) {
             // Reroute from where the car is pointing, not just where it is.
             reroute(point, travelHeading(location))
+        } else {
+            // Back on the line: whatever was last computed worked, so the next
+            // bit of trouble starts from a clean slate rather than a backoff
+            // inherited from trouble that is over.
+            rerouteLimiter.onRoute()
         }
     }
 
     /**
-     * The vehicle's own heading, or null when it cannot be trusted.
+     * The vehicle's own heading, or null when nothing knows it.
      *
      * Taken from the fix rather than NavUpdate.bearing on purpose: that one
      * falls back to the matched road's direction so the arrow stays steady,
      * and on an off-route event the matched road is the one the driver has
      * just left — precisely the direction a reroute must not assume.
+     *
+     * Below the speed where a satellite course means anything, the answer used
+     * to be null, and a router given no heading will happily start a route by
+     * turning the car around. There is usually a reason a driver is not on the
+     * route, and being told to go back the way they came is rarely it. So the
+     * fallbacks: the course the vehicle has actually traced over the last few
+     * seconds, then the phone's own idea of which way it points.
      */
-    private fun travelHeading(location: Location): Double? =
-        if (location.hasBearing() && location.speed >= NavigationCore.MIN_HEADING_SPEED_MPS) {
+    private fun travelHeading(location: Location): Double? = when {
+        location.hasBearing() && location.speed >= NavigationCore.MIN_HEADING_SPEED_MPS ->
             location.bearing.toDouble()
-        } else null
+        else -> travel.fromMovement() ?: heading.bearing
+    }
 
     private fun reroute(from: LatLon, heading: Double?) {
         val destination = _state.value.selected ?: return
         if (_state.value.rerouting) return
+        val now = System.currentTimeMillis()
+        // Asking again on a three-second heartbeat is not persistence, it is a
+        // loop: adopting a route clears the strike count, so a car the map
+        // cannot place asks forever. Each attempt that does not get it back on
+        // the line waits longer than the last.
+        if (!rerouteLimiter.shouldReroute(now)) return
         _state.update { it.copy(rerouting = true) }
-        recorder.note("reroute", detail = "heading=${heading ?: "none"}", atMillis = System.currentTimeMillis())
-        _voice.tryEmit(context.getString(R.string.nav_rerouting))
+        recorder.note("reroute", detail = "heading=${heading ?: "none"}", atMillis = now)
+        if (rerouteLimiter.shouldAnnounce(now)) _voice.tryEmit(context.getString(R.string.nav_rerouting))
         viewModelScope.launch {
             runCatching { engine.route(from, destination.point, alternatives = 0, fromHeading = heading) }
                 .onSuccess { bundle ->
