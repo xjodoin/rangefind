@@ -20,7 +20,8 @@ adapted to range-addressed static objects:
 1. **Extraction** (`scripts/osm_road_graph.mjs`, `--profile car|bike|foot`):
    allowed `highway=*` ways from an OSM PBF become a junction-collapsed
    directed graph per profile. The car profile caps class speeds by
-   `maxspeed` (including `maxspeed:forward`/`:backward`) and applies
+   `maxspeed` (including `maxspeed:forward`/`:backward`, and
+   `maxspeed:conditional` carried separately as a time window) and applies
    `oneway`, access filters, and roundabouts; bike honors
    `oneway:bicycle=no` and opposite cycleways; foot ignores vehicular
    oneway and adds footways/paths/steps. All profiles degrade speeds on
@@ -169,6 +170,13 @@ node scripts/osm_road_graph.mjs quebec-latest.osm.pbf quebec.graph.bin
 node scripts/route_bench.mjs build quebec.graph.bin ./route-graph --shards 4
 ```
 
+A reader requires the exact format version it was built for — cell v7, root
+v4, source `rfroutesrc-v6` — and there are no compatibility shims. Carrying
+older shapes means a branch per field per version, and every one of those is a
+place to read a byte that is really the next field. An index is derived data
+and reproducing it is two commands, so a format change is a rebuild, not an
+archaeology problem. Clients holding an older copy are told to refresh it.
+
 ## Quebec benchmark
 
 `scripts/route_bench.mjs bench` verifies exact equality against a reference
@@ -264,13 +272,50 @@ cut): cold 110–126 ms, 4.4–4.7 MB, warm 20–43 ms, 90 MB index.
 ## Speed limits
 
 Cells carry a per-edge posted limit in km/h (0 when the way has no `maxspeed`
-tag), and `route()` reports it on every edge plus a per-step summary — the
-limit covering the most of that street:
+tag). `route()` reports it three ways: per edge, as a per-step summary, and —
+the one a moving vehicle should read — as a step function over distance
+travelled.
 
 ```js
-route.steps[0].speedLimitKmh   // 50
 route.edges[0].speedLimitKmh   // 50
+route.steps[0].speedLimitKmh   // 50, the limit covering most of that street
+route.speedLimits              // [{ atMeters: 0, limitKmh: 50 }, { atMeters: 1302, limitKmh: 70 }, …]
 ```
+
+The per-step number is for the itinerary list, where one number per street is
+the right answer and there is no position to be more precise about. It is the
+wrong answer for a sign: a street is not a limit, and an autoroute drops from
+100 to 70 through an interchange and climbs back without ever changing its
+name. Measured on the published Québec index, Laval to Montréal is 22.4 km
+over 17 steps with 10 limit changes, and 883 m of it — 3.9% — reads wrong if
+the step's single number is used.
+
+### Limits that apply only at certain times
+
+`maxspeed:conditional` (school zones, in practice) rides beside the posted
+limit rather than replacing it. Distinct windows live in the root; an edge
+names one with a byte. Québec's 105 conditional ways use ten windows between
+them, over 757 of 4,676,721 car edges.
+
+```js
+route.speedLimits[3]
+// { atMeters: 120, limitKmh: 50,
+//   conditional: { limitKmh: 30, days: 0b0011111,       // Mo-Fr, from Monday
+//                  startMinute: 420, endMinute: 1020,   // 07:00-17:00
+//                  monthStart: 9, monthEnd: 6 } }       // a school year, wrapping
+```
+
+The index does not resolve the window: it is static and the answer depends on
+the clock, so an index that picked one would be wrong for every hour it was
+not rebuilt in. The caller answers it, on local device time — the limit that
+matters is the one on the sign the driver is looking at. Pass `departAt` (an
+ISO local datetime or a `Date`) and the ETA includes the time spent at the
+lower limit, reported as `route.conditionalDelaySeconds`. The search itself is
+unchanged: 757 edges in 4.7 million cannot alter which way is quickest.
+
+Month ranges are inclusive and may wrap, because a school year runs September
+to June; read as a plain low-to-high span that range is empty, which silences
+every school zone in the province and does so silently.
 
 This is deliberately a separate column rather than something derived from
 `seconds`. The travel weight also absorbs surface and smoothness degradation,
