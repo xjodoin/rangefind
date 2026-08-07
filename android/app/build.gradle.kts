@@ -18,6 +18,16 @@ android {
         versionName = "0.1.0"
     }
 
+    // `org.json` and `SystemClock` are Android stubs that throw on the JVM by
+    // default. The drive summary is built out of both, and the crash it hid —
+    // a number rounded by formatting it and parsing it back, which depends on
+    // the device's locale — is only reachable from a unit test if they answer.
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false

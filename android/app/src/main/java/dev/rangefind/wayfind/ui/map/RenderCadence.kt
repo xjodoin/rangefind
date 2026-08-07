@@ -219,9 +219,9 @@ object RenderCadence {
 
         JSONObject()
             .put("frames", frames)
-            .put("movingSeconds", String.format("%.1f", seconds).toDouble())
-            .put("driveSeconds", String.format("%.1f", elapsed).toDouble())
-            .put("fps", if (seconds > 0) String.format("%.1f", frames / seconds).toDouble() else 0.0)
+            .put("movingSeconds", round1(seconds))
+            .put("driveSeconds", round1(elapsed))
+            .put("fps", if (seconds > 0) round1(frames / seconds) else 0.0)
             .put("vehicleUpdates", updates)
             .put("gapP50Ms", percentile(0.50))
             .put("gapP95Ms", percentile(0.95))
@@ -229,18 +229,38 @@ object RenderCadence {
             .put("gapWorstMs", worstGapMs.toInt())
             .put("framesOver33Ms", over33)
             .put("framesOver66Ms", over66)
-            .put("droppedPercent", String.format("%.1f", 100.0 * over33 / counted).toDouble())
+            .put("droppedPercent", round1(100.0 * over33 / counted))
             .put("settledFrames", settled)
             .put("settledGapP95Ms", settledPercentile(0.95))
             .put("settledGapWorstMs", (BUCKETS - 1 downTo 0).firstOrNull { settledGaps[it] > 0 } ?: 0)
             .put("settledDroppedPercent",
-                if (settled == 0) 0.0 else String.format("%.1f", 100.0 * settledOver33 / settled).toDouble())
+                if (settled == 0) 0.0 else round1(100.0 * settledOver33 / settled))
             .put("frameSource", if (mapFrameSeen) "map" else "vsync")
             .put("stylePushes", pushes.size)
             .put("stylePushP50Ms", pushes.sorted().getOrElse(pushes.size / 2) { 0.0 }.toInt())
             .put("stylePushP95Ms", pushes.sorted().getOrElse((pushes.size * 95) / 100) { 0.0 }.toInt())
             .put("stylePushMaxMs", (pushes.maxOrNull() ?: 0.0).toInt())
     }
+
+    /**
+     * One decimal place, without going through text to get there.
+     *
+     * These figures were rounded by formatting them and parsing the string
+     * back — and `String.format` writes in the device's locale while
+     * `toDouble` reads only the machine one. On a phone set to French the
+     * round trip is `464.1` → `"464,1"` → NumberFormatException, thrown from
+     * the last thing a drive does before it ends.
+     *
+     * That is the crash on arrival: the app closed as the driver pulled up,
+     * every time, and only for users whose language puts a comma in a
+     * number. It never once reproduced in English. Six of them are in the
+     * device's crash buffer, all of this shape.
+     *
+     * Rounding is arithmetic, so it is done with arithmetic. There is no
+     * locale to get wrong.
+     */
+    private fun round1(value: Double): Double =
+        if (value.isFinite()) kotlin.math.round(value * 10) / 10 else 0.0
 
     /** Below this the map is not really moving, so neither is the measurement. */
     private const val MOVING_MPS = 2.0
