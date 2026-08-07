@@ -16,6 +16,33 @@ const FORMAT_VERSION = 1;
 const VALUE_FLOAT64 = 1;
 const VALUE_INT_DELTA = 2;
 
+class ChunkedByteWriter {
+  constructor(chunkBytes = 1024 * 1024) {
+    this.chunkBytes = chunkBytes;
+    this.pending = Buffer.allocUnsafe(chunkBytes);
+    this.offset = 0;
+    this.chunks = [];
+    this.length = 0;
+  }
+
+  push(...values) {
+    for (const value of values) {
+      if (this.offset === this.pending.length) {
+        this.chunks.push(this.pending);
+        this.pending = Buffer.allocUnsafe(this.chunkBytes);
+        this.offset = 0;
+      }
+      this.pending[this.offset++] = value;
+      this.length++;
+    }
+  }
+
+  finish() {
+    if (this.offset) this.chunks.push(this.pending.subarray(0, this.offset));
+    return Buffer.concat(this.chunks, this.length);
+  }
+}
+
 function pushFloat64(out, value) {
   const bytes = new Uint8Array(8);
   new DataView(bytes.buffer).setFloat64(0, Number(value || 0), true);
@@ -138,7 +165,11 @@ export function decodeDocValueSortPage(buffer, expected = {}) {
 }
 
 export function encodeDocValueSortDirectory({ field, pageSize, total, pages, summaryFields, packTable, packIndexes }) {
-  const out = [...DOC_VALUE_SORT_DIRECTORY_MAGIC];
+  // Page directories can contain hundreds of thousands of records. Writing
+  // bytes into fixed chunks avoids retaining the encoded form as boxed JS
+  // numbers (roughly 8x their serialized size) before the final Buffer copy.
+  const out = new ChunkedByteWriter();
+  out.push(...DOC_VALUE_SORT_DIRECTORY_MAGIC);
   pushVarint(out, FORMAT_VERSION);
   pushUtf8(out, field.name);
   pushUtf8(out, field.kind);
@@ -177,7 +208,7 @@ export function encodeDocValueSortDirectory({ field, pageSize, total, pages, sum
     }
   }
   return {
-    buffer: Buffer.from(Uint8Array.from(out)),
+    buffer: out.finish(),
     meta: {
       format: DOC_VALUE_SORT_DIRECTORY_FORMAT,
       page_format: DOC_VALUE_SORT_PAGE_FORMAT,

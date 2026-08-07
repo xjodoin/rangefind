@@ -252,6 +252,16 @@ incrementally before an atomic content-addressed rename. The serialized format
 is unchanged, but continent-scale tables no longer require a multi-gigabyte
 `Buffer` or exceed Node/OpenSSL's single `Hash.update()` input limit.
 
+Sorted numeric and boolean doc-value indexes use an external merge. Fixed-width
+`(value, doc-id)` records are sorted in typed-array chunks, spilled beneath the
+resumable build directory, and merged through a bounded reader heap directly
+into tie-aware pages. Spill runs are removed on success or failure. Page-pack
+entries are append-only and directory bytes are assembled in bounded chunks,
+so heap use depends on configured chunk and page sizes rather than corpus size.
+`docValueSortedSortChunkRows` controls the typed-array run size and
+`docValueSortedSortMaxOpenRuns` bounds merge fan-in; neither changes the
+published v1 page or directory formats.
+
 The temporary build code store uses four-byte facet cells: empty and
 single-valued rows are encoded inline, while only genuinely multi-valued rows
 use an overflow file. Sequential column writes are coalesced into bounded

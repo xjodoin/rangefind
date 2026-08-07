@@ -189,6 +189,13 @@
 
 ### Fixed
 
+- Build sorted numeric and boolean doc-value indexes with fixed-width spill
+  runs and a bounded k-way merge instead of retaining one JavaScript object per
+  matching document. Brazil-scale shards no longer exhaust the V8 heap when
+  entering `doc-value-sorted`; tie-aware pages and the published format remain
+  unchanged. Sorted-page pack bookkeeping is append-only, and large directory
+  encoders now use bounded byte chunks instead of boxed byte arrays.
+
 - Stream dense document-pointer tables to disk while hashing them in bounded
   batches. Very large corpora such as Brazil no longer fail after doc packing
   with Node's `ERR_OUT_OF_RANGE: data is too long`, and avoid retaining the

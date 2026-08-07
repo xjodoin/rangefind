@@ -571,6 +571,8 @@ budget bounds decoded term metadata even when a very high fan-in is selected.
 
 `docPageSize` (`32`), `docPackBytes` / `docPagePackBytes` (`4 MiB`),
 `docValueChunkSize` (`2048`), `docValueSortedPageSize` (`512`),
+`docValueSortedSortChunkRows` (`1048576`),
+`docValueSortedSortMaxOpenRuns` (`64`),
 `filterBitmaps` (`true`), `filterBitmapMaxFacetValues` (`64`).
 
 ### Query bundles (optional precomputed top-k)

@@ -106,6 +106,7 @@ import {
 } from "./doc_value_tree.js";
 import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
 import { streamDocPointerTableFromReader } from "./doc_pointers.js";
+import { forEachExternallySortedNumericRow } from "./numeric_sort_spool.js";
 import { createJsonlReadStream, eachJsonLine } from "./jsonl.js";
 import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
@@ -1553,13 +1554,6 @@ function summarizeDocValuePage(summaryFields, codes, docs) {
   return summaries;
 }
 
-function nextSortPageEnd(rows, start, pageSize) {
-  let end = Math.min(rows.length, start + pageSize);
-  const maxEnd = Math.min(rows.length, start + pageSize * 4);
-  while (end < maxEnd && rows[end]?.value === rows[end - 1]?.value) end++;
-  return end;
-}
-
 function geoComponentNames(config) {
   const names = new Set();
   for (const geoField of config.geo || []) {
@@ -1572,7 +1566,7 @@ function geoComponentNames(config) {
 
 function writeDocValueSortedIndexes(out, config, total, codes) {
   const pageSize = Math.max(1, Math.floor(Number(config.docValueSortedPageSize || 512)));
-  const packWriter = createPackWriter(resolve(out, "doc-values", "sorted-packs"), config.docValueSortedPackBytes || config.docValuePackBytes);
+  const packWriter = createAppendOnlyPackWriter(resolve(out, "doc-values", "sorted-packs"), config.docValueSortedPackBytes || config.docValuePackBytes);
   const fields = {};
   const geoComponents = geoComponentNames(config);
   // Geo coordinate components stay out of the sorted trees (their spatial
@@ -1583,22 +1577,14 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
   const pagesByField = new Map();
 
   for (const field of sourceFields) {
-    const rows = [];
     const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
-    for (let start = 0; start < total; start += readChunkSize) {
-      const values = codeRows(codes, field.name, start, Math.min(total, start + readChunkSize));
-      for (let row = 0; row < values.length; row++) {
-        const value = sortableDocValue(field, values[row]);
-        if (Number.isFinite(value)) rows.push({ doc: start + row, value });
-      }
-    }
-    rows.sort((a, b) => a.value - b.value || a.doc - b.doc);
     const pages = [];
-    for (let start = 0, pageIndex = 0; start < rows.length; pageIndex++) {
-      const end = nextSortPageEnd(rows, start, pageSize);
-      const pageRows = rows.slice(start, end);
-      const encoded = encodeDocValueSortPage(field, start, pageRows);
-      const entry = writePackedShard(packWriter, `${field.name}\u0000${pageIndex}`, gzipSync(encoded.buffer, { level: 6 }), {
+    let pageRows = [];
+    let rankStart = 0;
+    const writePage = () => {
+      if (!pageRows.length) return;
+      const encoded = encodeDocValueSortPage(field, rankStart, pageRows);
+      const entry = writePackedShard(packWriter, `${field.name}\u0000${pages.length}`, gzipSync(encoded.buffer, { level: 6 }), {
         kind: "doc-value-sort-page",
         codec: DOC_VALUE_SORT_PAGE_FORMAT,
         logicalLength: encoded.buffer.length
@@ -1608,9 +1594,28 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
         entry,
         summaries: summarizeDocValuePage(summaryFields, codes, pageRows.map(row => row.doc))
       });
-      start = end;
-    }
-    pagesByField.set(field.name, { field, pages, total: rows.length });
+      rankStart += pageRows.length;
+      pageRows = [];
+    };
+    const sort = forEachExternallySortedNumericRow({
+      total,
+      tempDir: buildPath(config, "doc-value-sorted", safeObjectName(field.name)),
+      chunkRows: config.docValueSortedSortChunkRows,
+      readChunkRows: readChunkSize,
+      maxOpenRuns: config.docValueSortedSortMaxOpenRuns,
+      readValues: (start, count) => codeRows(codes, field.name, start, start + count),
+      valueOf: value => sortableDocValue(field, value)
+    }, (doc, value) => {
+      // Preserve the v1 page contract: start with pageSize rows, extend equal
+      // values up to 4x to avoid splitting common ties, then cap the page.
+      if (pageRows.length >= pageSize && (
+        pageRows.length >= pageSize * 4
+        || value !== pageRows[pageRows.length - 1].value
+      )) writePage();
+      pageRows.push({ doc, value });
+    });
+    writePage();
+    pagesByField.set(field.name, { field, pages, total: sort.rows, sort });
   }
 
   finalizePackWriter(packWriter);
@@ -1620,7 +1625,10 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
   let directoryLogicalBytes = 0;
   mkdirSync(resolve(out, "doc-values", "sorted"), { recursive: true });
 
-  for (const { field, pages, total: fieldTotal } of pagesByField.values()) {
+  for (const { field, pages, total: fieldTotal, sort } of pagesByField.values()) {
+    for (const page of pages) {
+      page.entry.pack = packWriter.packNameMap?.get(page.entry.pack) || page.entry.pack;
+    }
     const directory = encodeDocValueSortDirectory({
       field,
       pageSize,
@@ -1643,6 +1651,13 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
       total: fieldTotal,
       page_size: pageSize,
       pages: pages.length,
+      sort: {
+        strategy: "external-merge",
+        chunk_rows: sort.chunkRows,
+        initial_runs: sort.runs,
+        merge_passes: sort.mergePasses,
+        spill_bytes: sort.tempBytes
+      },
       directory: {
         format: DOC_VALUE_SORT_DIRECTORY_FORMAT,
         compression: "gzip-member",

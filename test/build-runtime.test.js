@@ -157,6 +157,9 @@ test("builder output is searchable through the range-based runtime", async (t) =
     docValueChunkSize: 2,
     docValueLookupChunkSize: 1,
     docValueSortedPageSize: 2,
+    // Exercise spill runs and a bounded fan-in merge in the real builder.
+    docValueSortedSortChunkRows: 2,
+    docValueSortedSortMaxOpenRuns: 2,
     // Force multiple external layout chunks so the k-way heap merge is
     // covered by the end-to-end searchable-output assertions below.
     docLayoutSortChunkDocs: 2,

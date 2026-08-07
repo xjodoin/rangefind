@@ -71,6 +71,8 @@ export const DEFAULTS = {
   docLayoutStrategy: "locality",
   docValuePackBytes: 4 * 1024 * 1024,
   docValueSortedPageSize: 512,
+  docValueSortedSortChunkRows: 1024 * 1024,
+  docValueSortedSortMaxOpenRuns: 64,
   docValueSortedPackBytes: 4 * 1024 * 1024,
   sortReplicas: [],
   sortReplicaRankChunkSize: 4096,
