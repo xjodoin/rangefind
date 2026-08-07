@@ -170,8 +170,8 @@ node scripts/osm_road_graph.mjs quebec-latest.osm.pbf quebec.graph.bin
 node scripts/route_bench.mjs build quebec.graph.bin ./route-graph --shards 4
 ```
 
-A reader requires the exact format version it was built for — cell v7, root
-v4, source `rfroutesrc-v6` — and there are no compatibility shims. Carrying
+A reader requires the exact format version it was built for — cell v8, root
+v5, source `rfroutesrc-v7` — and there are no compatibility shims. Carrying
 older shapes means a branch per field per version, and every one of those is a
 place to read a byte that is really the next field. An index is derived data
 and reproducing it is two commands, so a format change is a rebuild, not an
@@ -268,6 +268,85 @@ cut): cold 110–126 ms, 4.4–4.7 MB, warm 20–43 ms, 90 MB index.
   per-query fetch stats.
 - Snap results are cached per coordinate, so matrices re-snap each stop
   once, not once per pair.
+
+## What the signs say
+
+A motorway's name is the one thing never written on a sign. Nobody in Québec
+is looking for "Autoroute Félix-Leclerc"; they are looking for a green panel
+reading **40 Ouest**, and above the slip road, **Sortie 32**. Guiding by
+`name` alone announced roads by a label the driver could not see, and
+announced the exit — the one instruction on a motorway that has to be right —
+as a nameless ramp.
+
+Distinct sign faces live in the root; an edge names one by index. Steps read
+them back flattened:
+
+```js
+route.steps[4].ref              // "40"        the road's own number
+route.steps[3].exitRef          // "32"        the exit number on the panel
+route.steps[3].destinationRef   // "20 Est;30" where the ramp leads, with cardinal
+route.steps[3].destination      // "Montréal;Québec"
+```
+
+All four come straight off the map, and the counts are why this works at all.
+Across Québec, `ref` is on 12,605 of 12,866 motorway and trunk ways;
+`destination:ref` on 5,739 slip roads; `junction:ref` on 1,442, backed by
+1,323 numbered `motorway_junction` nodes. Direction is tagged on **41** route
+relations in the entire province and is useless — but it is in
+`destination:ref` on thousands of ramps, because that is what the sign says.
+Semicolon lists are kept verbatim: which destination to lead with is a
+presentation decision, and only the client knows how much room the banner has.
+
+### Roundabouts
+
+A circle arrives from the extract as two or three unnamed forty-metre ways
+whose turn angles describe the curve rather than where the driver ends up — so
+a roundabout followed by a left turn drew, and spoke, "bear right". The arcs
+of one circle collapse into a single step, and the exits passed are counted as
+the route goes round:
+
+```js
+route.steps[7].roundabout       // true
+route.steps[7].roundaboutExit   // 2 — "take the second exit"
+```
+
+The exit number is the instruction, and it is the one thing geometry can never
+supply. A roundabout that straddles a leaf boundary reports `0` rather than a
+guess, and the client falls back to "at the roundabout, take the exit onto X".
+
+### Stop signs belong to an approach, not to a junction
+
+A stop sign is a property of one approach to an intersection, and OSM says so:
+36,704 of Québec's stop nodes are tagged `direction=forward` and 31,468
+`direction=backward`, against 4,882 with no direction at all. Reading the node
+without its direction put a stop in front of every driver who passed it,
+including the ones on the road with right of way — a recorded drive down Rue
+Main drew three stops the driver never had to make, all of them belonging to
+the side streets.
+
+Junction kinds and junction penalties are both resolved per direction of
+travel, and the intersection merge runs once per direction: two signals five
+metres apart facing opposite ways are one red light to nobody, and merging
+them across directions would leave one carriageway paying for a wait and the
+other paying for nothing. Cardinal forms (`N`, `SSE`) and bearings (`225`) are
+far down the tail and not resolvable without the way's heading at that node,
+so they stay visible to both — a stop shown that is not there is a smaller
+fault than a stop hidden that is.
+
+### Ferries
+
+A ferry has no `highway` tag — it is `route=ferry` — so every class lookup
+keyed on `highway` treated the crossing as unroutable and dropped it. On a
+coastline that is not a missing edge but a missing road: the router sent
+drivers the long way round a river, or refused the trip, with nothing on
+screen to say a boat was the answer. Québec has 65 of them.
+
+A crossing is priced from its own `duration` rather than from a class speed,
+plus half its `interval` as the expected wait (capped at 30 minutes, and 10
+minutes where no interval is tagged). The wait is most of what a ferry costs,
+and pricing one as a road is what makes a router send somebody to sit at a
+slip for forty minutes to save four. Sorel-Tracy to Berthierville comes out at
+9.2 km and 51 minutes by boat, against roughly 130 km by the nearest bridge.
 
 ## Speed limits
 

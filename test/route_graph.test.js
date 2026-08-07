@@ -1323,3 +1323,253 @@ test("a conditional limit survives the index and says when it applies", async (t
     "with no departure given, the posted limit stands"
   );
 });
+
+test("a stop sign is charged and drawn only to the approach it faces", async () => {
+  // OSM tags 36,704 of Québec's stop nodes `direction=forward` and 31,468
+  // `direction=backward`, against 4,882 with no direction at all — the
+  // direction is the rule, not the exception. Reading the node without it put
+  // a stop sign in front of every driver who passed, including the ones on
+  // the road with right of way: a drive down Rue Main drew three stops the
+  // driver never had to make, all of them belonging to the side streets.
+  const { chargeEachIntersectionOnce, signFacing, FACES_FORWARD, FACES_BACKWARD, FACES_BOTH } =
+    await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+
+  assert.equal(signFacing(tags([["direction", "forward"]])), FACES_FORWARD);
+  assert.equal(signFacing(tags([["direction", "backward"]])), FACES_BACKWARD);
+  assert.equal(signFacing(tags([["direction", "both"]])), FACES_BOTH);
+  // A bearing or a cardinal cannot be resolved without the way's heading at
+  // that node, so it stays visible to both. A stop shown that is not there is
+  // a smaller fault than a stop hidden that is.
+  assert.equal(signFacing(tags([["direction", "225"]])), FACES_BOTH);
+  assert.equal(signFacing(tags([])), FACES_BOTH);
+
+  const quiet = () => {};
+  const STOP = 2;
+  // Two stop signs at one crossroads, facing opposite ways and close enough
+  // that the intersection merge would otherwise treat them as one.
+  const ids = new Float64Array([1, 2]);
+  const lat = new Int32Array([455000000, 455000900]);
+  const lon = new Int32Array([-736000000, -736000000]);
+  const kind = new Uint8Array([STOP, STOP]);
+  const faces = new Uint8Array([FACES_FORWARD, FACES_BACKWARD]);
+
+  const forward = new Uint16Array([20, 20]);
+  chargeEachIntersectionOnce(ids, lat, lon, forward, kind, quiet, faces, FACES_FORWARD);
+  assert.deepEqual([...forward], [20, 0], "only the sign facing this driver is charged");
+
+  const backward = new Uint16Array([20, 20]);
+  chargeEachIntersectionOnce(ids, lat, lon, backward, kind, quiet, faces, FACES_BACKWARD);
+  assert.deepEqual([...backward], [0, 20], "and the opposite driver pays their own");
+
+  // The merge must not collapse across directions, or one carriageway would
+  // absorb the other's charge and the other would pay nothing at all.
+  const both = new Uint16Array([20, 20]);
+  chargeEachIntersectionOnce(ids, lat, lon, both, kind, quiet, faces, FACES_BOTH);
+  assert.deepEqual(
+    [...both].filter(Boolean).length, 1,
+    "two signs facing one driver at one intersection are still one wait"
+  );
+});
+
+test("what the signs say survives the index — number, exit, and where it leads", async (t) => {
+  // A motorway's name is the one thing never written on a sign. Guiding by it
+  // announced roads by a label the driver could not see, and announced the
+  // exit — the instruction on a motorway that has to be right — as a nameless
+  // ramp. Québec tags `ref` on 12,605 of 12,866 motorway ways and
+  // `destination:ref` on 5,739 slip roads, which is where "40 Ouest" is.
+  const { makeSignTable, waySigns } = await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+
+  const ramp = waySigns(tags([
+    ["junction:ref", "32"],
+    ["destination:ref", "20 Est;30"],
+    ["destination", "Québec;Sorel-Tracy"]
+  ]));
+  assert.equal(ramp.forward.exit, "32");
+  assert.equal(ramp.forward.destRef, "20 Est;30", "semicolon lists stay as OSM writes them");
+  assert.equal(ramp.forward.dest, "Québec;Sorel-Tracy");
+
+  // A two-way road signed differently at each end: taking the unsuffixed
+  // value for both would point half its traffic at the wrong city.
+  const split = waySigns(tags([
+    ["destination:ref", "20 Est"],
+    ["destination:ref:backward", "20 Ouest"]
+  ]));
+  assert.equal(split.forward.destRef, "20 Est");
+  assert.equal(split.backward.destRef, "20 Ouest");
+
+  // `destination:street` is the same promise in words where the target is a
+  // street rather than a numbered route.
+  assert.equal(waySigns(tags([["destination:street", "Boulevard Labelle"]])).forward.dest, "Boulevard Labelle");
+
+  const table = makeSignTable();
+  assert.equal(table.idFor({ ref: "", exit: "", destRef: "", dest: "" }), 0, "a blank sign is no sign");
+  const first = table.idFor({ ref: "40", exit: "", destRef: "", dest: "" });
+  assert.equal(table.idFor({ ref: "40", exit: "", destRef: "", dest: "" }), first, "identical faces share an entry");
+  assert.notEqual(table.idFor({ ref: "40", exit: "28", destRef: "", dest: "" }), first);
+
+  // End to end: an edge names a sign face by index and a route's steps read
+  // it back without a further fetch.
+  const graph = syntheticGraph(8, 8, 7);
+  graph.signs = [
+    { ref: "40", exit: "", destRef: "", dest: "" },
+    { ref: "", exit: "28", destRef: "40 Ouest", dest: "Montréal" }
+  ];
+  graph.edgeSign = Uint32Array.from(graph.edgeFrom, (_, i) => (i % 5 === 0 ? 2 : 1));
+  // Every fifth edge is a roundabout arc, so the flag has to survive too.
+  graph.edgeFlags = Uint8Array.from(graph.edgeFrom, (_, i) => (i % 5 === 0 ? 1 : 0));
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-signs-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 16, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  assert.equal(engine.root.signs.length, 2, "the root carries the sign table");
+  assert.equal(engine.root.signs[1].destRef, "40 Ouest");
+
+  const route = await engine.route({
+    from: { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 },
+    to: { lat: graph.nodeLat.at(-1) / 1e7, lon: graph.nodeLon.at(-1) / 1e7 }
+  });
+  assert.ok(route.steps.length, "the route has steps to sign");
+  for (const step of route.steps) {
+    // Flattened onto the step: every consumer wants the strings and none of
+    // them wants to know a sign table exists.
+    assert.equal(typeof step.ref, "string");
+    assert.equal(typeof step.exitRef, "string");
+    assert.equal(typeof step.destinationRef, "string");
+    assert.equal(typeof step.destination, "string");
+    assert.equal(typeof step.roundabout, "boolean");
+  }
+  assert.ok(
+    route.steps.some(step => step.ref === "40" || step.exitRef === "28"),
+    "and at least one of them says what its sign says"
+  );
+});
+
+test("a roundabout is one maneuver with an exit to count, not three nameless arcs", async (t) => {
+  // A circle arrives from the extract as two or three unnamed forty-metre
+  // ways whose turn angles describe the curve rather than where the driver
+  // ends up — so a roundabout followed by a left turn was drawn, and spoken,
+  // as "bear right". The exit number is the instruction, and it is the one
+  // thing geometry can never supply.
+  const width = 6;
+  const graph = syntheticGraph(width, 6, 11);
+  // Turn a run of consecutive edges into a roundabout, all sharing a name
+  // with neither neighbour so the collapse cannot be an artefact of naming.
+  graph.edgeFlags = Uint8Array.from(graph.edgeFrom, () => 0);
+  const circle = [];
+  for (let i = 0; i < graph.edgeFrom.length; i++) {
+    if (graph.edgeFrom[i] + 1 === graph.edgeTo[i] && graph.edgeFrom[i] < width - 1) {
+      graph.edgeFlags[i] = 1;
+      circle.push(i);
+    }
+  }
+  assert.ok(circle.length >= 2, "the fixture needs a run of arcs to collapse");
+  // Distinct names per arc: if the collapse were really name-based rather
+  // than flag-based, this would produce one line per arc.
+  graph.names = [...graph.names, "Arc A", "Arc B", "Arc C"];
+  circle.forEach((edge, i) => {
+    graph.edgeName[edge] = graph.names.length - 3 + (i % 3);
+  });
+  // Make the ring the cheap way across, so the route certainly uses it.
+  for (const edge of circle) graph.edgeWeightDs[edge] = 1;
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-circle-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 12, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  const route = await engine.route({
+    from: { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 },
+    to: { lat: graph.nodeLat[width - 1] / 1e7, lon: graph.nodeLon[width - 1] / 1e7 }
+  });
+  const arcs = route.steps.filter(step => step.roundabout);
+  assert.equal(arcs.length, 1, "however many arcs the circle is built from, it is one step");
+  assert.ok(arcs[0].roundaboutExit >= 1, "and it says which exit to take");
+  // The arc never merges with the road either side of it: entering a
+  // roundabout and driving down a street are not the same instruction.
+  const index = route.steps.indexOf(arcs[0]);
+  for (const neighbour of [route.steps[index - 1], route.steps[index + 1]]) {
+    if (neighbour) assert.equal(neighbour.roundabout, false);
+  }
+});
+
+test("a fix's own error bar decides how wide the snap looks, and distance is charged", async (t) => {
+  // The seed cost of a snap match was the cost of the rest of its own edge
+  // and nothing else, so which road a reroute started from was decided by how
+  // fast the road was rather than how close: twenty metres of autoroute costs
+  // less than twenty metres of boulevard. A driver beside the A-13 was handed
+  // a route down the desserte and declared off-route eleven times in four
+  // minutes.
+  const graph = syntheticGraph(10, 10, 23);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-snap-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 20, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  const from = { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 };
+  const to = { lat: graph.nodeLat.at(-1) / 1e7, lon: graph.nodeLon.at(-1) / 1e7 };
+
+  // A wider band is more candidates, never fewer, and never a worse route:
+  // the search still picks the cheapest, it simply gets to see the road the
+  // car is actually on.
+  const tight = await engine.route({ from, to });
+  const wide = await engine.route({ from, to, accuracyMeters: 45 });
+  assert.ok(Number.isFinite(wide.seconds));
+  assert.ok(
+    wide.seconds >= tight.seconds - 1e-6,
+    "widening the band cannot make the answer cheaper than the unpenalised one"
+  );
+
+  // Every candidate knows how much further off it is than the nearest, which
+  // is what the seed charge is computed from. Charged on the excess, not the
+  // absolute distance: a trip that genuinely starts eighty metres from any
+  // road must not have all its candidates taxed for the same eighty metres.
+  const snapped = await engine.snap(from);
+  assert.ok(snapped.matches.length >= 1);
+  assert.equal(snapped.matches[0].extraMeters, 0, "the nearest road is charged nothing");
+  for (const match of snapped.matches) {
+    assert.ok(match.extraMeters >= 0);
+    assert.ok(match.extraMeters <= 25 + 1e-6, "and the default band is the ordinary GPS error");
+  }
+});
+
+test("a ferry is a road the router can take, priced by its timetable", async () => {
+  // A ferry has no `highway` tag — it is `route=ferry` — so every class
+  // lookup keyed on `highway` treated the crossing as unroutable and dropped
+  // it. On a coastline that is not a missing edge but a missing road: the
+  // router sends a driver the long way round a river, or refuses the trip,
+  // with nothing on screen to say a boat was the answer.
+  const { PROFILES, wayClass, FERRY_CLASS, parseDuration, ferryWaitSeconds } =
+    await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+
+  assert.equal(wayClass(tags([["route", "ferry"]])), FERRY_CLASS);
+  assert.equal(wayClass(tags([["highway", "primary"]])), "primary");
+
+  // OSM writes `duration` as a clock or as an ISO period, and two fields are
+  // hours:minutes — a twelve-minute crossing is "00:12", not twelve seconds.
+  assert.equal(parseDuration("00:12"), 12 * 60);
+  assert.equal(parseDuration("PT10M"), 10 * 60);
+  assert.equal(parseDuration("1:30:00"), 90 * 60);
+  assert.equal(parseDuration(""), 0);
+  assert.equal(parseDuration("not a duration"), 0);
+
+  // What a ferry costs is mostly the wait for the next sailing, and pricing
+  // it as a road is what makes a router send somebody to sit at a slip for
+  // forty minutes to save four.
+  assert.equal(ferryWaitSeconds(tags([["interval", "01:00"]])), 30 * 60);
+  assert.equal(ferryWaitSeconds(tags([["interval", "04:00"]])), 30 * 60, "capped, not unbounded");
+  assert.ok(ferryWaitSeconds(tags([])) > 0, "an untagged interval is not a zero wait");
+
+  // A car ferry carries cars; a foot-and-bicycle one says so on itself.
+  const carry = tags([["route", "ferry"], ["motor_vehicle", "yes"]]);
+  const walkOn = tags([["route", "ferry"], ["motor_vehicle", "no"], ["foot", "yes"]]);
+  assert.equal(PROFILES.car.allowed(carry), true);
+  assert.equal(PROFILES.car.allowed(walkOn), false);
+  assert.equal(PROFILES.foot.allowed(walkOn), true);
+  // And a ferry is never one-way, whatever the default for its class.
+  assert.equal(PROFILES.car.oneway(carry), 0);
+});

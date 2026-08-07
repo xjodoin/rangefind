@@ -24,8 +24,8 @@ export const ROUTE_ROOT_MAGIC = [0x52, 0x46, 0x52, 0x54]; // RFRT
 export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
-const ROOT_VERSION = 4;
-const CELL_VERSION = 7;
+const ROOT_VERSION = 5;
+const CELL_VERSION = 8;
 // v5 cells carry no lane column. A published index is a large download that
 // A reader requires the version it was built for. Carrying older shapes means
 // a branch per field per version, and every one of those is a place to read a
@@ -148,6 +148,14 @@ export function encodeRouteCell(cell) {
       // limits, and the sign must show whichever is in force. Zero is "always
       // the posted one", which is nearly every edge and costs one byte.
       pushVarint(out, cell.condRules ? cell.condRules[e] : 0);
+      // What the signs over this edge say, as a 1-based index into the
+      // root's table: the route number, the exit number, and what the slip
+      // road leads to. A motorway's *name* is the one thing never written on
+      // a sign, so guidance that has only the name has nothing to say.
+      pushVarint(out, cell.signs ? cell.signs[e] : 0);
+      // Flag byte. Bit 0: this edge runs inside a roundabout, which is a
+      // maneuver rather than a road and cannot be inferred from geometry.
+      pushVarint(out, cell.flags ? cell.flags[e] : 0);
       // Lane movements for this edge, left to right. Jagged because most
       // edges have none: an untagged edge costs the single zero that says so.
       const lanes = cell.lanes ? cell.lanes[e] : null;
@@ -199,6 +207,8 @@ export function decodeRouteCell(bytes) {
   const junctions = new Uint8Array(edgeCount);
   const speeds = new Uint8Array(edgeCount);
   const condRules = new Uint8Array(edgeCount);
+  const signs = new Uint32Array(edgeCount);
+  const flags = new Uint8Array(edgeCount);
   const laneOffsets = new Uint32Array(edgeCount + 1);
   const laneMasks = [];
   const extLat = new Int32Array(edgeCount);
@@ -218,6 +228,8 @@ export function decodeRouteCell(bytes) {
       junctions[cursor] = readVarint(bytes, state);
       speeds[cursor] = readVarint(bytes, state);
       condRules[cursor] = readVarint(bytes, state);
+      signs[cursor] = readVarint(bytes, state);
+      flags[cursor] = readVarint(bytes, state);
       if (hasLanes) {
         const laneCount = readVarint(bytes, state);
         for (let i = 0; i < laneCount; i++) laneMasks.push(readVarint(bytes, state));
@@ -235,7 +247,7 @@ export function decodeRouteCell(bytes) {
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
   return {
     cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm,
-    nameIds, classes, junctions, speeds, condRules,
+    nameIds, classes, junctions, speeds, condRules, signs, flags,
     laneOffsets, laneMasks: Uint8Array.from(laneMasks),
     extLat, extLon, geomRefs
   };
@@ -471,6 +483,18 @@ export function encodeRouteRoot(root) {
     pushVarint(out, rule.monthStart);
     pushVarint(out, rule.monthEnd);
   }
+  // The distinct sign faces edges name by index. Written once for the whole
+  // graph because a province's motorways repeat a few thousand between them,
+  // and because a step has to be able to say "40 Ouest, sortie 32" without
+  // fetching anything a route did not already need.
+  const signs = root.signs || [];
+  pushVarint(out, signs.length);
+  for (const sign of signs) {
+    pushUtf8(out, sign.ref || "");
+    pushUtf8(out, sign.exit || "");
+    pushUtf8(out, sign.destRef || "");
+    pushUtf8(out, sign.dest || "");
+  }
   const buckets = root.buckets || [{ name: "base", rules: [], factors: [] }];
   pushVarint(out, buckets.length);
   for (const bucket of buckets) {
@@ -546,6 +570,16 @@ export function decodeRouteRoot(bytes) {
       monthEnd: readVarint(bytes, state)
     });
   }
+  const signCount = readVarint(bytes, state);
+  const signs = [];
+  for (let i = 0; i < signCount; i++) {
+    signs.push({
+      ref: readUtf8(bytes, state),
+      exit: readUtf8(bytes, state),
+      destRef: readUtf8(bytes, state),
+      dest: readUtf8(bytes, state)
+    });
+  }
   const bucketCount = readVarint(bytes, state);
   const buckets = [];
   for (let i = 0; i < bucketCount; i++) {
@@ -613,6 +647,7 @@ export function decodeRouteRoot(bytes) {
     profile,
     classes,
     condRules,
+    signs,
     buckets,
     shards,
     leaves,

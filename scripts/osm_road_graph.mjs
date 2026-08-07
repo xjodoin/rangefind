@@ -15,6 +15,22 @@ import { scanPbf } from "./osm_pbf.mjs";
 
 const EARTH_RADIUS_METERS = 6371008.7714;
 
+/**
+ * The class a way routes as.
+ *
+ * A ferry has no `highway` tag at all — it is `route=ferry` — so every class
+ * lookup keyed on `highway` treated the crossing as unroutable and dropped it.
+ * On a coastline that is not a missing edge, it is a missing road: the router
+ * would send a driver the long way round a river, or refuse the trip outright,
+ * with nothing on screen to say a boat was the answer.
+ */
+export const FERRY_CLASS = "ferry";
+
+export function wayClass(tags) {
+  if (tags.get("route") === "ferry") return FERRY_CLASS;
+  return tags.get("highway");
+}
+
 // Default car speeds in km/h per highway class. Ways whose class is absent
 // here are not drivable and are skipped.
 const CAR_SPEEDS = {
@@ -32,7 +48,10 @@ const CAR_SPEEDS = {
   residential: 30,
   living_street: 10,
   service: 15,
-  road: 30
+  road: 30,
+  // Nominal only: a crossing's real speed comes from its `duration` tag and
+  // its real cost is mostly the wait for the next sailing. See ferryProfile.
+  [FERRY_CLASS]: 20
 };
 
 // Effective cycling speeds, not the speed a bicycle is capable of. A
@@ -58,7 +77,8 @@ const BIKE_SPEEDS = {
   path: 12,
   footway: 6,
   pedestrian: 6,
-  road: 14
+  road: 14,
+  [FERRY_CLASS]: 20
 };
 
 /**
@@ -100,7 +120,8 @@ const FOOT_SPEEDS = {
   primary: 4,
   primary_link: 4,
   cycleway: 5,
-  road: 5
+  road: 5,
+  [FERRY_CLASS]: 20
 };
 
 const ACCESS_DENIED = new Set(["no", "private", "delivery", "agricultural", "forestry", "military"]);
@@ -127,6 +148,70 @@ function destinationOnly(tags) {
     if (value != null) return ACCESS_DESTINATION_ONLY.has(value);
   }
   return false;
+}
+
+/**
+ * How long a crossing takes, in seconds, from OSM's `duration`.
+ *
+ * Written either as a clock ("00:12", "1:30:00") or as an ISO 8601 period
+ * ("PT10M"). Returns 0 when there is no usable value, which leaves the
+ * crossing costed from its nominal class speed.
+ */
+export function parseDuration(value) {
+  if (!value) return 0;
+  const text = String(value).trim();
+  const iso = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i.exec(text);
+  if (iso && (iso[1] || iso[2] || iso[3] || iso[4])) {
+    return Number(iso[1] || 0) * 86400 + Number(iso[2] || 0) * 3600 +
+      Number(iso[3] || 0) * 60 + Number(iso[4] || 0);
+  }
+  const parts = text.split(":").map(part => Number(part.trim()));
+  if (!parts.length || parts.some(part => !Number.isFinite(part))) return 0;
+  // Two fields are hours:minutes — OSM's convention for `duration`, not
+  // minutes:seconds. A twelve-minute crossing is "00:12".
+  if (parts.length === 2) return parts[0] * 3600 + parts[1] * 60;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 1) return parts[0] * 60;
+  return 0;
+}
+
+/**
+ * The wait before a crossing, in seconds.
+ *
+ * A ferry is not a road, and pricing one as if it were is what makes a router
+ * send somebody down to a slip to sit for forty minutes to save four. What it
+ * costs is mostly the wait for the next sailing, and `interval` is the
+ * headway — so half of it is the wait a driver arriving at random expects.
+ * With no interval tagged, a default stands in rather than nothing: zero is
+ * the one answer that is certainly wrong.
+ */
+export function ferryWaitSeconds(tags) {
+  const interval = parseDuration(tags.get("interval"));
+  const expected = interval > 0 ? interval / 2 : FERRY_DEFAULT_WAIT_SECONDS;
+  return Math.min(expected, FERRY_MAX_WAIT_SECONDS);
+}
+
+const FERRY_DEFAULT_WAIT_SECONDS = 600;
+const FERRY_MAX_WAIT_SECONDS = 1800;
+
+/**
+ * Whether a profile may board this crossing.
+ *
+ * Ferries carry different things — some take cars, some are foot-and-bicycle
+ * only — and they say so on themselves. Absent tags mean the usual: a ferry
+ * route in the road network carries vehicles unless it says otherwise.
+ */
+function ferryAllowed(tags, profileName) {
+  const keys = profileName === "car"
+    ? ["motorcar", "motor_vehicle", "vehicle", "access"]
+    : profileName === "bike"
+      ? ["bicycle", "vehicle", "access"]
+      : ["foot", "access"];
+  for (const key of keys) {
+    const value = tags.get(key);
+    if (value != null) return !ACCESS_DENIED.has(value);
+  }
+  return true;
 }
 
 /**
@@ -168,8 +253,15 @@ const FOOT_NODE_PENALTIES = { traffic_signals: 60, level_crossing: 30, crossing_
  * cost, in rank order so the signal is the one that gets charged and the
  * crossings beside it fall in behind it. Kind codes are left alone: what is
  * drawn on the map is the query layer's business.
+ *
+ * Run once per direction of travel. Two signals five metres apart facing
+ * opposite ways are one red light to nobody — they are one each to two
+ * drivers — so merging them across directions would leave one carriageway
+ * paying for a wait and the other paying for nothing. [faces] says which
+ * approaches each node governs, and only nodes a given driver actually meets
+ * take part in that driver's merge.
  */
-export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kindCode, log) {
+export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kindCode, log, faces = null, facing = FACES_BOTH) {
   const MERGE_METERS = 30;
   const charged = [];
   const grid = new Map();
@@ -179,7 +271,16 @@ export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kin
   const key = (cx, cy) => `${cx},${cy}`;
 
   const candidates = [];
-  for (let i = 0; i < penaltyDs.length; i++) if (penaltyDs[i] > 0) candidates.push(i);
+  for (let i = 0; i < penaltyDs.length; i++) {
+    if (penaltyDs[i] <= 0) continue;
+    if (faces && (faces[i] & facing) === 0) {
+      // Not this driver's sign at all: no charge, and it must not absorb one
+      // that is.
+      penaltyDs[i] = 0;
+      continue;
+    }
+    candidates.push(i);
+  }
   // Heaviest first: the signal becomes the intersection's charge, not whichever
   // crossing happened to be scanned first.
   candidates.sort((a, b) => penaltyDs[b] - penaltyDs[a] || usedIds[a] - usedIds[b]);
@@ -213,7 +314,40 @@ export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kin
     grid.get(cell).push(index);
     charged.push(index);
   }
-  log(`junction penalties: ${charged.length} intersections charged, ${merged} duplicate nodes absorbed`);
+  const which = facing === FACES_FORWARD ? "forward" : facing === FACES_BACKWARD ? "backward" : "both";
+  log(`junction penalties (${which}): ${charged.length} intersections charged, ${merged} duplicate nodes absorbed`);
+}
+
+/** Per-edge flags. Bit 0: the edge runs inside a roundabout. */
+export const EDGE_FLAG_ROUNDABOUT = 1;
+
+/** Which way a sign faces: 1 forward along the way, 2 backward, 3 both. */
+export const FACES_FORWARD = 1;
+export const FACES_BACKWARD = 2;
+export const FACES_BOTH = FACES_FORWARD | FACES_BACKWARD;
+
+/**
+ * Which approach a stop sign, signal or give-way actually governs.
+ *
+ * A stop sign is not a property of an intersection, it is a property of one
+ * approach to it — and OSM says so: 36,704 of Québec's stop nodes are tagged
+ * `direction=forward` and 31,468 `direction=backward`, against 4,882 with no
+ * direction at all. Reading the node without its direction put a stop sign in
+ * front of every driver who passed it, including the ones on the road that
+ * has right of way. On a drive down Rue Main the app drew three stops the
+ * driver never had to make, all of them belonging to the side streets.
+ *
+ * Cardinal forms ("N", "SSE") and bearings ("225") are also in use, but far
+ * down the tail and not resolvable without the way's own heading at that
+ * node; they are read as facing both ways, which is the old behaviour and the
+ * safe one — a stop shown that is not there is a smaller fault than a stop
+ * hidden that is.
+ */
+export function signFacing(tags) {
+  const direction = tags.get("direction");
+  if (direction === "forward") return FACES_FORWARD;
+  if (direction === "backward") return FACES_BACKWARD;
+  return FACES_BOTH;
 }
 
 function nodePenaltyDs(profile, tags) {
@@ -278,8 +412,9 @@ export const PROFILES = {
     turnCosts: BIKE_TURN_COSTS,
     maxSpeedKmh: 30,
     allowed(tags) {
-      const highway = tags.get("highway");
+      const highway = wayClass(tags);
       if (!highway || !(highway in BIKE_SPEEDS)) return false;
+      if (highway === FERRY_CLASS) return ferryAllowed(tags, "bike");
       if (tags.get("area") === "yes") return false;
       const bicycle = tags.get("bicycle");
       // An explicit permission outranks everything below: a bridge that
@@ -310,8 +445,9 @@ export const PROFILES = {
     turnCosts: null,
     maxSpeedKmh: 6,
     allowed(tags) {
-      const highway = tags.get("highway");
+      const highway = wayClass(tags);
       if (!highway || !(highway in FOOT_SPEEDS)) return false;
+      if (highway === FERRY_CLASS) return ferryAllowed(tags, "foot");
       if (tags.get("area") === "yes") return false;
       const foot = tags.get("foot");
       if (foot != null) return !ACCESS_DENIED.has(foot);
@@ -522,7 +658,7 @@ export function wayLanes(tags, oneway) {
 }
 
 export function waySpeeds(tags, profile) {
-  const base = profile.speeds[tags.get("highway")];
+  const base = profile.speeds[wayClass(tags)];
   let forward = base;
   let backward = base;
   if (profile.speedTags) {
@@ -578,6 +714,81 @@ export function waySpeeds(tags, profile) {
       ? conditional
       : null
   };
+}
+
+/**
+ * What the signs over a road actually say.
+ *
+ * A motorway's name is the one thing never written on a sign. Nobody in
+ * Québec is looking for "Autoroute Félix-Leclerc"; they are looking for a
+ * green panel reading **40 Ouest**, and above the slip road, **Sortie 32**.
+ * Guiding by `name` meant the app announced a road by a label the driver
+ * could not see, and announced the exit — the one instruction on a motorway
+ * that has to be right — as a nameless ramp.
+ *
+ * All four fields come straight off the map:
+ *
+ * - `ref` is the road's own number, on 12,605 of Québec's 12,866 motorway and
+ *   trunk ways. "40".
+ * - `exit` is the exit number, from `junction:ref` on the slip road or from
+ *   the `motorway_junction` node it leaves. "32", "89-N".
+ * - `destRef` is what the slip road leads to, as a number *with its cardinal*
+ *   — which is where "40 Ouest" actually comes from, since direction is
+ *   tagged on only 41 route relations in the whole province and is useless.
+ *   "20 Est;30".
+ * - `dest` is the place the sign names. "Montréal;Québec".
+ *
+ * Semicolons are OSM's list separator and are kept verbatim: which of the
+ * listed destinations to lead with is a presentation decision, and the client
+ * is the only thing that knows how much room the banner has.
+ */
+export function makeSignTable() {
+  const signs = [];
+  const byKey = new Map();
+  return {
+    signs,
+    /** 0 means "no sign data"; anything else is a 1-based entry. */
+    idFor(sign) {
+      if (!sign || (!sign.ref && !sign.exit && !sign.destRef && !sign.dest)) return 0;
+      const key = `${sign.ref}\u0000${sign.exit}\u0000${sign.destRef}\u0000${sign.dest}`;
+      const existing = byKey.get(key);
+      if (existing != null) return existing;
+      signs.push(sign);
+      const id = signs.length;
+      byKey.set(key, id);
+      return id;
+    }
+  };
+}
+
+/** Trim, collapse whitespace, and drop the empty string. */
+function signText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The signs for a way, per direction.
+ *
+ * Directional suffixes win where present: a two-way road signed differently
+ * at each end is tagged `destination:ref:forward` and `:backward`, and taking
+ * the unsuffixed value for both would point half its traffic at the wrong
+ * city. Slip roads are one-way, so in practice the plain form covers nearly
+ * all of it.
+ */
+export function waySigns(tags) {
+  const ref = signText(tags.get("ref"));
+  const exit = signText(tags.get("junction:ref"));
+  const pick = (key, suffix) =>
+    signText(tags.get(`${key}:${suffix}`) || tags.get(key));
+  const make = (suffix) => ({
+    ref,
+    exit,
+    destRef: pick("destination:ref", suffix),
+    // `destination:street` is the same promise in words when the target is a
+    // street rather than a numbered route, and is what the sign says there.
+    dest: pick("destination", suffix) || pick("destination:street", suffix)
+  });
+  return { forward: make("forward"), backward: make("backward") };
 }
 
 /**
@@ -655,8 +866,9 @@ function parseOneway(tags) {
 }
 
 function carAllowed(tags) {
-  const highway = tags.get("highway");
+  const highway = wayClass(tags);
   if (!highway || !(highway in CAR_SPEEDS)) return false;
+  if (highway === FERRY_CLASS) return ferryAllowed(tags, "car");
   if (tags.get("area") === "yes") return false;
   const motorVehicle = tags.get("motor_vehicle") ?? tags.get("vehicle");
   if (motorVehicle != null) return !ACCESS_DENIED.has(motorVehicle);
@@ -760,7 +972,12 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // Distinct conditional windows, shared across the whole extract. Declared
   // with the way spool because the way pass is what fills it.
   const conditionalTable = makeConditionalTable();
+  // Distinct sign faces, shared across the extract. A province's motorways
+  // repeat a few thousand between them, so a table plus a per-edge index is
+  // the whole cost of carrying what the green panels say.
+  const signTable = makeSignTable();
   const ways = [];
+  let ferryWays = 0;
   const names = [""];
   const nameIds = new Map([["", 0]]);
   const restrictions = [];
@@ -771,6 +988,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
       wayCount++;
       if (refs.length < 2 || !profile.allowed(tags)) return;
       const speeds = waySpeeds(tags, profile);
+      const signs = waySigns(tags);
+      const isFerry = wayClass(tags) === FERRY_CLASS;
+      if (isFerry) ferryWays++;
       const name = tags.get("name") || tags.get("ref") || "";
       let nameId = nameIds.get(name);
       if (nameId == null) {
@@ -798,10 +1018,21 @@ export function extractRoadGraph(pbfPath, options = {}) {
         postedFwd: speeds.postedForward,
         postedBwd: speeds.postedBackward,
         condRule: conditionalTable.idFor(speeds.conditional),
-        oneway: profile.oneway(tags),
+        oneway: isFerry ? 0 : profile.oneway(tags),
         lanes: wayLanes(tags, profile.oneway(tags)),
         nameId,
-        classCode: classCodes.get(tags.get("highway")) ?? 0
+        signFwd: signTable.idFor(signs.forward),
+        signBwd: signTable.idFor(signs.backward),
+        // A roundabout is a maneuver, not a road, and the only thing that
+        // says so is this tag. Without it the circle arrives as two or three
+        // nameless forty-metre steps with turn angles that describe the
+        // curve rather than the exit — which is exactly what a driver was
+        // shown at the Boulevard Labelle giratoire.
+        roundabout: tags.get("junction") === "roundabout" || tags.get("junction") === "circular",
+        ferry: isFerry,
+        ferryDurationSeconds: isFerry ? parseDuration(tags.get("duration")) : 0,
+        ferryWaitSeconds: isFerry ? ferryWaitSeconds(tags) : 0,
+        classCode: classCodes.get(wayClass(tags)) ?? 0
       });
     },
     onRelation(id, members, tags) {
@@ -845,6 +1076,13 @@ export function extractRoadGraph(pbfPath, options = {}) {
   const found = new Uint8Array(usedIds.length);
   const penaltyDs = new Uint16Array(usedIds.length);
   const kindCode = new Uint8Array(usedIds.length);
+  // Which approach each tagged node governs, so a stop sign facing the side
+  // street is not shown to the traffic that has right of way.
+  const kindFaces = new Uint8Array(usedIds.length).fill(FACES_BOTH);
+  // Exit numbers, from the `motorway_junction` node the slip road leaves.
+  // 1,326 of Québec's 1,798 such nodes carry one, which is the most reliable
+  // source there is for the number on the green panel.
+  const exitRefByNode = new Map();
   scanPbf(pbfPath, {
     onNode(id, lat, lon, tags) {
       const index = binarySearch(usedIds, id);
@@ -855,11 +1093,51 @@ export function extractRoadGraph(pbfPath, options = {}) {
       if (tags) {
         penaltyDs[index] = nodePenaltyDs(profile, tags);
         kindCode[index] = nodeKindCode(tags);
+        kindFaces[index] = signFacing(tags);
+        if (tags.get("highway") === "motorway_junction") {
+          const exit = signText(tags.get("ref"));
+          if (exit) exitRefByNode.set(index, exit);
+        }
       }
     }
   });
+  log(`exits: ${exitRefByNode.size} numbered motorway junctions`);
 
-  chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kindCode, log);
+  // Penalties are charged per direction of travel, because a sign is charged
+  // to the driver who faces it. The two runs write into separate arrays; the
+  // shared `penaltyDs` is only the source they are copied from.
+  const penaltyFwd = Uint16Array.from(penaltyDs);
+  const penaltyBwd = Uint16Array.from(penaltyDs);
+  chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyFwd, kindCode, log, kindFaces, FACES_FORWARD);
+  chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyBwd, kindCode, log, kindFaces, FACES_BACKWARD);
+
+  /** The kind a driver travelling [facing] actually meets at this node. */
+  const kindFor = (index, facing) =>
+    (kindFaces[index] & facing) !== 0 ? kindCode[index] : 0;
+
+  // Ferry crossings are priced from their own `duration` rather than from a
+  // class speed: the whole point of the tag is that a boat's pace is not a
+  // road's. Done here because it needs the coordinates pass 2 just landed.
+  let ferryTimed = 0;
+  for (const way of ways) {
+    if (!way.ferry || way.ferryDurationSeconds <= 0) continue;
+    let meters = 0;
+    let previous = -1;
+    for (let i = 0; i < way.refCount; i++) {
+      const used = binarySearch(usedIds, allRefs[way.refStart + i]);
+      if (used < 0 || !found[used]) continue;
+      if (previous >= 0) {
+        meters += haversineMetersE7(latE7[previous], lonE7[previous], latE7[used], lonE7[used]);
+      }
+      previous = used;
+    }
+    if (meters <= 0) continue;
+    const kmh = Math.max(1, (meters / 1000) / (way.ferryDurationSeconds / 3600));
+    way.speedFwd = kmh;
+    way.speedBwd = kmh;
+    ferryTimed++;
+  }
+  if (ferryWays) log(`ferries: ${ferryWays} crossings, ${ferryTimed} timed from duration`);
 
   // Graph nodes are junctions with a known coordinate, numbered by sorted id.
   const nodeIndex = new Map();
@@ -891,7 +1169,14 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // none, so an empty list costs the single byte that says so.
   const laneOffsets = [0];
   const laneBytes = new GrowUint8();
-  const emitEdge = (from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind, postedKmh, condRule, lanes, points, reversed) => {
+  // What the signs say, as an index into the extract's sign table, and the
+  // per-edge flag byte (bit 0: this edge is inside a roundabout).
+  const edgeSign = [];
+  const edgeFlags = [];
+  const emitEdge = ({
+    from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind,
+    postedKmh, condRule, lanes, points, reversed, signId, flags
+  }) => {
     edgeFrom.push(from);
     edgeTo.push(to);
     edgeWeightDs.push(weightDs);
@@ -902,6 +1187,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeJunction.push(junctionKind);
     edgeSpeed.push(postedKmh || 0);
     edgeCond.push(condRule || 0);
+    edgeSign.push(signId || 0);
+    edgeFlags.push(flags || 0);
     geomScratch.length = 0;
     // Interior polyline points only, zigzag-delta E7 from the from-node.
     const interior = points.length - 2;
@@ -928,17 +1215,50 @@ export function extractRoadGraph(pbfPath, options = {}) {
   };
 
   const segment = [];
+  // Everything a slip road is signed with rides on its edges. The exit
+  // number is the exception: it belongs to the `motorway_junction` node the
+  // ramp leaves, so it is resolved per edge rather than per way, and only
+  // for the first edge of the ramp — the number is announced once.
+  const signWithExit = (baseId, exit) => {
+    if (!exit) return baseId;
+    const base = baseId ? signTable.signs[baseId - 1] : null;
+    if (base && base.exit === exit) return baseId;
+    return signTable.idFor({
+      ref: base ? base.ref : "",
+      exit,
+      destRef: base ? base.destRef : "",
+      dest: base ? base.dest : ""
+    });
+  };
+  const isLinkClass = (classCode) => classTable[classCode]?.endsWith("_link") === true;
   for (const way of ways) {
     segment.length = 0;
     let fromNode = -1;
+    let fromUsed = -1;
     let fromPenalty = 0;
     let fromKind = 0;
     let lengthMeters = 0;
     // Signals and stops usually sit on interior way nodes, not on the
     // shared junction node; carry their delay and kind onto the edge.
-    let segPenalty = 0;
-    let segKind = 0;
-    let segKindIndex = 0;
+    // Accumulated per direction, because a sign facing one way is not a
+    // delay for traffic going the other.
+    let segPenaltyFwd = 0;
+    let segPenaltyBwd = 0;
+    let segKindFwd = 0;
+    let segKindFwdIndex = 0;
+    let segKindBwd = 0;
+    let segKindBwdIndex = 0;
+    const flags = way.roundabout ? EDGE_FLAG_ROUNDABOUT : 0;
+    // A boat leaves when it leaves. The wait is charged once to the crossing
+    // rather than spread along it, so a longer ferry is not made to look
+    // like a worse one.
+    const ferryWaitDs = way.ferry ? Math.round(way.ferryWaitSeconds * 10) : 0;
+    const resetSegment = () => {
+      segPenaltyFwd = 0;
+      segPenaltyBwd = 0;
+      segKindFwd = 0;
+      segKindBwd = 0;
+    };
     for (let i = 0; i < way.refCount; i++) {
       const ref = allRefs[way.refStart + i];
       const used = binarySearch(usedIds, ref);
@@ -946,9 +1266,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
         // Missing node (clipped extract): break the segment here.
         segment.length = 0;
         fromNode = -1;
+        fromUsed = -1;
         lengthMeters = 0;
-        segPenalty = 0;
-        segKind = 0;
+        resetSegment();
         continue;
       }
       const lat = latE7[used];
@@ -960,22 +1280,29 @@ export function extractRoadGraph(pbfPath, options = {}) {
       segment.push([lat, lon]);
       const graphNode = nodeIndex.get(ref);
       if (graphNode == null) {
-        segPenalty += penaltyDs[used];
-        if (JUNCTION_RANK[kindCode[used]] > JUNCTION_RANK[segKind]) {
-          segKind = kindCode[used];
-          segKindIndex = segment.length - 1;
+        segPenaltyFwd += penaltyFwd[used];
+        segPenaltyBwd += penaltyBwd[used];
+        const forwardKind = kindFor(used, FACES_FORWARD);
+        if (JUNCTION_RANK[forwardKind] > JUNCTION_RANK[segKindFwd]) {
+          segKindFwd = forwardKind;
+          segKindFwdIndex = segment.length - 1;
+        }
+        const backwardKind = kindFor(used, FACES_BACKWARD);
+        if (JUNCTION_RANK[backwardKind] > JUNCTION_RANK[segKindBwd]) {
+          segKindBwd = backwardKind;
+          segKindBwdIndex = segment.length - 1;
         }
         continue;
       }
       if (fromNode < 0) {
         fromNode = graphNode;
-        fromPenalty = penaltyDs[used];
-        fromKind = kindCode[used];
+        fromUsed = used;
+        fromPenalty = penaltyBwd[used];
+        fromKind = kindFor(used, FACES_BACKWARD);
         segment.length = 0;
         segment.push([lat, lon]);
         lengthMeters = 0;
-        segPenalty = 0;
-        segKind = 0;
+        resetSegment();
         continue;
       }
       if (graphNode === fromNode && lengthMeters < 0.01) continue;
@@ -983,30 +1310,49 @@ export function extractRoadGraph(pbfPath, options = {}) {
       const lastIndex = segment.length - 1;
       // Pick the most important junction on this edge per direction, with
       // its polyline point index packed alongside (kind + index * 8).
-      const pick = (endKind, endIndex) => {
-        if (JUNCTION_RANK[segKind] > JUNCTION_RANK[endKind]) return { kind: segKind, index: segKindIndex };
+      const pick = (segKind, segIndex, endKind, endIndex) => {
+        if (JUNCTION_RANK[segKind] > JUNCTION_RANK[endKind]) return { kind: segKind, index: segIndex };
         return endKind ? { kind: endKind, index: endIndex } : { kind: 0, index: 0 };
       };
+      const link = isLinkClass(way.classCode);
       if (way.oneway >= 0) {
-        const junction = pick(kindCode[used], lastIndex);
-        const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedFwd * 1000) / 3600)) * 10) + penaltyDs[used] + segPenalty);
-        emitEdge(fromNode, graphNode, weightDs, distDm, way.nameId, way.id, way.classCode, junction.kind + junction.index * 8, way.postedFwd, way.condRule, way.lanes.forward, segment, false);
+        const junction = pick(segKindFwd, segKindFwdIndex, kindFor(used, FACES_FORWARD), lastIndex);
+        const weightDs = ferryWaitDs +
+          Math.max(1, Math.round((lengthMeters / ((way.speedFwd * 1000) / 3600)) * 10) + penaltyFwd[used] + segPenaltyFwd);
+        emitEdge({
+          from: fromNode, to: graphNode, weightDs, distDm,
+          nameId: way.nameId, wayId: way.id, classCode: way.classCode,
+          junctionKind: junction.kind + junction.index * 8,
+          postedKmh: way.postedFwd, condRule: way.condRule,
+          lanes: way.lanes.forward, points: segment, reversed: false,
+          signId: link ? signWithExit(way.signFwd, exitRefByNode.get(fromUsed)) : way.signFwd,
+          flags
+        });
       }
       if (way.oneway <= 0) {
-        const junction = pick(fromKind, lastIndex);
+        const junction = pick(segKindBwd, segKindBwdIndex, fromKind, lastIndex);
         // Reversed polyline: mirror the point index.
         const mirrored = junction.kind ? { kind: junction.kind, index: lastIndex - junction.index } : junction;
-        const weightDs = Math.max(1, Math.round((lengthMeters / ((way.speedBwd * 1000) / 3600)) * 10) + fromPenalty + segPenalty);
-        emitEdge(graphNode, fromNode, weightDs, distDm, way.nameId, way.id, way.classCode, mirrored.kind + mirrored.index * 8, way.postedBwd, way.condRule, way.lanes.backward, segment, true);
+        const weightDs = ferryWaitDs +
+          Math.max(1, Math.round((lengthMeters / ((way.speedBwd * 1000) / 3600)) * 10) + fromPenalty + segPenaltyBwd);
+        emitEdge({
+          from: graphNode, to: fromNode, weightDs, distDm,
+          nameId: way.nameId, wayId: way.id, classCode: way.classCode,
+          junctionKind: mirrored.kind + mirrored.index * 8,
+          postedKmh: way.postedBwd, condRule: way.condRule,
+          lanes: way.lanes.backward, points: segment, reversed: true,
+          signId: link ? signWithExit(way.signBwd, exitRefByNode.get(used)) : way.signBwd,
+          flags
+        });
       }
       fromNode = graphNode;
-      fromPenalty = penaltyDs[used];
-      fromKind = kindCode[used];
+      fromUsed = used;
+      fromPenalty = penaltyBwd[used];
+      fromKind = kindFor(used, FACES_BACKWARD);
       segment.length = 0;
       segment.push([lat, lon]);
       lengthMeters = 0;
-      segPenalty = 0;
-      segKind = 0;
+      resetSegment();
     }
   }
   log(`edges: ${edgeFrom.length} directed`);
@@ -1034,6 +1380,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeJunction,
     edgeSpeed,
     edgeCond,
+    edgeSign,
+    edgeFlags,
     geomOffsets,
     geomBytes,
     laneOffsets,
@@ -1056,6 +1404,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
       edgeJunction: Uint8Array.from(expanded.edgeJunction),
       edgeSpeed: Uint8Array.from(expanded.edgeSpeed),
       edgeCond: Uint8Array.from(expanded.edgeCond || []),
+      edgeSign: Uint32Array.from(expanded.edgeSign || []),
+      edgeFlags: Uint8Array.from(expanded.edgeFlags || []),
       geomOffsets: Uint32Array.from(expanded.geomOffsets),
       geomBytes: Uint8Array.from(expanded.geomBytes.view()),
       laneOffsets: Uint32Array.from(expanded.laneOffsets),
@@ -1063,7 +1413,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
       names,
       profile: profile.name,
       classes: classTable,
-      condRules: conditionalTable.rules
+      condRules: conditionalTable.rules,
+      signs: signTable.signs
     }, log);
   }
 
@@ -1079,6 +1430,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeJunction: Uint8Array.from(edgeJunction),
     edgeSpeed: Uint8Array.from(edgeSpeed),
     edgeCond: Uint8Array.from(edgeCond),
+    edgeSign: Uint32Array.from(edgeSign),
+    edgeFlags: Uint8Array.from(edgeFlags),
     laneOffsets: Uint32Array.from(laneOffsets),
     laneBytes: Uint8Array.from(laneBytes.view()),
     geomOffsets: Uint32Array.from(geomOffsets),
@@ -1086,7 +1439,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     names,
     profile: profile.name,
     classes: classTable,
-    condRules: conditionalTable.rules
+    condRules: conditionalTable.rules,
+    signs: signTable.signs
   }, log);
 }
 
@@ -1100,6 +1454,8 @@ export function applyTurnRestrictions(context) {
   const edgeJunction = context.edgeJunction || null;
   const edgeSpeed = context.edgeSpeed || null;
   const edgeCond = context.edgeCond || null;
+  const edgeSign = context.edgeSign || null;
+  const edgeFlags = context.edgeFlags || null;
   if (!restrictions.length) return;
 
   const copyEdgeTo = (source, from, toOverride) => {
@@ -1113,6 +1469,8 @@ export function applyTurnRestrictions(context) {
     if (edgeJunction) edgeJunction.push(edgeJunction[source]);
     if (edgeSpeed) edgeSpeed.push(edgeSpeed[source]);
     if (edgeCond) edgeCond.push(edgeCond[source]);
+    if (edgeSign) edgeSign.push(edgeSign[source]);
+    if (edgeFlags) edgeFlags.push(edgeFlags[source]);
     const start = geomOffsets[source];
     const end = geomOffsets[source + 1];
     geomBytes.ensure(end - start);
@@ -1353,7 +1711,7 @@ export function expandTurnCosts(context, turnCosts) {
   const {
     restrictions, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass, edgeJunction,
-    edgeSpeed, edgeCond, geomOffsets, geomBytes, laneOffsets, laneBytes, log
+    edgeSpeed, edgeCond, edgeSign, edgeFlags, geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
   const edgeCount = edgeFrom.length;
   const nodeCount = nodeLat.length;
@@ -1473,6 +1831,8 @@ export function expandTurnCosts(context, turnCosts) {
   const newJunction = [];
   const newSpeed = [];
   const newCond = [];
+  const newSign = [];
+  const newFlags = [];
   const newGeomOffsets = [0];
   const newGeomBytes = new GrowUint8();
   const newLaneOffsets = [0];
@@ -1496,6 +1856,8 @@ export function expandTurnCosts(context, turnCosts) {
       newJunction.push(edgeJunction ? edgeJunction[out] : 0);
       newSpeed.push(edgeSpeed ? edgeSpeed[out] : 0);
       newCond.push(edgeCond ? edgeCond[out] : 0);
+      newSign.push(edgeSign ? edgeSign[out] : 0);
+      newFlags.push(edgeFlags ? edgeFlags[out] : 0);
       const start = geomOffsets[out];
       const end = geomOffsets[out + 1];
       newGeomBytes.ensure(end - start);
@@ -1528,6 +1890,8 @@ export function expandTurnCosts(context, turnCosts) {
     edgeJunction: newJunction,
     edgeSpeed: newSpeed,
     edgeCond: newCond,
+    edgeSign: newSign,
+    edgeFlags: newFlags,
     geomOffsets: newGeomOffsets,
     geomBytes: newGeomBytes,
     laneOffsets: newLaneOffsets,
@@ -1640,6 +2004,8 @@ function filterLargestScc(graph, log) {
   const edgeJunction = [];
   const edgeSpeed = [];
   const edgeCond = [];
+  const edgeSign = [];
+  const edgeFlags = [];
   const geomOffsets = [0];
   const geomBytes = new GrowUint8();
   const laneOffsets = [0];
@@ -1657,6 +2023,8 @@ function filterLargestScc(graph, log) {
     edgeJunction.push(graph.edgeJunction[i]);
     edgeSpeed.push(graph.edgeSpeed ? graph.edgeSpeed[i] : 0);
     edgeCond.push(graph.edgeCond ? graph.edgeCond[i] : 0);
+    edgeSign.push(graph.edgeSign ? graph.edgeSign[i] : 0);
+    edgeFlags.push(graph.edgeFlags ? graph.edgeFlags[i] : 0);
     const start = graph.geomOffsets[i];
     const end = graph.geomOffsets[i + 1];
     geomBytes.ensure(end - start);
@@ -1687,6 +2055,8 @@ function filterLargestScc(graph, log) {
     edgeJunction: Uint8Array.from(edgeJunction),
     edgeSpeed: Uint8Array.from(edgeSpeed),
     edgeCond: Uint8Array.from(edgeCond),
+    edgeSign: Uint32Array.from(edgeSign),
+    edgeFlags: Uint8Array.from(edgeFlags),
     laneOffsets: Uint32Array.from(laneOffsets),
     laneBytes: Uint8Array.from(laneBytes.view()),
     geomOffsets: Uint32Array.from(geomOffsets),
@@ -1694,7 +2064,8 @@ function filterLargestScc(graph, log) {
     names: graph.names,
     profile: graph.profile,
     classes: graph.classes,
-    condRules: graph.condRules || []
+    condRules: graph.condRules || [],
+    signs: graph.signs || []
   };
 }
 
@@ -1712,6 +2083,8 @@ export function writeRoadGraph(path, graph) {
     ["edgeJunction", graph.edgeJunction],
     ["edgeSpeed", graph.edgeSpeed],
     ["edgeCond", graph.edgeCond],
+    ["edgeSign", graph.edgeSign],
+    ["edgeFlags", graph.edgeFlags],
     ["laneOffsets", graph.laneOffsets],
     ["laneBytes", graph.laneBytes],
     ["geomOffsets", graph.geomOffsets],
@@ -1719,11 +2092,14 @@ export function writeRoadGraph(path, graph) {
     ["namesBytes", namesBytes]
   ];
   const header = {
-    format: "rfroutesrc-v6",
+    format: "rfroutesrc-v7",
     // The distinct conditional windows an edge's condRule indexes into. A
     // whole province shares a handful, so they ride in the header rather than
     // being repeated per edge.
     condRules: graph.condRules || [],
+    // What the green panels say, as distinct sign faces an edge names by
+    // index. A province repeats a few thousand between all its motorways.
+    signs: graph.signs || [],
     nodes: graph.nodeLat.length,
     edges: graph.edgeFrom.length,
     profile: graph.profile || "car",
@@ -1749,11 +2125,12 @@ export async function readRoadGraph(path) {
   const bytes = readFileSync(path);
   const newline = bytes.indexOf(0x0a);
   const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
-  if (header.format !== "rfroutesrc-v6") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
+  if (header.format !== "rfroutesrc-v7") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
   const graph = {
     profile: header.profile || "car",
     classes: header.classes || [],
-    condRules: header.condRules || []
+    condRules: header.condRules || [],
+    signs: header.signs || []
   };
   let offset = newline + 1;
   for (const section of header.sections) {

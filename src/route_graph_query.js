@@ -29,6 +29,14 @@ const E7_RAD = Math.PI / 180 / 1e7;
 // the decision.
 const HEADING_ALIGNED_DEG = 45;
 const HEADING_OPPOSED_DEG = 135;
+// Per-edge flag bits, matching the extractor's own encoding.
+const EDGE_FLAG_ROUNDABOUT = 1;
+// How much further than the nearest road a snap candidate may be and still
+// be considered. Ordinary GPS error on an open road lives inside the first
+// figure; a caller reporting worse accuracy can widen it up to the second,
+// beyond which the "candidates" are just other roads in the neighbourhood.
+const SNAP_EXTRA_METERS = 25;
+const SNAP_EXTRA_METERS_MAX = 60;
 
 function routeError(code, message) {
   const error = new Error(message);
@@ -641,7 +649,7 @@ export async function openRouteGraph(options) {
   const snapCache = new Map();
   const defaultMaxSnapMeters = Number(options.maxSnapMeters ?? 250);
 
-  async function snap(point, { maxCandidates = 8, extraMeters = 25, maxSnapMeters = defaultMaxSnapMeters } = {}) {
+  async function snap(point, { maxCandidates = 8, extraMeters = SNAP_EXTRA_METERS, maxSnapMeters = defaultMaxSnapMeters } = {}) {
     const lat = Number(point?.lat);
     const lon = Number(point?.lon ?? point?.lng);
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
@@ -728,6 +736,10 @@ export async function openRouteGraph(options) {
     }
     const best = matches[0];
     const kept = matches.filter(match => match.distMeters <= best.distMeters + extraMeters).slice(0, maxCandidates);
+    // How much further off each candidate is than the nearest one. The
+    // search charges for this, so a slip road twenty metres away stops
+    // beating the road the car is actually on.
+    for (const match of kept) match.extraMeters = match.distMeters - best.distMeters;
     return { latE7, lonE7, matches: kept };
   }
 
@@ -1276,6 +1288,38 @@ export async function openRouteGraph(options) {
       ...geometryLeaves.map(leaf => loadCellGeometry(leaf))
     ]);
     const geometryByLeaf = new Map(geometryLeaves.map((leaf, i) => [leaf, geometryBlocks[i]]));
+
+    /** The sign face an edge carries, or null. */
+    const signTable = root.signs || [];
+    const signOf = (cell, edge) => {
+      const id = cell.signs ? cell.signs[edge] : 0;
+      const entry = id ? signTable[id - 1] : null;
+      if (!entry) return null;
+      if (!entry.ref && !entry.exit && !entry.destRef && !entry.dest) return null;
+      return entry;
+    };
+
+    // Cells the route already passes through, so an exit count can read a
+    // roundabout node's other arms without another fetch. A roundabout that
+    // straddles a leaf boundary simply goes uncounted, and the instruction
+    // falls back to "at the roundabout, take the exit onto X" — which is
+    // still the maneuver, just without the number.
+    const cellsInPlay = [...new Map(rawEdges.map(raw => [raw.leaf, raw.cell])).values()];
+    const cellForNode = (node) => cellsInPlay.find(
+      cell => node >= cell.firstNode && node < cell.firstNode + cell.nodeCount
+    );
+    /** How many arms lead *out* of the circle at this node: 0 or 1. */
+    const exitsAtNode = (node) => {
+      const cell = cellForNode(node);
+      if (!cell) return 0;
+      const local = node - cell.firstNode;
+      for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
+        if (!cell.flags || (cell.flags[e] & EDGE_FLAG_ROUNDABOUT) === 0) return 1;
+      }
+      return 0;
+    };
+    let roundaboutExits = 0;
+
     const geometry = [];
     let distanceMeters = 0;
     let conditionalDelaySeconds = 0;
@@ -1375,11 +1419,31 @@ export async function openRouteGraph(options) {
         condRule
       });
       const name = names ? names[cell.nameIds[edge]] || "" : "";
+      const roundabout = cell.flags ? (cell.flags[edge] & EDGE_FLAG_ROUNDABOUT) !== 0 : false;
+      const sign = signOf(cell, edge);
+      // A roundabout is one instruction however many arcs it is made of, and
+      // it is never the road before or after it. Two ways round that: arcs
+      // always join each other, and never join anything else.
       const last = steps[steps.length - 1];
-      if (last && last.name === name) {
+      const continues = last && (
+        roundabout ? last.roundabout : (!last.roundabout && last.name === name)
+      );
+      if (roundabout) {
+        // Every arc ends at an arm of the circle. The ones that lead out are
+        // the exits a driver counts, so counting them as they go past is what
+        // turns "at the roundabout" into "take the second exit".
+        roundaboutExits += exitsAtNode(cell.targets[edge]);
+      }
+      if (continues) {
         last.meters += meters;
         last.seconds += seconds;
         if (speedLimitKmh) last.limitMeters.set(speedLimitKmh, (last.limitMeters.get(speedLimitKmh) || 0) + meters);
+        // A run of edges is signed by the first of them that says anything,
+        // and an exit number outranks a bare route number: it is the thing
+        // written largest on the panel and the only one that is unambiguous.
+        if (sign && (!last.sign || (sign.exit && !last.sign.exit))) last.sign = sign;
+        if (roundabout) last.roundaboutExit = roundaboutExits;
+        if (!last.name && name) last.name = name;
       } else {
         // `at` indexes the route geometry point where this step begins, so
         // clients can slice per-street geometry (e.g. road-name labels) and
@@ -1400,9 +1464,16 @@ export async function openRouteGraph(options) {
           // checked against the classes it actually chose.
           roadClass: cell.classes ? cell.classes[edge] : 0,
           lanes: laneListOf(approachCell, approachEdge),
+          // What a driver would read on a sign here, rather than what the
+          // road is called in the database. Null on the ordinary street that
+          // carries no numbers, which is most of them.
+          sign,
+          roundabout,
+          roundaboutExit: roundabout ? roundaboutExits : 0,
           limitMeters: new Map(speedLimitKmh ? [[speedLimitKmh, meters]] : [])
         });
       }
+      if (!roundabout) roundaboutExits = 0;
     }
     if (chain.endMatch) pushPoint(chain.endMatch.snappedLatE7, chain.endMatch.snappedLonE7);
     // Where the posted limit changes along the route, as a step function over
@@ -1456,6 +1527,15 @@ export async function openRouteGraph(options) {
       }
       step.speedLimitKmh = best;
       delete step.limitMeters;
+      // Flattened, because every consumer wants the four strings and none of
+      // them wants to know a sign table exists. Empty rather than absent so
+      // a client never has to distinguish "no sign" from "not this version".
+      const sign = step.sign;
+      step.ref = sign?.ref || "";
+      step.exitRef = sign?.exit || "";
+      step.destinationRef = sign?.destRef || "";
+      step.destination = sign?.dest || "";
+      delete step.sign;
     }
     response.distanceMeters = distanceMeters;
     response.geometry = geometry;
@@ -1534,7 +1614,17 @@ export async function openRouteGraph(options) {
         speculative = { leaves, contexts, promise };
       }
     }
-    const [snapFrom, snapTo] = await Promise.all([snap(params.from), snap(params.to)]);
+    // A fix good to twenty-five metres cannot be used to pick between two
+    // roads twenty metres apart, and a candidate band narrower than the
+    // error simply throws away the road the car is actually on before the
+    // search ever sees it — which is how a driver on a service road beside a
+    // motorway gets routed onto the motorway. Widen the band to the reported
+    // accuracy and let the costs above decide; they now charge for distance.
+    const accuracyMeters = Math.max(0, Number(params.accuracyMeters) || 0);
+    const fromOptions = accuracyMeters > SNAP_EXTRA_METERS
+      ? { extraMeters: Math.min(accuracyMeters, SNAP_EXTRA_METERS_MAX) }
+      : undefined;
+    const [snapFrom, snapTo] = await Promise.all([snap(params.from, fromOptions), snap(params.to)]);
     const snapLeaves = new Set();
     for (const match of snapFrom.matches) {
       snapLeaves.add(match.leaf);
@@ -1574,6 +1664,25 @@ export async function openRouteGraph(options) {
       const cell = fetched.cells.get(match.leaf);
       return cell ? liveAdjustedWeight(live, cell, match.edgeIndex, base) : base;
     };
+    // How far off the line a candidate is, priced.
+    //
+    // The seed cost of a snap match was the cost of the rest of its own edge
+    // and nothing else, so which road a reroute started from was decided by
+    // how *fast* the road was, not by how close it was: an autoroute twenty
+    // metres away out-seeded the boulevard the car was driving on, because
+    // twenty metres of autoroute costs less than twenty metres of boulevard.
+    // A driver on Boulevard Notre-Dame beside the A-13 was handed a route
+    // down the desserte, drove straight on as anyone would, and was declared
+    // off-route eleven times in four minutes.
+    //
+    // Charged on the *excess* over the nearest candidate rather than on the
+    // absolute distance: a trip that genuinely starts eighty metres from any
+    // road — a car park, a forecourt — must not have every one of its
+    // candidates taxed equally for the same eighty metres.
+    const snapPenaltyDsPerMeter = Math.max(0, Math.round((params.snapPenaltySecondsPerMeter ?? 1) * 10));
+    const snapPenalty = (match) =>
+      Math.round((match.extraMeters || 0) * snapPenaltyDsPerMeter);
+
     // A reroute happens while the driver is moving, and the snap offers both
     // directions of the road they are on — the two are metres apart, so both
     // are near-equally good matches. Seeding the opposing edge at its bare
@@ -1597,12 +1706,12 @@ export async function openRouteGraph(options) {
 
     const forwardSeeds = snapFrom.matches.map(match => ({
       node: match.toNode,
-      weight: Math.round(effMatchWeight(match) * (1 - match.ratio)) + headingPenalty(match),
+      weight: Math.round(effMatchWeight(match) * (1 - match.ratio)) + headingPenalty(match) + snapPenalty(match),
       match
     })).filter(seed => Number.isFinite(seed.weight));
     const backwardSeeds = snapTo.matches.map(match => ({
       node: match.fromNode,
-      weight: Math.round(effMatchWeight(match) * match.ratio),
+      weight: Math.round(effMatchWeight(match) * match.ratio) + snapPenalty(match),
       match
     })).filter(seed => Number.isFinite(seed.weight));
 
@@ -1611,7 +1720,8 @@ export async function openRouteGraph(options) {
     for (const from of snapFrom.matches) {
       for (const to of snapTo.matches) {
         if (from.leaf === to.leaf && from.edgeIndex === to.edgeIndex && to.ratio >= from.ratio) {
-          const weight = Math.round(effMatchWeight(from) * (to.ratio - from.ratio)) + headingPenalty(from);
+          const weight = Math.round(effMatchWeight(from) * (to.ratio - from.ratio)) +
+            headingPenalty(from) + snapPenalty(from) + snapPenalty(to);
           if (Number.isFinite(weight) && (!sameEdge || weight < sameEdge.weight)) sameEdge = { weight, from, to };
         }
       }

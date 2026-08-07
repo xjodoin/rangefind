@@ -426,6 +426,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     const cellJunctions = new Uint8Array(cellEdgeCount);
     const cellSpeeds = new Uint8Array(cellEdgeCount);
     const cellCondRules = new Uint8Array(cellEdgeCount);
+    // What the signs over this edge say, as an index into the root's table,
+    // and the flag byte that says whether it is inside a roundabout.
+    const cellSigns = new Uint32Array(cellEdgeCount);
+    const cellFlags = new Uint8Array(cellEdgeCount);
     // Lane movements per edge, in the edge's own travel direction. Jagged,
     // and empty for the overwhelming majority of edges.
     const cellLanes = new Array(cellEdgeCount);
@@ -449,6 +453,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         cellJunctions[cursor] = graph.edgeJunction ? graph.edgeJunction[edgeId] : 0;
         cellSpeeds[cursor] = graph.edgeSpeed ? graph.edgeSpeed[edgeId] : 0;
         cellCondRules[cursor] = graph.edgeCond ? graph.edgeCond[edgeId] : 0;
+        cellSigns[cursor] = graph.edgeSign ? graph.edgeSign[edgeId] : 0;
+        cellFlags[cursor] = graph.edgeFlags ? graph.edgeFlags[edgeId] : 0;
         if (graph.laneOffsets && graph.laneBytes) {
           const laneStart = graph.laneOffsets[edgeId];
           const laneCount = graph.laneBytes[laneStart] || 0;
@@ -514,6 +520,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       classes: cellClasses,
       speeds: cellSpeeds,
       condRules: cellCondRules,
+      signs: cellSigns,
+      flags: cellFlags,
       lanes: cellLanes,
       junctions: cellJunctions,
       extLat,
@@ -634,6 +642,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     levelFanouts,
     profile: graph.profile || "car",
     condRules: graph.condRules || [],
+    // The distinct sign faces an edge's signId indexes into. Shared across
+    // the whole graph the way conditional windows are: a route's steps read
+    // them without another fetch.
+    signs: graph.signs || [],
     classes,
     buckets,
     shards,

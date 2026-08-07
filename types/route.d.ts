@@ -51,6 +51,30 @@ export interface RouteStep {
    * also absorbs surface degradation and junction penalties.
    */
   speedLimitKmh?: number;
+  /**
+   * The road's own number as written on the sign — "40", "A 13". A motorway's
+   * *name* is the one thing never posted, so guidance that reads the name
+   * announces roads by a label the driver cannot see.
+   */
+  ref?: string;
+  /** Exit number off the green panel — "32", "89-N". */
+  exitRef?: string;
+  /**
+   * Where a slip road leads, numbered and with its cardinal — "20 Est;30".
+   * This is where a direction comes from in practice: OSM tags `direction` on
+   * a handful of route relations and on thousands of ramps.
+   */
+  destinationRef?: string;
+  /** The places named on the sign — "Montréal;Québec". Semicolon-separated. */
+  destination?: string;
+  /**
+   * Whether this step runs inside a roundabout. The arcs of one circle
+   * collapse into a single step: a roundabout is one maneuver, and its turn
+   * angles describe the curve rather than where the driver ends up.
+   */
+  roundabout?: boolean;
+  /** Which exit of that roundabout the route leaves by; 0 when unknown. */
+  roundaboutExit?: number;
 }
 
 /** 1 traffic signals, 2 stop, 3 give way, 4 level crossing, 5 crossing. */
