@@ -179,6 +179,66 @@ class TripRecorder(context: Context) {
         runCatching { file.appendText(row.toString() + "\n") }
     }
 
+    /**
+     * A route that replaced the one the drive started with.
+     *
+     * The header records the original and nothing else did, so every reroute
+     * after it was invisible: a complaint that the app "rerouted me onto the
+     * wrong road" could be seen happening — the cross-track climbing away
+     * from a line — without the line itself ever being in the file. Eleven
+     * reroutes in four minutes on one recorded drive, and not one of the
+     * eleven answers was written down.
+     */
+    fun noteRoute(route: Route, atMillis: Long) {
+        val file = sink ?: return
+        val row = JSONObject()
+            .put("kind", "route-replaced")
+            .put("at", atMillis)
+            .put("seconds", route.seconds)
+            .put("distanceMeters", route.distanceMeters)
+            .put("steps", JSONArray().apply {
+                route.steps.forEach { step ->
+                    put(
+                        JSONObject()
+                            .put("name", step.name)
+                            .put("meters", step.meters)
+                            .put("roadClass", step.roadClass)
+                            .put("ref", step.ref)
+                            .put("exitRef", step.exitRef)
+                            .put("destinationRef", step.destinationRef)
+                            .put("roundabout", step.roundabout)
+                            .put("roundaboutExit", step.roundaboutExit)
+                    )
+                }
+            })
+            .put("geometry", JSONArray().apply {
+                route.geometry.forEach { point ->
+                    put(JSONArray().put(point.lat).put(point.lon))
+                }
+            })
+        runCatching { file.appendText(row.toString() + "\n") }
+    }
+
+    /**
+     * An uncaught exception, written before the process goes.
+     *
+     * "The app closes when I arrive" is the hardest kind of report to act on:
+     * it names a moment, not a cause, and by the time it can be described the
+     * stack is gone. Writing it into the trace makes the next such report
+     * carry its own diagnosis, and the trace is already the thing the driver
+     * sends. Best effort by construction — the process is dying.
+     */
+    fun noteCrash(throwable: Throwable, atMillis: Long) {
+        val file = sink ?: return
+        val row = JSONObject()
+            .put("kind", "crash")
+            .put("at", atMillis)
+            .put("type", throwable.javaClass.name)
+            .put("message", throwable.message.orEmpty())
+            .put("stack", throwable.stackTraceToString().take(MAX_STACK_CHARS))
+        runCatching { file.appendText(row.toString() + "\n") }
+    }
+
     /** Note something the caller did, so the trace explains its own gaps. */
     fun note(event: String, detail: String? = null, atMillis: Long) {
         val file = sink ?: return
@@ -237,5 +297,7 @@ class TripRecorder(context: Context) {
 
     private companion object {
         const val MAX_TRACES = 5
+        /** Enough for the frames that matter, short of a runaway recursion. */
+        const val MAX_STACK_CHARS = 8000
     }
 }

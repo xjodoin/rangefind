@@ -25,11 +25,13 @@ import dev.rangefind.wayfind.region.RegionPreferences
 import dev.rangefind.wayfind.region.RegionServer
 import dev.rangefind.wayfind.region.RegionStatus
 import dev.rangefind.wayfind.region.RegionStore
+import dev.rangefind.wayfind.region.ActiveTrip
 import dev.rangefind.wayfind.nav.NavUpdate
 import dev.rangefind.wayfind.nav.TravelMode
 import dev.rangefind.wayfind.ui.map.RenderCadence
 import dev.rangefind.wayfind.nav.TripRecorder
 import dev.rangefind.wayfind.nav.NavigationCore
+import dev.rangefind.wayfind.nav.NavigationService
 import dev.rangefind.wayfind.nav.RerouteLimiter
 import dev.rangefind.wayfind.nav.TravelHeading
 import kotlinx.coroutines.FlowPreview
@@ -139,6 +141,7 @@ class MapsViewModel(
     private val downloads = mutableMapOf<String, Job>()
 
     init {
+        installCrashRecorder()
         refreshRegions()
         viewModelScope.launch {
             // A region kept on the device wins over the network base: the user
@@ -154,7 +157,10 @@ class MapsViewModel(
             // Adopting a region changes which row reads as active.
             if (active != null) refreshRegions()
             runCatching { engine.init(searchBase, base) }
-                .onSuccess { info -> _state.update { it.copy(loading = false, info = info) } }
+                .onSuccess { info ->
+                    _state.update { it.copy(loading = false, info = info) }
+                    resumeInterruptedTrip()
+                }
                 .onFailure { error ->
                     _state.update {
                         it.copy(
@@ -605,7 +611,13 @@ class MapsViewModel(
             val place = resolved ?: Place(
                 id = "pin",
                 name = context.getString(R.string.place_dropped_pin),
-                address = String.format("%.5f, %.5f", point.lat, point.lon),
+                // Coordinates are written the way coordinates are written,
+                // not the way the device writes numbers: in French the
+                // default locale renders this "45,64015, -73,79837", where
+                // the same character separates the decimals and the pair.
+                address = String.format(
+                    java.util.Locale.ROOT, "%.5f, %.5f", point.lat, point.lon
+                ),
                 locality = "",
                 category = "",
                 type = "",
@@ -711,8 +723,101 @@ class MapsViewModel(
         if (regionPrefs.recordTrips) {
             recorder.start(_state.value.activeRoute, System.currentTimeMillis(), environment())
         }
+        // Guidance holds location while the app is out of sight, and the
+        // platform only allows that from a foreground service. Without one a
+        // phone call quietly starved navigation of fixes and could take the
+        // process with it, which is why a drive never came back afterwards.
+        NavigationService.start(context, _state.value.selected?.name.orEmpty())
+        // And on disk, in case the process goes anyway. The service makes
+        // that unlikely, not impossible, and a driver who loses the app
+        // mid-motorway should get their destination back rather than a
+        // search box.
+        _state.value.selected?.let { place ->
+            regionPrefs.activeTrip = ActiveTrip(
+                lat = place.lat,
+                lon = place.lon,
+                name = place.name,
+                address = place.address,
+                startedAtMillis = System.currentTimeMillis()
+            )
+        }
         _state.update { it.copy(sheet = SheetMode.Navigating, issueMarks = 0) }
         greeting?.let { _voice.tryEmit(it) }
+    }
+
+    /**
+     * Picks a drive back up after the app was taken away mid-trip.
+     *
+     * A phone call is the ordinary case: the activity goes, and with it the
+     * view model and every trace of where the driver was going. What comes
+     * back is a fresh app on a search screen, which is not a recovery — the
+     * driver is still on the motorway and now has to type.
+     *
+     * Resuming re-plans from the car's position now rather than restoring
+     * the old line: after several minutes on a call, the saved route starts
+     * somewhere the car left long ago, and adopting it would open the drive
+     * already off-route. A trip older than a few hours is not an interrupted
+     * drive, it is yesterday's, and is simply discarded.
+     */
+    private suspend fun resumeInterruptedTrip() {
+        val trip = regionPrefs.activeTrip ?: return
+        val age = System.currentTimeMillis() - trip.startedAtMillis
+        if (age !in 0..RESUME_WINDOW_MILLIS) {
+            regionPrefs.activeTrip = null
+            return
+        }
+        val here = _state.value.userLocation ?: locationProvider.lastKnown()
+            ?.let { LatLon(it.latitude, it.longitude) }
+        val destination = Place(
+            id = "",
+            name = trip.name,
+            address = trip.address,
+            locality = "",
+            category = "",
+            type = "",
+            lat = trip.lat,
+            lon = trip.lon,
+            distanceMeters = null
+        )
+        // With no fix yet there is nothing to route from. Put the driver back
+        // on the destination rather than on a blank search: one tap resumes,
+        // and nothing has been silently invented on their behalf.
+        if (here == null) {
+            _state.update { it.copy(selected = destination, sheet = SheetMode.Place) }
+            return
+        }
+        val bundle = runCatching {
+            engine.route(here, destination.point, alternatives = 0)
+        }.getOrNull()
+        if (bundle == null) {
+            _state.update { it.copy(selected = destination, sheet = SheetMode.Place) }
+            return
+        }
+        _state.update {
+            it.copy(selected = destination, routes = bundle, activeRouteIndex = 0)
+        }
+        startNavigation()
+    }
+
+    /**
+     * Puts the stack of a fatal crash into the drive's own trace.
+     *
+     * "The app closes when I arrive at the destination" is a report about a
+     * moment, and a moment is not something that can be fixed. The trace is
+     * already what a driver sends, and it already knows exactly where the
+     * drive was, so the crash belongs in it: the next such report arrives
+     * with the exception that caused it instead of a recollection of when.
+     *
+     * The previous handler is always called. Replacing it rather than
+     * chaining would swallow whatever reporting the platform does, and the
+     * one thing worse than a crash with no stack is a crash with no crash.
+     */
+    private fun installCrashRecorder() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            runCatching { recorder.noteCrash(error, System.currentTimeMillis()) }
+            previous?.uncaughtException(thread, error)
+        }
     }
 
     /**
@@ -728,6 +833,9 @@ class MapsViewModel(
     fun stopNavigation() {
         heading.stop()
         motion.reset()
+        rerouteLimiter.reset()
+        NavigationService.stop(context)
+        regionPrefs.activeTrip = null
         recorder.note("stopped-by-user", atMillis = System.currentTimeMillis())
         recordRenderCadence()
         recorder.stop()
@@ -851,7 +959,8 @@ class MapsViewModel(
             point = fused?.position ?: point,
             speedMps = fused?.speedMps ?: if (location.hasSpeed()) location.speed.toDouble() else 0.0,
             gpsBearing = fused?.bearing,
-            hasBearing = fused != null || location.hasBearing()
+            hasBearing = fused != null || location.hasBearing(),
+            accuracyMeters = if (location.hasAccuracy()) location.accuracy.toDouble() else 0.0
         )
         // Trace the fix whether or not the core made anything of it: a fix it
         // declined to use is exactly the kind of gap worth seeing afterwards.
@@ -866,6 +975,16 @@ class MapsViewModel(
             recordRenderCadence()
             recorder.stop()
             core.stop()
+            // Arriving ends the drive exactly as pressing stop does, and it
+            // was not doing any of the rest of it: the compass stayed
+            // registered, the motion model kept its last pose, and the
+            // foreground service kept the notification up over a trip that
+            // had finished.
+            heading.stop()
+            motion.reset()
+            rerouteLimiter.reset()
+            NavigationService.stop(context)
+            regionPrefs.activeTrip = null
             // Stopping the state machine is not finishing the drive: without
             // this the phone stayed on the navigation sheet at the doorstep,
             // with no guidance left to give and no way out but Back. The car
@@ -883,7 +1002,11 @@ class MapsViewModel(
         }
         if (update.offRoute) {
             // Reroute from where the car is pointing, not just where it is.
-            reroute(point, travelHeading(location))
+            reroute(
+                from = point,
+                heading = travelHeading(location),
+                accuracyMeters = if (location.hasAccuracy()) location.accuracy.toDouble() else 0.0
+            )
         } else {
             // Back on the line: whatever was last computed worked, so the next
             // bit of trouble starts from a clean slate rather than a backoff
@@ -913,7 +1036,7 @@ class MapsViewModel(
         else -> travel.fromMovement() ?: heading.bearing
     }
 
-    private fun reroute(from: LatLon, heading: Double?) {
+    private fun reroute(from: LatLon, heading: Double?, accuracyMeters: Double = 0.0) {
         val destination = _state.value.selected ?: return
         if (_state.value.rerouting) return
         val now = System.currentTimeMillis()
@@ -923,12 +1046,29 @@ class MapsViewModel(
         // the line waits longer than the last.
         if (!rerouteLimiter.shouldReroute(now)) return
         _state.update { it.copy(rerouting = true) }
-        recorder.note("reroute", detail = "heading=${heading ?: "none"}", atMillis = now)
+        recorder.note(
+            "reroute",
+            detail = "heading=${heading ?: "none"} accuracy=${accuracyMeters}",
+            atMillis = now
+        )
         if (rerouteLimiter.shouldAnnounce(now)) _voice.tryEmit(context.getString(R.string.nav_rerouting))
         viewModelScope.launch {
-            runCatching { engine.route(from, destination.point, alternatives = 0, fromHeading = heading) }
+            runCatching {
+                engine.route(
+                    from, destination.point,
+                    alternatives = 0,
+                    fromHeading = heading,
+                    accuracyMeters = accuracyMeters
+                )
+            }
                 .onSuccess { bundle ->
                     core.replaceRoutes(listOf(bundle.primary))
+                    // The replacement goes into the trace as well as into the
+                    // state machine. Without it a report of "it rerouted me
+                    // onto the wrong road" cannot be checked at all: the file
+                    // held the route the drive started with and nothing about
+                    // the eleven that replaced it.
+                    recorder.noteRoute(bundle.primary, System.currentTimeMillis())
                     _state.update { it.copy(routes = bundle, activeRouteIndex = 0, rerouting = false) }
                 }
                 .onFailure { _state.update { it.copy(rerouting = false) } }
@@ -936,6 +1076,13 @@ class MapsViewModel(
     }
 
     companion object {
+        /**
+         * How long an interrupted drive stays resumable. Long enough to
+         * cover a call, a fuel stop or a coffee; short enough that opening
+         * the app the next morning does not restart yesterday's trip.
+         */
+        private const val RESUME_WINDOW_MILLIS = 3 * 60 * 60 * 1000L
+
         fun factory(
             context: Context,
             engine: RangefindEngine,

@@ -54,6 +54,21 @@ val REGION_CATALOG = listOf(
 )
 
 /**
+ * A drive the app was in the middle of when it was interrupted.
+ *
+ * Only the destination, deliberately. Resuming means routing again from
+ * wherever the car is now — a saved route computed before a five-minute phone
+ * call starts somewhere the car has long since left.
+ */
+data class ActiveTrip(
+    val lat: Double,
+    val lon: Double,
+    val name: String,
+    val address: String,
+    val startedAtMillis: Long
+)
+
+/**
  * Remembers which region is in use and where they are fetched from. The host
  * is editable because a phone on Wi-Fi cannot reach the emulator's 10.0.2.2
  * loopback alias — it needs the development machine's LAN address.
@@ -95,6 +110,47 @@ class RegionPreferences(context: Context) {
         get() = TravelMode.ofProfile(prefs.getString(KEY_MODE, null))
         set(value) = prefs.edit().putString(KEY_MODE, value.profile).apply()
 
+    /**
+     * The drive in progress, so it survives the app being taken away.
+     *
+     * A phone call can cost the app its activity, and with the activity goes
+     * the view model and everything the drive knew — where it was going most
+     * of all. The driver comes back to a search box. Storing the destination
+     * is what lets guidance be picked up again from wherever the car has got
+     * to by then, which is the only sensible place to resume from anyway:
+     * the old route describes a position several minutes stale.
+     *
+     * Cleared when the drive ends, by arrival or by hand, so returning to the
+     * app the next morning does not offer to resume yesterday.
+     */
+    var activeTrip: ActiveTrip?
+        get() {
+            // Stored as text: SharedPreferences has no double, and a float
+            // rounds a coordinate by about a metre.
+            val lat = prefs.getString(KEY_TRIP_LAT, null)?.toDoubleOrNull()
+            val lon = prefs.getString(KEY_TRIP_LON, null)?.toDoubleOrNull()
+            if (lat == null || lon == null) return null
+            return ActiveTrip(
+                lat = lat,
+                lon = lon,
+                name = prefs.getString(KEY_TRIP_NAME, "").orEmpty(),
+                address = prefs.getString(KEY_TRIP_ADDRESS, "").orEmpty(),
+                startedAtMillis = prefs.getLong(KEY_TRIP_AT, 0L)
+            )
+        }
+        set(value) = prefs.edit().apply {
+            if (value == null) {
+                remove(KEY_TRIP_LAT); remove(KEY_TRIP_LON)
+                remove(KEY_TRIP_NAME); remove(KEY_TRIP_ADDRESS); remove(KEY_TRIP_AT)
+            } else {
+                putString(KEY_TRIP_LAT, value.lat.toString())
+                putString(KEY_TRIP_LON, value.lon.toString())
+                putString(KEY_TRIP_NAME, value.name)
+                putString(KEY_TRIP_ADDRESS, value.address)
+                putLong(KEY_TRIP_AT, value.startedAtMillis)
+            }
+        }.apply()
+
     fun sourceUrlOf(id: String) = "$host/$id-index/"
 
     private companion object {
@@ -103,6 +159,11 @@ class RegionPreferences(context: Context) {
         const val KEY_CHOSEN = "chosen"
         const val KEY_RECORD = "recordTrips"
         const val KEY_MODE = "travelMode"
+        const val KEY_TRIP_LAT = "tripLat"
+        const val KEY_TRIP_LON = "tripLon"
+        const val KEY_TRIP_NAME = "tripName"
+        const val KEY_TRIP_ADDRESS = "tripAddress"
+        const val KEY_TRIP_AT = "tripAt"
         /** The emulator's alias for the development machine's loopback. */
         const val DEFAULT_HOST = "http://10.0.2.2:5185"
     }
