@@ -246,6 +246,12 @@ buffer and a full compressed buffer for large partitions. The main thread still
 owns final directory assembly, which keeps range lookup deterministic while
 moving partition encoding off the main event loop.
 
+Dense document-pointer tables are measured and emitted in fixed-size batches.
+Each batch is written to a temporary file and fed into the content SHA-256
+incrementally before an atomic content-addressed rename. The serialized format
+is unchanged, but continent-scale tables no longer require a multi-gigabyte
+`Buffer` or exceed Node/OpenSSL's single `Hash.update()` input limit.
+
 The temporary build code store uses four-byte facet cells: empty and
 single-valued rows are encoded inline, while only genuinely multi-valued rows
 use an overflow file. Sequential column writes are coalesced into bounded

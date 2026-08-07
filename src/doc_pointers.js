@@ -81,34 +81,36 @@ export function buildDocPointerTable(entries, packIndexes, options = {}) {
   return { buffer, meta };
 }
 
-export function buildDocPointerTableFromReader(count, packIndexes, readEntry, options = {}) {
+function* pointerEntryBatches(count, readEntry, options, pass) {
   const batchSize = Math.max(1, Math.floor(Number(options.batchSize || 65536)));
-  const visitEntries = (pass, visitor) => {
-    if (typeof options.readBatch !== "function") {
-      for (let i = 0; i < count; i++) visitor(readEntry(i), i);
-      return;
+  for (let start = 0; start < count; start += batchSize) {
+    const expected = Math.min(batchSize, count - start);
+    const entries = typeof options.readBatch === "function"
+      ? options.readBatch(start, expected, pass)
+      : Array.from({ length: expected }, (_, row) => readEntry(start + row));
+    if (!Array.isArray(entries) || entries.length !== expected) {
+      throw new Error(`Rangefind doc pointer batch at ${start} returned ${entries?.length ?? 0} of ${expected} entries.`);
     }
-    for (let start = 0; start < count; start += batchSize) {
-      const expected = Math.min(batchSize, count - start);
-      const entries = options.readBatch(start, expected, pass);
-      if (!Array.isArray(entries) || entries.length !== expected) {
-        throw new Error(`Rangefind doc pointer batch at ${start} returned ${entries?.length ?? 0} of ${expected} entries.`);
-      }
-      for (let row = 0; row < entries.length; row++) visitor(entries[row], start + row);
-    }
-  };
+    yield { start, entries };
+  }
+}
+
+export function streamDocPointerTableFromReader(count, packIndexes, readEntry, options = {}) {
+  if (typeof options.write !== "function") throw new Error("Rangefind streamed doc pointer table needs a write callback.");
   let maxPack = 0;
   let maxOffset = 0;
   let maxLength = 0;
   let maxLogicalLength = 0;
-  visitEntries("measure", (entry) => {
-    const packIndex = packIndexes.get(entry.pack);
-    if (!Number.isFinite(packIndex)) throw new Error(`Rangefind doc pointer references unknown pack ${entry.pack}.`);
-    maxPack = Math.max(maxPack, packIndex);
-    maxOffset = Math.max(maxOffset, entry.offset || 0);
-    maxLength = Math.max(maxLength, entry.length || 0);
-    maxLogicalLength = Math.max(maxLogicalLength, entry.logicalLength || 0);
-  });
+  for (const { entries } of pointerEntryBatches(count, readEntry, options, "measure")) {
+    for (const entry of entries) {
+      const packIndex = packIndexes.get(entry.pack);
+      if (!Number.isFinite(packIndex)) throw new Error(`Rangefind doc pointer references unknown pack ${entry.pack}.`);
+      maxPack = Math.max(maxPack, packIndex);
+      maxOffset = Math.max(maxOffset, entry.offset || 0);
+      maxLength = Math.max(maxLength, entry.length || 0);
+      maxLogicalLength = Math.max(maxLogicalLength, entry.logicalLength || 0);
+    }
+  }
   const widths = {
     pack: fixedWidth([maxPack]),
     offset: fixedWidth([maxOffset]),
@@ -126,21 +128,34 @@ export function buildDocPointerTableFromReader(count, packIndexes, readEntry, op
   };
   const header = headerBytes(meta, options.magic || DOC_POINTER_PAGE_MAGIC);
   meta.dataOffset = header.length;
-  const buffer = Buffer.alloc(meta.dataOffset + count * recordBytes);
-  buffer.set(header, 0);
-  visitEntries("write", (entry, i) => {
-    let offset = meta.dataOffset + i * recordBytes;
-    writeFixedInt(buffer, offset, widths.pack, packIndexes.get(entry.pack));
-    offset += widths.pack;
-    writeFixedInt(buffer, offset, widths.offset, entry.offset);
-    offset += widths.offset;
-    writeFixedInt(buffer, offset, widths.length, entry.length);
-    offset += widths.length;
-    writeFixedInt(buffer, offset, widths.logicalLength, entry.logicalLength || 0);
-    offset += widths.logicalLength;
-    buffer.set(checksumToBytes(entry.checksum), offset);
+  options.write(header);
+  for (const { entries } of pointerEntryBatches(count, readEntry, options, "write")) {
+    const buffer = Buffer.allocUnsafe(entries.length * recordBytes);
+    for (let row = 0; row < entries.length; row++) {
+      const entry = entries[row];
+      let offset = row * recordBytes;
+      writeFixedInt(buffer, offset, widths.pack, packIndexes.get(entry.pack));
+      offset += widths.pack;
+      writeFixedInt(buffer, offset, widths.offset, entry.offset);
+      offset += widths.offset;
+      writeFixedInt(buffer, offset, widths.length, entry.length);
+      offset += widths.length;
+      writeFixedInt(buffer, offset, widths.logicalLength, entry.logicalLength || 0);
+      offset += widths.logicalLength;
+      buffer.set(checksumToBytes(entry.checksum), offset);
+    }
+    options.write(buffer);
+  }
+  return { meta, bytes: meta.dataOffset + count * recordBytes };
+}
+
+export function buildDocPointerTableFromReader(count, packIndexes, readEntry, options = {}) {
+  const chunks = [];
+  const streamed = streamDocPointerTableFromReader(count, packIndexes, readEntry, {
+    ...options,
+    write: chunk => chunks.push(Buffer.from(chunk))
   });
-  return { buffer, meta };
+  return { buffer: Buffer.concat(chunks, streamed.bytes), meta: streamed.meta };
 }
 
 export function parseDocPointerHeader(buffer, options = {}) {

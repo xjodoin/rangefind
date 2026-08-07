@@ -189,6 +189,11 @@
 
 ### Fixed
 
+- Stream dense document-pointer tables to disk while hashing them in bounded
+  batches. Very large corpora such as Brazil no longer fail after doc packing
+  with Node's `ERR_OUT_OF_RANGE: data is too long`, and avoid retaining the
+  entire multi-gigabyte pointer table in memory.
+
 - (superseded) The draft per-record proof-of-work was first made
   non-blocking (`minePowChunked`, sliced mining with a wall-clock
   budget), then removed entirely with the rest of per-record PoW when

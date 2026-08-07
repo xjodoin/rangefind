@@ -105,7 +105,7 @@ import {
   encodeDocValueSortPage
 } from "./doc_value_tree.js";
 import { createFilterBitmap, encodeFilterBitmap, FILTER_BITMAP_FORMAT, setFilterBitmapBit } from "./filter_bitmaps.js";
-import { buildDocPointerTableFromReader } from "./doc_pointers.js";
+import { streamDocPointerTableFromReader } from "./doc_pointers.js";
 import { createJsonlReadStream, eachJsonLine } from "./jsonl.js";
 import { createFieldRowPipeline } from "./field_rows.js";
 import { OBJECT_CHECKSUM_ALGORITHM, OBJECT_NAME_HASH_LENGTH, OBJECT_POINTER_FORMAT, OBJECT_STORE_FORMAT } from "./object_store.js";
@@ -1040,24 +1040,52 @@ async function finishDocPacks(out, spool, total, config) {
   const packIndexes = new Map(packWriter.packs.map((pack, index) => [pack.file, index]));
   const packFiles = packTable(packWriter.packs);
   const entryInFd = openSync(entryPath, "r");
+  const pointerDir = resolve(out, "docs", "pointers");
+  mkdirSync(pointerDir, { recursive: true });
+  const pointerTmp = resolve(pointerDir, `0000.${process.pid}.${Date.now()}.tmp`);
+  const pointerFd = openSync(pointerTmp, "w");
+  const pointerHash = createHash("sha256");
   let pointerTable;
+  let pointerFailure = null;
   try {
-    pointerTable = buildDocPointerTableFromReader(
+    pointerTable = streamDocPointerTableFromReader(
       total,
       packIndexes,
       doc => readPackedDocEntry(entryInFd, doc, packFiles),
       {
         batchSize: Math.max(1, Math.floor(Number(config.docPointerReadBatchDocs || 65536))),
-        readBatch: (start, count, pass) => readPackedDocEntryBatch(entryInFd, start, count, packFiles, pass === "write")
+        readBatch: (start, count, pass) => readPackedDocEntryBatch(entryInFd, start, count, packFiles, pass === "write"),
+        write(chunk) {
+          pointerHash.update(chunk);
+          let offset = 0;
+          while (offset < chunk.length) {
+            const written = writeSync(pointerFd, chunk, offset, chunk.length - offset);
+            if (!written) throw new Error("Rangefind doc pointer table write made no progress.");
+            offset += written;
+          }
+        }
       }
     );
+  } catch (error) {
+    pointerFailure = error;
   } finally {
     closeSync(entryInFd);
+    closeSync(pointerFd);
   }
-  const hash = sha256Hex(pointerTable.buffer);
+  if (pointerFailure) {
+    rmSync(pointerTmp, { force: true });
+    throw pointerFailure;
+  }
+  const hash = pointerHash.digest("hex");
   const file = `docs/pointers/${hashedFile("0000", hash, ".bin.gz")}`;
-  mkdirSync(resolve(out, "docs", "pointers"), { recursive: true });
-  writeFileSync(resolve(out, file), pointerTable.buffer);
+  const pointerPath = resolve(out, file);
+  try {
+    if (existsSync(pointerPath)) rmSync(pointerTmp, { force: true });
+    else renameSync(pointerTmp, pointerPath);
+  } catch (error) {
+    rmSync(pointerTmp, { force: true });
+    throw error;
+  }
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
@@ -1074,7 +1102,7 @@ async function finishDocPacks(out, spool, total, config) {
       order: "doc-id",
       content_hash: hash,
       immutable: true,
-      bytes: pointerTable.buffer.length,
+      bytes: pointerTable.bytes,
       pack_table: packTable(packWriter.packs)
     },
     packs: packWriter.packs
