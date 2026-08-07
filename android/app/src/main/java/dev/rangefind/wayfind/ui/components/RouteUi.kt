@@ -64,6 +64,8 @@ import androidx.compose.material.icons.filled.DirectionsWalk
 import dev.rangefind.wayfind.engine.LaneTurn
 import androidx.compose.material.icons.filled.CallSplit
 import androidx.compose.material.icons.filled.MergeType
+import androidx.compose.material.icons.filled.RotateRight
+import androidx.compose.material.icons.filled.DirectionsBoat
 import dev.rangefind.wayfind.nav.ItineraryLine
 import dev.rangefind.wayfind.nav.Maneuver
 import dev.rangefind.wayfind.nav.TravelMode
@@ -312,12 +314,36 @@ private fun StepsPreview(route: Route) {
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(Modifier.width(14.dp))
+                // The exit number leads the line, the way it leads the sign.
+                val plate = when {
+                    line.exitRef.isNotBlank() ->
+                        stringResource(R.string.nav_exit_number_label, line.exitRef)
+                    line.maneuver == Maneuver.Roundabout && line.roundaboutExit > 0 ->
+                        stringResource(R.string.nav_roundabout_exit_label, line.roundaboutExit)
+                    else -> ""
+                }
+                if (plate.isNotBlank()) {
+                    Surface(
+                        shape = SIGN_PLATE,
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Text(
+                            plate,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                }
                 Text(
                     line.name.ifBlank {
                         stringResource(
                             when (line.maneuver) {
                                 Maneuver.Exit -> R.string.nav_exit_label
                                 Maneuver.Merge -> R.string.nav_merge_label
+                                Maneuver.Roundabout -> R.string.nav_roundabout_label
+                                Maneuver.Ferry -> R.string.nav_ferry_label
                                 else -> R.string.directions_unnamed_road
                             }
                         )
@@ -380,6 +406,8 @@ fun NavigationOverlay(
     val continueLabel = stringResource(R.string.nav_continue)
     val exitLabel = stringResource(R.string.nav_exit_label)
     val mergeLabel = stringResource(R.string.nav_merge_label)
+    val roundaboutLabel = stringResource(R.string.nav_roundabout_label)
+    val ferryLabel = stringResource(R.string.nav_ferry_label)
 
     Box(Modifier.fillMaxSize()) {
 
@@ -403,6 +431,11 @@ fun NavigationOverlay(
                         when {
                             nav?.maneuver == Maneuver.Exit -> Icons.Filled.CallSplit
                             nav?.maneuver == Maneuver.Merge -> Icons.Filled.MergeType
+                            // A roundabout's turn angle describes the curve of
+                            // the circle, not where the driver ends up, so the
+                            // geometry-derived arrow is worse than no arrow.
+                            nav?.maneuver == Maneuver.Roundabout -> Icons.Filled.RotateRight
+                            nav?.maneuver == Maneuver.Ferry -> Icons.Filled.DirectionsBoat
                             route != null && nav != null -> maneuverIcon(route, nav.stepIndex + 1)
                             else -> Icons.Filled.Straight
                         },
@@ -412,12 +445,40 @@ fun NavigationOverlay(
                     )
                     Spacer(Modifier.width(16.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(
-                            nav?.let { formatManeuverDistance(context, it.metersToManeuver) }
-                                ?: placeholder,
-                            style = MaterialTheme.typography.headlineMedium,
-                            color = MaterialTheme.colorScheme.onPrimary
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                nav?.let { formatManeuverDistance(context, it.metersToManeuver) }
+                                    ?: placeholder,
+                                style = MaterialTheme.typography.headlineMedium,
+                                color = MaterialTheme.colorScheme.onPrimary
+                            )
+                            // The exit number, drawn as the plate it is. A
+                            // driver approaching an interchange is reading
+                            // panels for a number, and "take the exit" does
+                            // not tell them whether this one is theirs.
+                            val plate = when {
+                                nav == null -> ""
+                                nav.exitRef.isNotBlank() ->
+                                    stringResource(R.string.nav_exit_number_label, nav.exitRef)
+                                nav.maneuver == Maneuver.Roundabout && nav.roundaboutExit > 0 ->
+                                    stringResource(R.string.nav_roundabout_exit_label, nav.roundaboutExit)
+                                else -> ""
+                            }
+                            if (plate.isNotBlank()) {
+                                Spacer(Modifier.width(10.dp))
+                                Surface(
+                                    shape = SIGN_PLATE,
+                                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f)
+                                ) {
+                                    Text(
+                                        plate,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.onPrimary,
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+                        }
                         Text(
                             // What the voice is about to say, verbatim. Falling
                             // back to the road being driven on told a driver to
@@ -427,6 +488,8 @@ fun NavigationOverlay(
                                 when (nav.maneuver) {
                                     Maneuver.Exit -> exitLabel
                                     Maneuver.Merge -> mergeLabel
+                                    Maneuver.Roundabout -> roundaboutLabel
+                                    Maneuver.Ferry -> ferryLabel
                                     else -> continueLabel
                                 }
                             } ?: continueLabel,
@@ -830,9 +893,12 @@ private fun turnDeltaAtStep(route: Route, index: Int): Double {
 private fun itineraryIcon(route: Route, line: ItineraryLine): ImageVector = when (line.maneuver) {
     // A slip road curves gently whichever way it goes, so the arrow has to
     // come from what the ramp does rather than from its geometry — otherwise
-    // leaving a motorway and joining one draw the same picture.
+    // leaving a motorway and joining one draw the same picture. A roundabout
+    // is the same problem in the extreme: its angles describe a circle.
     Maneuver.Exit -> Icons.Filled.CallSplit
     Maneuver.Merge -> Icons.Filled.MergeType
+    Maneuver.Roundabout -> Icons.Filled.RotateRight
+    Maneuver.Ferry -> Icons.Filled.DirectionsBoat
     else -> maneuverIcon(route, line.index)
 }
 

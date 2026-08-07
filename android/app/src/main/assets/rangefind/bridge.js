@@ -129,7 +129,17 @@ function trimRoute(route) {
       // The kind of road this step runs on, resolved here so the app never
       // needs the index's class table. A ramp is unnamed far more often than
       // not, and its class is the only thing that says what it is.
-      roadClass: routeEngine?.root?.classes?.[step.roadClass] || ""
+      roadClass: routeEngine?.root?.classes?.[step.roadClass] || "",
+      // What the signs say, which on a motorway is the only thing a driver
+      // can act on: the road's number, the exit's number, and what the slip
+      // road leads to. Semicolon-separated lists as OSM writes them.
+      ref: step.ref || "",
+      exitRef: step.exitRef || "",
+      destinationRef: step.destinationRef || "",
+      destination: step.destination || "",
+      // A roundabout is one maneuver, and the exit is the instruction.
+      roundabout: Boolean(step.roundabout),
+      roundaboutExit: step.roundaboutExit ?? 0
     })),
     // Where the posted limit changes, as a step function over distance
     // travelled. A step is one street and a street routinely carries several
@@ -344,7 +354,7 @@ const handlers = {
     return { place: places[0] || null };
   },
 
-  async route({ from, to, alternatives, departureTime, fromHeading }) {
+  async route({ from, to, alternatives, departureTime, fromHeading, accuracyMeters }) {
     if (!routeEngine) throw new Error(routeUnavailable || "Routing unavailable");
     // Live traffic when the mesh has any, the static metric otherwise —
     // the router's degradation contract means this needs no branch.
@@ -364,7 +374,13 @@ const handlers = {
       // Only sent while actually moving: a heading from a standing vehicle is
       // noise, and biasing the snap with it would invent a U-turn penalty for
       // a driver who is free to pull away in either direction.
-      ...(Number.isFinite(fromHeading) ? { fromHeading } : {})
+      ...(Number.isFinite(fromHeading) ? { fromHeading } : {}),
+      // How good the fix that produced `from` actually was. The snap widens
+      // its candidate band to match, because a band narrower than the error
+      // throws away the road the car is on before anything can weigh it —
+      // which is how a driver on a service road beside the A-13 was handed a
+      // route down the motorway, over and over.
+      ...(Number.isFinite(accuracyMeters) ? { accuracyMeters } : {})
     });
     return {
       primary: trimRoute(result),

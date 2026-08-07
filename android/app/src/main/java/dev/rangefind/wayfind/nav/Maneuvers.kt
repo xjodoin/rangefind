@@ -27,6 +27,18 @@ enum class Maneuver {
     Exit,
     /** Joining a faster road by a slip road. */
     Merge,
+    /**
+     * Entering a roundabout, which is one instruction and not the two or
+     * three nameless arcs it is built from.
+     *
+     * The turn angle is useless here: it describes the curve of the circle,
+     * not which way the driver ends up going, so a roundabout followed by a
+     * left turn was drawn — and spoken — as "bear right". What a driver
+     * needs is the exit to count to, which is why the index carries it.
+     */
+    Roundabout,
+    /** Boarding a ferry. */
+    Ferry,
     Arrive
 }
 
@@ -55,6 +67,8 @@ const val STRAIGHT_DEGREES = 22.0
 fun maneuverOnto(route: Route, index: Int, turnDelta: Double): Maneuver {
     val step = route.steps.getOrNull(index) ?: return Maneuver.Continue
     if (index >= route.steps.lastIndex) return Maneuver.Arrive
+    if (step.roundabout) return Maneuver.Roundabout
+    if (step.isFerry) return Maneuver.Ferry
     if (isRamp(step)) {
         val from = rankOf(route.steps.getOrNull(index - 1)?.roadClass.orEmpty())
         // The road the ramp actually leads to, past any further ramps.
@@ -98,7 +112,11 @@ data class ItineraryLine(
     val index: Int,
     val name: String,
     val meters: Double,
-    val maneuver: Maneuver
+    val maneuver: Maneuver,
+    /** Exit number off the sign, when the maneuver has one. */
+    val exitRef: String = "",
+    /** Which exit of a roundabout to take; 0 when unknown. */
+    val roundaboutExit: Int = 0
 )
 
 fun itineraryOf(route: Route, turnDeltaAt: (Int) -> Double): List<ItineraryLine> {
@@ -109,14 +127,47 @@ fun itineraryOf(route: Route, turnDeltaAt: (Int) -> Double): List<ItineraryLine>
         val fold = index > 0 && !isWorthAnnouncing(route, index, delta)
         if (fold && lines.isNotEmpty()) {
             val last = lines.removeAt(lines.lastIndex)
-            // Keep the name the driver is on unless it had none.
             lines += last.copy(
                 meters = last.meters + step.meters,
-                name = last.name.ifBlank { step.name }
+                // Keep the name the driver is on unless it had none — except
+                // on a roundabout, where the circle's own name (when it even
+                // has one) is not the instruction. What the driver needs is
+                // the road they come off onto, which is this step.
+                name = if (last.maneuver == Maneuver.Roundabout && step.name.isNotBlank()) step.name
+                else last.name.ifBlank { step.name }
             )
         } else {
-            lines += ItineraryLine(index, step.name, step.meters, maneuver)
+            lines += ItineraryLine(
+                index = index,
+                // A motorway is signed by its number, never by its name. The
+                // itinerary reads the same way the panels do.
+                name = signpostName(step),
+                meters = step.meters,
+                maneuver = maneuver,
+                exitRef = step.exitRef,
+                roundaboutExit = step.roundaboutExit
+            )
         }
     }
     return lines
+}
+
+/**
+ * How a step should be written down.
+ *
+ * A slip road is where the sign does the most work: it has no name, so the
+ * only useful thing to say is where it goes — "40 Ouest", "Montréal". The
+ * road it leads onto says its number first and its name second, because that
+ * is the order they appear overhead.
+ */
+fun signpostName(step: RouteStep): String {
+    if (step.roadClass.endsWith("_link")) {
+        val toward = step.towardLabel
+        if (toward.isNotBlank()) return toward
+    }
+    val ref = step.signLabel
+    if (ref.isBlank() || ref == step.name) return step.name
+    // Both, when the road has a number and a name that differ and there is
+    // something to be gained from saying so — "40 · Autoroute Félix-Leclerc".
+    return if (step.name.isBlank()) ref else "$ref · ${step.name}"
 }

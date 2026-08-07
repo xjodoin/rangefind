@@ -19,6 +19,7 @@ import androidx.car.app.navigation.model.TravelEstimate
 import androidx.car.app.model.DateTimeWithZone
 import androidx.core.graphics.drawable.IconCompat
 import androidx.lifecycle.lifecycleScope
+import dev.rangefind.wayfind.nav.Maneuver as NavManeuver
 import dev.rangefind.wayfind.R
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -96,11 +97,27 @@ class DriveScreen(
 
     private fun currentStep(state: CarState): Step = Step.Builder()
         .setCue(
-            state.nextStepName.ifBlank { state.stepName }
-                .ifBlank { carContext.getString(R.string.nav_continue) }
+            // What the driver is being told to do, written the way the signs
+            // are: "Sortie 32 · 40 Ouest" rather than the name of a road that
+            // appears on no panel anywhere.
+            cueFor(state).ifBlank { carContext.getString(R.string.nav_continue) }
         )
-        .setManeuver(Maneuver.Builder(maneuverType(state.turnDelta)).build())
+        .setManeuver(Maneuver.Builder(maneuverType(state)).build())
         .build()
+
+    private fun cueFor(state: CarState): String {
+        val target = state.maneuverTarget.ifBlank { state.nextStepName }.ifBlank { state.stepName }
+        val plate = when {
+            state.exitRef.isNotBlank() ->
+                carContext.getString(R.string.nav_exit_number_label, state.exitRef)
+            state.maneuver == NavManeuver.Roundabout && state.roundaboutExit > 0 ->
+                carContext.getString(R.string.nav_roundabout_exit_label, state.roundaboutExit)
+            else -> ""
+        }
+        return if (plate.isBlank()) target
+        else if (target.isBlank()) plate
+        else "$plate · $target"
+    }
 
     override fun onGetTemplate(): Template {
         val state = navigator.state.value
@@ -159,7 +176,27 @@ class DriveScreen(
             .build()
     }
 
-    private fun maneuverType(delta: Double) = when {
+    /**
+     * The glyph the head unit draws.
+     *
+     * Read from what the maneuver *is* wherever that is known, and only from
+     * the turn angle otherwise. A roundabout's angles describe the curve of
+     * the circle rather than where the driver ends up, and a slip road bends
+     * gently whichever way it goes — so both drew arrows that contradicted
+     * what the voice was saying at the same moment.
+     */
+    private fun maneuverType(state: CarState) = when (state.maneuver) {
+        NavManeuver.Roundabout ->
+            if (state.roundaboutExit > 0) Maneuver.TYPE_ROUNDABOUT_ENTER_AND_EXIT_CW
+            else Maneuver.TYPE_ROUNDABOUT_ENTER_CW
+        NavManeuver.Exit -> Maneuver.TYPE_OFF_RAMP_NORMAL_RIGHT
+        NavManeuver.Merge -> Maneuver.TYPE_ON_RAMP_NORMAL_RIGHT
+        NavManeuver.Ferry -> Maneuver.TYPE_FERRY_BOAT
+        NavManeuver.Arrive -> Maneuver.TYPE_DESTINATION
+        else -> turnGlyph(state.turnDelta)
+    }
+
+    private fun turnGlyph(delta: Double) = when {
         abs(delta) > 150 -> Maneuver.TYPE_U_TURN_LEFT
         delta <= -60 -> Maneuver.TYPE_TURN_NORMAL_LEFT
         delta <= -22 -> Maneuver.TYPE_TURN_SLIGHT_LEFT

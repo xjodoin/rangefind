@@ -29,7 +29,15 @@ interface RangefindEngine {
         from: LatLon,
         to: LatLon,
         alternatives: Int = 2,
-        fromHeading: Double? = null
+        fromHeading: Double? = null,
+        /**
+         * The error bar on the fix [from] came from. The snap widens its
+         * candidate band to match: a band narrower than the error discards
+         * the road the car is on before anything can weigh it, which is how
+         * a car on a service road beside a motorway gets routed onto the
+         * motorway.
+         */
+        accuracyMeters: Double? = null
     ): RouteBundle
     suspend fun snap(point: LatLon): SnapPoint?
 
@@ -178,8 +186,48 @@ data class RouteStep(
      * so on. A slip road is unnamed far more often than not, so its class is
      * the only thing that says it is a ramp at all.
      */
-    val roadClass: String = ""
-)
+    val roadClass: String = "",
+    /**
+     * The road's own number, as written on the sign: "40", "A 13". On a
+     * motorway this is the only label a driver can act on — the name is
+     * never posted, and "Autoroute Félix-Leclerc" describes a road nobody
+     * can find a sign for.
+     */
+    val ref: String = "",
+    /** The exit number off the green panel: "32", "89-N". */
+    val exitRef: String = "",
+    /**
+     * What a slip road leads to, numbered and with its cardinal: "20 Est",
+     * "25 Nord;40". This is where a direction actually comes from — OSM
+     * tags direction on only a handful of route relations, but it is on
+     * thousands of ramps, because that is what the sign says.
+     */
+    val destinationRef: String = "",
+    /** The places named on the sign: "Montréal;Québec". */
+    val destination: String = "",
+    /** Whether this step runs inside a roundabout. */
+    val roundabout: Boolean = false,
+    /** Which exit of that roundabout the route leaves by; 0 when unknown. */
+    val roundaboutExit: Int = 0
+) {
+    /** A crossing by boat rather than by road. */
+    val isFerry: Boolean get() = roadClass == "ferry"
+
+    /**
+     * The label to guide by: the number if the road has one, its name
+     * otherwise. Semicolon lists are cut to their first entry — a banner has
+     * room for one answer, and the first is the one the sign leads with.
+     */
+    val signLabel: String
+        get() = firstOf(ref).ifBlank { name }
+
+    /** Where a slip road leads, as the sign puts it: "20 Est". */
+    val towardLabel: String
+        get() = firstOf(destinationRef).ifBlank { firstOf(destination) }
+}
+
+private fun firstOf(list: String): String =
+    list.substringBefore(';').trim()
 
 /** Lane movement bits, matching the route index's own encoding. */
 object LaneTurn {

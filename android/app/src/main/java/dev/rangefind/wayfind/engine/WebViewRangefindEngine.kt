@@ -193,7 +193,8 @@ class WebViewRangefindEngine(context: Context) : RangefindEngine {
         from: LatLon,
         to: LatLon,
         alternatives: Int,
-        fromHeading: Double?
+        fromHeading: Double?,
+        accuracyMeters: Double?
     ): RouteBundle {
         val payload = call(
             "route",
@@ -202,6 +203,7 @@ class WebViewRangefindEngine(context: Context) : RangefindEngine {
                 .put("to", JSONObject().put("lat", to.lat).put("lon", to.lon))
                 .put("alternatives", alternatives)
                 .apply { fromHeading?.let { put("fromHeading", it) } }
+                .apply { accuracyMeters?.takeIf { it > 0 }?.let { put("accuracyMeters", it) } }
         )
         val primary = payload.optJSONObject("primary")?.toRoute()
             ?: throw RangefindException("No route found")
@@ -329,7 +331,13 @@ private fun JSONObject.toRoute(): Route {
                 lanes = it.optJSONArray("lanes")?.let { array ->
                     List(array.length()) { index -> array.optInt(index) }
                 } ?: emptyList(),
-                speedLimitKmh = it.optInt("speedLimitKmh")
+                speedLimitKmh = it.optInt("speedLimitKmh"),
+                ref = it.optString("ref", ""),
+                exitRef = it.optString("exitRef", ""),
+                destinationRef = it.optString("destinationRef", ""),
+                destination = it.optString("destination", ""),
+                roundabout = it.optBoolean("roundabout", false),
+                roundaboutExit = it.optInt("roundaboutExit", 0)
             )
         },
         junctions = optJSONArray("junctions").map {

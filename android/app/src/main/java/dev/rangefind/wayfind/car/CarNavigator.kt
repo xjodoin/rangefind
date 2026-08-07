@@ -12,6 +12,7 @@ import dev.rangefind.wayfind.engine.Place
 import dev.rangefind.wayfind.engine.Route
 import dev.rangefind.wayfind.engine.RouteBundle
 import dev.rangefind.wayfind.nav.GuidanceSpeaker
+import dev.rangefind.wayfind.nav.Maneuver
 import dev.rangefind.wayfind.nav.NavAlternative
 import dev.rangefind.wayfind.nav.NavigationCore
 import kotlinx.coroutines.CoroutineScope
@@ -49,6 +50,19 @@ data class CarState(
     val speedMps: Double = 0.0,
     val speedLimitKmh: Int = 0,
     val turnDelta: Double = 0.0,
+    /**
+     * What the next instruction actually is, rather than a turn angle. A
+     * roundabout's angles describe the curve of the circle and a slip road's
+     * describe a gentle bend whichever way it goes, so neither can be read
+     * off the geometry the head unit was reading it off.
+     */
+    val maneuver: Maneuver = Maneuver.Continue,
+    /** The road the maneuver leads onto, written the way the signs are. */
+    val maneuverTarget: String = "",
+    /** The exit number on the panel, when this one has one. */
+    val exitRef: String = "",
+    /** Which exit to take at a roundabout; 0 when unknown. */
+    val roundaboutExit: Int = 0,
     val alternatives: List<NavAlternative> = emptyList(),
     val rerouting: Boolean = false
 ) {
@@ -199,14 +213,21 @@ class CarNavigator(private val context: Context) {
             location.bearing.toDouble()
         } else null
 
-    private fun reroute(from: LatLon, heading: Double?) {
+    private fun reroute(from: LatLon, heading: Double?, accuracyMeters: Double = 0.0) {
         val destination = _state.value.destination ?: return
         if (_state.value.rerouting) return
         _state.update { it.copy(rerouting = true) }
         say(context.getString(R.string.nav_rerouting))
         scope.launch {
             val engine = WayfindRuntime.engineOrNull() ?: return@launch
-            runCatching { engine.route(from, destination.point, alternatives = 0, fromHeading = heading) }
+            runCatching {
+                engine.route(
+                    from, destination.point,
+                    alternatives = 0,
+                    fromHeading = heading,
+                    accuracyMeters = accuracyMeters
+                )
+            }
                 .onSuccess { bundle ->
                     core.replaceRoutes(listOf(bundle.primary))
                     _state.update { it.copy(routes = bundle, rerouting = false) }
@@ -223,7 +244,8 @@ class CarNavigator(private val context: Context) {
             point = point,
             speedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0,
             gpsBearing = if (location.hasBearing()) location.bearing.toDouble() else null,
-            hasBearing = location.hasBearing()
+            hasBearing = location.hasBearing(),
+            accuracyMeters = if (location.hasAccuracy()) location.accuracy.toDouble() else 0.0
         ) ?: return
 
         update.voice?.let { say(it) }
@@ -241,6 +263,10 @@ class CarNavigator(private val context: Context) {
                 speedMps = update.speedMps,
                 speedLimitKmh = update.speedLimitKmh,
                 turnDelta = update.turnDelta,
+                maneuver = update.maneuver,
+                maneuverTarget = update.maneuverTarget,
+                exitRef = update.exitRef,
+                roundaboutExit = update.roundaboutExit,
                 alternatives = update.alternatives
             )
         }
@@ -250,7 +276,13 @@ class CarNavigator(private val context: Context) {
             _state.update { it.copy(navigating = false) }
             return
         }
-        if (update.offRoute) reroute(point, travelHeading(location))
+        if (update.offRoute) {
+            reroute(
+                point,
+                travelHeading(location),
+                if (location.hasAccuracy()) location.accuracy.toDouble() else 0.0
+            )
+        }
     }
 
 }

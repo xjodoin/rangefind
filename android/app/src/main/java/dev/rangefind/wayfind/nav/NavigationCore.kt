@@ -58,6 +58,15 @@ data class NavUpdate(
      * so they cannot disagree.
      */
     val maneuverTarget: String,
+    /**
+     * The exit number on the sign, when the next maneuver is a slip road
+     * that has one. This is the largest thing written on the panel and the
+     * only unambiguous way to identify an exit; a driver checking whether
+     * this is theirs is looking for a number, not a road name.
+     */
+    val exitRef: String,
+    /** Which exit to take at a roundabout; 0 when unknown. */
+    val roundaboutExit: Int,
     /** Lanes of the approach to the next maneuver, left to right. */
     val lanes: List<Int>,
     /** Which of those lanes lead where the route goes. */
@@ -160,7 +169,16 @@ class NavigationCore(private val context: Context) {
         point: LatLon,
         speedMps: Double,
         gpsBearing: Double?,
-        hasBearing: Boolean
+        hasBearing: Boolean,
+        /**
+         * The fix's own error bar, in metres. Off-route is a claim about
+         * where the car is, and a claim cannot be more certain than its
+         * evidence: on the recorded drives, 14 of 40 reroutes fired on a
+         * cross-track smaller than the accuracy of the fix that produced it.
+         * Nothing was wrong on the road — the receiver was guessing, and the
+         * app rerouted on the guess.
+         */
+        accuracyMeters: Double = 0.0
     ): NavUpdate? {
         val active = tracker ?: return null
         val route = active.route
@@ -177,9 +195,13 @@ class NavigationCore(private val context: Context) {
         }
         // Going the wrong way down the road only means something for traffic
         // that has a way to be on. Someone on foot turning to look at a shop
-        // window is not driving into oncoming cars.
+        // window is not driving into oncoming cars. And it only means
+        // anything once the car is somewhere the road is not: sitting on the
+        // line with a noisy compass is not a wrong-way manoeuvre, and two of
+        // the recorded reroutes fired from 7 m off the line on that alone.
         val headingWrong = mode != TravelMode.Walk &&
             speedMps > 2.0 &&
+            match.crossTrackMeters > SNAP_TRUST_METERS &&
             absBearingDelta(match.bearing, heading) > 110.0
 
         // How far the car still is from where the route ends. Needed before the
@@ -194,12 +216,16 @@ class NavigationCore(private val context: Context) {
         // inside the destination's apron nothing counts as off-route.
         val arriving = toDestination < mode.arrivalApronMeters
 
+        // How far the fix could be wrong by, capped: a receiver claiming a
+        // hundred-metre error is not a licence to stop noticing that the car
+        // has left the road, only a reason to want better evidence first.
+        val doubt = accuracyMeters.coerceIn(0.0, ACCURACY_ALLOWANCE_MAX_METERS)
         // A trip that starts in a pedestrian zone or a car park begins tens of
         // metres from the nearest routable road, so a standstill can never be
         // off-route; only a wild distance overrides that.
         val off = !arriving && (
-            (match.crossTrackMeters > mode.offRouteMeters && moving) ||
-                match.crossTrackMeters > mode.offRouteHardMeters ||
+            (match.crossTrackMeters > mode.offRouteMeters + doubt && moving) ||
+                match.crossTrackMeters > mode.offRouteHardMeters + doubt ||
                 headingWrong
             )
         offRouteStrikes = if (off) offRouteStrikes + 1 else 0
@@ -243,10 +269,19 @@ class NavigationCore(private val context: Context) {
         // would sit on screen for kilometres of open road.
         val maneuverKind = maneuverOnto(route, stepIndex + 1, turnDelta)
         val maneuverTarget = when (maneuverKind) {
-            Maneuver.Exit, Maneuver.Merge -> roadBeyondRamp(route, stepIndex + 1)
+            // What the ramp is signed with beats where it structurally goes:
+            // the panel says "40 Ouest / Montréal", and the road it joins is
+            // called Autoroute Félix-Leclerc, which appears nowhere a driver
+            // can see. Fall through to the road itself only when the ramp
+            // carries no sign at all.
+            Maneuver.Exit, Maneuver.Merge -> next?.towardLabel.orEmpty()
+                .ifBlank { roadBeyondRamp(route, stepIndex + 1) }
                 .ifBlank { next?.name.orEmpty() }
-            else -> next?.name.orEmpty()
+            // At a roundabout the instruction is the road you come off onto.
+            Maneuver.Roundabout -> roadBeyondRoundabout(route, stepIndex + 1)
+            else -> next?.let { signpostName(it) }.orEmpty()
         }
+        val exitRef = next?.exitRef.orEmpty()
         val lanes = if (mode.showsRoadSigns && toManeuver <= LANE_GUIDANCE_METERS) {
             next?.lanes.orEmpty()
         } else emptyList()
@@ -260,10 +295,12 @@ class NavigationCore(private val context: Context) {
             else -> announcement(
                 stepIndex = stepIndex,
                 meters = toManeuver,
-                nextName = next?.name.orEmpty(),
+                nextName = next?.let { signpostName(it) }.orEmpty(),
                 turnDelta = turnDelta,
                 maneuver = maneuverKind,
-                beyondName = maneuverTarget
+                beyondName = maneuverTarget,
+                exitRef = exitRef,
+                roundaboutExit = next?.roundaboutExit ?: 0
             )
         }
 
@@ -314,6 +351,8 @@ class NavigationCore(private val context: Context) {
             turnDelta = turnDelta,
             maneuver = maneuverKind,
             maneuverTarget = maneuverTarget,
+            exitRef = exitRef,
+            roundaboutExit = next?.roundaboutExit ?: 0,
             lanes = lanes,
             laneUsable = laneUsable,
             offRoute = offRoute,
@@ -327,7 +366,20 @@ class NavigationCore(private val context: Context) {
     private fun roadBeyondRamp(route: Route, from: Int): String {
         var index = from
         while (index < route.steps.size && route.steps[index].roadClass.endsWith("_link")) index++
-        return route.steps.getOrNull(index)?.name.orEmpty()
+        return route.steps.getOrNull(index)?.let { signpostName(it) }.orEmpty()
+    }
+
+    /**
+     * The road the roundabout is left by.
+     *
+     * The circle itself is the thing being entered, never the answer: a
+     * driver told to "continue onto (unnamed)" at a giratoire has been told
+     * nothing. What matters is the arm they come off on.
+     */
+    private fun roadBeyondRoundabout(route: Route, from: Int): String {
+        var index = from
+        while (index < route.steps.size && route.steps[index].roundabout) index++
+        return route.steps.getOrNull(index)?.let { signpostName(it) }.orEmpty()
     }
 
     private fun announcement(
@@ -336,14 +388,19 @@ class NavigationCore(private val context: Context) {
         nextName: String,
         turnDelta: Double,
         maneuver: Maneuver,
-        beyondName: String
+        beyondName: String,
+        exitRef: String,
+        roundaboutExit: Int
     ): String? {
         val ramp = maneuver == Maneuver.Exit || maneuver == Maneuver.Merge
+        val circle = maneuver == Maneuver.Roundabout
+        val ferry = maneuver == Maneuver.Ferry
         // A slip road almost never has a name, and bailing on that left every
         // motorway entrance and exit silent — the two instructions on a long
         // drive a driver most needs spoken. A ramp is announced by what it is
-        // and where it leads, not by a name it does not have.
-        if (nextName.isBlank() && !ramp) return null
+        // and where it leads, not by a name it does not have. The same is
+        // true of a roundabout, whose arcs are nameless by construction.
+        if (nextName.isBlank() && !ramp && !circle && !ferry) return null
         // Nothing to say about a road merely changing name underfoot.
         if (maneuver == Maneuver.Continue && nextName.isBlank()) return null
         val threshold = ANNOUNCE_THRESHOLDS.firstOrNull { meters <= it }
@@ -361,8 +418,44 @@ class NavigationCore(private val context: Context) {
         // opening call from 2 km out still has to say how far.
         val imminent = threshold != null && threshold <= IMMINENT_METERS
         val rounded = (meters / 50).roundToInt() * 50
+        if (ferry) {
+            val target = beyondName.ifBlank { nextName }
+            return if (imminent) context.getString(R.string.nav_ferry_now, target)
+            else context.getString(R.string.nav_ferry_in_meters, rounded, target)
+        }
+        if (circle) {
+            val target = beyondName.ifBlank { nextName }
+            return when {
+                // "Take the second exit" is the whole instruction, and it is
+                // the one thing the turn angle could never supply.
+                roundaboutExit > 0 && target.isNotBlank() ->
+                    if (imminent) context.getString(R.string.nav_roundabout_exit_onto_now, roundaboutExit, target)
+                    else context.getString(R.string.nav_roundabout_exit_onto_in_meters, rounded, roundaboutExit, target)
+                roundaboutExit > 0 ->
+                    if (imminent) context.getString(R.string.nav_roundabout_exit_now, roundaboutExit)
+                    else context.getString(R.string.nav_roundabout_exit_in_meters, rounded, roundaboutExit)
+                target.isNotBlank() ->
+                    if (imminent) context.getString(R.string.nav_roundabout_onto_now, target)
+                    else context.getString(R.string.nav_roundabout_onto_in_meters, rounded, target)
+                else ->
+                    if (imminent) context.getString(R.string.nav_roundabout_now)
+                    else context.getString(R.string.nav_roundabout_in_meters, rounded)
+            }
+        }
         if (ramp) {
             val target = beyondName.ifBlank { nextName }
+            // The exit number is what the driver is scanning the panels for,
+            // so it leads. "Take exit 32 toward 40 Ouest" is the sign read
+            // aloud; "take the exit" is a description of a road layout.
+            if (maneuver == Maneuver.Exit && exitRef.isNotBlank()) {
+                return when {
+                    target.isBlank() ->
+                        if (imminent) context.getString(R.string.nav_exit_number_now, exitRef)
+                        else context.getString(R.string.nav_exit_number_in_meters, rounded, exitRef)
+                    imminent -> context.getString(R.string.nav_exit_number_onto_now, exitRef, target)
+                    else -> context.getString(R.string.nav_exit_number_onto_in_meters, rounded, exitRef, target)
+                }
+            }
             return when {
                 maneuver == Maneuver.Exit && target.isBlank() ->
                     if (imminent) context.getString(R.string.nav_exit_now)
@@ -524,5 +617,12 @@ class NavigationCore(private val context: Context) {
         private const val U_TURN_DEGREES = 150.0
         /** How close the maneuver must be before lane guidance is shown. */
         private const val LANE_GUIDANCE_METERS = 700.0
+
+        /**
+         * The most a poor fix may excuse. Beyond this the receiver is not
+         * measuring anything and its own error bar stops being informative;
+         * the hard distance still catches a car that has genuinely gone.
+         */
+        const val ACCURACY_ALLOWANCE_MAX_METERS = 60.0
     }
 }
