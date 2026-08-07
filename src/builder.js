@@ -4263,7 +4263,17 @@ function stableJson(value) {
 function buildFingerprint(config) {
   const inputStat = statSync(config.input);
   const configForHash = { ...config };
-  for (const key of ["_buildRoot", "debugFailAfterStage", "failAfterStage"]) delete configForHash[key];
+  // These settings bound temporary external-sort resources but cannot change
+  // sorted row order or published bytes. Keeping them out of the compatibility
+  // fingerprint also lets a release introduce/tune the defaults while reusing
+  // scan, reduce, and completed sidecar stages from the previous builder.
+  for (const key of [
+    "_buildRoot",
+    "debugFailAfterStage",
+    "failAfterStage",
+    "docValueSortedSortChunkRows",
+    "docValueSortedSortMaxOpenRuns"
+  ]) delete configForHash[key];
   const payload = {
     schema: BUILD_RESUME_SCHEMA_VERSION,
     config: configForHash,

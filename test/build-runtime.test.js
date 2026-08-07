@@ -960,7 +960,13 @@ test("resumable builds reuse scan and reduce stages and keep old manifest on fai
   await assert.rejects(() => build({ configPath: sidecarConfigPath }), /debug failure after sidecar-doc-packs/u);
   const docPackStage = await resumeStageFile(sidecarOutput, "sidecar-doc-packs");
   const docPackBefore = await readFile(docPackStage, "utf8");
-  await writeFile(sidecarConfigPath, JSON.stringify(baseConfig));
+  await writeFile(sidecarConfigPath, JSON.stringify({
+    ...baseConfig,
+    // External-sort resource tuning is output-neutral and must not strand
+    // compatible completed sidecars in a different resume directory.
+    docValueSortedSortChunkRows: 2,
+    docValueSortedSortMaxOpenRuns: 2
+  }));
   await build({ configPath: sidecarConfigPath });
   assert.equal(await readFile(docPackStage, "utf8"), docPackBefore);
 

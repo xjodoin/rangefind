@@ -195,6 +195,8 @@
   entering `doc-value-sorted`; tie-aware pages and the published format remain
   unchanged. Sorted-page pack bookkeeping is append-only, and large directory
   encoders now use bounded byte chunks instead of boxed byte arrays.
+  External-sort chunk and fan-in tuning is excluded from resume compatibility
+  fingerprints so upgrading or retuning does not discard completed stages.
 
 - Stream dense document-pointer tables to disk while hashing them in bounded
   batches. Very large corpora such as Brazil no longer fail after doc packing
