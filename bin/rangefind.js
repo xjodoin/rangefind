@@ -10,6 +10,7 @@ Usage:
   rangefind suggest <index> <prefix>   [--size N] [--json]
   rangefind count   <index> <query...> [--shards a,b]
   rangefind info    <index> [--json]
+  rangefind inspect <artifact> [--json | --full]
 
 <index> is a local index directory or an http(s) index URL — single,
 generational, or sharded indexes all work.
@@ -54,6 +55,10 @@ Commands:
   suggest Search-as-you-type autocomplete for a prefix.
   count   Exact match count for a text query.
   info    Index metadata: totals, build time, provenance, features, shards.
+  inspect Decode a binary index artifact (local file or URL, .gz handled).
+          Sniffs the RF magic: full decode for doc-value manifests
+          (rfdvm-v1), header decode for geo tree roots, identification for
+          every other artifact. --full dumps the complete decoded JSON.
 
 MCP:      an MCP server over any index ships as the rangefind-mcp package:
             npx rangefind-mcp --index docs=./public/rangefind
@@ -80,6 +85,7 @@ function parseArgs(argv) {
     else if ((value = take("box")) !== undefined) args.box = value;
     else if ((value = take("shards")) !== undefined) args.shards = value.split(",").map(s => s.trim()).filter(Boolean);
     else if (arg === "--json") args.json = true;
+    else if (arg === "--full") args.full = true;
     else if (arg === "--update") args.update = true;
     else if (arg === "--compact") args.compact = true;
     else if (arg === "--help" || arg === "-h") args.help = true;
@@ -258,6 +264,41 @@ if (command === "build") {
       if (info.shards.length > 30) console.log(`  … ${info.shards.length - 30} more`);
     }
     if (info.generations) console.log(`generations: ${info.generations}`);
+  }
+} else if (command === "inspect") {
+  const ref = args.positionals[0];
+  if (!ref) fatal("Missing artifact path or URL");
+  const { inspectArtifact, isGzipBytes } = await import("../src/inspect.js");
+  let bytes;
+  if (/^https?:\/\//u.test(ref)) {
+    const response = await fetch(ref);
+    if (!response.ok) fatal(`Fetch failed (${response.status}) for ${ref}`);
+    bytes = new Uint8Array(await response.arrayBuffer());
+  } else {
+    const { readFile } = await import("node:fs/promises");
+    bytes = new Uint8Array(await readFile(ref));
+  }
+  let gzip = false;
+  if (isGzipBytes(bytes)) {
+    const { gunzipSync } = await import("node:zlib");
+    bytes = new Uint8Array(gunzipSync(bytes));
+    gzip = true;
+  }
+  const report = { source: ref, gzip, ...inspectArtifact(bytes, { full: args.full }) };
+  if (args.json || args.full) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    const { fields, ...header } = report;
+    for (const [key, value] of Object.entries(header)) {
+      console.log(`${key}: ${typeof value === "object" && value !== null ? JSON.stringify(value) : value}`);
+    }
+    if (Array.isArray(fields)) {
+      console.log(`fields (${fields.length}):`);
+      for (const field of fields) {
+        const range = field.min != null ? `  [${field.min} .. ${field.max}]` : "";
+        console.log(`  ${field.name}  ${field.kind}/${field.type}  ${field.chunks} chunks${field.lookupChunks ? ` (+${field.lookupChunks} lookup)` : ""}${range}`);
+      }
+    }
   }
 } else {
   fatal(`Unknown command: ${command}`);

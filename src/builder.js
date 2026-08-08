@@ -66,6 +66,7 @@ import {
   summarizeBlockFilters
 } from "./codec.js";
 import { geoComponentFieldNames, getPath, readConfig } from "./config.js";
+import { encodeDocValueChecksums, encodeDocValueManifest } from "./doc_value_manifest.js";
 import { closeScoringDfReaders, installScoringDfProvider, loadScoringStats } from "./scoring_stats.js";
 import {
   buildGeoTreeLeaves,
@@ -4164,6 +4165,7 @@ function minimalManifest(manifest) {
       build: "debug/build-telemetry.json",
       optimizer: INDEX_OPTIMIZER_PATH,
       doc_values: "doc-values/manifest.json.gz",
+      ...(manifest.doc_values_binary?.file ? { doc_values_v2: manifest.doc_values_binary.file } : {}),
       doc_value_sorted: "doc-values/sorted/manifest.json.gz",
       filter_bitmaps: "filter-bitmaps/manifest.json.gz",
       facet_dictionaries: "facets/manifest.json.gz"
@@ -5170,6 +5172,25 @@ export async function build({ configPath, update = false, compact = false }) {
     writeAtomic(resolve(dirs.out, "debug", "build-telemetry.json"), JSON.stringify(buildTelemetry, null, 2));
     writeAtomic(resolve(dirs.out, INDEX_OPTIMIZER_PATH), JSON.stringify(optimizerReport, null, 2));
     writeAtomic(resolve(dirs.out, "doc-values", "manifest.json.gz"), gzipSync(JSON.stringify(docValues), { level: 6 }));
+    if (Object.keys(docValues.fields || {}).length) {
+      // Binary twin of the JSON manifest above: same information, ~30x
+      // smaller and parsed in milliseconds. Checksums live in a fixed-width
+      // sidecar so verifying engines range-read exactly the rows they check.
+      // The JSON manifest stays for runtimes that predate rfdvm-v1.
+      const docValueChecksums = encodeDocValueChecksums(docValues);
+      let checksumsFile = "";
+      if (docValueChecksums) {
+        checksumsFile = `checksums.${sha256Hex(docValueChecksums.buffer).slice(0, 24)}.bin`;
+        writeAtomic(resolve(dirs.out, "doc-values", checksumsFile), docValueChecksums.buffer);
+      }
+      const binaryManifest = gzipSync(encodeDocValueManifest(docValues, {
+        checksumsFile: checksumsFile ? `doc-values/${checksumsFile}` : "",
+        checksumAlgorithm: docValueChecksums?.algorithm || ""
+      }, manifest.total), { level: 6 });
+      const binaryManifestFile = `manifest.${sha256Hex(binaryManifest).slice(0, 24)}.bin.gz`;
+      writeAtomic(resolve(dirs.out, "doc-values", binaryManifestFile), binaryManifest);
+      manifest.doc_values_binary = { file: `doc-values/${binaryManifestFile}` };
+    }
     writeAtomic(resolve(dirs.out, "doc-values", "sorted", "manifest.json.gz"), gzipSync(JSON.stringify(manifest.doc_value_sorted), { level: 6 }));
     writeAtomic(resolve(dirs.out, "filter-bitmaps", "manifest.json.gz"), gzipSync(JSON.stringify(filterBitmaps), { level: 6 }));
     writeAtomic(resolve(dirs.out, "facets", "manifest.json.gz"), gzipSync(JSON.stringify(facetDictionaries), { level: 6 }));

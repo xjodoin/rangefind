@@ -131,6 +131,20 @@ missing, false, and true. The manifest carries per-chunk summaries, so broad
 filter and sort queries can fetch only the involved columns and skip chunks that
 cannot match instead of downloading one global code table.
 
+That per-chunk metadata scales with fields × chunks, so it ships twice: the
+JSON `doc-values/manifest.json.gz` (compatibility) and a binary twin,
+`doc-values/manifest.<hash>.bin.gz` (`rfdvm-v1`, advertised as
+`lazy_manifests.doc_values_v2`), which stores it columnar — pack names once in
+a table, chunk boundaries derived from `chunk_size`, offsets delta-coded,
+min/max behind presence bitmaps. On a planet-scale shard that turns a 7.3MB
+download that inflates to 46MB of JSON (~500ms to decode) into ~240KB decoded
+in under 30ms. Per-chunk sha256 rows live in an uncompressed fixed-width
+sidecar (`doc-values/checksums.<hash>.bin`, 32 bytes per chunk in emission
+order); verifying engines range-read exactly the rows for the chunks they
+check, and everyone else never downloads incompressible hex. Runtimes prefer
+the binary manifest and fall back to the JSON on any failure; `rangefind
+inspect <artifact>` decodes either for debugging.
+
 `doc-values/sorted/*.bin.gz` stores a lazy binary directory per numeric/date/
 boolean field. Each directory points into `doc-values/sorted-packs/*.bin.gz`, where
 `rfdocvaluesortpage-v1` pages keep value-sorted `(value, docId)` rows plus
@@ -441,9 +455,16 @@ Query lanes:
   shape to the returned page window.
 - **Text plus distance sort** (`q` with `geo.sort: "distance"`): the runtime
   resolves the exact text match set from postings (same minShouldMatch rule
-  as `count()`, bounded by `geoTextSortMaxDf`, default 200k postings), then
-  the nearest lane orders it with the usual early-stop proof — "closest
-  bakeries first" is exact.
+  as `count()`, bounded by `geoTextSortMaxDf`, default 200k postings). A
+  match set that is dense in the corpus is handed to the nearest lane, which
+  orders it with the usual early-stop proof. A sparse match set skips the
+  tree entirely: the traversal would open leaf pages ring-by-ring until it
+  happened upon k matching docs (for a rare brand name, every page within
+  the radius), so the runtime instead fetches lat/lon doc values for exactly
+  the matched docs and orders them locally (`geoLane: "nearestTextDocValues"`,
+  chosen by pricing estimated traversal bytes against doc-value chunk bytes;
+  its `total` is exact). An empty match set returns immediately without
+  touching the tree. Either way, "closest bakeries first" is exact.
 - **Route corridor** (`geo.route` with `geo.sort: "route"`): encoded polyline,
   GeoJSON, or coordinate input is normalized into directed segments. Buffered
   segment boxes are rasterized independently into multi-resolution cells so a

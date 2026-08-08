@@ -101,7 +101,17 @@ export function createFetchMeter(match = /\/rangefind\//u, classify = () => "mat
       if (!meter.by[bucket]) meter.by[bucket] = { requests: 0, bytes: 0 };
       meter.requests++;
       meter.by[bucket].requests++;
-      const length = Number(response.headers.get("content-length") || 0);
+      // A 200 answer to a Range request means the server ignored the range
+      // and content-length names the WHOLE object — the runtime cancels or
+      // slices that body, so count the requested spans instead of phantom
+      // hundreds of megabytes.
+      const rangeHeader = init?.headers?.Range || init?.headers?.range || "";
+      const spanBytes = [...String(rangeHeader).matchAll(/(\d+)-(\d+)/gu)]
+        .reduce((sum, span) => sum + (Number(span[2]) - Number(span[1]) + 1), 0);
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      const length = rangeHeader && response.status === 200
+        ? Math.min(contentLength, spanBytes)
+        : contentLength;
       if (Number.isFinite(length) && length > 0) {
         meter.bytes += length;
         meter.by[bucket].bytes += length;

@@ -940,6 +940,10 @@ async function anchoredExactText(engine, q, params, anchor, {
   const coverage = anchorCoverageShards(engine, anchor);
   const explicitScope = explicitShardScope(params);
   const directScope = explicitScope.length ? explicitScope : coverage;
+  // The coverage shard is pure geometry — known before a single byte moves.
+  // Warm its manifest now so the fetch overlaps the serial authority-lexicon
+  // resolution below instead of queuing behind it on a cold engine.
+  if (directScope.length) engine.prefetchShards?.(directScope);
   const compoundName = fold(q).split(/[^\p{L}\p{N}]+/u).filter(Boolean).length >= 2;
 
   // A geo-sorted local text result can prove its own whole-name match. For
@@ -997,6 +1001,27 @@ async function anchoredExactText(engine, q, params, anchor, {
     }
   }
 
+  // Every intent path serially resolves root authority before its first real
+  // search, yet authority only picks the lane: geometry already fixed the
+  // shard scope, and the repeated-name branches below issue exactly this
+  // distance-sorted search (probeParams collapses to params whenever
+  // authority resolves). Start it now so the cascade's first real bytes move
+  // immediately; a low or missing authority count simply discards the
+  // speculative page, whose fetches stay useful as cache warm-up for the
+  // text probe. Doc values back the sparse nearest lane, so their manifest
+  // warms alongside.
+  let speculativeNearest = null;
+  if (intent && directScope.length && !params.geo?.box) {
+    engine.prefetchShards?.(directScope, { docValues: true });
+    speculativeNearest = engine.search({
+      ...params,
+      shards: params.shards == null ? directScope : params.shards,
+      geo: {
+        near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+        sort: "distance"
+      }
+    }).then(response => ({ response }), error => ({ error }));
+  }
   let intentAuthority;
   if (intent && allowUngatedFuzzy) intentAuthority = await exactAuthorityScope(engine, q);
 
@@ -1127,8 +1152,21 @@ async function anchoredExactText(engine, q, params, anchor, {
   // A high root-authority count already proves this is a repeated name, so
   // skip the text hydration probe and go straight to exact nearest traversal.
   if (scope.length && Number(authority?.count || 0) >= Math.max(32, requestedSize * 2)) {
-    const nearest = await nearestExact("osmNearExactGeo");
-    if (nearest) return nearest;
+    if (speculativeNearest) {
+      // The speculative run already issued this exact search over the
+      // geometric scope (a superset of any authority-narrowed scope, which
+      // routing prunes for free), so consume it instead of re-searching.
+      const settled = await speculativeNearest;
+      if (settled.response) {
+        return exactGeoResponse(settled.response, authority, directScope, NEAR_TEXT_RADIUS_METERS, "osmNearExactGeo");
+      }
+      if (!isGeoTextSortBudgetError(settled.error)) throw settled.error;
+      // Budget errors fall through to the bounded text probe, exactly as a
+      // fresh nearestExact would.
+    } else {
+      const nearest = await nearestExact("osmNearExactGeo");
+      if (nearest) return nearest;
+    }
   }
   // A bounded text window is considerably cheaper than attaching lat/lon
   // doc-value chunks to every exact brand hit in a province. OSM documents
@@ -1167,8 +1205,18 @@ async function anchoredExactText(engine, q, params, anchor, {
   // a result set larger than the probe window is handed to the geo tree for
   // an exact distance-ordered page.
   if (scopedText && response.total > response.results.length) {
-    const nearest = await nearestExact(authority ? "osmNearExactGeo" : "osmNearFuzzyGeo");
-    if (nearest) return nearest;
+    // With authority resolved, probeParams collapsed to params, so the
+    // speculative distance-sorted run is this exact search — consume it.
+    if (speculativeNearest && authority) {
+      const settled = await speculativeNearest;
+      if (settled.response) {
+        return exactGeoResponse(settled.response, authority, directScope, NEAR_TEXT_RADIUS_METERS, "osmNearExactGeo");
+      }
+      if (!isGeoTextSortBudgetError(settled.error)) throw settled.error;
+    } else {
+      const nearest = await nearestExact(authority ? "osmNearExactGeo" : "osmNearFuzzyGeo");
+      if (nearest) return nearest;
+    }
     // The bounded embedded-coordinate page below remains correct and local;
     // it is only not guaranteed to contain every nearer repeated name.
   }

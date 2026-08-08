@@ -3582,7 +3582,11 @@ syncSheetMode();
 async function boot() {
   loadIndexStatus();
   initRouteGraph();
-  engine = await createSearch({ baseUrl: OSM_INDEX_BASE_URL });
+  // Cloudflare (this index's CDN) rejects multipart byte ranges with a 400,
+  // so probing multi-range would waste one guaranteed round trip on the very
+  // first grouped read; the runtime's per-origin downgrade only kicks in
+  // after that first failure.
+  engine = await createSearch({ baseUrl: OSM_INDEX_BASE_URL, multiRangeRequests: false });
   const total = engine.manifest.total || 0;
   const shardCount = engine.shards?.length || 1;
   const builtAt = formatDate(engine.manifest.built_at);

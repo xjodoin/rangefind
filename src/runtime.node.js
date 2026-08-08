@@ -24,7 +24,16 @@ import { open, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createSearch, setFetchImplementation } from "./runtime.js";
+import { gunzip } from "node:zlib";
+import { promisify } from "node:util";
+import { createSearch, setFetchImplementation, setInflateImplementation } from "./runtime.js";
+
+// Native zlib beats piping through DecompressionStream by ~8x on large
+// payloads (a planet-shard doc-values manifest inflates in ~45ms instead of
+// ~360ms), and promisified gunzip runs on libuv's thread pool instead of the
+// main loop.
+const gunzipAsync = promisify(gunzip);
+setInflateImplementation(compressed => gunzipAsync(new Uint8Array(compressed)));
 
 const DEFAULT_MEMORY_CACHE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_FILE_HANDLE_LIMIT = 32;

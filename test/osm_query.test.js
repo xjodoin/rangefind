@@ -1609,10 +1609,15 @@ test("OSM anchored exact and one-edit landmark names bypass locality parsing", a
     size: 10,
     near: { lat: 45.5019, lon: -73.5674 }
   });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].filters, undefined);
+  // The intent lane fires a speculative distance-sorted search alongside the
+  // authority lookup (calls[0]); the landmark's low count discards it and the
+  // bounded text probe (calls[1]) answers.
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].geo?.sort, "distance");
   assert.deepEqual(calls[0].shards, ["quebec"]);
-  assert.equal(calls[0].geo, undefined);
+  assert.equal(calls[1].filters, undefined);
+  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(calls[1].geo, undefined);
   assert.equal(exact.stats.plannerLane, "osmNearExactText");
 
   const fuzzy = await searchOsmQuery(engine, {
@@ -1620,8 +1625,8 @@ test("OSM anchored exact and one-edit landmark names bypass locality parsing", a
     size: 10,
     near: { lat: 45.5019, lon: -73.5674 }
   });
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1].shards, ["quebec"]);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(calls[3].shards, ["quebec"]);
   assert.equal(fuzzy.stats.plannerLane, "osmNearIntentText");
   assert.equal(fuzzy.results[0].name, "McGill University");
 });

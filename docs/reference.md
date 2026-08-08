@@ -106,6 +106,17 @@ rangefind build --config path/to/rangefind.config.json --compact
   the old `gen-NNNN/` directories. Fails (keeping the generation files) if
   any live document from the generational index is missing from the input.
 
+```bash
+rangefind inspect doc-values/manifest.<hash>.bin.gz
+rangefind inspect https://example.com/rangefind/geo/location.<hash>.bin.gz --json
+```
+
+`rangefind inspect <artifact>` decodes a binary index artifact (local path or
+URL; gzip handled) by sniffing its RF magic: full decode for `rfdvm-v1`
+doc-value manifests, header decode for geo tree roots, identification (name +
+size) for every other artifact. `--json` prints the report as JSON; `--full`
+additionally dumps the complete decoded structure.
+
 ### Programmatic
 
 ```js
@@ -623,6 +634,8 @@ loadFacetValues }`.
 | `geoLeafPageBatchSize` | `16` | 1–64 | Geo leaf pages fetched per batch. |
 | `geoTextMaxCandidatePoints` | `100000` | ≥0 | Above this, text+geo verifies via doc-values instead of a tree doc-set. |
 | `geoTextSortMaxDf` | `200000` | ≥0 | Posting budget for exact text distance sort. |
+| `geoTextNearestDocValues` | priced | — | Sparse text + distance sort orders matches from lat/lon doc values instead of traversing the geo tree. `false` disables, `true` skips the pricing gate. |
+| `docValuesBinaryManifest` | `true` | — | Prefer the binary doc-values manifest (`rfdvm-v1`, ~30x smaller and parsed in ms) when the index advertises one; `false` forces the JSON manifest. |
 | `facetCountMaxChunks` | `32` | ≥1 | Doc-value chunks scanned before facet-count sampling. |
 | `docRangePlanner` | `true` | — | Enable doc-range block pruning. |
 | `docRangeImpactPlanner` | `true` | — | Enable impact-ordered doc-range planning. |
@@ -738,6 +751,15 @@ early-stopped totals and sampled facet counts.
 - **`engine.authorityLookup(surface, { size })`** — normalized exact-surface
   lookup in the authority autocomplete lexicon. Sharded-root matches include
   owning `shards`; returns `null` when no suitable lexicon exists.
+- **`engine.prefetchShards(names, { docValues })`** — sharded roots only:
+  fire-and-forget warm-up of the named shards' engines (manifest fetch +
+  parse, the longest serial leg of a cold scoped query); `docValues: true`
+  additionally warms each shard's doc-values manifest (a multi-MB fetch +
+  parse that otherwise lands on the first lane needing doc values). Never
+  throws; unknown names and fetch failures are swallowed, and a failed
+  speculative fetch is retried by the next real access. Single/generational
+  engines expose the doc-values half directly as
+  **`engine.prefetchDocValues()`**.
 - **`engine.hydrateRows(rows)`** — hydrate `[index, score]` rows into display
   results (used internally by the generational layer).
 - **`engine.loadBuildTelemetry()`**, **`loadIndexOptimizer()`**, and
@@ -752,7 +774,8 @@ Notable fields:
 
 - Text: `plannerLane` (`tailProof` | `fullFallback` | `blockBudget`),
   `exact`, `blocksDecoded`, `postingsDecoded`, `skippedBlocks`.
-- Geo: `geoLane` (`browse` | `nearest` | `nearestText` | `textDocSet` |
+- Geo: `geoLane` (`browse` | `nearest` | `nearestText` | `nearestTextDocValues` |
+  `nearestTextEmpty` | `textDocSet` |
   `textDocValues` | route/cell variants), `geoCandidateLeaves`,
   `geoLeavesVisited`, `geoPointsScanned`, `geoPointsAccepted`, plus route-cell
   and route-ranking counters when applicable.

@@ -30,6 +30,7 @@ import {
 } from "./geo_cells.js";
 import { matchPointToRoute, prepareRoute, routeMatchPublic } from "./geo_route.js";
 import { decodeDocPointerRecord } from "./doc_pointers.js";
+import { parseDocValueManifest } from "./doc_value_manifest.js";
 import { applyHighlights, highlightTermSet } from "./highlight.js";
 import {
   applyPermutation,
@@ -101,6 +102,13 @@ const GEO_TEXT_MAX_CANDIDATE_POINTS = 100000;
 // otherwise fetch to verify matches. The hard cap bounds the in-memory Set.
 const GEO_TEXT_DOC_SET_HARD_CAP = 1000000;
 const GEO_TEXT_SORT_MAX_DF = 200000;
+// Pricing for the sparse-match nearest lane: the tree traversal scans about
+// k/matchDensity points before it can prove the k nearest, at roughly this
+// many encoded bytes per point (deliberately low — under-pricing traversal
+// keeps dense queries on the tree lane). Estimates below the floor skip the
+// doc-values manifest fetch entirely.
+const GEO_TEXT_NEAREST_POINT_BYTES_ESTIMATE = 16;
+const GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES = 1 << 20;
 const FACET_COUNT_MAX_CHUNKS = 32;
 const FACET_COUNT_SIZE = 10;
 const textDecoder = new TextDecoder();
@@ -218,7 +226,24 @@ async function traceSpan(name, fn) {
   }
 }
 
-async function traceFetch(bucket, fn) {
+// Byte accounting counts what the runtime actually consumes, not what the
+// content-length header claims: a server that ignores Range answers 200 with
+// the WHOLE object's length (a multi-hundred-MB pointer file), yet the
+// runtime cancels that body unread — counting the header would report
+// phantom megabytes to traces and the demo's query X-ray.
+function defaultTraceFetchBytes(response) {
+  return Number(response?.headers?.get?.("content-length") || 0);
+}
+
+function recordTraceBytes(name, bytes) {
+  const trace = activeRuntimeTrace;
+  if (!trace || !Number.isFinite(bytes) || bytes <= 0) return;
+  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0, bytes: 0 };
+  current.bytes += bytes;
+  trace.spans.set(name, current);
+}
+
+async function traceFetch(bucket, fn, measureBytes = defaultTraceFetchBytes) {
   const trace = activeRuntimeTrace;
   if (!trace) return fn();
   const started = nowMs();
@@ -227,8 +252,7 @@ async function traceFetch(bucket, fn) {
     response = await fn();
     return response;
   } finally {
-    const bytes = Number(response?.headers?.get?.("content-length") || 0);
-    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, bytes);
+    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, measureBytes(response));
   }
 }
 
@@ -324,10 +348,13 @@ async function fetchGzipArrayBuffer(url) {
 
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
+  // A 200 answer means Range was ignored: bytes are recorded only if the
+  // body is actually read (the salvage path below), never from the header.
+  const rangeBytes = response => (response?.status === 206 ? defaultTraceFetchBytes(response) : 0);
   for (let attempt = 0; ; attempt++) {
     const response = await traceFetch(bucket, () => fetchImpl(url, {
       headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-    }));
+    }), rangeBytes);
     if (response.status === 206) {
       return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
     }
@@ -341,6 +368,7 @@ async function fetchRange(url, offset, length) {
       const total = Number(response.headers.get("content-length") || 0);
       if (total > 0 && total <= Math.max(length * 4, 1 << 20)) {
         const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+        recordTraceBytes(`${bucket}.fetch`, body.byteLength || total);
         return body.slice(offset, offset + length);
       }
       try {
@@ -357,8 +385,29 @@ async function fetchRange(url, offset, length) {
   }
 }
 
+// Origins that answered a multi-range request with anything other than a
+// multipart 206 never get asked again this session: Cloudflare (and most
+// CDNs) reject multipart ranges deterministically, so re-probing would waste
+// a guaranteed round trip on every grouped read. Only a definitive response
+// marks the origin — thrown fetch errors may be transient network faults and
+// keep the capability open.
+const multiRangeUnsupportedOrigins = new Set();
+
+function urlOrigin(url) {
+  try {
+    return new URL(String(url)).origin;
+  } catch {
+    return "";
+  }
+}
+
 async function fetchRanges(url, ranges, options = {}) {
-  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false) {
+  if (
+    ranges.length <= 1
+    || !fetchSupportsMultiRange
+    || options.multiRangeRequests === false
+    || multiRangeUnsupportedOrigins.has(urlOrigin(url))
+  ) {
     return Promise.all(ranges.map(range => fetchRange(url, range.offset, range.length)));
   }
   const maxRanges = Math.max(2, Math.min(64, Math.floor(Number(options.multiRangeMaxRanges || 32))));
@@ -373,17 +422,26 @@ async function fetchRanges(url, ranges, options = {}) {
   const bucket = traceBucketFromUrl(url);
   let response;
   try {
+    // Bytes are counted only for a genuine multipart answer; rejected or
+    // range-ignoring responses are cancelled unread below and the exact
+    // single-range fallback does its own accounting.
     response = await traceFetch(bucket, () => fetchImpl(url, {
       headers: {
         Range: `bytes=${ranges.map(range => `${range.offset}-${range.offset + range.length - 1}`).join(",")}`
       }
-    }));
+    }), fetched => (
+      fetched?.status === 206
+        && /^multipart\/byteranges(?:;|$)/iu.test(fetched.headers?.get?.("content-type") || "")
+        ? defaultTraceFetchBytes(fetched)
+        : 0
+    ));
     const contentType = response.headers?.get?.("content-type") || "";
     if (response.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(contentType)) {
       const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
       const parts = parseMultipartByteRanges(body, contentType);
       return selectMultipartByteRanges(parts, ranges);
     }
+    multiRangeUnsupportedOrigins.add(urlOrigin(url));
   } catch {
     // Cross-origin servers may reject non-safelisted multi-range headers.
     // Exact single-range reads below remain universally compatible.
@@ -579,10 +637,19 @@ export async function createSearch(options = {}) {
 
   async function ensureDocValuesManifest() {
     if (docValues) return docValues;
+    const binaryPath = options.docValuesBinaryManifest !== false
+      ? manifest.lazy_manifests?.doc_values_v2
+      : null;
     const path = manifest.lazy_manifests?.doc_values;
-    if (!path) return null;
+    if (!binaryPath && !path) return null;
     if (!docValuesPromise) {
-      docValuesPromise = fetchManifestJsonIfOk(path).then(meta => {
+      // The binary manifest is ~30x smaller and parses in milliseconds; the
+      // JSON manifest remains both the fallback for fetch/parse failures and
+      // the only source on indexes that predate rfdvm-v1.
+      const loadJson = () => (path ? fetchManifestJsonIfOk(path) : null);
+      const loadBinary = () => fetchGzipArrayBuffer(new URL(binaryPath, baseUrl))
+        .then(buffer => traceSpanSync("manifest.parse", () => parseDocValueManifest(buffer)));
+      docValuesPromise = (binaryPath ? loadBinary().catch(loadJson) : Promise.resolve(loadJson())).then(meta => {
         docValues = meta || null;
         if (docValues) manifest.doc_values = docValues;
         return docValues;
@@ -924,6 +991,40 @@ export async function createSearch(options = {}) {
     return `${field}\u0000${lookup ? "lookup" : "chunk"}\u0000${index}`;
   }
 
+  // The binary doc-values manifest keeps sha256 rows in an uncompressed
+  // fixed-width sidecar instead of inline (hex does not compress). When this
+  // engine verifies checksums, the rows for a batch are range-read here —
+  // chunks of one field occupy consecutive rows, so a batch usually costs a
+  // single tiny read — and attached where verifyBlockPointer expects them.
+  async function attachDocValueChecksumRows(pending) {
+    const meta = docValues?.checksum_rows;
+    if (!verifyChecksums || !meta?.file) return;
+    const rowBytes = Number(meta.rowBytes) || 32;
+    const items = pending.filter(item => !item.entry.checksum && Number.isInteger(item.entry.checksumRow));
+    if (!items.length) return;
+    const rows = [...new Set(items.map(item => item.entry.checksumRow))].sort((a, b) => a - b);
+    const ranges = [];
+    for (const row of rows) {
+      const last = ranges[ranges.length - 1];
+      if (last && row * rowBytes === last.offset + last.length) last.length += rowBytes;
+      else ranges.push({ offset: row * rowBytes, length: rowBytes });
+    }
+    const buffers = await fetchRanges(new URL(meta.file, baseUrl), ranges, options);
+    const valueByRow = new Map();
+    ranges.forEach((range, index) => {
+      const bytes = new Uint8Array(buffers[index]);
+      for (let at = 0; at + rowBytes <= bytes.length; at += rowBytes) {
+        let value = "";
+        for (let i = 0; i < rowBytes; i++) value += bytes[at + i].toString(16).padStart(2, "0");
+        valueByRow.set((range.offset + at) / rowBytes, value);
+      }
+    });
+    for (const item of items) {
+      const value = valueByRow.get(item.entry.checksumRow);
+      if (value) item.entry.checksum = { algorithm: meta.algorithm || "sha256", value };
+    }
+  }
+
   async function loadDocValueChunks(requests) {
     return traceSpan("docValues.loadChunks", async () => {
       if (!docValues || !requests.length) return;
@@ -943,6 +1044,15 @@ export async function createSearch(options = {}) {
         promise.catch(() => {});
         docValueCache.set(key, promise);
         pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
+      }
+      try {
+        await attachDocValueChecksumRows(pending);
+      } catch (error) {
+        for (const item of pending) {
+          docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
+          item.reject(error);
+        }
+        return;
       }
       await readRangeGroups(
         rangeGroups(pending),
@@ -4286,6 +4396,85 @@ export async function createSearch(options = {}) {
     return Math.round(distance * 10) / 10;
   }
 
+  // Distance-ordered text matches without touching the geo tree. The nearest
+  // traversal opens leaf pages ring-by-ring until it happens upon k matching
+  // docs, so a name that is sparse in this shard ("boulangerie ange" near
+  // Montréal: 24 docs) forces it through every page within the radius. When
+  // the match set is small relative to the corpus, fetching lat/lon doc
+  // values for exactly the matched docs and ordering them locally is bounded
+  // by the match count instead of the point density — and its total is exact.
+  async function runGeoTextNearestByDocValues({ page, size, filters, geoPlan, hasFilters, matchDocs }) {
+    // Option: false disables the lane, true skips the pricing gate (tiny test
+    // fixtures never clear the byte floor), unset prices it.
+    if (options.geoTextNearestDocValues === false) return null;
+    const forced = options.geoTextNearestDocValues === true;
+    const root = await loadGeoTreeRoot(geoPlan.field);
+    if (!root?.total) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const expectedTraversalBytes = k * (root.total / matchDocs.size) * GEO_TEXT_NEAREST_POINT_BYTES_ESTIMATE;
+    let docValueBytes = null;
+    if (!forced) {
+      if (expectedTraversalBytes < GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES) return null;
+      docValueBytes = await estimateGeoFilterDocValueBytes(geoPlan, matchDocs.size);
+      if (!docValueBytes || docValueBytes >= expectedTraversalBytes) return null;
+    }
+    const docs = Array.from(matchDocs);
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const bitmapStore = docFilterPlan?.active ? await filterBitmapStoreForPlan(docFilterPlan) : null;
+    const bitmapCovered = bitmapStore?.covered || new Set();
+    const residualFilterFields = docFilterPlan?.active
+      ? [...new Set(filterPlanFields(docFilterPlan))].filter(field => !bitmapCovered.has(field))
+      : [];
+    const store = await valueStoreForDocs(
+      [geoPlan.latField, geoPlan.lonField, ...residualFilterFields],
+      docs
+    );
+    const codeData = mergeValueStores(store, bitmapStore);
+    const near = geoPlan.near;
+    const matched = [];
+    for (const doc of docs) {
+      const latE7 = latToE7(valueForDoc(store, geoPlan.latField, doc));
+      const lonE7 = lonToE7(valueForDoc(store, geoPlan.lonField, doc));
+      if (latE7 == null || lonE7 == null) continue;
+      if (!geoPointMatchesE7(geoPlan, latE7, lonE7)) continue;
+      if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+      matched.push({
+        doc,
+        dist: near ? haversineMetersE7(near.latE7, near.lonE7, latE7, lonE7) : 0
+      });
+    }
+    matched.sort((a, b) => a.dist - b.dist || a.doc - b.doc);
+    const rows = matched.slice(offset, offset + size).map(item => [item.doc, 0]);
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(rows, resultContext);
+    if (near) {
+      for (const result of results) {
+        const item = matched.find(entry => entry.doc === result.index);
+        if (item) result.distanceMeters = roundedDistanceMeters(item.dist);
+      }
+    }
+    return {
+      total: matched.length,
+      results,
+      page,
+      size,
+      approximate: false,
+      stats: {
+        exact: true,
+        geoLane: "nearestTextDocValues",
+        geoField: geoPlan.field,
+        geoDistanceSorted: true,
+        geoRouteSorted: false,
+        ...(docValueBytes ? { geoDocValueBytesEstimated: Math.round(docValueBytes) } : {}),
+        geoTraversalBytesEstimated: Math.round(expectedTraversalBytes),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
+
   async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
     return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs }));
   }
@@ -7456,7 +7645,10 @@ export async function createSearch(options = {}) {
     const baseTerms = queryAnalysis.baseTerms;
     if (geoPlan?.sort || geoPlan?.routeSort) {
       // Exact text + geographic ordering: resolve the full text match set once,
-      // then let the geo tree order it with the nearest early-stop proof.
+      // then let the geo tree order it with the nearest early-stop proof. Both
+      // ordering lanes need the tree root, so its fetch overlaps the posting
+      // reads instead of queuing behind them (the promise is cached per field).
+      loadGeoTreeRoot(geoPlan.field).catch(() => {});
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
         const budgetError = new Error("Rangefind: text geo sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
@@ -7470,14 +7662,44 @@ export async function createSearch(options = {}) {
       // bitmap/doc-value selection to runGeoBrowse so a repeated map query
       // does not pay a one-time lazy-manifest fetch after its first result.
       await ensureFacetDictionaries(userFilters);
-      const geoResponse = await runGeoBrowse({
-        page,
-        size,
-        filters: userFilters,
-        geoPlan,
-        hasFilters: hasUserFilters,
-        textMatchDocs: match.docs
-      });
+      let geoResponse = null;
+      if (!match.docs.size) {
+        // An empty match set would still make the traversal scan every leaf
+        // in the constraint before it could prove there is nothing to rank.
+        geoResponse = {
+          total: 0,
+          results: [],
+          page,
+          size,
+          approximate: false,
+          stats: {
+            exact: true,
+            geoLane: geoPlan.routeSort ? "routeTextEmpty" : "nearestTextEmpty",
+            geoField: geoPlan.field,
+            geoDistanceSorted: !!geoPlan.sort,
+            geoRouteSorted: !!geoPlan.routeSort
+          }
+        };
+      } else if (!geoPlan.routeSort) {
+        geoResponse = await runGeoTextNearestByDocValues({
+          page,
+          size,
+          filters: userFilters,
+          geoPlan,
+          hasFilters: hasUserFilters,
+          matchDocs: match.docs
+        });
+      }
+      if (!geoResponse) {
+        geoResponse = await runGeoBrowse({
+          page,
+          size,
+          filters: userFilters,
+          geoPlan,
+          hasFilters: hasUserFilters,
+          textMatchDocs: match.docs
+        });
+      }
       if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for geographic sorting.");
       geoResponse.stats = {
         ...(geoResponse.stats || {}),
@@ -8618,6 +8840,19 @@ export async function createSearch(options = {}) {
     return indexes.map(index => Object.fromEntries(fields.map(field => [field, valueForDoc(store, field, index)])));
   }
 
+  // Fire-and-forget warm-up for the doc-values manifest — on planet-scale
+  // shards it is a multi-MB JSON whose fetch + inflate + parse otherwise sits
+  // on the critical path the first time a lane touches doc values. The
+  // promise is cached, so warming early simply moves that work behind
+  // whatever network waits the query is already paying.
+  function prefetchDocValues() {
+    try {
+      Promise.resolve(ensureDocValuesManifest()).catch(() => {});
+    } catch {
+      // Warm-up must never surface an error; the real access path reports it.
+    }
+  }
+
   return {
     manifest,
     analyzer,
@@ -8629,6 +8864,7 @@ export async function createSearch(options = {}) {
     hydrateRows,
     searchAddressAuthority,
     loadDocValues,
+    prefetchDocValues,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,
@@ -10085,6 +10321,32 @@ async function createShardedSearch(root, options, baseUrl) {
     }
   }
 
+  // Fire-and-forget warm-up: instantiating a shard engine fetches and parses
+  // its manifest, the longest single serial leg of a cold scoped query.
+  // Callers that already know which shards a query will hit (the OSM anchored
+  // cascade knows its coverage shard from pure geometry before any fetch)
+  // overlap that leg with their own resolution work. Unknown names and
+  // engine failures are swallowed — this is an optimization, never a gate;
+  // the later real access surfaces any error through the normal path.
+  function prefetchShards(names, { docValues = false } = {}) {
+    let picked;
+    try {
+      picked = candidateShards({ shards: names });
+    } catch {
+      return;
+    }
+    for (const shard of picked) {
+      const promise = engineAt(shard.index);
+      Promise.resolve(promise).then(shardEngine => {
+        if (docValues) shardEngine.prefetchDocValues?.();
+      }, () => {
+        // A speculative failure must not poison the slot: clearing it lets
+        // the next real access retry instead of replaying a cached rejection.
+        if (engines[shard.index] === promise) engines[shard.index] = null;
+      });
+    }
+  }
+
   return {
     manifest: root,
     shards: shards.map(shard => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
@@ -10093,7 +10355,8 @@ async function createShardedSearch(root, options, baseUrl) {
     count,
     authorityLookup,
     vectorSearch,
-    loadFacetValues
+    loadFacetValues,
+    prefetchShards
   };
 }
 

@@ -835,6 +835,81 @@ async function runGeoOracleSuite(configOverrides, assertManifest) {
       tinyBudget.search({ q: "bakery", geo: { near: center, sort: "distance" } }),
       /geoTextSortMaxDf/
     );
+
+    // Sparse text + distance sort can skip the tree traversal entirely and
+    // order the match set from lat/lon doc values. Forced here because the
+    // pricing gate never fires on a fixture this small; results, distances,
+    // and filters must agree with the traversal lane exactly.
+    const docValueNearestEngine = await createSearch({
+      baseUrl: server.baseUrl,
+      geoTextNearestDocValues: true
+    });
+    const docValueNearest = await docValueNearestEngine.search({
+      q: "bakery",
+      geo: { near: center, sort: "distance" },
+      size: 5
+    });
+    assert.equal(docValueNearest.stats.geoLane, "nearestTextDocValues");
+    assert.equal(docValueNearest.stats.exact, true);
+    assert.equal(docValueNearest.approximate, false);
+    assert.deepEqual(
+      docValueNearest.results.map(result => result.title),
+      textNearestExpected.map(item => item.title)
+    );
+    assert.deepEqual(
+      docValueNearest.results.map(result => result.distanceMeters),
+      textNearestExpected.map(item => Math.round(item.dist * 10) / 10)
+    );
+    // The lane sees the whole match set, so its total is exact.
+    assert.equal(
+      docValueNearest.total,
+      points.filter(point => point.category === "bakery").length
+    );
+
+    // A radius bound filters the doc-value lane the same way it filters the
+    // traversal.
+    const docValueRadius = await docValueNearestEngine.search({
+      q: "bakery",
+      geo: { near: { ...center, radiusMeters: radius }, sort: "distance" },
+      size: 100
+    });
+    const docValueRadiusExpected = radiusExpected.filter(point => point.category === "bakery");
+    assert.equal(docValueRadius.stats.geoLane, "nearestTextDocValues");
+    assert.equal(docValueRadius.total, docValueRadiusExpected.length);
+    assert.ok(docValueRadius.results.every(result => result.distanceMeters <= radius));
+
+    // Facet and numeric filters compose on the doc-value lane.
+    const docValueFiltered = await docValueNearestEngine.search({
+      q: "montreal",
+      filters: { numbers: { rating: { min: 2 } } },
+      geo: { near: center, sort: "distance" },
+      size: 5
+    });
+    assert.equal(docValueFiltered.stats.geoLane, "nearestTextDocValues");
+    assert.deepEqual(
+      docValueFiltered.results.map(result => result.title),
+      filteredTextExpected.map(item => item.title)
+    );
+
+    // A query with no matching docs must not traverse the geo tree at all —
+    // before the short-circuit, an empty match set scanned every leaf inside
+    // the constraint before proving there was nothing to rank.
+    const emptyStart = server.requests.length;
+    const emptyNearest = await engine.search({
+      q: "zzzunmatchedterm",
+      geo: { near: { ...center, radiusMeters: radius }, sort: "distance" },
+      size: 5
+    });
+    const emptyRequests = server.requests.slice(emptyStart);
+    assert.equal(emptyNearest.total, 0);
+    assert.deepEqual(emptyNearest.results, []);
+    assert.equal(emptyNearest.stats.geoLane, "nearestTextEmpty");
+    const emptyGeoRequests = emptyRequests.filter(request => request.pathname.includes("/geo/"));
+    assert.deepEqual(
+      emptyGeoRequests,
+      [],
+      "zero-match distance sort should not touch the geo tree"
+    );
   } finally {
     await server.close();
   }
