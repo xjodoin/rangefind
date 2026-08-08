@@ -12,6 +12,7 @@
     <string name="action_close">Close</string>
     <string name="action_clear">Clear</string>
     <string name="action_recenter">Recenter</string>
+    <string name="action_resume_follow">Follow my position again</string>
     <string name="action_end_navigation">End navigation</string>
 
     <!-- Search -->
@@ -125,6 +126,12 @@
     <string name="diag_mark">Mark a problem</string>
     <string name="diag_mark_count">%1$d</string>
 
+    <!-- Settings sheet -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_tab_maps">Maps</string>
+    <string name="settings_tab_traffic">Traffic</string>
+    <string name="settings_tab_diagnostics">Diagnostics</string>
+
     <!-- Offline regions -->
     <string name="region_offline_title">Offline regions</string>
     <string name="region_offline_subtitle">Keep a route index on this device</string>
@@ -187,4 +194,289 @@
     <string name="format_bytes">%1$d B</string>
     <string name="format_kilobytes">%1$d KB</string>
     <string name="format_megabytes">%1$.1f MB</string>
+    <!-- Live traffic (PulseMesh) -->
+    <string name="mesh_title">Live traffic</string>
+    <string name="mesh_subtitle">Anonymous observations from other drivers, peer to peer. No traffic server, and the route still works without it.</string>
+    <string name="mesh_enable">Turn on live traffic</string>
+    <string name="mesh_disable">Turn off</string>
+    <!-- The transport, which is a different question from whether anything
+         on the map was invented here: demo mode with the vehicles switched
+         off draws only what real drivers nearby have said. -->
+    <string name="mesh_mode_demo">No keeper — this device only</string>
+    <string name="mesh_mode_mesh">Joined the mesh</string>
+    <string name="mesh_mode_off">Off</string>
+    <string name="mesh_demo_note">No keeper is configured, so the vehicles you see are simulated on this phone. Everything else is real: the records, the validation and the aggregate the router uses.</string>
+    <string name="mesh_demo_note_off">No keeper is configured and the demo vehicles are off, so the map shows only what real Wayfind drivers near you have published — which may be nothing at all.</string>
+    <string name="mesh_simulated">Simulated traffic</string>
+    <string name="mesh_simulated_note">Demo vehicles generated on this phone, not other drivers. Their records and the validation behind them are real; where the vehicles are and how fast they go is invented. Turn this off and the map stays empty until real Wayfind drivers are nearby.</string>
+    <!-- On the map itself, wherever invented traffic is being drawn: a
+         driver deciding whether to believe a jam is owed this. -->
+    <string name="mesh_demo_badge">Demo traffic</string>
+    <string name="mesh_contribute">Share my speeds</string>
+    <string name="mesh_contribute_note" formatted="false">Anonymous, with no identity on any record. Most observations are suppressed by the protocol before they are sent, and contribution pauses below 20% battery unless you are charging.</string>
+    <string name="mesh_stats">%1$d peers · %2$d records · %3$d segments</string>
+    <string name="mesh_suppressed">%1$d of %2$d fixes published (%3$s)</string>
+    <string name="mesh_report_title">Report what you can see</string>
+    <string name="mesh_report_disclosure">A report is public and carries the spot you are at right now. It becomes a marker other drivers act on only once several of them confirm it.</string>
+    <string name="mesh_report_sent">Reported to the mesh</string>
+    <string name="mesh_report_declined">Not sent: %1$s</string>
+    <string name="mesh_answer_sent">Answer sent</string>
+    <string name="mesh_answer_still">Still there</string>
+    <string name="mesh_answer_gone">Gone</string>
+    <string name="mesh_reason_no_position">no recent position on a road</string>
+    <string name="mesh_reason_rate">already reported this in the last few minutes</string>
+    <string name="mesh_reason_answered">you already answered this one</string>
+    <string name="mesh_reason_policy">this report type is not allowed here</string>
+    <string name="mesh_incident_hint">unconfirmed · %1$d peer</string>
+    <string name="mesh_incident_hints">unconfirmed · %1$d peers</string>
+    <string name="mesh_incident_shown">%1$d peers · %2$d s ago</string>
+    <string name="mesh_share_title">Share this drive</string>
+    <string name="mesh_share_note">One link, 45 bytes in its fragment. No server ever sees it, and only someone holding it can follow you.</string>
+    <string name="mesh_share_button">Create a link</string>
+    <string name="mesh_share_stop">Stop sharing</string>
+    <string name="mesh_share_unavailable">This drive could not be published, so there is no link to share yet. Live traffic has to be on.</string>
+    <string name="mesh_follow_failed">That link could not be followed: %1$s</string>
+    <string name="mesh_live_route">+%1$d min from live traffic</string>
+    <string name="mesh_live_route_clear">Live traffic agrees with the map here</string>
+    <!-- Threads: sharing a drive -->
+    <string name="mesh_share_mode_fine">Live position</string>
+    <string name="mesh_share_mode_fine_note">A locator. Right for a courier, whose position is the point.</string>
+    <string name="mesh_share_mode_coarse">Stops only</string>
+    <string name="mesh_share_mode_coarse_note">No position at all, so a leaked link is worth what a timetable is. Right for anything carrying children.</string>
+    <string name="mesh_following_title">Following a drive</string>
+    <string name="mesh_following_stop">Stop following</string>
+    <string name="mesh_following_waiting">Waiting for the first update</string>
+    <string name="mesh_following_eta">%1$s away · %2$s</string>
+    <string name="mesh_following_age">%1$d s ago</string>
+    <string name="mesh_following_coarse">This link carries stop events only; no position is published.</string>
+    <string name="mesh_basis_live">from live traffic</string>
+    <string name="mesh_basis_static">from the map</string>
+    <!-- How the followed run travels (§5.2), and what that costs an
+         arrival computed on a graph for something else. -->
+    <string name="mesh_travel_car">By car</string>
+    <string name="mesh_travel_bike">By bike</string>
+    <string name="mesh_travel_foot">On foot</string>
+    <string name="mesh_travel_inline_car">by car</string>
+    <string name="mesh_travel_inline_bike">by bike</string>
+    <string name="mesh_travel_inline_foot">on foot</string>
+    <string name="mesh_profile_map_car">driving map</string>
+    <string name="mesh_profile_map_bike">cycling map</string>
+    <string name="mesh_profile_map_foot">walking map</string>
+    <string name="mesh_following_mismatch">Arrival computed on the %1$s — this run is %2$s</string>
+    <!-- What the driver has said about the stops, from the run itself. -->
+    <string name="mesh_following_progress">%1$d of %2$d delivered</string>
+    <string name="mesh_following_progress_missed">%1$d of %2$d delivered, %3$d skipped</string>
+    <string name="mesh_following_last_delivered">Stop %1$d delivered</string>
+    <string name="mesh_following_last_skipped">Stop %1$d skipped</string>
+    <string name="mesh_following_last_skipped_because">Stop %1$d skipped — %2$s</string>
+    <string name="mesh_following_last_failed">Stop %1$d not delivered</string>
+    <string name="mesh_following_last_failed_because">Stop %1$d not delivered — %2$s</string>
+    <string name="mesh_following_your_stop_skipped">Your stop was skipped — no arrival is expected</string>
+    <string name="mesh_following_your_stop_skipped_because">Your stop was skipped — %1$s</string>
+    <string name="mesh_following_your_stop_failed">Your stop could not be delivered</string>
+    <string name="mesh_following_your_stop_failed_because">Your stop could not be delivered — %1$s</string>
+    <string name="mesh_stop_reason_absent">customer absent</string>
+    <string name="mesh_stop_reason_refused">refused</string>
+    <string name="mesh_stop_reason_inaccessible">could not get in</string>
+    <string name="mesh_stop_reason_parcel">parcel missing or damaged</string>
+    <string name="mesh_stop_reason_other">another reason</string>
+    <string name="mesh_share_started">Sharing this drive</string>
+
+    <!-- Dispatch tickets (PulseMesh threads §20). A ticket is a publish
+         capability: whoever holds it can move the vehicle every customer
+         holding the follow link is watching. -->
+    <string name="mesh_job_title">A job for you</string>
+    <string name="mesh_job_stop_numbered">Stop %1$d</string>
+    <string name="mesh_job_stop_line">%1$d. %2$s</string>
+    <string name="mesh_job_stop_count">%1$d stops, in driving order</string>
+    <string name="mesh_job_stop_default">Delivery stop</string>
+    <!-- Per-stop delivery metadata (§20.8). Driver-side only: it is in the
+         plan, the plan reaches this phone inside the ticket, and the wire
+         carries an 8-byte hash of it and nothing else. None of these
+         strings may end up in a note, a cancel reason or a shared link.
+         A stated 0 is drawn as "0 parcels" — the dispatcher said the van
+         carries nothing for this door — while a field nobody stated is
+         drawn as nothing at all. -->
+    <plurals name="mesh_job_stop_parcels">
+        <item quantity="one">%1$d parcel</item>
+        <item quantity="other">%1$d parcels</item>
+    </plurals>
+    <!-- Quoted so aapt keeps the spaces around the dot: it trims a
+         resource's leading and trailing whitespace otherwise. Same
+         reason as attribution_carto above. -->
+    <string name="mesh_job_stop_meta_sep">" · "</string>
+    <string name="mesh_job_stop_call">Call this stop</string>
+    <string name="mesh_job_expiry">Valid until %1$s</string>
+    <string name="mesh_job_issuer">Issued by %1$s</string>
+    <string name="mesh_job_warning">Accepting publishes this vehicle to everyone holding the customer\'s link.</string>
+    <string name="mesh_job_accept">Accept</string>
+    <string name="mesh_job_decline">Decline</string>
+    <string name="mesh_job_unusable">This job cannot be taken: %1$s</string>
+    <string name="mesh_job_unreadable">That is not a job this app can read.</string>
+    <!-- Known to be a ticket, and unreadable: the holder has a real job in
+         their hand, so the fix is a fresh ticket rather than a decoder's
+         complaint about some other artifact. -->
+    <string name="mesh_job_ticket_unreadable">This job ticket cannot be read — ask the dispatcher to issue a fresh one.</string>
+    <!-- The offer's meta line: what the link is worth, then how the run moves. -->
+    <string name="mesh_job_mode_line">%1$s · %2$s</string>
+    <string name="mesh_job_accepted">Job taken. The customer\'s link is live.</string>
+    <string name="mesh_job_failed">Could not take the job: %1$s</string>
+    <!-- A dispatch ticket is a day's work, so the app counts it out loud. -->
+    <string name="mesh_job_progress">Stop %1$d of %2$d</string>
+    <string name="mesh_job_continue">Continue</string>
+    <!-- The tracking link, on the card the driver already has open. -->
+    <string name="mesh_job_share">Share the tracking link</string>
+    <string name="mesh_job_share_republish">This run is not publishing. Sharing starts it again under a new link, and anyone holding the old one will see a vehicle that has stopped.</string>
+    <string name="mesh_job_stop_delivered">Stop %1$d of %2$d delivered — next: %3$s</string>
+    <string name="mesh_job_stop_skipped">Stop %1$d of %2$d skipped — next: %3$s</string>
+    <string name="mesh_job_stop_failed">Stop %1$d of %2$d not delivered — next: %3$s</string>
+    <string name="mesh_job_run_complete">All %1$d delivered — run closed</string>
+    <string name="mesh_reason_no_mesh">live traffic is off, and a job publishes onto the mesh</string>
+    <string name="mesh_reason_no_run">no job is publishing from this phone</string>
+    <string name="mesh_reason_photo_too_big">the photo is too large to send</string>
+    <string name="mesh_reason_photo_coarse">this job does not publish a position, and a photo would give one away</string>
+    <string name="mesh_reason_photo_unreadable">the photo did not come out</string>
+    <!-- Marking a stop. Delivery is asserted by the driver, never inferred
+         from having arrived: the two look identical from a phone. -->
+    <string name="mesh_job_mark_delivered">Delivered</string>
+    <string name="mesh_job_mark_delivered_photo">Delivered, with a photo</string>
+    <string name="mesh_job_mark_skip">Skip…</string>
+    <string name="mesh_job_arrived">You are here — say what happened</string>
+    <string name="mesh_job_mark_unsent">Stop %1$d marked on this phone only — not published (%2$s)</string>
+    <!-- The photo is sealed before the outcome is recorded, so a refused
+         photo refuses the whole mark: the stop can be marked again without
+         one, and saying so is the only useful thing to tell the driver. -->
+    <string name="mesh_job_mark_photo_refused">Stop %1$d not published — the photo was refused (%2$s). Mark it again without a photo.</string>
+    <string name="mesh_job_photo_add">Add a photo</string>
+    <string name="mesh_job_photo_attached">Photo attached — goes with “not delivered”</string>
+    <string name="mesh_job_skip_title">Stop %1$d: what happened?</string>
+    <string name="mesh_job_skip_explainer">Skipped means you did not go. Not delivered means you went and could not hand it over.</string>
+    <string name="mesh_job_reason_absent">Customer absent</string>
+    <string name="mesh_job_reason_refused">Refused</string>
+    <string name="mesh_job_reason_inaccessible">Could not get in</string>
+    <string name="mesh_job_reason_parcel">Parcel missing or damaged</string>
+    <string name="mesh_job_reason_other">Other — say why</string>
+    <string name="mesh_job_note_hint">In a few words (goes to the customer)</string>
+    <string name="mesh_job_mark_skipped_action">Mark skipped</string>
+    <string name="mesh_job_mark_failed_action">Mark not delivered</string>
+    <string name="mesh_job_mark_cancel">Cancel</string>
+    <string name="mesh_job_more">More for this job</string>
+    <string name="mesh_job_cant_finish">Can\'t finish this job</string>
+    <string name="mesh_job_cancel_title">Can\'t finish this job?</string>
+    <string name="mesh_job_cancel_body">%1$d of the %2$d stops still have no outcome.</string>
+    <string name="mesh_job_cancel_explainer">Every customer holding a tracking link is told the run is cancelled, and the dispatcher sees it live. Nobody is coming back to those stops today.</string>
+    <string name="mesh_job_cancel_reason_hint">Why, in a few words (goes to the customer)</string>
+    <string name="mesh_job_cancel_keep">Keep the job</string>
+    <string name="mesh_job_cancel_confirm">Cancel this job</string>
+    <string name="mesh_job_canceled_notice">Run cancelled — %1$d stops left unmarked, and everyone watching has been told.</string>
+    <string name="mesh_handover_button">Hand over this job</string>
+    <string name="mesh_handover_note">Seal the job to a device you have enrolled. The customer\'s link keeps working.</string>
+    <string name="mesh_handover_title">Hand over this job</string>
+    <!-- Since the ticket is sealed to one device, the old warning — "anyone
+         who photographs this can publish the vehicle" — is no longer true.
+         What is still true is the other half: whoever opens it publishes
+         this vehicle. -->
+    <string name="mesh_handover_warning">Only %1$s can open this. Point that phone\'s camera at it — that device then becomes the publisher, so stop driving this job on this one.</string>
+    <string name="mesh_handover_close">Close</string>
+    <string name="mesh_handover_unavailable">There is no job to hand over.</string>
+    <!-- Enrolment is the gate on transfer, so an empty roster is not a
+         failure to report: it is a missing prerequisite to name. -->
+    <string name="mesh_handover_no_devices">No device is enrolled yet, and a job is sealed to one device or to nobody. The other driver opens Wayfind, shows their device card, and this phone opens it — then the job can be handed over.</string>
+    <string name="mesh_handover_pick_title">Hand over to which device?</string>
+    <string name="mesh_handover_pick_note">The job is sealed to the device you pick, and no other phone can open it.</string>
+    <string name="mesh_handover_pick_cancel">Cancel</string>
+    <!-- The two refusals §20.9 keeps apart, because they have different
+         fixes: one is enrolment, the other is a fresh ticket. -->
+    <string name="mesh_job_sealed_elsewhere">This job was sealed for another device. Ask the dispatcher to enrol this device and send it again.</string>
+    <string name="mesh_job_unsealed">This job arrived unsealed, so anyone who handled it can read the addresses and publish the vehicle. Ask the dispatcher to enrol this device and send a sealed job.</string>
+    <string name="mesh_job_no_device_key">This phone has no device identity yet, so a sealed job cannot be opened here.</string>
+
+    <!-- Device identity and enrolment (threads §20.9). -->
+    <string name="device_section_title">This device</string>
+    <string name="device_section_note">A job travels encrypted and is sealed to one device. Show this card to the other driver\'s camera, and open theirs the same way, before either of you can hand a job over.</string>
+    <string name="device_name_label">Name on the card</string>
+    <string name="device_name_hint">e.g. Léa — Pixel 8</string>
+    <string name="device_fingerprint_label">Fingerprint</string>
+    <string name="device_fingerprint_note">Read these characters aloud and check they match the other phone. A card is just bytes on a screen; that comparison is what enrolment is worth.</string>
+    <string name="device_show_card">Show my device card</string>
+    <string name="device_card_title">My device card</string>
+    <string name="device_card_share">Send this card</string>
+    <string name="device_card_share_chooser">Send your device card</string>
+    <string name="device_card_close">Close</string>
+    <string name="device_card_unavailable">This phone has no device identity yet.</string>
+    <string name="device_card_unreadable">That device card cannot be read — ask them to show it again.</string>
+    <string name="device_unnamed">Unnamed device</string>
+    <string name="device_enrol_title">Enrol this device?</string>
+    <string name="device_enrol_note">Check this fingerprint matches what the other phone is showing right now. Anyone can put a card on a screen; this comparison is the only thing that says it is theirs.</string>
+    <string name="device_enrol_confirm">Enrol</string>
+    <string name="device_enrol_cancel">Cancel</string>
+    <string name="device_enrolled_notice">%1$s can now be handed a job.</string>
+    <string name="device_roster_title">Devices you can hand a job to</string>
+    <string name="device_roster_empty">None yet. A job cannot be handed on until a device is enrolled.</string>
+    <string name="device_forget">Remove</string>
+    <string name="device_added_at">Enrolled %1$s</string>
+    <!-- The one loss this design cannot recover from, said before it
+         happens rather than after. -->
+    <string name="device_key_loss_note">This key never leaves the phone. Reinstalling Wayfind or clearing its data destroys it: every job already sealed to this device stops opening, and the dispatcher has to enrol this phone again.</string>
+    <string name="device_key_plain">Stored without hardware protection on this phone.</string>
+    <string name="mesh_handover_too_big">This plan is bigger than a camera can scan. Send the ticket as a file instead — it carries the same job.</string>
+    <string name="mesh_handover_stop_note">The other phone is publishing this vehicle now, so this one says nothing on the way out: a goodbye from here would tell every customer the run had ended.</string>
+    <string name="mesh_handover_stop_here">They have it — stop publishing here</string>
+    <string name="mesh_handover_stopped_notice">Stopped publishing here. The other phone is driving this job now.</string>
+    <string name="mesh_handover_share">Share ticket</string>
+    <string name="mesh_handover_share_chooser">Hand over the ticket</string>
+
+    <!-- Job offers (threads §20.4). An offer is the one artifact on this
+         channel that is public and unsealed by design: it goes to couriers
+         the dispatcher has never met, so it carries a commitment to a plan
+         plus coarse descriptors and no address at all. Every line here has
+         to stay inside what the bytes say — there is no stop in an offer to
+         name, and the locality is a grid cell rather than a place. -->
+    <string name="offer_title">A job on offer</string>
+    <plurals name="offer_stops">
+        <item quantity="one">%1$d stop</item>
+        <item quantity="other">%1$d stops</item>
+    </plurals>
+    <string name="offer_distance">%1$s in total</string>
+    <string name="offer_pay">%1$s for the round</string>
+    <string name="offer_pay_unstated">No pay stated in this offer.</string>
+    <string name="offer_label">“%1$s”</string>
+    <string name="offer_expires">Offer valid until %1$s</string>
+    <string name="offer_issuer">Offered by %1$s</string>
+    <string name="offer_locality">Around %1$s</string>
+    <!-- The grid is stated because a coordinate without its resolution
+         reads as a position. It is the mean of the stops snapped to a
+         0.01° grid: a point usually with nothing at it. -->
+    <string name="offer_locality_grid">A grid square about %1$s km across, not an address — the point is the middle of the round and usually has nothing at it.</string>
+    <string name="offer_spread_1km">Stops range within about 1 km of that point.</string>
+    <string name="offer_spread_3km">Stops range within about 3 km of that point.</string>
+    <string name="offer_spread_10km">Stops range within about 10 km of that point.</string>
+    <string name="offer_spread_30km">Stops range within about 30 km of that point.</string>
+    <string name="offer_spread_beyond">Stops range more than 30 km from that point.</string>
+    <string name="offer_no_addresses">The addresses are not in this offer. They arrive only if this job is awarded to this device.</string>
+    <string name="offer_send_card">Send my device card</string>
+    <string name="offer_send_card_note">This protocol carries no bidding channel. Your card goes over whatever channel the dispatcher already uses; if they pick you, they seal the job to this device.</string>
+    <string name="offer_dismiss">Dismiss</string>
+    <string name="offer_unusable">This offer does not check out: %1$s</string>
+    <string name="offer_unreadable">That job offer cannot be read — ask the dispatcher to post a fresh one.</string>
+    <string name="offer_bid_sent">Card sent. This offer is kept here, so the job you are awarded can be checked against it.</string>
+    <string name="offer_held_title">Jobs you have bid on</string>
+    <string name="offer_held_empty">None. Sending your device card for an offer records it here, and whatever you are awarded afterwards is checked against it.</string>
+    <string name="offer_held_bid_at">Card sent %1$s</string>
+    <string name="offer_held_expires">Valid until %1$s</string>
+    <string name="offer_forget">Remove</string>
+    <!-- What the courier\'s own device makes of an award, given what they
+         bid on (§20.4). The three cases are deliberately not one: a
+         mismatched commitment on the same job id is refused, an award
+         matching none of the open bids is warned about because a second
+         unrelated dispatch looks exactly the same, and a check that
+         passed is said out loud rather than left silent. -->
+    <string name="offer_award_matches">This is the job you bid on — same plan, same issuer.</string>
+    <string name="offer_award_mismatch">This is not the job you bid on: %1$s. It will not be taken.</string>
+    <string name="offer_award_mismatch_unnamed">This is not the job you bid on, and the check that failed was not named. It will not be taken.</string>
+    <plurals name="offer_award_unknown">
+        <item quantity="one">This award matches none of the %1$d offer you bid on. That is what a swapped plan looks like — and also what a second, unrelated job looks like. Check with the dispatcher before accepting.</item>
+        <item quantity="other">This award matches none of the %1$d offers you bid on. That is what a swapped plan looks like — and also what a second, unrelated job looks like. Check with the dispatcher before accepting.</item>
+    </plurals>
+    <string name="offer_award_refused">Refused: this award is not the job that was offered (%1$s).</string>
 </resources>

@@ -23,6 +23,30 @@ export const CLASS_SPEED_CAP_KMH = Object.freeze({
 });
 const DEFAULT_CLASS_CAP_KMH = 50;
 
+// §5.1 gossip verdicts. A GossipSub topic validator runs *before* the
+// message is forwarded, so these three words decide both what this node
+// keeps and what it relays — and relaying is vouching (rule 5 asks only
+// whether the delivering peer is bonded). The strings are exactly
+// libp2p's `TopicValidatorResult` values, spelled out here so this module
+// stays importable without the optional libp2p dependency.
+//
+//   ACCEPT  delivered here and forwarded to our mesh peers.
+//   IGNORE  neither delivered nor forwarded, and no peer is scored down.
+//   REJECT  as IGNORE, plus GossipSub scores down the peer that handed us
+//           the bytes — reserved for provable misbehaviour, which is
+//           exactly the set the trust ledger already treats as a lie
+//           (`verdict.trustPenalty`, rules 10–12).
+export const GOSSIP_ACCEPT = "accept";
+export const GOSSIP_IGNORE = "ignore";
+export const GOSSIP_REJECT = "reject";
+
+/** The stricter of two verdicts: reject beats ignore beats accept. */
+export function worseGossipVerdict(a, b) {
+  if (a === GOSSIP_REJECT || b === GOSSIP_REJECT) return GOSSIP_REJECT;
+  if (a === GOSSIP_IGNORE || b === GOSSIP_IGNORE) return GOSSIP_IGNORE;
+  return GOSSIP_ACCEPT;
+}
+
 // §6 rule 12: classes on which contributions are dropped unconditionally.
 export const DENIED_CLASSES = Object.freeze(new Set([
   "service", "driveway", "parking_aisle", "track", "living_street", "pedestrian", "footway"
@@ -155,33 +179,47 @@ export function createValidator({
     return null;
   }
 
+  /**
+   * Rules 10–12. Returns `{ judged, failure }`: `judged` is false when
+   * this receiver does not hold the leaf and therefore could not apply
+   * them at all. The distinction matters beyond bookkeeping — §5.1's
+   * topic validator refuses to *forward* a record whose map-dependent
+   * rules it could not evaluate, because relaying is vouching and a peer
+   * may only vouch for what it actually checked.
+   */
   function checkLeafRules(record, isIncident) {
     const context = cellContext ? cellContext(record.leafCell) : null;
-    if (!context) return null; // rules 10–12 are probabilistic across peers
+    if (!context) return { judged: false, failure: null }; // rules 10–12 are probabilistic across peers
     // Rule 11: segment existence.
     if ((record.geomRef >>> 1) >= context.polylineCount) {
-      return fail(11, "segment does not exist in leaf", { trustPenalty: true });
+      return { judged: true, failure: fail(11, "segment does not exist in leaf", { trustPenalty: true }) };
     }
     // Rule 12: reportable class.
     const roadClass = context.classOf ? context.classOf(record.geomRef) : null;
     if (roadClass && DENIED_CLASSES.has(roadClass)) {
-      return fail(12, `class ${roadClass} is never reportable`, { trustPenalty: true });
+      return { judged: true, failure: fail(12, `class ${roadClass} is never reportable`, { trustPenalty: true }) };
     }
     if (!isIncident) {
       // Rule 10: class plausibility.
       const capKmh = (roadClass && CLASS_SPEED_CAP_KMH[roadClass]) || DEFAULT_CLASS_CAP_KMH;
       const representativeKmh = 5 * record.speedBin + 2.5;
       if (representativeKmh > capKmh * 1.15) {
-        return fail(10, `speed implausible for class ${roadClass || "unknown"}`, { trustPenalty: true });
+        return {
+          judged: true,
+          failure: fail(10, `speed implausible for class ${roadClass || "unknown"}`, { trustPenalty: true })
+        };
       }
       const staticMeters = context.metersOf ? context.metersOf(record.geomRef) : null;
       if (record.meters > 0 && Number.isFinite(staticMeters) && staticMeters > 0) {
         if (record.meters < staticMeters * 0.8 || record.meters > staticMeters * 1.2) {
-          return fail(10, "meters disagrees with static segment length", { trustPenalty: true });
+          return {
+            judged: true,
+            failure: fail(10, "meters disagrees with static segment length", { trustPenalty: true })
+          };
         }
       }
     }
-    return null;
+    return { judged: true, failure: null };
   }
 
   /**
@@ -215,9 +253,9 @@ export function createValidator({
     if (!takeToken(fromPeer, nowMillis)) return fail(7, "per-peer rate exceeded");
     const topicFailure = checkTopic(record, topic);
     if (topicFailure) return topicFailure;
-    const leafFailure = checkLeafRules(record, false);
-    if (leafFailure) return leafFailure;
-    return { ok: true, record };
+    const leaf = checkLeafRules(record, false);
+    if (leaf.failure) return leaf.failure;
+    return { ok: true, record, judged: leaf.judged };
   }
 
   /** Validates one PMI1 (§6 with the incident-specific rows of rule 3/5/7). */
@@ -250,9 +288,9 @@ export function createValidator({
     if (!takeIncidentToken(fromPeer, nowMillis)) return fail(7, "per-peer incident rate exceeded");
     const topicFailure = checkTopic(record, topic);
     if (topicFailure) return topicFailure;
-    const leafFailure = checkLeafRules(record, true);
-    if (leafFailure) return leafFailure;
-    return { ok: true, record };
+    const leaf = checkLeafRules(record, true);
+    if (leaf.failure) return leaf.failure;
+    return { ok: true, record, judged: leaf.judged };
   }
 
   /**
@@ -280,7 +318,9 @@ export function createValidator({
       return fail(5, "ban testimony from an unbonded deliverer");
     }
     if (!takeBanToken(fromPeer, nowMillis)) return fail(7, "per-peer ban rate exceeded");
-    return { ok: true, record };
+    // A PMX1 names a peer hash, not a road: nothing here depends on
+    // holding a leaf, so testimony is always fully judged.
+    return { ok: true, record, judged: true };
   }
 
   return { validateContribution, validateIncident, validateBan, constants };

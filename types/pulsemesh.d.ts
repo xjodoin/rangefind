@@ -258,6 +258,8 @@ export declare function fromHex(hex: string): Uint8Array;
 
 export declare const TOPIC_PREFIX: string;
 export declare const SYNC_PROTOCOL: string;
+/** Threads §5.5 catch-up: PMR1 in, PMM1 out. */
+export declare const THREAD_PROTOCOL: string;
 export declare function shardOfCell(cell: MeshCell): number;
 export declare function topicName(parts: {
   epochPrefix16hex: string; zoneX: number; zoneY: number; window: number; shard: number;
@@ -576,6 +578,14 @@ export interface MeshNetwork {
   publish(topic: string, payload: Uint8Array, fromId: string): void;
   request(fromId: string, toId: string, payload: Uint8Array): Promise<Uint8Array | null> | Uint8Array | null;
   peersOf(nodeId: string): string[];
+  /**
+   * The multiaddrs this host is actually connected to, each ending in
+   * `/p2p/<peerId>` so it can be dialled again as-is (threads §20.10).
+   * Only the wire transport has these. The library reports; the host
+   * persists — there is no peer store here, because what a device may
+   * remember about who it has talked to is a product decision.
+   */
+  knownPeers?(): string[];
   schedule?(fn: () => void, delayMs: number): unknown;
 }
 
@@ -620,6 +630,21 @@ export declare class MeshNode {
   registerBond(payload: Uint8Array | BondFields, fromPeer: string, nowMillis?: number):
     { ok: true; expiresMillis: number } | { ok: false; reason: string };
   isBonded(peerId: string, nowMillis?: number): boolean;
+  /** §5.4: peers whose bond this node verified (or a gateway admitted), and until when. */
+  readonly bondedPeers: Map<string, number>;
+  /** §8.4: peers forfeited on first-hand evidence, and until when. */
+  readonly locallyBanned: Map<string, number>;
+  /**
+   * Optional tap for gateways (§16 LoRa bridges, §12.1 fleet seeds).
+   * Fires only for records that passed every rule and entered the store —
+   * from gossip and from merged snapshots alike — which is what makes it
+   * usable as a bridge's gate: what it hands you is what this node has
+   * already staked its bond on.
+   */
+  onRecordAccepted?: ((
+    record: ContributionRecord | IncidentRecord,
+    meta: { fromPeer: string | null; nowMillis: number; viaSnapshot?: boolean }
+  ) => void) | null;
   onGossip(topic: string, payload: Uint8Array, fromPeer: string, nowMillis?: number): void;
   onStream(payload: Uint8Array, fromPeer: string, nowMillis?: number): Uint8Array | null;
   fetchCells(wanted: MeshCell[], options?: { nowMillis?: number }): Promise<number>;
@@ -633,6 +658,9 @@ export declare function createLoopbackNetwork(options?: { clock?: () => number }
   counters(nodeId: string): { gossipIn: number; gossipOut: number; streamIn: number; streamOut: number; messages: number };
   nodes: Map<string, MeshNode>;
 };
+
+// The integration boundary a host actually wires (session + simulator).
+export * from "./pulsemesh-session.js";
 
 /** UTF-8, keys sorted at every level, no whitespace — the signing encoding. */
 export declare function canonicalJson(value: unknown): string;

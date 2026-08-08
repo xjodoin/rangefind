@@ -35,6 +35,11 @@ android {
             // No public route index is hosted yet; Directions stays disabled
             // until a base URL is configured in-app.
             buildConfigField("String", "ROUTE_BASE_URL", "\"\"")
+            // A PulseMesh keeper to bootstrap the live-traffic mesh from.
+            // Empty until one is deployed: with no keeper the only mesh
+            // available is the on-device demo transport, and the app says
+            // so rather than implying it has joined anything.
+            buildConfigField("String", "PULSEMESH_BOOTSTRAP", "\"\"")
         }
         debug {
             isMinifyEnabled = false
@@ -46,6 +51,7 @@ android {
             // `route-graph/` (e.g. the Luxembourg test index served by the
             // osm-geo demo server on 5184) is reachable without bundling it.
             buildConfigField("String", "ROUTE_BASE_URL", "\"http://10.0.2.2:5184/route-graph/\"")
+            buildConfigField("String", "PULSEMESH_BOOTSTRAP", "\"\"")
         }
     }
 
@@ -85,7 +91,19 @@ android {
 // (npm run build:browser) instead of checking copies into the app module.
 val syncRangefindBundles by tasks.registering(Copy::class) {
     from(rootProject.file("../dist")) {
-        include("runtime.browser.js", "osm.browser.js", "route.browser.js", "pulsemesh.mobile.js")
+        include(
+            "runtime.browser.js", "osm.browser.js", "route.browser.js",
+            // Live traffic. The core and the thread channel are small and
+            // always loaded; the libp2p transport is 2.6 MB and is imported
+            // on demand, so a build with no keeper configured ships it and
+            // never executes it.
+            "pulsemesh.mobile.js", "pulsemesh-threads.browser.js",
+            "pulsemesh-libp2p.browser.js",
+            // Handover (threads §20.5) draws the ticket as a QR the next
+            // driver's own camera reads. Imported on demand, so a phone
+            // that never dispatches never loads it.
+            "qr.browser.js"
+        )
     }
     into(layout.projectDirectory.dir("src/main/assets/rangefind"))
 }

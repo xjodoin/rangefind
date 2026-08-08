@@ -37,11 +37,13 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.location.LocationComponentActivationOptions
 import org.maplibre.android.location.LocationComponentOptions
+import org.maplibre.android.location.OnCameraTrackingChangedListener
 import org.maplibre.android.location.modes.CameraMode
 import org.maplibre.android.location.modes.RenderMode
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
@@ -67,10 +69,20 @@ private const val SRC_CROSSING = "rf-src-crossing"
 private const val SRC_PUCK = "rf-src-puck"
 private const val SRC_ORIGIN = "rf-src-origin"
 
+// Live traffic (PulseMesh). Three sources, because the three are three
+// different claims: a measured aggregate of the road's speed, a reported
+// incident that may or may not be corroborated, and one vehicle that
+// authorized this phone to watch it.
+private const val SRC_TRAFFIC = "rf-src-traffic"
+private const val SRC_INCIDENT = "rf-src-incident"
+private const val SRC_THREAD = "rf-src-thread"
+
 private const val LYR_RESULTS = "rf-lyr-results"
 private const val LYR_ALT = "rf-lyr-alt"
 /** Topmost layer this file installs; the vehicle goes above it. */
 private const val LYR_PUCK = "rf-lyr-puck"
+private const val LYR_TRAFFIC = "rf-lyr-traffic"
+private const val LYR_INCIDENT = "rf-lyr-incident"
 
 /** Up to three candidates: the fastest plus two alternates. */
 private val SRC_LABEL = listOf("rf-src-label-0", "rf-src-label-1", "rf-src-label-2")
@@ -103,6 +115,8 @@ fun MapCanvas(
     onResultTapped: (Int) -> Unit,
     onRouteTapped: (Int) -> Unit,
     onLongPress: (LatLon) -> Unit,
+    /** The drive's camera stopped following because the map was panned. */
+    onFollowDismissed: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current.density
@@ -118,6 +132,7 @@ fun MapCanvas(
     val currentOnResult by rememberUpdatedState(onResultTapped)
     val currentOnRoute by rememberUpdatedState(onRouteTapped)
     val currentOnLongPress by rememberUpdatedState(onLongPress)
+    val currentOnFollowDismissed by rememberUpdatedState(onFollowDismissed)
 
     val mapView = rememberMapViewWithLifecycle()
 
@@ -132,6 +147,7 @@ fun MapCanvas(
         mapView.getMapAsync { map ->
             MapSnapshotter.attach(map)
             holder.map = map
+            holder.onFollowDismissed = { currentOnFollowDismissed() }
             map.uiSettings.isAttributionEnabled = false
             map.uiSettings.isLogoEnabled = false
             map.uiSettings.isCompassEnabled = false
@@ -156,6 +172,13 @@ fun MapCanvas(
                 map.addOnCameraIdleListener {
                     val target = map.cameraPosition.target ?: return@addOnCameraIdleListener
                     currentOnCenter(LatLon(target.latitude, target.longitude))
+                    // Belt and braces on the dismissal callback. Whether it
+                    // fires is MapLibre's business and depends on which
+                    // gesture ended the tracking; whether the camera is still
+                    // following is a fact we can just read. A driver left
+                    // looking at a map that stopped following, with no way
+                    // back, is the failure this is here to prevent.
+                    if (holder.followBroken()) currentOnFollowDismissed()
                 }
                 map.addOnMapClickListener { point ->
                     val screen = map.projection.toScreenLocation(point)
@@ -209,7 +232,14 @@ fun MapCanvas(
         state.activeRouteIndex,
         state.nav,
         state.userLocation,
-        state.sheet
+        state.sheet,
+        // Live traffic changes on its own clock, with no route or fix
+        // moving: leaving these out of the key meant the mesh could fill
+        // with observations and the map would never redraw, because
+        // nothing it was watching had changed.
+        state.traffic,
+        state.incidents,
+        state.following
     ) {
         holder.latest = state
         holder.palette = palette
@@ -300,6 +330,14 @@ fun MapCanvas(
     // Camera: explicit recenter request.
     LaunchedEffect(state.recenterTick) {
         if (state.recenterTick == 0) return@LaunchedEffect
+        // Mid-drive this is "follow me again", not "look at me once". Flying a
+        // north-up, untilted camera to the vehicle and leaving it there would
+        // answer the button and still not resume the drive: the next fix would
+        // slide out from under a map that had stopped tracking.
+        if (state.sheet == SheetMode.Navigating) {
+            holder.resumeFollow(mapView.height)
+            return@LaunchedEffect
+        }
         val here = state.userLocation ?: return@LaunchedEffect
         val map = holder.map ?: return@LaunchedEffect
         map.animateCamera(
@@ -371,7 +409,11 @@ private class MapHolder {
 
     private var vehicleReady = false
     private var following = false
+    private var trackingListenerBound = false
     private var viewportHeightPx = 0
+
+    /** Told when a gesture, not the app, ended the drive's camera tracking. */
+    var onFollowDismissed: (() -> Unit)? = null
 
     fun resetFollow() {
         runCatching { map?.locationComponent?.cameraMode = CameraMode.NONE }
@@ -408,9 +450,11 @@ private class MapHolder {
                 )
                 .accuracyColor(palette.puckHalo.toArgb())
                 .accuracyAlpha(0.28f)
-                // A pan mid-drive moves the camera's focus rather than
-                // dropping the follow, so a glance up the road doesn't end
-                // with the map stranded behind the car.
+                // A nudge does not end the follow, a deliberate pan does: the
+                // thresholds behind this flag are what tell the two apart.
+                // The pan is honoured rather than fought — a driver looking up
+                // the road means it — and the way back is the recenter
+                // control, which [onFollowDismissed] is what raises.
                 .trackingGesturesManagement(true)
                 // Above everything this file draws. Left to itself the
                 // component sits under the route, and since the route line
@@ -425,8 +469,51 @@ private class MapHolder {
                     .build()
             )
             vehicleReady = true
+            // Bound once, not per style load: the component keeps its listener
+            // list across styles, and a second copy would report every pan
+            // twice.
+            if (!trackingListenerBound) {
+                trackingListenerBound = true
+                map.locationComponent.addOnCameraTrackingChangedListener(
+                    object : OnCameraTrackingChangedListener {
+                        override fun onCameraTrackingDismissed() {
+                            // Only a drive has a follow to lose. Outside one
+                            // the camera is the user's anyway.
+                            if (following) onFollowDismissed?.invoke()
+                        }
+
+                        override fun onCameraTrackingChanged(currentMode: Int) {}
+                    }
+                )
+            }
             applyFollow()
         }
+    }
+
+    /**
+     * Whether a drive is running but the camera has stopped following it.
+     *
+     * Read from the component rather than remembered, so it is true however
+     * the tracking ended.
+     */
+    fun followBroken(): Boolean {
+        if (!following || !vehicleReady) return false
+        return runCatching { map?.locationComponent?.cameraMode == CameraMode.NONE }
+            .getOrDefault(false)
+    }
+
+    /**
+     * Puts the camera back on the vehicle after a pan dropped it.
+     *
+     * Not [setFollowing]: that one owns the drive's render window, and
+     * restarting it here would clear the frame histogram every time a driver
+     * glanced up the road — the trace would report the last few seconds of a
+     * twenty-minute drive.
+     */
+    fun resumeFollow(viewportHeightPx: Int) {
+        if (!following) return
+        if (viewportHeightPx > 0) this.viewportHeightPx = viewportHeightPx
+        applyFollow()
     }
 
     /** Where the vehicle is, once per fix; the component animates between. */
@@ -633,6 +720,53 @@ private class MapHolder {
             )
         }
 
+        // Live traffic. Every segment carries its own colour and confidence,
+        // so one layer draws free-flowing through stopped and a weakly
+        // corroborated hint stays visibly weaker than a jam.
+        style.setSource(
+            SRC_TRAFFIC,
+            FeatureCollection.fromFeatures(
+                state.traffic.filter { it.points.size >= 2 }.map { segment ->
+                    Feature.fromGeometry(
+                        LineString.fromLngLats(segment.points.map { Point.fromLngLat(it.lon, it.lat) })
+                    ).apply {
+                        addStringProperty("color", trafficColor(segment.level))
+                        addNumberProperty("confidence", segment.confidence.coerceIn(0.0, 1.0))
+                    }
+                }
+            )
+        )
+
+        style.setSource(
+            SRC_INCIDENT,
+            FeatureCollection.fromFeatures(
+                state.incidents.map { incident ->
+                    Feature.fromGeometry(Point.fromLngLat(incident.lon, incident.lat)).apply {
+                        addStringProperty("tier", incident.tier)
+                        addStringProperty("key", incident.key)
+                    }
+                }
+            )
+        )
+
+        // A followed run's position, and only while the subscriber says it is
+        // live: §12 is explicit that a stale position must not be presented as
+        // a live one, and a dot on a map is exactly that presentation.
+        val followed = state.following?.takeIf { it.live && it.hasPosition }
+        style.setSource(
+            SRC_THREAD,
+            FeatureCollection.fromFeatures(
+                listOfNotNull(
+                    followed?.let { drive ->
+                        val lat = drive.lat
+                        val lon = drive.lon
+                        if (lat == null || lon == null) null
+                        else Feature.fromGeometry(Point.fromLngLat(lon, lat))
+                    }
+                )
+            )
+        )
+
         // Parked: a plain dot from this layer. Driving: the vehicle belongs to
         // MapLibre's location component, so this source empties and gets out
         // of its way.
@@ -644,6 +778,19 @@ private class MapHolder {
             )
         )
     }
+}
+
+/**
+ * How a congestion level reads on the map. The thresholds behind these
+ * levels are the session's, not the map's — the drawing only has to be
+ * unambiguous about which of them it is showing.
+ */
+private fun trafficColor(level: String): String = when (level) {
+    "stopped" -> "#C0392B"
+    "heavy" -> "#E07B39"
+    "slow" -> "#E5B93C"
+    "free" -> "#3F9D6A"
+    else -> "#8D939C"
 }
 
 private fun List<RouteJunction>.toPoints() =
@@ -663,7 +810,8 @@ private fun Style.setLine(id: String, lines: List<List<LatLon>>) {
 private fun installLayers(style: Style, palette: MapPalette, density: Float) {
     (listOf(
         SRC_ALT, SRC_ROUTE, SRC_TRAVELED, SRC_RESULTS, SRC_DESTINATION,
-        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN
+        SRC_SIGNAL, SRC_STOP, SRC_CROSSING, SRC_PUCK, SRC_ORIGIN,
+        SRC_TRAFFIC, SRC_INCIDENT, SRC_THREAD
     ) + SRC_LABEL).forEach { id ->
         if (style.getSource(id) == null) {
             style.addSource(GeoJsonSource(id, FeatureCollection.fromFeatures(emptyList())))
@@ -684,6 +832,32 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
             PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
         )
 
+    // Under everything the driver is following: live traffic describes the
+    // road, it does not replace the line. Colour comes from each feature so
+    // one layer covers free-flowing through stopped.
+    style.addLayer(
+        LineLayer("rf-lyr-traffic-casing", SRC_TRAFFIC).withProperties(
+            PropertyFactory.lineColor(0xFF14161D.toInt()),
+            PropertyFactory.lineWidth(13f),
+            PropertyFactory.lineOpacity(0.30f),
+            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
+        )
+    )
+    style.addLayer(
+        LineLayer(LYR_TRAFFIC, SRC_TRAFFIC).withProperties(
+            PropertyFactory.lineColor(Expression.get("color")),
+            PropertyFactory.lineWidth(9f),
+            // Confidence is drawn rather than hidden: a two-report hint is
+            // visibly fainter than a corroborated jam, because it is a
+            // weaker claim and the map should not flatten the difference.
+            PropertyFactory.lineOpacity(
+                Expression.max(Expression.literal(0.35f), Expression.get("confidence"))
+            ),
+            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
+        )
+    )
     style.addLayer(line("rf-lyr-alt-casing", SRC_ALT, palette.routeAlternateCasing.toArgb(), 11f, 0.9f))
     style.addLayer(line(LYR_ALT, SRC_ALT, palette.routeAlternate.toArgb(), 6.5f, 0.9f))
     style.addLayer(line("rf-lyr-traveled", SRC_TRAVELED, palette.routeTraveled.toArgb(), 9f, 0.85f))
@@ -743,6 +917,48 @@ private fun installLayers(style: Style, palette: MapPalette, density: Float) {
             )
         )
     }
+
+    // An incident that peers have corroborated is drawn as a fact; one that
+    // has not is drawn smaller and dimmer, because §8.5 says it is a hint.
+    style.addLayer(
+        CircleLayer(LYR_INCIDENT, SRC_INCIDENT).withProperties(
+            PropertyFactory.circleRadius(
+                Expression.switchCase(
+                    Expression.eq(Expression.get("tier"), Expression.literal("shown")),
+                    Expression.literal(9f),
+                    Expression.literal(6.5f)
+                )
+            ),
+            PropertyFactory.circleColor(
+                Expression.switchCase(
+                    Expression.eq(Expression.get("tier"), Expression.literal("shown")),
+                    Expression.color(0xFFC0392B.toInt()),
+                    Expression.color(0xFFE5B93C.toInt())
+                )
+            ),
+            PropertyFactory.circleStrokeWidth(3f),
+            PropertyFactory.circleStrokeColor(0xFFFAF9F6.toInt()),
+            PropertyFactory.circleOpacity(
+                Expression.switchCase(
+                    Expression.eq(Expression.get("tier"), Expression.literal("shown")),
+                    Expression.literal(0.96f),
+                    Expression.literal(0.72f)
+                )
+            )
+        )
+    )
+
+    // A vehicle this phone was given a link to follow. Deliberately not the
+    // location puck's blue: this is someone else, and conflating the two
+    // would be the worst possible confusion on a moving map.
+    style.addLayer(
+        CircleLayer("rf-lyr-thread", SRC_THREAD).withProperties(
+            PropertyFactory.circleRadius(9f),
+            PropertyFactory.circleColor(0xFF2F6DF6.toInt()),
+            PropertyFactory.circleStrokeWidth(3.5f),
+            PropertyFactory.circleStrokeColor(0xFFFAF9F6.toInt())
+        )
+    )
 
     style.addLayer(
         CircleLayer("rf-lyr-puck-halo", SRC_PUCK).withProperties(

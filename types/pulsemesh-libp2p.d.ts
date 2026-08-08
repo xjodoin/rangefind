@@ -10,6 +10,15 @@ import type { MeshNetwork, MeshNode } from "./pulsemesh.js";
 export declare function createPulseMeshHost(options?: {
   listen?: string[];
   bootstrapPeers?: string[];
+  /**
+   * Peers this host met last time and the *host* chose to remember
+   * (threads §20.10). Dialled alongside `bootstrapPeers` — configured
+   * first, deduplicated — with the same best-effort semantics. The
+   * library persists nothing.
+   */
+  rememberedPeers?: string[];
+  profile?: "browser" | "node";
+  dht?: boolean | Record<string, unknown>;
 }): Promise<Libp2pLike>;
 
 /**
@@ -29,6 +38,13 @@ export declare function createLibp2pNetwork(host: Libp2pLike): MeshNetwork & {
    * minted; false when the budget or signal ended the search.
    */
   mintBond(options?: { budgetMillis?: number | null; signal?: AbortSignal | null; chunkMillis?: number }): Promise<boolean>;
+  /**
+   * The multiaddrs this host is actually connected to, each ending in
+   * `/p2p/<peerId>` so it can be dialled again as-is (threads §20.10).
+   * The seam that lets a host stop depending on a seed after first
+   * contact: the library reports, the host decides what to keep.
+   */
+  knownPeers(): string[];
   close(): Promise<void>;
 };
 
@@ -37,7 +53,12 @@ export interface Libp2pLike {
   peerId: { toString(): string };
   getMultiaddrs(): Array<{ toString(): string }>;
   getPeers(): Array<{ toString(): string }>;
-  getConnections(): unknown[];
+  getConnections(): Array<{
+    remotePeer: { toString(): string };
+    /** Present on a live connection; `knownPeers()` skips one without it. */
+    remoteAddr?: { toString(): string };
+    newStream(protocol: string): Promise<unknown>;
+  }>;
   handle(protocol: string, handler: (context: unknown) => void): Promise<void> | void;
   unhandle(protocol: string): Promise<void>;
   dial(address: unknown): Promise<unknown>;

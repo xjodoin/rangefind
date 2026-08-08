@@ -3,7 +3,7 @@
 // in MeshNode; this file only maps its four transport verbs onto a
 // libp2p host:
 //
-//   subscribe/unsubscribe  -> GossipSub topics
+//   subscribe/unsubscribe  -> GossipSub topics (+ a topic validator)
 //   publish                -> GossipSub publish
 //   request                -> one framed request/response per stream on
 //                             /rangefind/pulsemesh/1/sync
@@ -13,11 +13,23 @@
 // message id = first 20 bytes of SHA-256 of the payload. The libp2p
 // packages are optional peer dependencies, loaded dynamically — engine
 // consumers that never touch the wire mesh install nothing.
+//
+// **Relaying implies validating.** GossipSub forwards a message to its
+// mesh peers the moment it arrives, before any application handler sees
+// it, so a node that validates only on delivery relays records it never
+// checked — and rule 5 has the far side accept them because the
+// *delivering* peer is bonded. That is a laundering path through any
+// honest relay. Every topic this network subscribes to therefore carries
+// a GossipSub topic validator (`pubsub.topicValidators`), which runs the
+// full §6 pipeline before the forward decision; the delivery listener
+// then consumes that verdict instead of running validation a second
+// time.
 
-import { BOND_PROTOCOL, SYNC_PROTOCOL } from "./topics.js";
+import { BOND_PROTOCOL, PHOTO_PROTOCOL, SYNC_PROTOCOL, THREAD_PROTOCOL } from "./topics.js";
 import { encodePMA1 } from "./codec.js";
 import { mintBond as mineBondProof } from "./bond.js";
-import { sha256 } from "./sha256.js";
+import { GOSSIP_ACCEPT, GOSSIP_IGNORE, GOSSIP_REJECT } from "./validate.js";
+import { sha256, toHex } from "./sha256.js";
 import { pushVarint } from "../binary.js";
 
 /** Browsers have no sockets to listen on, so the transport set differs. */
@@ -44,6 +56,14 @@ const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 export async function createPulseMeshHost({
   listen = null,
   bootstrapPeers = [],
+  // Peers this host met last time and the *host* chose to remember
+  // (threads §20.10). Dialled exactly like the configured bootstrap and
+  // with the same best-effort semantics; the difference is only where
+  // they came from. The library persists nothing — there is no peer
+  // store here, and deliberately so: what a device is allowed to
+  // remember about who it has talked to is the embedding app's decision,
+  // not a default this file gets to make.
+  rememberedPeers = [],
   // "node" — TCP, for keepers and servers. "browser" — WebSockets to
   // reach keepers plus WebRTC for peer-to-peer, and Circuit Relay v2 for
   // NAT traversal, which is the only combination a browser tab can use.
@@ -117,13 +137,24 @@ export async function createPulseMeshHost({
     streamMuxers: [yamux()],
     services
   });
-  for (const address of bootstrapPeers) {
-    try {
-      const { multiaddr } = await import("@multiformats/multiaddr");
-      await host.dial(multiaddr(address));
-    } catch {
-      // Bootstrap peers are best-effort; the mesh degrades, the router
-      // keeps working on the static metric.
+  // Configured first, remembered second: a fleet that just moved its
+  // seed wants the address it was handed today tried before the one this
+  // device happened to talk to last week. Deduplicated so a remembered
+  // peer that is also the configured seed is one dial.
+  const dialList = [];
+  for (const address of [...bootstrapPeers, ...rememberedPeers]) {
+    const text = String(address ?? "").trim();
+    if (text && !dialList.includes(text)) dialList.push(text);
+  }
+  if (dialList.length) {
+    const { multiaddr } = await import("@multiformats/multiaddr");
+    for (const address of dialList) {
+      try {
+        await host.dial(multiaddr(address));
+      } catch {
+        // Bootstrap peers are best-effort; the mesh degrades, the router
+        // keeps working on the static metric.
+      }
     }
   }
   return host;
@@ -192,14 +223,123 @@ function framed(payload) {
   return bytes;
 }
 
+// Validate-once bookkeeping. Only an *accepted* message is ever
+// delivered — GossipSub neither dispatches nor forwards on Ignore or
+// Reject — so the cache only ever holds verdicts that are about to be
+// consumed microtasks later, in the same turn that produced them.
+// Bounded and expiring all the same, because "about to be" is a
+// property of this GossipSub version and not a guarantee we own: a
+// message accepted for a topic we have just unsubscribed from, or one
+// GossipSub drops between validation and dispatch, would otherwise
+// leave an entry behind for a flood to accumulate.
+const VERDICT_CACHE_MAX = 512;
+const VERDICT_TTL_MS = 30_000;
+
 /**
  * Wraps a libp2p host as a MeshNetwork for exactly one MeshNode. Call
  * `close()` when done (leaves the host itself to the caller).
+ *
+ * `validate` is the seam that makes relaying imply validating. It is
+ * called as `(topic, payload, propagationSource, nowMillis)` from a
+ * GossipSub topic validator — before the message is forwarded — and
+ * returns one of the `GOSSIP_*` verdicts, or `null` for "not mine to
+ * judge", which leaves the message to the ordinary delivery path exactly
+ * as before. The default is the registered MeshNode's own `judgeGossip`,
+ * so every existing caller gets the property without changing a line.
  */
-export function createLibp2pNetwork(host) {
+export function createLibp2pNetwork(host, { validate = null } = {}) {
   let meshNode = null;
   const subscriptions = new Set();
-  const stats = { gossipIn: 0, gossipOut: 0, requests: 0, responses: 0, served: 0, bondsSent: 0, bondsReceived: 0 };
+  const stats = {
+    gossipIn: 0, gossipOut: 0, requests: 0, responses: 0, served: 0,
+    bondsSent: 0, bondsReceived: 0, threadsServed: 0, threadRequests: 0,
+    photosServed: 0, photoRequests: 0,
+    // §5.1 topic-validator accounting: how many messages this node
+    // judged before forwarding, and how each judgement came out. A
+    // relay's `gossipIgnored` is the honest cost of the rule — a peer
+    // holding a sparse map cannot vouch for areas it has no leaf for.
+    gossipJudged: 0, gossipRelayed: 0, gossipIgnored: 0, gossipRejected: 0
+  };
+
+  // msgKey -> expiry. See VERDICT_CACHE_MAX above.
+  const verdicts = new Map();
+  // The same bytes GossipSub's msgIdFn hashes, so one message has one
+  // key on both sides of the forward decision.
+  const verdictKey = data => toHex(sha256(data).subarray(0, 20));
+
+  const rememberVerdict = key => {
+    if (verdicts.size >= VERDICT_CACHE_MAX) {
+      const now = Date.now();
+      for (const [stale, expires] of verdicts) if (expires <= now) verdicts.delete(stale);
+      // Still full: drop oldest-first (Map iterates in insertion order).
+      while (verdicts.size >= VERDICT_CACHE_MAX) {
+        const oldest = verdicts.keys().next().value;
+        if (oldest === undefined) break;
+        verdicts.delete(oldest);
+      }
+    }
+    verdicts.set(key, Date.now() + VERDICT_TTL_MS);
+  };
+
+  // Presence is consumption, expired or not: an entry that outlived its
+  // TTL still means this message was validated once, and re-validating
+  // it would charge one peer twice for one record — the failure mode
+  // that wrongly forfeits honest peers. Expiry bounds memory, nothing
+  // else.
+  const takeVerdict = key => verdicts.delete(key);
+
+  const judge = validate
+    ?? ((topic, payload, fromPeer, nowMillis) => meshNode?.judgeGossip?.(topic, payload, fromPeer, nowMillis) ?? null);
+
+  /**
+   * The GossipSub topic validator (libp2p's `TopicValidatorFn`: it is
+   * awaited inside `validateReceivedMessage`, which runs to completion
+   * before `forwardMessage`, so an async verdict genuinely gates the
+   * forward). Registered per subscribed topic and removed on
+   * unsubscribe.
+   */
+  const topicValidator = async (propagationSource, message) => {
+    // A topic we are not subscribed to is a topic we have no business
+    // vouching for, whatever a peer chose to send us.
+    if (!meshNode || !subscriptions.has(message.topic)) return GOSSIP_IGNORE;
+    let action;
+    try {
+      action = await judge(
+        message.topic,
+        message.data,
+        propagationSource?.toString?.() ?? "unknown",
+        meshNode.clock()
+      );
+    } catch {
+      // A validator that throws must not turn into a forward.
+      return GOSSIP_IGNORE;
+    }
+    // Null: another channel's topic (the reserved thread namespace).
+    // Nothing was consumed, so the delivery listener handles it as it
+    // always did — the thread channel is authenticated end to end by its
+    // own key and no bond of ours vouches for it.
+    if (action == null) return GOSSIP_ACCEPT;
+    stats.gossipJudged++;
+    stats.gossipIn += message.data.length;
+    if (action === GOSSIP_ACCEPT) {
+      stats.gossipRelayed++;
+      rememberVerdict(verdictKey(message.data));
+      return GOSSIP_ACCEPT;
+    }
+    if (action === GOSSIP_REJECT) {
+      stats.gossipRejected++;
+      return GOSSIP_REJECT;
+    }
+    stats.gossipIgnored++;
+    return GOSSIP_IGNORE;
+  };
+
+  const registerValidator = topic => {
+    host.services.pubsub?.topicValidators?.set(topic, topicValidator);
+  };
+  const unregisterValidator = topic => {
+    host.services.pubsub?.topicValidators?.delete(topic);
+  };
 
   // §5.4 admission. `ownBondBytes` is set by mintBond() and then pushed
   // to every peer we are connected to now or connect to later. Presenting
@@ -273,6 +413,12 @@ export function createLibp2pNetwork(host) {
   const onGossip = event => {
     const { msg, propagationSource } = event.detail;
     if (!meshNode || !subscriptions.has(msg.topic)) return;
+    // Validate once. The topic validator has already run the whole §6
+    // pipeline for this message — including rule 7's token bucket and
+    // the §8.4 trust/forfeiture path, neither of which is side-effect
+    // free — and stored it. Running it again here would charge one peer
+    // twice for one record and could forfeit an honest one.
+    if (takeVerdict(verdictKey(msg.data))) return;
     stats.gossipIn += msg.data.length;
     meshNode.onGossip(msg.topic, msg.data, propagationSource?.toString() ?? "unknown", meshNode.clock());
   };
@@ -314,6 +460,106 @@ export function createLibp2pNetwork(host) {
     })()).catch(() => {});
   };
 
+  /**
+   * One framed request, one framed response, off whichever MeshNode seam
+   * the caller names. Both thread-side protocols have exactly this
+   * shape and neither consults a bond — the sync stream's contract is
+   * the one that differs, which is why it stays written out above.
+   */
+  const streamResponder = (label, seam, count) => ({ stream, connection }) => {
+    const fromPeer = connection.remotePeer.toString();
+    const responses = [];
+    let answered = false;
+    let expired = false;
+    const deadline = setTimeout(() => {
+      expired = true;
+      stream.abort?.(new Error(`PulseMesh ${label} read timed out.`));
+    }, SERVE_TIMEOUT_MS);
+    if (typeof deadline.unref === "function") deadline.unref();
+    const assemble = frameAssembler(payload => {
+      if (answered || !meshNode?.[seam]) return;
+      answered = true;
+      count();
+      const response = meshNode[seam](payload, fromPeer, meshNode.clock());
+      if (response) responses.push(framed(response));
+    });
+    stream.sink((async function* () {
+      try {
+        for await (const chunk of stream.source) {
+          if (expired) return;
+          try {
+            assemble(chunk);
+          } catch {
+            return;
+          }
+          if (answered) break;
+        }
+        if (!expired) yield* responses;
+      } finally {
+        clearTimeout(deadline);
+      }
+    })()).catch(() => {});
+  };
+
+  // Threads §5.5: PMR1 in, PMM1 out, on its own protocol. Deliberately
+  // not folded into the sync stream — a responder here serves sealed
+  // bytes it may not be able to open and never consults a bond, and any
+  // subscriber answers, which is what makes availability scale with the
+  // audience instead of against it.
+  const onThreadStream = streamResponder("thread", "onOtherStream", () => { stats.threadsServed++; });
+
+  // Threads §20.7: PMTF in, PMTB out. Sealed proof-of-delivery bytes, on
+  // demand, and only from a peer publishing the run — relays never cache
+  // these, so this seam answers for one device's own photos or answers
+  // "not held".
+  const onPhotoStream = streamResponder("photo", "onPhotoStream", () => { stats.photosServed++; });
+
+  /**
+   * One framed request, one framed response, on whichever protocol the
+   * caller names. The two channels share the framing and nothing else:
+   * the sync stream answers a bonded traffic peer, the thread stream
+   * answers anyone at all with bytes it cannot read.
+   */
+  async function requestOn(protocol, toId, payload) {
+    const connection = host.getConnections().find(candidate => candidate.remotePeer.toString() === toId);
+    if (!connection) return null;
+    stats.requests++;
+    let stream;
+    try {
+      stream = await connection.newStream(protocol);
+    } catch {
+      return null;
+    }
+    try {
+      return await new Promise(resolve => {
+        const timer = setTimeout(() => resolve(null), REQUEST_TIMEOUT_MS);
+        // Counted here, not in `finally`: a timeout and a stream that
+        // closed without answering are both non-responses, and a counter
+        // that ticks for them is a counter that can never reveal the
+        // failure it exists to reveal.
+        const finish = value => {
+          clearTimeout(timer);
+          if (value) stats.responses++;
+          resolve(value);
+        };
+        const assemble = frameAssembler(response => finish(response.slice()));
+        stream.sink((async function* () {
+          yield framed(payload);
+        })()).catch(() => finish(null));
+        (async () => {
+          try {
+            for await (const chunk of stream.source) assemble(chunk);
+            finish(null); // stream ended without a response frame
+          } catch {
+            finish(null);
+          }
+        })();
+      });
+    } finally {
+      stream.close().catch(() => {});
+    }
+  }
+
   host.services.pubsub.addEventListener("gossipsub:message", onGossip);
   host.addEventListener("peer:connect", onPeerConnect);
   // Registration is async. Callers that announce readiness (a keeper
@@ -324,7 +570,9 @@ export function createLibp2pNetwork(host) {
   let registrationError = null;
   const ready = Promise.all([
     Promise.resolve(host.handle(SYNC_PROTOCOL, onSyncStream)),
-    Promise.resolve(host.handle(BOND_PROTOCOL, onBondStream))
+    Promise.resolve(host.handle(BOND_PROTOCOL, onBondStream)),
+    Promise.resolve(host.handle(THREAD_PROTOCOL, onThreadStream)),
+    Promise.resolve(host.handle(PHOTO_PROTOCOL, onPhotoStream))
   ]).catch(error => { registrationError = error; });
   const scheduled = new Set();
 
@@ -363,10 +611,14 @@ export function createLibp2pNetwork(host) {
     },
     subscribe(_nodeId, topic) {
       subscriptions.add(topic);
+      // Validator first: a subscribe that raced a message in flight
+      // would otherwise forward one unjudged.
+      registerValidator(topic);
       host.services.pubsub.subscribe(topic);
     },
     unsubscribe(_nodeId, topic) {
       subscriptions.delete(topic);
+      unregisterValidator(topic);
       try {
         host.services.pubsub.unsubscribe(topic);
       } catch {
@@ -380,46 +632,53 @@ export function createLibp2pNetwork(host) {
       });
     },
     async request(_fromId, toId, payload) {
-      const connection = host.getConnections().find(candidate => candidate.remotePeer.toString() === toId);
-      if (!connection) return null;
-      stats.requests++;
-      let stream;
-      try {
-        stream = await connection.newStream(SYNC_PROTOCOL);
-      } catch {
-        return null;
-      }
-      try {
-        return await new Promise(resolve => {
-          const timer = setTimeout(() => resolve(null), REQUEST_TIMEOUT_MS);
-          // Counted here, not in `finally`: a timeout and a stream that
-          // closed without answering are both non-responses, and a
-          // counter that ticks for them is a counter that can never
-          // reveal the failure it exists to reveal.
-          const finish = value => {
-            clearTimeout(timer);
-            if (value) stats.responses++;
-            resolve(value);
-          };
-          const assemble = frameAssembler(response => finish(response.slice()));
-          stream.sink((async function* () {
-            yield framed(payload);
-          })()).catch(() => finish(null));
-          (async () => {
-            try {
-              for await (const chunk of stream.source) assemble(chunk);
-              finish(null); // stream ended without a response frame
-            } catch {
-              finish(null);
-            }
-          })();
-        });
-      } finally {
-        stream.close().catch(() => {});
-      }
+      return requestOn(SYNC_PROTOCOL, toId, payload);
+    },
+    /** Threads §5.5 catch-up: the same framing on its own protocol. */
+    async requestThread(_fromId, toId, payload) {
+      stats.threadRequests++;
+      return requestOn(THREAD_PROTOCOL, toId, payload);
+    },
+    /**
+     * Threads §20.7: one sealed photo by content hash. Availability is
+     * bounded by the driver being online — nothing relays or caches a
+     * blob this size, so there is no second holder to fall back to.
+     */
+    async requestPhoto(_fromId, toId, payload) {
+      stats.photoRequests++;
+      return requestOn(PHOTO_PROTOCOL, toId, payload);
     },
     peersOf() {
       return host.getPeers().map(String);
+    },
+    /**
+     * The multiaddrs this host is **actually connected to**, each ending
+     * in `/p2p/<peerId>` so it can be dialled again as-is (threads
+     * §20.10).
+     *
+     * The seam a host needs to stop depending on a seed. A fleet seed
+     * matters at first contact and should matter at no other time: once a
+     * device has met the mesh it has met peers, and dialling one of those
+     * next time is both faster and one less thing that has to still be
+     * running. Reporting is all this does — persisting the list, ageing
+     * it, capping it and deciding whether a device is allowed to keep it
+     * at all belong to the host, which is the only layer that knows
+     * whether this is a fleet's own phone or a stranger's browser.
+     *
+     * Relayed and loopback addresses come back as they are: a circuit
+     * address is a perfectly good thing to remember behind NAT, and a
+     * host running its own tests connects to 127.0.0.1 on purpose.
+     */
+    knownPeers() {
+      const out = [];
+      for (const connection of host.getConnections()) {
+        const peer = connection.remotePeer.toString();
+        const address = connection.remoteAddr?.toString?.();
+        if (!address) continue;
+        const dialable = address.includes(`/p2p/${peer}`) ? address : `${address}/p2p/${peer}`;
+        if (!out.includes(dialable)) out.push(dialable);
+      }
+      return out;
     },
     schedule(fn, delayMs) {
       const timer = setTimeout(() => {
@@ -444,6 +703,7 @@ export function createLibp2pNetwork(host) {
       for (const timer of scheduled) clearTimeout(timer);
       scheduled.clear();
       for (const topic of subscriptions) {
+        unregisterValidator(topic);
         try {
           host.services.pubsub.unsubscribe(topic);
         } catch {
@@ -451,9 +711,12 @@ export function createLibp2pNetwork(host) {
         }
       }
       subscriptions.clear();
+      verdicts.clear();
       await ready;
       await host.unhandle(SYNC_PROTOCOL).catch(() => {});
       await host.unhandle(BOND_PROTOCOL).catch(() => {});
+      await host.unhandle(THREAD_PROTOCOL).catch(() => {});
+      await host.unhandle(PHOTO_PROTOCOL).catch(() => {});
       meshNode = null;
     }
   };

@@ -10,22 +10,33 @@
 
 import { speedBinFromMps } from "./bins.js";
 import {
+  STOP_OUTCOME,
+  STOP_REASON,
+  THREAD_MAX_NOTE_BYTES,
   THREAD_MODE,
   THREAD_STATE,
+  THREAD_TRAVEL_MODE,
+  decodeDayCertificate,
   encodeThreadBody,
   encodeThreadBodyPreimage,
   encodeThreadRecord,
   threadRecordAad
 } from "./thread_codec.js";
 import {
+  PHOTO_SEAL_OVERHEAD,
+  THREAD_MAX_PHOTO_BYTES,
   deriveThreadKeys,
+  photoCommitment,
+  photoKeyFor,
   publicKeyFromSeed,
+  sealPhoto,
   sealThreadBody,
   signThread,
   threadTag,
   threadWindow
 } from "./thread_crypto.js";
-import { parseSegment } from "./codec.js";
+import { parseSegment, utf8Bytes } from "./codec.js";
+import { toHex } from "./sha256.js";
 
 export const THREAD_CONSTANTS = Object.freeze({
   THREAD_UPDATE_FINE: 5,
@@ -44,41 +55,151 @@ export const THREAD_CONSTANTS = Object.freeze({
   THREAD_CACHE_RATE: 3,
   // §10 rule 4 stop suppression, in metres and seconds.
   THREAD_STOP_RADIUS: 40,
-  THREAD_STOP_LINGER: 10
+  THREAD_STOP_LINGER: 10,
+  /**
+   * §21. How often a route-day publisher re-emits its PMTC certificate.
+   *
+   * 60 s, matching `THREAD_COARSE_HEARTBEAT`, for two reasons that meet
+   * at the same number. It bounds how long a late joiner sits holding
+   * records it cannot yet verify — and one minute is inside
+   * `THREAD_STALE` (90 s), so a subscriber never spends longer waiting
+   * for authority than the UI would spend claiming "live" anyway. And it
+   * costs almost nothing: a coarse run doubles its record rate to two
+   * records a minute (~6 B/s), and a fine run pays one certificate per
+   * twelve records. Cheaper would mostly buy re-verifying a certificate
+   * that has not changed; dearer starts to matter inside the 240-record
+   * `THREAD_CACHE_RING`, which is what makes §5.5 catch-up carry the
+   * certificate for free.
+   */
+  THREAD_CERT_INTERVAL: 60,
+  /**
+   * §21. How many records a subscriber holds while it waits for the
+   * day's certificate. See the note on the buffer in thread_consume.js.
+   */
+  THREAD_HELD_RECORDS: 32
 });
 
 /**
  * Creates a run publisher.
  *
- * - privateSeed: the run's Ed25519 seed. Fresh per run (§4.1); it never
- *   leaves the device and nothing derived from it goes on the wire.
+ * Two credential shapes, and exactly one of them per publisher:
+ *
+ * - **One-off (§4.1).** `privateSeed` is the run's Ed25519 seed. Fresh
+ *   per run; it never leaves the device, it signs the records, and the
+ *   link carries its public key. This is a v1 link.
+ * - **A route day (§21).** `daySeed` plus the `certificate` that vouches
+ *   for it. The *root* public key comes out of the certificate and is
+ *   what derives the topic tag and the content key — so the run
+ *   publishes to the route's permanent address under a key that is good
+ *   for one day. This is a v2 link, and it is the same 45 bytes on day 1
+ *   and day 40.
+ *
+ * Passing `privateSeed` alongside a certificate is refused rather than
+ * ignored. The root seed has no business on a driver's phone: it is the
+ * term, and the only reason day keys exist is that a phone gets lost.
+ *
  * - plan: optional run plan `{ planRef, stops: [{ lat, lon, index }],
  *   dwellSeconds }`. Drives coarse stop events and §10 rule 4.
  * - publish({ bytes, tag, seq }): transport callback.
+ * - maxRunSeconds: how long this run may keep publishing. The 6 h
+ *   default is sized for a self-started social run — someone shares a
+ *   drive and forgets to stop it, and a link that outlives the reason it
+ *   was shared is the harm. A **dispatched** day is not that run: it
+ *   carries its own bound in the ticket's `notAfter`, which a dispatcher
+ *   set deliberately, so `publishTicket` passes that instead (§20.6).
+ * - travelMode: how the vehicle moves. Defaults to the plan's, because a
+ *   dispatcher who wrote "bike" into a ticket decided that; 0 when
+ *   nobody said.
  */
 export async function createThreadPublisher({
-  privateSeed,
+  privateSeed = null,
+  daySeed = null,
+  certificate = null,
   epoch32,
   mode = THREAD_MODE.COARSE,
   plan = null,
   publish = null,
   constants = THREAD_CONSTANTS,
   clock = Date.now,
-  snap = null
+  snap = null,
+  startSeq = 0,
+  maxRunSeconds = constants.THREAD_MAX_RUN_SECONDS,
+  travelMode = null
 } = {}) {
-  const publicKey = await publicKeyFromSeed(privateSeed);
+  const dayCertificate = certificate
+    ? (certificate instanceof Uint8Array ? decodeDayCertificate(certificate) : certificate)
+    : null;
+  if (dayCertificate && privateSeed) {
+    throw new Error(
+      "A route-day publisher takes the day seed and its certificate, never the route root: "
+      + "a device holding the root holds the whole term, which is what day keys exist to prevent."
+    );
+  }
+  if (dayCertificate && daySeed?.length !== 32) {
+    throw new Error("A route-day publisher needs the 32-byte day seed its certificate covers.");
+  }
+  if (!dayCertificate && daySeed) {
+    throw new Error("A day seed publishes nothing without its certificate: subscribers refuse an uncertified key.");
+  }
+  // The seed that **signs**, which on a route day is not the seed the
+  // identity belongs to. Everything else in this file that was reaching
+  // for `privateSeed` wants this one — including the §20.7 photo key, so
+  // a leaked day seed opens that day's photos and no others, and the
+  // depot re-derives the day seed from the root to open them later.
+  const secretSeed = dayCertificate ? daySeed : privateSeed;
+  if (secretSeed?.length !== 32) throw new Error("A thread publisher needs a 32-byte Ed25519 seed.");
+  if (dayCertificate) {
+    const dayPublicKey = await publicKeyFromSeed(daySeed);
+    for (let i = 0; i < 32; i++) {
+      if (dayPublicKey[i] !== dayCertificate.dayPublicKey[i]) {
+        throw new Error("This day seed is not the one the certificate vouches for.");
+      }
+    }
+  }
+  // Identity, not authority: on a route day the topic tag, the content
+  // key and the link all keep deriving from the **root** public key, so
+  // a parent's 45 bytes are the same on day 1 and on day 40.
+  const publicKey = dayCertificate ? dayCertificate.rootPublicKey : await publicKeyFromSeed(privateSeed);
   const keys = await deriveThreadKeys(publicKey);
   const epochPrefix8 = epoch32.subarray(0, 8);
   const planRef = plan?.planRef || new Uint8Array(8);
+  const runTravelMode = travelMode ?? plan?.travelMode ?? THREAD_TRAVEL_MODE.UNSPECIFIED;
 
-  let seq = 0;
+  // Ticket handover (§20): emit() increments before sealing, so the
+  // second holder's first record is startSeq + 1 and no follower ever
+  // sees a sequence regression.
+  let seq = startSeq;
   let state = THREAD_STATE.SCHEDULED;
+  // The last stop the run has *dealt with*, in plan order: visited and
+  // resolved, or passed. Monotonic, and never a high-water mark of the
+  // paperwork — an outcome recorded for a stop the vehicle has not
+  // reached yet lives in the outcome map and leaves this alone (§5.2.1).
   let stopIndex = 0;
   let lastEmitMillis = -Infinity;
   let lastStateEmitted = null;
   let dwellDepartedMillis = -Infinity;
+  // -Infinity, so the first thing any route-day run puts on its topic is
+  // its certificate — before the record that needs it. That is also the
+  // whole of "re-emits on rotation": a new day is a new publisher, and a
+  // new publisher leads with the new day's certificate.
+  let lastCertMillis = -Infinity;
   const startedAt = clock();
-  const stats = { published: 0, suppressedTraffic: 0, stopEvents: 0 };
+  const stats = { published: 0, suppressedTraffic: 0, stopEvents: 0, marked: 0, certificates: 0 };
+
+  // The cumulative outcome map, one entry per plan stop, index i holding
+  // the 1-based stop i + 1. Only `markStop` ever writes it: dwell
+  // detection knows the vehicle stopped somewhere, which is not the same
+  // claim as knowing the parcel was handed over.
+  const outcomes = new Array(plan?.stops?.length || 0).fill(STOP_OUTCOME.PENDING);
+  let lastOutcome = null;
+
+  // §20.7. Sealed proof-of-delivery blobs this device holds, keyed by the
+  // commitment that went on the wire. Unbounded within a run on purpose:
+  // a delivery day is a few hundred photos of ~100 KB, and evicting one
+  // is deleting the only copy of the evidence the run committed to —
+  // there is no server holding a second one. The bound that matters is
+  // per photo (THREAD_MAX_PHOTO_BYTES) and the run's own lifetime.
+  const photos = new Map();
 
   function metersBetween(a, b) {
     const toRad = Math.PI / 180;
@@ -100,12 +221,10 @@ export async function createThreadPublisher({
     return best;
   }
 
-  async function emit(body, nowMillis) {
+  /** Seals one already-encoded body into a PMT1 and hands it to the transport. */
+  async function emitPlaintext(plaintext, nowMillis, extra) {
     const window = threadWindow(nowMillis);
     const tag = await threadTag(keys, epoch32, window);
-    const preimage = encodeThreadBodyPreimage(body);
-    const signature = await signThread(preimage, privateSeed);
-    const plaintext = encodeThreadBody(body, signature);
     seq += 1;
     const aad = threadRecordAad(epochPrefix8, tag, seq);
     const ciphertext = await sealThreadBody(keys, seq, aad, plaintext);
@@ -113,12 +232,52 @@ export async function createThreadPublisher({
     if (record.bytes.length > constants.THREAD_MAX_RECORD_BYTES) {
       throw new Error(`PMT1 record exceeds ${constants.THREAD_MAX_RECORD_BYTES} bytes.`);
     }
+    const emitted = { bytes: record.bytes, tag, seq, window, ...extra };
+    if (publish) await publish(emitted);
+    return emitted;
+  }
+
+  /**
+   * §21. Puts the day certificate on the run's own topic, sealed under
+   * the same content key as everything else.
+   *
+   * A record rather than a side channel, deliberately: §5.5 catch-up
+   * already serves whatever is in the ring for a tag, so a parent who
+   * opens the link mid-morning pulls the certificate out of the same
+   * PMM1 as the records, with no new protocol id, no new message type
+   * and no fetch that could fail separately from the one it depends on.
+   */
+  async function emitCertificate(nowMillis = clock()) {
+    if (!dayCertificate) return null;
+    lastCertMillis = nowMillis;
+    stats.certificates++;
+    return emitPlaintext(dayCertificate.bytes, nowMillis, { certificate: dayCertificate });
+  }
+
+  async function emit(body, nowMillis) {
+    // Ahead of the record, never after it: a subscriber that has the
+    // certificate first never has to hold anything.
+    if (dayCertificate && nowMillis - lastCertMillis >= constants.THREAD_CERT_INTERVAL * 1000) {
+      await emitCertificate(nowMillis);
+    }
+    const preimage = encodeThreadBodyPreimage(body);
+    const signature = await signThread(preimage, secretSeed);
+    const plaintext = encodeThreadBody(body, signature);
+    const emitted = await emitPlaintext(plaintext, nowMillis, { body });
     lastEmitMillis = nowMillis;
     lastStateEmitted = body.state;
     stats.published++;
-    const emitted = { bytes: record.bytes, tag, seq, window, body };
-    if (publish) await publish(emitted);
     return emitted;
+  }
+
+  /** A note as bytes, whether the caller had a string or already had bytes. */
+  function noteBytes(note) {
+    if (!note) return new Uint8Array(0);
+    const bytes = typeof note === "string" ? utf8Bytes(note) : note;
+    if (bytes.length > THREAD_MAX_NOTE_BYTES) {
+      throw new Error(`A thread note is at most ${THREAD_MAX_NOTE_BYTES} bytes; this one is ${bytes.length}.`);
+    }
+    return bytes;
   }
 
   function bodyFor({ nowMillis, match, speedMps, runState, note }) {
@@ -143,13 +302,18 @@ export async function createThreadPublisher({
       unixSeconds: Math.floor(nowMillis / 1000),
       state: runState,
       mode,
+      travelMode: runTravelMode,
       leafCell,
       geomRef,
       ratioQ12,
       speedBin: speedBinFromMps(Math.max(0, speedMps || 0)) ?? 0,
       stopIndex,
       planRef,
-      note: note || new Uint8Array(0)
+      // A copy: the map keeps changing and an emitted body is a record
+      // of one moment.
+      outcomes: [...outcomes],
+      lastOutcome: lastOutcome ? { ...lastOutcome } : null,
+      note: noteBytes(note)
     };
   }
 
@@ -161,7 +325,7 @@ export async function createThreadPublisher({
    * convincing, entirely false standstill.
    */
   async function handleFix({ lat, lon, speedMps = 0, nowMillis = clock(), match = null, note = null }) {
-    if (nowMillis - startedAt > constants.THREAD_MAX_RUN_SECONDS * 1000) {
+    if (nowMillis - startedAt > maxRunSeconds * 1000) {
       return { published: false, reason: "run-expired", contributeTraffic: false };
     }
     const point = Number.isFinite(lat) && Number.isFinite(lon) ? { lat, lon } : null;
@@ -174,7 +338,10 @@ export async function createThreadPublisher({
     if (state === THREAD_STATE.SCHEDULED) runState = THREAD_STATE.EN_ROUTE;
     if (near && stopped) {
       runState = THREAD_STATE.DWELLING;
-      stopIndex = near.stop.index;
+      // Passing or dwelling at a stop is progress through the plan, but
+      // only ever forwards: a van that swings back past stop 2 on its way
+      // to stop 9 has not undone stops 3 to 8.
+      stopIndex = Math.max(stopIndex, near.stop.index);
     } else if (runState === THREAD_STATE.DWELLING) {
       runState = THREAD_STATE.EN_ROUTE;
       dwellDepartedMillis = nowMillis;
@@ -219,15 +386,150 @@ export async function createThreadPublisher({
     return emit(bodyFor({ nowMillis, match: null, speedMps: 0, runState: state, note }), nowMillis);
   }
 
+  /**
+   * Seals one proof-of-delivery photo and returns its commitment (§20.7).
+   *
+   * The size check is on the plaintext plus the seal's own overhead, so
+   * an oversized photo is refused before any crypto runs — the caller
+   * gets the number it exceeded rather than a stall.
+   */
+  async function attachPhoto(index, photo, allowCoarsePhoto) {
+    if (!(photo instanceof Uint8Array)) {
+      throw new Error("A proof-of-delivery photo is a Uint8Array of already-compressed image bytes.");
+    }
+    if (!photo.length) throw new Error("That photo is empty.");
+    if (mode === THREAD_MODE.COARSE && !allowCoarsePhoto) {
+      throw new Error(
+        "This run publishes coarse, which withholds the vehicle's position — and a doorstep photo "
+        + "gives it away with a house number on it. Pass { allowCoarsePhoto: true } to mean it."
+      );
+    }
+    const sealedLength = photo.length + PHOTO_SEAL_OVERHEAD;
+    if (sealedLength > THREAD_MAX_PHOTO_BYTES) {
+      throw new Error(
+        `That photo seals to ${sealedLength} bytes and the cap is ${THREAD_MAX_PHOTO_BYTES}: `
+        + "compress it further before marking the stop."
+      );
+    }
+    const key = await photoKeyFor(secretSeed, planRef, index);
+    const sealed = await sealPhoto(key, photo);
+    const hash = toHex(photoCommitment(sealed));
+    photos.set(hash, sealed);
+    return hash;
+  }
+
+  /**
+   * What actually happened at a stop, asserted by the driver.
+   *
+   * This is the only writer of the outcome map. Dwell detection keeps
+   * advancing `stopIndex` — that inference is fine, it only claims the
+   * vehicle went past — but "delivered" is a different claim and nothing
+   * infers it. An unmarked stop the vehicle drove past stays PENDING on
+   * the wire, which is the honest answer.
+   *
+   * Marking records the outcome for **any** stop, and moves `stopIndex`
+   * only over the contiguous run of resolved stops in front of it. A
+   * dispatcher pre-marking stop 7 while the van is at stop 3 must not
+   * make stops 4 to 6 look already dealt with, because every follower
+   * between them would then compute "your delivery is behind us" and be
+   * told nothing at all (§5.2.1, §9.1).
+   *
+   * Emits immediately, bypassing the cadence: a customer waiting to hear
+   * their parcel was left with a neighbour should not wait out a 60 s
+   * coarse heartbeat for it. Re-marking overwrites, because a failed
+   * retry that is later delivered is an ordinary day.
+   *
+   * `photo` is an optional proof of delivery: **already-compressed image
+   * bytes**, a `Uint8Array` of a JPEG, WebP or PNG the host produced.
+   * This function does not resize, re-encode or strip anything, and it
+   * cannot — it has no image decoder and no business having one. So
+   * recompressing to a sane size and, above all, **removing EXIF (which
+   * on a phone camera contains the GPS fix the run may be deliberately
+   * withholding)** is the host's obligation, not this library's. See
+   * §20.7; a canvas re-encode does both at once and is what the demo
+   * does.
+   *
+   * The photo never rides gossip. It is sealed under a key derived from
+   * the run's private seed (so only the driver and the dispatcher can
+   * open it — a link holder cannot), kept here, and named on the wire by
+   * a 32-byte commitment; the bytes travel on request over §20.7's own
+   * protocol.
+   *
+   * `allowCoarsePhoto` defaults to **false** and refuses a photo on a
+   * coarse run. §11 coarse means the operator decided this audience is
+   * not entitled to the vehicle's position; a doorstep photo hands over
+   * a position with a doormat and a house number on it, out of band and
+   * without the granularity control ever being consulted. Opting in is
+   * possible because a dispatcher who holds both the seed and the plan
+   * already knows where the stop is — but it has to be said out loud.
+   */
+  async function markStop(index, outcome, {
+    reason = STOP_REASON.NONE,
+    note = null,
+    photo = null,
+    allowCoarsePhoto = false,
+    nowMillis = clock()
+  } = {}) {
+    const stops = plan?.stops || [];
+    if (!stops.length) throw new Error("This run has no plan, so it has no stops to mark.");
+    if (!Number.isInteger(index) || index < 1 || index > stops.length) {
+      throw new Error(`Stop ${index} is not on this run's plan (1..${stops.length}).`);
+    }
+    if (outcome !== STOP_OUTCOME.DELIVERED
+      && outcome !== STOP_OUTCOME.SKIPPED
+      && outcome !== STOP_OUTCOME.FAILED) {
+      throw new Error("A stop is marked delivered, skipped, or failed — never back to pending.");
+    }
+    const reasonCode = Number.isInteger(reason) ? reason : STOP_REASON.NONE;
+    if (reasonCode < 0 || reasonCode > STOP_REASON.OTHER) {
+      throw new Error(`Unknown stop reason code ${reason}.`);
+    }
+    const photoHash = photo ? await attachPhoto(index, photo, allowCoarsePhoto) : null;
+    outcomes[index - 1] = outcome;
+    lastOutcome = { stopIndex: index, outcome, reasonCode, photoHash };
+    // Monotonic and contiguous. Marking stop 3 after stop 5 — the
+    // paperwork catching up with the driving — records the outcome
+    // without teleporting the vehicle backwards down the plan; marking
+    // the stop the run is actually on advances by one, and hops over
+    // whatever was already marked immediately after it.
+    while (stopIndex < stops.length && outcomes[stopIndex] !== STOP_OUTCOME.PENDING) stopIndex += 1;
+    // A run with a marked stop is not "scheduled, not started".
+    if (state === THREAD_STATE.SCHEDULED) state = THREAD_STATE.EN_ROUTE;
+    stats.marked++;
+    return emit(bodyFor({ nowMillis, match: null, speedMps: 0, runState: state, note }), nowMillis);
+  }
+
   return {
+    /** The run's **identity**: on a route day, the root, not the day key. */
     publicKey,
     keys,
     handleFix,
     finish,
     announce,
+    markStop,
+    /** §21. The certificate this run publishes under, or null on a one-off run. */
+    certificate: dayCertificate,
+    /** The key that actually signs. Null on a one-off run, where it is `publicKey`. */
+    dayPublicKey: dayCertificate?.dayPublicKey ?? null,
+    /** Push the certificate now — for a host that knows it has new listeners. */
+    emitCertificate,
     stats,
+    /** The cumulative map, copied — callers must go through markStop. */
+    outcomes: () => [...outcomes],
+    lastOutcome: () => (lastOutcome ? { ...lastOutcome } : null),
+    /**
+     * The sealed blobs this run committed to (§20.7), for whatever
+     * transport answers PMTF. Keyed by commitment hex; the values are
+     * ciphertext, so handing this to a transport hands it nothing it
+     * could read.
+     */
+    photoStore: photos,
+    /** One sealed blob by commitment (hex), or null. */
+    photoFor: hash => photos.get(String(hash || "").toLowerCase()) ?? null,
     get seq() { return seq; },
     get state() { return state; },
-    get mode() { return mode; }
+    get stopIndex() { return stopIndex; },
+    get mode() { return mode; },
+    get travelMode() { return runTravelMode; }
   };
 }

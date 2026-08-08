@@ -242,7 +242,17 @@ class NavigationCore(private val context: Context) {
         val remainingMeters = route.distanceMeters * fraction
         val remainingSeconds = route.seconds * fraction
         val stepIndex = active.stepIndexAt(lastAlong)
-        val next = route.steps.getOrNull(stepIndex + 1)
+        // What the driver turns onto, looking through any junction stub the
+        // router split out between here and there. [stepThroughJunction] has
+        // the reasoning; where the next step is a real road — the ordinary
+        // case — this is the next step and nothing below changes.
+        val throughIndex = stepThroughJunction(route, stepIndex + 1)
+        val next = route.steps.getOrNull(throughIndex)
+        // Lane markings are the exception to looking through the junction:
+        // they describe the approach *to* a step, so the ones a driver can see
+        // through the windscreen belong to the step immediately ahead — the
+        // stub's own approach — not to the road past it.
+        val approaching = route.steps.getOrNull(stepIndex + 1)
         val toManeuver = active.metersToNextManeuver(lastAlong) ?: geometric
         // Arrival used to depend purely on progress along the line. When the
         // match saturates short of the end — a destination set back from the
@@ -263,11 +273,14 @@ class NavigationCore(private val context: Context) {
             parked
 
         val offRoute = offRouteStrikes >= mode.offRouteStrikes
-        val turnDelta = turnDeltaAt(route, next?.at)
+        // The whole heading change through the junction, not just the half of
+        // it past the stub — otherwise a left turn split into "straight" then
+        // "left" is announced as the straight bit.
+        val turnDelta = turnDeltaThrough(route, stepIndex + 1, throughIndex) { turnDeltaAt(route, it) }
         // Lane guidance only means anything close to the junction it belongs
         // to; further back it is a row of arrows about nothing yet, and it
         // would sit on screen for kilometres of open road.
-        val maneuverKind = maneuverOnto(route, stepIndex + 1, turnDelta)
+        val maneuverKind = maneuverOnto(route, throughIndex, turnDelta)
         val maneuverTarget = when (maneuverKind) {
             // What the ramp is signed with beats where it structurally goes:
             // the panel says "40 Ouest / Montréal", and the road it joins is
@@ -275,15 +288,15 @@ class NavigationCore(private val context: Context) {
             // can see. Fall through to the road itself only when the ramp
             // carries no sign at all.
             Maneuver.Exit, Maneuver.Merge -> next?.towardLabel.orEmpty()
-                .ifBlank { roadBeyondRamp(route, stepIndex + 1) }
+                .ifBlank { roadBeyondRamp(route, throughIndex) }
                 .ifBlank { next?.name.orEmpty() }
             // At a roundabout the instruction is the road you come off onto.
-            Maneuver.Roundabout -> roadBeyondRoundabout(route, stepIndex + 1)
+            Maneuver.Roundabout -> roadBeyondRoundabout(route, throughIndex)
             else -> next?.let { signpostName(it) }.orEmpty()
         }
         val exitRef = next?.exitRef.orEmpty()
         val lanes = if (mode.showsRoadSigns && toManeuver <= LANE_GUIDANCE_METERS) {
-            next?.lanes.orEmpty()
+            approaching?.lanes.orEmpty()
         } else emptyList()
         val laneUsable = usableLanes(lanes, turnDelta)
         val voice = when {
@@ -609,6 +622,7 @@ class NavigationCore(private val context: Context) {
         /** How far off an alternate the car can be before it stops being one. */
         const val ALT_LIVE_METERS = 60.0
         private val ANNOUNCE_THRESHOLDS = listOf(60, 200, 400)
+
         /** Close enough that the instruction is "now" rather than a distance. */
         private const val IMMINENT_METERS = 60
         /** Turn-angle bands, matching the on-screen maneuver glyph. */

@@ -4743,6 +4743,8 @@ var GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 var GEO_TEXT_MAX_CANDIDATE_POINTS = 1e5;
 var GEO_TEXT_DOC_SET_HARD_CAP = 1e6;
 var GEO_TEXT_SORT_MAX_DF = 2e5;
+var GEO_TEXT_NEAREST_POINT_BYTES_ESTIMATE = 16;
+var GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES = 1 << 20;
 var FACET_COUNT_MAX_CHUNKS = 32;
 var FACET_COUNT_SIZE = 10;
 var textDecoder4 = new TextDecoder();
@@ -8421,6 +8423,73 @@ async function createSearch(options = {}) {
   function roundedDistanceMeters(distance) {
     return Math.round(distance * 10) / 10;
   }
+  async function runGeoTextNearestByDocValues({ page, size, filters, geoPlan, hasFilters, matchDocs }) {
+    if (options.geoTextNearestDocValues === false) return null;
+    const forced = options.geoTextNearestDocValues === true;
+    const root = await loadGeoTreeRoot(geoPlan.field);
+    if (!root?.total) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const expectedTraversalBytes = k * (root.total / matchDocs.size) * GEO_TEXT_NEAREST_POINT_BYTES_ESTIMATE;
+    let docValueBytes = null;
+    if (!forced) {
+      if (expectedTraversalBytes < GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES) return null;
+      docValueBytes = await estimateGeoFilterDocValueBytes(geoPlan, matchDocs.size);
+      if (!docValueBytes || docValueBytes >= expectedTraversalBytes) return null;
+    }
+    const docs = Array.from(matchDocs);
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const bitmapStore = docFilterPlan?.active ? await filterBitmapStoreForPlan(docFilterPlan) : null;
+    const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
+    const residualFilterFields = docFilterPlan?.active ? [...new Set(filterPlanFields(docFilterPlan))].filter((field) => !bitmapCovered.has(field)) : [];
+    const store = await valueStoreForDocs(
+      [geoPlan.latField, geoPlan.lonField, ...residualFilterFields],
+      docs
+    );
+    const codeData = mergeValueStores(store, bitmapStore);
+    const near = geoPlan.near;
+    const matched = [];
+    for (const doc of docs) {
+      const latE7 = latToE7(valueForDoc(store, geoPlan.latField, doc));
+      const lonE7 = lonToE7(valueForDoc(store, geoPlan.lonField, doc));
+      if (latE7 == null || lonE7 == null) continue;
+      if (!geoPointMatchesE7(geoPlan, latE7, lonE7)) continue;
+      if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+      matched.push({
+        doc,
+        dist: near ? haversineMetersE7(near.latE7, near.lonE7, latE7, lonE7) : 0
+      });
+    }
+    matched.sort((a, b) => a.dist - b.dist || a.doc - b.doc);
+    const rows = matched.slice(offset, offset + size).map((item) => [item.doc, 0]);
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(rows, resultContext);
+    if (near) {
+      for (const result of results) {
+        const item = matched.find((entry) => entry.doc === result.index);
+        if (item) result.distanceMeters = roundedDistanceMeters(item.dist);
+      }
+    }
+    return {
+      total: matched.length,
+      results,
+      page,
+      size,
+      approximate: false,
+      stats: {
+        exact: true,
+        geoLane: "nearestTextDocValues",
+        geoField: geoPlan.field,
+        geoDistanceSorted: true,
+        geoRouteSorted: false,
+        ...docValueBytes ? { geoDocValueBytesEstimated: Math.round(docValueBytes) } : {},
+        geoTraversalBytesEstimated: Math.round(expectedTraversalBytes),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
   async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
     return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs }));
   }
@@ -11277,14 +11346,42 @@ async function createSearch(options = {}) {
       }
       const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
       await ensureFacetDictionaries(userFilters);
-      const geoResponse = await runGeoBrowse({
-        page,
-        size,
-        filters: userFilters,
-        geoPlan,
-        hasFilters: hasUserFilters,
-        textMatchDocs: match.docs
-      });
+      let geoResponse = null;
+      if (!match.docs.size) {
+        geoResponse = {
+          total: 0,
+          results: [],
+          page,
+          size,
+          approximate: false,
+          stats: {
+            exact: true,
+            geoLane: geoPlan.routeSort ? "routeTextEmpty" : "nearestTextEmpty",
+            geoField: geoPlan.field,
+            geoDistanceSorted: !!geoPlan.sort,
+            geoRouteSorted: !!geoPlan.routeSort
+          }
+        };
+      } else if (!geoPlan.routeSort) {
+        geoResponse = await runGeoTextNearestByDocValues({
+          page,
+          size,
+          filters: userFilters,
+          geoPlan,
+          hasFilters: hasUserFilters,
+          matchDocs: match.docs
+        });
+      }
+      if (!geoResponse) {
+        geoResponse = await runGeoBrowse({
+          page,
+          size,
+          filters: userFilters,
+          geoPlan,
+          hasFilters: hasUserFilters,
+          textMatchDocs: match.docs
+        });
+      }
       if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for geographic sorting.");
       geoResponse.stats = {
         ...geoResponse.stats || {},

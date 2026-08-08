@@ -461,6 +461,54 @@ policy altered in transit; an absent field means no suppression.
   application-level trust ledger (§8.4) for local ranking only.
 - Sync stream protocol id: `/rangefind/pulsemesh/1/sync`.
 
+**Relaying implies validating.** GossipSub forwards a message to its mesh
+peers on receipt, *before* the application handler runs. An
+implementation that validates on delivery therefore relays records it
+never checked — and rule 5 has every downstream peer accept them, because
+rule 5 asks only whether the **delivering** peer is bonded. That is a
+laundering path through any honest relay, and it does not depend on the
+relay being malicious or even misconfigured. An implementation MUST
+therefore register a **GossipSub topic validator** on every topic it
+subscribes to, run the §6 pipeline there, and remove the validator when
+it unsubscribes. The verdict maps onto libp2p's `TopicValidatorResult`:
+
+| Verdict | When | Effect |
+| --- | --- | --- |
+| `Reject` | a rule failure that carries a §8.4 trust penalty — rules 10–12, the ones verifiable against the receiver's own map | not delivered, not forwarded, and GossipSub scores down the peer that handed over the bytes |
+| `Ignore` | everything else: replays (rule 6), stale windows, foreign epochs, out-of-zone records, unparseable frames, and **anything the receiver could not judge** | not delivered, not forwarded, nobody scored |
+| `Accept` | every record in the message passed every applicable rule *and* rules 10–12 were actually evaluable | delivered and forwarded |
+
+Two consequences are deliberate:
+
+- **`Reject` is reserved for provable misbehaviour.** A relay handing us
+  a record we already hold is doing its job; scoring it down would let an
+  attacker degrade honest peers simply by replaying their own traffic
+  back at them. `verdict.trustPenalty` — the same signal the trust ledger
+  treats as a lie — is the only thing that may Reject.
+- **A peer may only vouch for what it can check.** Rules 10–12 need the
+  leaf cell loaded. A receiver that does not hold it MAY still keep the
+  record (its own risk, and §6 keeps plausibility probabilistic across
+  peers) but MUST NOT forward it. The honest cost is that a peer with a
+  sparse map relays less; the alternative is a mesh in which "validated
+  by a bonded relay" means nothing. A message carrying several records is
+  forwarded only if *every* record in it was accepted and judged — the
+  message is what the transport relays, so the message is what the peer
+  vouches for.
+
+Validation MUST run **exactly once** per message. The §6 pipeline is not
+side-effect free: rule 7's token bucket and the §8.4 trust and forfeiture
+path both mutate state, so validating in the topic validator and again on
+delivery would charge one peer twice for one record and can forfeit an
+honest peer. Implementations consume the validator's verdict on delivery
+rather than recomputing it, and the cache that carries it across MUST be
+bounded and expiring so a flood cannot grow it.
+
+Transports with no relay step — the in-process loopback, the §16 LoRa
+bridge — keep validating on delivery. There is no forward to gate, and
+nothing was vouched for on the way in. The same holds for the solicited
+pull path (§11.6): a PMS1 is merged, not relayed, and is validated on
+merge with the serving peer as the rule 5 voucher.
+
 ### 5.2 Topic grammar
 
 ```
@@ -642,7 +690,15 @@ context.
 Failing 10–12 additionally applies a trust penalty to the delivering
 peer (§8.4). Records that pass validation are stored even when rules
 10–12 could not be evaluated — plausibility is enforced probabilistically
-by whichever peers do hold the cell.
+by whichever peers do hold the cell. Storing is not relaying, though: a
+receiver that could not evaluate 10–12 keeps the record and does **not**
+forward it (§5.1), because forwarding is vouching and it checked nothing
+about where the record claims to be.
+
+This pipeline runs in the GossipSub topic validator, before the message
+is forwarded, and exactly once per message (§5.1). Rules 6 and 7 make
+that ordering load-bearing rather than cosmetic: both are stateful, so a
+second pass over the same message would charge one delivering peer twice.
 
 ## 7. Local store
 
@@ -1173,6 +1229,100 @@ same trust treatment as anyone's. Run profile: Node ≥ 20, js-libp2p
 with TCP+WSS listeners, `STORE_CONTRIB_CAP` raised (tunable), Circuit
 Relay v2 service enabled.
 
+### 12.1 Fleet seeds: admission and bridging
+
+A **fleet seed** is a keeper a small operator runs as the one dialable
+peer its own devices bootstrap from (threads §20.10). Its address travels
+inside sealed tickets — never in an offer, never on a public channel — so
+the set of devices that can reach it is the set the dispatcher awarded a
+job to. This section says what a seed MAY do with that fact.
+
+**Admission.** A courier phone MUST NOT be expected to mint a §5.4 bond:
+the mint is a 256 MiB memory-hard solve, affordable once per peer per day
+on a desktop, and the phone-affordable variant was measured and refuted
+as a Sybil defence (benchmarks §14). A seed MAY therefore admit its
+**directly connected** peers the way §16.3's LoRa bridge admits radio
+senders — writing them into its bonded-peer registry, with no PMA1 of
+their own — because a different admission applies: reaching the seed
+required an address that only a sealed ticket carried. A seed MAY instead
+use an explicit peerId allowlist. Either way:
+
+- Admission MUST be per-connection and released on disconnect.
+- Admission MUST NOT survive §8.4 forfeiture: a peer this node forfeited
+  on first-hand rule 10–12 evidence MUST NOT be re-admitted until the
+  refusal lapses. Forfeiture is the mute; no separate strike counter is
+  required, because on IP the delivering peer is the connection's
+  authenticated peerId.
+- An implementation MUST NOT bind a device card, ticket, or thread key to
+  a libp2p peerId in order to admit. Such a binding would let the fleet
+  join its drivers' traffic records to their identities — precisely the
+  linkage §10.2 exists to prevent — and buys nothing the seal already
+  provides.
+- A keeper that is NOT a fleet seed MUST NOT admit unbonded peers.
+  Admission is opt-in configuration (`--admit`), never a default.
+
+**Bridging.** A seed MAY join its island to a wider mesh under one of
+three policies:
+
+| Policy | Outward | Inward |
+| --- | --- | --- |
+| `off` | nothing | nothing |
+| `in` | nothing | upstream records are republished to the island |
+| `both` | validated island records are republished upstream under the seed's own bond | as `in` |
+
+Requirements:
+
+1. **Two hosts.** A bridged seed MUST NOT place its island and the wider
+   mesh on the same GossipSub host.
+
+   This rule predates the §5.1 topic validators and outlived them.
+   Historically it was the *only* thing standing between an admitted
+   island device and the wider mesh: GossipSub forwarded on receipt,
+   before any application-level validation, so a single host with a foot
+   in both meshes vouched — under rule 5, which asks only whether the
+   *delivering* peer is bonded — for records it never checked. Topic
+   validators close that hole generally: a conforming seed on one host
+   now validates each message before forwarding it, so nothing crosses
+   unchecked. The rule stays for two reasons that survive the fix. Two
+   hosts make "validate, then vouch" a property of the transport rather
+   than of one process's correctness — the seed cannot lose the property
+   by misconfiguration, a library upgrade, or a topic whose validator was
+   never registered. And the split is what makes the three policies
+   *directions* at all: `in` needs an upstream node that publishes
+   nothing, which a single host in both meshes cannot be.
+
+   A keeper that is a fleet seed (`--admit`) with a wider-mesh bootstrap
+   and no `--bridge` MUST therefore still be refused, as defence in
+   depth — not because the general hole is open.
+2. **Validation is acceptance.** A record MUST have passed rules 1–12
+   against the bridging node's own static map, and entered its store,
+   before it may be republished on the other side. No second validation
+   pass is required or wanted: a record that failed never becomes
+   eligible, and re-running the validator would repeat one verdict at the
+   cost of a second replay lookup.
+3. **The seed's bond is what vouches.** An outward record is republished
+   as the seed's own, so remote peers penalize and, at the trust floor,
+   forfeit **the seed** for its drivers' behaviour. This is the intended
+   incentive: policing sits with the operator who can identify the van.
+4. **Zones.** Bridging MUST be confined to the seed's pinned zones in
+   both directions. An unzoned bridge on a planet-scale mesh pulls the
+   planet through a depot's uplink.
+5. **`in` is read-only upstream and bonded downward.** §11.6 is a
+   whole-node mode; a seed that adopted it wholesale would stop serving
+   its island. The upstream node carries §11.6 (no bond, no gossip
+   membership, everything pulled PMG1→PMQ1→PMS1 on tick), while the
+   island node remains an ordinary bonded publisher. "Read-only" then
+   names a direction, because a direction is what each node is.
+6. **Loop termination** is the rule 6 replay window: a record pushed
+   across is in both stores, so its return is a replay, is dropped, and
+   never crosses again.
+
+**Disclosure.** A bridged seed makes the fleet's *territory* weakly
+visible to whoever peers with it — the zones it publishes into, and the
+rough volume it publishes. It reveals no driver, vehicle or job: a PMC1
+carries no identity (`reportId` is fresh random per record, §10.2), and
+thread contents are sealed to keys the mesh does not hold.
+
 ## 13. Test vectors
 
 Epoch (test only): `SHA256("pulsemesh-test-vector")` =
@@ -1319,7 +1469,9 @@ src/pulsemesh/reticent.js    the four emission gates + forwarder rotation       
 src/pulsemesh/incidents.js   type table, scoring, contradiction decay, policy     (§2.6, §8.5)
 src/pulsemesh/forward.js     PMF1 accept/validate/hold/republish                  (§4.5)
 src/pulsemesh/node.js        transport-agnostic node, epoch overlap, keeper       (§5.1, §11, §12)
-src/pulsemesh/libp2p.js      js-libp2p binding: GossipSub + sync streams          (§5.1)
+src/pulsemesh/bridge.js      fleet seed: island admission + the three bridges     (§12.1)
+src/pulsemesh/libp2p.js      js-libp2p binding: GossipSub topic validators +
+                             sync streams                                        (§5.1)
 src/pulsemesh/mobile.js      app-side contributor: fixes → snap → gates → emit    (§10.1, pulsemesh.md delta 4)
 src/pulsemesh/thread_*.js    the thread channel (pulsemesh-threads.md §17)
 src/pulsemesh/threads.js     thread entry point (rangefind/pulsemesh/threads)
@@ -1327,7 +1479,7 @@ scripts/pulsemesh_sim.mjs        phase-2 simulation harness                     
 scripts/pulsemesh_bench.mjs      per-operation cost
 scripts/pulsemesh_wire_bench.mjs real-socket transport measurements               (M3)
 scripts/pulsemesh_thread_bench.mjs thread crypto, bandwidth, catch-up availability
-scripts/pulsemesh_keeper.mjs     runnable keeper process                          (§12)
+scripts/pulsemesh_keeper.mjs     runnable keeper process, --admit/--bridge        (§12, §12.1)
 scripts/pulsemesh_demo.mjs       end-to-end demo on the real OSM route graph
 test/pulsemesh_*.test.js     per-module + cross-implementation vectors (§13)
 ```
@@ -1422,9 +1574,26 @@ a test asserts it rather than where the code merely looks right.
       vouching paths); rejected outright where bonds are undeployed;
       mint is sliced and abortable. proofType 1 is burned and never
       accepted.
+- [x] §5.1 relaying implies validating: a bonded honest relay in an
+      attacker→relay→observer line does not forward a record that fails
+      rule 10 against its own map (the observer receives no bytes at
+      all), still forwards a valid one, Ignores rather than Rejects a
+      rule-6 replay so the sender is neither scored down nor penalized,
+      and validates a relayed message exactly once. Real TCP, in
+      `test/pulsemesh_relay_validation.test.js`; the loopback and
+      snapshot-merge paths are asserted to keep validating on delivery
+      in the same file.
 - [x] §11.6 read-only: joins no gossip topic, never publishes, mints no
       bond, and converges through the padded pull path alone (covered by
       a real-TCP wire test).
+- [x] §12.1 fleet seed: an unbonded island driver's records are accepted
+      upstream because the seed republished them under its own bond, and
+      upstream records reach that driver (`both`); nothing the island
+      publishes leaves a `in` seed while upstream records still arrive;
+      nothing crosses either way with `off`; a record the seed's own map
+      refuses is never republished and its sender is forfeited and not
+      re-admitted; bridging is confined to the pinned zones. All over
+      real TCP, in `test/pulsemesh_fleet_bridge.test.js`.
 - [x] §8.4 forfeiture: the trust floor from first-hand rule 10–12
       evidence revokes the bond, refuses re-registration for its
       remaining lifetime, and publishes PMX1; refusal lapses with the

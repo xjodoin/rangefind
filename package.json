@@ -108,6 +108,10 @@
       "types": "./types/pulsemesh-lora.d.ts",
       "default": "./src/pulsemesh/lora.js"
     },
+    "./pulsemesh/bridge": {
+      "types": "./types/pulsemesh-bridge.d.ts",
+      "default": "./src/pulsemesh/bridge.js"
+    },
     "./pulsemesh/libp2p": {
       "types": "./types/pulsemesh-libp2p.d.ts",
       "node": "./src/pulsemesh/libp2p.js",
@@ -122,6 +126,9 @@
       "types": "./types/config.d.ts",
       "node": "./src/config.js",
       "default": "./src/node_only_entry.js"
+    },
+    "./qr": {
+      "default": "./src/qr.js"
     },
     "./analysis": "./src/analysis.js",
     "./terms": "./src/terms.js",
@@ -162,7 +169,7 @@
   ],
   "scripts": {
     "build:browser": "node scripts/build_browser_bundle.mjs",
-    "build:osm-demo": "npm run build:browser && cp dist/runtime.browser.js dist/osm.browser.js dist/route.browser.js dist/pulsemesh.browser.js dist/pulsemesh-libp2p.browser.js examples/osm-geo/public/",
+    "build:osm-demo": "npm run build:browser && cp dist/runtime.browser.js dist/osm.browser.js dist/route.browser.js dist/pulsemesh.browser.js dist/pulsemesh-threads.browser.js dist/pulsemesh-libp2p.browser.js dist/qr.browser.js examples/osm-geo/public/",
     "setup:osm-demo-route": "node scripts/osm_demo_route_setup.mjs",
     "build:element": "node scripts/build_element_bundle.mjs",
     "build:example": "node scripts/build_browser_bundle.mjs && node bin/rangefind.js build --config examples/basic/rangefind.config.json && cp dist/runtime.browser.js examples/basic/public/runtime.browser.js",

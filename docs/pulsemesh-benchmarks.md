@@ -404,6 +404,11 @@ measurement; verification still runs on every record.
 | Padding overhead on that recovery | 2.00× (16 cells requested for 8 wanted) |
 | Publisher gossip out | 54 bytes/record |
 
+These are the machine and the run that produced §9's narrative; §9a below
+re-measures the ingest and latency rows against the §5.1 topic validators
+in a paired before/after, which is the comparison to read for that
+change.
+
 The delivery figure is the one worth dwelling on. A contribution goes
 from `publishRecord` on one host to *validated and stored* on another —
 across a real socket, through Noise, through GossipSub, through
@@ -425,6 +430,33 @@ profile; browser peers will use WebRTC or WebSockets on the same adapter
 and should be measured separately. And the 54 bytes/record publisher
 figure counts one GossipSub copy per mesh peer, so it scales with mesh
 degree, not with the network.
+
+### 9a. What the §5.1 topic validators cost
+
+Validation moved *ahead of* the forward decision — a GossipSub topic
+validator now runs the whole §6 pipeline before a message is relayed, so
+that relaying implies validating. The work per message is the same work
+as before; what changed is where it sits, plus one SHA-256 to key the
+validate-once verdict on each side of the forward decision.
+
+Paired runs on one machine, five each, `--peers=6 --records=1200`
+(1 080 records in the burst phase, 5 400 record-deliveries), medians:
+
+| | Before | After |
+| --- | --- | --- |
+| Gossip delivery p50 | 0.99 ms | **1.00 ms** |
+| Gossip delivery p95 | 2.20 ms | **2.20 ms** |
+| Burst wall clock | 328 ms | **351 ms** |
+| Sustained ingest | 3 297 records/s | **3 077 records/s** |
+
+End-to-end delivery latency does not move: the pipeline runs once either
+way, and running it a few hundred microseconds earlier in the same task
+is invisible at the millisecond scale that matters. Peak burst throughput
+gives up **~7%**, about **+4 µs per record-delivery**, and the run-to-run
+spread (2 700–3 400 records/s after, 3 000–3 400 before) is wide enough
+that the two distributions overlap — this is at the noise floor, not
+above it. It buys a property no amount of throughput substitutes for: a
+bonded peer no longer vouches for bytes it never read.
 
 Reproduce with `npm run bench:pulsemesh:wire`.
 
@@ -485,8 +517,9 @@ WebCrypto path, so the same numbers apply in a browser.
 
 | Operation | Result |
 | --- | --- |
-| PMT1 record (fine mode) | **130 bytes** |
-| PMTP body | 92 bytes (28-byte preimage + 64-byte signature) |
+| PMT1 record (fine mode, no run plan) | **133 bytes** |
+| PMTP body | 95 bytes (31-byte preimage + 64-byte signature) |
+| Cumulative outcome map, per record | +16 B at 50 stops, +55 B at 200 |
 | The link — the entire capability | **45 bytes** |
 | Key schedule from the capability | 0.06 ms, once per thread |
 | Sign (publisher) | 0.064 ms |
@@ -517,11 +550,11 @@ here it is that addressing is impossible.
 
 | Claim in §15 | Measured |
 | --- | --- |
-| 26 B/s per fine thread | **26.0 B/s** |
-| 94 KB per thread-hour | **91 KB** |
-| ~47 MB for a 500-bus fleet-hour | **45 MB** |
-| Coarse "two orders of magnitude below" | **19.5% of fine** — one order, not two |
-| Subscriber cache ≈ 16 KB/thread | 30 KiB at the default ring |
+| 26.6 B/s per fine thread | **26.6 B/s** |
+| 94 KB per thread-hour | **94 KB** |
+| ~46 MB for a 500-bus fleet-hour | **46 MB** |
+| Coarse "two orders of magnitude below" | **20.0% of fine** — one order, not two |
+| Subscriber cache ≈ 16 KB/thread | 31 KiB at the default ring |
 
 The spec's arithmetic holds everywhere except the coarse-mode claim,
 which was optimistic: coarse costs about a fifth of fine, not a

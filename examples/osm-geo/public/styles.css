@@ -2095,3 +2095,550 @@ a { color: inherit; }
     max-height: none;
   }
 }
+
+/* --- PulseMesh -----------------------------------------------------------
+   Live traffic, live incidents and threads share one card, and each is a
+   different kind of claim: a measured aggregate, an uncorroborated report,
+   and one vehicle that authorized you to watch it. The styling keeps them
+   distinguishable rather than blending them into one "live" colour. */
+
+.mesh-card {
+  flex: 0 0 auto;
+  margin: 8px 8px 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background:
+    radial-gradient(circle at 88% 0, rgba(53, 194, 172, .09), transparent 52%),
+    rgba(14, 16, 22, .6);
+}
+.mesh-card[hidden] { display: none; }
+.mesh-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mesh-card__header h3 {
+  margin: 2px 0 0;
+  color: #fffef8;
+  font: 700 1.02rem/1.2 var(--display);
+  letter-spacing: -.02em;
+}
+.mesh-card__eyebrow {
+  margin: 0;
+  color: var(--pine);
+  font: 640 .62rem/1 var(--mono);
+  letter-spacing: .16em;
+  text-transform: uppercase;
+}
+.mesh-card__lede {
+  margin: 9px 0 11px;
+  color: var(--muted);
+  font: 400 .78rem/1.5 var(--body);
+}
+.mesh-pill {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  color: var(--muted);
+  font: 620 .66rem/1 var(--mono);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.mesh-pill[data-mode="local"] { border-color: rgba(255, 201, 64, .34); color: var(--marker-soft); }
+.mesh-pill[data-mode="mesh"] { border-color: rgba(53, 194, 172, .38); color: var(--pine); }
+
+.mesh-toggle {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid rgba(53, 194, 172, .34);
+  border-radius: 10px;
+  background: rgba(53, 194, 172, .12);
+  color: #d9fbf4;
+  font: 640 .82rem/1 var(--display);
+  cursor: pointer;
+  transition: border-color .16s ease, background .16s ease;
+}
+.mesh-toggle:hover { border-color: rgba(53, 194, 172, .55); }
+.mesh-toggle.active { border-color: var(--line-bright); background: rgba(250, 249, 242, .05); color: var(--paper); }
+.mesh-toggle:disabled { opacity: .55; cursor: progress; }
+
+.mesh-body { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+.mesh-body[hidden] { display: none; }
+
+.mesh-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.mesh-stat {
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(250, 249, 242, .025);
+  text-align: center;
+}
+.mesh-stat strong { display: block; color: var(--paper); font: 680 .95rem/1 var(--display); }
+.mesh-stat small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font: 500 .6rem/1 var(--mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.mesh-note { margin: 0; color: var(--muted); font: 400 .73rem/1.5 var(--body); }
+.mesh-hint { margin: 6px 0 0; color: var(--muted); font: 400 .69rem/1.45 var(--body); }
+
+.mesh-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+.mesh-check input { margin-top: 3px; accent-color: var(--pine); }
+.mesh-check b { display: block; color: var(--paper); font: 620 .78rem/1.3 var(--display); }
+.mesh-check small { display: block; margin-top: 3px; color: var(--muted); font: 400 .69rem/1.45 var(--body); }
+.mesh-check input:disabled + span { opacity: .5; }
+
+.mesh-secondary {
+  padding: 7px 11px;
+  border: 1px solid var(--line-bright);
+  border-radius: 9px;
+  background: rgba(250, 249, 242, .04);
+  color: var(--paper);
+  font: 600 .74rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-secondary:hover { border-color: var(--marker); color: var(--marker-soft); }
+
+.mesh-section { border-top: 1px solid var(--line); padding-top: 11px; }
+.mesh-section__label {
+  margin: 0 0 8px;
+  color: var(--paper);
+  font: 620 .72rem/1 var(--display);
+  letter-spacing: .01em;
+}
+.mesh-report-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.mesh-report-row button {
+  padding: 6px 10px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: 600 .71rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-report-row button:hover { border-color: var(--danger); color: #ffd6d0; }
+
+.mesh-incidents { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.mesh-incidents[hidden] { display: none; }
+.mesh-incident {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: 9px;
+  cursor: pointer;
+}
+/* A corroborated incident is a fact; a lone report is not, and must not
+   look like one. */
+.mesh-incident[data-tier="shown"] { border-left-color: var(--danger); }
+.mesh-incident[data-tier="hint"] { border-left-color: var(--marker); opacity: .78; }
+.mesh-incident b { color: var(--paper); font: 620 .76rem/1.2 var(--display); }
+.mesh-incident small { grid-column: 1; color: var(--muted); font: 400 .66rem/1.3 var(--mono); }
+.mesh-incident__actions { grid-row: 1 / span 2; display: flex; gap: 5px; }
+.mesh-incident__actions button {
+  padding: 4px 8px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: 600 .64rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-incident__actions button:hover { border-color: var(--pine); color: var(--pine); }
+
+.mesh-share { margin-top: 8px; display: flex; flex-direction: column; gap: 5px; }
+.mesh-share[hidden] { display: none; }
+.mesh-share input,
+.mesh-follow input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 12, 17, .7);
+  color: var(--paper);
+  font: 400 .68rem/1.3 var(--mono);
+}
+.mesh-share small { color: var(--muted); font: 400 .66rem/1.4 var(--body); }
+
+/* Dispatch tickets (threads §20). The QR is the handover channel: the
+   capability travels over no server, so the two devices in the room are
+   the only path there is. This page is dark and a QR needs its quiet
+   zone to read, hence the white tile rather than an inverted code. */
+.mesh-job { margin: 9px 0; display: flex; flex-direction: column; gap: 9px; }
+.mesh-job[hidden] { display: none; }
+.mesh-qr {
+  align-self: flex-start;
+  width: 100%;
+  max-width: 240px;
+  padding: 12px;
+  border-radius: 14px;
+  background: #ffffff;
+  line-height: 0;
+}
+.mesh-qr svg { display: block; width: 100%; height: auto; }
+.mesh-job__caption { color: var(--muted); font: 400 .66rem/1.4 var(--body); }
+/* The run, in the order it is to be driven. The numbers are the point:
+   the ticket is a sequence, not a bag of addresses. */
+.mesh-job__summary { color: var(--marker-soft); font: 550 .64rem/1.4 var(--mono); }
+.mesh-job__stops {
+  margin: 0;
+  padding: 0 0 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: #c8ccd3;
+  font: 400 .7rem/1.4 var(--body);
+}
+.mesh-job__stops li::marker { color: var(--marker); font: 550 .64rem/1 var(--mono); }
+.mesh-job__meta { color: var(--muted); font: 400 .64rem/1.5 var(--mono); }
+/* The driver link is a publish capability and the customer link is not.
+   Two identical text boxes would be a lie by layout. */
+.mesh-job__warning {
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 139, 126, .4);
+  border-radius: 9px;
+  color: #ffd6d0;
+  font: 500 .7rem/1.45 var(--body);
+}
+/* The dispatcher's per-stop details, collapsed. Most stops on most days
+   are an address and nothing else; five open boxes per stop on a
+   twelve-drop round is a form nobody fills in. */
+.mesh-job-details { margin: 9px 0; display: flex; flex-direction: column; gap: 5px; }
+.mesh-job-details[hidden] { display: none; }
+.mesh-job-details__stop {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 9px;
+}
+.mesh-job-details__stop summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+}
+.mesh-job-details__stop summary b { color: var(--paper); font: 550 .72rem/1.35 var(--body); }
+.mesh-job-details__stop summary small { color: var(--muted); font: 400 .64rem/1.35 var(--mono); }
+.mesh-job-details__stop[open] { border-color: var(--line-bright); }
+.mesh-job-details__field { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.mesh-job-details__field small { color: var(--muted); font: 400 .64rem/1.3 var(--body); }
+.mesh-job-details__field input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(10, 12, 17, .7);
+  color: var(--paper);
+  font: 400 .7rem/1.3 var(--body);
+}
+.mesh-job-details__note { color: var(--muted); font: 400 .66rem/1.45 var(--body); }
+
+.mesh-link { display: flex; flex-direction: column; gap: 4px; }
+.mesh-link small { color: var(--muted); font: 400 .67rem/1.45 var(--body); }
+.mesh-link input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 12, 17, .7);
+  color: var(--paper);
+  font: 400 .68rem/1.3 var(--mono);
+}
+.mesh-link[data-tone="publish"] small { color: var(--marker-soft); }
+.mesh-link[data-tone="publish"] input { border-color: rgba(255, 201, 64, .45); }
+
+.mesh-accept {
+  margin-top: 9px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--marker);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.mesh-accept[hidden] { display: none; }
+.mesh-accept b { color: var(--paper); font: 620 .78rem/1.35 var(--display); }
+.mesh-accept small { color: var(--muted); font: 400 .68rem/1.45 var(--body); }
+.mesh-accept__stops { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 3px; }
+.mesh-accept__stops li { color: var(--paper); font: 500 .71rem/1.4 var(--body); }
+.mesh-accept__stops li span { display: block; color: var(--muted); font: 400 .64rem/1.4 var(--mono); }
+.mesh-accept button {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 6px 12px;
+  border: 1px solid rgba(255, 201, 64, .5);
+  border-radius: 999px;
+  background: rgba(255, 201, 64, .1);
+  color: var(--marker-soft);
+  font: 600 .72rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-accept button:hover { border-color: var(--marker); }
+
+.mesh-follow { margin-top: 9px; display: flex; gap: 6px; }
+.mesh-follow button {
+  flex: 0 0 auto;
+  padding: 7px 12px;
+  border: 1px solid var(--line-bright);
+  border-radius: 8px;
+  background: rgba(250, 249, 242, .04);
+  color: var(--paper);
+  font: 600 .72rem/1 var(--display);
+  cursor: pointer;
+}
+
+.route-live-note {
+  margin: 8px 0 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  font: 500 .72rem/1.4 var(--body);
+}
+.route-live-note[hidden] { display: none; }
+.route-live-note[data-tone="slow"] { border-color: rgba(255, 139, 126, .38); color: #ffd6d0; }
+.route-live-note[data-tone="clear"] { border-color: rgba(53, 194, 172, .32); color: #bdeee5; }
+
+/* Threads: what a link reveals is a harm decision, so the two modes are
+   shown side by side with what each one costs if it leaks — not hidden
+   behind a word like "precision". */
+.mesh-modes { display: flex; flex-direction: column; gap: 6px; margin-bottom: 9px; }
+.mesh-modes button {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.mesh-modes button b { display: block; color: var(--paper); font: 620 .75rem/1.3 var(--display); }
+.mesh-modes button small { display: block; margin-top: 2px; color: var(--muted); font: 400 .67rem/1.4 var(--body); }
+.mesh-modes button.active { border-color: rgba(53, 194, 172, .45); background: rgba(53, 194, 172, .08); }
+.mesh-modes button.active b { color: #d9fbf4; }
+
+.mesh-follow-card {
+  margin-top: 9px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.mesh-follow-card[hidden] { display: none; }
+/* A live position and a stale one are different claims (§12), and the
+   card must not let them look alike. */
+.mesh-follow-card[data-live="true"] { border-left-color: #2f6df6; }
+.mesh-follow-card[data-live="false"] { border-left-color: var(--muted); opacity: .78; }
+.mesh-follow-card b { color: var(--paper); font: 620 .78rem/1.35 var(--display); }
+.mesh-follow-card small { color: var(--muted); font: 400 .68rem/1.4 var(--mono); }
+.mesh-follow-card__eta { color: #bdeee5 !important; font: 500 .72rem/1.4 var(--body) !important; }
+/* A stop the driver wrote off has no arrival, and must not be coloured
+   like one that does. */
+.mesh-follow-card__eta[data-tone="marked"] { color: var(--marker-soft) !important; }
+.mesh-follow-card__caveat { color: var(--marker-soft) !important; font: 400 .68rem/1.45 var(--body) !important; }
+.mesh-follow-card__mark { color: #c8ccd3 !important; font: 500 .7rem/1.45 var(--body) !important; }
+
+/* Per-stop outcomes (threads §5.2). Only stops somebody has spoken for
+   get a badge: a pending stop draws nothing, because "nobody has said"
+   and "the van has not arrived" are different statements and a grey
+   badge would be read as the second. */
+.mesh-outcomes { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px; }
+.mesh-outcome {
+  padding: 3px 8px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  color: var(--muted);
+  font: 600 .64rem/1.3 var(--mono);
+}
+.mesh-outcome[data-outcome="delivered"] { border-color: rgba(53, 194, 172, .45); color: #bdeee5; }
+.mesh-outcome[data-outcome="skipped"] { border-color: rgba(255, 201, 64, .45); color: var(--marker-soft); }
+.mesh-outcome[data-outcome="failed"] { border-color: rgba(255, 139, 126, .45); color: #ffd6d0; }
+
+/* The chips a dispatcher picks a travel profile with. Small, because it
+   is one word about a job, unlike §11's mode which needs its trade-off
+   spelled out. */
+/* Enrolled devices (§20.9). The fingerprint is the point of the row —
+   it is what two people read to each other before a job is sealed — so
+   it is monospaced and not smaller than the name it belongs to. */
+.mesh-devices { margin: 8px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; }
+.mesh-device {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.mesh-device b { color: var(--paper); font: 550 .73rem/1.3 var(--body); }
+.mesh-device code { grid-column: 1; color: var(--marker-soft); font: 500 .68rem/1.3 var(--mono); }
+.mesh-device[data-self="true"] { border-color: rgba(53, 194, 172, .38); }
+.mesh-device__self { grid-column: 1; color: var(--pine); font: 500 .64rem/1.3 var(--body); }
+.mesh-device button {
+  grid-row: 1 / span 2;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: 600 .66rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-device button:hover { border-color: var(--danger); color: #ffd6d0; }
+
+.mesh-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.mesh-chips button {
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: 600 .7rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-chips button.active {
+  border-color: rgba(53, 194, 172, .45);
+  background: rgba(53, 194, 172, .08);
+  color: #d9fbf4;
+}
+
+/* The driver's row: the stop in front of them and the two things only
+   they can say about it. */
+.mesh-drive {
+  margin-top: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--marker);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mesh-drive[hidden] { display: none; }
+.mesh-drive small { color: var(--muted); font: 400 .67rem/1.4 var(--body); }
+.mesh-drive__summary { color: var(--marker-soft) !important; font: 550 .64rem/1.4 var(--mono) !important; }
+.mesh-drive__stop { color: var(--paper); font: 620 .78rem/1.3 var(--display); }
+/* What the driver reads at the door (threads §20.8). The order number
+   and the parcel count are checked against the label on the box while
+   standing outside, so they are the largest thing on the row after the
+   address — not a metadata footnote under the buttons. */
+.mesh-drive__ids { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.mesh-drive__ref {
+  color: var(--marker-soft);
+  font: 640 .95rem/1.2 var(--mono);
+  letter-spacing: .02em;
+}
+.mesh-drive__parcels { color: var(--paper); font: 620 .82rem/1.2 var(--display); }
+.mesh-drive__instructions {
+  margin: 0;
+  padding: 6px 9px;
+  border-left: 2px solid var(--line-bright);
+  color: #c8ccd3;
+  font: 400 .74rem/1.45 var(--body);
+}
+.mesh-drive__contact {
+  align-self: flex-start;
+  padding: 6px 12px;
+  border: 1px solid rgba(53, 194, 172, .5);
+  border-radius: 999px;
+  color: #bdeee5;
+  font: 600 .72rem/1 var(--display);
+  text-decoration: none;
+}
+.mesh-drive__contact:hover { border-color: var(--pine); }
+
+.mesh-drive__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.mesh-drive__actions button {
+  padding: 6px 12px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--paper);
+  font: 600 .7rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-drive__actions button:first-child { border-color: rgba(53, 194, 172, .5); color: #bdeee5; }
+.mesh-drive__cancel { color: var(--muted) !important; }
+.mesh-drive__reason,
+.mesh-drive__detail {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 12, 17, .7);
+  color: var(--paper);
+  font: 400 .7rem/1.3 var(--body);
+}
+.mesh-drive__detail[hidden] { display: none; }
+
+/* Proof of delivery (threads §20.7). The file input is the button: one
+   action, because a driver at a door will not press two, and a photo
+   with no mark says nothing on the wire. */
+.mesh-drive__photo {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  color: var(--paper);
+  font: 600 .7rem/1 var(--display);
+  cursor: pointer;
+}
+.mesh-drive__photo input { display: none; }
+
+/* The photo on the follower card, and the chip that stands in for it.
+   A viewer holding only the 45-byte link cannot derive the key, so it
+   gets the commitment in words — which is honest, not a placeholder. */
+.mesh-photo {
+  max-width: 100%;
+  margin-top: 6px;
+  border: 1px solid var(--line-bright);
+  border-radius: 8px;
+}
+.mesh-photo-chip {
+  align-self: flex-start;
+  margin-top: 5px;
+  padding: 3px 9px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  color: var(--muted);
+  font: 600 .64rem/1.4 var(--mono);
+}
+.mesh-photo-chip[data-state="sealed"] { border-color: rgba(53, 194, 172, .35); color: #bdeee5; }
+.mesh-follow-card button {
+  align-self: flex-start;
+  margin-top: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--line-bright);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--paper);
+  font: 600 .68rem/1 var(--display);
+  cursor: pointer;
+}

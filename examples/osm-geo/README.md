@@ -136,6 +136,146 @@ Directions features:
 - a Route X-Ray receipt showing the object fetches, bytes, and shards each
   route touched — the routing analogue of the search Query X-Ray.
 
+## Live traffic (PulseMesh)
+
+The route card is followed by a **Live traffic** card that turns the
+peer-to-peer traffic channel on. There is no traffic server in the path, and
+the router works without any of it — that degradation is the contract, and
+turning the card off proves it.
+
+With it on, the demo:
+
+- colours the roads it has observations for, green through red, with a
+  corroborated jam drawn more strongly than a two-report hint;
+- states what live traffic did to the ETA (`+2 min from live traffic · 82
+  edges re-weighted from 39 observed segments`) and re-routes when the picture
+  moves materially;
+- pins incidents, marks the uncorroborated ones "unconfirmed", and offers
+  *Still there* / *Gone* on each — which is how §8.5 gets the distinct-peer
+  corroboration that turns a claim into something the router acts on;
+- reports a crash, closure, road works, police or an object on the road from
+  the position the demo drive is at, behind the disclosure §10.4 requires;
+- shares the drive as a **45-byte capability in a URL fragment** — no server,
+  here or anywhere, ever receives it — choosing what the link is worth if it
+  leaks (a live locator, or stop events with no position at all), and follows
+  one pasted in or opened in the address bar.
+
+- **is a device** (§20.9): the page mints an X25519 keypair on first use and
+  shows it under **This device** — a name you can change, a fingerprint, and
+  the PMV1 card as a QR and a `wayfind://device#…` link. That card is what a
+  dispatcher scans to be able to send this browser a job, and what this
+  browser shows when it wants to be given one. The fingerprint exists to be
+  read aloud and checked against the other phone's screen: a card is bytes on
+  a screen, and a screen in a depot can be showing anybody's. **Enrolled
+  devices** is the list a job can be sealed to — paste a card, or open a
+  `wayfind://device#…` link, and confirm. The key lives in localStorage,
+  which is not a Keystore: clearing site data destroys it and every job
+  already sealed to it becomes unopenable by anybody. The page says so under
+  the card rather than in a footnote.
+
+  One browser plays dispatcher and driver here, and the demo does not paper
+  over it: there is no hidden driver device. *Use this device's card* fills
+  the enrol field with this browser's own card and stops — you enrol it
+  yourself, and the roster row says "This device" so the two keys acting are
+  never mistaken for two devices.
+
+- **dispatches a job** (§20): one ticket, issued against the route on screen,
+  sealed to an enrolled device, produces two artifacts that are deliberately
+  unequal. The customer link is the ordinary read-only 45 bytes and exists
+  *before* a driver does, so it can go out with the order confirmation. The
+  job itself is **never in the clear** (§20.9): what the QR and the file
+  carry is PME1 ciphertext addressed to the driver's device and to this
+  dispatcher's own, so a photograph of the code on the counter is worth
+  nothing to the person who took it. Whoever *can* open it still holds a
+  publish capability — the protocol cannot tell two holders of one run seed
+  apart — which is why it goes to one named device and no other, and why
+  *Create a job ticket* with an empty roster explains enrolment instead of
+  failing. Opening it (or pasting it into the follow box) shows the driver an
+  accept card — stops, what the link reveals, expiry, issuer — rather than
+  acting on it the way a follow link is acted on: taking a job is a decision.
+  A job sealed for somebody else says exactly that, *sealed for another
+  device*, with this device's fingerprint to send back — not a decode error,
+  because the two have different fixes. *Hand over this job* re-seals the
+  same run to a device picked from the roster, so a second courier
+  resumes the run above the audience's own highest `seq` (§20.5) and the
+  customer's link never dies — and if the next driver was never enrolled
+  here, the panel says so and points at the card flow. No card, no transfer.
+  The QR encoder is `src/qr.js`, in-repo, because
+  the package has no runtime dependencies and ISO/IEC 18004 does not move.
+  Enter several delivery addresses in *Directions* and the ticket carries all
+  of them, in the order `itinerary()` worked out rather than the order they
+  were typed — pick *End anywhere* under **Finish** so the optimizer is not
+  forced to treat the last address entered as the terminus. The origin never
+  becomes a stop on the ticket (it is where the vehicle leaves from, not a
+  delivery), and each customer should be sent their link plus their own stop
+  only: the plan holds every other customer's address.
+
+  Each stop takes optional **delivery details** (§20.8) behind an *Add details*
+  row — order reference, parcel count, instructions, contact — and the driver's
+  row shows them for the stop in front of them: the reference and the count
+  large, because those are what get checked against the box on a doorstep, the
+  instruction under them, and the contact as a one-tap `tel:` link. None of it
+  reaches the mesh: it lives in the plan, the plan lives in the ticket, and what
+  goes on the wire is an 8-byte hash of the plan. What it *does* change is what
+  the ticket is worth to read — a customer list rather than a route sheet —
+  which is the reason the ticket is now sealed: the details are readable only
+  by the devices it was addressed to, and the tile names them. An empty parcel
+  box means *nobody said*, which the protocol keeps distinct from a stated `0`.
+
+  A full day of stops is bigger than a phone camera can scan, so the job
+  also downloads as a one-line `job-<id>.wayfindjob` file — the same sealed
+  bytes, carrying the `wayfind://ticket#…` URL as text so it survives mail
+  clients and copy-paste — and when the plan outgrows the scannable QR bound
+  the page drops the symbol rather than printing an unreadable one. Sealing
+  costs 130 bytes for one recipient and 194 for two, so that bound is lower
+  than it was: about ten metadata-free stops rather than fifteen. *Open a
+  ticket or link file* next to the follow box reads one back in, which is the
+  paste path with the typing done for you; the file is ciphertext, so the
+  channel carrying it cannot read the job — the device it is addressed to
+  still gets a publish capability.
+
+Following shows a card whose sentence comes from the subscriber itself, never
+from the page: a stale position is never presented as a live one. Under it is
+an arrival computed **here**, routing the position they broadcast to the
+destination this browser cares about under this browser's live-traffic
+metric — so the publisher broadcasts one position and never learns which
+destination anyone asked about.
+
+In local mode the follower is a second in-tab peer, because no transport
+loops a publish back to its own sender: on a real mesh the follower is simply
+another device. Joining late is the interesting case — the viewer holds
+nothing but the link, and pulls the run it missed out of the *other peer's*
+cache (§5.5), which is why availability grows with the audience instead of
+costing more.
+
+Two modes, both real protocol bytes:
+
+```bash
+# Default: peers inside this tab, fed by simulated vehicles on your corridor.
+# Works from file:// and from any static host.
+npm run serve:osm-geo
+
+# Or join a real mesh: run a keeper and pass its multiaddr.
+npm run pulsemesh:keeper
+open "http://localhost:5184/?keeper=/ip4/127.0.0.1/tcp/4001/ws/p2p/12D3Koo..."
+
+# A fleet's own seed (threads §20.10): the keeper prints its dialable
+# addresses, a wayfind://seed#… card and a scannable QR of it, on stderr.
+# Paste or scan that into "This fleet's seed" and every job this browser
+# issues carries the address *inside the sealed ticket* — so it reaches
+# the driver's phone and nobody else.
+npm run pulsemesh:keeper -- --seed-card --seed-label="Depot seed"
+```
+
+A browser joins the wire **read-only** (protocol §11.6): it mints no admission
+bond, joins no gossip topic, and pulls what it shows over the padded sync
+path. That is the design, not a demo limitation — a tab that will never
+contribute should not pay a 256 MiB mint, and an unbonded peer in the gossip
+mesh would only punch holes in other peers' delivery paths.
+
+Console access, for poking at it: `window.rangefindPulseMesh` exposes
+`snapshot()`, `traffic()`, `incidents()`, `drawn()` and the session itself.
+
 ## Build
 
 ```bash

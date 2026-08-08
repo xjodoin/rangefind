@@ -15,7 +15,8 @@ intact; the sections below note where this version deliberately differs
 and why. Status: **implemented** — the consumption side (provider
 contract, segment identity, live-metric search), the full protocol v1
 traffic channel (`src/pulsemesh/`), the js-libp2p wire transport and
-keeper (`src/pulsemesh/libp2p.js`, `scripts/pulsemesh_keeper.mjs`), and
+keeper (`src/pulsemesh/libp2p.js`, `scripts/pulsemesh_keeper.mjs`, with
+the fleet-seed admission and bridge in `src/pulsemesh/bridge.js`), and
 the phase-2 simulation are done, tested, and measured; all five protocol
 milestones (M1–M5) are complete. The wire-level implementation
 specification — byte layouts, topic grammar, bin tables, the
@@ -118,11 +119,17 @@ No global pluggable-cost router is claimed or needed.
 
 ### 4. Platform reality: browsers read, apps write
 
-*Implemented.* `rangefind/pulsemesh` bundles for the browser at 106 KB
+*Implemented.* `rangefind/pulsemesh` bundles for the browser at 141 KB
 with the transport split into a separate 2.5 MB entry point loaded on
-demand; `rangefind/pulsemesh/mobile` is the app-side contributor, wired
-into the Android app. Measured in
+demand; `rangefind/pulsemesh/mobile` is the app-side surface, wired into
+the Android app — live traffic on the map, incident reporting, thread
+sharing and the settings that gate them. Measured in
 [benchmarks §9d and §9e](pulsemesh-benchmarks.md).
+
+The split holds in practice: the web demo joins the real mesh
+**read-only** (§11.6) — no bond, no gossip membership, everything pulled
+over the padded sync path — while the phone is the side that can
+contribute, and does so only when its owner turns it on.
 
 Backgrounded browser tabs lose `watchPosition`; screen-off ends
 reporting. Web clients are therefore treated as **consumers** (and
@@ -277,6 +284,37 @@ only above corroboration minimums (≥2 reports for a low-confidence hint,
 ≥3 for a normal aggregate). Confidence = source diversity × freshness ×
 agreement. Congestion ratio = observed / static free-flow.
 
+### Relaying implies validating
+
+A peer's admission bond is what vouches for the proofless records it
+hands over (§5.4, rule 5) — so the peer must actually have checked them.
+GossipSub does not make that automatic: it forwards a message to its mesh
+peers the moment it arrives, before the application sees it. Validating
+on delivery therefore means every honest relay spends its bond on bytes
+it never looked at, and anyone can launder invalid records through one.
+
+The transport closes it rather than the application: every topic the
+library subscribes to carries a GossipSub **topic validator**, so the
+whole validation pipeline runs before the forward decision, exactly once
+per message. A provable lie — a speed the road class cannot carry, a
+segment that does not exist — is *rejected*, which scores the peer that
+handed it over down in GossipSub's own accounting. Everything else that
+must not travel is *ignored*: a replay, a stale window, a record for a
+zone we are not in. Ignoring costs the sender nothing, which is the
+point — rejecting a duplicate would let an attacker degrade honest peers
+by replaying their own traffic back at them.
+
+The honest cost: **a peer only vouches for what it can check.** The rules
+that catch implausible records need the local map for the area. A peer
+that does not hold that leaf still keeps the record — its own risk, and
+plausibility was always enforced probabilistically by whoever does hold
+the cell — but does not pass it on. So a device with a sparse map relays
+less than one with a full one, and a browser holding one corridor relays
+almost nothing outside it. At the limit, a node wired with no static map
+at all forwards nothing — a pure sink, which is the honest description of
+what its vouching was ever worth. Keepers, which hold their pinned zones in
+full, carry the fan-out; that is what keepers are for.
+
 ### TTLs (receiver-enforced; senders can only shorten)
 
 | Item | Value |
@@ -380,6 +418,267 @@ batching) lives behind `fetch()`. The engine contributes: epoch checks,
 confidence/age blending, closure semantics, corridor-exact search,
 graceful degradation, and the `result.live` application report.
 
+### The session (what a host actually wires)
+
+A host wants six things and nothing else: route under live traffic, see
+where the jams and incidents are, contribute if the user said so, report
+an incident, follow the corridor being driven, and know what the mesh is
+doing. `createMeshSession({ engine, network, … })` in
+[`src/pulsemesh/session.js`](../src/pulsemesh/session.js) is that
+surface, and both shipped hosts — the Android app and the OSM web demo —
+sit on it:
+
+```js
+const session = await createMeshSession({ engine, network, id, contribute: false });
+await engine.route({ from, to, live: session.provider() });
+await session.followRoute(candidates);   // subscribe zones, fill cells, warm leaves
+const jams = await session.traffic();    // polylines, speeds, confidence, level
+const pins = await session.incidents();  // scored, positioned, tiered shown/hint
+await session.reportIncident({ type: 1, acknowledgedPublic: true });
+```
+
+Two things it gets right that a host writing its own wiring got wrong,
+twice:
+
+- **The static index answers rules 10–12.** `engine.cellFacts(leaf)`
+  returns the leaf's real polyline count, per-geomRef road class, length
+  and free-flow speed, warmed for the leaves the session is listening to.
+  The stand-in it replaces (`polylineCount: 1 << 20`,
+  `classOf: () => "secondary"`) made rule 11 unfireable and capped
+  *every* road at 100 km/h, so an honest motorway contribution failed
+  rule 10 and cost the peer that delivered it trust. Not holding a leaf
+  is a legal state (§6 says 10–12 are probabilistic across peers);
+  inventing its contents is not.
+- **Contributions carry a real length.** `metersOf` comes from the same
+  edge the router costed, so `record.meters` cannot disagree with a
+  neighbour's rule 10, and a receiver can turn a speed bin back into a
+  time. With 0 there, the familiar symptom is `states: 15, applied: 0`.
+
+The session also holds the cell derivation every peer must agree on: the
+z15 cell of the **leaf's bbox centre**. §2.3 words it as the cell of the
+snapped coordinate, but a wire record carries `leafCell/geomRef` and no
+coordinate, so a receiver has to derive the cell from the static index
+alone — and the leaf bbox is in the route-graph root, which every peer
+has, while the segment's geometry is not. It is coarser than the spec
+reads and it is what interoperates.
+
+**The host owns the clock.** `session.start()` schedules its own
+maintenance, which is right in a browser tab and wrong in an app: a
+headless WebView is a hidden page and Chromium clamps a hidden page's
+timers, so a mesh that scheduled its own anti-entropy ticked once and
+then stopped — measured on a Pixel emulator. An app host skips `start()`
+and calls `session.tick()` on its own cadence.
+
+### What the two shipped hosts do with it
+
+| | Web demo (`examples/osm-geo`) | Android (`android/`) |
+|---|---|---|
+| Role | consumer; read-only on the wire (§11.6) | consumer, contributor when asked |
+| Transport | loopback with simulated vehicles, or libp2p/WSS to a keeper via `?keeper=` | loopback demo transport, or libp2p/WSS via `BuildConfig.PULSEMESH_BOOTSTRAP` |
+| Clock | `session.start()` | Kotlin polls `tickMesh()` |
+| Draws | traffic polylines, incident pins, followed vehicle | same three, as MapLibre layers |
+| Reports | disclosure dialog → `reportIncident` | disclosure sheet → `reportIncident` |
+| Threads | share link + follow field | share sheet + follow |
+
+Both label the mode they are in. A host running simulated vehicles
+because no keeper is configured must not look like a host on a real
+mesh, and both say which on screen. Android goes one step further,
+because a phone is where the claim is acted on: the simulation is a
+switch the driver owns, it can be turned off with live traffic left up
+(the store keeps what it already validated — the source going away is not
+grounds for unlearning it), and the map itself carries a label for as long
+as anything invented is being drawn.
+
+### The thread channel, wired
+
+`createThreadChannel({ node, network, engine, host })` in
+[`thread_session.js`](../src/pulsemesh/thread_session.js) is the other
+half: publishers, follows, and the three things between the sealing code
+and a transport that every host would otherwise have written itself —
+derive the topic from the rotating tag, follow the 5-minute rotation, and
+route arriving payloads to the right subscriber. It rides the same
+MeshNode: the traffic channel parses an incoming topic, finds §5.2's
+reserved `t` namespace, and hands it over through `onOtherTopic`.
+
+What it adds beyond delivery:
+
+- **Catch-up (§5.5, §8 path 2), which is not an optimisation.** A phone
+  that slept for four minutes has a hole in a thread, and the only
+  alternative to filling it from other peers is a mailbox host — the
+  exact server this design exists to avoid. Every follower caches the
+  sealed bytes it sees and answers PMR1 on
+  `/rangefind/pulsemesh/1/thread` for the tags it holds, so
+  **availability scales with audience size**. A relay cannot open what it
+  caches and does not need to be trusted: records travel verbatim, so
+  tampering fails the AEAD, forgery fails the signature and replay fails
+  `seq` — at the joiner, which validates everything itself. Requests are
+  padded to 4/8/16 tags with CSPRNG decoys, which is free here because a
+  tag is indistinguishable from random; a responder answers unknown tags
+  with count 0 so a prober cannot learn which threads it follows.
+- **Discovery (§4.2)**, when the host has a DHT: publishers *and*
+  followers advertise the rendezvous key, so a bigger audience makes a
+  thread easier to join rather than more expensive.
+- **A fleet seed (threads §20.10), for when there is nothing to dial.**
+  Discovery finds a *thread*; it does not find the *mesh*. A capability
+  is a key, not a location (§5.4), so a cold device holding a perfect
+  follow link and no `bootstrapPeers` connects to nothing. At fleet scale
+  the answer is not a DHT — ten drivers who can all dial one machine have
+  a working mesh — it is one keeper the operator runs:
+  `pulsemesh_keeper.mjs --seed-card` prints its dialable multiaddrs, a
+  `wayfind://seed#…` card (PMH1) and a scannable QR of it on **stderr**,
+  leaving the stdout JSON-lines contract intact. The address then travels
+  two ways and deliberately not a third: signed **inside the sealed
+  ticket**, so it reaches the awarded device and no channel it crossed;
+  optionally as a `?b=…` **query** hint on a public link, never the
+  fragment, which stays byte-identical; and **never in a job offer**,
+  which is broadcast to strangers and would publish a small operator's
+  own machine to everyone who reads an ad. After first contact
+  `network.knownPeers()` reports what the host is actually connected to
+  and `createPulseMeshHost({ rememberedPeers })` dials it back, so the
+  seed is a single point of failure for *joining* and for nothing else.
+  The library reports and accepts; persisting is the host's business.
+- **§10 rule 4 surfaced, not buried.** `handleFix` returns
+  `contributeTraffic`, and a host that ignores it lets a dwelling vehicle
+  publish a standstill onto a road that is flowing.
+
+Both hosts carry the whole feature: mode choice (§11 is a harm decision,
+so it is asked — coarse withholds position entirely), start and stop,
+a followed-drive card whose sentence comes from the subscriber's own
+`status()`, and an arrival computed locally from the broadcast position
+under this device's live metric. Android also takes the link as a deep
+link, so being sent one opens the app already following.
+
+One trap worth naming: §12's claim is (live position?) × (live traffic?),
+and the subscriber only knows the first half. Pass `hasTraffic` or the
+card will say "static-metric ETA" directly above a live-traffic one —
+the self-contradiction §12 exists to prevent.
+
+## A fleet's island, and joining it to the rest (§12.1)
+
+A seed card gives a fleet a mesh of its own. On its own that is an
+**island**: the drivers see each other, and nothing they learn reaches
+anybody else, nor anybody else's them. Two flags decide whether it stays
+one, and they are independent axes:
+
+```
+node scripts/pulsemesh_keeper.mjs --graph=<dir> --epoch=<64 hex> \
+     --listen=/ip4/0.0.0.0/tcp/4001 --zones=144/180 --seed-card \
+     --admit=connected --bridge=both --bootstrap=/ip4/…/p2p/12D3Koo…
+```
+
+- `--admit` — whether this seed vouches for **its own devices**.
+- `--bridge=off|in|both` — what crosses between them and the rest.
+
+Which address means what stops being obvious once there are two sides, so
+the keeper says it in `--help` and again here: **`--listen` is my
+island** — the address a driver's phone dials, and the one `--seed-card`
+prints — while **`--bootstrap` is the wider network**, dialled by a
+second, listen-less host inside the same process. A fleet seed never
+dials a driver; drivers arrive, carrying an address a sealed ticket
+brought them.
+
+### Why drivers do not mint bonds, and what admits them instead
+
+A §5.4 bond is a 256 MiB memory-hard solve. It is affordable because it
+is once per peer per day, and the cheap phone-sized variant was
+implemented, measured and **refuted** as a Sybil defence (benchmarks
+§14) — so "every courier phone mints one" was never on the table. The
+codebase already had the answer for exactly this shape: §16.3's LoRa
+bridge admits radio senders who minted nothing, because a *different*
+admission applies to them and the security boundary is the bridge.
+
+**Here, being directly connected to the seed is the admission.** Reaching
+a fleet seed requires its address; that address travels only inside
+sealed tickets, to devices the dispatcher awarded a job to. So the set of
+peers able to dial the seed already *is* the fleet — enforced by the
+seal, not by a roster the keeper would have to hold and keep current.
+Fleets that want the stricter thing can pass `--admit=<peerId>,…`.
+
+What this deliberately does **not** build is a binding between a driver's
+device card and their libp2p peerId. It would be easy, and it would hand
+the operator the one thing the contributor pipeline spends §10.2
+preventing: the ability to join anonymous traffic records to a named
+driver. The seal already establishes who may connect. A roster would add
+de-anonymisation and nothing else.
+
+### The fleet stakes its own bond on its drivers
+
+An outward record is republished **as the seed's own**. Remote peers
+therefore penalize the seed for what its drivers say, and at the trust
+floor they forfeit it — at which point the whole fleet loses reach, not
+one phone. That is the intended arrangement, not a wart: policing lands
+on the party that can actually do it, the operator who knows which van is
+which, instead of on strangers who can only see a peer id.
+
+Inward, the seed validates every arrival against its own map before it
+enters its store, and only what entered the store is eligible to cross —
+so acceptance *is* the gate, and no second validation pass exists to
+disagree with the first. A driver who publishes what the map refuses gets
+the ordinary §8.4 treatment: two provable rule 10–12 failures floor its
+trust, which revokes the admission, refuses re-admission for the bucket,
+and gossips PMX1 testimony. Unlike the radio bridge, no bespoke strike
+counter is needed — on IP the delivering peer is an authenticated peerId,
+so the machinery that already existed applies.
+
+### `in` is read-only upstream and bonded downward
+
+§11.6 read-only means no bond and no gossip topics, which is the right
+posture for a fleet that wants the world's traffic without publishing its
+own. But a seed still has to serve its island, and read-only is a
+whole-node property. The two-host split resolves it exactly: the upstream
+node is read-only (mints nothing, joins no upstream topic, pulls
+PMG1→PMQ1→PMS1 on tick), while the island node stays an ordinary bonded
+peer that publishes and vouches downward. "Read-only" ends up naming a
+*direction*, because a direction is what each node is.
+
+The same split is what makes the bridge honest rather than incidental.
+GossipSub forwards a message to its mesh peers **on receipt**, before the
+application handler runs — so a node that validates on delivery relays
+records it never checked, and rule 5 on the far side is satisfied by
+bytes nobody looked at. That was true of every keeper from the beginning;
+fleet seeds only turned it into an incentive problem. It is now closed
+where it belongs, in the transport: every topic this library subscribes
+to carries a GossipSub **topic validator**, so the §6 pipeline runs
+before the forward decision and relaying implies validating everywhere
+(§5.1).
+
+The two-host split stays anyway. It makes "validate, then vouch" a
+property of the transport rather than of one process staying correct, and
+it is what lets `in` and `both` be *directions* at all. The keeper still
+refuses the one-host laundering shape (`--admit` with `--bootstrap` and
+no `--bridge`) — as defence in depth now, not as the only defence — and
+says so.
+
+### Pin the zones
+
+`--zones` is not optional advice for a bridged seed. Bridging is confined
+to the pinned zones in both directions, so a depot pins the territory its
+drivers actually work; an unzoned bridge on a planet-scale mesh pulls the
+planet through the depot's uplink and contributes a continent's worth of
+nothing back.
+
+### The honest costs
+
+- **A bridged seed makes the fleet's territory weakly visible.** Whoever
+  peers with it can see which zones it publishes into and roughly how
+  much. It reveals no **driver**, no **vehicle** and no **job**: a
+  traffic record carries no identity (`reportId` is fresh random per
+  record) and thread contents are sealed to keys the mesh does not hold.
+  "This operator works the south shore" is inferable; "this van was at
+  this address" is not.
+- **The seed is a single point of failure for *joining*, not for an
+  established connection.** A mesh that has formed keeps working when the
+  seed goes down — gossip, catch-up and the ETA are peer-to-peer, and
+  `rememberedPeers` means a device that has connected once need not come
+  back through it. What breaks is a *cold* device on a day the seed is
+  down.
+- **Admission is only as good as the seal.** A leaked ticket is a device
+  that can contribute under the fleet's bond until it is caught by rule
+  10–12 or removed from an allowlist. That is the same exposure the
+  ticket already carried (it can publish as that vehicle, §20.5); the
+  bridge does not widen it, and the allowlist narrows it for fleets that
+  want the trade.
+
 ## Second channel: threads
 
 The traffic channel answers *"how fast is this road"* from many
@@ -419,6 +718,19 @@ decrypt and verify the thread. Nothing else is in the link: no host, no
 mailbox, no bootstrap address. Late joiners catch up from other
 subscribers' caches, so availability scales with audience size instead
 of costing a server.
+
+**A recurring route splits identity from authority.** A school bus keeps
+one plan for a term and changes driver some days, so the run that
+*publishes* it cannot be the thing that *identifies* it — rotating the
+key for a new driver would rotate every parent's link. So the root key
+stays the identity (topic tag, content key, the 45 bytes), and a
+short-lived day key derived from it and certified by it carries the
+publish authority. The driver's phone holds one day of authority and
+never the root; the certificate rides the run's own topic, so host-free
+catch-up delivers it to a late joiner for free; and a subscriber refuses
+any certificate valid for more than 48 hours, so "short-lived" is a
+property the verifier enforces rather than one the depot promises.
+Details in [threads §21](pulsemesh-threads.md).
 
 **How the two touch.** Threads never feed traffic aggregates — a signed
 single-source record entering a corroborated aggregate would turn a
@@ -503,8 +815,10 @@ the record set and reports recovered-route fraction per gate.
    rules. The local-ETA thesis is a test rather than a claim — a
    subscriber's arrival estimate moves when a jam is injected into the
    traffic channel, on the real OSM graph, with the subscriber sending
-   nothing. Its pilot (T5) is a coarse-mode school run and remains
-   open.
+   nothing. Recurring routes (threads §21) are implemented too: a
+   term-long link that survives a daily change of driver, verified
+   through a root-signed day certificate carried on the run's own topic.
+   Its pilot (T5) is a coarse-mode school run and remains open.
 
 ## Acceptance criteria (inherited, still binding)
 

@@ -27,7 +27,10 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   heading, a pitched follow camera with speed-banded zoom, maneuver banner,
   traveled-route dimming, current-road pill, speed readout against the posted
   speed limit (the readout turns when you are over it), spoken guidance,
-  and automatic rerouting when you leave the line. Alternates you could still
+  and automatic rerouting when you leave the line. Panning the map to look up
+  the road is honoured rather than fought, and raises a recenter control that
+  puts the camera back on the car — the follow is dropped by a deliberate pan,
+  and before this there was no way back short of ending the trip. Alternates you could still
   take stay on the map with their ETA delta, and one tap re-tracks onto the
   other line from where the car already is — they disappear once you commit to
   a branch, because by then they are no longer an option.
@@ -39,6 +42,13 @@ primitive for a road, and *wayfinding* is the discipline of navigating space.
   turn-by-turn on the head unit, with a map drawn by the app itself.
 - **Offline regions**: preload a route index onto the device, refresh it, or
   delete it, and route from it with no network at all.
+- **Live traffic (PulseMesh)**: anonymous peer-to-peer speed observations
+  colour the roads, move the ETA, and can re-route around a jam — with no
+  traffic server anywhere in the path. Reporting a crash or a closure is one
+  tap, incidents other drivers reported can be confirmed or refuted while
+  passing them, and a drive can be shared as a single 45-byte capability link
+  that no server ever sees. Reading traffic and publishing your own speeds are
+  separate decisions, and publishing is off until you turn it on.
 
 ## Offline regions
 
@@ -120,9 +130,10 @@ embedded V8/Hermes host (zero-copy `ArrayBuffer`, native zlib) or a
 | --- | --- |
 | `engine/RangefindEngine.kt` | Interface and domain models — the app's whole dependency on Rangefind |
 | `engine/WebViewRangefindEngine.kt` | Headless WebView host, request-id bridge with cancellation |
-| `assets/rangefind/bridge.js` | JS side of the bridge: search, suggest, route, snap, reverse |
+| `assets/rangefind/bridge.js` | JS side of the bridge: search, suggest, route, snap, reverse, live traffic |
 | `ui/MapsViewModel.kt` | State machine: search, directions, navigation, rerouting |
 | `ui/map/MapCanvas.kt` | MapLibre sources/layers, camera behavior, hit testing |
+| `ui/components/TrafficUi.kt` | Live-traffic settings, the incident report sheet, the confirm/refute prompt |
 | `ui/map/MapIcons.kt` | Procedurally drawn pins and road-sign symbols |
 | `nav/RouteTracker.kt` | Along-route distances, nearest-point matching, line splitting |
 | `nav/Geo.kt` | Haversine, bearings, point-to-segment projection |
@@ -161,6 +172,154 @@ search keeps working and the Directions button explains why it is disabled.
 For release builds, set `ROUTE_BASE_URL` to an https base that serves the route
 graph with `Accept-Ranges` and permissive CORS (a `Range` header is not
 CORS-safelisted, so the origin must answer the preflight).
+
+### Live traffic
+
+Live traffic is off until you turn it on, in the offline-regions sheet. What
+happens then depends on `BuildConfig.PULSEMESH_BOOTSTRAP`:
+
+- **Empty (the default)** — no keeper is deployed yet, so the app runs the
+  mesh over a loopback transport with three simulated vehicles crawling the
+  corridor you routed. Every byte still goes through the codec, the twelve
+  validation rules against this device's own copy of the index, and the
+  weighted-median aggregate the router consumes; only the drivers are
+  invented, and both the sheet and the map say so on screen — the map
+  carries a **Demo traffic** label for as long as anything invented is being
+  drawn, mid-drive included. The vehicles are a switch of their own
+  (*Simulated traffic*, in the traffic tab) and turning them off leaves live
+  traffic running: the mesh keeps whatever it already validated and the map
+  then shows only real Wayfind drivers nearby, which may be nothing at all.
+  The choice is remembered, so it is not re-imposed on the next launch.
+- **A keeper multiaddr** (`/dns4/keeper.example/tcp/443/wss/p2p/12D3Koo…`) —
+  the app joins the real mesh over WebSockets. `pulsemesh-libp2p.browser.js`
+  is in the assets and loads on demand, so a build with no keeper configured
+  never executes it.
+
+Run a keeper with `npm run pulsemesh:keeper`. Contribution over a real
+transport needs a §5.4 admission bond, which is a memory-hard mint; that path
+is implemented but **unexercised on real phone hardware**.
+
+### Sharing a drive
+
+A shared drive is a **thread**: one vehicle, a bounded audience, and a
+capability that is 45 bytes in a URL fragment. Nothing else is in the link —
+no host, no mailbox, no bootstrap address — and because it lives in the
+fragment, no server receives it on either path: browsers never transmit a
+fragment, and Android hands it to the app intact.
+
+Sharing asks what the link should be worth if it leaks, because that is a
+harm decision rather than a bandwidth one:
+
+- **Live position** — a locator. Right for a courier, whose position is the
+  point.
+- **Stops only** — no position at all, so a leaked link is worth roughly what
+  a printed timetable is. Right for anything carrying children.
+
+The link is sent through the ordinary share sheet, from two places: the
+traffic tab, which starts and stops a plain single-destination drive, and the
+delivery-progress card, which is where a driver mid-day actually is. The card
+shares the run already publishing — a run taken from a dispatcher's ticket
+included — and when the app holds a plan but no run, which is what a process
+death leaves behind, it publishes the stored plan again first and says on the
+card that the new link supersedes the old one.
+
+A dispatch run publishes **the whole plan**, in plan order and with its plan
+positions intact, not the stops still to come: the wire keys its outcome map
+by position in the published list, so renumbering it would attribute a
+delivery to the wrong doorstep with nothing on either side to reveal it.
+
+Ending a run publishes one final record, and **which** record it is is not a
+button's choice. `COMPLETED` is a claim — every customer holding the link and
+the dispatcher watching are told the run arrived — so it is emitted only when
+every stop in the plan has an outcome the driver asserted. A day stopped with
+stops still unmarked closes as `CANCELED` whichever control ended it
+(`finalRecordFor` in `engine/RangefindEngine.kt` is the single place that
+decides, and is unit-tested). *Can't finish this job*, in the progress card's
+overflow menu, is the deliberate path: it confirms who hears the cancellation
+and takes the driver's reason as the record's ≤64-byte note.
+
+Handing the job to another van is in the same menu, gated on holding a ticket
+rather than on a live run — the ticket is on disk, so a process death that took
+the run with it leaves the capability intact. Since threads §20.9 it is gated
+on one more thing, and that is the headline: **the job is sealed to a device
+you have already enrolled**, so the menu asks *which* device before it draws
+anything. With an empty roster there is no key to address the ciphertext to,
+and the app says exactly that — the other driver has to show their device card
+in Wayfind and this phone has to open it — instead of drawing a QR nobody in
+the world could open.
+
+What the QR and the `.wayfindjob` file carry is the **sealed PME1 envelope**.
+A photograph of either by anyone else is ciphertext, which is why the dialog no
+longer warns that whoever photographs it can publish the vehicle: it names the
+one device that can open it, and says that when they do, they become the
+publisher.
+
+The dialog then offers the one exit in the app that publishes **nothing**:
+after §20.5 both phones hold the same seed and the wire cannot tell them apart,
+so a goodbye from the old device would tell every customer the run had ended
+while the new driver is still delivering. That action is reachable from nowhere
+else; an ordinary stop always says goodbye.
+
+### Device identity and enrolment
+
+Every install mints one X25519 **device key** on first run (§20.9). It is not
+the run seed, which travels with a ticket, and not an issuer seed, which signs:
+it never signs anything, and its only job is to be the address a ticket can be
+sealed to. It lives in `SharedPreferences` as AES-256-GCM ciphertext under a
+key generated inside `AndroidKeyStore`, so a backup or a read of the
+preferences file is ciphertext with no key beside it. A phone whose Keystore
+refuses stores the key in the clear and says so on the settings card rather
+than pretending otherwise.
+
+**Losing the key is unrecoverable, by construction.** Reinstalling the app or
+clearing its data destroys it, and every job already sealed to that device
+stops opening; the dispatcher has to enrol the phone again. The settings card
+states this where the key is.
+
+*Settings → Traffic → This device* holds the card: an editable name (≤ 32
+bytes, what the other driver reads), the fingerprint in a size two people can
+read to each other across a counter, the card as a QR, and the same card as a
+shareable `wayfind://device#…` link. Below it is the roster — the devices this
+phone can hand a job to — with a remove action.
+
+There is no scanner in this app, by the same design as the ticket path: the
+other phone's **system camera** fires `ACTION_VIEW` on the card URL it decodes,
+and the `wayfind://device` filter is what catches it. Wayfind then opens a
+confirmation showing the name and the fingerprint, and says plainly that the
+fingerprint is there to be checked against what the other phone is showing —
+four bytes is not a cryptographic binding and §20.9 does not claim it is; it is
+eight characters two people compare in three seconds, which is the check that
+actually happens in a doorway.
+
+```bash
+adb shell 'am start -a android.intent.action.VIEW -d "wayfind://device\#<card>"'
+```
+
+Receiving one opens the app already following: live traffic comes up on its
+own (threads need no admission bond and work read-only), and the card states
+only what the subscriber can support — a stale position is never presented as
+a live one. The arrival is computed **on the receiving device**, routing the
+position they broadcast to the destination *you* care about under *your*
+live-traffic metric, so the publisher never learns which destination anyone
+asked about.
+
+Two intent filters carry the link:
+
+```bash
+# Works today, no domain verification needed.
+adb shell 'am start -a android.intent.action.VIEW -d "wayfind://thread\#<capability>"'
+```
+
+The `https://rangefind.dev/t#…` filter is declared with `autoVerify`, so it
+opens the app **only once `/.well-known/assetlinks.json` is published for the
+signing certificate** — until then Android routes it to the browser, which is
+the correct fallback (the web demo follows the same link). Enable it on one
+device for testing with `adb shell pm set-app-links --package
+dev.rangefind.wayfind 1 rangefind.dev`.
+
+The mesh's clock lives in Kotlin, not in the page: a headless WebView is a
+hidden page and Chromium clamps a hidden page's timers, so `MapsViewModel`
+calls `tickMesh()` on its own cadence and the JS side schedules nothing.
 
 ## Cars
 

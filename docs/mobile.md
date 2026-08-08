@@ -153,3 +153,57 @@ embed a JS engine (JavaScriptCore is built into iOS) and run
 Incremental publishing (`build --update`) composes with downloaded indexes:
 unchanged packs keep their content-addressed names, so an updated index
 re-downloads only what changed if you sync file-by-file.
+
+## Live traffic on a phone (`rangefind/pulsemesh/mobile`)
+
+The design's whole platform premise is that browsers read and apps write:
+a backgrounded tab loses `watchPosition` and a screen-off phone stops
+reporting, so the realistic sustained contributor is an app. The mobile
+entry point is that side of it, and it is the same session the web demo
+uses — the difference is the defaults, not the pipeline.
+
+```js
+import { createMobileMesh } from "rangefind/pulsemesh/mobile";
+
+const mesh = await createMobileMesh({
+  engine,                       // an open route graph
+  network,                      // a MeshNetwork, or null to run consume-only
+  batteryLevel: () => level,    // §10.1 rule 5: contribution pauses below 20%
+  charging: () => plugged       // unless charging
+});
+
+await engine.route({ from, to, live: mesh.provider() });
+await mesh.followRoute(candidates);
+await mesh.onLocation({ lat, lon, speedMps, courseDeg });   // publishes nothing
+mesh.setContributing(true);                                  // until asked
+```
+
+Three things a host has to get right, all learned the hard way in
+`android/`:
+
+- **Drive the clock yourself.** `mesh.start()` schedules its own
+  maintenance, which is right in a page and wrong in an app host. A
+  headless WebView is a hidden page and Chromium clamps a hidden page's
+  timers: a mesh that scheduled its own anti-entropy ticked once and
+  never again. Call `mesh.tick()` on the host's cadence instead.
+- **Offer every fix, even when not contributing.** `onLocation` publishes
+  nothing unless contribution is on, but it keeps the snapped position
+  fresh — and §10.4 only files an incident report for a *recently
+  snapped* position. Skipping the call when contribution is off silently
+  turns "I don't share my speed" into "I can't report a crash".
+- **Say which mesh you are on.** With no keeper reachable, a host can run
+  the corridor simulator (`createCorridorTraffic`) so the feature is
+  testable before peers exist. Everything about those records is real
+  except the drivers, and a screen that does not say so is claiming
+  something it cannot support. Make it refusable, separately from live
+  traffic, and say so **on the map** rather than only in a settings sheet:
+  the label is read at the moment a jam is being believed. Stopping the
+  simulator withdraws the source and nothing else — records already
+  validated stay, and age out on TTL like any others.
+
+`rangefind/pulsemesh/threads` adds the second channel — one vehicle, a
+bounded audience, a 45-byte capability in a URL fragment. It needs no
+admission bond and works in read-only mode, because thread records are
+authenticated end to end by the thread key rather than by membership.
+See [pulsemesh.md](pulsemesh.md) and
+[pulsemesh-threads.md](pulsemesh-threads.md).

@@ -64,6 +64,7 @@ import androidx.compose.material.icons.filled.DirectionsWalk
 import dev.rangefind.wayfind.engine.LaneTurn
 import androidx.compose.material.icons.filled.CallSplit
 import androidx.compose.material.icons.filled.MergeType
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.DirectionsBoat
 import dev.rangefind.wayfind.nav.ItineraryLine
@@ -97,7 +98,13 @@ fun DirectionsSheet(
 ) {
     val context = LocalContext.current
     val travelModeLabel = stringResource(R.string.mode_switch)
-    SheetSurface(bottomInset = bottomInset) {
+    // Same fault as the settings sheet: this grew with the route and the end of
+    // it — the steps, the fetch receipt — went off the bottom of the screen. The
+    // whole sheet is bounded now and the itinerary takes whatever is left over,
+    // so dragging the handle up is what buys more steps rather than a fixed
+    // 132 dp window over them.
+    SheetSurface(bottomInset = bottomInset, resizable = true) {
+      Column(Modifier.heightIn(max = LocalSheetContentMaxHeight.current)) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
@@ -236,6 +243,26 @@ fun DirectionsSheet(
                         )
                     }
 
+                    // What live traffic did to that number. Stated rather
+                    // than folded in silently: a driver who can see a red
+                    // stretch on the map is owed the connection between it
+                    // and the ETA that just moved.
+                    if (route.hasLive) {
+                        val delayMinutes = (route.liveDelaySeconds / 60).toInt()
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            if (delayMinutes >= 1) {
+                                stringResource(R.string.mesh_live_route, delayMinutes)
+                            } else {
+                                stringResource(R.string.mesh_live_route_clear)
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (delayMinutes >= 1) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 20.dp)
+                        )
+                    }
+
                     if (state.allRoutes.size > 1) {
                         Spacer(Modifier.height(12.dp))
                         Row(
@@ -276,7 +303,10 @@ fun DirectionsSheet(
                     }
 
                     Spacer(Modifier.height(12.dp))
-                    StepsPreview(route)
+                    // Takes the room left after everything above it has had
+                    // what it needs, and no more: fill = false so a two-step
+                    // route stays a short sheet instead of a tall empty one.
+                    StepsPreview(route, Modifier.weight(1f, fill = false))
 
                     Spacer(Modifier.height(10.dp))
                     Text(
@@ -293,14 +323,17 @@ fun DirectionsSheet(
                 }
             }
         }
+      }
     }
 }
 
 @Composable
-private fun StepsPreview(route: Route) {
+private fun StepsPreview(route: Route, modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    LazyColumn(Modifier.heightIn(max = 132.dp)) {
-        itemsIndexed(itineraryOf(route) { i -> turnDeltaAtStep(route, i) }.take(12)) { _, line ->
+    // Every step, not the first twelve: the list is lazy, and a route with
+    // thirty turns is exactly the one whose thirtieth turn you wanted to read.
+    LazyColumn(modifier) {
+        itemsIndexed(itineraryOf(route) { i -> turnDeltaAtStep(route, i) }) { _, line ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -395,6 +428,7 @@ fun NavigationOverlay(
     bottomInset: Dp,
     onSelectRoute: (Int) -> Unit,
     onMarkIssue: () -> Unit,
+    onRecenter: () -> Unit,
     onStop: () -> Unit
 ) {
     val context = LocalContext.current
@@ -600,6 +634,42 @@ fun NavigationOverlay(
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)
                         )
                     }
+                }
+            }
+        }
+
+        // Back to the car, after a pan took the camera off it.
+        //
+        // This lives inside the overlay rather than beside it: drawn from the
+        // screen behind, it landed under the overlay's own bottom panel, which
+        // is exactly where it was reported missing. It sits above the flag
+        // button when there is one, on the side the hand already rests.
+        if (state.cameraDetached) {
+            val stacked = if (state.recordTrips) 76.dp else 0.dp
+            Surface(
+                onClick = onRecenter,
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shadowElevation = 8.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(
+                        end = 16.dp,
+                        bottom = bottomInset + 122.dp + stacked +
+                            if (offers.isNotEmpty()) 58.dp else 0.dp
+                    )
+                    .size(64.dp)
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Icon(
+                        Icons.Filled.MyLocation,
+                        contentDescription = stringResource(R.string.action_resume_follow),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
                 }
             }
         }

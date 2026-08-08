@@ -241,6 +241,14 @@
                 <button id="clearStopsButton" class="clear-button" type="button">Clear</button>
               </span>
             </div>
+            <div id="tripEndRow" class="departure-row" hidden>
+              <span class="departure-row__label">Finish</span>
+              <div class="departure-options" role="radiogroup" aria-label="Where the trip ends">
+                <button type="button" data-trip-end="last" class="active" aria-pressed="true">End at last stop</button>
+                <button type="button" data-trip-end="open" aria-pressed="false">End anywhere</button>
+                <button type="button" data-trip-end="loop" aria-pressed="false">Return to start</button>
+              </div>
+            </div>
             <div id="departureRow" class="departure-row" hidden>
               <span class="departure-row__label">Depart</span>
               <div class="departure-options" role="radiogroup" aria-label="Departure time">
@@ -287,6 +295,7 @@
               <span id="routeBucket" class="route-card__bucket"></span>
             </p>
           </header>
+          <p id="routeLiveNote" class="route-live-note" hidden></p>
           <p id="routeOrder" class="route-card__order" hidden></p>
           <div id="routeNavActions" class="route-nav-actions" hidden>
             <button id="navDemoButton" class="route-nav-actions__primary" type="button">
@@ -310,6 +319,190 @@
             <summary><span>Turn-by-turn</span><span class="query-receipt__chevron" aria-hidden="true">⌄</span></summary>
             <ol id="routeSteps" class="route-steps"></ol>
           </details>
+        </section>
+
+        <section id="meshCard" class="mesh-card" aria-label="Live traffic" hidden>
+          <header class="mesh-card__header">
+            <div>
+              <p class="mesh-card__eyebrow">PulseMesh</p>
+              <h3>Live traffic, no traffic server</h3>
+            </div>
+            <span id="meshModePill" class="mesh-pill" data-mode="off">Off</span>
+          </header>
+          <p class="mesh-card__lede">
+            Peers gossip 42-byte anonymous observations. Every subscriber recomputes the same
+            weighted-median aggregate, and the router consumes it through the ordinary live-traffic
+            contract — so with no peers, no data, or no mesh at all, the route still works.
+          </p>
+          <button id="meshToggle" class="mesh-toggle" type="button">Turn on live traffic</button>
+
+          <div id="meshBody" class="mesh-body" hidden>
+            <div id="meshStats" class="mesh-stats" aria-label="Mesh state"></div>
+            <p id="meshNote" class="mesh-note"></p>
+
+            <label class="mesh-check">
+              <input id="meshContribute" type="checkbox">
+              <span>
+                <b>Contribute my speeds</b>
+                <small>Anonymous, no identity on any record, and the reticent profile suppresses
+                  most of them. Off by default — publishing where you drive is a decision.</small>
+              </span>
+            </label>
+            <button id="meshSimulate" class="mesh-secondary" type="button" hidden>Pause simulated traffic</button>
+
+            <div class="mesh-section">
+              <p class="mesh-section__label">Report what you can see</p>
+              <div id="meshReportRow" class="mesh-report-row"></div>
+              <p class="mesh-hint">A report is public and carries the spot you are at. It becomes a
+                fact on the map only when other peers corroborate it.</p>
+            </div>
+
+            <ul id="meshIncidentList" class="mesh-incidents" aria-label="Live incidents" hidden></ul>
+
+            <div class="mesh-section">
+              <p class="mesh-section__label">Share this drive</p>
+              <div class="mesh-modes" role="radiogroup" aria-label="What the link reveals">
+                <button id="meshModeFine" type="button" role="radio" aria-checked="true" class="active">
+                  <b>Live position</b>
+                  <small>A locator. Right for a courier, whose position is the product.</small>
+                </button>
+                <button id="meshModeCoarse" type="button" role="radio" aria-checked="false">
+                  <b>Stops only</b>
+                  <small>No position at all — a leaked link is worth what a timetable is.
+                    Right for anything carrying children.</small>
+                </button>
+              </div>
+              <button id="meshShareButton" class="mesh-secondary" type="button">Create a tracking link</button>
+              <div id="meshShareOut" class="mesh-share" hidden></div>
+              <!-- What happened at a stop is the one thing the vehicle's
+                   movement cannot establish, so it is a button rather than
+                   an inference. -->
+              <div id="meshDriveRow" class="mesh-drive" hidden></div>
+              <p class="mesh-hint">The whole capability is 45 bytes in the URL fragment, which
+                browsers never transmit — no server, here or anywhere, sees a tracking key.</p>
+            </div>
+
+            <!-- §20.9. A job is ciphertext addressed to a device, so this
+                 browser needs a device identity of its own — the thing a
+                 dispatcher enrols, and equally the thing this tab shows when
+                 it wants to be handed a job. -->
+            <div class="mesh-section">
+              <p class="mesh-section__label">This device</p>
+              <p class="mesh-hint">A job is encrypted to the device it is for, so a device must be
+                enrolled before it can be sent one. This is this browser's card: show it to a
+                dispatcher to be given jobs.</p>
+              <label class="mesh-link">
+                <small>Device name — what a dispatcher sees in their list (32 bytes)</small>
+                <input id="meshDeviceName" type="text" maxlength="32" spellcheck="false"
+                  placeholder="e.g. Léa — Pixel 8">
+              </label>
+              <div id="meshDeviceOut" class="mesh-job"></div>
+            </div>
+
+            <div class="mesh-section">
+              <p class="mesh-section__label">Enrolled devices</p>
+              <p class="mesh-hint">Read the fingerprint aloud and check it matches the one on the
+                other phone — a card is bytes on a screen, and a screen in a depot can be showing
+                anybody's.</p>
+              <div class="mesh-follow">
+                <input id="meshEnrolInput" type="text" placeholder="Paste a device card (wayfind://device#…)" spellcheck="false">
+                <button id="meshEnrolButton" type="button">Enrol</button>
+              </div>
+              <!-- Both roles are played by one browser here. Rather than
+                   inventing a driver device behind the user's back, this
+                   fills the field above with this browser's own card and
+                   makes them enrol it — the same mechanism, visible. -->
+              <button id="meshEnrolSelfButton" class="mesh-secondary" type="button">Use this device's card</button>
+              <ul id="meshDeviceList" class="mesh-devices" aria-label="Enrolled devices"></ul>
+            </div>
+
+            <!-- §20.10. A capability says what a run is; it says nothing
+                 about how to reach the mesh it lives on. A fleet does not
+                 need a DHT for this — ten drivers who can all dial one
+                 machine have a working mesh — it needs one peer, and this
+                 is where its address goes. -->
+            <div class="mesh-section">
+              <p class="mesh-section__label">This fleet's seed</p>
+              <p class="mesh-hint">A follow link and a job are keys, not addresses: a phone that has
+                never met the mesh has nothing to dial. Run <code>pulsemesh_keeper.mjs --seed-card</code>
+                and scan or paste the <code>wayfind://seed#…</code> it prints. The address then travels
+                <b>inside the sealed job</b>, so it reaches the driver's device and nobody else — it is
+                deliberately never in an offer, which is broadcast to strangers.</p>
+              <div class="mesh-follow">
+                <input id="meshSeedInput" type="text" spellcheck="false"
+                  placeholder="wayfind://seed#… or /ip4/203.0.113.7/tcp/4001/p2p/12D3Koo…">
+                <button id="meshSeedButton" type="button">Use this seed</button>
+              </div>
+              <div id="meshSeedOut" class="mesh-job"></div>
+            </div>
+
+            <div class="mesh-section">
+              <p class="mesh-section__label">Dispatch a job</p>
+              <p class="mesh-hint">A ticket carries the run's own key, so the customer's link can be
+                printed on the order confirmation before a courier has been found — and if the bike
+                breaks, the same ticket goes to the next enrolled device and that link keeps working.
+                The mode chosen above travels in the ticket: whoever decides who gets the link
+                decides what the link is worth. The ticket itself is never in the clear — it is
+                sealed to the driver's device and to this one, so this dispatcher can still open it.</p>
+              <!-- Enrolment is the gate: there is no "seal to whoever holds
+                   this", so the recipient is chosen before the job exists. -->
+              <div id="meshRecipientRow" class="mesh-chips" role="radiogroup" aria-label="Which device this job is sealed to"></div>
+              <!-- How the round is made is part of the plan, not the driver
+                   app's guess: the follower routes from the broadcast
+                   position, and a car graph applied to a bike badly
+                   overstates the arrival. -->
+              <div id="meshTravelRow" class="mesh-chips" role="radiogroup" aria-label="How this job is made">
+                <button id="meshTravelCar" type="button" role="radio" aria-checked="true" class="active">By car</button>
+                <button id="meshTravelBike" type="button" role="radio" aria-checked="false">By bike</button>
+                <button id="meshTravelFoot" type="button" role="radio" aria-checked="false">On foot</button>
+              </div>
+              <!-- What the driver reads at the door. It rides inside the
+                   plan, which never leaves the ticket: the wire carries an
+                   8-byte hash of the plan and nothing else, so no follower
+                   can see any of this (§20.8). -->
+              <div id="meshJobStops" class="mesh-job-details" hidden></div>
+              <button id="meshJobButton" class="mesh-secondary" type="button">Create a job ticket</button>
+              <!-- The mirror image of the ticket (§20.4): a ticket goes to
+                   one enrolled device and is always sealed, an offer goes
+                   to couriers nobody has met and is never sealed. It is
+                   safe in public because it holds a hash of the plan and
+                   coarse descriptors, not an address. -->
+              <label class="mesh-link">
+                <small>Offer pay — minor units, e.g. 2450 for $24.50. Optional, and public.</small>
+                <input id="meshOfferPay" type="number" min="0" step="1" placeholder="2450">
+              </label>
+              <label class="mesh-link">
+                <small>Offer currency — 3-letter ISO 4217 code. Refused, never guessed.</small>
+                <input id="meshOfferCurrency" type="text" maxlength="3" spellcheck="false" placeholder="EUR">
+              </label>
+              <label class="mesh-link">
+                <small>Offer label — one public line a bidder reads (48 bytes). Never an address.</small>
+                <input id="meshOfferLabel" type="text" maxlength="48" spellcheck="false"
+                  placeholder="e.g. 12 parcels, city centre">
+              </label>
+              <button id="meshOfferButton" class="mesh-secondary" type="button">Broadcast an offer</button>
+              <p id="meshJobGate" class="mesh-hint" hidden></p>
+              <div id="meshOfferOut" class="mesh-job" hidden></div>
+              <div id="meshJobOut" class="mesh-job" hidden></div>
+              <button id="meshHandoverButton" class="mesh-secondary" type="button" hidden>Hand over this job</button>
+            </div>
+
+            <div class="mesh-section">
+              <p class="mesh-section__label">Follow a drive, or take a job</p>
+              <div class="mesh-follow">
+                <input id="meshFollowInput" type="text" placeholder="Paste a follow link, a job, an offer, or a device card" spellcheck="false">
+                <button id="meshFollowButton" type="button">Follow</button>
+              </div>
+              <!-- A full day's plan is too big for a camera, so the same
+                   signed ticket also travels as a one-line file. Reading it
+                   here is the paste path with the typing done for you. -->
+              <button id="meshFileButton" class="mesh-secondary" type="button">Open a ticket or link file</button>
+              <input id="meshFileInput" type="file" accept=".wayfindjob,text/plain" hidden>
+              <div id="meshAcceptCard" class="mesh-accept" hidden></div>
+              <div id="meshFollowCard" class="mesh-follow-card" hidden></div>
+              <p id="meshFollowOut" class="mesh-hint" hidden></p>
+            </div>
+          </div>
         </section>
         <div id="emptyState" class="empty-state">
           <span class="empty-state__graphic" aria-hidden="true"><i></i><i></i><i></i></span>

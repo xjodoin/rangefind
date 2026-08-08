@@ -171,3 +171,52 @@ fun signpostName(step: RouteStep): String {
     // something to be gained from saying so — "40 · Autoroute Félix-Leclerc".
     return if (step.name.isBlank()) ref else "$ref · ${step.name}"
 }
+
+/**
+ * Below this a step is part of a junction, not a road the drive spends any
+ * time on. Sized off what junctions actually produce — the two that went
+ * unannounced on a recorded drive were 12 m and 14 m — and well under the
+ * 60 m at which the last call before a turn goes out, so nothing a driver
+ * could act on is ever collapsed away.
+ */
+const val JUNCTION_STUB_METERS = 30.0
+
+/**
+ * The first step from [from] long enough to be a leg of the drive.
+ *
+ * OSM splits a junction into whatever ways meet inside it, and each comes back
+ * as its own step: turning left off Boulevard du Domaine onto Boulevard
+ * René-A.-Robert is reported as twelve metres of Rue Saint-Pierre between the
+ * two. Read literally that is "continue onto Rue Saint-Pierre" — a street the
+ * driver is on for one second — and the left turn that is the whole
+ * instruction gets twelve metres of warning, which at 40 km/h is one second of
+ * it. A driver was handed exactly that twice on one drive and reported,
+ * correctly, that they never got the turn.
+ *
+ * So a step this short is treated as part of the junction rather than a road:
+ * the announcement names what lies past it, and the turn is the whole heading
+ * change across it. Roundabouts are short by construction and have their own
+ * handling, so they are never collapsed.
+ */
+fun stepThroughJunction(route: Route, from: Int): Int {
+    var index = from
+    while (index < route.steps.size - 1 &&
+        !route.steps[index].roundabout &&
+        route.steps[index].meters < JUNCTION_STUB_METERS
+    ) index++
+    return index
+}
+
+/**
+ * The heading change across the whole of a collapsed junction, so a left turn
+ * split into "straight" then "left" is announced as the left turn it is.
+ */
+fun turnDeltaThrough(route: Route, from: Int, through: Int, turnDeltaAt: (Int?) -> Double): Double {
+    var delta = 0.0
+    for (index in from..through) delta += turnDeltaAt(route.steps.getOrNull(index)?.at)
+    // Two 60° kinks are a 120° turn, not a −240° one.
+    var normalized = delta
+    while (normalized > 180) normalized -= 360
+    while (normalized <= -180) normalized += 360
+    return normalized
+}

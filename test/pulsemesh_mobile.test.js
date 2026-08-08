@@ -142,9 +142,11 @@ test("a consume-only phone still routes, and gossip reaches it", async t => {
   const driver = await createMobileMesh({
     engine, network, id: "driver", profile: "cadence", contribute: true, constants, transport: "loopback"
   });
-  const zones = reader.followRoute(base);
+  // Following a corridor now warms the static facts for its leaves as
+  // well as subscribing to its zones, so it is asynchronous.
+  const zones = await reader.followRoute(base);
   assert.ok(zones.length > 0, "the reader subscribes to the corridor's zones");
-  driver.followRoute(base);
+  await driver.followRoute(base);
 
   // The driver crawls the corridor. Fixes are real coordinates; snap()
   // turns them into segment ids exactly as on a phone.

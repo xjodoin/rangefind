@@ -2,6 +2,9 @@ package dev.rangefind.wayfind.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -45,10 +48,18 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.pluralStringResource
@@ -446,12 +457,47 @@ fun AttributionChip(info: EngineInfo?, modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * How much room the sheet is giving its content right now.
+ *
+ * A sheet that simply grew with its content ran off the bottom of the screen
+ * and took the end of itself with it — the last rows of a settings section, the
+ * fetch receipt under a route. Content that can be long reads this and caps
+ * itself, so what does not fit scrolls instead of disappearing. The value moves
+ * when the handle is dragged, which is what makes the drag do anything.
+ */
+val LocalSheetContentMaxHeight = compositionLocalOf { 320.dp }
+
+/**
+ * The band a dragged sheet stays inside, as a fraction of the screen.
+ *
+ * The floor is not "as small as it will go": a route sheet keeps its mode
+ * switch, its ETA and its Start button outside the scrolling part, and dragged
+ * below about this the button is what falls off the bottom. The ceiling leaves
+ * a strip of map, because a sheet that covers the route is not showing you the
+ * route.
+ */
+private const val SHEET_MIN_FRACTION = 0.38f
+private const val SHEET_MAX_FRACTION = 0.90f
+
 /** Shared bottom-sheet chrome: rounded top, elevation, drag affordance. */
 @Composable
 fun SheetSurface(
     bottomInset: androidx.compose.ui.unit.Dp,
+    /**
+     * Whether the handle resizes the sheet. Only worth setting on sheets whose
+     * content reads [LocalSheetContentMaxHeight] — anywhere else the drag would
+     * be a gesture that visibly does nothing.
+     */
+    resizable: Boolean = false,
+    initialFraction: Float = 0.52f,
     content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit
 ) {
+    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
+    val density = LocalDensity.current
+    // Survives rotation: a sheet the user pulled up should still be up
+    // afterwards, and landscape is exactly where they had to pull it.
+    var fraction by rememberSaveable { mutableFloatStateOf(initialFraction) }
     Surface(
         shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp),
         color = MaterialTheme.colorScheme.surface,
@@ -463,14 +509,37 @@ fun SheetSurface(
                 .fillMaxWidth()
                 .padding(top = 10.dp, bottom = bottomInset + 16.dp)
         ) {
+            // The pill is four pixels tall and nobody can hit four pixels in a
+            // moving car. The grab area is the full width of the sheet and the
+            // height of a fingertip; the pill just says where it is.
             Box(
-                Modifier
-                    .padding(bottom = 12.dp)
-                    .align(Alignment.CenterHorizontally)
-                    .size(width = 36.dp, height = 4.dp)
-                    .background(MaterialTheme.colorScheme.outlineVariant, CircleShape)
-            )
-            content()
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(26.dp)
+                    .then(
+                        if (!resizable) Modifier else Modifier.draggable(
+                            orientation = Orientation.Vertical,
+                            state = rememberDraggableState { delta ->
+                                // Up is negative and means a taller sheet.
+                                val step = with(density) { delta.toDp() } / screenHeight
+                                fraction = (fraction - step)
+                                    .coerceIn(SHEET_MIN_FRACTION, SHEET_MAX_FRACTION)
+                            }
+                        )
+                    )
+            ) {
+                Box(
+                    Modifier
+                        .size(width = 36.dp, height = 4.dp)
+                        .background(MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                )
+            }
+            CompositionLocalProvider(
+                LocalSheetContentMaxHeight provides screenHeight * fraction
+            ) {
+                content()
+            }
         }
     }
 }

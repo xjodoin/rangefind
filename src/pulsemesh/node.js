@@ -13,7 +13,16 @@
 //   network.subscribe(nodeId, topic) / unsubscribe(nodeId, topic)
 //   network.publish(topic, payload, fromId)          // gossip
 //   network.request(fromId, toId, payload) -> bytes  // sync stream
+//   network.requestThread(fromId, toId, payload) -> bytes  // §5.5 catch-up
+//   network.requestPhoto(fromId, toId, payload) -> bytes   // §20.7 blobs
 //   network.peersOf(nodeId) -> peerId[]
+//
+// A transport that forwards before the application sees a message —
+// GossipSub does — additionally calls `node.judgeGossip(...)` in place of
+// `node.onGossip(...)`, ahead of its forward decision, and acts on the
+// verdict it returns. Transports that hand a message straight to their
+// one local node (loopback, LoRa) keep calling `onGossip`: there is no
+// relay step to gate, and nothing was vouched for on the way in.
 
 import { DEFAULT_CONSTANTS, detailCellKey, timeBucketFromMillis, topicWindowFromMillis } from "./bins.js";
 import {
@@ -29,12 +38,19 @@ import {
   decodePMA1,
   encodePMX1,
   BAN_REASON_INVALID_RECORDS,
+  parseSegment,
   utf8Bytes
 } from "./codec.js";
 import { verifyBond } from "./bond.js";
 import { PulseMeshStore } from "./store.js";
 import { TrustLedger } from "./aggregate.js";
-import { createValidator } from "./validate.js";
+import {
+  GOSSIP_ACCEPT,
+  GOSSIP_IGNORE,
+  GOSSIP_REJECT,
+  createValidator,
+  worseGossipVerdict
+} from "./validate.js";
 import { createForwardHandler } from "./forward.js";
 import { createPulseMeshProvider } from "./provider.js";
 import { scoreIncidentKey } from "./incidents.js";
@@ -353,68 +369,147 @@ export class MeshNode {
 
   // --- Gossip receipt (§6) ----------------------------------------------
 
+  /**
+   * Delivery-time receipt: the loopback network, the LoRa bridge, and any
+   * transport with no validator seam of its own land here. On GossipSub
+   * the message has normally already been judged by `judgeGossip` before
+   * it was forwarded, and the transport consumes that verdict rather than
+   * calling this a second time (rule 7's token bucket and the §8.4 trust
+   * path both mutate state — validating twice would charge one peer twice
+   * for one record and forfeit honest peers).
+   */
   onGossip(topicName, payload, fromPeer, nowMillis = this.clock()) {
     const topic = parseTopic(topicName);
-    if (!topic || topic.reserved) return;
-    if (!this.#acceptsEpochTopic(topic.epochPrefix16hex, nowMillis)) return;
-    if (payload.length > this.constants.MAX_GOSSIP_BYTES) { this.#drop("oversize"); return; }
-    if (!windowAcceptable(topic.window, nowMillis)) { this.#drop("window"); return; }
+    if (!topic || topic.reserved) {
+      // The thread channel's key-derived topics (§5.2's reserved `t`
+      // namespace) ride the same host and the same gossip mesh. They
+      // are end-to-end authenticated by the thread key and mean nothing
+      // to the traffic channel, so they are handed to whoever wired the
+      // other channel up rather than silently dropped — otherwise every
+      // host has to bypass this node to receive its own threads.
+      this.onOtherTopic?.(topicName, payload, fromPeer, nowMillis);
+      return;
+    }
+    this.#ingestGossip(topic, payload, fromPeer, nowMillis);
+  }
+
+  /**
+   * §5.1: the GossipSub topic-validator seam — **relaying implies
+   * validating**. GossipSub forwards a message to its mesh peers on
+   * receipt, so a node that validates only on delivery spends its bond
+   * vouching, at the transport layer, for bytes it never checked; any
+   * peer could then launder invalid records through an honest relay.
+   * Registered as a topic validator, this runs the real §6 pipeline
+   * *before* the forward decision and returns what the transport should
+   * do with the message:
+   *
+   *   GOSSIP_REJECT  a record failed a rule the trust ledger treats as a
+   *                  provable lie (rules 10–12, `verdict.trustPenalty`).
+   *                  Reject scores down the peer that handed us the
+   *                  bytes, so nothing weaker may use it.
+   *   GOSSIP_IGNORE  everything else that must not travel further: a
+   *                  replay, a stale window, a foreign epoch, an
+   *                  out-of-zone record — and, crucially, anything this
+   *                  node could not actually judge (no leaf loaded for
+   *                  the area). Ignore penalizes nobody, which is what
+   *                  keeps an attacker from scoring down honest peers by
+   *                  replaying their own traffic back at them.
+   *   GOSSIP_ACCEPT  checked in full, stored, safe to vouch for.
+   *   null           not this node's channel to judge (the reserved
+   *                  thread namespace, or a topic that is not ours at
+   *                  all). The caller falls back to its previous
+   *                  behaviour; nothing is consumed and no side effect
+   *                  has happened here.
+   *
+   * A message carrying several records is forwarded only if *every* one
+   * of them was accepted and fully judged: the message is the unit the
+   * transport relays, so it is the unit this node vouches for.
+   */
+  judgeGossip(topicName, payload, fromPeer, nowMillis = this.clock()) {
+    const topic = parseTopic(topicName);
+    if (!topic || topic.reserved) return null;
+    return this.#ingestGossip(topic, payload, fromPeer, nowMillis);
+  }
+
+  #ingestGossip(topic, payload, fromPeer, nowMillis) {
+    if (!this.#acceptsEpochTopic(topic.epochPrefix16hex, nowMillis)) return GOSSIP_IGNORE;
+    if (payload.length > this.constants.MAX_GOSSIP_BYTES) { this.#drop("oversize"); return GOSSIP_IGNORE; }
+    if (!windowAcceptable(topic.window, nowMillis)) { this.#drop("window"); return GOSSIP_IGNORE; }
     let message;
     try {
       message = decodeAny(payload);
     } catch {
       this.#drop("rule1");
-      return;
+      return GOSSIP_IGNORE;
     }
     if (message.kind === "batch") {
-      for (const record of message.records) this.#acceptContribution(record, fromPeer, topic, nowMillis);
-    } else if (message.kind === "incident") {
-      this.#acceptIncident(message, fromPeer, topic, nowMillis);
-    } else if (message.kind === "ban") {
-      this.#acceptBan(message, fromPeer, nowMillis);
-    } else {
-      this.#drop("unexpected-" + (message.magic || message.kind));
+      // An empty batch is nothing to vouch for.
+      let action = message.records.length ? GOSSIP_ACCEPT : GOSSIP_IGNORE;
+      for (const record of message.records) {
+        action = worseGossipVerdict(action, this.#acceptContribution(record, fromPeer, topic, nowMillis));
+      }
+      return action;
     }
+    if (message.kind === "incident") return this.#acceptIncident(message, fromPeer, topic, nowMillis);
+    if (message.kind === "ban") return this.#acceptBan(message, fromPeer, nowMillis);
+    this.#drop("unexpected-" + (message.magic || message.kind));
+    return GOSSIP_IGNORE;
   }
 
   #acceptContribution(record, fromPeer, topic, nowMillis) {
     const verdict = this.validator.validateContribution(record, { store: this.store, fromPeer, topic, nowMillis });
     if (!verdict.ok) {
+      this.#drop(`rule${verdict.rule}`);
       if (verdict.trustPenalty) {
         this.trust.penalizeValidation(fromPeer);
         this.#maybeForfeit(fromPeer, nowMillis);
+        return GOSSIP_REJECT;
       }
-      this.#drop(`rule${verdict.rule}`);
-      return;
+      return GOSSIP_IGNORE;
     }
     const result = this.store.addContribution(record, { nowMillis, deliveredBy: fromPeer });
-    if (result.added) {
-      this.stats.gossipAccepted++;
-      // Optional tap for gateways (LoRa bridges §16): fires only for
-      // records that passed every rule and entered the store.
-      this.onRecordAccepted?.(record, { fromPeer, nowMillis });
-    } else this.#drop(result.reason);
+    if (!result.added) {
+      this.#drop(result.reason);
+      return GOSSIP_IGNORE;
+    }
+    this.stats.gossipAccepted++;
+    // Optional tap for gateways (LoRa bridges §16, fleet seeds §12.1):
+    // fires only for records that passed every rule and entered the
+    // store, on this path and on the snapshot merge below. That is what
+    // makes it usable as a bridge's gate — a gateway republishing from
+    // here is republishing what this node already staked its bond on.
+    this.onRecordAccepted?.(record, { fromPeer, nowMillis });
+    // Stored, but relayed only if rules 10–12 could actually be applied:
+    // a peer whose map does not cover this leaf has checked nothing about
+    // where the record claims to be, and vouching for it would make
+    // "relay implies validation" nominal. It keeps the record for its own
+    // use — that is its own risk to take — and does not pass it on.
+    return verdict.judged ? GOSSIP_ACCEPT : GOSSIP_IGNORE;
   }
 
   #acceptIncident(record, fromPeer, topic, nowMillis) {
     const verdict = this.validator.validateIncident(record, { store: this.store, fromPeer, topic, nowMillis });
     if (!verdict.ok) {
+      this.#drop(`rule${verdict.rule}`);
       if (verdict.trustPenalty) {
         this.trust.penalizeValidation(fromPeer);
         this.#maybeForfeit(fromPeer, nowMillis);
+        return GOSSIP_REJECT;
       }
-      this.#drop(`rule${verdict.rule}`);
-      return;
+      return GOSSIP_IGNORE;
     }
     const result = this.store.addIncident(record, {
       nowMillis,
       deliveredBy: fromPeer,
       scoreOf: key => this.#scoreOf(key, nowMillis)
     });
-    if (result.added) {
-      this.stats.gossipAccepted++;
-      this.onRecordAccepted?.(record, { fromPeer, nowMillis });
-    } else this.#drop(result.reason);
+    if (!result.added) {
+      this.#drop(result.reason);
+      return GOSSIP_IGNORE;
+    }
+    this.stats.gossipAccepted++;
+    this.onRecordAccepted?.(record, { fromPeer, nowMillis });
+    return verdict.judged ? GOSSIP_ACCEPT : GOSSIP_IGNORE;
   }
 
   #drop(reason) {
@@ -478,18 +573,25 @@ export class MeshNode {
    * three colluding bonds can make a mesh distrust an honest peer's
    * weight for a while, which is the designed cost ceiling of defamation
    * here; they cannot silence it.
+   *
+   * Returns a §5.1 gossip verdict. Testimony never rejects: a PMX1 is an
+   * accusation, and the ledger's own answer to a false one is
+   * corroboration thresholds, not GossipSub scoring — a replayed or
+   * over-rate announcement is a relay doing its job badly, not a lie.
    */
   #acceptBan(record, fromPeer, nowMillis) {
     const idHex = toHex(record.reportId);
     for (const [id, seen] of this.banReportIds) {
       if (nowMillis - seen > this.constants.BAN_TTL * 1000) this.banReportIds.delete(id);
     }
-    if (this.banReportIds.has(idHex)) { this.#drop("banReplay"); return; }
+    if (this.banReportIds.has(idHex)) { this.#drop("banReplay"); return GOSSIP_IGNORE; }
     const verdict = this.validator.validateBan(record, { fromPeer, nowMillis });
-    if (!verdict.ok) { this.#drop(`banRule${verdict.rule}`); return; }
+    if (!verdict.ok) { this.#drop(`banRule${verdict.rule}`); return GOSSIP_IGNORE; }
     this.banReportIds.set(idHex, nowMillis);
     const hashHex = toHex(record.targetHash16);
-    if (hashHex === toHex(banPeerHash16(this.id))) return; // testimony about us decides nothing here
+    // Testimony about us decides nothing here — and must not be relayed
+    // by its own target, who is the last peer with a neutral view of it.
+    if (hashHex === toHex(banPeerHash16(this.id))) return GOSSIP_IGNORE;
     let entry = this.banLedger.get(hashHex);
     if (!entry) {
       if (this.banLedger.size >= this.constants.BAN_TARGET_CAP) {
@@ -508,16 +610,18 @@ export class MeshNode {
     }
     entry.accusers.set(fromPeer ?? "local", nowMillis);
     this.stats.bansAccepted++;
-    if (entry.accusers.size < this.constants.BAN_MIN_SOURCES) return;
-    if (!entry.corroborated) {
-      entry.corroborated = true;
-      this.stats.bansCorroborated++;
+    if (entry.accusers.size >= this.constants.BAN_MIN_SOURCES) {
+      if (!entry.corroborated) {
+        entry.corroborated = true;
+        this.stats.bansCorroborated++;
+      }
+      const target = this.peerHashIndex.get(hashHex);
+      if (target && !entry.appliedTo.has(target)) {
+        this.trust.penalizeRemoteBan(target);
+        entry.appliedTo.add(target);
+      }
     }
-    const target = this.peerHashIndex.get(hashHex);
-    if (target && !entry.appliedTo.has(target)) {
-      this.trust.penalizeRemoteBan(target);
-      entry.appliedTo.add(target);
-    }
+    return GOSSIP_ACCEPT;
   }
 
   // --- Sync stream server (§4.5) ----------------------------------------
@@ -557,7 +661,12 @@ export class MeshNode {
         return null;
       }
       default:
-        return null; // unknown magics are ignored, not errors (§1)
+        // §1 says unknown magics are ignored rather than errors — but the
+        // thread channel's PMR1 arrives here on transports that do not
+        // separate the two protocols, and dropping it would mean no
+        // catch-up at all. Offered to whoever wired that channel up; still
+        // ignored when nobody has.
+        return this.onOtherStream?.(payload, fromPeer, nowMillis) ?? null;
     }
   }
 
@@ -622,11 +731,32 @@ export class MeshNode {
   /**
    * §11.2: adopt locally-computed candidate routes as the corridor cache
    * target — subscribe to the z9 zones they cross, then fill their z15
-   * cells through the padded fetch. `routes` are geometries as
+   * cells through the padded fetch. `routes` are routes as
    * `engine.route({ alternatives })` returns them.
+   *
+   * Cells come from `cellOf` over the routes' own edges whenever the
+   * routes carry them, and only fall back to rasterizing the geometry
+   * when they do not. The two are not the same set: `cellOf` is the cell
+   * a *record* lands in, and every shipped host derives it from the
+   * leaf's centre rather than from where the road runs, so a corridor
+   * rasterized from geometry names cells nothing is stored under and
+   * zones nobody publishes to. Whatever cellOf says is, by construction,
+   * where to look.
    */
   async followCorridor(routes, { nowMillis = this.clock(), corridorMeters = 250 } = {}) {
-    const cells = corridorCells({ routes, corridorMeters, constants: this.constants });
+    const list = (Array.isArray(routes) ? routes : [routes]).filter(Boolean);
+    const byEdge = new Map();
+    for (const route of list) {
+      for (const edge of route.edges || []) {
+        if (!edge?.segment) continue;
+        const { leafCell, geomRef } = parseSegment(edge.segment);
+        const cell = this.cellOf({ leafCell, geomRef });
+        if (cell) byEdge.set(detailCellKey(cell), cell);
+      }
+    }
+    const cells = byEdge.size
+      ? [...byEdge.values()]
+      : corridorCells({ routes: list, corridorMeters, constants: this.constants });
     if (!cells.length) return 0;
     const zones = new Map();
     for (const cell of cells) {
@@ -656,7 +786,15 @@ export class MeshNode {
         const verdict = this.validator.validateContribution(record, { store: this.store, fromPeer: null, vouchPeer: fromPeer, nowMillis });
         if (!verdict.ok) continue;
         const result = this.store.addContribution(record, { nowMillis, deliveredBy: fromPeer });
-        if (result.added) accepted++;
+        if (result.added) {
+          accepted++;
+          // Same contract as the gossip path: every rule passed and the
+          // record entered the store. A §11.6 read-only node has no other
+          // way in — it joins no topic — so a gateway whose upstream side
+          // is read-only (the `--bridge=in` fleet seed, §12.1) would
+          // otherwise have nothing to hand its island.
+          this.onRecordAccepted?.(record, { fromPeer, nowMillis, viaSnapshot: true });
+        }
       }
       for (const record of cell.incidents) {
         const verdict = this.validator.validateIncident(record, { store: this.store, fromPeer: null, vouchPeer: fromPeer, nowMillis });
@@ -666,7 +804,10 @@ export class MeshNode {
           deliveredBy: fromPeer,
           scoreOf: key => this.#scoreOf(key, nowMillis)
         });
-        if (result.added) accepted++;
+        if (result.added) {
+          accepted++;
+          this.onRecordAccepted?.(record, { fromPeer, nowMillis, viaSnapshot: true });
+        }
       }
     }
     this.stats.snapshotsMerged++;
@@ -774,6 +915,44 @@ export function createLoopbackNetwork({ clock = Date.now } = {}) {
       counters(fromId).streamOut += payload.length;
       counters(toId).streamIn += payload.length;
       const response = target.onStream(payload, fromId, clock());
+      if (response) {
+        counters(toId).streamOut += response.length;
+        counters(fromId).streamIn += response.length;
+      }
+      return response;
+    },
+    /**
+     * The thread channel's own protocol (threads §5.5). In one process
+     * there is nothing to separate, so it lands on the same node — but
+     * the seam exists here too, because a responder on this protocol
+     * serves sealed bytes it cannot open and never consults a bond,
+     * which is a different contract from the traffic sync stream.
+     */
+    async requestThread(fromId, toId, payload) {
+      const target = nodes.get(toId);
+      if (!target?.onOtherStream) return null;
+      counters(fromId).streamOut += payload.length;
+      counters(toId).streamIn += payload.length;
+      const response = target.onOtherStream(payload, fromId, clock());
+      if (response) {
+        counters(toId).streamOut += response.length;
+        counters(fromId).streamIn += response.length;
+      }
+      return response;
+    },
+    /**
+     * Proof-of-delivery blobs (threads §20.7): PMTF in, PMTB out. A
+     * third seam rather than a magic on `onOtherStream`, because a
+     * catch-up responder answers for anyone's thread out of a shared
+     * relay cache and a photo responder answers only for runs it is
+     * itself publishing.
+     */
+    async requestPhoto(fromId, toId, payload) {
+      const target = nodes.get(toId);
+      if (!target?.onPhotoStream) return null;
+      counters(fromId).streamOut += payload.length;
+      counters(toId).streamIn += payload.length;
+      const response = target.onPhotoStream(payload, fromId, clock());
       if (response) {
         counters(toId).streamOut += response.length;
         counters(fromId).streamIn += response.length;

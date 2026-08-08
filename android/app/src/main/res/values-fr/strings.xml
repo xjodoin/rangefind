@@ -11,6 +11,7 @@
     <string name="action_close">Fermer</string>
     <string name="action_clear">Effacer</string>
     <string name="action_recenter">Recentrer</string>
+    <string name="action_resume_follow">Suivre ma position à nouveau</string>
     <string name="action_end_navigation">Arrêter la navigation</string>
 
     <!-- Recherche -->
@@ -125,6 +126,11 @@
     <string name="diag_mark_count">%1$d</string>
 
     <!-- Régions hors ligne -->
+    <string name="settings_title">Paramètres</string>
+    <string name="settings_tab_maps">Cartes</string>
+    <string name="settings_tab_traffic">Trafic</string>
+    <string name="settings_tab_diagnostics">Diagnostic</string>
+
     <string name="region_offline_title">Régions hors ligne</string>
     <string name="region_offline_subtitle">Conserver un index routier sur cet appareil</string>
     <string name="region_source_host">Hôte source</string>
@@ -186,4 +192,262 @@
     <string name="format_bytes">%1$d o</string>
     <string name="format_kilobytes">%1$d ko</string>
     <string name="format_megabytes">%1$.1f Mo</string>
+    <!-- Trafic en direct (PulseMesh) -->
+    <string name="mesh_title">Trafic en direct</string>
+    <string name="mesh_subtitle">Des observations anonymes d\'autres conducteurs, de pair à pair. Aucun serveur de trafic, et l\'itinéraire fonctionne sans lui.</string>
+    <string name="mesh_enable">Activer le trafic en direct</string>
+    <string name="mesh_disable">Désactiver</string>
+    <!-- Le transport, question distincte de celle de savoir si quelque chose
+         sur la carte a été inventé ici : sans relais et sans véhicules de
+         démonstration, la carte n\'affiche que de vrais conducteurs. -->
+    <string name="mesh_mode_demo">Aucun relais — cet appareil seulement</string>
+    <string name="mesh_mode_mesh">Connecté au réseau</string>
+    <string name="mesh_mode_off">Désactivé</string>
+    <string name="mesh_demo_note">Aucun relais n\'est configuré : les véhicules affichés sont simulés sur ce téléphone. Tout le reste est réel — les enregistrements, la validation et l\'agrégat utilisé par le calcul d\'itinéraire.</string>
+    <string name="mesh_demo_note_off">Aucun relais n\'est configuré et les véhicules de démonstration sont désactivés : la carte n\'affiche que ce que de vrais conducteurs Wayfind proches ont publié — parfois rien du tout.</string>
+    <string name="mesh_simulated">Trafic simulé</string>
+    <string name="mesh_simulated_note">Des véhicules de démonstration générés sur ce téléphone, et non d\'autres conducteurs. Leurs enregistrements et la validation qui les juge sont réels ; leur position et leur vitesse sont inventées. Désactivez-les et la carte reste vide jusqu\'à ce que de vrais conducteurs Wayfind soient à proximité.</string>
+    <!-- Sur la carte elle-même, partout où du trafic inventé est tracé : un
+         conducteur qui décide s\'il croit à un bouchon y a droit. -->
+    <string name="mesh_demo_badge">Trafic simulé</string>
+    <string name="mesh_contribute">Partager mes vitesses</string>
+    <string name="mesh_contribute_note" formatted="false">Anonyme, sans aucune identité dans les enregistrements. La plupart des observations sont supprimées par le protocole avant l\'envoi, et la contribution s\'arrête sous 20 % de batterie sauf en charge.</string>
+    <string name="mesh_stats">%1$d pairs · %2$d enregistrements · %3$d tronçons</string>
+    <string name="mesh_suppressed">%1$d fix sur %2$d publiés (%3$s)</string>
+    <string name="mesh_report_title">Signaler ce que vous voyez</string>
+    <string name="mesh_report_disclosure">Un signalement est public et transmet l\'endroit où vous êtes en ce moment. Il ne devient un repère pour les autres qu\'une fois confirmé par plusieurs d\'entre eux.</string>
+    <string name="mesh_report_sent">Signalé au réseau</string>
+    <string name="mesh_report_declined">Non envoyé : %1$s</string>
+    <string name="mesh_answer_sent">Réponse envoyée</string>
+    <string name="mesh_answer_still">Toujours là</string>
+    <string name="mesh_answer_gone">Disparu</string>
+    <string name="mesh_reason_no_position">aucune position récente sur une route</string>
+    <string name="mesh_reason_rate">déjà signalé il y a quelques minutes</string>
+    <string name="mesh_reason_answered">vous avez déjà répondu à celui-ci</string>
+    <string name="mesh_reason_policy">ce type de signalement n\'est pas permis ici</string>
+    <string name="mesh_incident_hint">non confirmé · %1$d pair</string>
+    <string name="mesh_incident_hints">non confirmé · %1$d pairs</string>
+    <string name="mesh_incident_shown">%1$d pairs · il y a %2$d s</string>
+    <string name="mesh_share_title">Partager ce trajet</string>
+    <string name="mesh_share_note">Un seul lien, 45 octets dans son fragment. Aucun serveur ne le voit, et seul celui qui le détient peut vous suivre.</string>
+    <string name="mesh_share_button">Créer un lien</string>
+    <string name="mesh_share_stop">Arrêter le partage</string>
+    <string name="mesh_share_unavailable">Ce trajet n\'a pas pu être publié : il n\'y a donc pas encore de lien à partager. Le trafic en direct doit être activé.</string>
+    <string name="mesh_follow_failed">Ce lien n\'a pas pu être suivi : %1$s</string>
+    <string name="mesh_live_route">+%1$d min à cause du trafic</string>
+    <string name="mesh_live_route_clear">Le trafic confirme l\'estimation de la carte</string>
+    <!-- Fils : partager un trajet -->
+    <string name="mesh_share_mode_fine">Position en direct</string>
+    <string name="mesh_share_mode_fine_note">Un localisateur. Adapté à un livreur, dont la position est justement le sujet.</string>
+    <string name="mesh_share_mode_coarse">Arrêts seulement</string>
+    <string name="mesh_share_mode_coarse_note">Aucune position : un lien qui fuite ne vaut pas plus qu\'un horaire affiché. Adapté à tout ce qui transporte des enfants.</string>
+    <string name="mesh_following_title">Trajet suivi</string>
+    <string name="mesh_following_stop">Arrêter le suivi</string>
+    <string name="mesh_following_waiting">En attente de la première mise à jour</string>
+    <string name="mesh_following_eta">Dans %1$s · %2$s</string>
+    <string name="mesh_following_age">il y a %1$d s</string>
+    <string name="mesh_following_coarse">Ce lien ne transmet que les arrêts ; aucune position n\'est publiée.</string>
+    <string name="mesh_basis_live">selon le trafic en direct</string>
+    <string name="mesh_basis_static">selon la carte</string>
+    <!-- Le mode de déplacement de la course (§5.2), et ce que coûte une
+         arrivée calculée sur un graphe fait pour autre chose. -->
+    <string name="mesh_travel_car">En voiture</string>
+    <string name="mesh_travel_bike">À vélo</string>
+    <string name="mesh_travel_foot">À pied</string>
+    <string name="mesh_travel_inline_car">en voiture</string>
+    <string name="mesh_travel_inline_bike">à vélo</string>
+    <string name="mesh_travel_inline_foot">à pied</string>
+    <string name="mesh_profile_map_car">carte routière</string>
+    <string name="mesh_profile_map_bike">carte cyclable</string>
+    <string name="mesh_profile_map_foot">carte piétonne</string>
+    <string name="mesh_following_mismatch">Arrivée calculée sur la %1$s — cette course se fait %2$s</string>
+    <!-- Ce que le conducteur a déclaré sur les arrêts, d\'après la course. -->
+    <string name="mesh_following_progress">%1$d arrêts livrés sur %2$d</string>
+    <string name="mesh_following_progress_missed">%1$d arrêts livrés sur %2$d, %3$d non livrés</string>
+    <string name="mesh_following_last_delivered">Arrêt %1$d livré</string>
+    <string name="mesh_following_last_skipped">Arrêt %1$d sauté</string>
+    <string name="mesh_following_last_skipped_because">Arrêt %1$d sauté — %2$s</string>
+    <string name="mesh_following_last_failed">Arrêt %1$d non livré</string>
+    <string name="mesh_following_last_failed_because">Arrêt %1$d non livré — %2$s</string>
+    <string name="mesh_following_your_stop_skipped">Votre arrêt a été sauté — aucune arrivée n\'est prévue</string>
+    <string name="mesh_following_your_stop_skipped_because">Votre arrêt a été sauté — %1$s</string>
+    <string name="mesh_following_your_stop_failed">Votre arrêt n\'a pas pu être livré</string>
+    <string name="mesh_following_your_stop_failed_because">Votre arrêt n\'a pas pu être livré — %1$s</string>
+    <string name="mesh_stop_reason_absent">client absent</string>
+    <string name="mesh_stop_reason_refused">refusé</string>
+    <string name="mesh_stop_reason_inaccessible">accès impossible</string>
+    <string name="mesh_stop_reason_parcel">colis manquant ou abîmé</string>
+    <string name="mesh_stop_reason_other">une autre raison</string>
+    <string name="mesh_share_started">Partage du trajet en cours</string>
+
+    <!-- Bons de course (PulseMesh threads §20). Un bon est une capacité de
+         publication : celui qui le détient peut déplacer le véhicule que
+         suivent tous les détenteurs du lien client. -->
+    <string name="mesh_job_title">Une course pour vous</string>
+    <string name="mesh_job_stop_numbered">Arrêt %1$d</string>
+    <string name="mesh_job_stop_line">%1$d. %2$s</string>
+    <string name="mesh_job_stop_count">%1$d arrêts, dans l\'ordre du trajet</string>
+    <string name="mesh_job_stop_default">Point de livraison</string>
+    <!-- Métadonnées par arrêt (§20.8). Côté chauffeur uniquement : elles
+         sont dans le plan, le plan arrive dans le billet, et le fil ne
+         transporte qu\'un condensé de 8 octets. Rien de tout cela ne doit
+         se retrouver dans une note, un motif d\'annulation ou un lien
+         partagé. En français, 0 prend le singulier — « 0 colis » — et
+         c\'est une information du répartiteur, pas une case vide. -->
+    <plurals name="mesh_job_stop_parcels">
+        <item quantity="one">%1$d colis</item>
+        <item quantity="other">%1$d colis</item>
+    </plurals>
+    <!-- Entre guillemets pour que aapt garde les espaces autour du
+         point : il supprime sinon les espaces de tête et de fin.
+         Même raison que attribution_carto plus haut. -->
+    <string name="mesh_job_stop_meta_sep">" · "</string>
+    <string name="mesh_job_stop_call">Appeler ce point de livraison</string>
+    <string name="mesh_job_expiry">Valide jusqu\'à %1$s</string>
+    <string name="mesh_job_issuer">Émis par %1$s</string>
+    <string name="mesh_job_warning">Accepter publie ce véhicule auprès de tous ceux qui détiennent le lien du client.</string>
+    <string name="mesh_job_accept">Accepter</string>
+    <string name="mesh_job_decline">Refuser</string>
+    <string name="mesh_job_unusable">Cette course ne peut pas être prise : %1$s</string>
+    <string name="mesh_job_unreadable">Ceci n\'est pas une course lisible par cette application.</string>
+    <string name="mesh_job_ticket_unreadable">Ce bon de course est illisible — demandez au répartiteur d\'en émettre un nouveau.</string>
+    <string name="mesh_job_mode_line">%1$s · %2$s</string>
+    <string name="mesh_job_accepted">Course acceptée. Le lien du client est actif.</string>
+    <string name="mesh_job_failed">Impossible de prendre la course : %1$s</string>
+    <string name="mesh_job_progress">Arrêt %1$d sur %2$d</string>
+    <string name="mesh_job_continue">Continuer</string>
+    <!-- Le lien de suivi, sur la carte que le conducteur a déjà sous les yeux. -->
+    <string name="mesh_job_share">Partager le lien de suivi</string>
+    <string name="mesh_job_share_republish">Cette course n\'est pas publiée. Le partage la relance sous un nouveau lien, et ceux qui détiennent l\'ancien verront un véhicule immobile.</string>
+    <string name="mesh_job_stop_delivered">Arrêt %1$d sur %2$d livré — suivant : %3$s</string>
+    <string name="mesh_job_stop_skipped">Arrêt %1$d sur %2$d sauté — suivant : %3$s</string>
+    <string name="mesh_job_stop_failed">Arrêt %1$d sur %2$d non livré — suivant : %3$s</string>
+    <string name="mesh_job_run_complete">Les %1$d arrêts sont livrés — course terminée</string>
+    <string name="mesh_reason_no_mesh">le trafic en direct est désactivé, et une course se publie sur le réseau</string>
+    <string name="mesh_reason_no_run">aucune course n\'est publiée depuis ce téléphone</string>
+    <string name="mesh_reason_photo_too_big">la photo est trop lourde pour être envoyée</string>
+    <string name="mesh_reason_photo_coarse">cette course ne publie aucune position, et une photo la révélerait</string>
+    <string name="mesh_reason_photo_unreadable">la photo n\'a pas abouti</string>
+    <!-- Déclarer un arrêt. La livraison est affirmée par le conducteur,
+         jamais déduite de l\'arrivée : les deux se ressemblent depuis un
+         téléphone. -->
+    <string name="mesh_job_mark_delivered">Livré</string>
+    <string name="mesh_job_mark_delivered_photo">Livré, avec une photo</string>
+    <string name="mesh_job_mark_skip">Sauter…</string>
+    <string name="mesh_job_arrived">Vous y êtes — dites ce qui s\'est passé</string>
+    <string name="mesh_job_mark_unsent">Arrêt %1$d noté sur ce téléphone seulement — non publié (%2$s)</string>
+    <!-- La photo est scellée avant l\'enregistrement du résultat : une photo
+         refusée refuse donc la déclaration entière. L\'arrêt peut être noté
+         de nouveau sans photo, et c\'est la seule chose utile à dire. -->
+    <string name="mesh_job_mark_photo_refused">Arrêt %1$d non publié — la photo a été refusée (%2$s). Notez-le de nouveau sans photo.</string>
+    <string name="mesh_job_photo_add">Ajouter une photo</string>
+    <string name="mesh_job_photo_attached">Photo jointe — accompagne « non livré »</string>
+    <string name="mesh_job_skip_title">Arrêt %1$d : que s\'est-il passé ?</string>
+    <string name="mesh_job_skip_explainer">Sauté : vous n\'y êtes pas allé. Non livré : vous y êtes allé et n\'avez pas pu remettre le colis.</string>
+    <string name="mesh_job_reason_absent">Client absent</string>
+    <string name="mesh_job_reason_refused">Refusé</string>
+    <string name="mesh_job_reason_inaccessible">Accès impossible</string>
+    <string name="mesh_job_reason_parcel">Colis manquant ou abîmé</string>
+    <string name="mesh_job_reason_other">Autre — précisez</string>
+    <string name="mesh_job_note_hint">En quelques mots (transmis au client)</string>
+    <string name="mesh_job_mark_skipped_action">Noter sauté</string>
+    <string name="mesh_job_mark_failed_action">Noter non livré</string>
+    <string name="mesh_job_mark_cancel">Annuler</string>
+    <string name="mesh_job_more">Autres actions pour cette course</string>
+    <string name="mesh_job_cant_finish">Impossible de terminer</string>
+    <string name="mesh_job_cancel_title">Impossible de terminer cette course ?</string>
+    <string name="mesh_job_cancel_body">%1$d des %2$d arrêts n\'ont encore aucun résultat.</string>
+    <string name="mesh_job_cancel_explainer">Chaque client qui a le lien de suivi apprend que la course est annulée, et le répartiteur le voit en direct. Personne ne repassera à ces arrêts aujourd\'hui.</string>
+    <string name="mesh_job_cancel_reason_hint">Pourquoi, en quelques mots (transmis au client)</string>
+    <string name="mesh_job_cancel_keep">Garder la course</string>
+    <string name="mesh_job_cancel_confirm">Annuler cette course</string>
+    <string name="mesh_job_canceled_notice">Course annulée — %1$d arrêts restés sans résultat, et tout le monde a été averti.</string>
+    <string name="mesh_handover_button">Transmettre cette course</string>
+    <string name="mesh_handover_note">Scellez la course à un appareil que vous avez inscrit. Le lien du client continue de fonctionner.</string>
+    <string name="mesh_handover_title">Transmettre cette course</string>
+    <string name="mesh_handover_warning">Seul %1$s peut ouvrir ceci. Visez-le avec la caméra de ce téléphone — cet appareil devient alors l\'émetteur, donc cessez de faire cette course sur celui-ci.</string>
+    <string name="mesh_handover_close">Fermer</string>
+    <string name="mesh_handover_unavailable">Aucune course à transmettre.</string>
+    <string name="mesh_handover_no_devices">Aucun appareil inscrit, et une course est scellée à un appareil ou à personne. L\'autre conducteur ouvre Wayfind, montre sa carte d\'appareil, et ce téléphone l\'ouvre — la course pourra alors être transmise.</string>
+    <string name="mesh_handover_pick_title">Transmettre à quel appareil ?</string>
+    <string name="mesh_handover_pick_note">La course est scellée à l\'appareil choisi ; aucun autre téléphone ne peut l\'ouvrir.</string>
+    <string name="mesh_handover_pick_cancel">Annuler</string>
+    <string name="mesh_job_sealed_elsewhere">Cette course a été scellée pour un autre appareil. Demandez au répartiteur d\'inscrire cet appareil et de la renvoyer.</string>
+    <string name="mesh_job_unsealed">Cette course est arrivée non scellée : toute personne l\'ayant manipulée peut lire les adresses et publier le véhicule. Demandez au répartiteur d\'inscrire cet appareil et d\'envoyer une course scellée.</string>
+    <string name="mesh_job_no_device_key">Ce téléphone n\'a pas encore d\'identité d\'appareil ; une course scellée ne peut pas y être ouverte.</string>
+
+    <!-- Identité de l\'appareil et inscription (threads §20.9). -->
+    <string name="device_section_title">Cet appareil</string>
+    <string name="device_section_note">Une course voyage chiffrée et est scellée à un seul appareil. Montrez cette carte à la caméra de l\'autre conducteur, et ouvrez la sienne de la même façon, avant que l\'un de vous puisse transmettre une course.</string>
+    <string name="device_name_label">Nom sur la carte</string>
+    <string name="device_name_hint">p. ex. Léa — Pixel 8</string>
+    <string name="device_fingerprint_label">Empreinte</string>
+    <string name="device_fingerprint_note">Lisez ces caractères à voix haute et vérifiez qu\'ils correspondent à l\'autre téléphone. Une carte n\'est que des octets sur un écran ; cette comparaison est ce qui donne sa valeur à l\'inscription.</string>
+    <string name="device_show_card">Montrer ma carte d\'appareil</string>
+    <string name="device_card_title">Ma carte d\'appareil</string>
+    <string name="device_card_share">Envoyer cette carte</string>
+    <string name="device_card_share_chooser">Envoyer votre carte d\'appareil</string>
+    <string name="device_card_close">Fermer</string>
+    <string name="device_card_unavailable">Ce téléphone n\'a pas encore d\'identité d\'appareil.</string>
+    <string name="device_card_unreadable">Cette carte d\'appareil est illisible — demandez qu\'on vous la remontre.</string>
+    <string name="device_unnamed">Appareil sans nom</string>
+    <string name="device_enrol_title">Inscrire cet appareil ?</string>
+    <string name="device_enrol_note">Vérifiez que cette empreinte correspond à ce qu\'affiche l\'autre téléphone en ce moment. N\'importe qui peut mettre une carte à l\'écran ; cette comparaison est la seule chose qui dit qu\'elle est bien la sienne.</string>
+    <string name="device_enrol_confirm">Inscrire</string>
+    <string name="device_enrol_cancel">Annuler</string>
+    <string name="device_enrolled_notice">%1$s peut maintenant recevoir une course.</string>
+    <string name="device_roster_title">Appareils à qui transmettre une course</string>
+    <string name="device_roster_empty">Aucun pour l\'instant. Une course ne peut être transmise tant qu\'aucun appareil n\'est inscrit.</string>
+    <string name="device_forget">Retirer</string>
+    <string name="device_added_at">Inscrit le %1$s</string>
+    <string name="device_key_loss_note">Cette clé ne quitte jamais le téléphone. Réinstaller Wayfind ou effacer ses données la détruit : toute course déjà scellée à cet appareil cesse de s\'ouvrir, et le répartiteur doit inscrire ce téléphone de nouveau.</string>
+    <string name="device_key_plain">Conservée sans protection matérielle sur ce téléphone.</string>
+    <string name="mesh_handover_too_big">Ce plan dépasse ce qu\'une caméra peut lire. Envoyez plutôt le bon sous forme de fichier — il porte la même course.</string>
+    <string name="mesh_handover_stop_note">L\'autre téléphone émet pour ce véhicule maintenant, donc celui-ci ne dit rien en partant : un adieu d\'ici annoncerait à chaque client que la course est terminée.</string>
+    <string name="mesh_handover_stop_here">Il l\'a — cesser d\'émettre ici</string>
+    <string name="mesh_handover_stopped_notice">Émission arrêtée ici. L\'autre téléphone fait cette course maintenant.</string>
+    <string name="mesh_handover_share">Partager le bon</string>
+    <string name="mesh_handover_share_chooser">Transmettre le bon</string>
+
+    <!-- Offres de course (threads §20.4) : le seul artefact de ce canal
+         public et non scellé par conception. Il ne contient aucune adresse,
+         seulement un engagement sur le plan et des descripteurs grossiers. -->
+    <string name="offer_title">Une course proposée</string>
+    <plurals name="offer_stops">
+        <item quantity="one">%1$d arrêt</item>
+        <item quantity="other">%1$d arrêts</item>
+    </plurals>
+    <string name="offer_distance">%1$s au total</string>
+    <string name="offer_pay">%1$s pour la tournée</string>
+    <string name="offer_pay_unstated">Aucune rémunération indiquée dans cette offre.</string>
+    <string name="offer_label">« %1$s »</string>
+    <string name="offer_expires">Offre valable jusqu\'au %1$s</string>
+    <string name="offer_issuer">Proposée par %1$s</string>
+    <string name="offer_locality">Autour de %1$s</string>
+    <string name="offer_locality_grid">Une case de grille d\'environ %1$s km de côté, pas une adresse — le point est le centre de la tournée et n\'a généralement rien dessus.</string>
+    <string name="offer_spread_1km">Les arrêts s\'étendent jusqu\'à environ 1 km de ce point.</string>
+    <string name="offer_spread_3km">Les arrêts s\'étendent jusqu\'à environ 3 km de ce point.</string>
+    <string name="offer_spread_10km">Les arrêts s\'étendent jusqu\'à environ 10 km de ce point.</string>
+    <string name="offer_spread_30km">Les arrêts s\'étendent jusqu\'à environ 30 km de ce point.</string>
+    <string name="offer_spread_beyond">Les arrêts s\'étendent à plus de 30 km de ce point.</string>
+    <string name="offer_no_addresses">Les adresses ne sont pas dans cette offre. Elles n\'arrivent que si la course est attribuée à cet appareil.</string>
+    <string name="offer_send_card">Envoyer ma carte d\'appareil</string>
+    <string name="offer_send_card_note">Ce protocole ne transporte aucune enchère. Votre carte part par le canal que le répartiteur utilise déjà ; s\'il vous choisit, il scelle la course à cet appareil.</string>
+    <string name="offer_dismiss">Ignorer</string>
+    <string name="offer_unusable">Cette offre ne se vérifie pas : %1$s</string>
+    <string name="offer_unreadable">Cette offre de course est illisible — demandez au répartiteur d\'en publier une nouvelle.</string>
+    <string name="offer_bid_sent">Carte envoyée. Cette offre est conservée ici, pour vérifier la course qui vous sera attribuée.</string>
+    <string name="offer_held_title">Courses pour lesquelles vous vous êtes proposé</string>
+    <string name="offer_held_empty">Aucune. Envoyer votre carte d\'appareil pour une offre l\'enregistre ici, et ce qui vous sera attribué ensuite est vérifié contre elle.</string>
+    <string name="offer_held_bid_at">Carte envoyée le %1$s</string>
+    <string name="offer_held_expires">Valable jusqu\'au %1$s</string>
+    <string name="offer_forget">Retirer</string>
+    <string name="offer_award_matches">C\'est bien la course pour laquelle vous vous êtes proposé — même plan, même émetteur.</string>
+    <string name="offer_award_mismatch">Ce n\'est pas la course pour laquelle vous vous êtes proposé : %1$s. Elle ne sera pas prise.</string>
+    <string name="offer_award_mismatch_unnamed">Ce n\'est pas la course pour laquelle vous vous êtes proposé, et la vérification en cause n\'a pas été nommée. Elle ne sera pas prise.</string>
+    <plurals name="offer_award_unknown">
+        <item quantity="one">Cette attribution ne correspond à aucune des %1$d offres pour lesquelles vous vous êtes proposé. C\'est à cela que ressemble un plan échangé — et aussi une seconde course sans rapport. Vérifiez auprès du répartiteur avant d\'accepter.</item>
+        <item quantity="other">Cette attribution ne correspond à aucune des %1$d offres pour lesquelles vous vous êtes proposé. C\'est à cela que ressemble un plan échangé — et aussi une seconde course sans rapport. Vérifiez auprès du répartiteur avant d\'accepter.</item>
+    </plurals>
+    <string name="offer_award_refused">Refusé : cette attribution n\'est pas la course proposée (%1$s).</string>
 </resources>

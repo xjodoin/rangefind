@@ -23,6 +23,7 @@ import {
 } from "../src/pulsemesh/thread_crypto.js";
 import {
   THREAD_MODE,
+  THREAD_TRAVEL_MODE,
   THREAD_STATE,
   decodeThreadBody,
   decodeThreadLink,
@@ -76,14 +77,23 @@ const VECTOR_BODY = {
   unixSeconds: 1754265600,
   state: THREAD_STATE.EN_ROUTE,
   mode: THREAD_MODE.FINE,
+  travelMode: THREAD_TRAVEL_MODE.CAR,
   leafCell: 3181,
   geomRef: 885,
   ratioQ12: 2048,
   speedBin: 7,
   stopIndex: 8,
   planRef: sha256Utf8("plan").subarray(0, 8),
+  // The floor: a run with no plan still spends three bytes saying it has
+  // no outcome map, no last mark and no note. A delivery round's own
+  // cost is measured separately below.
+  outcomes: [],
+  lastOutcome: null,
   note: new Uint8Array(0)
 };
+
+/** What a delivery round adds to every record (§5.2.1). */
+const OUTCOME_PLAN_SIZES = [50, 200];
 
 // --- 1. Crypto and codec cost --------------------------------------------
 
@@ -115,9 +125,21 @@ const VECTOR_BODY = {
   }, 500);
 
   const link = encodeThreadLink({ publicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 1754294400 });
+  // What a delivery round pays for carrying the whole day's outcomes in
+  // every record — the price of a follower who joins at lunchtime still
+  // learning that stop 7 was skipped at ten (§5.2.1).
+  const outcomeCost = OUTCOME_PLAN_SIZES.map(stops => {
+    const withPlan = encodeThreadBodyPreimage({
+      ...VECTOR_BODY,
+      outcomes: new Array(stops).fill(1),
+      lastOutcome: { stopIndex: stops, outcome: 2, reasonCode: 1 }
+    });
+    return `${stops} stops: +${withPlan.length - preimage.length} B`;
+  }).join(", ");
   report("crypto and codec", {
-    "PMT1 record size (fine mode)": `${record.bytes.length} bytes`,
-    "PMTP body size": `${body.length} bytes (28-byte preimage + 64-byte signature)`,
+    "PMT1 record size (fine mode, no plan)": `${record.bytes.length} bytes`,
+    "PMTP body size": `${body.length} bytes (${preimage.length}-byte preimage + 64-byte signature)`,
+    "cumulative outcome map, per record": outcomeCost,
     "link size": `${link.length} bytes`,
     "key schedule from the capability": `${derive.msPerOp.toFixed(3)} ms (once per thread)`,
     "topic tag (HMAC)": `${Math.round(tagCost.perSecond).toLocaleString()} /s`,

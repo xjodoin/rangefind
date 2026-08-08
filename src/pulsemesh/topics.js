@@ -15,6 +15,18 @@ export const SYNC_PROTOCOL = "/rangefind/pulsemesh/1/sync";
 // than a sync message so a peer can present its bond before it has
 // anything to say.
 export const BOND_PROTOCOL = "/rangefind/pulsemesh/1/bond";
+// Threads §5.5 catch-up: PMR1 in, PMM1 out. Separate from the traffic
+// sync protocol because the two channels answer to different things —
+// this one serves sealed bytes the responder may not be able to open,
+// and never consults a bond.
+export const THREAD_PROTOCOL = "/rangefind/pulsemesh/1/thread";
+// Threads §20.7 proof-of-delivery photos: PMTF in, PMTB out. Its own
+// protocol rather than a second magic on the thread stream because the
+// two have opposite shapes — catch-up serves 256-byte records to anyone
+// and scales with the audience, while this serves one ~100 KB blob and
+// only the publisher ever holds one. Separating them keeps a relay's
+// catch-up path free of a transfer it can never answer.
+export const PHOTO_PROTOCOL = "/rangefind/pulsemesh/1/photo";
 
 export function shardOfCell(cell) {
   return sha256(utf8Bytes(`${cell.x}/${cell.y}`))[0] % 16;

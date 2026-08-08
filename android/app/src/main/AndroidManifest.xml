@@ -43,6 +43,69 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- A shared drive is a link, and a link has to open something.
+                 The capability lives in the fragment, which is never sent to
+                 rangefind.dev on the web and is handed to us intact here, so
+                 opening one in Wayfind means no server sees it at any point
+                 on either path. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="rangefind.dev" android:pathPrefix="/t" />
+                <!-- A dispatched job (threads §20). Same shape, different
+                     capability: /t lets you watch a run, /j lets you take
+                     one, and the app branches on the artifact rather than
+                     on the path it arrived by. -->
+                <data android:scheme="https" android:host="rangefind.dev" android:pathPrefix="/j" />
+            </intent-filter>
+            <!-- The same capabilities without depending on a domain at all.
+                 This is also the handover path: the next driver's own camera
+                 app fires ACTION_VIEW on the QR this phone displays, which
+                 is why there is no scanner anywhere in this app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="wayfind" android:host="thread" />
+                <data android:scheme="wayfind" android:host="ticket" />
+                <!-- A device card (threads §20.9). Enrolment is the gate on
+                     transfer — a job can only be sealed to a device this
+                     phone already holds the public key of — so the other
+                     driver shows their card and this phone's camera opens
+                     it here. Same carrier as everything else: base64url in
+                     the fragment, which is never transmitted. -->
+                <data android:scheme="wayfind" android:host="device" />
+                <!-- A job offer (threads §20.4). The one artifact here that
+                     is public and unsealed by design: it goes to strangers,
+                     so it carries a commitment and coarse descriptors and
+                     no address at all. It arrives the way a stranger's
+                     artifact does — a QR in a depot, a line in a group
+                     chat — and the system camera fires ACTION_VIEW on it,
+                     which is why there is no scanner in this app. -->
+                <data android:scheme="wayfind" android:host="offer" />
+            </intent-filter>
+            <!-- A plan bigger than a camera can scan travels as a file, and
+                 a file reaches an app by being shared into it: a dispatcher
+                 mails the ticket and the driver picks Wayfind from the
+                 share sheet. The link may arrive as the mail body or as the
+                 attachment, so both are read. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <!-- The same ticket saved to Downloads and tapped there. File
+                 managers label a .wayfindjob by whatever the server said,
+                 which is text/plain when it was honest and
+                 application/octet-stream when it had no idea. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" android:mimeType="text/plain" />
+                <data android:scheme="content" android:mimeType="application/octet-stream" />
+            </intent-filter>
         </activity>
 
         <service
@@ -82,6 +145,19 @@
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
+        </provider>
+        <!-- Handed-over tickets, and only those. A second authority rather
+             than another path on the trace provider: the grant a share
+             hands out is per-authority, and a driver mailing a ticket has
+             no business widening what a trace share could reach. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.tickets"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/ticket_paths" />
         </provider>
 
     </application>

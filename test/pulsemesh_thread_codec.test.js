@@ -23,8 +23,13 @@ import {
   verifyThread
 } from "../src/pulsemesh/thread_crypto.js";
 import {
+  STOP_OUTCOME,
+  STOP_REASON,
+  THREAD_MAX_BODY_BYTES,
+  THREAD_MAX_RECORD_BYTES,
   THREAD_MODE,
   THREAD_STATE,
+  THREAD_TRAVEL_MODE,
   decodeThreadBody,
   decodeThreadLink,
   decodeThreadRecord,
@@ -49,12 +54,18 @@ const VECTOR_BODY = {
   unixSeconds: 1754265600,
   state: THREAD_STATE.EN_ROUTE,
   mode: THREAD_MODE.FINE,
+  // §11 `mode` and §5.2 `travelMode` are different questions — what the
+  // link reveals, and how the vehicle moves — so the vector gives them
+  // different values on purpose.
+  travelMode: THREAD_TRAVEL_MODE.CAR,
   leafCell: 3181,
   geomRef: 885,
   ratioQ12: 2048,
   speedBin: 7,
   stopIndex: 8,
   planRef: fromHex("10c2d3bff3368b2e"),
+  outcomes: [],
+  lastOutcome: null,
   note: new Uint8Array(0)
 };
 
@@ -116,38 +127,46 @@ test("§16.3 the link is 45 bytes and lives in a URL fragment", async () => {
   assert.deepEqual(decodeThreadLink(link), parsed);
   assert.throws(() => decodeThreadLink(link.subarray(0, 44)), /45 bytes/);
   assert.throws(() => parseThreadLinkUrl("https://track.example/r"), /fragment/);
+  // Version 1 is the §16.3 vector and means "the key in this link signs
+  // its own records". Version 2 is §21's delegated form, which a
+  // subscriber must treat differently — it says nothing about the bytes
+  // here, since the vector is a one-off run and stays version 1.
+  assert.equal(decodeThreadLink(link).delegated, false);
+  const delegated = Uint8Array.from(link);
+  delegated[0] = 2;
+  assert.equal(decodeThreadLink(delegated).delegated, true);
   const wrongVersion = Uint8Array.from(link);
-  wrongVersion[0] = 2;
+  wrongVersion[0] = 3;
   assert.throws(() => decodeThreadLink(wrongVersion), /version/);
 });
 
 test("§16.4 signed preimage and sealed record are byte-identical", async () => {
   const { publicKey, keys, tag } = await vectorFixture();
   const preimage = encodeThreadBodyPreimage(VECTOR_BODY);
-  assert.equal(toHex(preimage), "504d545080f0bfc4060202ed18f5068010070810c2d3bff3368b2e00");
-  assert.equal(preimage.length, 28);
+  assert.equal(toHex(preimage), "504d545080f0bfc406020201ed18f5068010070810c2d3bff3368b2e000000");
+  assert.equal(preimage.length, 31);
 
   const signature = await signThread(preimage, PUBLISHER_SEED);
   assert.equal(
     toHex(signature),
-    "b0b3192ceefeb4be4a2addebc3a74409324ee4613b1715cb974a5841edc982e4" +
-    "8500128fde33572ebaef2b639d34d283b1b68dcedfa7a092b86936c1bf783c07"
+    "ab698bf41fc97ba4555c3a5a0ae790d039273eb0674f6be0ad61140d41edfe9f" +
+    "0498a4b4f44a24fefe0b99eaf8953472ebd8b52fc2f89b1a4205943987e30f06"
   );
   const body = encodeThreadBody(VECTOR_BODY, signature);
-  assert.equal(body.length, 92);
+  assert.equal(body.length, 95);
 
   const aad = threadRecordAad(EPOCH_PREFIX8, tag, 42);
   assert.equal(toHex(aad), "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a");
   const ciphertext = await sealThreadBody(keys, 42, aad, body);
   const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 42, ciphertext });
-  assert.equal(record.bytes.length, 130);
+  assert.equal(record.bytes.length, 133);
   assert.equal(
     toHex(record.bytes),
-    "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a6c7a8da4d85d9063cc5eb7" +
-    "17fe848766a01c64b39e7051e5a88fc7d84c799bbaab39ea92bce979fdbb5412" +
-    "f46e0a53c20d5243e25caceba50baea321a0a61066048684867b197163aa0633" +
-    "0039f2730fcd49b1f3535d5d4ce4467d9de6e36c35429b0f6cc17c58ab3098ae" +
-    "12d4"
+    "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a6f7a8da4d85d9063cc5eb7" +
+    "1712716a95268c73bc86a24089e44a7a7d62c928a32cbe9fd21d6a288405cb8f" +
+    "ea6ddf8df6554e6a47f074ca1de7227eae05ceeeeb8fc01365a1e9bab637909e" +
+    "3842d6f1f0e84ea37c031daf6067fc919866eadfaf2e888b8ce54447d1e2bdf7" +
+    "5792b13843"
   );
 
   // Round trip: open, decode, verify.
@@ -160,6 +179,9 @@ test("§16.4 signed preimage and sealed record are byte-identical", async () => 
   assert.equal(parsed.ratio, 0.5);
   assert.equal(parsed.stopIndex, 8);
   assert.equal(parsed.state, THREAD_STATE.EN_ROUTE);
+  assert.equal(parsed.travelMode, THREAD_TRAVEL_MODE.CAR);
+  assert.deepEqual(parsed.outcomes, []);
+  assert.equal(parsed.lastOutcome, null);
   assert.ok(await verifyThread(parsed.preimage, parsed.signature, publicKey));
 
   // Nothing on the wire reveals the capability (§4.1): P must not appear
@@ -363,6 +385,135 @@ test("leaf 0 carries a real position, and only 0/0/0 means withheld", async () =
   const body = decodeThreadBody(await open(publisher.keys, record.seq, record.aad, record.ciphertext));
   assert.equal(body.segment, "0/0/0", "the sentinel collision still reports a position");
   assert.equal(body.ratioQ12, 1, "nudged one quantum — about 10 cm — off the sentinel");
+});
+
+test("a 200-stop outcome map, travelMode and lastOutcome survive the wire", async () => {
+  const { publicKey, keys, tag } = await vectorFixture();
+  // A full delivery day. Two bits a stop, packed LSB-first, so the whole
+  // day's outcomes cost 50 bytes — and they are in *every* record, because
+  // the gossip channel is lossy and a follower who slept through the
+  // record where stop 7 was skipped has no other way to learn it.
+  const outcomes = Array.from({ length: 200 }, (_, i) => i % 4);
+  const body = {
+    ...VECTOR_BODY,
+    travelMode: THREAD_TRAVEL_MODE.BIKE,
+    stopIndex: 137,
+    outcomes,
+    lastOutcome: {
+      stopIndex: 137,
+      outcome: STOP_OUTCOME.SKIPPED,
+      reasonCode: STOP_REASON.CUSTOMER_ABSENT
+    }
+  };
+  const preimage = encodeThreadBodyPreimage(body);
+  const signature = await signThread(preimage, PUBLISHER_SEED);
+  const sealed = encodeThreadBody(body, signature);
+  const parsed = decodeThreadBody(sealed);
+
+  assert.equal(parsed.travelMode, THREAD_TRAVEL_MODE.BIKE);
+  assert.deepEqual(parsed.outcomes, outcomes, "200 stops, two bits each, LSB-first");
+  assert.equal(parsed.outcomes.length, 200);
+  assert.deepEqual(parsed.lastOutcome, {
+    stopIndex: 137,
+    outcome: STOP_OUTCOME.SKIPPED,
+    reasonCode: STOP_REASON.CUSTOMER_ABSENT,
+    // §20.7: a mark always says whether it carries a photo, and this one
+    // does not. One byte, and it is what makes the commitment's presence
+    // part of the signed preimage rather than an optional trailer.
+    photoHash: null
+  });
+  // 50 bytes for the day: the whole point of the packed map.
+  assert.equal(preimage.length - encodeThreadBodyPreimage(VECTOR_BODY).length, 50 + 2 + 4 + 1,
+    "50 map bytes, a 2-byte count, a 4-byte lastOutcome, and a wider stopIndex");
+
+  // The signature covers the new fields, so an outcome cannot be edited
+  // by anyone holding only the link.
+  assert.ok(await verifyThread(parsed.preimage, parsed.signature, publicKey));
+  const forged = { ...body, outcomes: outcomes.map(() => STOP_OUTCOME.DELIVERED) };
+  assert.equal(
+    await verifyThread(encodeThreadBodyPreimage(forged), signature, publicKey),
+    false,
+    "flipping the day to all-delivered breaks the signature"
+  );
+
+  // And it still fits a PMT1 record with room to spare.
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 42);
+  const record = encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8, tag, seq: 42,
+    ciphertext: await sealThreadBody(keys, 42, aad, sealed)
+  });
+  assert.ok(record.bytes.length <= THREAD_MAX_RECORD_BYTES,
+    `a 200-stop day is ${record.bytes.length} bytes, inside the ${THREAD_MAX_RECORD_BYTES}-byte limit`);
+
+  // Trailing bytes are still refused, with the new fields in the body.
+  assert.throws(() => decodeThreadBody(Uint8Array.from([...sealed, 0])), /trailing/);
+  assert.throws(() => decodeThreadBody(sealed.subarray(0, sealed.length - 1)), /truncated|trailing/);
+});
+
+test("a plan too large to encode is refused, with the number that fits", () => {
+  // The body is signed and sealed before it is ever framed, so a record
+  // that overflows 256 has already been signed: the refusal has to happen
+  // at encode, and it has to say what would have fitted.
+  // The published caps are the worst case: the widest position varints a
+  // planet-scale leaf index can produce, and the widest stopIndex. A body
+  // with smaller ones fits a few more stops, and the error quotes *that*
+  // body's number rather than one universal figure.
+  const worst = {
+    ...VECTOR_BODY,
+    // The widest a planet-scale leaf index makes them…
+    leafCell: 268435455, geomRef: 268435455, ratioQ12: 4095,
+    // …and the widest a stop index can be, since a stop index is bounded
+    // by the stop count and no plan reaches 16384 stops.
+    stopIndex: 999,
+    lastOutcome: { stopIndex: 999, outcome: STOP_OUTCOME.FAILED, reasonCode: STOP_REASON.OTHER }
+  };
+  const noted = { ...worst, note: new Uint8Array(64) };
+
+  assert.ok(encodeThreadBodyPreimage({ ...noted, outcomes: new Array(172).fill(1) }).length + 64
+    <= THREAD_MAX_BODY_BYTES, "172 stops fit alongside a full 64-byte note");
+  assert.throws(
+    () => encodeThreadBodyPreimage({ ...noted, outcomes: new Array(600).fill(1) }),
+    /600 plan stops cost 150 bytes of outcome map and this note costs 64.*at most 172 stops/su
+  );
+
+  // Without a note the same body carries a far longer day.
+  assert.ok(encodeThreadBodyPreimage({ ...worst, outcomes: new Array(428).fill(1) }).length + 64
+    <= THREAD_MAX_BODY_BYTES);
+  assert.throws(
+    () => encodeThreadBodyPreimage({ ...worst, outcomes: new Array(600).fill(1) }),
+    /at most 428 stops/su
+  );
+
+  // The realistic case the feature is sized for: a 200-stop day still
+  // leaves 57 bytes of note even at the worst position width.
+  assert.ok(encodeThreadBodyPreimage({
+    ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(57)
+  }).length + 64 <= THREAD_MAX_BODY_BYTES);
+  assert.throws(
+    () => encodeThreadBodyPreimage({
+      ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(58)
+    }),
+    /allows 213/su
+  );
+
+  // §20.7: a photo commitment is 32 of those bytes, and it comes out of
+  // the same budget. The same 200-stop day with one attached leaves 25.
+  const withPhoto = {
+    ...worst,
+    lastOutcome: { ...worst.lastOutcome, photoHash: "d3".repeat(32) },
+    outcomes: new Array(200).fill(1)
+  };
+  assert.ok(encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(25) }).length + 64
+    <= THREAD_MAX_BODY_BYTES);
+  assert.throws(
+    () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(26) }),
+    /allows 213/su
+  );
+  assert.throws(
+    () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(64), outcomes: new Array(600).fill(1) }),
+    /at most 48 stops/su,
+    "a full note and a photo together leave very little day"
+  );
 });
 
 test("base64url round-trips arbitrary bytes", () => {

@@ -2679,6 +2679,7 @@ async function anchoredExactText(engine, q, params, anchor, {
   const coverage = anchorCoverageShards(engine, anchor);
   const explicitScope = explicitShardScope(params);
   const directScope = explicitScope.length ? explicitScope : coverage;
+  if (directScope.length) engine.prefetchShards?.(directScope);
   const compoundName = fold(q).split(/[^\p{L}\p{N}]+/u).filter(Boolean).length >= 2;
   if (!intent && compoundName && directScope.length) {
     try {
@@ -2724,6 +2725,18 @@ async function anchoredExactText(engine, q, params, anchor, {
     } catch (error) {
       if (!isGeoTextSortBudgetError(error)) throw error;
     }
+  }
+  let speculativeNearest = null;
+  if (intent && directScope.length && !params.geo?.box) {
+    engine.prefetchShards?.(directScope, { docValues: true });
+    speculativeNearest = engine.search({
+      ...params,
+      shards: params.shards == null ? directScope : params.shards,
+      geo: {
+        near: { lat: anchor.lat, lon: anchor.lon, radiusMeters: NEAR_TEXT_RADIUS_METERS },
+        sort: "distance"
+      }
+    }).then((response2) => ({ response: response2 }), (error) => ({ error }));
   }
   let intentAuthority;
   if (intent && allowUngatedFuzzy) intentAuthority = await exactAuthorityScope(engine, q);
@@ -2828,8 +2841,16 @@ async function anchoredExactText(engine, q, params, anchor, {
     }
   };
   if (scope.length && Number(authority?.count || 0) >= Math.max(32, requestedSize * 2)) {
-    const nearest = await nearestExact("osmNearExactGeo");
-    if (nearest) return nearest;
+    if (speculativeNearest) {
+      const settled = await speculativeNearest;
+      if (settled.response) {
+        return exactGeoResponse(settled.response, authority, directScope, NEAR_TEXT_RADIUS_METERS, "osmNearExactGeo");
+      }
+      if (!isGeoTextSortBudgetError(settled.error)) throw settled.error;
+    } else {
+      const nearest = await nearestExact("osmNearExactGeo");
+      if (nearest) return nearest;
+    }
   }
   const scopedText = scope.length > 0;
   const response = await engine.search(scopedText ? {
@@ -2853,8 +2874,16 @@ async function anchoredExactText(engine, q, params, anchor, {
     if (!namedFuzzy) return null;
   }
   if (scopedText && response.total > response.results.length) {
-    const nearest = await nearestExact(authority ? "osmNearExactGeo" : "osmNearFuzzyGeo");
-    if (nearest) return nearest;
+    if (speculativeNearest && authority) {
+      const settled = await speculativeNearest;
+      if (settled.response) {
+        return exactGeoResponse(settled.response, authority, directScope, NEAR_TEXT_RADIUS_METERS, "osmNearExactGeo");
+      }
+      if (!isGeoTextSortBudgetError(settled.error)) throw settled.error;
+    } else {
+      const nearest = await nearestExact(authority ? "osmNearExactGeo" : "osmNearFuzzyGeo");
+      if (nearest) return nearest;
+    }
   }
   const exact = [];
   const fuzzy = [];

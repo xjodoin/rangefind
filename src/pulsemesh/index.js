@@ -78,7 +78,9 @@ export {
 } from "./bond.js";
 
 export {
+  PHOTO_PROTOCOL,
   SYNC_PROTOCOL,
+  THREAD_PROTOCOL,
   TOPIC_PREFIX,
   activeWindows,
   parseTopic,
@@ -101,6 +103,8 @@ export {
 } from "./incidents.js";
 export { createPulseMeshProvider } from "./provider.js";
 export { createContributor } from "./contribute.js";
+export { checkMeshHost, congestionLevel, createMeshSession } from "./session.js";
+export { createCorridorTraffic } from "./simulate.js";
 export { createReticentProfile } from "./reticent.js";
 export { createForwardHandler } from "./forward.js";
 export { buildCellRequests, buildDecoyPool, corridorCells, diffDigest, requestOverhead } from "./sync.js";

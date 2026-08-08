@@ -9,6 +9,7 @@ import {
 } from "./osm.browser.js";
 import { openRouteGraphUrl } from "./route.browser.js";
 import { createPulseMeshDemo } from "./pulsemesh-demo.js";
+import { encodeQr, qrSvg } from "./qr.browser.js";
 import { geometryFeatureBounds, resultGeometryFeature } from "./result_geometry.js";
 
 const queryInput = document.querySelector("#queryInput");
@@ -1298,6 +1299,7 @@ const addStopButton = document.querySelector("#addStopButton");
 const swapStopsButton = document.querySelector("#swapStopsButton");
 const clearStopsButton = document.querySelector("#clearStopsButton");
 const departureRow = document.querySelector("#departureRow");
+const tripEndRow = document.querySelector("#tripEndRow");
 const routeReceipt = document.querySelector("#routeReceipt");
 const routeReceiptSummary = document.querySelector("#routeReceiptSummary");
 const routeReceiptRoute = document.querySelector("#routeReceiptRoute");
@@ -1325,6 +1327,11 @@ let directionsMode = false;
 let stops = [];
 let stopPickIndex = -1;
 let departureChoice = "now";
+// Where a multi-stop run is allowed to finish. "last" pins the address the
+// dispatcher typed last, "open" lets the optimizer choose the terminus, and
+// "loop" brings the vehicle home. Only ever offered from three stops up,
+// because with two there is nothing to order.
+let tripEndChoice = "last";
 let routePlan = null; // { kind: "pair", candidates, active } | { kind: "trip", trip }
 let routeToken = 0;
 let stopMarkers = [];
@@ -1405,6 +1412,9 @@ async function initRouteGraph() {
     routeAvailable = true;
     departureRow.hidden = routeBucketNames.length < 2;
     modeDirectionsTab.title = "Turn-by-turn routing computed in this browser";
+    // Live traffic is bound to this exact index build (its sourceHash is
+    // the mesh epoch), so the card only exists once the graph is open.
+    wireMeshControls();
   } catch {
     routeAvailable = false;
     modeDirectionsTab.setAttribute("aria-disabled", "true");
@@ -1423,6 +1433,18 @@ function resolvedStops() {
 
 function directionsReady() {
   return stops.length >= 2 && stops.every(stop => stop.place && !stop.error);
+}
+
+/** The end mode the itinerary planner is asked for. */
+function tripEndParams() {
+  if (tripEndChoice === "open") return { openEnd: true };
+  if (tripEndChoice === "loop") return { roundTrip: true };
+  return { roundTrip: false };
+}
+
+function updateTripEndRow() {
+  if (!tripEndRow) return;
+  tripEndRow.hidden = resolvedStops().length < 3;
 }
 
 function updateDirectionsHud() {
@@ -1839,6 +1861,7 @@ function renderStops() {
     return row;
   }));
   addStopButton.disabled = stops.length >= MAX_STOPS;
+  updateTripEndRow();
   updateDirectionsHud();
 }
 
@@ -2226,14 +2249,229 @@ function departureParams() {
 // every subscriber recomputes the same weighted-median aggregate, and the
 // router consumes it through the ordinary LiveTrafficProvider contract.
 // See docs/pulsemesh.md.
+//
+// Three things are drawn from it, and they are deliberately different
+// claims. The traffic layer is a measurement — an aggregate of independent
+// observations the router itself acts on. An incident is a *claim*, shown
+// as a hint until enough distinct peers corroborate it. A thread is one
+// vehicle that authorized you specifically to watch it. The UI never
+// blurs the three.
+
+const meshCard = document.querySelector("#meshCard");
+const meshToggle = document.querySelector("#meshToggle");
+const meshModePill = document.querySelector("#meshModePill");
+const meshBody = document.querySelector("#meshBody");
+const meshStats = document.querySelector("#meshStats");
+const meshNote = document.querySelector("#meshNote");
+const meshContribute = document.querySelector("#meshContribute");
+const meshSimulate = document.querySelector("#meshSimulate");
+const meshReportRow = document.querySelector("#meshReportRow");
+const meshIncidentList = document.querySelector("#meshIncidentList");
+const meshShareButton = document.querySelector("#meshShareButton");
+const meshShareOut = document.querySelector("#meshShareOut");
+const meshModeFine = document.querySelector("#meshModeFine");
+const meshModeCoarse = document.querySelector("#meshModeCoarse");
+const meshFollowInput = document.querySelector("#meshFollowInput");
+const meshFollowButton = document.querySelector("#meshFollowButton");
+const meshFollowOut = document.querySelector("#meshFollowOut");
+const meshFollowCard = document.querySelector("#meshFollowCard");
+const meshFileButton = document.querySelector("#meshFileButton");
+const meshFileInput = document.querySelector("#meshFileInput");
+const meshDriveRow = document.querySelector("#meshDriveRow");
+const meshTravelCar = document.querySelector("#meshTravelCar");
+const meshTravelBike = document.querySelector("#meshTravelBike");
+const meshTravelFoot = document.querySelector("#meshTravelFoot");
+const meshJobButton = document.querySelector("#meshJobButton");
+const meshOfferButton = document.querySelector("#meshOfferButton");
+const meshOfferOut = document.querySelector("#meshOfferOut");
+const meshOfferPay = document.querySelector("#meshOfferPay");
+const meshOfferLabel = document.querySelector("#meshOfferLabel");
+const meshOfferCurrency = document.querySelector("#meshOfferCurrency");
+const meshJobStops = document.querySelector("#meshJobStops");
+const meshJobOut = document.querySelector("#meshJobOut");
+const meshJobGate = document.querySelector("#meshJobGate");
+const meshHandoverButton = document.querySelector("#meshHandoverButton");
+const meshDeviceName = document.querySelector("#meshDeviceName");
+const meshDeviceOut = document.querySelector("#meshDeviceOut");
+const meshDeviceList = document.querySelector("#meshDeviceList");
+const meshEnrolInput = document.querySelector("#meshEnrolInput");
+const meshEnrolButton = document.querySelector("#meshEnrolButton");
+const meshEnrolSelfButton = document.querySelector("#meshEnrolSelfButton");
+const meshSeedInput = document.querySelector("#meshSeedInput");
+const meshSeedButton = document.querySelector("#meshSeedButton");
+const meshSeedOut = document.querySelector("#meshSeedOut");
+const meshRecipientRow = document.querySelector("#meshRecipientRow");
+const meshAcceptCard = document.querySelector("#meshAcceptCard");
+const routeLiveNote = document.querySelector("#routeLiveNote");
+
+const MESH_REFRESH_MS = 2000;
+// Reporting is public and locates you. §10.4 will not mint a report
+// without the caller asserting it said so, and this is where it is said.
+const MESH_DISCLOSURE = "Reports are public and carry the spot you are at right now. Continue?";
+const MESH_LEVEL_COLORS = {
+  stopped: "#c0392b",
+  heavy: "#e07b39",
+  slow: "#e5b93c",
+  free: "#3f9d6a",
+  unknown: "#8d939c"
+};
+const MESH_REPORTABLE = [
+  { type: 1, label: "Crash" },
+  { type: 3, label: "Closure" },
+  { type: 6, label: "Road works" },
+  { type: 5, label: "Police" },
+  { type: 8, label: "Object on road" }
+];
 
 let pulseMesh = null;
+let meshTimer = null;
+let meshFollowTimer = null;
+let meshFollow = null;
+let meshRun = null;
+// §11: what a shared link is worth if it leaks. Fine is a live locator;
+// coarse withholds position entirely and publishes stop events only.
+let meshShareFine = true;
+// The plan a followed run is measured against — for a private drive that
+// is the one stop the publisher put in the link's plan.
+let meshFollowPlan = null;
+let meshLastTraffic = [];
+let meshLastIncidents = [];
+let meshRouteAt = 0;
+// §20: the ticket this tab issued or accepted, and the one it has been
+// offered but not taken. They are different states and the card shows
+// different things for each.
+let meshJob = null;
+let meshPendingTicket = null;
+// A ticket's mode byte, from §20.3: 1 coarse, 2 fine.
+const THREAD_MODE_FINE = 2;
+// The plan's label field is capped at 48 UTF-8 bytes (§20.2); stay under it.
+const JOB_LABEL_BYTES = 40;
+
+// §5.2 travelMode: how the vehicle moves, which is a different question
+// from §11's `mode` — one is what the link reveals, the other is what
+// graph the follower's ETA should be computed on.
+const TRAVEL_MODE = { CAR: 1, BIKE: 2, FOOT: 3 };
+const TRAVEL_MODE_LABELS = { 0: "unspecified", 1: "by car", 2: "by bike", 3: "on foot" };
+let meshTravelMode = TRAVEL_MODE.CAR;
+
+// §5.2 outcomes. Pending is the absence of an assertion, never a claim
+// that the vehicle has not arrived.
+const STOP_OUTCOME = { PENDING: 0, DELIVERED: 1, SKIPPED: 2, FAILED: 3 };
+const STOP_OUTCOME_LABELS = { 1: "delivered", 2: "skipped", 3: "failed" };
+// Two labels per reason on purpose: the driver picks from an instruction
+// ("Other — say why") and the follower reads a statement ("no reason
+// given"). Reusing one string makes one of the two read as nonsense.
+const STOP_REASONS = [
+  { code: 1, label: "Customer absent", said: "customer absent" },
+  { code: 2, label: "Refused", said: "refused" },
+  { code: 3, label: "Could not get in", said: "could not get in" },
+  { code: 4, label: "Parcel missing or damaged", said: "parcel missing or damaged" },
+  { code: 5, label: "Other — say why", said: "no reason given" }
+];
+const STOP_REASON_LABELS = Object.fromEntries(STOP_REASONS.map(r => [r.code, r.said]));
+const STOP_REASON_OTHER = 5;
+
+/**
+ * The reason clause a follower reads, or "" for none.
+ *
+ * Code 5 with a note attached says nothing on its own — the note *is* the
+ * reason — so it is dropped rather than printed as "no reason given"
+ * immediately before the reason.
+ */
+function stopReasonClause(reasonCode, hasNote) {
+  if (!reasonCode) return "";
+  if (reasonCode === STOP_REASON_OTHER && hasNote) return "";
+  return ` — ${STOP_REASON_LABELS[reasonCode] || "no reason given"}`;
+}
+// Which stop the driver has the skip sheet open for, if any.
+let meshSkipFor = null;
+// This browser's device identity (§20.9), once the controller has minted
+// it: `{ publicKeyHex, fingerprint, name, cardUrl }`. Held so the card
+// tile is not rebuilt — and the QR re-encoded — on every two-second tick.
+let meshDeviceIdentity = null;
+// The enrolled device the next job will be sealed to, by public key hex.
+// There is no default: choosing who a job is addressed to is the decision
+// §20.9 exists to make explicit.
+let meshRecipient = null;
+// A device card someone pasted or opened, waiting to be enrolled.
+let meshPendingCard = null;
+// Per-stop delivery metadata the dispatcher typed, keyed by rounded
+// coordinate rather than by list position: details belong to the *stop*,
+// so reordering the round or optimizing the itinerary must carry them
+// along rather than leave a phone number attached to a slot.
+const meshStopDetails = new Map();
+// The stop set the details editor is currently showing. Re-rendering it
+// on every mesh tick would collapse an open panel and wipe half-typed
+// text out from under the dispatcher, so it is rebuilt only when the
+// round itself changes.
+let meshStopDetailsKey = "";
+// The delivery photo currently on the follower card: its commitment and
+// the object URL rendering it. Revoked on replace — a blob URL that is
+// never released keeps the decoded image alive for the life of the tab.
+let meshPhotoShown = { hash: null, url: null };
+
+/**
+ * The longest edge a delivery photo is downscaled to, and the JPEG
+ * quality it is re-encoded at (threads §20.7).
+ *
+ * The re-encode is not only about size. A canvas `toBlob` writes a fresh
+ * JPEG from pixels, so **every EXIF tag is dropped** — including the GPS
+ * fix a phone camera stamps into the file, which would otherwise publish
+ * the customer's front door to anyone who can open the photo, out of
+ * band and past every §11 control on the run. `markStop` cannot do this
+ * for us: it has no image decoder, and stripping metadata is stated in
+ * the spec as the host's obligation.
+ */
+const PHOTO_MAX_EDGE = 1024;
+const PHOTO_QUALITY = 0.6;
+// §20.7's cap, minus the seal's own 28 bytes.
+const PHOTO_MAX_SEALED = 131072;
+
+/**
+ * A camera file to bytes the mesh will carry: downscaled, re-encoded,
+ * metadata gone. Rejects rather than silently sending something too
+ * large — a driver is owed the sentence, not a failed mark.
+ */
+async function compressPhoto(file) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, PHOTO_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", PHOTO_QUALITY));
+  if (!blob) throw new Error("this browser could not re-encode that image");
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (bytes.length + 28 > PHOTO_MAX_SEALED) {
+    throw new Error(`that photo is ${Math.round(bytes.length / 1024)} KB even after downscaling`);
+  }
+  return bytes;
+}
+
+function meshRequested() {
+  return new URLSearchParams(location.search).get("keeper");
+}
 
 async function togglePulseMesh(on) {
   if (!routeEngine) return null;
   if (!on) {
+    if (meshTimer) { clearInterval(meshTimer); meshTimer = null; }
     if (pulseMesh) await pulseMesh.stop();
     pulseMesh = null;
+    meshFollow = null;
+    meshRun = null;
+    meshJob = null;
+    meshDeviceIdentity = null;
+    meshDeviceCardKey = "";
+    meshRecipient = null;
+    meshLastTraffic = [];
+    meshLastIncidents = [];
+    if (meshJobOut) { meshJobOut.hidden = true; meshJobOut.replaceChildren(); }
+    if (meshOfferOut) { meshOfferOut.hidden = true; meshOfferOut.replaceChildren(); }
+    dismissJobOffer();
+    setMeshFeatures([]);
+    renderMeshCard();
     return null;
   }
   if (!pulseMesh) {
@@ -2241,39 +2479,2421 @@ async function togglePulseMesh(on) {
       engine: routeEngine,
       // A keeper multiaddr in the URL joins the real mesh; without one the
       // demo runs peers inside this tab so it works on any static host.
-      mode: new URLSearchParams(location.search).get("keeper") ? "keeper" : "local",
-      keeperAddress: new URLSearchParams(location.search).get("keeper")
+      mode: meshRequested() ? "mesh" : "local",
+      keeperAddress: meshRequested(),
+      onChange: () => { refreshMeshDisplay().catch(() => {}); }
     });
     await pulseMesh.start();
+    // Minted before anything is rendered: this browser is a device, and
+    // the card it shows has to exist before a dispatcher can enrol it.
+    await refreshDeviceIdentity();
+    await meshFollowActiveRoute();
+    if (pulseMesh.mode === "local") pulseMesh.startSimulation();
+    meshTimer = setInterval(() => {
+      refreshMeshDisplay().catch(() => {});
+      pulseMesh?.tickThreads();
+    }, MESH_REFRESH_MS);
   }
+  renderMeshCard();
   return pulseMesh;
 }
 
+/** Hands the mesh whatever routes are on screen, so it scopes to them. */
+async function meshFollowActiveRoute() {
+  if (!pulseMesh) return;
+  const routes = [];
+  if (routePlan?.kind === "pair") routes.push(...routePlan.candidates);
+  else if (routePlan?.kind === "trip") routes.push(...routePlan.trip.legs);
+  if (!routes.length) return;
+  await pulseMesh.followRoutes(routes);
+}
+
+// --- Map layers -------------------------------------------------------------
+
+let meshLayersWaiting = false;
+let pendingMeshFeatures = null;
+let meshLayerError = null;
+
+function createMeshLayers() {
+  map.addSource("pulsemeshLive", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+  // Under the route line, over the basemap: the road is being described,
+  // not replaced.
+  const before = map.getLayer("route-alt") ? "route-alt" : undefined;
+  map.addLayer({
+    id: "mesh-traffic-casing",
+    type: "line",
+    source: "pulsemeshLive",
+    filter: ["==", ["get", "kind"], "traffic"],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: { "line-color": "#1b1e24", "line-width": 9, "line-opacity": 0.35 }
+  }, before);
+  map.addLayer({
+    id: "mesh-traffic",
+    type: "line",
+    source: "pulsemeshLive",
+    filter: ["==", ["get", "kind"], "traffic"],
+    layout: { "line-cap": "round", "line-join": "round" },
+    paint: {
+      "line-color": ["get", "color"],
+      "line-width": 6,
+      // Confidence is drawn, not hidden: a two-report hint is visibly
+      // fainter than a corroborated jam, because it is a weaker claim.
+      "line-opacity": ["max", 0.35, ["to-number", ["get", "confidence"], 0]]
+    }
+  }, before);
+  map.addLayer({
+    id: "mesh-incident-dot",
+    type: "circle",
+    source: "pulsemeshLive",
+    filter: ["==", ["get", "kind"], "incident"],
+    paint: {
+      "circle-radius": ["case", ["==", ["get", "tier"], "shown"], 8, 6],
+      "circle-color": ["case", ["==", ["get", "tier"], "shown"], "#c0392b", "#e5b93c"],
+      "circle-stroke-width": 2,
+      "circle-stroke-color": "#faf9f2",
+      "circle-opacity": ["case", ["==", ["get", "tier"], "shown"], 0.95, 0.7]
+    }
+  });
+  map.addLayer({
+    id: "mesh-incident-label",
+    type: "symbol",
+    source: "pulsemeshLive",
+    filter: ["==", ["get", "kind"], "incident"],
+    minzoom: 11,
+    layout: {
+      "text-field": ["get", "label"],
+      "text-font": ["Open Sans Semibold"],
+      "text-size": 11,
+      "text-offset": [0, 1.2],
+      "text-anchor": "top",
+      "text-allow-overlap": false
+    },
+    paint: {
+      "text-color": "#2a2118",
+      "text-halo-color": "rgba(250, 249, 242, 0.94)",
+      "text-halo-width": 1.5
+    }
+  });
+  map.addLayer({
+    id: "mesh-thread",
+    type: "circle",
+    source: "pulsemeshLive",
+    filter: ["==", ["get", "kind"], "thread"],
+    paint: {
+      "circle-radius": 7,
+      "circle-color": "#2f6df6",
+      "circle-stroke-width": 3,
+      "circle-stroke-color": "#faf9f2"
+    }
+  });
+}
+
+function setMeshFeatures(features) {
+  pendingMeshFeatures = features;
+  if (!map.getSource("pulsemeshLive")) {
+    let created = false;
+    // Attempted rather than gated on isStyleLoaded(): that flag goes false
+    // again whenever sources are loading, so a periodic refresh that only
+    // tries while it is true can miss every window it gets and leave the
+    // overlay permanently invisible. addSource throws when the style is
+    // not ready, which is a perfectly good gate on its own.
+    try {
+      createMeshLayers();
+      created = true;
+      meshLayerError = null;
+    } catch (error) {
+      // Kept rather than swallowed: a layer that never gets added is a
+      // traffic overlay that never appears, and "nothing happened" is the
+      // hardest bug there is to see.
+      meshLayerError = String(error?.message || error);
+    }
+    if (!created) {
+      if (!meshLayersWaiting) {
+        meshLayersWaiting = true;
+        setTimeout(() => {
+          meshLayersWaiting = false;
+          if (pendingMeshFeatures) setMeshFeatures(pendingMeshFeatures);
+        }, 400);
+      }
+      return;
+    }
+  }
+  map.getSource("pulsemeshLive")?.setData({ type: "FeatureCollection", features });
+}
+
+function meshFeatures(traffic, incidents, threadPoint) {
+  const features = [];
+  for (const entry of traffic) {
+    features.push({
+      type: "Feature",
+      properties: {
+        kind: "traffic",
+        color: MESH_LEVEL_COLORS[entry.level] || MESH_LEVEL_COLORS.unknown,
+        confidence: Number(entry.confidence?.toFixed(2) || 0),
+        level: entry.level
+      },
+      geometry: { type: "LineString", coordinates: entry.points.map(([lat, lon]) => [lon, lat]) }
+    });
+  }
+  for (const incident of incidents) {
+    features.push({
+      type: "Feature",
+      properties: {
+        kind: "incident",
+        tier: incident.tier,
+        label: incident.tier === "shown" ? incident.typeName : `${incident.typeName} (unconfirmed)`
+      },
+      geometry: { type: "Point", coordinates: [incident.lon, incident.lat] }
+    });
+  }
+  if (threadPoint) {
+    features.push({
+      type: "Feature",
+      properties: { kind: "thread" },
+      geometry: { type: "Point", coordinates: [threadPoint.lon, threadPoint.lat] }
+    });
+  }
+  return features;
+}
+
+async function refreshMeshDisplay() {
+  if (!pulseMesh) return;
+  const [traffic, incidents] = await Promise.all([pulseMesh.traffic(), pulseMesh.incidents()]);
+  meshLastTraffic = traffic;
+  meshLastIncidents = incidents;
+  const threadPoint = meshFollow ? await meshFollow.position().catch(() => null) : null;
+  setMeshFeatures(meshFeatures(traffic, incidents, threadPoint));
+  renderMeshCard();
+  await maybeRerouteForTraffic();
+}
+
 /**
- * Reports the jam the active route is driving into, then re-routes. The
- * contributions are made by simulated vehicles in local mode; on a real
- * mesh this is what other drivers' phones would already have said.
+ * Re-runs the route when the live picture has moved, at most every
+ * 20 seconds. The point of the demo is that a jam changes the answer, and
+ * an answer computed before the jam existed cannot show that; recomputing
+ * on every aggregation bucket would just burn byte ranges.
  */
-async function reportPulseMeshJam() {
-  const active = routePlan?.candidates?.[routePlan.active];
-  if (!pulseMesh || !active?.edges?.length) return null;
-  pulseMesh.followRoute(active);
-  const segments = active.edges
-    .slice(Math.floor(active.edges.length * 0.3), Math.floor(active.edges.length * 0.3) + 15)
-    .map(edge => edge.segment);
-  const published = await pulseMesh.simulateJam(segments);
-  return { published, ...pulseMesh.refreshState() };
+async function maybeRerouteForTraffic() {
+  if (!pulseMesh || !routePlan || nav) return;
+  if (!meshLastTraffic.some(entry => entry.level === "stopped" || entry.level === "heavy")) return;
+  if (Date.now() - meshRouteAt < 20000) return;
+  meshRouteAt = Date.now();
+  await maybeRoute();
+}
+
+// --- The panel --------------------------------------------------------------
+
+function meshStatChip(label, value) {
+  const chip = document.createElement("div");
+  chip.className = "mesh-stat";
+  const strong = document.createElement("strong");
+  strong.textContent = String(value);
+  const small = document.createElement("small");
+  small.textContent = label;
+  chip.append(strong, small);
+  return chip;
+}
+
+function renderMeshCard() {
+  if (!meshCard) return;
+  meshCard.hidden = !routeEngine;
+  const running = Boolean(pulseMesh);
+  meshToggle.textContent = running ? "Turn off" : "Turn on live traffic";
+  meshToggle.classList.toggle("active", running);
+  meshBody.hidden = !running;
+  if (!running) {
+    meshModePill.textContent = "Off";
+    meshModePill.dataset.mode = "off";
+    return;
+  }
+  const snapshot = pulseMesh.snapshot();
+  meshModePill.textContent = snapshot.mode === "mesh" ? "Live mesh" : "In-tab peers";
+  meshModePill.dataset.mode = snapshot.mode || "off";
+
+  meshStats.replaceChildren(
+    meshStatChip("peers", snapshot.peers),
+    meshStatChip("records", snapshot.records),
+    meshStatChip("segments", snapshot.segments),
+    meshStatChip("zones", snapshot.zones),
+    meshStatChip("drawn", meshLastTraffic.length),
+    meshStatChip("incidents", meshLastIncidents.length)
+  );
+
+  const notes = [];
+  if (snapshot.error) notes.push(snapshot.error);
+  if (snapshot.mode === "mesh") {
+    notes.push("Read-only on the wire: this tab mints no admission bond, joins no gossip topic, and pulls what it shows over the padded sync path (§11.6).");
+  } else {
+    notes.push(`${snapshot.vehicles} simulated vehicles are driving your corridor inside this tab — real records, real validation, no server.`);
+  }
+  if (snapshot.contributing) {
+    notes.push(`This tab is contributing under the reticent profile: ${snapshot.emitted} of ${snapshot.fixes} fixes published, the rest suppressed by the gates (${snapshot.lastReason || "—"}).`);
+  }
+  const dispatched = pulseMesh.hasActiveTicket;
+  if (snapshot.sharing && dispatched) {
+    notes.push("This run came from a dispatch ticket: the followers were given their link before this device took the job, and handing the ticket on keeps that link alive (§20).");
+  }
+  meshNote.textContent = notes.join(" ");
+
+  if (meshShareButton) {
+    meshShareButton.textContent = snapshot.sharing
+      ? (dispatched ? "End this job" : "Stop sharing this drive")
+      : "Create a tracking link";
+  }
+  if (meshJobButton) {
+    const routed = Boolean(activeRouteGeometry());
+    // While this device is publishing someone's job it has one; issuing a
+    // second from the same tab would only be confusing. An empty roster
+    // does *not* disable it: the button's job in that state is to explain
+    // what enrolment is and where to do it (§20.9).
+    meshJobButton.disabled = !routed || dispatched;
+    meshJobButton.title = routed
+      ? "Seal a dispatch ticket for the route on screen to an enrolled device"
+      : "Plot a route first — a job ticket names where the vehicle is going";
+  }
+  if (meshOfferButton) {
+    // An offer needs a round and nothing else — no roster, no recipient.
+    // That is the point: it goes to couriers this dispatcher has not met.
+    const routed = Boolean(activeRouteGeometry());
+    meshOfferButton.disabled = !routed || dispatched;
+    meshOfferButton.title = routed
+      ? "Publish a signed advertisement of this round — no address in it, safe to post anywhere"
+      : "Plot a route first — an offer describes a round";
+  }
+  if (meshJobGate) {
+    const gate = dispatched ? null : jobGateReason();
+    meshJobGate.hidden = !gate;
+    meshJobGate.textContent = gate || "";
+  }
+  if (meshHandoverButton) meshHandoverButton.hidden = !dispatched;
+  meshContribute.checked = snapshot.contributing;
+  meshContribute.disabled = snapshot.readOnly;
+  meshSimulate.hidden = snapshot.mode !== "local";
+  meshSimulate.textContent = snapshot.simulating ? "Pause simulated traffic" : "Resume simulated traffic";
+
+  renderMeshIncidents();
+  renderDeviceCard();
+  renderFleetSeed();
+  renderDeviceRoster();
+  renderRecipientRow();
+  renderJobStopDetails();
+  renderDriverStops();
+  updateRouteLiveNote();
+}
+
+function renderMeshIncidents() {
+  if (!meshIncidentList) return;
+  meshIncidentList.replaceChildren();
+  meshIncidentList.hidden = meshLastIncidents.length === 0;
+  for (const incident of meshLastIncidents.slice(0, 6)) {
+    const item = document.createElement("li");
+    item.className = "mesh-incident";
+    item.dataset.tier = incident.tier;
+    const title = document.createElement("b");
+    title.textContent = incident.typeName;
+    const meta = document.createElement("small");
+    meta.textContent = incident.tier === "shown"
+      ? `${incident.sources} peers · ${incident.ageSeconds}s ago`
+      : `unconfirmed · ${incident.sources} peer${incident.sources === 1 ? "" : "s"}`;
+    item.append(title, meta);
+    const actions = document.createElement("span");
+    actions.className = "mesh-incident__actions";
+    for (const [label, polarity] of [["Still there", 2], ["Gone", 3]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", () => answerMeshIncident(incident, polarity));
+      actions.append(button);
+    }
+    item.append(actions);
+    item.addEventListener("click", event => {
+      if (event.target.tagName === "BUTTON") return;
+      map.easeTo({ center: [incident.lon, incident.lat], zoom: Math.max(map.getZoom(), 14) });
+    });
+    meshIncidentList.append(item);
+  }
+}
+
+function updateRouteLiveNote() {
+  if (!routeLiveNote) return;
+  const active = routePlan?.kind === "pair" ? routePlan.candidates[routePlan.active] : null;
+  const live = active?.live;
+  if (!live || !Number.isFinite(active.adjustedSeconds)) {
+    routeLiveNote.hidden = true;
+    return;
+  }
+  const delta = Math.round((active.adjustedSeconds - active.seconds) / 60);
+  routeLiveNote.hidden = false;
+  routeLiveNote.dataset.tone = delta > 0 ? "slow" : "clear";
+  // `applied` counts edges re-weighted, not states consumed: one observed
+  // segment fans out to every edge sharing the leaf's canonical polyline,
+  // so it routinely exceeds `states` and the two must not be phrased as a
+  // fraction of each other.
+  routeLiveNote.textContent = live.applied === 0
+    ? `Live traffic on; nothing observed on this route yet (${live.states} live segments held).`
+    : delta > 0
+      ? `+${delta} min from live traffic · ${live.applied} edges re-weighted from ${live.states} observed segments`
+      : `Live traffic agrees with the static metric here · ${live.applied} edges re-weighted`;
+}
+
+// --- Reporting --------------------------------------------------------------
+
+function renderMeshReportRow() {
+  if (!meshReportRow) return;
+  meshReportRow.replaceChildren();
+  for (const entry of MESH_REPORTABLE) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = entry.label;
+    button.addEventListener("click", () => reportMeshIncident(entry));
+    meshReportRow.append(button);
+  }
+}
+
+async function reportMeshIncident(entry) {
+  if (!pulseMesh) return;
+  if (!window.confirm(MESH_DISCLOSURE)) return;
+  const result = await pulseMesh.report({ type: entry.type, acknowledgedPublic: true });
+  if (result.emitted) {
+    showToast(`${entry.label} reported to the mesh`, "info");
+    await refreshMeshDisplay();
+    return;
+  }
+  showToast(
+    result.reason === "no-position"
+      ? "Reports come from where you are: start the demo drive, or share your location, first."
+      : `Report declined by the protocol (${result.reason})`,
+    "error"
+  );
+}
+
+async function answerMeshIncident(incident, polarity) {
+  if (!pulseMesh) return;
+  if (!window.confirm(MESH_DISCLOSURE)) return;
+  const result = await pulseMesh.answer({ key: incident.key, polarity, acknowledgedPublic: true });
+  showToast(
+    result.emitted
+      ? "Answer published — §8.5 scores it against the other peers'"
+      : `Answer declined (${result.reason})`,
+    result.emitted ? "info" : "error"
+  );
+  await refreshMeshDisplay();
+}
+
+// --- Threads ----------------------------------------------------------------
+
+async function shareThisDrive() {
+  if (!pulseMesh) return;
+  if (meshRun) {
+    const dispatched = pulseMesh.hasActiveTicket;
+    await pulseMesh.endDrive();
+    meshRun = null;
+    meshJob = null;
+    meshShareOut.hidden = true;
+    if (meshJobOut) { meshJobOut.hidden = true; meshJobOut.replaceChildren(); }
+    renderMeshCard();
+    showToast(dispatched ? "Job closed — the run is finished" : "Sharing stopped — the run is closed", "info");
+    return;
+  }
+  const geometry = activeRouteGeometry();
+  if (!geometry?.length) {
+    showToast("Plot a route first — a thread follows a drive", "error");
+    return;
+  }
+  const end = geometry[geometry.length - 1];
+  const run = await pulseMesh.shareDrive({
+    fine: meshShareFine,
+    travelMode: meshTravelMode,
+    plan: {
+      stops: [{
+        index: 1, lat: end[0], lon: end[1],
+        label: planLabel(stops[stops.length - 1]?.place?.label || "Destination")
+      }],
+      dwellSeconds: 0,
+      travelMode: meshTravelMode
+    }
+  });
+  if (!run?.url) {
+    showToast("Threads need WebCrypto's Ed25519 on this browser", "error");
+    return;
+  }
+  meshRun = run;
+  meshShareOut.hidden = false;
+  meshShareOut.replaceChildren();
+  const input = document.createElement("input");
+  input.readOnly = true;
+  input.value = run.url;
+  input.addEventListener("focus", () => input.select());
+  const note = document.createElement("small");
+  note.textContent = meshShareFine
+    ? "45 bytes in the fragment — the page host never sees it. Expires in 3 hours. Start the demo drive to publish."
+    : "Stops only: this link carries no position at all. Expires in 3 hours.";
+  meshShareOut.append(input, note);
+  input.select();
+  renderMeshCard();
+}
+
+/**
+ * The driver's row: the stop in front of them, and the two things only
+ * they can say about it.
+ *
+ * Everything else on this channel is inferred from movement, and rightly
+ * so — where the van is, whether it is dwelling, how far it has got. What
+ * happened at the door is not inferable: a van parked outside a house for
+ * four minutes could have delivered, been refused, or found nobody in,
+ * and those are three different sentences to send a customer. So this is
+ * a button, it publishes immediately rather than on the next heartbeat,
+ * and an unmarked stop stays blank on the wire rather than being guessed.
+ */
+function renderDriverStops() {
+  if (!meshDriveRow) return;
+  const driving = pulseMesh?.drivingSnapshot?.() ?? null;
+  if (!driving) {
+    meshDriveRow.replaceChildren();
+    meshDriveRow.hidden = true;
+    meshSkipFor = null;
+    return;
+  }
+
+  // The stop in front of the driver: the first one nobody has spoken for.
+  const pending = driving.stops.find(stop => !driving.outcomes[stop.index - 1]);
+  const done = driving.outcomes.filter(Boolean).length;
+
+  // The card re-renders on the mesh tick, and a driver halfway through
+  // typing why a delivery failed must not have the sheet pulled out from
+  // under them. While it is open for the stop it was opened for, it is
+  // left exactly as it is — chosen reason, typed text, and cursor.
+  if (meshSkipFor != null && meshSkipFor === pending?.index
+    && meshDriveRow.querySelector(".mesh-drive__reason")) {
+    return;
+  }
+  meshDriveRow.replaceChildren();
+  meshDriveRow.hidden = false;
+
+  const summary = document.createElement("small");
+  summary.className = "mesh-drive__summary";
+  summary.textContent = `${done} of ${driving.stops.length} stops marked · ${TRAVEL_MODE_LABELS[driving.travelMode] || "unspecified"}`;
+  meshDriveRow.append(summary);
+
+  if (!pending) {
+    const finished = document.createElement("small");
+    finished.textContent = "Every stop on this run has an outcome.";
+    meshDriveRow.append(finished);
+    return;
+  }
+
+  const current = document.createElement("b");
+  current.className = "mesh-drive__stop";
+  current.textContent = pending.label || `Stop ${pending.index}`;
+  meshDriveRow.append(current);
+  renderStopDetails(pending);
+
+  if (meshSkipFor !== pending.index) {
+    const actions = document.createElement("div");
+    actions.className = "mesh-drive__actions";
+    const delivered = document.createElement("button");
+    delivered.type = "button";
+    delivered.textContent = "Delivered";
+    delivered.addEventListener("click", () => {
+      markCurrentStop(pending.index, STOP_OUTCOME.DELIVERED).catch(() => {});
+    });
+    const skip = document.createElement("button");
+    skip.type = "button";
+    skip.textContent = "Skip…";
+    skip.addEventListener("click", () => {
+      meshSkipFor = pending.index;
+      renderDriverStops();
+    });
+
+    // Proof of delivery (§20.7). Choosing a photo *is* marking delivered
+    // — one action, because a driver holding a parcel at a door is not
+    // going to press two buttons, and a photo without the mark says
+    // nothing on the wire. The image never rides gossip: it is sealed
+    // under a key only the dispatcher and this device can derive, and
+    // the record carries a 32-byte commitment to it.
+    const photoLabel = document.createElement("label");
+    photoLabel.className = "mesh-drive__photo";
+    photoLabel.textContent = "Add photo";
+    const photoInput = document.createElement("input");
+    photoInput.type = "file";
+    photoInput.accept = "image/*";
+    // Opens the camera directly on a phone rather than the gallery.
+    photoInput.setAttribute("capture", "environment");
+    photoInput.addEventListener("change", () => {
+      const file = photoInput.files?.[0];
+      photoInput.value = "";
+      if (file) deliverWithPhoto(pending.index, file).catch(() => {});
+    });
+    photoLabel.append(photoInput);
+
+    actions.append(delivered, photoLabel, skip);
+    meshDriveRow.append(actions);
+    return;
+  }
+
+  // The skip sheet. A reason code is five bits of structure the customer's
+  // app can render in their own language; the free text is the escape
+  // hatch and it costs 64 bytes on the wire, so it is capped there.
+  const reason = document.createElement("select");
+  reason.className = "mesh-drive__reason";
+  reason.setAttribute("aria-label", "Why this stop was not made");
+  for (const entry of STOP_REASONS) {
+    const option = document.createElement("option");
+    option.value = String(entry.code);
+    option.textContent = entry.label;
+    reason.append(option);
+  }
+  const detail = document.createElement("input");
+  detail.type = "text";
+  detail.className = "mesh-drive__detail";
+  detail.placeholder = "Up to 64 characters, sent to the follower";
+  detail.maxLength = 64;
+  detail.hidden = true;
+  reason.addEventListener("change", () => {
+    detail.hidden = Number(reason.value) !== 5;
+    if (!detail.hidden) detail.focus();
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "mesh-drive__actions";
+  // Skipped and failed are different claims — "we did not go" against "we
+  // went and it did not work" — and the customer is owed the right one.
+  for (const [outcome, label] of [[STOP_OUTCOME.SKIPPED, "Mark skipped"], [STOP_OUTCOME.FAILED, "Mark failed"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", () => {
+      markCurrentStop(pending.index, outcome, {
+        reason: Number(reason.value),
+        note: detail.hidden ? null : detail.value.trim() || null
+      }).catch(() => {});
+    });
+    actions.append(button);
+  }
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "mesh-drive__cancel";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => { meshSkipFor = null; renderDriverStops(); });
+  actions.append(cancel);
+
+  meshDriveRow.append(reason, detail, actions);
+}
+
+/**
+ * What the driver reads at the door (§20.8).
+ *
+ * The order reference and the parcel count go first and go large,
+ * because they are what gets checked against the label on the box while
+ * standing on a doorstep; the instruction is the sentence that decides
+ * what to do when nobody answers; the contact is a `tel:` link so it is
+ * one tap rather than a number to memorise and retype in a car.
+ *
+ * `parcels` is `null` when the dispatcher never said and a number when
+ * they did — including **0**, which is a real instruction ("nothing to
+ * carry": a collection, a survey, a signature). Rendering unstated as
+ * "0 parcels" would invent a claim, so unstated renders as nothing.
+ */
+function renderStopDetails(stop) {
+  if (!stop) return;
+  const hasParcels = Number.isFinite(stop.parcels);
+  if (stop.orderRef || hasParcels) {
+    const line = document.createElement("div");
+    line.className = "mesh-drive__ids";
+    if (stop.orderRef) {
+      const ref = document.createElement("b");
+      ref.textContent = stop.orderRef;
+      ref.className = "mesh-drive__ref";
+      line.append(ref);
+    }
+    if (hasParcels) {
+      const parcels = document.createElement("b");
+      parcels.className = "mesh-drive__parcels";
+      parcels.textContent = stop.parcels === 1 ? "1 parcel" : `${stop.parcels} parcels`;
+      line.append(parcels);
+    }
+    meshDriveRow.append(line);
+  }
+  if (stop.instructions) {
+    const instructions = document.createElement("p");
+    instructions.className = "mesh-drive__instructions";
+    instructions.textContent = stop.instructions;
+    meshDriveRow.append(instructions);
+  }
+  if (stop.contact) {
+    const contact = document.createElement("a");
+    contact.className = "mesh-drive__contact";
+    // The dispatcher typed this and the ticket's signature covers it, so
+    // it is not attacker-controlled the way a search result is — but it
+    // is still user text in a URL, and `tel:` takes no spaces.
+    contact.href = `tel:${stop.contact.replace(/[^\d+]/gu, "")}`;
+    contact.textContent = `Call ${stop.contact}`;
+    contact.rel = "noreferrer";
+    meshDriveRow.append(contact);
+  }
+}
+
+/**
+ * Delivered, with the photo. The downscale-and-re-encode happens here,
+ * in the page, because stripping the camera's EXIF GPS is the host's
+ * obligation and the library states it as a MUST (§20.7).
+ */
+async function deliverWithPhoto(index, file) {
+  let photo;
+  try {
+    photo = await compressPhoto(file);
+  } catch (error) {
+    showToast(`That photo could not be attached: ${error?.message || error}`, "error");
+    return;
+  }
+  await markCurrentStop(index, STOP_OUTCOME.DELIVERED, { photo });
+}
+
+async function markCurrentStop(index, outcome, options = {}) {
+  if (!pulseMesh) return;
+  try {
+    await pulseMesh.markStop(index, outcome, options);
+  } catch (error) {
+    showToast(`That stop could not be marked: ${error?.message || error}`, "error");
+    return;
+  }
+  meshSkipFor = null;
+  showToast(`Stop ${index} marked ${STOP_OUTCOME_LABELS[outcome]} — published to the followers now`, "info");
+  renderDriverStops();
+}
+
+/**
+ * §11 is a harm decision, not a bandwidth one, so it is asked rather
+ * than defaulted: coarse publishes stop events and a heartbeat with no
+ * position at all, and a leaked coarse link is worth roughly what a
+ * printed timetable is.
+ */
+function setShareMode(fine) {
+  meshShareFine = fine;
+  meshModeFine?.classList.toggle("active", fine);
+  meshModeCoarse?.classList.toggle("active", !fine);
+  meshModeFine?.setAttribute("aria-checked", String(fine));
+  meshModeCoarse?.setAttribute("aria-checked", String(!fine));
+}
+
+/**
+ * How the round is made. It goes into the *plan*, which means it is
+ * hashed into `planRef` and therefore part of the job's identity — the
+ * dispatcher who routed and priced a bike round decided this, not the
+ * driver's phone, and not the follower's guess.
+ */
+function setTravelMode(value) {
+  meshTravelMode = value;
+  for (const [mode, button] of [
+    [TRAVEL_MODE.CAR, meshTravelCar], [TRAVEL_MODE.BIKE, meshTravelBike], [TRAVEL_MODE.FOOT, meshTravelFoot]
+  ]) {
+    button?.classList.toggle("active", mode === value);
+    button?.setAttribute("aria-checked", String(mode === value));
+  }
+}
+
+// --- Dispatch tickets (§20) -------------------------------------------------
+//
+// A tracking link and a dispatch ticket both live in a URL fragment and
+// both look like noise, and there the resemblance ends: one lets you
+// watch a vehicle, the other lets you *be* it. Everything below exists to
+// keep that difference visible — the driver link is labelled as a publish
+// capability, the customer link as read-only, and an incoming ticket gets
+// an accept card rather than being acted on the way a follow link is.
+
+function planLabel(text) {
+  const encoder = new TextEncoder();
+  let value = String(text || "").trim();
+  while (encoder.encode(value).length > JOB_LABEL_BYTES) value = value.slice(0, -1);
+  return value;
+}
+
+function formatExpiry(unixSeconds) {
+  return new Intl.DateTimeFormat(undefined, {
+    day: "numeric", month: "short", hour: "numeric", minute: "2-digit"
+  }).format(new Date(unixSeconds * 1000));
+}
+
+function jobModeLabel(mode) {
+  return mode === THREAD_MODE_FINE ? "live position" : "stops only";
+}
+
+// A phone camera, not the encoder, is the real ceiling. Past about
+// version 25 the modules are finer than a hand-held scan across a
+// counter can resolve, so the policy is to refuse rather than to print a
+// technically-valid symbol nobody can read — a full delivery day simply
+// travels as a file instead.
+const QR_MAX_VERSION = 25;
+
+function meshQrTile(text, label = "Driver link") {
+  const tile = document.createElement("div");
+  tile.className = "mesh-qr";
+  const qr = encodeQr(text, { ecLevel: "M", maxVersion: QR_MAX_VERSION });
+  // The markup is generated by src/qr.js from module coordinates — the
+  // payload reaches it as geometry, never as text — so there is nothing
+  // here for a link to inject.
+  tile.innerHTML = qrSvg(qr, { margin: 4 });
+  tile.querySelector("svg")?.setAttribute("aria-label", `${label} as a QR code, version ${qr.version}`);
+  return tile;
+}
+
+/**
+ * The same signed bytes, as a file.
+ *
+ * One line, the driver URL — `wayfind://ticket#<base64url>`, which the
+ * driver app registers — because text survives mail clients, messengers
+ * and copy-paste, and because any human who opens it sees a tappable
+ * link rather than a binary blob. Nothing about the trust model changes
+ * with the carrier: a ticket file is a publish capability, and it
+ * travels under the same rule the ticket does.
+ */
+function ticketFileName(jobIdHex) {
+  const id = String(jobIdHex || "").slice(0, 12) || "unassigned";
+  return `job-${id}.wayfindjob`;
+}
+
+function ticketFileUrl(ticketBase64) {
+  return `wayfind://ticket#${ticketBase64}`;
+}
+
+function downloadTicketFile(ticketBase64, jobIdHex) {
+  const blob = new Blob([`${ticketFileUrl(ticketBase64)}\n`], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = ticketFileName(jobIdHex);
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  // Revoked on the next turn: Safari reads the blob after the click
+  // returns, so revoking synchronously hands it a dead URL.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function meshLinkField(caption, value, tone = "") {
+  const wrap = document.createElement("label");
+  wrap.className = "mesh-link";
+  if (tone) wrap.dataset.tone = tone;
+  const label = document.createElement("small");
+  label.textContent = caption;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.readOnly = true;
+  input.spellcheck = false;
+  input.value = value;
+  input.addEventListener("focus", () => input.select());
+  wrap.append(label, input);
+  return wrap;
+}
+
+// --- Devices (§20.9) --------------------------------------------------------
+//
+// A job is ciphertext addressed to a device, which means this browser is
+// a device: it has a keypair, a name, a fingerprint and a card, and it
+// shows all four. The same card is what a dispatcher scans to be able to
+// send this browser a job, and what this browser shows a driver.
+//
+// One page plays both roles, and that is exactly where a demo can lie.
+// It does not: there is no hidden "driver device". If you want to send
+// this browser a job from this browser, you enrol its own card through
+// the same paste-and-confirm path a second phone would use, and the
+// roster says "this device" next to the row so the two keys acting are
+// never confused for two devices.
+
+/** The card tile, rebuilt only when the card itself changes. */
+let meshDeviceCardKey = "";
+
+async function refreshDeviceIdentity() {
+  if (!pulseMesh) return null;
+  meshDeviceIdentity = await pulseMesh.deviceIdentity().catch(() => null);
+  return meshDeviceIdentity;
+}
+
+function renderDeviceCard() {
+  if (!meshDeviceOut) return;
+  const me = meshDeviceIdentity;
+  if (!me) {
+    meshDeviceOut.replaceChildren();
+    meshDeviceCardKey = "";
+    return;
+  }
+  // Never while it is being typed into: the mesh card re-renders every
+  // two seconds and would otherwise reset the cursor mid-name.
+  if (meshDeviceName && document.activeElement !== meshDeviceName) meshDeviceName.value = me.name;
+  if (me.cardUrl === meshDeviceCardKey) return;
+  meshDeviceCardKey = me.cardUrl;
+  meshDeviceOut.replaceChildren();
+
+  const identity = document.createElement("small");
+  identity.className = "mesh-job__summary";
+  identity.textContent = `${me.name} · fingerprint ${me.fingerprint}`;
+  meshDeviceOut.append(identity);
+
+  try {
+    meshDeviceOut.append(meshQrTile(me.cardUrl, "This device's card"));
+  } catch {
+    // A card is 40-odd bytes; there is no plan in it and no version of
+    // this that does not fit. Nothing to say if the encoder ever refuses.
+  }
+  const caption = document.createElement("small");
+  caption.className = "mesh-job__caption";
+  // The fingerprint's whole purpose, said where the fingerprint is.
+  caption.textContent = "Point a dispatcher's camera here, then read the fingerprint aloud and check it "
+    + "matches what their screen shows. The card is a public key: it says where a job can be sent, "
+    + "and it opens nothing.";
+  meshDeviceOut.append(caption);
+
+  meshDeviceOut.append(meshLinkField("Device card link — send it however you like; it is not a secret.", me.cardUrl));
+
+  const warning = document.createElement("p");
+  warning.className = "mesh-job__warning";
+  // The irreversible one. A browser has no Keystore, and a job sealed to
+  // a key that no longer exists cannot be opened by anybody at all.
+  warning.textContent = "This device's private key lives in this browser's localStorage — clearing site "
+    + "data or using another browser destroys it. Jobs already sealed to it can then be opened by "
+    + "nobody, including the dispatcher unless it sealed a copy to itself. Enrol again after a reset.";
+  meshDeviceOut.append(warning);
+}
+
+// --- The fleet's seed (§20.10) ----------------------------------------------
+//
+// The one thing in this card that is a **location** rather than a
+// capability. Everything else here grants something: a follow link
+// grants watching, a job grants publishing, a device card grants being
+// sent one. A seed address grants nothing at all — it says where a peer
+// is, and every thread on the far side still needs its own key.
+//
+// Which is why it needs no fingerprint ceremony and no enrolment gate,
+// and why the demo can accept one from a pasted link without asking
+// anybody to compare digits: an address naming the wrong machine does
+// not impersonate a seed, it fails to connect.
+
+function renderFleetSeed() {
+  if (!meshSeedOut || !pulseMesh) return;
+  const seeds = pulseMesh.fleetSeeds();
+  const remembered = pulseMesh.rememberedPeers();
+  meshSeedOut.replaceChildren();
+
+  const summary = document.createElement("small");
+  summary.className = "mesh-job__summary";
+  summary.textContent = seeds.length
+    ? `${seeds.length} seed address${seeds.length === 1 ? "" : "es"} · every job this browser issues carries ${seeds.length === 1 ? "it" : "them"}, sealed`
+    : "No seed — a job issued now carries no way to reach the mesh";
+  meshSeedOut.append(summary);
+
+  if (seeds.length) {
+    const list = document.createElement("ol");
+    list.className = "mesh-job__stops";
+    for (const address of seeds) {
+      const item = document.createElement("li");
+      item.textContent = address;
+      list.append(item);
+    }
+    meshSeedOut.append(list);
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "mesh-secondary";
+    clear.textContent = "Forget this seed";
+    clear.addEventListener("click", () => {
+      pulseMesh.setFleetSeeds("").then(() => {
+        showToast("Seed forgotten — new jobs will carry no bootstrap address", "info");
+        renderMeshCard();
+      }).catch(() => {});
+    });
+    meshSeedOut.append(clear);
+  }
+
+  const peers = document.createElement("small");
+  peers.className = "mesh-job__caption";
+  // The point of remembering: the seed is a first-contact problem, and
+  // once it has been solved once it should stay solved.
+  peers.textContent = remembered.length
+    ? `${remembered.length} peer${remembered.length === 1 ? "" : "s"} remembered from earlier sessions — `
+      + "this browser dials those too on start, so the seed only has to be up the first time."
+    : "No peers remembered yet. Once this browser has connected to the mesh once, it dials those "
+      + "peers on the next start and the seed stops being a single point of failure for joining.";
+  meshSeedOut.append(peers);
+}
+
+/**
+ * Takes a seed from whatever arrived: a `wayfind://seed#…` card, a bare
+ * fragment, or a multiaddr typed straight in. The card is the path a
+ * dispatcher uses (scan the keeper's own terminal); the typed multiaddr
+ * is the path an operator who already has the address uses.
+ */
+async function enrolFleetSeed(text) {
+  if (!pulseMesh) return null;
+  const value = String(text || "").trim();
+  if (!value) return null;
+  try {
+    // A card is base64url, in a fragment or bare; anything else is
+    // treated as typed addresses so the sentence a user gets for
+    // "seed.depot.example:4001" is the codec's own — "a seed address is
+    // a multiaddr and starts with /" — rather than base64's complaint
+    // about a string that was never meant to be base64.
+    const card = value.includes("#") || /^[A-Za-z0-9_-]+$/u.test(value);
+    if (!card) {
+      const seeds = await pulseMesh.setFleetSeeds(value);
+      showToast(`Seed set — ${seeds.length} address${seeds.length === 1 ? "" : "es"}`, "info");
+      renderMeshCard();
+      return seeds;
+    }
+    const enrolled = await pulseMesh.enrolSeed(value);
+    showToast(
+      `${enrolled.label || "Seed"} enrolled — ${enrolled.addresses.length} address`
+      + `${enrolled.addresses.length === 1 ? "" : "es"}. Jobs issued from here carry it, sealed.`,
+      "info"
+    );
+    renderMeshCard();
+    return enrolled.seeds;
+  } catch (error) {
+    showToast(`That is not a seed: ${error?.message || error}`, "error");
+    return null;
+  }
+}
+
+function renderDeviceRoster() {
+  if (!meshDeviceList || !pulseMesh) return;
+  const list = pulseMesh.roster();
+  meshDeviceList.replaceChildren();
+  if (!list.length) {
+    const empty = document.createElement("li");
+    empty.className = "mesh-device";
+    const title = document.createElement("b");
+    title.textContent = "No devices enrolled yet";
+    const note = document.createElement("code");
+    note.textContent = "no card, no job";
+    empty.append(title, note);
+    meshDeviceList.append(empty);
+    return;
+  }
+  for (const entry of list) {
+    const self = entry.publicKey === meshDeviceIdentity?.publicKeyHex;
+    const item = document.createElement("li");
+    item.className = "mesh-device";
+    item.dataset.self = String(self);
+    const name = document.createElement("b");
+    name.textContent = entry.name || "Unnamed device";
+    const fingerprint = document.createElement("code");
+    fingerprint.textContent = entry.fingerprint;
+    item.append(name, fingerprint);
+    if (self) {
+      const badge = document.createElement("small");
+      badge.className = "mesh-device__self";
+      badge.textContent = "This device — a job sealed here can be accepted in this tab";
+      item.append(badge);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      pulseMesh.removeDevice(entry.publicKey);
+      if (meshRecipient === entry.publicKey) meshRecipient = null;
+      showToast(`${entry.name} removed — no new job can be sealed to it`, "info");
+      renderMeshCard();
+    });
+    item.append(remove);
+    meshDeviceList.append(item);
+  }
+}
+
+function renderRecipientRow() {
+  if (!meshRecipientRow || !pulseMesh) return;
+  const list = pulseMesh.roster();
+  // A device that was removed cannot stay selected, or the next job would
+  // be sealed to a key the dispatcher no longer claims to know.
+  if (meshRecipient && !list.some(entry => entry.publicKey === meshRecipient)) meshRecipient = null;
+  meshRecipientRow.replaceChildren();
+  meshRecipientRow.hidden = !list.length;
+  for (const entry of list) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.role = "radio";
+    chip.ariaChecked = String(meshRecipient === entry.publicKey);
+    chip.className = meshRecipient === entry.publicKey ? "active" : "";
+    chip.textContent = `${entry.name} · ${entry.fingerprint}`;
+    chip.addEventListener("click", () => {
+      meshRecipient = entry.publicKey;
+      renderMeshCard();
+    });
+    meshRecipientRow.append(chip);
+  }
+}
+
+/**
+ * Enrols a card, from wherever it arrived: the enrol field, the follow
+ * field, or a `wayfind://device#…` opened in the address bar.
+ */
+async function enrolDeviceCard(text) {
+  if (!pulseMesh) return null;
+  try {
+    const entry = await pulseMesh.enrolDevice(text);
+    await refreshDeviceIdentity();
+    // Newly enrolled is almost always the device you are about to send
+    // to, but selecting it is still a click the user sees happen.
+    meshRecipient = entry.publicKey;
+    showToast(
+      entry.alreadyEnrolled
+        ? `${entry.name} was already enrolled — fingerprint ${entry.fingerprint}`
+        : `${entry.name} enrolled — check the fingerprint ${entry.fingerprint} against their screen`,
+      "info"
+    );
+    renderMeshCard();
+    return entry;
+  } catch (error) {
+    showToast(`That is not a device card: ${error?.message || error}`, "error");
+    return null;
+  }
+}
+
+/** A card that arrived on its own, shown before it is trusted. */
+function showDeviceCardOffer(card, source) {
+  if (!meshAcceptCard) return;
+  meshPendingCard = source;
+  meshFollowOut.hidden = true;
+  meshAcceptCard.hidden = false;
+  meshAcceptCard.replaceChildren();
+  const title = document.createElement("b");
+  title.textContent = "A device card was opened";
+  const meta = document.createElement("small");
+  meta.textContent = `${card.name || "Unnamed device"} · fingerprint ${card.fingerprint}`;
+  const note = document.createElement("small");
+  // Enrolling is not neutral: it is what makes this device a place jobs —
+  // and the customer data in them — can be sent.
+  note.textContent = "Enrolling adds it to this dispatcher's list, so jobs can be sealed to it. "
+    + "Read the fingerprint aloud first and check it matches the other phone's screen.";
+  const enrol = document.createElement("button");
+  enrol.type = "button";
+  enrol.textContent = "Enrol this device";
+  enrol.addEventListener("click", () => {
+    const pending = meshPendingCard;
+    dismissJobOffer();
+    enrolDeviceCard(pending).catch(() => {});
+  });
+  meshAcceptCard.append(title, meta, note, enrol);
+}
+
+/**
+ * The issued ticket, or the same ticket again when it is being handed on.
+ * Handover shows no customer link because the customer already has one —
+ * that it survives the change of driver is the point of §20.
+ */
+function renderJobTicket({ handover = false } = {}) {
+  if (!meshJobOut || !meshJob) return;
+  meshJobOut.hidden = false;
+  meshJobOut.replaceChildren();
+
+  const ticketStopList = meshJob.stops || [];
+  if (ticketStopList.length) {
+    const summary = document.createElement("small");
+    summary.className = "mesh-job__summary";
+    summary.textContent = ticketStopList.length === 1
+      ? "1 stop"
+      : `${ticketStopList.length} stops · optimized order`;
+    const list = document.createElement("ol");
+    list.className = "mesh-job__stops";
+    for (const [index, stop] of ticketStopList.entries()) {
+      const item = document.createElement("li");
+      item.textContent = stop.label || `Stop ${index + 1}`;
+      list.append(item);
+    }
+    meshJobOut.append(summary, list);
+  }
+
+  // A full delivery day does not fit a QR at a scannable version, and a
+  // squeezed symbol nobody's camera can read is worse than no symbol:
+  // the driver would try, fail, and have no idea why. When the plan is
+  // too big the tile is simply replaced by the sentence that says so —
+  // the file below carries the identical bytes either way. Sealing costs
+  // 130 bytes for one recipient and 194 for two, so the ceiling is lower
+  // than it was: about ten metadata-free stops rather than fifteen.
+  const carriesContact = ticketStopList.some(stop => stop.contact);
+  const sealedTo = meshJob.recipient
+    ? `${meshJob.recipient.name} (${meshJob.recipient.fingerprint})`
+    : "the chosen device";
+
+  const caption = document.createElement("small");
+  caption.className = "mesh-job__caption";
+  try {
+    meshJobOut.append(meshQrTile(meshJob.driverUrl, "Sealed job"));
+    // The claim that changed with §20.9, said plainly: this symbol is
+    // ciphertext. Not "handle it carefully" — unreadable.
+    caption.textContent = handover
+      ? `Point the next driver's camera here. It is sealed to ${sealedTo}: no other phone in the `
+        + "room gets anything from photographing it."
+      : `Point the driver's camera here. The job is sealed to ${sealedTo}, so a photograph of this `
+        + "code is ciphertext to everyone else — and nothing about the job reaches the mesh either, "
+        + "which only ever carries an 8-byte hash of the plan.";
+  } catch {
+    caption.textContent = "This plan is bigger than a phone camera can scan — "
+      + "hand the driver the file or the link instead. The file is the same sealed bytes.";
+  }
+  meshJobOut.append(caption);
+
+  const privacy = document.createElement("p");
+  privacy.className = "mesh-job__warning";
+  // The honest residue. Sealing removes the bystander with a camera; it
+  // does not remove the recipient, who holds a publish capability and,
+  // since §20.8, a short customer list.
+  privacy.textContent = (carriesContact
+    ? "Only the devices this was sealed to can read it — including the order numbers and customer "
+      + "phone numbers inside. "
+    : "Only the devices this was sealed to can read it. ")
+    + (meshJob.recipientCount === 1
+      // The dispatcher sealed to itself and to nobody else, which in this
+      // demo means it enrolled its own card as the driver. Saying "and
+      // this dispatcher" as if that were a second party would be a lie.
+      ? `That is one device — ${sealedTo}, which is this browser acting as both dispatcher and driver. `
+      : `That is two devices: ${sealedTo}, and this dispatcher, so this browser can still open the `
+        + "job it sent. ")
+    + "Whoever can open it can publish this vehicle — the protocol cannot tell two holders of one "
+    + "run seed apart, so send it to one device and no other.";
+  meshJobOut.append(privacy);
+
+  if (handover) {
+    const warning = document.createElement("p");
+    warning.className = "mesh-job__warning";
+    // §20.5: two holders of one seed are indistinguishable on the wire,
+    // so the protocol cannot enforce this and the page has to say it.
+    warning.textContent = "Handing this over means the other device publishes this vehicle, and reads "
+      + "every stop's order number, parcel count and customer phone number. "
+      + "Stop sharing here once they have it — the protocol cannot tell two holders of one run apart.";
+    meshJobOut.append(warning);
+  }
+
+  meshJobOut.append(meshLinkField(
+    meshJob.recipientCount === 1
+      ? `Sealed job — readable only by ${sealedTo}. Whoever can open it publishes the vehicle.`
+      : `Sealed job — readable only by ${sealedTo} and this dispatcher. Whoever can open it publishes the vehicle.`,
+    meshJob.driverUrl,
+    "publish"
+  ));
+
+  if (meshJob.ticketBase64) {
+    const download = document.createElement("button");
+    download.type = "button";
+    download.className = "mesh-secondary";
+    download.textContent = "Download sealed job file";
+    download.addEventListener("click", () => {
+      downloadTicketFile(meshJob.ticketBase64, meshJob.jobIdHex);
+    });
+    const fileNote = document.createElement("small");
+    fileNote.className = "mesh-job__caption";
+    // Same sealed bytes as the QR, different carrier — and the file is
+    // the only carrier once a plan outgrows a camera.
+    fileNote.textContent = `${ticketFileName(meshJob.jobIdHex)} — the same sealed job as a one-line file, `
+      + "for a plan too big to scan. It is ciphertext, so the channel it travels over cannot read it; "
+      + "the device it is addressed to still gets a publish capability.";
+    meshJobOut.append(download, fileNote);
+  }
+
+  if (meshJob.bootstrap?.length) {
+    const seed = document.createElement("small");
+    seed.className = "mesh-job__caption";
+    // The claim §20.10 makes, said where it is true: the address is in
+    // the sealed bytes above, so it reached the driver's device and no
+    // channel it travelled over saw it.
+    seed.textContent = `This job carries the fleet's seed (${meshJob.bootstrap.join(", ")}) inside the `
+      + "sealed ticket, so the driver's phone can reach the mesh on a cold start — and only that "
+      + "phone learns the address. An offer never carries one: it is broadcast to strangers, and a "
+      + "small operator's own machine is not something to publish to everyone who reads an ad.";
+    meshJobOut.append(seed);
+  }
+
+  if (meshJob.customerUrl) {
+    meshJobOut.append(meshLinkField(
+      "Customer link — read-only. Send it with the order confirmation.",
+      meshJob.customerUrl
+    ));
+    if (meshJob.customerHintUrl) {
+      meshJobOut.append(meshLinkField(
+        "Customer link with the seed hinted — same capability, plus an address to dial.",
+        meshJob.customerHintUrl
+      ));
+      const placement = document.createElement("small");
+      placement.className = "mesh-job__caption";
+      // One line, because the difference is one line: what is in front of
+      // the `#` is sent to the page host, and what is behind it never is.
+      placement.textContent = "The capability is behind the #, which browsers never transmit, so no "
+        + "server ever sees it; the seed is in front of it, as a public address the customer's device "
+        + "may dial or ignore. The two links have byte-identical fragments.";
+      meshJobOut.append(placement);
+    }
+    if (ticketStopList.length > 1) {
+      const caveat = document.createElement("small");
+      caveat.className = "mesh-job__caption";
+      // The plan is the driver's and the dispatcher's. Sending a customer
+      // the whole run to explain their own ETA sends them every other
+      // customer's address, which is not a trade the customer was offered.
+      caveat.textContent = "Send each customer this link plus their own stop — never the run. "
+        + "Handing over the whole plan hands over every other customer's address, order number "
+        + "and phone number.";
+      meshJobOut.append(caveat);
+    }
+  }
+
+  const meta = document.createElement("small");
+  meta.className = "mesh-job__meta";
+  meta.textContent = `Job ${meshJob.jobIdHex.slice(0, 12)} · ${jobModeLabel(meshJob.mode)}`
+    + ` · ${TRAVEL_MODE_LABELS[meshJob.travelMode] || "unspecified"}`
+    + ` · expires ${formatExpiry(meshJob.notAfter)}`;
+  meshJobOut.append(meta);
+}
+
+/**
+ * The deliveries a ticket carries, in the order the driver should make
+ * them.
+ *
+ * A trip's stop 0 is where the dispatcher is sending the vehicle *from* —
+ * the yard, the restaurant, the driver's current position — not a
+ * customer, so it never becomes a stop on the ticket. A round trip names
+ * it a second time at the tail; that repeat is not a delivery either.
+ */
+function ticketStops() {
+  if (routePlan?.kind === "trip") {
+    const seen = new Set([0]);
+    const ordered = [];
+    for (const index of routePlan.trip.order) {
+      if (seen.has(index)) continue;
+      seen.add(index);
+      const place = stops[index]?.place;
+      if (!place) continue;
+      ordered.push({
+        lat: place.lat,
+        lon: place.lon,
+        label: planLabel(place.label || `Stop ${ordered.length + 1}`)
+      });
+    }
+    return ordered;
+  }
+  // A two-point route: the ticket names the end of the line the router
+  // actually traced, which is the snapped road position rather than the
+  // rooftop the search matched.
+  const geometry = activeRouteGeometry();
+  if (!geometry?.length) return [];
+  const end = geometry[geometry.length - 1];
+  return [{ lat: end[0], lon: end[1], label: planLabel(stops[stops.length - 1]?.place?.label || "Drop-off") }];
+}
+
+/**
+ * Delivery metadata is per **stop**, not per slot, so it is keyed by the
+ * stop's own position: re-optimizing a round or dropping a stop out of
+ * the middle must not leave a customer's phone number attached to
+ * whoever ends up third in the list.
+ */
+function stopDetailKey(stop) {
+  return `${stop.lat.toFixed(5)},${stop.lon.toFixed(5)}`;
+}
+
+// The caps are the protocol's (§20.8), restated here the way the note
+// field's 64 already is. They are UTF-8 **byte** caps and these are
+// character limits, so an accented instruction can still be refused —
+// the encoder is the authority and its message reaches the toast.
+const STOP_DETAIL_FIELDS = [
+  { key: "orderRef", label: "Order reference", max: 24, placeholder: "e.g. 4471" },
+  { key: "parcels", label: "Parcels", max: 5, placeholder: "e.g. 2", numeric: true },
+  { key: "instructions", label: "Instructions", max: 64, placeholder: "e.g. side gate, leave with neighbour" },
+  { key: "contact", label: "Contact", max: 24, placeholder: "e.g. +1 514 555 0134", contact: true }
+];
+
+/** A one-line summary of what a stop already carries, for the collapsed row. */
+function stopDetailSummary(details) {
+  if (!details) return "Add details";
+  const parts = [];
+  if (details.orderRef) parts.push(`#${details.orderRef}`);
+  // `0` is a statement — "nothing to carry" — and must not vanish into a
+  // falsy check the way an unfilled box does.
+  if (details.parcels !== "" && details.parcels != null) {
+    parts.push(details.parcels === "1" ? "1 parcel" : `${details.parcels} parcels`);
+  }
+  if (details.instructions) parts.push("instructions");
+  if (details.contact) parts.push("contact");
+  return parts.length ? parts.join(" · ") : "Add details";
+}
+
+/**
+ * The dispatcher's per-stop detail editor.
+ *
+ * Collapsed by default: most stops on most days are an address and
+ * nothing else, and five boxes per stop on a twelve-drop round is a form
+ * nobody fills in. A `<details>` element does the disclosure natively,
+ * so it keeps the keyboard and screen-reader behaviour for free.
+ */
+function renderJobStopDetails() {
+  if (!meshJobStops) return;
+  const planned = pulseMesh && !pulseMesh.hasActiveTicket ? ticketStops() : [];
+  const signature = planned.map(stopDetailKey).join("|");
+  if (!planned.length) {
+    meshJobStops.hidden = true;
+    meshJobStops.replaceChildren();
+    meshStopDetailsKey = "";
+    return;
+  }
+  // Same round as last render: leave the DOM alone. The mesh tick runs
+  // every two seconds and a dispatcher typing an address into a box does
+  // not want it replaced underneath the cursor.
+  if (signature === meshStopDetailsKey && meshJobStops.childElementCount) return;
+  meshStopDetailsKey = signature;
+  meshJobStops.hidden = false;
+  meshJobStops.replaceChildren();
+
+  for (const [index, stop] of planned.entries()) {
+    const key = stopDetailKey(stop);
+    const details = meshStopDetails.get(key) || {};
+    const panel = document.createElement("details");
+    panel.className = "mesh-job-details__stop";
+    const summary = document.createElement("summary");
+    const name = document.createElement("b");
+    name.textContent = `${index + 1}. ${stop.label || `Stop ${index + 1}`}`;
+    const state = document.createElement("small");
+    state.textContent = stopDetailSummary(details);
+    summary.append(name, state);
+    panel.append(summary);
+
+    for (const field of STOP_DETAIL_FIELDS) {
+      const row = document.createElement("label");
+      row.className = "mesh-job-details__field";
+      const caption = document.createElement("small");
+      caption.textContent = field.label;
+      const input = document.createElement("input");
+      input.type = field.numeric ? "number" : (field.contact ? "tel" : "text");
+      if (field.numeric) { input.min = "0"; input.step = "1"; }
+      input.maxLength = field.max;
+      input.placeholder = field.placeholder;
+      input.value = details[field.key] ?? "";
+      input.addEventListener("input", () => {
+        const current = meshStopDetails.get(key) || {};
+        const value = input.value.trim();
+        if (value === "") delete current[field.key];
+        else current[field.key] = value;
+        meshStopDetails.set(key, current);
+        state.textContent = stopDetailSummary(current);
+      });
+      row.append(caption, input);
+      panel.append(row);
+    }
+    meshJobStops.append(panel);
+  }
+
+  const note = document.createElement("small");
+  note.className = "mesh-job-details__note";
+  // The privacy claim, stated where the phone number is typed rather
+  // than only in the docs: this is why it is safe to put here at all.
+  note.textContent = "These reach the driver inside the ticket and stop there — the wire carries an "
+    + "8-byte hash of the plan, so no follower ever sees an order number, a parcel count or a phone "
+    + "number. They do live in the ticket, so a leaked one now reads as a customer list.";
+  meshJobStops.append(note);
+}
+
+/** The typed details for a stop, as the plan codec wants them. */
+function withStopDetails(stop) {
+  const details = meshStopDetails.get(stopDetailKey(stop));
+  if (!details) return stop;
+  const parcels = details.parcels === "" || details.parcels == null ? null : Number(details.parcels);
+  return {
+    ...stop,
+    orderRef: details.orderRef || null,
+    // `0` survives: "nothing to carry, and the dispatcher said so" is a
+    // different claim from "nobody said", and the plan can hold both.
+    parcels: Number.isInteger(parcels) ? parcels : null,
+    instructions: details.instructions || null,
+    contact: details.contact || null
+  };
+}
+
+/**
+ * What is missing before a job can be issued at all.
+ *
+ * Enrolment is the gate (§20.9), so the button cannot simply fail: an
+ * empty roster is not an error the dispatcher made, it is a step nobody
+ * has taken yet, and the page has to name the step.
+ */
+function jobGateReason() {
+  if (!pulseMesh) return null;
+  if (!pulseMesh.roster().length) {
+    return "No device is enrolled, and a job can only be sealed to a device this dispatcher already "
+      + "holds the key for. Ask the driver for their device card — the wayfind://device link or QR on "
+      + "their phone — paste it under “Enrolled devices”, and check the fingerprint aloud. To try both "
+      + "roles in this one browser, press “Use this device's card” and enrol it.";
+  }
+  if (!meshRecipient) {
+    return "Pick the device this job is for. It is sealed to that device and to this dispatcher, and "
+      + "to nobody else — there is no “seal to whoever holds it”.";
+  }
+  return null;
+}
+
+async function createJobTicket() {
+  if (!pulseMesh) return;
+  const gate = jobGateReason();
+  if (gate) {
+    // Said in place rather than in a toast that disappears: the fix is
+    // three steps long and lives in a section further up the card.
+    if (meshJobGate) { meshJobGate.hidden = false; meshJobGate.textContent = gate; }
+    if (!pulseMesh.roster().length) meshEnrolInput?.focus();
+    return;
+  }
+  const ticket = ticketStops().map(withStopDetails);
+  if (!ticket.length) {
+    showToast("Plot a route first — a job ticket names where the vehicle is going", "error");
+    return;
+  }
+  try {
+    const job = await pulseMesh.issueJob({
+      stops: ticket,
+      fine: meshShareFine,
+      travelMode: meshTravelMode,
+      recipient: meshRecipient
+    });
+    meshJob = { ...job, stops: ticket };
+    renderJobTicket();
+    showToast(
+      `Job sealed to ${job.recipient.name} — the customer's link works before a driver exists`,
+      "info"
+    );
+  } catch (error) {
+    showToast(`The job could not be issued: ${error?.message || error}`, "error");
+    return;
+  }
+  renderMeshCard();
+}
+
+// --- Offers (§20.4) ---------------------------------------------------------
+//
+// The one artifact on this channel that is *meant* to be public. A
+// ticket is sealed because it goes to one device; an offer is unsealed
+// because it goes to strangers, and it is safe in public because it
+// contains a commitment to the plan and coarse descriptors rather than
+// anything worth stealing. Both halves of that are said on the card,
+// because a page that shows a QR without saying which of the two it is
+// has taught the user nothing.
+
+/** The routed distance of what is on screen — the size of the work. */
+function routeTotalMeters() {
+  if (!routePlan) return 0;
+  return routePlan.kind === "pair"
+    ? routePlan.candidates[routePlan.active].distanceMeters
+    : routePlan.trip.totalMeters;
+}
+
+function formatOfferPay(payMinor, currency) {
+  if (payMinor == null || !currency) return null;
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(payMinor / 100);
+  } catch {
+    return `${(payMinor / 100).toFixed(2)} ${currency}`;
+  }
+}
+
+/** "around 45.51, −73.58" — best-effort a place name for the same cell. */
+async function coarsePlaceName(centroid) {
+  const coordinates = `${centroid.lat.toFixed(2)}, ${centroid.lon.toFixed(2)}`;
+  if (!engine) return coordinates;
+  try {
+    const response = await reverseGeocodeOsm(engine, { lat: centroid.lat, lon: centroid.lon, size: 1 });
+    // The hit's **city and nothing else**. The nearest match to a grid
+    // centre is a street address, and printing it beside the cell would
+    // hand back exactly the precision the grid was there to remove — the
+    // municipality is coarser than the cell, so it adds a name without
+    // adding a location.
+    const place = (response.results || [])[0]?.city;
+    return place ? `${place} — ${coordinates}` : coordinates;
+  } catch {
+    return coordinates;
+  }
+}
+
+/** The coarse summary both the dispatcher and the bidder see. */
+function offerSummaryLines(offer) {
+  const pay = formatOfferPay(offer.payMinor, offer.currency);
+  const lines = [
+    `${offer.stopCount === 1 ? "1 stop" : `${offer.stopCount} stops`} · ${formatDistance(offer.totalMeters)}`
+      + ` · ${TRAVEL_MODE_LABELS[offer.travelMode] || "unspecified"} · ${jobModeLabel(offer.mode)}`,
+    `Ranges ${offer.spreadLabel}`,
+    `Expires ${formatExpiry(offer.notAfter)} · issuer ${offer.issuerHex.slice(0, 12)}`
+  ];
+  if (pay) lines.push(`Pay ${pay}`);
+  if (offer.label) lines.push(`“${offer.label}”`);
+  return lines;
+}
+
+async function broadcastJobOffer() {
+  if (!pulseMesh) return;
+  const stops = ticketStops().map(withStopDetails);
+  if (!stops.length) {
+    showToast("Plot a route first — an offer describes a round", "error");
+    return;
+  }
+  let offer;
+  try {
+    offer = await pulseMesh.broadcastOffer({
+      stops,
+      fine: meshShareFine,
+      travelMode: meshTravelMode,
+      totalMeters: Math.round(routeTotalMeters()),
+      payMinor: meshOfferPay?.value ? Number(meshOfferPay.value) : null,
+      // No default. A currency the page guessed is a price the dispatcher
+      // did not quote, and the codec refuses anything that is not ISO 4217.
+      currency: meshOfferPay?.value ? (meshOfferCurrency?.value.trim() || "EUR") : null,
+      label: meshOfferLabel?.value.trim() || null
+    });
+  } catch (error) {
+    showToast(`The offer could not be broadcast: ${error?.message || error}`, "error");
+    return;
+  }
+  await renderJobOffer(offer);
+  showToast(`Offer broadcast — ${offer.bytes} bytes, and not one address in them`, "info");
+}
+
+async function renderJobOffer(offer) {
+  if (!meshOfferOut) return;
+  meshOfferOut.hidden = false;
+  meshOfferOut.replaceChildren();
+
+  const title = document.createElement("b");
+  title.textContent = "A public offer for this round";
+  meshOfferOut.append(title);
+
+  const summary = document.createElement("small");
+  summary.className = "mesh-job__summary";
+  summary.textContent = offerSummaryLines(offer).join(" · ");
+  meshOfferOut.append(summary);
+
+  const where = document.createElement("small");
+  where.className = "mesh-job__summary";
+  where.textContent = `Around ${await coarsePlaceName(offer.centroid)}`
+    + ` (the centroid of the stops, rounded to a ${offer.centroid.gridDegrees}° grid — about 1 km)`;
+  meshOfferOut.append(where);
+
+  try {
+    meshOfferOut.append(meshQrTile(offer.offerUrl, "Job offer"));
+  } catch {
+    // 148–177 bytes. There is no round that makes this fail.
+  }
+
+  const caption = document.createElement("small");
+  caption.className = "mesh-job__caption";
+  // The claim that makes this button different from the one above it.
+  caption.textContent = "This one is not sealed, and does not need to be: post it in a group chat, a "
+    + "channel, a noticeboard. Anybody who reads it learns how many stops, how far, which travel mode, "
+    + "roughly where the round sits and until when — and nothing that names a door.";
+  meshOfferOut.append(caption);
+
+  const learns = document.createElement("p");
+  learns.className = "mesh-job__caption";
+  learns.textContent = "What a bidder does not learn: any stop's position, any address label, any order "
+    + "number, parcel count, instruction or customer phone number. Those are in the plan, and the offer "
+    + `carries only an 8-byte hash of it (${offer.bytes} bytes total). They reach one device — the one `
+    + "that is finally awarded the sealed ticket.";
+  meshOfferOut.append(learns);
+
+  meshOfferOut.append(meshLinkField(
+    "Offer link — public. Safe to post anywhere; it opens nothing and moves no vehicle.",
+    offer.offerUrl
+  ));
+
+  const meta = document.createElement("small");
+  meta.className = "mesh-job__meta";
+  meta.textContent = `Job ${offer.jobIdHex.slice(0, 12)} · the courier's device checks the ticket it is `
+    + "finally handed against this — a swapped plan is refused by name.";
+  meshOfferOut.append(meta);
+}
+
+/**
+ * An offer that arrived, shown to a courier deciding whether to bid.
+ *
+ * The honest line is the whole card: the addresses are *not* in this,
+ * and they arrive only if the job is awarded to this device. A page that
+ * showed a coarse summary without saying so would read as a job with
+ * missing details rather than a job with withheld ones.
+ */
+async function showOfferCard(text) {
+  if (!pulseMesh || !meshAcceptCard) return;
+  let offer;
+  try {
+    offer = await pulseMesh.describeOffer(text);
+  } catch (error) {
+    meshFollowOut.hidden = false;
+    meshFollowOut.textContent = `That offer did not decode: ${error?.message || error}`;
+    return;
+  }
+  meshFollowOut.hidden = true;
+  meshAcceptCard.hidden = false;
+  meshAcceptCard.replaceChildren();
+
+  const title = document.createElement("b");
+  title.textContent = "A job offer";
+  const meta = document.createElement("small");
+  meta.textContent = offerSummaryLines(offer).join(" · ");
+  meshAcceptCard.append(title, meta);
+
+  const where = document.createElement("small");
+  where.textContent = `Around ${await coarsePlaceName(offer.centroid)} — a ${offer.centroid.gridDegrees}° `
+    + "grid cell, about a kilometre across.";
+  meshAcceptCard.append(where);
+
+  const honest = document.createElement("small");
+  // The sentence this card exists for.
+  honest.textContent = offer.ok
+    ? "The addresses are not in this offer. Nobody who reads it — including you — can tell which doors "
+      + "the round visits. They arrive only if the dispatcher awards the job to this device, sealed to "
+      + "its key. What is in here is a hash of the plan, so the ticket you are eventually sent can be "
+      + "checked against this exact round."
+    : `This offer cannot be trusted: ${offer.reason}.`;
+  meshAcceptCard.append(honest);
+
+  const reply = document.createElement("button");
+  reply.type = "button";
+  reply.textContent = "Send this device's card to be considered";
+  reply.disabled = !offer.ok;
+  reply.addEventListener("click", () => { bidOnOffer(text).catch(() => {}); });
+  meshAcceptCard.append(reply);
+
+  const transport = document.createElement("small");
+  // Said plainly rather than implied: there is no market here.
+  transport.textContent = "There is no bidding channel in this protocol. Replying means sending the "
+    + "dispatcher your device card — the wayfind://device link below — by whatever channel you already "
+    + "use. Enrolment is what makes a sealed job possible at all (§20.9).";
+  meshAcceptCard.append(transport);
+}
+
+/** Records the bid and hands the courier their card to send. */
+async function bidOnOffer(text) {
+  try {
+    await pulseMesh.rememberOffer(text, { bid: true });
+  } catch (error) {
+    showToast(`That offer could not be kept: ${error?.message || error}`, "error");
+    return;
+  }
+  const me = await refreshDeviceIdentity();
+  if (!me) return;
+  meshAcceptCard.replaceChildren();
+  const title = document.createElement("b");
+  title.textContent = "Offer kept — send this card to the dispatcher";
+  const note = document.createElement("small");
+  note.textContent = "This device now remembers the round that was advertised. When a sealed job arrives, "
+    + "it is checked against it, and a job that is not the one offered is refused by name rather than "
+    + "quietly accepted.";
+  meshAcceptCard.append(title, note);
+  try {
+    meshAcceptCard.append(meshQrTile(me.cardUrl, "This device's card"));
+  } catch {
+    // A card is 40-odd bytes.
+  }
+  meshAcceptCard.append(meshLinkField(
+    "Device card — a public key. It says where a job can be sent, and opens nothing.",
+    me.cardUrl
+  ));
+  showToast("Offer kept — the ticket you are sent will be checked against it", "info");
+}
+
+/**
+ * Handing the job to the next driver.
+ *
+ * Since §20.9 this is not "show the same QR again": the ticket is
+ * re-sealed to a device chosen from the roster, which means the next
+ * driver has to have been enrolled here *before* the bike broke. There
+ * is no path around that, and when the roster is empty the panel says so
+ * instead of offering a button that cannot work.
+ */
+function handOverJob() {
+  if (!pulseMesh?.hasActiveTicket || !meshJobOut) return;
+  const devices = pulseMesh.roster();
+  meshJobOut.hidden = false;
+  meshJobOut.replaceChildren();
+
+  const title = document.createElement("b");
+  title.textContent = "Hand this job to another device";
+  meshJobOut.append(title);
+
+  if (!devices.length) {
+    const gate = document.createElement("p");
+    gate.className = "mesh-job__warning";
+    gate.textContent = "No device is enrolled here, so this job cannot be handed to anyone. A job is "
+      + "encrypted to the device it is for: get the next driver's device card (the wayfind://device "
+      + "link or QR on their phone), enrol it under “Enrolled devices”, then come back. No card, no "
+      + "transfer — that is the rule, not a limitation of this page.";
+    meshJobOut.append(gate);
+    return;
+  }
+
+  const note = document.createElement("small");
+  note.className = "mesh-job__caption";
+  note.textContent = "The same run, re-sealed to the device you pick. The customer's link keeps "
+    + "working — that it survives the change of driver is the point of a dispatch ticket.";
+  meshJobOut.append(note);
+
+  const row = document.createElement("div");
+  row.className = "mesh-chips";
+  for (const entry of devices) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.textContent = `${entry.name} · ${entry.fingerprint}`;
+    chip.addEventListener("click", () => { resealToDevice(entry).catch(() => {}); });
+    row.append(chip);
+  }
+  meshJobOut.append(row);
+}
+
+async function resealToDevice(entry) {
+  try {
+    const job = await pulseMesh.handOverJob(entry.publicKey);
+    meshJob = { ...job, stops: meshJob?.stops || pulseMesh.drivingSnapshot()?.stops || [] };
+    renderJobTicket({ handover: true });
+    showToast(`Re-sealed to ${entry.name} — only that device can open it`, "info");
+  } catch (error) {
+    showToast(`The job could not be handed over: ${error?.message || error}`, "error");
+  }
+}
+
+/** An offered ticket, shown before it is taken. */
+async function showJobOffer(text) {
+  if (!pulseMesh || !meshAcceptCard) return;
+  let job;
+  try {
+    job = await pulseMesh.describeJob(text);
+  } catch (error) {
+    meshFollowOut.hidden = false;
+    // `describeJob` already says "ticket" when the artifact is one, so
+    // this renders its sentence rather than wrapping it in a second.
+    meshFollowOut.textContent = String(error?.message || error);
+    return;
+  }
+  meshPendingTicket = text;
+  meshFollowOut.hidden = true;
+  meshAcceptCard.hidden = false;
+  meshAcceptCard.replaceChildren();
+
+  const title = document.createElement("b");
+  // It opened, so it was sealed to this device: that is the only reason
+  // its stops are on screen, and saying so makes the gate visible at the
+  // moment it let something through.
+  title.textContent = "A job sealed to this device";
+  const meta = document.createElement("small");
+  meta.textContent = `${jobModeLabel(job.mode)} · ${TRAVEL_MODE_LABELS[job.travelMode] || "unspecified"}`
+    + ` · expires ${formatExpiry(job.notAfter)}`
+    + ` · issuer ${job.issuerHex.slice(0, 12)} · job ${job.jobIdHex.slice(0, 12)}`;
+  meshAcceptCard.append(title, meta);
+
+  const list = document.createElement("ol");
+  list.className = "mesh-accept__stops";
+  for (const stop of job.stops) {
+    const item = document.createElement("li");
+    item.textContent = stop.label || `Stop ${stop.index}`;
+    const coordinates = document.createElement("span");
+    coordinates.textContent = `${stop.lat.toFixed(5)}, ${stop.lon.toFixed(5)}`;
+    item.append(coordinates);
+    list.append(item);
+  }
+  meshAcceptCard.append(list);
+
+  // §20.4: if this device bid on an offer, say out loud whether the job
+  // it was handed is the job that was advertised. A verdict shown only on
+  // failure is a verdict nobody trusts on success.
+  if (job.award) {
+    const award = document.createElement("small");
+    award.className = "mesh-job__meta";
+    award.textContent = job.award.ok
+      ? "Matches the offer you kept: same plan (planRef), same job, same issuer, same graph epoch, and "
+        + "it does not run later than advertised."
+      : `This is NOT the job that was offered — ${job.award.reason}. `
+        + "Refusing it: the round you agreed to is not the round in this ticket.";
+    meshAcceptCard.append(award);
+  }
+
+  const note = document.createElement("small");
+  note.textContent = job.ok
+    ? "This job was sealed to this device's key — that is why it opened here at all. "
+      + "Accepting publishes this vehicle to everyone holding the customer's link."
+    : `This job cannot be published: ${job.reason}.`;
+  meshAcceptCard.append(note);
+
+  const accept = document.createElement("button");
+  accept.type = "button";
+  accept.textContent = "Accept job";
+  accept.disabled = !job.ok;
+  accept.addEventListener("click", () => { acceptOfferedJob().catch(() => {}); });
+  meshAcceptCard.append(accept);
+}
+
+function dismissJobOffer() {
+  meshPendingTicket = null;
+  meshPendingCard = null;
+  if (meshAcceptCard) {
+    meshAcceptCard.hidden = true;
+    meshAcceptCard.replaceChildren();
+  }
+}
+
+async function acceptOfferedJob() {
+  const ticket = meshPendingTicket;
+  if (!ticket) return;
+  if (!pulseMesh) await togglePulseMesh(true);
+  if (!pulseMesh) return;
+  try {
+    const { job } = await pulseMesh.acceptJob(ticket);
+    meshRun = pulseMesh.run;
+    // No ticket bytes are kept here. The opened artifact stays inside the
+    // controller, and handing the job on goes back through it to be
+    // re-sealed — there is no plaintext ticket for this page to hold.
+    meshJob = {
+      ticketBase64: null,
+      driverUrl: null,
+      customerUrl: null,
+      stops: job.stops,
+      jobIdHex: job.jobIdHex,
+      mode: job.mode,
+      travelMode: job.travelMode,
+      notAfter: job.notAfter
+    };
+    dismissJobOffer();
+    showToast("Job accepted — you are now publishing this run", "info");
+    await routeToJobStop(job);
+  } catch (error) {
+    showToast(`The job could not be accepted: ${error?.message || error}`, "error");
+  }
+  renderMeshCard();
+}
+
+/**
+ * Puts the job's last stop where the router already looks for a
+ * destination, so the driver gets the ordinary directions flow rather
+ * than a second, parallel one.
+ */
+async function routeToJobStop(job) {
+  const last = job.stops?.[job.stops.length - 1];
+  if (!Number.isFinite(last?.lat) || !Number.isFinite(last?.lon)) return;
+  map.flyTo({ center: [last.lon, last.lat], zoom: Math.max(map.getZoom(), 13), essential: true });
+  if (routeAvailable !== true) return;
+  if (!directionsMode) setDirectionsMode(true);
+  if (stops.length < 2) {
+    while (stops.length < 2) stops.push(newStop());
+    renderStops();
+  }
+  const index = stops.length - 1;
+  const stop = stops[index];
+  if (!stop?.input) return;
+  const label = last.label || `${last.lat.toFixed(5)}, ${last.lon.toFixed(5)}`;
+  stop.text = label;
+  stop.input.value = label;
+  setStopNote(stop, "");
+  await setStopPlace(index, { lat: last.lat, lon: last.lon, label });
+  if (!stops[0]?.place) {
+    showToast("Destination set from the ticket — set your start point to route there.", "info");
+  }
+}
+
+async function followSharedDrive() {
+  if (!pulseMesh) return;
+  if (meshFollow) {
+    pulseMesh.stopFollowing();
+    meshFollow = null;
+    meshFollowPlan = null;
+    // A blob URL nobody revokes keeps the decoded image alive for the
+    // life of the tab, which is exactly the wrong thing to do with a
+    // photo of somebody's doorstep.
+    if (meshPhotoShown.url) URL.revokeObjectURL(meshPhotoShown.url);
+    meshPhotoShown = { hash: null, url: null };
+    clearInterval(meshFollowTimer);
+    meshFollowTimer = null;
+    meshFollowCard.hidden = true;
+    meshFollowOut.hidden = true;
+    meshFollowButton.textContent = "Follow";
+    await refreshMeshDisplay();
+    return;
+  }
+  const value = meshFollowInput.value.trim();
+  if (!value) return;
+  // A ticket pasted here is not a link to follow: it is a job to take,
+  // and acting on it the way this function acts on a link would put the
+  // person who pasted it on the road without being asked.
+  const artifact = await pulseMesh.classifyFragment(value).catch(() => null);
+  if (artifact?.kind === "ticket") {
+    await showJobOffer(value);
+    return;
+  }
+  // An offer is neither a run to watch nor a job to take: it is an
+  // advertisement, and the only decision it asks for is whether to bid.
+  if (artifact?.kind === "offer") {
+    if (artifact.reason) {
+      meshFollowOut.hidden = false;
+      meshFollowOut.textContent = artifact.reason;
+      return;
+    }
+    await showOfferCard(value);
+    return;
+  }
+  // A device card is neither a run to watch nor a job to take: it is an
+  // address to seal jobs *to*, and enrolling it is a decision about who
+  // this dispatcher will send customer data to.
+  if (artifact?.kind === "device") {
+    showDeviceCardOffer(artifact.card, value);
+    return;
+  }
+  // A seed card is a location, not a capability: there is nothing to
+  // watch and nothing to accept, so it goes straight to the seed list.
+  // Nothing is granted by holding one, which is why this needs no
+  // confirmation step where a device card needs two.
+  if (artifact?.kind === "seed") {
+    if (artifact.reason) {
+      meshFollowOut.hidden = false;
+      meshFollowOut.textContent = artifact.reason;
+      return;
+    }
+    await enrolFleetSeed(value);
+    meshFollowInput.value = "";
+    return;
+  }
+  // A link this build cannot read is named for what it is. Falling
+  // through would hand the user the link decoder's byte-count complaint.
+  if (artifact?.kind === "link" && artifact.reason) {
+    meshFollowOut.hidden = false;
+    meshFollowOut.textContent = artifact.reason;
+    return;
+  }
+  dismissJobOffer();
+  try {
+    meshFollow = await pulseMesh.followDrive(value, {
+      onUpdate: () => { refreshMeshDisplay().catch(() => {}); }
+    });
+    // A follow that starts mid-run has a hole by definition, and the
+    // channel fills it from other followers on join — so the card may
+    // have a position before a single new update arrives.
+    meshFollowOut.hidden = false;
+    meshFollowOut.textContent = "Following. Nothing but the link left this browser.";
+    meshFollowButton.textContent = "Stop";
+    clearInterval(meshFollowTimer);
+    meshFollowTimer = setInterval(() => { renderMeshFollow().catch(() => {}); }, 2000);
+    await renderMeshFollow();
+  } catch (error) {
+    meshFollowOut.hidden = false;
+    meshFollowOut.textContent = `That link did not decode: ${error?.message || error}`;
+  }
+}
+
+/**
+ * A ticket or link handed over as a file.
+ *
+ * A day's worth of stops outgrows a QR long before it outgrows the
+ * protocol, so the artifact also travels as a one-line text file. It is
+ * the same signed bytes over a different carrier, which is why this does
+ * nothing of its own: it reads the line into the follow field and calls
+ * the paste handler, so classify, accept and describe all behave exactly
+ * as they do for a link someone typed.
+ */
+async function openTicketFile() {
+  const file = meshFileInput?.files?.[0];
+  if (!file) return;
+  let text;
+  try {
+    text = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.addEventListener("load", () => resolve(String(reader.result || "")));
+      reader.addEventListener("error", () => reject(reader.error || new Error("unreadable")));
+      reader.readAsText(file);
+    });
+  } catch (error) {
+    showToast(`That file could not be read: ${error?.message || error}`, "error");
+    return;
+  } finally {
+    // Cleared so that choosing the same file twice fires `change` again.
+    meshFileInput.value = "";
+  }
+  if (!text.trim()) {
+    showToast("That file is empty — a ticket file is one line, the job's link", "error");
+    return;
+  }
+  meshFollowInput.value = text.trim();
+  // The follow button is a toggle. A file arriving while a follow is
+  // open means "watch this one instead", not "stop watching".
+  if (meshFollow) await followSharedDrive();
+  await followSharedDrive();
+}
+
+const THREAD_STATE_LABELS = {
+  1: "scheduled", 2: "en route", 3: "at a stop", 4: "arrived", 5: "cancelled", 6: "off plan"
+};
+
+/**
+ * What the driver has said about the stops, on the followed run's card.
+ *
+ * The map is cumulative in every record precisely so this can be drawn
+ * from the newest update alone: the gossip channel is lossy and catch-up
+ * reaches back two minutes, so a card that had to diff a history would
+ * show a follower who joined late a day with holes in it.
+ *
+ * A pending stop draws nothing. "Nobody has said what happened here" and
+ * "the van has not arrived" are different statements, and a badge for the
+ * first would be read as the second.
+ */
+function renderFollowedOutcomes(status, update) {
+  const outcomes = status.outcomes || [];
+  const marked = outcomes
+    .map((outcome, i) => ({ index: i + 1, outcome }))
+    .filter(entry => entry.outcome !== STOP_OUTCOME.PENDING);
+  if (!marked.length) return;
+
+  const badges = document.createElement("div");
+  badges.className = "mesh-outcomes";
+  for (const entry of marked) {
+    const badge = document.createElement("span");
+    badge.className = "mesh-outcome";
+    badge.dataset.outcome = STOP_OUTCOME_LABELS[entry.outcome];
+    badge.textContent = entry.outcome === STOP_OUTCOME.DELIVERED
+      ? `Stop ${entry.index} ✓`
+      : `Stop ${entry.index} ${STOP_OUTCOME_LABELS[entry.outcome]}`;
+    badges.append(badge);
+  }
+  meshFollowCard.append(badges);
+
+  // The latest mark in words, with its reason — which the bitmap alone
+  // cannot carry, and which is the whole difference between "skipped"
+  // and something a customer can act on.
+  const last = status.lastOutcome;
+  if (!last) return;
+  const sentence = document.createElement("small");
+  sentence.className = "mesh-follow-card__mark";
+  const hasNote = Boolean(update?.note?.length);
+  const note = hasNote ? ` (“${new TextDecoder().decode(update.note)}”)` : "";
+  const reason = stopReasonClause(last.reasonCode, hasNote);
+  sentence.textContent = `Stop ${last.stopIndex} ${STOP_OUTCOME_LABELS[last.outcome]}${reason}${note}`;
+  meshFollowCard.append(sentence);
+}
+
+/**
+ * The proof-of-delivery photo behind a mark, on the follower card
+ * (§20.7).
+ *
+ * Two outcomes, and the difference between them is the design rather
+ * than a limitation. A **dispatcher** — this browser, if it issued the
+ * job and still holds the ticket — can derive the key from the run seed,
+ * so it fetches the sealed blob by content hash, verifies it against the
+ * commitment, opens it and shows it. A **customer**, holding only the
+ * 45-byte link, cannot: the seed is not in the link and is not derivable
+ * from it. They get a chip saying a photo exists, which is honest and
+ * costs nothing — the commitment is in the record they can already read
+ * — and no fetch is attempted at all, because there would be nothing to
+ * do with the answer.
+ */
+async function renderFollowedPhoto(last, update) {
+  if (!last?.photoHash || !meshFollowCard) return;
+  if (meshPhotoShown.hash !== last.photoHash) {
+    if (meshPhotoShown.url) URL.revokeObjectURL(meshPhotoShown.url);
+    // The hash is claimed before the await, so the next tick's render
+    // does not fire a second fetch for the same photo.
+    meshPhotoShown = { hash: last.photoHash, url: null, holdsSeed: false };
+    let result = null;
+    try {
+      result = await pulseMesh?.followedPhoto({
+        photoHash: last.photoHash, stopIndex: last.stopIndex, planRef: update?.planRef
+      });
+    } catch (error) {
+      showToast(`That delivery photo would not open: ${error?.message || error}`, "error");
+    }
+    meshPhotoShown.holdsSeed = Boolean(result?.holdsSeed);
+    if (result?.bytes) {
+      meshPhotoShown.url = URL.createObjectURL(new Blob([result.bytes], { type: "image/jpeg" }));
+    }
+  }
+
+  if (meshPhotoShown.url) {
+    const image = document.createElement("img");
+    image.className = "mesh-photo";
+    image.src = meshPhotoShown.url;
+    image.alt = `Proof of delivery for stop ${last.stopIndex}`;
+    meshFollowCard.append(image);
+    return;
+  }
+
+  const chip = document.createElement("span");
+  chip.className = "mesh-photo-chip";
+  chip.dataset.state = meshPhotoShown.holdsSeed ? "unreachable" : "sealed";
+  // The two sentences are different facts and must not be blurred: one
+  // says the bytes are not for you, the other says they are for you and
+  // nobody reachable is holding them. Nothing relays a photo, so a
+  // driver who has gone home takes them with him.
+  chip.textContent = meshPhotoShown.holdsSeed
+    ? "Photo attached — the driver is not reachable right now"
+    : "Photo attached — dispatcher only";
+  meshFollowCard.append(chip);
+}
+
+/**
+ * The followed run's card.
+ *
+ * Every claim on it comes from the subscriber's own `status()`, not from
+ * this code: "bus expected 07:44" and "bus is here, arriving 07:44" are
+ * different claims, and §12 is explicit that a stale position must never
+ * be presented as the second.
+ */
+async function renderMeshFollow() {
+  if (!meshFollow || !meshFollowCard) return;
+  // §12's four rows are (live position?) × (live traffic?), and the
+  // subscriber can only answer the first half — the second is this
+  // device's own traffic channel. Without it the card said "live
+  // position, static-metric ETA" directly above a live-traffic ETA,
+  // which is the self-contradiction §12 exists to prevent.
+  const status = meshFollow.status({ hasTraffic: meshLastTraffic.length > 0 });
+  const update = meshFollow.latest();
+  meshFollowCard.hidden = false;
+  meshFollowCard.replaceChildren();
+
+  const claim = document.createElement("b");
+  claim.textContent = status.claim;
+  const meta = document.createElement("small");
+  meta.textContent = update
+    ? `${THREAD_STATE_LABELS[update.state] || "unknown"} · seq ${update.seq}` +
+      (status.travelMode ? ` · ${TRAVEL_MODE_LABELS[status.travelMode]}` : "") +
+      (status.ageSeconds != null ? ` · ${status.ageSeconds}s ago` : "")
+    : "waiting for the first update";
+  meshFollowCard.dataset.live = String(status.live);
+  meshFollowCard.append(claim, meta);
+
+  renderFollowedOutcomes(status, update);
+  await renderFollowedPhoto(status.lastOutcome, update);
+
+  // §9, the reason this channel lives in a maps engine: arrival is a
+  // local route query from the reported position to the stop *this*
+  // device cares about, under this device's live-traffic metric. The
+  // publisher broadcasts one position and never learns which stop
+  // anyone asked about.
+  const point = await meshFollow.position().catch(() => null);
+  if (point) {
+    if (!meshFollowPlan) {
+      meshFollowPlan = { stops: [{ index: 1, lat: point.lat, lon: point.lon }], dwellSeconds: 0 };
+    }
+    const destination = activeRouteGeometry()?.at(-1);
+    if (destination) {
+      meshFollowPlan = {
+        stops: [{ index: 1, lat: destination[0], lon: destination[1] }],
+        dwellSeconds: 0
+      };
+    }
+    const eta = await pulseMesh.followedEta(meshFollowPlan, 1).catch(() => null);
+    if (eta?.basis === "marked") {
+      // The driver said this stop is not being made. There is no arrival
+      // to show, so the card shows none — a number here would be a lie
+      // with a decimal point on it.
+      const line = document.createElement("small");
+      line.className = "mesh-follow-card__eta";
+      line.dataset.tone = "marked";
+      line.textContent = `The driver marked this stop ${eta.outcomeName}`
+        + stopReasonClause(eta.reasonCode, Boolean(update?.note?.length))
+        + ". No arrival is expected.";
+      meshFollowCard.append(line);
+    } else if (eta?.secondsFromNow != null) {
+      const line = document.createElement("small");
+      line.className = "mesh-follow-card__eta";
+      line.textContent = `${formatDuration(eta.secondsFromNow)} away · ${eta.basis} · from its ${eta.positionBasis === "reported-position" ? "reported position" : "last stop"}`;
+      meshFollowCard.append(line);
+      // §9 honesty: this page holds one graph and it is a driving graph.
+      // Routing a bike courier on it understates the time badly, and the
+      // follower is owed that sentence rather than a confident number.
+      if (eta.travelModeMismatch) {
+        const caveat = document.createElement("small");
+        caveat.className = "mesh-follow-card__caveat";
+        caveat.textContent = `This run is ${TRAVEL_MODE_LABELS[status.travelMode]}, and this page only has a `
+          + `${eta.profile} graph — the estimate is a ${eta.profile}'s, so treat it as a floor.`;
+        meshFollowCard.append(caveat);
+      }
+    }
+    const jump = document.createElement("button");
+    jump.type = "button";
+    jump.textContent = "Show on map";
+    jump.addEventListener("click", () => {
+      map.easeTo({ center: [point.lon, point.lat], zoom: Math.max(map.getZoom(), 14) });
+    });
+    meshFollowCard.append(jump);
+  } else if (update) {
+    // Coarse mode withholds position entirely — that is the setting
+    // working, not a failure, and the card says which.
+    const note = document.createElement("small");
+    note.textContent = "This link carries stop events only; no position is published.";
+    meshFollowCard.append(note);
+  }
+}
+
+/**
+ * One fix, to both channels, in the right order.
+ *
+ * The thread goes first because it is the one that can veto: threads §10
+ * rule 4 says a vehicle publishing a run must stop contributing *traffic*
+ * near its planned stops. A dwelling vehicle reports 0 km/h on a road
+ * that is flowing, and several of them corroborate each other into a
+ * convincing standstill that never happened.
+ */
+async function offerFixToMesh(lat, lon, speedMps, courseDeg) {
+  if (!pulseMesh) return;
+  let mayContribute = true;
+  if (meshRun) {
+    const result = await pulseMesh.threadFix({ lat, lon, speedMps }).catch(() => null);
+    if (result) mayContribute = result.contributeTraffic;
+  }
+  if (!mayContribute) return;
+  await pulseMesh.onLocation({ lat, lon, speedMps, courseDeg }).catch(() => {});
+}
+
+function wireMeshControls() {
+  if (!meshCard) return;
+  renderMeshReportRow();
+  meshToggle?.addEventListener("click", async () => {
+    meshToggle.disabled = true;
+    try {
+      await togglePulseMesh(!pulseMesh);
+      if (pulseMesh) await refreshMeshDisplay();
+    } catch (error) {
+      showToast(`Live traffic could not start: ${error?.message || error}`, "error");
+    } finally {
+      meshToggle.disabled = false;
+    }
+  });
+  meshContribute?.addEventListener("change", () => {
+    if (!pulseMesh) return;
+    if (meshContribute.checked && !window.confirm(
+      "Contributing publishes anonymous speed observations for the roads you drive. " +
+      "The reticent profile suppresses most of them and adds no identity to any record. Continue?"
+    )) {
+      meshContribute.checked = false;
+      return;
+    }
+    pulseMesh.setContributing(meshContribute.checked);
+    renderMeshCard();
+  });
+  meshSimulate?.addEventListener("click", () => {
+    if (!pulseMesh) return;
+    if (pulseMesh.snapshot().simulating) pulseMesh.stopSimulation();
+    else pulseMesh.startSimulation();
+    renderMeshCard();
+  });
+  meshShareButton?.addEventListener("click", () => { shareThisDrive().catch(() => {}); });
+  meshFollowButton?.addEventListener("click", () => { followSharedDrive().catch(() => {}); });
+  meshFileButton?.addEventListener("click", () => meshFileInput?.click());
+  meshFileInput?.addEventListener("change", () => { openTicketFile().catch(() => {}); });
+  meshJobButton?.addEventListener("click", () => { createJobTicket().catch(() => {}); });
+  meshOfferButton?.addEventListener("click", () => { broadcastJobOffer().catch(() => {}); });
+  meshHandoverButton?.addEventListener("click", () => handOverJob());
+  meshEnrolButton?.addEventListener("click", () => {
+    const value = meshEnrolInput?.value.trim();
+    if (!value) return;
+    enrolDeviceCard(value).then(entry => { if (entry && meshEnrolInput) meshEnrolInput.value = ""; });
+  });
+  meshEnrolInput?.addEventListener("keydown", event => {
+    if (event.key === "Enter") meshEnrolButton?.click();
+  });
+  meshSeedButton?.addEventListener("click", () => {
+    const value = meshSeedInput?.value.trim();
+    if (!value) return;
+    enrolFleetSeed(value).then(seeds => { if (seeds && meshSeedInput) meshSeedInput.value = ""; });
+  });
+  meshSeedInput?.addEventListener("keydown", event => {
+    if (event.key === "Enter") meshSeedButton?.click();
+  });
+  // One browser, both roles. This fills the enrol field with this
+  // device's own card and stops — the user still enrols it, so the
+  // mechanism they are shown is the mechanism a second phone would use.
+  meshEnrolSelfButton?.addEventListener("click", () => {
+    if (!meshDeviceIdentity || !meshEnrolInput) return;
+    meshEnrolInput.value = meshDeviceIdentity.cardUrl;
+    meshEnrolInput.focus();
+    showToast("This device's card is in the field — press Enrol to add it to the list", "info");
+  });
+  meshDeviceName?.addEventListener("change", () => {
+    if (!pulseMesh) return;
+    pulseMesh.setDeviceName(meshDeviceName.value)
+      .then(identity => {
+        meshDeviceIdentity = identity;
+        // A rename changes the card bytes, so anybody already holding it
+        // holds an out-of-date name for the same key — worth saying,
+        // because the fingerprint is what did not change.
+        showToast("Device renamed — the card changed, the key and fingerprint did not", "info");
+        renderMeshCard();
+      })
+      .catch(error => {
+        showToast(`That name will not fit: ${error?.message || error}`, "error");
+        meshDeviceName.value = meshDeviceIdentity?.name || "";
+      });
+  });
+  meshModeFine?.addEventListener("click", () => setShareMode(true));
+  meshModeCoarse?.addEventListener("click", () => setShareMode(false));
+  meshTravelCar?.addEventListener("click", () => setTravelMode(TRAVEL_MODE.CAR));
+  meshTravelBike?.addEventListener("click", () => setTravelMode(TRAVEL_MODE.BIKE));
+  meshTravelFoot?.addEventListener("click", () => setTravelMode(TRAVEL_MODE.FOOT));
+  // A link opened in the address bar is the intended way in: the
+  // capability lives in the fragment, which browsers never transmit, so
+  // the page can act on it without any server ever having seen it. Once
+  // the mesh is up, following starts on its own — being handed a link
+  // and then having to press a button is a step that exists only
+  // because someone forgot to take it out.
+  if (location.hash.length > 40) {
+    meshFollowInput.value = location.href;
+    followLinkFromFragment().catch(() => {});
+  }
+  renderMeshCard();
+}
+
+/**
+ * Follows the link this page was opened with, bringing the mesh up if it
+ * is not already. Threads need no admission bond and work in read-only
+ * mode — they are authenticated end to end by the thread key — so a
+ * viewer at home can follow a drive without contributing anything.
+ */
+async function followLinkFromFragment() {
+  if (!routeEngine) return;
+  if (!pulseMesh) await togglePulseMesh(true);
+  if (!pulseMesh) return;
+  // Same fragment, two very different artifacts. A follow link starts
+  // watching on its own — being handed a link and then having to press a
+  // button is a step nobody meant to leave in. A ticket does not: it is a
+  // publish capability, and taking a job is a decision.
+  const artifact = await pulseMesh.classifyFragment(location.href).catch(() => null);
+  if (artifact?.kind === "ticket") {
+    await showJobOffer(location.href);
+    return;
+  }
+  // An offer opened from a group chat: a coarse summary and a decision
+  // about whether to bid, never anything that starts on its own.
+  if (artifact?.kind === "offer" && !artifact.reason) {
+    await showOfferCard(location.href);
+    return;
+  }
+  // A `wayfind://device#…` opened here enrols nothing on its own: being
+  // handed a card is not the same as trusting it, and the fingerprint is
+  // meant to be compared before anybody presses anything.
+  if (artifact?.kind === "device") {
+    showDeviceCardOffer(artifact.card, location.href);
+    return;
+  }
+  // A `wayfind://seed#…` opened here — the dispatcher scanning the
+  // keeper's terminal — adds an address and nothing else. It grants
+  // nothing, so unlike a device card it needs no confirmation.
+  if (artifact?.kind === "seed" && !artifact.reason) {
+    await enrolFleetSeed(location.href);
+    return;
+  }
+  await followSharedDrive();
 }
 
 if (typeof window !== "undefined") {
-  // Exposed so the page (and anyone poking at the console) can drive the
-  // mesh without this module owning any UI.
+  // Still exposed for the console, but the page now drives the mesh
+  // through its own card rather than through this object.
   window.rangefindPulseMesh = {
     enable: () => togglePulseMesh(true),
     disable: () => togglePulseMesh(false),
-    report: reportPulseMeshJam,
-    state: () => pulseMesh?.refreshState() ?? null,
-    jams: () => pulseMesh?.jammedSegments() ?? [],
+    snapshot: () => pulseMesh?.snapshot() ?? null,
+    traffic: () => meshLastTraffic,
+    incidents: () => meshLastIncidents,
+    threads: () => pulseMesh?.threadStats ?? null,
+    follow: () => pulseMesh?.follow ?? null,
+    /** What actually reached the map, for checking the layer wiring. */
+    drawn: () => ({
+      layers: ["mesh-traffic", "mesh-traffic-casing", "mesh-incident-dot", "mesh-thread"]
+        .filter(id => map.getLayer(id)),
+      features: map.getSource("pulsemeshLive")?.serialize?.().data?.features?.length ?? 0,
+      styleLoaded: map.isStyleLoaded(),
+      routeSource: Boolean(map.getSource("routeLines")),
+      error: meshLayerError
+    }),
+    get session() { return pulseMesh?.session ?? null; },
     get mode() { return pulseMesh?.mode ?? null; }
   };
 }
@@ -2288,6 +4908,7 @@ function clearCorridorResults() {
 }
 
 function maybeRoute() {
+  updateTripEndRow();
   if (!directionsMode && !routePlan) return;
   if (!directionsReady()) {
     routeToken++;
@@ -2329,7 +4950,7 @@ async function computeRoute() {
       if (token !== routeToken) return;
       routePlan = { kind: "pair", candidates: [result, ...(result.alternatives || [])], active: 0 };
     } else {
-      const trip = await routeEngine.itinerary({ stops: points, roundTrip: false, ...departureParams() });
+      const trip = await routeEngine.itinerary({ stops: points, ...tripEndParams(), ...departureParams() });
       if (token !== routeToken) return;
       routePlan = { kind: "trip", trip };
     }
@@ -2506,6 +5127,10 @@ function renderRouteCard() {
   renderSteps();
   routeStepsWrap.open = true;
   routeNavActions.hidden = !routeEngine;
+  // A new route is a new corridor: the mesh re-scopes to it, and the card
+  // says what the live metric did to the answer.
+  updateRouteLiveNote();
+  meshFollowActiveRoute().catch(() => {});
 }
 
 function renderRouteReceipt(ms) {
@@ -3037,6 +5662,7 @@ function navHandleFix(lat, lon, headingHint) {
     nav.speedSample = { t: nowMs, p: match.progressMeters };
   }
   nav.lastFix = { lat, lon, bearing };
+  offerFixToMesh(lat, lon, nav.speedMps ?? 0, bearing);
   nav.puck?.setLngLat([lon, lat]);
   nav.puck?.setRotation(bearing);
   updateNavCamera(lat, lon, bearing, nav.source === "sim" ? NAV_SIM_TICK_MS + 60 : 900);
@@ -3408,6 +6034,19 @@ for (const option of departureRow.querySelectorAll("[data-departure]")) {
       other.setAttribute("aria-pressed", String(active));
     }
     if (directionsReady()) computeRoute();
+  });
+}
+
+for (const option of tripEndRow?.querySelectorAll("[data-trip-end]") || []) {
+  option.addEventListener("click", () => {
+    if (tripEndChoice === option.dataset.tripEnd) return;
+    tripEndChoice = option.dataset.tripEnd;
+    for (const other of tripEndRow.querySelectorAll("[data-trip-end]")) {
+      const active = other === option;
+      other.classList.toggle("active", active);
+      other.setAttribute("aria-pressed", String(active));
+    }
+    maybeRoute();
   });
 }
 

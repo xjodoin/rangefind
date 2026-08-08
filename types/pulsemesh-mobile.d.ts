@@ -1,4 +1,12 @@
 import type { MeshNetwork, MeshNode, PulseMeshConstants, PulseMeshProvider } from "./pulsemesh.js";
+import type { MeshSession } from "./pulsemesh-session.js";
+
+// An app host needs the whole session, plus the incident taxonomy its
+// report sheet is built from and the simulator that makes a live-traffic
+// feature testable before any peers exist.
+export * from "./pulsemesh-session.js";
+export { INCIDENT_TYPES } from "./pulsemesh.js";
+export { createLoopbackNetwork } from "./pulsemesh.js";
 
 /** What a host must provide before PulseMesh can run on it. */
 export declare function checkMobileHost(): {
@@ -8,6 +16,7 @@ export declare function checkMobileHost(): {
   threadsAvailable: boolean;
 };
 
+/** @deprecated The session is the surface; kept for older hosts. */
 export interface MobileMesh {
   node: MeshNode | null;
   contributor: unknown;
@@ -16,7 +25,7 @@ export interface MobileMesh {
     lat: number; lon: number; speedMps?: number; courseDeg?: number; nowMillis?: number;
   }): Promise<{ emitted: boolean; reason?: string }>;
   /** Subscribes to the z9 zones a route crosses. */
-  followRoute(route: { edges?: Array<{ segment: string }> }): Array<{ x: number; y: number }>;
+  followRoute(route: { edges?: Array<{ segment: string }> }): Promise<Array<{ x: number; y: number }>>;
   stats: { fixes: number; emitted: number; suppressed: number; lastReason: string | null; zones: number };
   host: ReturnType<typeof checkMobileHost>;
   /** Hand to `engine.route({ live })`. Null when consume-only. */
@@ -50,4 +59,4 @@ export declare function createMobileMesh(options: {
   contribute?: boolean;
   /** §11.6: consume-only over the pull path; no bond, no gossip membership. */
   readOnly?: boolean;
-}): Promise<MobileMesh>;
+}): Promise<MeshSession>;

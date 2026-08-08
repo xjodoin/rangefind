@@ -4001,6 +4001,127 @@ function routeMatchPublic(match) {
   };
 }
 
+// src/doc_value_manifest.js
+var DOC_VALUE_MANIFEST_MAGIC = [82, 70, 86, 77];
+var FORMAT_VERSION3 = 1;
+var CHECKSUM_ROW_BYTES = 32;
+function readZigzag2(bytes, state) {
+  const encoded = readVarint(bytes, state);
+  return encoded % 2 === 1 ? -(encoded + 1) / 2 : encoded / 2;
+}
+function readBitmap(bytes, state, count) {
+  const bits = new Array(count);
+  const byteCount = Math.ceil(count / 8);
+  for (let i = 0; i < count; i++) {
+    bits[i] = bytes[state.pos + (i >> 3)] >> (i & 7) & 1;
+  }
+  state.pos += byteCount;
+  return bits;
+}
+function decodeChunkSection(bytes, state, view, { chunkSize, total, packs, nextChecksumRow }) {
+  const count = readVarint(bytes, state);
+  const chunks = new Array(count);
+  let packIndex = 0;
+  let offset = 0;
+  for (let i = 0; i < count; i++) {
+    packIndex += readZigzag2(bytes, state);
+    offset += readZigzag2(bytes, state);
+    const length = readVarint(bytes, state);
+    const width = bytes[state.pos++];
+    const start = i * chunkSize;
+    chunks[i] = {
+      start,
+      count: Math.min(chunkSize, total - start),
+      pack: packs[packIndex],
+      packIndex,
+      offset,
+      length,
+      width,
+      min: null,
+      max: null,
+      words: null,
+      ...nextChecksumRow ? { checksumRow: nextChecksumRow.row++ } : {}
+    };
+  }
+  const flags = bytes[state.pos++];
+  if (flags & 1) {
+    const present = readBitmap(bytes, state, count);
+    for (let i = 0; i < count; i++) {
+      if (!present[i]) continue;
+      chunks[i].min = view.getFloat64(state.pos, true);
+      chunks[i].max = view.getFloat64(state.pos + 8, true);
+      state.pos += 16;
+    }
+  }
+  if (flags & 2) {
+    const wordsLen = readVarint(bytes, state);
+    const present = readBitmap(bytes, state, count);
+    for (let i = 0; i < count; i++) {
+      if (!present[i]) continue;
+      const words = new Array(wordsLen);
+      for (let j = 0; j < wordsLen; j++) {
+        words[j] = view.getUint32(state.pos, true);
+        state.pos += 4;
+      }
+      chunks[i].words = words;
+    }
+  }
+  return chunks;
+}
+function parseDocValueManifest(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  assertMagic(bytes, DOC_VALUE_MANIFEST_MAGIC, "Unsupported Rangefind doc-value manifest");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const state = { pos: DOC_VALUE_MANIFEST_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) {
+    throw new Error(`Unsupported Rangefind doc-value manifest version ${version}`);
+  }
+  const chunkSize = readVarint(bytes, state);
+  const lookupChunkSize = readVarint(bytes, state);
+  const total = readVarint(bytes, state);
+  const storage = readUtf8(bytes, state);
+  const compression = readUtf8(bytes, state);
+  const format = readUtf8(bytes, state);
+  const checksumsFile = readUtf8(bytes, state);
+  const checksumAlgorithm = readUtf8(bytes, state);
+  const packCount = readVarint(bytes, state);
+  const packs = new Array(packCount);
+  for (let i = 0; i < packCount; i++) packs[i] = readUtf8(bytes, state);
+  const nextChecksumRow = checksumsFile ? { row: 0 } : null;
+  const fieldCount = readVarint(bytes, state);
+  const fields = {};
+  for (let i = 0; i < fieldCount; i++) {
+    const name = readUtf8(bytes, state);
+    const kind = readUtf8(bytes, state);
+    const type = readUtf8(bytes, state);
+    const words = readVarint(bytes, state);
+    const hasLookup = bytes[state.pos++] === 1;
+    const chunks = decodeChunkSection(bytes, state, view, { chunkSize, total, packs, nextChecksumRow });
+    const lookupChunks = hasLookup ? decodeChunkSection(bytes, state, view, { chunkSize: lookupChunkSize, total, packs, nextChecksumRow }) : null;
+    fields[name] = {
+      name,
+      kind,
+      type,
+      words,
+      chunks,
+      ...lookupChunks ? { lookup_chunks: lookupChunks } : {}
+    };
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind doc-value manifest has trailing bytes.");
+  return {
+    storage,
+    compression,
+    format,
+    chunk_size: chunkSize,
+    lookup_chunk_size: lookupChunkSize,
+    total,
+    fields,
+    packs: packs.map((file) => ({ file })),
+    ...checksumsFile ? { checksum_rows: { file: checksumsFile, algorithm: checksumAlgorithm, rowBytes: CHECKSUM_ROW_BYTES } } : {}
+  };
+}
+
 // src/highlight.js
 var WORD_RE2 = /[\p{L}\p{M}\p{N}ー々]+/gu;
 function highlightTermSet(query, correctedQuery = "", analyzer = DEFAULT_ANALYZER) {
@@ -4095,7 +4216,7 @@ function applyHighlights(results, termSet, options = {}) {
 // src/vector_index.js
 var VECTOR_ROOT_FORMAT = "rfvecroot-v1";
 var VECTOR_CLUSTER_PAGE_FORMAT = "rfveccluster-v1";
-var FORMAT_VERSION3 = 1;
+var FORMAT_VERSION4 = 1;
 function vectorFromValue(value, dims) {
   if (value == null || value === "") return null;
   let out;
@@ -4148,7 +4269,7 @@ function decodeVectorClusterPage(buffer, expected = {}) {
   assertMagic(bytes, VECTOR_CLUSTER_PAGE_MAGIC, "Unsupported Rangefind vector cluster page");
   const state = { pos: VECTOR_CLUSTER_PAGE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind vector cluster page version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind vector cluster page version ${version}`);
   const field = readUtf8(bytes, state);
   if (expected.name && expected.name !== field) throw new Error(`Rangefind vector cluster page field mismatch: ${field}`);
   const clusterIndex = readVarint(bytes, state);
@@ -4172,7 +4293,7 @@ function parseVectorRoot(buffer) {
   assertMagic(bytes, VECTOR_ROOT_MAGIC, "Unsupported Rangefind vector root");
   const state = { pos: VECTOR_ROOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind vector root version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind vector root version ${version}`);
   const field = readUtf8(bytes, state);
   const metric = readUtf8(bytes, state);
   const dims = readVarint(bytes, state);
@@ -4742,6 +4863,8 @@ var GEO_E7_PRUNE_MARGIN_DEGREES = 1e-7;
 var GEO_TEXT_MAX_CANDIDATE_POINTS = 1e5;
 var GEO_TEXT_DOC_SET_HARD_CAP = 1e6;
 var GEO_TEXT_SORT_MAX_DF = 2e5;
+var GEO_TEXT_NEAREST_POINT_BYTES_ESTIMATE = 16;
+var GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES = 1 << 20;
 var FACET_COUNT_MAX_CHUNKS = 32;
 var FACET_COUNT_SIZE = 10;
 var textDecoder4 = new TextDecoder();
@@ -4839,7 +4962,17 @@ async function traceSpan(name, fn) {
     recordTraceSpan(trace, name, nowMs() - started);
   }
 }
-async function traceFetch(bucket, fn) {
+function defaultTraceFetchBytes(response) {
+  return Number(response?.headers?.get?.("content-length") || 0);
+}
+function recordTraceBytes(name, bytes) {
+  const trace = activeRuntimeTrace;
+  if (!trace || !Number.isFinite(bytes) || bytes <= 0) return;
+  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0, bytes: 0 };
+  current.bytes += bytes;
+  trace.spans.set(name, current);
+}
+async function traceFetch(bucket, fn, measureBytes = defaultTraceFetchBytes) {
   const trace = activeRuntimeTrace;
   if (!trace) return fn();
   const started = nowMs();
@@ -4848,8 +4981,7 @@ async function traceFetch(bucket, fn) {
     response = await fn();
     return response;
   } finally {
-    const bytes = Number(response?.headers?.get?.("content-length") || 0);
-    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, bytes);
+    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, measureBytes(response));
   }
 }
 function traceSpanSync(name, fn) {
@@ -4922,10 +5054,11 @@ async function fetchGzipArrayBuffer(url) {
 }
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
+  const rangeBytes = (response) => response?.status === 206 ? defaultTraceFetchBytes(response) : 0;
   for (let attempt = 0; ; attempt++) {
     const response = await traceFetch(bucket, () => fetchImpl(url, {
       headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-    }));
+    }), rangeBytes);
     if (response.status === 206) {
       return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
     }
@@ -4933,6 +5066,7 @@ async function fetchRange(url, offset, length) {
       const total = Number(response.headers.get("content-length") || 0);
       if (total > 0 && total <= Math.max(length * 4, 1 << 20)) {
         const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+        recordTraceBytes(`${bucket}.fetch`, body.byteLength || total);
         return body.slice(offset, offset + length);
       }
       try {
@@ -4947,8 +5081,16 @@ async function fetchRange(url, offset, length) {
     throw new Error(`Range request failed for ${url}`);
   }
 }
+var multiRangeUnsupportedOrigins = /* @__PURE__ */ new Set();
+function urlOrigin(url) {
+  try {
+    return new URL(String(url)).origin;
+  } catch {
+    return "";
+  }
+}
 async function fetchRanges(url, ranges, options = {}) {
-  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false) {
+  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false || multiRangeUnsupportedOrigins.has(urlOrigin(url))) {
     return Promise.all(ranges.map((range) => fetchRange(url, range.offset, range.length)));
   }
   const maxRanges = Math.max(2, Math.min(64, Math.floor(Number(options.multiRangeMaxRanges || 32))));
@@ -4966,13 +5108,14 @@ async function fetchRanges(url, ranges, options = {}) {
       headers: {
         Range: `bytes=${ranges.map((range) => `${range.offset}-${range.offset + range.length - 1}`).join(",")}`
       }
-    }));
+    }), (fetched) => fetched?.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(fetched.headers?.get?.("content-type") || "") ? defaultTraceFetchBytes(fetched) : 0);
     const contentType = response.headers?.get?.("content-type") || "";
     if (response.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(contentType)) {
       const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
       const parts = parseMultipartByteRanges(body, contentType);
       return selectMultipartByteRanges(parts, ranges);
     }
+    multiRangeUnsupportedOrigins.add(urlOrigin(url));
   } catch {
   }
   try {
@@ -5143,10 +5286,13 @@ async function createSearch(options = {}) {
   }
   async function ensureDocValuesManifest() {
     if (docValues) return docValues;
+    const binaryPath = options.docValuesBinaryManifest !== false ? manifest.lazy_manifests?.doc_values_v2 : null;
     const path = manifest.lazy_manifests?.doc_values;
-    if (!path) return null;
+    if (!binaryPath && !path) return null;
     if (!docValuesPromise) {
-      docValuesPromise = fetchManifestJsonIfOk(path).then((meta) => {
+      const loadJson = () => path ? fetchManifestJsonIfOk(path) : null;
+      const loadBinary = () => fetchGzipArrayBuffer(new URL(binaryPath, baseUrl)).then((buffer) => traceSpanSync("manifest.parse", () => parseDocValueManifest(buffer)));
+      docValuesPromise = (binaryPath ? loadBinary().catch(loadJson) : Promise.resolve(loadJson())).then((meta) => {
         docValues = meta || null;
         if (docValues) manifest.doc_values = docValues;
         return docValues;
@@ -5450,6 +5596,34 @@ async function createSearch(options = {}) {
   function docValueCacheKey(field, index, lookup = false) {
     return `${field}\0${lookup ? "lookup" : "chunk"}\0${index}`;
   }
+  async function attachDocValueChecksumRows(pending) {
+    const meta = docValues?.checksum_rows;
+    if (!verifyChecksums || !meta?.file) return;
+    const rowBytes = Number(meta.rowBytes) || 32;
+    const items = pending.filter((item) => !item.entry.checksum && Number.isInteger(item.entry.checksumRow));
+    if (!items.length) return;
+    const rows = [...new Set(items.map((item) => item.entry.checksumRow))].sort((a, b) => a - b);
+    const ranges = [];
+    for (const row of rows) {
+      const last = ranges[ranges.length - 1];
+      if (last && row * rowBytes === last.offset + last.length) last.length += rowBytes;
+      else ranges.push({ offset: row * rowBytes, length: rowBytes });
+    }
+    const buffers = await fetchRanges(new URL(meta.file, baseUrl), ranges, options);
+    const valueByRow = /* @__PURE__ */ new Map();
+    ranges.forEach((range, index) => {
+      const bytes = new Uint8Array(buffers[index]);
+      for (let at = 0; at + rowBytes <= bytes.length; at += rowBytes) {
+        let value = "";
+        for (let i = 0; i < rowBytes; i++) value += bytes[at + i].toString(16).padStart(2, "0");
+        valueByRow.set((range.offset + at) / rowBytes, value);
+      }
+    });
+    for (const item of items) {
+      const value = valueByRow.get(item.entry.checksumRow);
+      if (value) item.entry.checksum = { algorithm: meta.algorithm || "sha256", value };
+    }
+  }
   async function loadDocValueChunks(requests) {
     return traceSpan("docValues.loadChunks", async () => {
       if (!docValues || !requests.length) return;
@@ -5470,6 +5644,15 @@ async function createSearch(options = {}) {
         });
         docValueCache.set(key, promise);
         pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
+      }
+      try {
+        await attachDocValueChecksumRows(pending);
+      } catch (error) {
+        for (const item of pending) {
+          docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
+          item.reject(error);
+        }
+        return;
       }
       await readRangeGroups(
         rangeGroups(pending),
@@ -8428,6 +8611,73 @@ async function createSearch(options = {}) {
   function roundedDistanceMeters(distance) {
     return Math.round(distance * 10) / 10;
   }
+  async function runGeoTextNearestByDocValues({ page, size, filters, geoPlan, hasFilters, matchDocs }) {
+    if (options.geoTextNearestDocValues === false) return null;
+    const forced = options.geoTextNearestDocValues === true;
+    const root = await loadGeoTreeRoot(geoPlan.field);
+    if (!root?.total) return null;
+    const offset = (page - 1) * size;
+    const k = offset + size;
+    const expectedTraversalBytes = k * (root.total / matchDocs.size) * GEO_TEXT_NEAREST_POINT_BYTES_ESTIMATE;
+    let docValueBytes = null;
+    if (!forced) {
+      if (expectedTraversalBytes < GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES) return null;
+      docValueBytes = await estimateGeoFilterDocValueBytes(geoPlan, matchDocs.size);
+      if (!docValueBytes || docValueBytes >= expectedTraversalBytes) return null;
+    }
+    const docs = Array.from(matchDocs);
+    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const bitmapStore = docFilterPlan?.active ? await filterBitmapStoreForPlan(docFilterPlan) : null;
+    const bitmapCovered = bitmapStore?.covered || /* @__PURE__ */ new Set();
+    const residualFilterFields = docFilterPlan?.active ? [...new Set(filterPlanFields(docFilterPlan))].filter((field) => !bitmapCovered.has(field)) : [];
+    const store = await valueStoreForDocs(
+      [geoPlan.latField, geoPlan.lonField, ...residualFilterFields],
+      docs
+    );
+    const codeData = mergeValueStores(store, bitmapStore);
+    const near = geoPlan.near;
+    const matched = [];
+    for (const doc of docs) {
+      const latE7 = latToE7(valueForDoc(store, geoPlan.latField, doc));
+      const lonE7 = lonToE7(valueForDoc(store, geoPlan.lonField, doc));
+      if (latE7 == null || lonE7 == null) continue;
+      if (!geoPointMatchesE7(geoPlan, latE7, lonE7)) continue;
+      if (docFilterPlan?.active && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
+      matched.push({
+        doc,
+        dist: near ? haversineMetersE7(near.latE7, near.lonE7, latE7, lonE7) : 0
+      });
+    }
+    matched.sort((a, b) => a.dist - b.dist || a.doc - b.doc);
+    const rows = matched.slice(offset, offset + size).map((item) => [item.doc, 0]);
+    const resultContext = { hasTextTerms: false, preferDocPages: true };
+    const results = await rowsToResults(rows, resultContext);
+    if (near) {
+      for (const result of results) {
+        const item = matched.find((entry) => entry.doc === result.index);
+        if (item) result.distanceMeters = roundedDistanceMeters(item.dist);
+      }
+    }
+    return {
+      total: matched.length,
+      results,
+      page,
+      size,
+      approximate: false,
+      stats: {
+        exact: true,
+        geoLane: "nearestTextDocValues",
+        geoField: geoPlan.field,
+        geoDistanceSorted: true,
+        geoRouteSorted: false,
+        ...docValueBytes ? { geoDocValueBytesEstimated: Math.round(docValueBytes) } : {},
+        geoTraversalBytesEstimated: Math.round(expectedTraversalBytes),
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages,
+        docPayloadOverfetchDocs: resultContext.docPayloadOverfetchDocs
+      }
+    };
+  }
   async function runGeoBrowse({ page, size, filters, geoPlan, hasFilters, textMatchDocs = null }) {
     return traceSpan("geo.browse", () => runGeoBrowseInner({ page, size, filters, geoPlan, hasFilters, textMatchDocs }));
   }
@@ -11276,6 +11526,8 @@ async function createSearch(options = {}) {
     const analyzedTerms = queryAnalysis.analyzedTerms;
     const baseTerms = queryAnalysis.baseTerms;
     if (geoPlan?.sort || geoPlan?.routeSort) {
+      loadGeoTreeRoot(geoPlan.field).catch(() => {
+      });
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
         const budgetError = new Error("Rangefind: text geo sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
@@ -11284,14 +11536,42 @@ async function createSearch(options = {}) {
       }
       const hasUserFilters = Object.keys(userFilters.facets || {}).length || Object.keys(userFilters.numbers || {}).length || Object.keys(userFilters.booleans || {}).length;
       await ensureFacetDictionaries(userFilters);
-      const geoResponse = await runGeoBrowse({
-        page,
-        size,
-        filters: userFilters,
-        geoPlan,
-        hasFilters: hasUserFilters,
-        textMatchDocs: match.docs
-      });
+      let geoResponse = null;
+      if (!match.docs.size) {
+        geoResponse = {
+          total: 0,
+          results: [],
+          page,
+          size,
+          approximate: false,
+          stats: {
+            exact: true,
+            geoLane: geoPlan.routeSort ? "routeTextEmpty" : "nearestTextEmpty",
+            geoField: geoPlan.field,
+            geoDistanceSorted: !!geoPlan.sort,
+            geoRouteSorted: !!geoPlan.routeSort
+          }
+        };
+      } else if (!geoPlan.routeSort) {
+        geoResponse = await runGeoTextNearestByDocValues({
+          page,
+          size,
+          filters: userFilters,
+          geoPlan,
+          hasFilters: hasUserFilters,
+          matchDocs: match.docs
+        });
+      }
+      if (!geoResponse) {
+        geoResponse = await runGeoBrowse({
+          page,
+          size,
+          filters: userFilters,
+          geoPlan,
+          hasFilters: hasUserFilters,
+          textMatchDocs: match.docs
+        });
+      }
       if (!geoResponse) throw new Error("Rangefind: geo tree is unavailable for geographic sorting.");
       geoResponse.stats = {
         ...geoResponse.stats || {},
@@ -12240,6 +12520,13 @@ async function createSearch(options = {}) {
     const store = await valueStoreForDocs(fields, indexes);
     return indexes.map((index) => Object.fromEntries(fields.map((field) => [field, valueForDoc(store, field, index)])));
   }
+  function prefetchDocValues() {
+    try {
+      Promise.resolve(ensureDocValuesManifest()).catch(() => {
+      });
+    } catch {
+    }
+  }
   return {
     manifest,
     analyzer,
@@ -12251,6 +12538,7 @@ async function createSearch(options = {}) {
     hydrateRows,
     searchAddressAuthority,
     loadDocValues,
+    prefetchDocValues,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,
@@ -13443,6 +13731,22 @@ async function createShardedSearch(root, options, baseUrl) {
       return null;
     }
   }
+  function prefetchShards(names, { docValues = false } = {}) {
+    let picked;
+    try {
+      picked = candidateShards({ shards: names });
+    } catch {
+      return;
+    }
+    for (const shard of picked) {
+      const promise = engineAt(shard.index);
+      Promise.resolve(promise).then((shardEngine) => {
+        if (docValues) shardEngine.prefetchDocValues?.();
+      }, () => {
+        if (engines[shard.index] === promise) engines[shard.index] = null;
+      });
+    }
+  }
   return {
     manifest: root,
     shards: shards.map((shard) => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
@@ -13451,7 +13755,8 @@ async function createShardedSearch(root, options, baseUrl) {
     count,
     authorityLookup,
     vectorSearch,
-    loadFacetValues
+    loadFacetValues,
+    prefetchShards
   };
 }
 var runtime_default = createSearch;

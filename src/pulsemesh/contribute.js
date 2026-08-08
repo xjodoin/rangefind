@@ -92,6 +92,26 @@ export function createContributor({
   }
 
   /**
+   * Map-matches a fix and remembers it, without any of the emission
+   * gates. This is step 1 of handleFix, exposed on its own because
+   * reporting an incident is a different act from publishing
+   * measurements: a device that contributes nothing may still report the
+   * crash it is looking at, and §10.4 will only file that report for a
+   * *recently snapped* position. Without this, turning contribution off
+   * would silently turn incident reporting off with it.
+   */
+  async function observe(fix) {
+    const nowMillis = fix.nowMillis ?? clock();
+    const match = await snap(fix);
+    if (!match || match.distMeters > 50) {
+      lastMatch = null;
+      return null;
+    }
+    lastMatch = { ...match, nowMillis };
+    return lastMatch;
+  }
+
+  /**
    * §10.1 per-fix state machine. fix: { lat, lon, speedMps, courseDeg,
    * nowMillis? }. Returns { emitted, reason, record? }.
    */
@@ -104,13 +124,11 @@ export function createContributor({
     }
 
     // 1. Match.
-    const match = await snap(fix);
-    if (!match || match.distMeters > 50) {
+    const match = await observe({ ...fix, nowMillis });
+    if (!match) {
       stats.offRoad++;
-      lastMatch = null;
       return skip("off-road");
     }
-    lastMatch = { ...match, nowMillis };
 
     // 2. Quality.
     const headingDelta = Number.isFinite(fix.courseDeg) && Number.isFinite(match.bearingDeg)
@@ -237,5 +255,5 @@ export function createContributor({
     return { emitted: true, record: encodePMI1(fields) };
   }
 
-  return { handleFix, reportIncident, stats };
+  return { handleFix, observe, reportIncident, stats };
 }
