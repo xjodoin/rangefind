@@ -262,7 +262,13 @@ export interface RouteGraphEngine {
   }): Promise<MatrixResult>;
   itinerary(params: {
     stops: RoutePoint[];
+    /** Come back to stop 0 after the last one. Mutually exclusive with `openEnd`. */
     roundTrip?: boolean;
+    /**
+     * Start at stop 0, visit every other stop once, finish wherever the
+     * last delivery is. Mutually exclusive with `roundTrip`.
+     */
+    openEnd?: boolean;
     geometry?: boolean;
     bucket?: string;
     departureTime?: string | number | Date;

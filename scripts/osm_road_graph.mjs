@@ -262,7 +262,11 @@ const FOOT_NODE_PENALTIES = { traffic_signals: 60, level_crossing: 30, crossing_
  * take part in that driver's merge.
  */
 export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kindCode, log, faces = null, facing = FACES_BOTH) {
-  const MERGE_METERS = 30;
+  // Same radius as the query layer's marker merge, for the same reason —
+  // widened with it when a 31 m crossroads in Rosemère turned out to be one
+  // intersection that both layers were calling two. No along-route bound here:
+  // there is no route yet, only nodes, and a node cannot be visited twice.
+  const MERGE_METERS = 45;
   const charged = [];
   const grid = new Map();
   // Cell side comfortably over the merge radius, so a neighbour can only be in
@@ -635,6 +639,29 @@ function parseLaneCount(value) {
 }
 
 /**
+ * Whether a one-way carriageway shares a centre two-way left-turn lane.
+ *
+ * A wide street with a painted centre turn lane — the double-headed arrow — is
+ * one undivided road: a driver may turn left out of it into any driveway, and
+ * the oncoming traffic may do the same. Mappers routinely draw it as two
+ * `oneway=yes` ways a lane apart, each claiming the shared lane with
+ * `lanes:both_ways=1` and `turn:lanes:both_ways=left`. Boulevard Labelle
+ * through Rosemère is tagged exactly that way, ten metres between the two
+ * lines.
+ *
+ * Read literally that is a divided highway with no way across, and the router
+ * treated it as one: asked for a business on the far side it drove past the
+ * door, crossed at the next driveway that happened to be mapped through the
+ * median, and came back — a hundred metres of dogleg for a turn the driver
+ * makes every day. This tag is what says the crossing is allowed.
+ */
+export function centreTurnLane(tags) {
+  if (parseLaneCount(tags.get("lanes:both_ways")) > 0) return true;
+  const turns = tags.get("turn:lanes:both_ways");
+  return Boolean(turns) && turns.includes("left");
+}
+
+/**
  * Per-direction lane lists for a way.
  *
  * Unsuffixed `turn:lanes` describes a one-way's only direction, or — on a
@@ -977,6 +1004,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // the whole cost of carrying what the green panels say.
   const signTable = makeSignTable();
   const ways = [];
+  // One-way carriageways that share a painted centre left-turn lane with the
+  // line facing them, collected for [linkCentreTurnLanes].
+  const centreTurnWays = new Set();
   let ferryWays = 0;
   const names = [""];
   const nameIds = new Map([["", 0]]);
@@ -998,6 +1028,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
         names.push(name);
         nameIds.set(name, nameId);
       }
+      // Only a one-way line needs the crossing opened: where the way itself
+      // runs both directions the left turn was never in question.
+      if (profile.oneway(tags) !== 0 && centreTurnLane(tags)) centreTurnWays.add(id);
       const refStart = refSpool.length;
       const seen = new Set();
       for (const ref of refs) {
@@ -1357,6 +1390,17 @@ export function extractRoadGraph(pbfPath, options = {}) {
   }
   log(`edges: ${edgeFrom.length} directed`);
 
+  // A painted centre turn lane is a left turn the road allows and the two
+  // drawn lines deny. Opened before turn handling, so restrictions and turn
+  // costs are compiled over the crossings too and everything after this sees
+  // plain edges.
+  linkCentreTurnLanes({
+    centreTurnWays, nodeLat, nodeLon,
+    edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass,
+    edgeJunction, edgeSpeed, edgeCond, edgeSign, edgeFlags,
+    geomOffsets, geomBytes, laneOffsets, laneBytes, log
+  });
+
   // Turn handling. With turn costs enabled (car and bike by default), the
   // graph is fully junction-expanded into an edge-based graph: via-way
   // restrictions are compiled as chain copies first, then every junction
@@ -1442,6 +1486,458 @@ export function extractRoadGraph(pbfPath, options = {}) {
     condRules: conditionalTable.rules,
     signs: signTable.signs
   }, log);
+}
+
+/**
+ * How far apart the two lines of a centre-turn-lane road may sit and still be
+ * one road. Boulevard Labelle's are 10.4 m — two lanes of centreline offset
+ * plus the shared turn lane between them. Anything much wider is a boulevard
+ * with a real median, whatever it claims in its lane tags, and crossing it
+ * needs an intersection rather than a paint line.
+ */
+const CENTRE_CROSS_MIN_METERS = 3;
+const CENTRE_CROSS_MAX_METERS = 22;
+
+/**
+ * What crossing the oncoming lanes costs, in deciseconds.
+ *
+ * A left turn out of the centre lane is a wait for a gap, and the wait is the
+ * whole cost — the crossing itself is ten metres. Five seconds also keeps the
+ * one movement this opens up that is not simply a left turn honest: two
+ * crossings back to back are a u-turn across the centre lane, and at 2 x 50
+ * plus two left-turn charges they stay dearer than the 150 the profile already
+ * prices a u-turn at, so the router reaches for one no more often than before.
+ */
+const CENTRE_CROSS_PENALTY_DS = 50;
+
+/** Speed a driver crosses at, km/h — a crawl, because it is a standing start. */
+const CENTRE_CROSS_KMH = 20;
+
+/** How far a crossing must land from either end of the edge it splits. */
+const CENTRE_CROSS_MARGIN_METERS = 2;
+
+/** Two carriageways face each other when their headings differ by 120° or more. */
+const CENTRE_CROSS_OPPOSITE_DOT = -0.5;
+
+/**
+ * Opens the left turns a centre two-way left-turn lane actually allows.
+ *
+ * See [centreTurnLane]: such a road is one undivided street drawn as two
+ * one-way lines, and read literally it has no way across. Where the far line
+ * carries a junction with something else — a driveway, a side street, anything
+ * a driver would turn into — this splits the near line opposite it and joins
+ * the two with a short crossing edge in both directions. That is the movement
+ * the paint on the road permits, and the only one: crossings are added
+ * opposite somewhere to turn, never between two plain stretches of road.
+ *
+ * Runs before turn handling, so the crossings are ordinary edges by the time
+ * restrictions and turn costs are compiled and everything downstream — cliques,
+ * unpacking, guidance — sees nothing new. A crossing carries the carriageway's
+ * own name, because a driver waiting in the centre lane has not left the
+ * street yet; the maneuver is the turn out of it.
+ *
+ * Returns how many crossings were opened.
+ */
+export function linkCentreTurnLanes(context) {
+  const {
+    centreTurnWays, nodeLat, nodeLon,
+    edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass,
+    edgeJunction, edgeSpeed, edgeCond, edgeSign, edgeFlags,
+    geomOffsets, geomBytes, laneOffsets, laneBytes, log
+  } = context;
+  const note = log || (() => {});
+  if (!centreTurnWays || centreTurnWays.size === 0) return 0;
+
+  const edgeCount = edgeFrom.length;
+  const data = geomBytes.data;
+  let cursor = 0;
+  const readVarint = () => {
+    let value = 0;
+    let multiplier = 1;
+    for (;;) {
+      const byte = data[cursor++];
+      value += (byte & 0x7f) * multiplier;
+      if ((byte & 0x80) === 0) return value;
+      multiplier *= 0x80;
+    }
+  };
+  const readZigzag = () => {
+    const raw = readVarint();
+    return raw % 2 === 1 ? -(raw + 1) / 2 : raw / 2;
+  };
+  /** An edge's polyline, both endpoints included. */
+  const pointsOf = (edge) => {
+    cursor = geomOffsets[edge];
+    const interior = readVarint();
+    let lat = nodeLat[edgeFrom[edge]];
+    let lon = nodeLon[edgeFrom[edge]];
+    const points = [[lat, lon]];
+    for (let i = 0; i < interior; i++) {
+      lat += readZigzag();
+      lon += readZigzag();
+      points.push([lat, lon]);
+    }
+    points.push([nodeLat[edgeTo[edge]], nodeLon[edgeTo[edge]]]);
+    return points;
+  };
+
+  // Only named centre-turn carriageways take part: the name is what pairs a
+  // line with the one facing it, and an unnamed pair would match far too much.
+  const centreEdges = [];
+  for (let e = 0; e < edgeCount; e++) {
+    if (edgeName[e] && centreTurnWays.has(edgeWay[e])) centreEdges.push(e);
+  }
+  if (!centreEdges.length) return 0;
+
+  const METERS_PER_E7 = (EARTH_RADIUS_METERS * Math.PI) / 180 / 1e7;
+  const CELL_E7 = 4000;
+  const polylines = new Map();
+  const alongs = new Map();
+  const grid = new Map();
+  const cellKey = (cx, cy) => `${cx},${cy}`;
+  for (const e of centreEdges) {
+    const points = pointsOf(e);
+    polylines.set(e, points);
+    const along = [0];
+    for (let i = 0; i + 1 < points.length; i++) {
+      along.push(along[i] + haversineMetersE7(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1]));
+      const loLat = Math.min(points[i][0], points[i + 1][0]);
+      const hiLat = Math.max(points[i][0], points[i + 1][0]);
+      const loLon = Math.min(points[i][1], points[i + 1][1]);
+      const hiLon = Math.max(points[i][1], points[i + 1][1]);
+      for (let cx = Math.floor(loLat / CELL_E7); cx <= Math.floor(hiLat / CELL_E7); cx++) {
+        for (let cy = Math.floor(loLon / CELL_E7); cy <= Math.floor(hiLon / CELL_E7); cy++) {
+          const key = cellKey(cx, cy);
+          let bucket = grid.get(key);
+          if (!bucket) grid.set(key, (bucket = []));
+          bucket.push(e, i);
+        }
+      }
+    }
+    alongs.set(e, along);
+  }
+
+  // Which centre-turn street each node sits on, which way its traffic runs
+  // there, and whether anything else meets it — the "somewhere to turn into"
+  // that makes a crossing worth opening.
+  const nodeCount = nodeLat.length;
+  const centreName = new Int32Array(nodeCount).fill(-1);
+  const dirLat = new Float64Array(nodeCount);
+  const dirLon = new Float64Array(nodeCount);
+  for (const e of centreEdges) {
+    const points = polylines.get(e);
+    for (const [node, from, to] of [
+      [edgeFrom[e], points[0], points[1]],
+      [edgeTo[e], points[points.length - 2], points[points.length - 1]]
+    ]) {
+      if (centreName[node] >= 0) continue;
+      centreName[node] = edgeName[e];
+      const cosLat = Math.max(0.05, Math.cos(nodeLat[node] * 1e-7 * (Math.PI / 180)));
+      const dy = to[0] - from[0];
+      const dx = (to[1] - from[1]) * cosLat;
+      const length = Math.hypot(dx, dy) || 1;
+      dirLat[node] = dy / length;
+      dirLon[node] = dx / length;
+    }
+  }
+  const hasSideRoad = new Uint8Array(nodeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    for (const node of [edgeFrom[e], edgeTo[e]]) {
+      if (centreName[node] >= 0 && edgeName[e] !== centreName[node]) hasSideRoad[node] = 1;
+    }
+  }
+
+  // One crossing per node worth crossing to, at the closest point on the line
+  // facing it.
+  const cutsByEdge = new Map();
+  const crossings = [];
+  for (let node = 0; node < nodeCount; node++) {
+    if (centreName[node] < 0 || !hasSideRoad[node]) continue;
+    const lat = nodeLat[node];
+    const lon = nodeLon[node];
+    const cosLat = Math.max(0.05, Math.cos(lat * 1e-7 * (Math.PI / 180)));
+    const cx = Math.floor(lat / CELL_E7);
+    const cy = Math.floor(lon / CELL_E7);
+    let best = null;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const bucket = grid.get(cellKey(cx + dx, cy + dy));
+        if (!bucket) continue;
+        for (let b = 0; b < bucket.length; b += 2) {
+          const edge = bucket[b];
+          const index = bucket[b + 1];
+          if (edgeName[edge] !== centreName[node]) continue;
+          if (edgeFrom[edge] === node || edgeTo[edge] === node) continue;
+          const points = polylines.get(edge);
+          const a = points[index];
+          const c = points[index + 1];
+          const ax = (a[1] - lon) * METERS_PER_E7 * cosLat;
+          const ay = (a[0] - lat) * METERS_PER_E7;
+          const vx = (c[1] - a[1]) * METERS_PER_E7 * cosLat;
+          const vy = (c[0] - a[0]) * METERS_PER_E7;
+          const span = vx * vx + vy * vy;
+          if (span <= 0) continue;
+          const t = -(ax * vx + ay * vy) / span;
+          if (t < 0 || t > 1) continue;
+          const length = Math.sqrt(span);
+          // Facing traffic, not a service road running alongside.
+          if ((vy / length) * dirLat[node] + (vx / length) * dirLon[node] > CENTRE_CROSS_OPPOSITE_DOT) continue;
+          const perp = Math.hypot(ax + t * vx, ay + t * vy);
+          if (perp < CENTRE_CROSS_MIN_METERS || perp > CENTRE_CROSS_MAX_METERS) continue;
+          const along = alongs.get(edge);
+          const at = along[index] + t * length;
+          if (at < CENTRE_CROSS_MARGIN_METERS) continue;
+          if (at > along[along.length - 1] - CENTRE_CROSS_MARGIN_METERS) continue;
+          if (best && best.perp <= perp) continue;
+          best = {
+            edge,
+            index,
+            at,
+            perp,
+            lat: Math.round(a[0] + t * (c[0] - a[0])),
+            lon: Math.round(a[1] + t * (c[1] - a[1]))
+          };
+        }
+      }
+    }
+    if (!best) continue;
+    const cut = {
+      seg: best.index,
+      at: best.at,
+      lat: best.lat,
+      lon: best.lon,
+      node: nodeLat.length
+    };
+    nodeLat.push(cut.lat);
+    nodeLon.push(cut.lon);
+    let list = cutsByEdge.get(best.edge);
+    if (!list) cutsByEdge.set(best.edge, (list = []));
+    list.push(cut);
+    cut.crossing = { from: cut.node, to: node, meters: best.perp, like: best.edge };
+    crossings.push(cut.crossing);
+  }
+  if (!crossings.length) return 0;
+
+  // Two nodes opposite the same spot would split one edge twice a hair apart,
+  // leaving a piece too short to carry geometry. The second reuses the first.
+  for (const [edge, list] of cutsByEdge) {
+    list.sort((a, b) => a.at - b.at);
+    const kept = [];
+    for (const cut of list) {
+      const previous = kept[kept.length - 1];
+      if (previous && cut.at - previous.at < CENTRE_CROSS_MARGIN_METERS) {
+        // The node it opened stays where it is with nothing attached; the
+        // strongly-connected filter at the end of extraction drops it.
+        cut.crossing.from = previous.node;
+        continue;
+      }
+      kept.push(cut);
+    }
+    cutsByEdge.set(edge, kept);
+  }
+
+  // Rebuild: geometry lives in one shared byte spool with a prefix-offset per
+  // edge, so an edge cannot be lengthened or shortened where it lies.
+  const nextGeom = new GrowUint8();
+  const nextGeomOffsets = [0];
+  const nextLaneBytes = laneBytes ? new GrowUint8() : null;
+  const nextLaneOffsets = laneOffsets ? [0] : null;
+  const scratch = [];
+  const writeGeometry = (points) => {
+    scratch.length = 0;
+    const interior = points.length - 2;
+    pushVarint(scratch, Math.max(0, interior));
+    let prevLat = points[0][0];
+    let prevLon = points[0][1];
+    for (let i = 1; i <= interior; i++) {
+      pushZigzag(scratch, points[i][0] - prevLat);
+      pushZigzag(scratch, points[i][1] - prevLon);
+      prevLat = points[i][0];
+      prevLon = points[i][1];
+    }
+    nextGeom.ensure(scratch.length);
+    for (const byte of scratch) nextGeom.data[nextGeom.length++] = byte;
+    nextGeomOffsets.push(nextGeom.length);
+  };
+  const copyGeometry = (edge) => {
+    const start = geomOffsets[edge];
+    const end = geomOffsets[edge + 1];
+    nextGeom.ensure(end - start);
+    nextGeom.data.set(data.subarray(start, end), nextGeom.length);
+    nextGeom.length += end - start;
+    nextGeomOffsets.push(nextGeom.length);
+  };
+  const copyLanes = (edge) => {
+    if (!nextLaneBytes) return;
+    if (edge < 0) {
+      nextLaneBytes.push(0);
+      nextLaneOffsets.push(nextLaneBytes.length);
+      return;
+    }
+    const start = laneOffsets[edge];
+    const end = laneOffsets[edge + 1];
+    nextLaneBytes.ensure(end - start);
+    nextLaneBytes.data.set(laneBytes.data.subarray(start, end), nextLaneBytes.length);
+    nextLaneBytes.length += end - start;
+    nextLaneOffsets.push(nextLaneBytes.length);
+  };
+
+  const out = {
+    from: [], to: [], weight: [], dist: [], name: [], way: [], cls: [],
+    junction: [], speed: [], cond: [], sign: [], flags: []
+  };
+  const emit = (fields) => {
+    out.from.push(fields.from);
+    out.to.push(fields.to);
+    out.weight.push(fields.weight);
+    out.dist.push(fields.dist);
+    out.name.push(fields.name);
+    out.way.push(fields.way);
+    out.cls.push(fields.cls);
+    out.junction.push(fields.junction);
+    out.speed.push(fields.speed);
+    out.cond.push(fields.cond);
+    out.sign.push(fields.sign);
+    out.flags.push(fields.flags);
+  };
+
+  let splitEdges = 0;
+  for (let e = 0; e < edgeCount; e++) {
+    const cuts = cutsByEdge.get(e);
+    if (!cuts || !cuts.length) {
+      emit({
+        from: edgeFrom[e], to: edgeTo[e], weight: edgeWeightDs[e], dist: edgeDistDm[e],
+        name: edgeName[e], way: edgeWay[e], cls: edgeClass ? edgeClass[e] : 0,
+        junction: edgeJunction ? edgeJunction[e] : 0, speed: edgeSpeed ? edgeSpeed[e] : 0,
+        cond: edgeCond ? edgeCond[e] : 0, sign: edgeSign ? edgeSign[e] : 0,
+        flags: edgeFlags ? edgeFlags[e] : 0
+      });
+      copyGeometry(e);
+      copyLanes(e);
+      continue;
+    }
+    splitEdges++;
+    const points = polylines.get(e);
+    const packed = edgeJunction ? edgeJunction[e] : 0;
+    const junctionKind = packed % 8;
+    const junctionAt = junctionKind ? (packed - junctionKind) / 8 : -1;
+    const totalMeters = alongs.get(e)[points.length - 1] || 1;
+    const pieces = [];
+    let start = points[0];
+    let startOriginal = 0;
+    let from = edgeFrom[e];
+    let taken = 0;
+    for (const cut of cuts) {
+      const piece = [start];
+      const original = [startOriginal];
+      for (let i = Math.max(1, taken); i <= cut.seg; i++) {
+        piece.push(points[i]);
+        original.push(i);
+      }
+      piece.push([cut.lat, cut.lon]);
+      original.push(-1);
+      pieces.push({ from, to: cut.node, points: piece, original });
+      from = cut.node;
+      start = [cut.lat, cut.lon];
+      startOriginal = -1;
+      taken = cut.seg + 1;
+    }
+    const tail = [start];
+    const tailOriginal = [startOriginal];
+    for (let i = Math.max(1, taken); i < points.length - 1; i++) {
+      tail.push(points[i]);
+      tailOriginal.push(i);
+    }
+    tail.push(points[points.length - 1]);
+    tailOriginal.push(points.length - 1);
+    pieces.push({ from, to: edgeTo[e], points: tail, original: tailOriginal });
+
+    for (let p = 0; p < pieces.length; p++) {
+      const piece = pieces[p];
+      let meters = 0;
+      for (let i = 0; i + 1 < piece.points.length; i++) {
+        meters += haversineMetersE7(
+          piece.points[i][0], piece.points[i][1],
+          piece.points[i + 1][0], piece.points[i + 1][1]
+        );
+      }
+      // The wait folded into this edge's weight is spread over its pieces
+      // rather than charged to one of them: the drive costs what it cost, and
+      // no piece is long enough for where the seconds sit to be visible.
+      const share = meters / totalMeters;
+      const at = junctionAt >= 0 ? piece.original.indexOf(junctionAt) : -1;
+      const last = p === pieces.length - 1;
+      emit({
+        from: piece.from, to: piece.to,
+        weight: Math.max(1, Math.round(edgeWeightDs[e] * share)),
+        dist: Math.max(1, Math.round(meters * 10)),
+        name: edgeName[e], way: edgeWay[e], cls: edgeClass ? edgeClass[e] : 0,
+        junction: at >= 0 ? junctionKind + at * 8 : 0,
+        speed: edgeSpeed ? edgeSpeed[e] : 0, cond: edgeCond ? edgeCond[e] : 0,
+        sign: edgeSign ? edgeSign[e] : 0, flags: edgeFlags ? edgeFlags[e] : 0
+      });
+      writeGeometry(piece.points);
+      // Lane guidance describes the approach to the junction the edge ends at,
+      // so it belongs to the piece that still ends there.
+      copyLanes(last ? e : -1);
+    }
+  }
+
+  const crossKmhDs = (meters) => Math.max(1, Math.round((meters / ((CENTRE_CROSS_KMH * 1000) / 3600)) * 10));
+  for (const crossing of crossings) {
+    const like = crossing.like;
+    const weight = CENTRE_CROSS_PENALTY_DS + crossKmhDs(crossing.meters);
+    const dist = Math.max(1, Math.round(crossing.meters * 10));
+    for (const [from, to] of [[crossing.from, crossing.to], [crossing.to, crossing.from]]) {
+      emit({
+        from, to, weight, dist,
+        name: edgeName[like],
+        // No OSM way behind it, and way ids are what restrictions are matched
+        // by: zero is the one value no way can have.
+        way: 0,
+        cls: edgeClass ? edgeClass[like] : 0,
+        junction: 0,
+        speed: edgeSpeed ? edgeSpeed[like] : 0,
+        cond: 0,
+        sign: 0,
+        flags: 0
+      });
+      writeGeometry([[nodeLat[from], nodeLon[from]], [nodeLat[to], nodeLon[to]]]);
+      copyLanes(-1);
+    }
+  }
+
+  const replace = (target, values) => {
+    target.length = 0;
+    for (const value of values) target.push(value);
+  };
+  replace(edgeFrom, out.from);
+  replace(edgeTo, out.to);
+  replace(edgeWeightDs, out.weight);
+  replace(edgeDistDm, out.dist);
+  replace(edgeName, out.name);
+  replace(edgeWay, out.way);
+  if (edgeClass) replace(edgeClass, out.cls);
+  if (edgeJunction) replace(edgeJunction, out.junction);
+  if (edgeSpeed) replace(edgeSpeed, out.speed);
+  if (edgeCond) replace(edgeCond, out.cond);
+  if (edgeSign) replace(edgeSign, out.sign);
+  if (edgeFlags) replace(edgeFlags, out.flags);
+  replace(geomOffsets, nextGeomOffsets);
+  geomBytes.length = 0;
+  geomBytes.ensure(nextGeom.length);
+  geomBytes.data.set(nextGeom.view(), 0);
+  geomBytes.length = nextGeom.length;
+  if (nextLaneOffsets) {
+    replace(laneOffsets, nextLaneOffsets);
+    laneBytes.length = 0;
+    laneBytes.ensure(nextLaneBytes.length);
+    laneBytes.data.set(nextLaneBytes.view(), 0);
+    laneBytes.length = nextLaneBytes.length;
+  }
+
+  note(`centre turn lanes: ${crossings.length} crossings opened, ${splitEdges} carriageway edges split`);
+  return crossings.length;
 }
 
 export function applyTurnRestrictions(context) {

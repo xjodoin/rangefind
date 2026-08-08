@@ -814,6 +814,86 @@ test("itinerary orders stops and concatenates legs", async (t) => {
   assert.ok(trip.totalSeconds <= naiveTotal + 1e-9, "optimized order is no worse than input order");
 });
 
+test("an open-ended itinerary is free to finish at the last delivery", async (t) => {
+  const graph = syntheticGraph(20, 20, 11);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-open-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 40, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+  const nodeAt = (x, y) => y * 20 + x;
+  const point = (node) => ({ lat: graph.nodeLat[node] / 1e7, lon: graph.nodeLon[node] / 1e7 });
+
+  // The depot, three far corners, and — typed last, as a dispatcher would —
+  // a drop two blocks from the depot. Pinning that last address as the
+  // terminus forces a long haul home; letting the end float does not.
+  const stops = [
+    point(nodeAt(0, 0)),
+    point(nodeAt(18, 1)),
+    point(nodeAt(18, 18)),
+    point(nodeAt(1, 18)),
+    point(nodeAt(2, 2))
+  ];
+
+  const fixed = await engine.itinerary({ stops, geometry: false });
+  const open = await engine.itinerary({ stops, openEnd: true, geometry: false });
+
+  assert.equal(open.order[0], 0, "an open-ended trip still starts at stop 0");
+  assert.deepEqual([...open.order].sort((a, b) => a - b), [0, 1, 2, 3, 4], "every stop visited exactly once");
+  assert.equal(open.legs.length, stops.length - 1);
+  // Any fixed-end order is a legal open-ended order, so this direction is
+  // structural; the crafted layout makes it strict.
+  assert.ok(open.totalSeconds <= fixed.totalSeconds + 1e-9, "a free end is never worse than a pinned one");
+  assert.ok(open.totalSeconds < fixed.totalSeconds, "the free end skips the haul back to the last-typed address");
+  assert.notEqual(open.order[open.order.length - 1], stops.length - 1, "the last-typed stop is no longer the terminus");
+
+  // Round trips are untouched by the new mode.
+  const loop = await engine.itinerary({ stops, roundTrip: true, geometry: false });
+  assert.equal(loop.order.length, stops.length + 1, "a round trip has one extra hop");
+  assert.equal(loop.order[0], 0);
+  assert.equal(loop.order[loop.order.length - 1], 0, "a round trip comes home");
+  assert.equal(new Set(loop.order).size, stops.length, "a round trip visits every stop once");
+
+  await assert.rejects(
+    () => engine.itinerary({ stops, openEnd: true, roundTrip: true, geometry: false }),
+    /cannot both come back to the start and end anywhere/,
+    "the two end modes are mutually exclusive"
+  );
+});
+
+test("an open-ended itinerary past the exact bound falls back to 2-opt", async (t) => {
+  const graph = syntheticGraph(20, 20, 29);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-open-heuristic-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 40, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+  const nodeAt = (x, y) => y * 20 + x;
+  const point = (node) => ({ lat: graph.nodeLat[node] / 1e7, lon: graph.nodeLon[node] / 1e7 });
+
+  // Twelve stops: eleven interior under `openEnd`, one past the Held-Karp
+  // bound, entered in a deliberately bad zig-zag so the heuristic has
+  // something to fix.
+  const cells = [
+    [0, 0], [17, 2], [2, 5], [15, 7], [4, 10], [13, 12],
+    [6, 15], [11, 17], [8, 3], [3, 14], [16, 16], [9, 9]
+  ];
+  const stops = cells.map(([x, y]) => point(nodeAt(x, y)));
+  const trip = await engine.itinerary({ stops, openEnd: true, geometry: false });
+
+  assert.equal(trip.order[0], 0, "the heuristic still starts at stop 0");
+  assert.deepEqual(
+    [...trip.order].sort((a, b) => a - b),
+    cells.map((_, index) => index),
+    "the heuristic order is a permutation of the stops"
+  );
+  assert.equal(trip.legs.length, stops.length - 1);
+  assert.ok(Number.isFinite(trip.totalSeconds) && trip.totalSeconds > 0, "the trip has a finite cost");
+
+  const { seconds } = await engine.matrix({ points: stops });
+  let identityTotal = 0;
+  for (let i = 0; i + 1 < stops.length; i++) identityTotal += seconds[i][i + 1];
+  assert.ok(trip.totalSeconds <= identityTotal + 1e-6, "the heuristic beats the order the stops were typed in");
+});
+
 test("a reported heading prices turning around at the origin", async (t) => {
   const graph = syntheticGraph(14, 14, 73);
   const dir = mkdtempSync(join(tmpdir(), "rangefind-route-heading-"));
@@ -1002,6 +1082,19 @@ test("one intersection reports one junction, however many nodes describe it", as
   assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), SIGNAL, 455008000, -736000000), false);
   // The first junction of a drive has nothing to merge with.
   assert.equal(mergesWithPreviousJunction(null, SIGNAL, 455000000, -736000000), false);
+
+  // The width that started this: Chemin de la Grande-Côte crosses Boulevard
+  // Labelle in Rosemère with a carriageway and a turn lane on each side, and
+  // its two signal markers sit 31 m apart. One left turn, one red light — the
+  // driver was shown two.
+  const wide = at(45.6243114, -73.8025515, SIGNAL);
+  wide.atMeters = 278.7;
+  assert.equal(mergesWithPreviousJunction(wide, SIGNAL, 456240382, -738026403, 330.5), true);
+
+  // Same two coordinates, met 300 m apart along the route: a block circled,
+  // not a crossroads crossed. Distance alone cannot tell those apart, which is
+  // why the radius may only be this wide with the along-route bound beside it.
+  assert.equal(mergesWithPreviousJunction(wide, SIGNAL, 456240382, -738026403, 590.0), false);
 });
 
 test("one intersection costs one wait, however many nodes describe it", async () => {
@@ -1043,6 +1136,185 @@ test("one intersection costs one wait, however many nodes describe it", async ()
   // Kind codes are the query layer's business and must survive untouched, or
   // the map stops drawing lights it should draw.
   assert.deepEqual([...kind], [SIGNAL, SIGNAL, CROSSING, CROSSING]);
+});
+
+/**
+ * Boulevard Labelle through Rosemère, to the metre, as OSM has it: two
+ * `oneway=yes` lines 10.4 m apart, both named, both tagged `lanes:both_ways=1`
+ * and `turn:lanes:both_ways=left` — one undivided street with a painted centre
+ * turn lane, drawn as two. `a*` is the south-east-bound line the driver is on,
+ * `b*` the north-west-bound one; `e1` is the business being driven to, reached
+ * by a driveway off `b2`, and `a2`–`b0` is the one driveway near here that is
+ * mapped straight across the middle.
+ */
+const LABELLE = {
+  s: [45.623340, -73.801530],
+  a0: [45.622897, -73.800975],
+  a1: [45.622461, -73.800347],
+  a2: [45.622405, -73.800266],
+  b0: [45.622470, -73.800170],
+  b1: [45.622527, -73.800253],
+  b2: [45.622771, -73.800604],
+  b3: [45.622957, -73.800872],
+  e1: [45.622998, -73.800302]
+};
+
+class ByteSpool {
+  constructor() {
+    this.data = new Uint8Array(4096);
+    this.length = 0;
+  }
+  ensure(extra) {
+    if (this.length + extra <= this.data.length) return;
+    const next = new Uint8Array((this.length + extra) * 2);
+    next.set(this.data.subarray(0, this.length));
+    this.data = next;
+  }
+  push(value) {
+    this.ensure(1);
+    this.data[this.length++] = value;
+  }
+  view() {
+    return this.data.subarray(0, this.length);
+  }
+}
+
+function labelleGraph() {
+  const order = Object.keys(LABELLE);
+  const nodeLat = order.map(key => Math.round(LABELLE[key][0] * 1e7));
+  const nodeLon = order.map(key => Math.round(LABELLE[key][1] * 1e7));
+  const id = key => order.indexOf(key);
+  const graph = {
+    nodeLat, nodeLon,
+    edgeFrom: [], edgeTo: [], edgeWeightDs: [], edgeDistDm: [], edgeName: [],
+    edgeWay: [], edgeClass: [], edgeJunction: [], edgeSpeed: [], edgeCond: [],
+    edgeSign: [], edgeFlags: [],
+    geomOffsets: [0], geomBytes: new ByteSpool(),
+    laneOffsets: [0], laneBytes: new ByteSpool()
+  };
+  const meters = (from, to) => {
+    const toRad = Math.PI / 180 / 1e7;
+    const dLat = (nodeLat[to] - nodeLat[from]) * toRad;
+    const dLon = (nodeLon[to] - nodeLon[from]) * toRad;
+    const a = Math.sin(dLat / 2) ** 2 +
+      Math.cos(nodeLat[from] * toRad) * Math.cos(nodeLat[to] * toRad) * Math.sin(dLon / 2) ** 2;
+    return 2 * 6371008.7714 * Math.asin(Math.min(1, Math.sqrt(a)));
+  };
+  const add = (fromKey, toKey, way, name, kmh = 60) => {
+    const from = id(fromKey);
+    const to = id(toKey);
+    const length = meters(from, to);
+    graph.edgeFrom.push(from);
+    graph.edgeTo.push(to);
+    graph.edgeWeightDs.push(Math.max(1, Math.round((length / ((kmh * 1000) / 3600)) * 10)));
+    graph.edgeDistDm.push(Math.max(1, Math.round(length * 10)));
+    graph.edgeName.push(name);
+    graph.edgeWay.push(way);
+    graph.edgeClass.push(0);
+    graph.edgeJunction.push(0);
+    graph.edgeSpeed.push(kmh);
+    graph.edgeCond.push(0);
+    graph.edgeSign.push(0);
+    graph.edgeFlags.push(0);
+    graph.geomBytes.push(0);
+    graph.geomOffsets.push(graph.geomBytes.length);
+    graph.laneBytes.push(0);
+    graph.laneOffsets.push(graph.laneBytes.length);
+  };
+  const NAMED = 1;
+  for (const pair of [["s", "a0"], ["a0", "a1"], ["a1", "a2"]]) add(...pair, 1090282700, NAMED);
+  for (const pair of [["b0", "b1"], ["b1", "b2"], ["b2", "b3"]]) add(...pair, 1090282672, NAMED);
+  add("a2", "b0", 1090502896, 0, 20);
+  add("b0", "a2", 1090502896, 0, 20);
+  add("b2", "e1", 1090508941, 0, 20);
+  add("e1", "b2", 1090508941, 0, 20);
+  return graph;
+}
+
+async function labelleRoute(graph) {
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-centre-"));
+  try {
+    await buildRouteGraph({
+      nodeLat: Int32Array.from(graph.nodeLat),
+      nodeLon: Int32Array.from(graph.nodeLon),
+      edgeFrom: Uint32Array.from(graph.edgeFrom),
+      edgeTo: Uint32Array.from(graph.edgeTo),
+      edgeWeightDs: Uint32Array.from(graph.edgeWeightDs),
+      edgeDistDm: Uint32Array.from(graph.edgeDistDm),
+      edgeName: Uint32Array.from(graph.edgeName),
+      edgeClass: Uint8Array.from(graph.edgeClass),
+      edgeSpeed: Uint8Array.from(graph.edgeSpeed),
+      geomOffsets: Uint32Array.from(graph.geomOffsets),
+      geomBytes: Uint8Array.from(graph.geomBytes.view()),
+      names: ["", "Boulevard Labelle"],
+      profile: "car",
+      classes: ["primary"]
+    }, dir, { leafSize: 8, log: () => {} });
+    const engine = await openRouteGraphDir(dir);
+    return await engine.route({
+      from: { lat: LABELLE.s[0], lon: LABELLE.s[1] },
+      to: { lat: LABELLE.e1[0], lon: LABELLE.e1[1] }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("a painted centre turn lane is a left turn, not a hundred-metre dogleg", async () => {
+  const { centreTurnLane, linkCentreTurnLanes } = await import("../scripts/osm_road_graph.mjs");
+  const tags = pairs => new Map(pairs);
+
+  // What the tag looks like on the road it came from, and what it does not.
+  assert.equal(centreTurnLane(tags([["lanes:both_ways", "1"], ["lanes", "3"]])), true);
+  assert.equal(centreTurnLane(tags([["turn:lanes:both_ways", "left"]])), true);
+  assert.equal(centreTurnLane(tags([["lanes", "3"], ["oneway", "yes"]])), false);
+
+  // Read literally, the two lines have no way across, and the router answers
+  // the way the driver was shown: past the door, over at the one driveway that
+  // is mapped through the middle, and back up the other side.
+  const asDrawn = await labelleRoute(labelleGraph());
+  assert.ok(
+    asDrawn.distanceMeters > 120,
+    `the dogleg should be the long way round, got ${asDrawn.distanceMeters} m`
+  );
+  assert.equal(asDrawn.steps.length, 3, "past the destination, across, and back");
+
+  const linked = labelleGraph();
+  const opened = linkCentreTurnLanes({
+    ...linked,
+    centreTurnWays: new Set([1090282700, 1090282672]),
+    log: () => {}
+  });
+  assert.equal(opened, 1, "one crossing, opposite the one driveway there is to turn into");
+
+  // The crossing lands opposite the driveway rather than at either end of the
+  // block, and is one carriageway wide.
+  const crossings = [];
+  for (let e = 0; e < linked.edgeFrom.length; e++) {
+    if (linked.edgeWay[e] === 0) crossings.push(e);
+  }
+  assert.equal(crossings.length, 2, "a left turn is available from both sides");
+  for (const e of crossings) {
+    assert.ok(
+      linked.edgeDistDm[e] > 80 && linked.edgeDistDm[e] < 120,
+      `a crossing should be the 10.4 m between the lines, got ${linked.edgeDistDm[e] / 10} m`
+    );
+    // Still Boulevard Labelle: a driver waiting in the centre lane has not
+    // left the street, so the maneuver is the turn out of it, not onto it.
+    assert.equal(linked.edgeName[e], 1);
+  }
+
+  const direct = await labelleRoute(linked);
+  assert.ok(
+    direct.distanceMeters < asDrawn.distanceMeters - 60,
+    `the left turn should be far shorter than the dogleg, got ${direct.distanceMeters} m`
+  );
+  assert.equal(direct.steps.length, 1, "one street, one turn off it");
+  // And it must not have gone past the destination to get there: every point
+  // stays north-west of the driveway the dogleg used.
+  for (const [, lon] of direct.geometry) {
+    assert.ok(lon < LABELLE.b0[1], `route reached ${lon}, past the far driveway`);
+  }
 });
 
 test("the cycling profile prefers cycle infrastructure over arterials", async () => {

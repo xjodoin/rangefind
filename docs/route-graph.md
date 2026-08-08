@@ -30,10 +30,22 @@ adapted to range-addressed static objects:
    entering the tagged node. One intersection is charged once, however
    many nodes describe it: a divided road carries a signal on each
    carriageway and a signalised junction a crossing on each arm, all of
-   them one red light to a driver. Tagged nodes within 30 m of one already
+   them one red light to a driver. Tagged nodes within 45 m of one already
    charged are absorbed into it, heaviest first, so the signal is what gets
-   paid for and the crossings beside it fall in behind. Each edge carries its highway-class code for
-   the time-bucket metrics below. Turn
+   paid for and the crossings beside it fall in behind. (45 m rather than the
+   30 m this started at: a signalised crossroads with a carriageway and a turn
+   lane on each side spans a little over 30 m — Chemin de la Grande-Côte at
+   Boulevard Labelle measures 31.2 m — and the old radius cut through the
+   middle of one intersection rather than between two.) Each edge carries its
+   highway-class code for the time-bucket metrics below. A one-way carriageway
+   tagged `lanes:both_ways` or `turn:lanes:both_ways=left` shares a painted
+   centre two-way left-turn lane with the line facing it: one undivided street
+   drawn as two, which read literally has no way across. Wherever the far line
+   carries a junction with anything else, the near line is split opposite it
+   and the two are joined by a short crossing edge in both directions, priced
+   at the wait for a gap in the oncoming traffic. Without them the router
+   drives past a destination on the far side, crosses at whatever driveway
+   happens to be mapped through the middle, and comes back. Turn
    restrictions (`type=restriction` relations with a single via node,
    `no_*`/`only_*`, `except` handling, u-turn semantics) are compiled into
    the topology by via-node expansion: each restricted approach is
@@ -118,8 +130,17 @@ const route = await engine.route({
 const matrix = await engine.matrix({ points: stops }); // seconds[i][j]
 
 const trip = await engine.itinerary({ stops, roundTrip: false });
-// trip.order (Held-Karp exact ≤ ~12 stops, 2-opt beyond), trip.legs,
+// trip.order (Held-Karp exact ≤ 10 interior stops, 2-opt beyond), trip.legs,
 // trip.totalSeconds, trip.totalMeters
+
+// Three end modes, mutually exclusive. By default stop 0 is the start and
+// the last stop is a fixed end. `roundTrip: true` comes home to stop 0.
+// `openEnd: true` pins only the start and lets the optimizer choose where
+// the run finishes — a courier is rarely required to end at a particular
+// address, and pinning whichever one was entered last distorts the whole
+// order, not just the tail. `openEnd` leaves N−1 stops interior instead of
+// N−2, so it reaches the exact-solver bound one stop sooner.
+const run = await engine.itinerary({ stops, openEnd: true });
 
 // Time-of-day metrics: indexes built with time buckets answer per-bucket,
 // selected explicitly or by departure time against each bucket's rules.
@@ -488,11 +509,22 @@ metric-exact rerouting remains a hosted-service capability.
   charged once per intersection rather than once per tagged node. On
   Québec that merge absorbs roughly half the penalised nodes (car
   53,681 of 114,564; foot 45,333 against only 11,818 intersections
-  charged). Summing them instead priced crossing a divided boulevard at
-  two or three signal waits, which was enough to route a car around a
-  junction rather than straight through it. At snapped endpoints the
-  turn-cost share of a partial edge is ratio-scaled with the rest of its
-  weight.
+  charged — measured at the 30 m radius the merge started at, so the
+  current 45 m absorbs somewhat more). Summing them instead priced
+  crossing a divided boulevard at two or three signal waits, which was
+  enough to route a car around a junction rather than straight through
+  it. At snapped endpoints the turn-cost share of a partial edge is
+  ratio-scaled with the rest of its weight.
+- Centre-turn-lane crossings are synthesised from lane tags, so they are
+  only as good as those tags: a road with the paint but without
+  `lanes:both_ways` or `turn:lanes:both_ways` keeps the two lines it is
+  drawn as, and a genuinely divided road that carries the tags by mistake
+  gains a crossing it should not have. The 3–22 m width band and the
+  requirement that the far side actually carry a junction are what bound
+  the damage. A pair of crossings back to back is a u-turn across the
+  centre lane; it is priced rather than forbidden, and at 2 x 5 s plus two
+  left-turn charges it stays dearer than the u-turn cost the profile
+  already carries.
 - Bucket factors scale whole edge weights, including the folded junction
   penalty and turn-cost portions.
 - `liveWeights` re-ranks computed candidates; it does not re-run the

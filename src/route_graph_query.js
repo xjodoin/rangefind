@@ -62,20 +62,46 @@ function metersPerLatE7() {
 }
 
 /**
- * How close two junction markers of the same kind have to be before they are
- * treated as the one intersection. Sized for the width of a signalised
- * crossroads, and well under the gap between two intersections a driver would
- * ever count separately.
+ * How far apart the two sides of one intersection can sit and still be one
+ * intersection.
+ *
+ * Thirty metres was the width of an ordinary crossroads and missed the wide
+ * ones by a hair. Chemin de la Grande-Côte crosses Boulevard Labelle in
+ * Rosemère as a signalised crossroads with a carriageway and a turn lane on
+ * each side: its two signal markers land 31.2 m apart, and a driver making one
+ * left turn was shown two traffic lights. The population says the same thing —
+ * over 120 sampled routes around Montréal, same-kind marker pairs bunch hard
+ * in the 30–35 m band and thin out above 60 m, so the old radius cut straight
+ * through the middle of one crossroads rather than between two.
  */
-const JUNCTION_MERGE_METERS = 30;
+const JUNCTION_MERGE_METERS = 45;
+
+/**
+ * How far a driver may travel between the two sides of one intersection.
+ *
+ * Distance alone is not enough at this radius: a route that loops a block
+ * comes back within 45 m of a light it already passed, and those are two
+ * lights however close they end up on the map. A crossroads is crossed in
+ * roughly twice its width even when the route doglegs through it, so the far
+ * side arrives promptly or it is not the far side.
+ */
+const JUNCTION_MERGE_ALONG_METERS = 90;
 
 /**
  * Whether a junction marker describes the same intersection as the last one
- * reported. Same kind and close enough to be the far side of one crossroads
- * rather than the next one along.
+ * reported. Same kind, close enough to be the far side of one crossroads
+ * rather than the next one along, and reached soon enough to be the same
+ * crossing rather than a second visit.
  */
-export function mergesWithPreviousJunction(previous, kind, latE7, lonE7) {
+export function mergesWithPreviousJunction(previous, kind, latE7, lonE7, atMeters = null) {
   if (!previous || previous.kind !== kind) return false;
+  if (
+    atMeters != null &&
+    previous.atMeters != null &&
+    atMeters - previous.atMeters > JUNCTION_MERGE_ALONG_METERS
+  ) {
+    return false;
+  }
   return haversineMetersE7(
     Math.round(previous.lat * 1e7),
     Math.round(previous.lon * 1e7),
@@ -585,12 +611,7 @@ export async function openRouteGraph(options) {
     return (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
   }
 
-  // The inverse of snap(): decode a physical segment's canonical
-  // polyline and interpolate along it by arc length. Useful on its own
-  // for rendering a snapped marker or replaying a matched trace, and
-  // required by the thread channel, whose records carry position as
-  // (segment, ratio) rather than coordinates.
-  async function locate(segment, ratio = 0) {
+  function parseSegmentId(segment) {
     const parts = String(segment).split("/");
     if (parts.length !== 3) {
       throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment ids look like "leaf/polyline/direction"; got ${JSON.stringify(segment)}.`);
@@ -604,6 +625,11 @@ export async function openRouteGraph(options) {
     if (!Number.isInteger(polyline) || polyline < 0 || (direction !== 0 && direction !== 1)) {
       throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Bad segment id ${JSON.stringify(segment)}.`);
     }
+    return { leaf, polyline, direction };
+  }
+
+  async function segmentPoints(segment) {
+    const { leaf, polyline, direction } = parseSegmentId(segment);
     const geometryBlock = await loadCellGeometry(leaf);
     if (polyline >= geometryBlock.polylines.length) {
       throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment ${segment} does not exist in leaf ${leaf}.`);
@@ -612,6 +638,101 @@ export async function openRouteGraph(options) {
     if (points.length < 2) {
       throw routeError("RANGEFIND_ROUTE_BAD_SEGMENT", `Segment ${segment} has no geometry.`);
     }
+    return points;
+  }
+
+  /**
+   * A physical segment's canonical polyline, in travel order, as
+   * `{ points: [[lat, lon], …], meters }`.
+   *
+   * locate() answers "where along this segment", which is the wrong
+   * question for anything that draws the segment itself: a live-traffic
+   * overlay colours a *line*, and rebuilding that line from two locate()
+   * calls draws a straight chord across every bend in the road.
+   */
+  async function geometryOf(segment) {
+    const raw = await segmentPoints(segment);
+    const scale = metersPerLatE7();
+    const cosLat = Math.cos(raw[0] / 1e7 * Math.PI / 180);
+    const points = [];
+    let meters = 0;
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      points.push([raw[i] / 1e7, raw[i + 1] / 1e7]);
+      if (i + 3 < raw.length) {
+        const dLat = (raw[i + 2] - raw[i]) * scale;
+        const dLon = (raw[i + 3] - raw[i + 1]) * scale * cosLat;
+        meters += Math.sqrt(dLat * dLat + dLon * dLon);
+      }
+    }
+    return { segment, points, meters };
+  }
+
+  const factsCache = new Map();
+  /**
+   * The static facts about one leaf's edges, keyed by the geomRef that
+   * identifies a physical segment on the wire.
+   *
+   * This exists for PulseMesh. Its validator's rules 10–12 — does this
+   * segment exist, is its class reportable, is this speed and length
+   * plausible for it — are questions only the static index can answer,
+   * and a host that cannot answer them has to either skip the rules or
+   * invent the answers. Inventing them is worse than skipping: a stand-in
+   * class of "secondary" caps every road at 100 km/h, so an honest
+   * motorway contribution fails rule 10 and costs the peer that delivered
+   * it trust.
+   *
+   * Returned accessors are synchronous because the validator is; the
+   * caller warms the leaves it expects to hear about (its corridor) and
+   * treats a cold leaf as "no context", which is exactly what §6 says
+   * rules 10–12 are — probabilistic across peers.
+   */
+  function cellFacts(leaf) {
+    if (!Number.isInteger(leaf) || leaf < 0 || leaf >= root.leaves.length) {
+      return Promise.resolve(null);
+    }
+    let promise = factsCache.get(leaf);
+    if (!promise) {
+      promise = Promise.all([loadCell(leaf), loadCellGeometry(leaf)]).then(([cell, geometry]) => {
+        // One row per geomRef, not per edge: both directions of a physical
+        // polyline are separate geomRefs and may differ in class or length
+        // (a one-way pair is two edges), so keying by geomRef is what the
+        // wire record actually names.
+        const meters = new Map();
+        const classes = new Map();
+        const freeflow = new Map();
+        for (let edge = 0; edge < cell.geomRefs.length; edge++) {
+          const ref = cell.geomRefs[edge];
+          const edgeMeters = cell.distsDm[edge] / 10;
+          meters.set(ref, edgeMeters);
+          classes.set(ref, root.classes?.[cell.classes[edge]] || "");
+          // The static weight is deciseconds over this edge, so it already
+          // carries the profile's free-flow speed for this class and its
+          // posted limit — the exact baseline a congestion ratio compares
+          // an observation against.
+          const seconds = cell.weights[edge] / 10;
+          if (seconds > 0 && edgeMeters > 0) freeflow.set(ref, edgeMeters / seconds * 3.6);
+        }
+        return {
+          leaf,
+          polylineCount: geometry.polylines.length,
+          classOf: ref => classes.get(ref) ?? null,
+          metersOf: ref => meters.get(ref) ?? null,
+          freeflowKmhOf: ref => freeflow.get(ref) ?? null
+        };
+      });
+      factsCache.set(leaf, promise);
+      promise.catch(() => factsCache.delete(leaf));
+    }
+    return promise;
+  }
+
+  // The inverse of snap(): decode a physical segment's canonical
+  // polyline and interpolate along it by arc length. Useful on its own
+  // for rendering a snapped marker or replaying a matched trace, and
+  // required by the thread channel, whose records carry position as
+  // (segment, ratio) rather than coordinates.
+  async function locate(segment, ratio = 0) {
+    const points = await segmentPoints(segment);
     const clamped = Math.max(0, Math.min(1, Number(ratio) || 0));
     // Interpolate by distance along the polyline, not by point index:
     // vertices cluster on curves, so index interpolation would slide the
@@ -1371,20 +1492,15 @@ export async function openRouteGraph(options) {
         const previous = junctions[junctions.length - 1];
         const lat = points[pointIndex * 2] / 1e7;
         const lon = points[pointIndex * 2 + 1] / 1e7;
+        const atMeters = Math.round((distanceMeters + (cell.distsDm[edge] / 10) * along) * 10) / 10;
         const duplicate = mergesWithPreviousJunction(
           previous,
           kind,
           points[pointIndex * 2],
-          points[pointIndex * 2 + 1]
+          points[pointIndex * 2 + 1],
+          atMeters
         );
-        if (!duplicate) {
-          junctions.push({
-            kind,
-            lat,
-            lon,
-            atMeters: Math.round((distanceMeters + (cell.distsDm[edge] / 10) * along) * 10) / 10
-          });
-        }
+        if (!duplicate) junctions.push({ kind, lat, lon, atMeters });
       }
       const meters = cell.distsDm[edge] / 10;
       let seconds = cellEdgeWeight(cell, edge, factors) / 10;
@@ -1834,6 +1950,12 @@ export async function openRouteGraph(options) {
       candidates.sort((a, b) => (a.adjustedSeconds ?? a.seconds) - (b.adjustedSeconds ?? b.seconds));
     }
     const [best, ...rest] = candidates;
+    // The live summary was attached to the primary before this sort, and
+    // the sort can hand first place to an alternative — which is precisely
+    // the case where live traffic changed the answer. Carrying it onto the
+    // winner keeps `route.live` present exactly when it matters most,
+    // instead of vanishing at the moment it became interesting.
+    if (primary.live && !best.live) best.live = primary.live;
     best.alternatives = rest;
     return best;
   }
@@ -1991,13 +2113,35 @@ export async function openRouteGraph(options) {
     return { seconds, stats: statsSnapshot() };
   }
 
-  // Orders intermediate stops with exact Held-Karp up to 12 stops and a
-  // nearest-neighbor + 2-opt heuristic beyond, then routes each leg.
+  // Orders intermediate stops with exact Held-Karp up to 10 interior stops
+  // and a nearest-neighbor + 2-opt heuristic beyond, then routes each leg.
+  //
+  // Three shapes of trip, chosen by the caller:
+  //
+  //   default      stop 0 is the start, the last stop is the end, the rest
+  //                are reordered between them.
+  //   roundTrip    stop 0 is the start and the end; every other stop is
+  //                reordered between them.
+  //   openEnd      stop 0 is the start and nothing is pinned after it. A
+  //                courier is rarely required to finish at a particular
+  //                address, and pinning whichever address the dispatcher
+  //                happened to type last does not just fix the tail — it
+  //                distorts the whole plan, because every earlier stop is
+  //                ordered to feed a terminus nobody asked for.
+  //
+  // `openEnd` with N stops has N−1 interior stops, one more than the
+  // default shape with the same N, so it reaches the Held-Karp bound one
+  // stop sooner.
   async function itinerary(params) {
     const stops = params.stops;
     if (!Array.isArray(stops) || stops.length < 2) throw new Error("Itineraries need at least two stops.");
     const roundTrip = params.roundTrip === true;
-    const fixedEnd = !roundTrip;
+    const openEnd = params.openEnd === true;
+    if (roundTrip && openEnd) {
+      throw new Error("An itinerary cannot both come back to the start and end anywhere: pick roundTrip or openEnd, not both.");
+    }
+    const mode = roundTrip ? "roundTrip" : openEnd ? "openEnd" : "fixedEnd";
+    const fixedEnd = mode === "fixedEnd";
     const { seconds } = await matrix({ points: stops, bucket: params.bucket, departureTime: params.departureTime, live: params.live });
     const size = stops.length;
     const interior = [];
@@ -2006,9 +2150,9 @@ export async function openRouteGraph(options) {
     if (interior.length <= 1) {
       order = [0, ...interior, ...(fixedEnd ? [size - 1] : [])];
     } else if (interior.length <= 10) {
-      order = heldKarp(seconds, interior, fixedEnd ? size - 1 : 0, roundTrip);
+      order = heldKarp(seconds, interior, fixedEnd ? size - 1 : 0, mode);
     } else {
-      order = twoOpt(seconds, interior, fixedEnd ? size - 1 : 0, roundTrip);
+      order = twoOpt(seconds, interior, fixedEnd ? size - 1 : 0, mode);
     }
     if (roundTrip) order = [...order, 0];
     const legs = [];
@@ -2030,7 +2174,10 @@ export async function openRouteGraph(options) {
     return { order, legs, totalSeconds, totalMeters, stats: statsSnapshot() };
   }
 
-  function heldKarp(seconds, interior, endIndex, roundTrip) {
+  // `mode` picks the tail edge charged to the finished permutation:
+  // "fixedEnd" pays to reach `endIndex`, "roundTrip" pays to come home to
+  // stop 0, "openEnd" pays nothing — the tour simply stops where it stops.
+  function heldKarp(seconds, interior, endIndex, mode) {
     const n = interior.length;
     const full = 1 << n;
     const dp = Array.from({ length: full }, () => new Float64Array(n).fill(Infinity));
@@ -2053,7 +2200,9 @@ export async function openRouteGraph(options) {
     let bestCost = Infinity;
     let bestLast = -1;
     for (let last = 0; last < n; last++) {
-      const tail = roundTrip ? seconds[interior[last]][0] : seconds[interior[last]][endIndex];
+      const tail = mode === "openEnd" ? 0
+        : mode === "roundTrip" ? seconds[interior[last]][0]
+        : seconds[interior[last]][endIndex];
       const cost = dp[full - 1][last] + tail;
       if (cost < bestCost) {
         bestCost = cost;
@@ -2070,10 +2219,10 @@ export async function openRouteGraph(options) {
       last = prev;
     }
     orderInterior.reverse();
-    return roundTrip ? [0, ...orderInterior] : [0, ...orderInterior, endIndex];
+    return mode === "fixedEnd" ? [0, ...orderInterior, endIndex] : [0, ...orderInterior];
   }
 
-  function twoOpt(seconds, interior, endIndex, roundTrip) {
+  function twoOpt(seconds, interior, endIndex, mode) {
     // Nearest-neighbor construction.
     const remaining = new Set(interior);
     const tour = [0];
@@ -2091,16 +2240,23 @@ export async function openRouteGraph(options) {
       remaining.delete(best);
       current = best;
     }
-    if (!roundTrip) tour.push(endIndex);
-    // 2-opt improvement.
+    if (mode === "fixedEnd") tour.push(endIndex);
+    // 2-opt improvement. Reversing tour[i..j] rewires two edges — the one
+    // entering i and the one leaving j — except at a free tail, where the
+    // node at the end of the path has no successor edge to pay for. That
+    // makes the last position a legal j under `openEnd` and a fixed one
+    // otherwise.
+    const last = tour.length - 1;
+    const jMax = mode === "openEnd" ? last : last - 1;
     const cost = (a, b) => seconds[tour[a]][tour[b]];
     let improved = true;
     while (improved) {
       improved = false;
-      for (let i = 1; i + 1 < tour.length - 1; i++) {
-        for (let j = i + 1; j < tour.length - 1; j++) {
-          const before = cost(i - 1, i) + cost(j, j + 1);
-          const after = seconds[tour[i - 1]][tour[j]] + seconds[tour[i]][tour[j + 1]];
+      for (let i = 1; i < jMax; i++) {
+        for (let j = i + 1; j <= jMax; j++) {
+          const tail = j < last;
+          const before = cost(i - 1, i) + (tail ? cost(j, j + 1) : 0);
+          const after = seconds[tour[i - 1]][tour[j]] + (tail ? seconds[tour[i]][tour[j + 1]] : 0);
           if (after + 1e-9 < before) {
             let low = i;
             let high = j;
@@ -2144,7 +2300,13 @@ export async function openRouteGraph(options) {
     objectCache.clear();
     cellCache.clear();
     overlayCache.clear();
+    // Derived from the cells that just went; holding it would keep the
+    // decoded rows alive for every leaf a live-traffic session warmed.
+    factsCache.clear();
   }
 
-  return { root, route, matrix, itinerary, snap, locate, stats: statsSnapshot, resetStats, clearCaches };
+  return {
+    root, route, matrix, itinerary, snap, locate, geometryOf, cellFacts,
+    stats: statsSnapshot, resetStats, clearCaches
+  };
 }
