@@ -193,6 +193,45 @@ test("road graph writer replaces atomically without concatenating sections", asy
   }
 });
 
+test("SCC filtering writes retained edges directly into exact typed columns", async () => {
+  const { filterLargestScc } = await import("../scripts/osm_road_graph.mjs");
+  const graph = {
+    nodeLat: new Int32Array([100, 200, 300]),
+    nodeLon: new Int32Array([-100, -200, -300]),
+    edgeFrom: new Uint32Array([0, 1, 2]),
+    edgeTo: new Uint32Array([1, 0, 2]),
+    edgeWeightDs: new Uint32Array([10, 20, 30]),
+    edgeDistDm: new Uint32Array([11, 21, 31]),
+    edgeName: new Uint32Array([1, 2, 3]),
+    edgeClass: new Uint8Array([4, 5, 6]),
+    edgeJunction: new Uint8Array([7, 8, 9]),
+    edgeSpeed: new Uint8Array([40, 50, 60]),
+    edgeCond: new Uint8Array([1, 2, 3]),
+    edgeSign: new Uint32Array([10, 20, 30]),
+    edgeFlags: new Uint8Array([0, 1, 0]),
+    geomOffsets: new Uint32Array([0, 2, 3, 5]),
+    geomBytes: new Uint8Array([1, 2, 3, 4, 5]),
+    laneOffsets: new Uint32Array([0, 1, 3, 4]),
+    laneBytes: new Uint8Array([6, 7, 8, 9]),
+    names: ["", "A", "B", "isolated"],
+    profile: "car",
+    classes: ["road"],
+    condRules: [],
+    signs: []
+  };
+  const messages = [];
+  const filtered = filterLargestScc(graph, message => messages.push(message));
+  assert.deepEqual(filtered.nodeLat, new Int32Array([100, 200]));
+  assert.deepEqual(filtered.edgeFrom, new Uint32Array([0, 1]));
+  assert.deepEqual(filtered.edgeTo, new Uint32Array([1, 0]));
+  assert.deepEqual(filtered.edgeWeightDs, new Uint32Array([10, 20]));
+  assert.deepEqual(filtered.geomOffsets, new Uint32Array([0, 2, 3]));
+  assert.deepEqual(filtered.geomBytes, new Uint8Array([1, 2, 3]));
+  assert.deepEqual(filtered.laneOffsets, new Uint32Array([0, 1, 3]));
+  assert.deepEqual(filtered.laneBytes, new Uint8Array([6, 7, 8]));
+  assert.match(messages.at(-1), /largest 2 of 3 nodes/);
+});
+
 // Mirrors the engine's seed construction so reference and engine agree on
 // snapping by construction.
 function seedsFromSnap(snapResult, side) {
