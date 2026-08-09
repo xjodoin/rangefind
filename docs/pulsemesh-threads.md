@@ -289,14 +289,24 @@ Never transmitted in the clear.
 | 11 | planRef | bytes(8) | SHA-256 prefix of the run plan, zeros = none |
 | 12 | stopCount | varint | plan stops the outcome map covers, 0 = none |
 | 13 | outcomes | bytes(⌈stopCount/4⌉) | 2 bits per stop, LSB-first (§5.2.1) |
-| 14 | lastPresent | u8 | 0 absent, 1 followed by fields 15–19 |
-| 15 | lastStopIndex | varint | present iff field 14 is 1 |
-| 16 | lastOutcome | u8 | present iff field 14 is 1 |
-| 17 | lastReason | u8 | present iff field 14 is 1 (§5.2.1) |
-| 18 | lastPhoto | u8 | present iff field 14 is 1; 0 none, 1 followed by field 19 (§20.7) |
+| 14 | markFlags | u8 | bit 0 → fields 15–19, bit 1 → fields 20–21, bit 2 → field 22; other bits reserved and **refused** |
+| 15 | lastStopIndex | varint | present iff bit 0 |
+| 16 | lastOutcome | u8 | present iff bit 0 |
+| 17 | lastReason | u8 | present iff bit 0 (§5.2.1) |
+| 18 | lastPhoto | u8 | present iff bit 0; 0 none, 1 followed by field 19 (§20.7) |
 | 19 | photoHash | bytes(32) | present iff field 18 is 1; SHA-256 of the **sealed** blob |
-| 20 | noteLen ‖ note | varint ‖ bytes | operator message, ≤ 64 bytes UTF-8 |
-| 21 | signature | bytes(64) | Ed25519 over fields 1–20 |
+| 20 | reasonCount | varint | present iff bit 1; carried reasons (§5.2.1) |
+| 21 | reasons | (varint ‖ u8) × reasonCount | stopIndex, then reason in bits 0–6 and "this mark had a photo" in bit 7. Strictly increasing by stopIndex |
+| 22 | photoCount | varint | present iff bit 2; distinct photo commitments this run has published (§20.7) |
+| 23 | noteLen ‖ note | varint ‖ bytes | operator message, ≤ 64 bytes UTF-8 |
+| 24 | signature | bytes(64) | Ed25519 over fields 1–23 |
+
+Field 14 was a plain `lastPresent` boolean and bit 0 is still exactly
+that boolean, so a record with no carried reasons and no photos encodes
+to the bytes it always did — the §16.4 vector included. That is not
+nostalgia: it is what makes the day this channel is actually sized for
+— every stop delivered, nothing to explain — pay **nothing at all** for
+the fields below.
 
 `stopIndex` is **the last stop the run has dealt with, in plan order** —
 visited and resolved, or passed. It is monotonic and it is a position in
@@ -356,7 +366,7 @@ has not arrived*.
 
 `lastReason` gives the most recent mark a machine-readable why, so a
 follower's app renders it in its own language rather than parsing free
-text. Anything it cannot express goes in the note (field 18).
+text. Anything it cannot express goes in the note (field 23).
 
 | Value | Reason |
 | --- | --- |
@@ -378,9 +388,91 @@ bits a stop is cheap enough to simply repeat the whole answer: a
 
 `lastOutcome` is redundant with the map by construction, and carried
 anyway: without it a follower would have to diff two bitmaps to discover
-which stop just changed, and would have nowhere at all to read the
-reason. It is what lets a card say "stop 7 skipped — customer absent"
-from a single record.
+which stop just changed. It is what lets a card say "stop 7 skipped —
+customer absent" from a single record.
+
+##### Reasons are cumulative too, and for the same reason
+
+`lastOutcome` holds **one** mark and the next mark replaces it. That is
+a data-loss gap, and it is the one this channel is least able to afford.
+A driver marks stop 3 skipped, customer absent, with a doorstep photo,
+in a dead zone; marks stop 4 before coverage returns; and stop 3's
+reason and photo commitment are gone from the wire permanently, because
+nothing re-sends a record and §5.5 catch-up reaches back only
+`THREAD_MAX_AGE`. The board self-heals to "stop 3 skipped" from the
+cumulative map and can never say why. For a courier fleet that sentence
+is the most valuable record of the day.
+
+So fields 20–21 carry the reason for **every** stop the map says is
+skipped or failed, sparsely, in every record:
+
+```
+reasonCount varint, then reasonCount × ( stopIndex varint, reason u8 )
+```
+
+Delivered stops need no reason and pending stops have nothing to say, so
+a normal day's list is empty and costs zero bytes. Three failed stops on
+a 200-stop day cost seven. It self-heals exactly as the outcome map
+does: one record after the outage restates the lot.
+
+The reason byte is not just the code. Bits 0–6 are the `lastReason`
+value; **bit 7 says that mark carried a photo commitment** (§20.7). That
+bit is free — the code needs six — and it is the whole of what a
+subscriber can be told about a commitment that never reached it.
+
+**Reason `0` is carried explicitly, not omitted.** That is what makes a
+*gap* in the list mean something. Against a stop the map says is skipped:
+
+| The list | What it means |
+| --- | --- |
+| entry, reason 1–5 | the driver said why |
+| entry, reason 0 | the driver marked it and stated no reason — a complete answer |
+| **no entry** | the reason is **lost**: it aged out of the cap, or the run predates this field |
+
+`stopReasonFor(update, stopIndex)` is the accessor that keeps those
+apart, returning `reasonKnown: false` for the third row rather than a
+cheerful zero, and `hasPhoto: null` rather than `false` for a proof that
+may well exist. `estimateArrival` reports the same pair, so a customer
+whose parcel was refused at 09:12 is still told why at 16:00 — the old
+code could only answer when their stop happened to be the most recent
+mark in the record they were holding.
+
+##### The cap: bounded, never refused
+
+The list is bounded twice — by `THREAD_MAX_REASONS` (16), and by
+whatever is left of the 213-byte body once the plan, the note and any
+photo commitment have taken theirs. `fitStopReasons` applies both.
+
+It is **bounded rather than refused**, and the asymmetry with §5.2.2's
+plan-size refusal is deliberate. A plan's size is known before the run
+starts, so refusing it is a configuration error caught once, at the
+depot. A reason list grows during the day out of things a driver does at
+doors; refusing to encode at 09:41 because the twelfth stop failed would
+take the outcome map, the position, the state and the whole rest of the
+record down with it. That is a far worse loss than the reason it was
+protecting.
+
+**The oldest entries are evicted, not the newest.** The list is
+cumulative and self-healing, so what a record is buying with those bytes
+is recovery for a subscriber that was not listening. The gap that
+matters is a recent one: a subscriber that has been present already
+received the early reasons, and the ones it is most likely still missing
+are the ones just published. Losing the oldest therefore degrades
+gracefully — those reasons were almost certainly delivered when they
+were new — while losing the newest would lose exactly the ones the
+mechanism exists for.
+
+The 16 is sized on the day the channel is built for. A 200-stop plan
+leaves 57 bytes (§5.2.2); 16 entries cost 33 of them at one-byte stop
+indices and 49 at the widest a 200-stop plan can produce, so the cap is
+reachable at any hour without the reason list ever being the field that
+does not fit. It is also 8 % of a 200-stop day, several times the
+non-delivery rate a courier fleet actually runs at.
+
+A long **note** can squeeze the list, and is allowed to. Notes are
+operator announcements on the occasional record, not a per-fix field, so
+the next ordinary fix carries the full list again — the cumulative
+property makes that self-correcting in one record rather than a loss.
 
 Marking is a **stop event**, so it publishes immediately on both
 granularities rather than waiting out the cadence (§11). A customer
@@ -392,14 +484,25 @@ delivered is an ordinary day, not a protocol violation.
 
 Field 19 is a **commitment, never content**: 32 bytes naming a
 proof-of-delivery photo whose bytes travel elsewhere, on demand, over
-§20.7's own protocol. Field 18 is written whenever field 14 is, so a
-mark always says whether a photo exists and the answer is inside the
+§20.7's own protocol. Field 18 is written whenever bit 0 of field 14 is,
+so a mark always says whether a photo exists and the answer is inside the
 signature — a record cannot have a photo attached to it after the fact,
 and one cannot be stripped off without breaking the signature. A
 subscriber exposes it as `lastOutcome.photoHash`: lowercase hex, or
 `null`. Hex rather than bytes because every consumer of it uses it as a
 content address — a map key, a DOM attribute, an equality test — and
 none of them wants a `Uint8Array`.
+
+**Commitments are not carried cumulatively, and cannot be.** A
+commitment is 32 bytes; a second one does not fit the day this channel
+is sized for (§5.2.2 leaves 25 bytes beside the first). §20.7 works the
+consequence through, including the fetch-by-stop design that was
+rejected for it. What the record carries instead is field 22: how many
+distinct commitments the run has published so far. A subscriber holding
+fewer distinct hashes than that knows **exactly how many** proofs it can
+never fetch, and bit 7 of the reason byte names which skipped or failed
+stops they belong to. The loss is real and it is visible, which is the
+most this budget can honestly buy.
 
 #### 5.2.2 How large a plan can be
 
@@ -435,6 +538,34 @@ as 32 bytes of note, which is why each cell in the third column is the
 row below it in the second. A dispatcher who wants both a full note and
 a 200-stop day with photos has to give something up, and the encoder
 tells them which.
+
+**Every number above is unchanged by the carried reason list**, and that
+is the point of putting it behind a flag bit rather than a count byte. A
+run with nothing skipped or failed and no photos writes none of fields
+20–22 and encodes to the bytes it did before they existed.
+
+What they cost when a day does need them, measured out of the same
+200-stop body, against its 57 bytes of headroom:
+
+| Carried | Bytes | 200-stop note headroom |
+| --- | --- | --- |
+| nothing (an all-delivered day) | 0 | 57 |
+| 3 reasons | 7 | 50 |
+| 3 reasons + photo counter | 8 | 49 |
+| 16 reasons (`THREAD_MAX_REASONS`), stops < 128 | 33 | 24 |
+| 16 reasons, stops 128–16383 | 49 | 8 |
+| 16 reasons + photo counter, widest | 50 | 7 |
+
+One reason entry is a stop-index varint and one byte; the list adds a
+count varint on top; the photo counter is one byte for any run under 128
+photos. The outage this exists for — two stops marked in a dead zone,
+both with reasons and both with photos — costs **six bytes**: a count,
+two pairs, and the counter.
+
+`fitStopReasons` spends only what is there. On a body with no room left
+it keeps the newest entries that fit and drops the rest (§5.2.1); it
+never refuses, and the plan-size refusal above is unchanged and still
+the only thing that does.
 
 ### 5.3 States
 
@@ -555,6 +686,7 @@ answer.
 | `THREAD_MAX_RUN_SECONDS` | 21600 (6 h) | no | default thread lifetime; a ticket-born run uses its own `notAfter` instead (§20.6) |
 | `THREAD_TAG_BUDGET` | 32 / peer / window | yes | new cached tags per source peer |
 | `THREAD_CACHE_RATE` | 1 rec / 3 s / tag | yes | relay cache admission rate |
+| `THREAD_MAX_REASONS` | 16 | no | carried per-stop reasons in one record; also bounded by whatever the body has left (§5.2.1) |
 | `THREAD_MAX_PHOTO_BYTES` | 131072 | yes | largest sealed proof-of-delivery blob (§20.7) |
 | `THREAD_CERT_INTERVAL` | 60 s | yes | how often a route-day publisher re-emits its PMTC (§21) |
 | `THREAD_HELD_RECORDS` | 32 | yes | records held awaiting the day's certificate (§21) |
@@ -1296,6 +1428,35 @@ behaviour, not where the code merely looks right.
 - [x] A plan too large to encode is refused at encode time with the
       number of stops that would have fitted, rather than producing a
       record over `THREAD_MAX_RECORD_BYTES` (§5.2.2).
+- [x] **A dead zone costs no reasons.** A publisher marks two stops with
+      reasons and photos while its transport drops every record; on
+      reconnection a subscriber that heard none of it recovers both
+      stops' outcomes *and* both reasons from the next ordinary record,
+      which is not a retransmission of anything (§5.2.1).
+- [x] Reasons are carried for every skipped or failed stop and for no
+      other, reason `0` included — so a gap in the list is a **lost**
+      reason and `stopReasonFor` reports `reasonKnown: false` rather than
+      a cheerful zero, and `estimateArrival` passes the same distinction
+      to the customer (§5.2.1).
+- [x] The list is capped rather than refused: a 60-stop day where every
+      stop failed keeps the newest `THREAD_MAX_REASONS`, publishes every
+      record, and leaves the outcome map complete for all 60; a body with
+      no headroom left drops entries oldest-first rather than
+      overflowing 213 bytes (§5.2.1).
+- [x] The common case pays nothing: an all-delivered day and a run with
+      nothing marked encode **byte-identically** to the same body without
+      fields 20–22, the §16.4 vector's 31-byte preimage included, and the
+      whole §5.2.2 stop table is unmoved. The outage day costs six bytes
+      (§5.2.2).
+- [x] Carried reasons are inside the signature, ascend strictly by stop
+      index whatever order the driver marked in, and a duplicated entry,
+      a zero stop index, an over-wide reason code and a reserved bit in
+      the mark-flags byte are each refused rather than skipped (§5.2).
+- [x] A superseded photo commitment is lost **visibly**: the record says
+      how many commitments the run has published and which skipped or
+      failed stops carried one, `hasPhoto` is `null` rather than `false`
+      where nothing says, and no fetch-by-stop exists that would let a
+      publisher restate a commitment after the fact (§20.7.1).
 - [x] Stops marked skipped or failed leave the ETA chain, and the
       subscriber's own stop, so marked, yields a result with no arrival
       time in it at all (§9.1).
@@ -1775,6 +1936,70 @@ The commitment being *signed* is what makes it evidence. The driver is
 bound to one specific set of bytes at the moment of the mark; a photo
 substituted afterwards fails the hash, and a photo removed afterwards
 fails the signature.
+
+#### 20.7.1 A commitment published into a dead zone is lost, and says so
+
+The record carries **one** commitment, for the most recent mark, and the
+next mark replaces it. A driver who photographs stop 3 and then marks
+stop 4 before regaining coverage has published stop 3's commitment to
+nobody, and it is gone: the photo is still on the device, and no longer
+addressable by anyone who wants it, because the thing that addressed it
+was the commitment.
+
+§5.2.1 fixes the *reason* half of that by carrying reasons cumulatively.
+The commitment half cannot be fixed the same way, and the honest
+statement of why is worth more than a mechanism that pretends otherwise.
+
+**Carrying the most recent K commitments.** A commitment is 32 bytes.
+§5.2.2 leaves a 200-stop day 25 bytes of headroom *with* the first one,
+so K = 2 does not fit the day the feature exists for, let alone K = 4.
+Made budget-adaptive it collapses back to K = 1 on exactly the days it
+was supposed to help. Rejected: it buys nothing where it is needed and
+costs 32 bytes where it is not.
+
+**Making a photo addressable by `(planRef, stopIndex)` in the fetch
+protocol.** Tempting — a dispatcher could then ask for "the photo for
+stop 3" without holding its commitment — and rejected, because it
+quietly trades away the property this whole section exists for. The
+commitment is evidence *because a signed record committed to it before
+it was fetched*. A fetch keyed on the stop has to return something the
+requester can check, so the publisher would have to state the hash in
+the response — and the publisher is the party who might lie. That is not
+a verification, it is the publisher marking its own homework: the driver
+could photograph a doorstep at 18:00 and serve it as stop 3's proof, and
+the dispatcher would have no way to tell. A *signed* re-statement is no
+better; it is still a statement made after the fact, and the temporal
+binding — committed at the door, inside a record whose `unixSeconds` and
+`seq` place it there — is the entire value in a dispute. **Convenience
+is not worth the evidence property**, and a fetch-by-stop that returned
+un-verifiable bytes would be worse than no fetch, because a dispatcher
+would believe it.
+
+**What is implemented instead: the loss is made countable and visible.**
+
+- Field 22 carries **how many distinct commitments the run has
+  published**. A subscriber that holds fewer distinct hashes than that
+  knows exactly how many proofs it will never be able to fetch. One byte
+  for any realistic day, and it is written only by a run that has taken
+  a photo at all.
+- Bit 7 of each carried reason byte (§5.2.1) says **that mark had a
+  photo**, so a skipped or failed stop whose commitment was superseded
+  is identifiable by name, not merely by a count.
+- Nothing reports a missing proof as an absent one. `stopReasonFor`
+  returns `hasPhoto: null` where nothing it holds says, never `false`.
+
+So the residue is stated rather than hidden: **the commitment for a mark
+that was superseded before its record reached anyone is unrecoverable,
+and the driver's device should re-mark the stop.** Re-marking overwrites
+(§5.2.1), re-seals under the same per-stop key and publishes a fresh
+commitment, and the sealed blob it names is still on the device — the
+publisher evicts nothing for the life of the run. That is a real
+operational answer, and it is one the dispatcher can now know to ask
+for, which before this it could not.
+
+A UI that shows a delivery board SHOULD surface the shortfall rather
+than a clean-looking page: "2 of 5 proofs unavailable" is the true
+statement, and "no photo" is not.
 
 **Wire.** Two records, magic-discriminated as everywhere else. `PMTF`
 and `PMTB` rather than a `PMx1` pair, because the traffic channel

@@ -156,6 +156,85 @@ export interface StopMark {
   photoHash?: string | Uint8Array | null;
 }
 
+/**
+ * §5.2 field 14. Bit 0 is the boolean field 14 used to be, so a record
+ * that carries neither reasons nor a photo count is byte-identical to
+ * one written before they existed. Reserved bits are refused at decode.
+ */
+export declare const THREAD_MARK_FLAG: Readonly<{
+  LAST: 0x01;
+  REASONS: 0x02;
+  PHOTO_COUNT: 0x04;
+}>;
+
+/**
+ * §5.2.1. How many per-stop reasons one record carries. The list is also
+ * bounded by whatever the 213-byte body has left, whichever is smaller.
+ */
+export declare const THREAD_MAX_REASONS: 16;
+
+/**
+ * §5.2.1. Why one stop ended up skipped or failed, carried cumulatively
+ * so that a mark published into a dead zone is not lost when the next
+ * mark replaces `lastOutcome`.
+ */
+export interface CarriedStopReason {
+  /** 1-based, into the run plan. Strictly increasing on the wire. */
+  stopIndex: number;
+  /** A `STOP_REASON` value. `0` means the driver stated no reason. */
+  reasonCode: number;
+  /**
+   * §20.7: that mark carried a photo commitment. Bit 7 of the reason
+   * byte, so it is free. It says a proof exists — not that this record
+   * carries the commitment addressing it, which only `lastOutcome` ever
+   * does (§20.7.1).
+   */
+  photo: boolean;
+}
+
+/**
+ * What one stop's record says, and whether it says anything.
+ *
+ * `reasonKnown: false` is the distinction this type exists for: "stop 3
+ * skipped, no reason given" and "stop 3 skipped, and I never learned
+ * why" are different sentences, and before the carried reason list they
+ * were the same bytes. A UI that renders them the same is lying about
+ * one of them.
+ */
+export interface StopReasonFacts {
+  outcome: 0 | 1 | 2 | 3;
+  /** Null when unknown *or* when the outcome has no reason to carry. */
+  reasonCode: number | null;
+  /** False only when the stop is resolved-not-delivered and the reason is lost. */
+  reasonKnown: boolean;
+  /** Null where nothing we hold says — never a cheerful `false` (§20.7.1). */
+  hasPhoto: boolean | null;
+}
+
+/**
+ * §5.2.1. Reads one stop out of an update, keeping "no reason given"
+ * apart from "reason lost". Prefer this to searching `stopReasons` by
+ * hand: it also falls back to `lastOutcome` for a record written before
+ * the list existed.
+ */
+export declare function stopReasonFor(
+  body: Pick<ThreadBody, "outcomes"> & Partial<Pick<ThreadBody, "stopReasons" | "lastOutcome">>,
+  stopIndex: number
+): StopReasonFacts;
+
+/**
+ * §5.2.1. The most recent carried reasons that fit this body, oldest
+ * evicted first. Bounded, never throwing — a reason list that would not
+ * fit must not take the record's outcome map down with it.
+ *
+ * `body.stopReasons` is in **mark order**, oldest first, because that is
+ * the order this evicts by; the encoder sorts by stop index for the wire.
+ */
+export declare function fitStopReasons(
+  body: ThreadBodyFields,
+  options?: { max?: number }
+): CarriedStopReason[];
+
 /** What `markStop` accepts beyond the stop and the outcome. */
 export interface StopMarkOptions {
   reason?: number;
@@ -202,6 +281,24 @@ export interface ThreadBodyFields {
    */
   outcomes?: number[];
   lastOutcome?: StopMark | null;
+  /**
+   * §5.2.1. One entry per skipped or failed stop — cumulative, like the
+   * map, so that a reason published into a dead zone survives the mark
+   * that supersedes it. Encoder input is in mark order; the wire and a
+   * decoded body are in stop order.
+   *
+   * Read it with `stopReasonFor`, not by hand: a **gap** against a
+   * skipped stop means the reason was lost to the cap, which is a
+   * different answer from an entry whose `reasonCode` is 0.
+   */
+  stopReasons?: CarriedStopReason[];
+  /**
+   * §20.7. Distinct photo commitments this run has published so far.
+   * A subscriber holding fewer distinct hashes than this knows exactly
+   * how many proofs of delivery it can never fetch (§20.7.1). Omitted
+   * from the wire entirely when 0.
+   */
+  photoCount?: number;
   note?: Uint8Array;
 }
 
@@ -210,6 +307,8 @@ export interface ThreadBody extends ThreadBodyFields {
   note: Uint8Array;
   outcomes: number[];
   lastOutcome: StopMark | null;
+  stopReasons: CarriedStopReason[];
+  photoCount: number;
   signature: Uint8Array;
   preimage: Uint8Array;
   /** Null when the position was withheld (§11). */
@@ -488,6 +587,11 @@ export declare function createThreadPublisher(options: {
   markStop(index: number, outcome: 1 | 2 | 3, options?: StopMarkOptions): Promise<ThreadEmission>;
   outcomes(): number[];
   lastOutcome(): StopMark | null;
+  /**
+   * §5.2.1. Every skipped or failed stop's reason, in **mark order** —
+   * what the wire carries as much of as fits, keeping the newest.
+   */
+  stopReasons(): CarriedStopReason[];
   /** Sealed proof-of-delivery blobs this run committed to, by commitment hex. */
   photoStore: Map<string, Uint8Array>;
   photoFor(hash: string | Uint8Array): Uint8Array | null;
@@ -544,6 +648,18 @@ export interface ThreadStatus {
    */
   outcomes: number[];
   lastOutcome: StopMark | null;
+  /**
+   * §5.2.1, cumulative for the same reason the map is. A *gap* here
+   * against a skipped stop is a reason this device will never learn —
+   * read it through `stopReasonFor` rather than searching it by hand.
+   */
+  stopReasons: CarriedStopReason[];
+  /**
+   * §20.7. Distinct photo commitments the run says it has published.
+   * Fewer distinct commitments held than this is exactly how many proofs
+   * of delivery this device can never fetch (§20.7.1).
+   */
+  photoCount: number;
   travelMode: number;
   claim: string;
 }
@@ -609,6 +725,9 @@ export interface ArrivalEstimate extends RouteProfileFacts {
   outcome: 0;
   outcomeName: "pending";
   reasonCode: null;
+  /** A pending stop has no reason to have lost, so nothing is missing. */
+  reasonKnown: true;
+  hasPhoto: null;
   basis: "live-traffic" | "static-metric";
   positionBasis: "reported-position" | "last-stop";
   observationAgeSeconds: number;
@@ -619,8 +738,13 @@ export interface ArrivalEstimate extends RouteProfileFacts {
  * A stop the driver marked skipped or failed. No `arrivalMillis` and no
  * `secondsFromNow` exist on this shape at all: the vehicle is not coming,
  * and there must be no field a caller can accidentally render a time out
- * of. `reasonCode` is null when the wire's single `lastOutcome` belongs
- * to some other stop — the reason is genuinely unknown, not inferrable.
+ * of.
+ *
+ * The reason comes from the cumulative list (§5.2.1), so it answers for
+ * any stop the record covers rather than only the most recent mark — a
+ * customer refused at 09:12 is still told why at 16:00. `reasonCode` is
+ * null both when no reason was given and when the reason was lost, and
+ * `reasonKnown` is the only thing that tells those apart.
  */
 export interface MarkedStopResult extends RouteProfileFacts {
   arrivalMillis: null;
@@ -630,6 +754,10 @@ export interface MarkedStopResult extends RouteProfileFacts {
   outcome: 2 | 3;
   outcomeName: "skipped" | "failed";
   reasonCode: number | null;
+  /** False when the reason aged out of the cap, or the run predates it. */
+  reasonKnown: boolean;
+  /** §20.7: null where nothing we hold says, never a cheerful `false`. */
+  hasPhoto: boolean | null;
   basis: "marked";
   positionBasis: "none";
   observationAgeSeconds: number;

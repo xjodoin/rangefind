@@ -447,6 +447,16 @@ export async function createThreadSubscriber({
       // this device still has a live position, so no claim moves.
       outcomes: latest?.outcomes ?? [],
       lastOutcome: latest?.lastOutcome ?? null,
+      // Cumulative for the same reason the map is, and read the same way:
+      // an entry is why a stop was skipped or failed, and a *gap* against
+      // a skipped stop is a reason this device will never learn. Use
+      // `stopReasonFor` rather than searching this by hand — it is the
+      // thing that keeps "no reason given" and "reason lost" apart.
+      stopReasons: latest?.stopReasons ?? [],
+      // §20.7. How many photo commitments the run says it has published.
+      // Fewer distinct commitments held than this is exactly how many
+      // proofs of delivery this device can never fetch.
+      photoCount: latest?.photoCount ?? 0,
       travelMode: latest?.travelMode ?? 0,
       // The claim the UI is allowed to make, spelled out so it cannot be
       // accidentally upgraded.

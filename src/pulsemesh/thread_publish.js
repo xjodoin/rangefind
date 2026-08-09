@@ -13,6 +13,7 @@ import {
   STOP_OUTCOME,
   STOP_REASON,
   THREAD_MAX_NOTE_BYTES,
+  THREAD_MAX_REASONS,
   THREAD_MODE,
   THREAD_STATE,
   THREAD_TRAVEL_MODE,
@@ -20,6 +21,7 @@ import {
   encodeThreadBody,
   encodeThreadBodyPreimage,
   encodeThreadRecord,
+  fitStopReasons,
   threadRecordAad
 } from "./thread_codec.js";
 import {
@@ -193,6 +195,20 @@ export async function createThreadPublisher({
   const outcomes = new Array(plan?.stops?.length || 0).fill(STOP_OUTCOME.PENDING);
   let lastOutcome = null;
 
+  /**
+   * §5.2.1. Why each unresolved-but-not-delivered stop ended that way,
+   * keyed by stop index, in **mark order** — a `Map` iterates by
+   * insertion, and re-marking deletes before it sets, so the most recent
+   * mark is always last. That order is what the cap evicts by, and it is
+   * the reason this is not simply derived from `outcomes` at emit time:
+   * a bitmap knows which stops failed, not which failed most recently.
+   *
+   * Only skipped and failed stops are in here. A delivered stop needs no
+   * reason and a pending one has nothing to say, so a normal day carries
+   * an empty list and pays nothing at all for it (§5.2.2).
+   */
+  const reasonMarks = new Map();
+
   // §20.7. Sealed proof-of-delivery blobs this device holds, keyed by the
   // commitment that went on the wire. Unbounded within a run on purpose:
   // a delivery day is a few hundred photos of ~100 KB, and evicting one
@@ -298,7 +314,7 @@ export async function createThreadPublisher({
       // cheaper than losing the position entirely.
       if (leafCell === 0 && geomRef === 0 && ratioQ12 === 0) ratioQ12 = 1;
     }
-    return {
+    const draft = {
       unixSeconds: Math.floor(nowMillis / 1000),
       state: runState,
       mode,
@@ -313,8 +329,21 @@ export async function createThreadPublisher({
       // of one moment.
       outcomes: [...outcomes],
       lastOutcome: lastOutcome ? { ...lastOutcome } : null,
+      stopReasons: [...reasonMarks.values()],
+      // Not `reasonMarks.size` and not a counter of its own: `photos` is
+      // keyed by commitment, so its size is exactly "distinct commitments
+      // this run has published" — the number a subscriber checks its own
+      // collection against to learn how many proofs it has missed (§20.7).
+      photoCount: photos.size,
       note: noteBytes(note)
     };
+    // Trimmed against this body's own remaining budget rather than a
+    // fixed number alone, because a long plan and a long note are what
+    // actually spend it. Oldest first: see `fitStopReasons`. Done here so
+    // that a mark can never fail to encode because of the reason it was
+    // carrying — losing the record would lose the outcome map with it.
+    draft.stopReasons = fitStopReasons(draft);
+    return draft;
   }
 
   /**
@@ -487,6 +516,27 @@ export async function createThreadPublisher({
     const photoHash = photo ? await attachPhoto(index, photo, allowCoarsePhoto) : null;
     outcomes[index - 1] = outcome;
     lastOutcome = { stopIndex: index, outcome, reasonCode, photoHash };
+    // §5.2.1. `lastOutcome` holds one mark and the next one replaces it,
+    // so a reason published into a dead zone used to be gone the moment
+    // the next stop was marked. Every resolved-not-delivered stop keeps
+    // its reason here instead, and every record re-states them, so a
+    // subscriber that heard none of the outage recovers the lot from the
+    // first record after it.
+    reasonMarks.delete(index);
+    if (outcome !== STOP_OUTCOME.DELIVERED) {
+      // Reason `NONE` is recorded rather than omitted: a stop that is in
+      // this list with reason 0 was marked and no reason was given, which
+      // a subscriber must be able to tell from a stop that is missing
+      // from it because the cap dropped it (§5.2.1, `stopReasonFor`).
+      reasonMarks.set(index, { stopIndex: index, reasonCode, photo: photoHash != null });
+      // Delete-then-set already moved this stop to the end of the
+      // insertion order; trimming from the front drops the oldest mark,
+      // which is the one a listening subscriber is least likely to still
+      // be missing.
+      while (reasonMarks.size > THREAD_MAX_REASONS) {
+        reasonMarks.delete(reasonMarks.keys().next().value);
+      }
+    }
     // Monotonic and contiguous. Marking stop 3 after stop 5 — the
     // paperwork catching up with the driving — records the outcome
     // without teleporting the vehicle backwards down the plan; marking
@@ -517,6 +567,11 @@ export async function createThreadPublisher({
     /** The cumulative map, copied — callers must go through markStop. */
     outcomes: () => [...outcomes],
     lastOutcome: () => (lastOutcome ? { ...lastOutcome } : null),
+    /**
+     * §5.2.1. Every skipped or failed stop's reason, in mark order —
+     * what the wire carries as much of as fits, newest first.
+     */
+    stopReasons: () => [...reasonMarks.values()].map(entry => ({ ...entry })),
     /**
      * The sealed blobs this run committed to (§20.7), for whatever
      * transport answers PMTF. Keyed by commitment hex; the values are

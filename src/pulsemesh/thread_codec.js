@@ -88,6 +88,40 @@ export const THREAD_MAX_NOTE_BYTES = 64;
 export const THREAD_PHOTO_HASH_BYTES = 32;
 
 /**
+ * §5.2 field 14, the mark block's flags. Bit 0 is the byte that used to
+ * be a plain `lastPresent` boolean, so a record that carries nothing new
+ * is byte-identical to one this build's predecessor wrote — including
+ * the §16.4 vector.
+ */
+export const THREAD_MARK_FLAG = Object.freeze({
+  /** Fields 15–19: the most recent mark. */
+  LAST: 0x01,
+  /** Fields 20–21: the cumulative reason list (§5.2.1). */
+  REASONS: 0x02,
+  /** Field 22: how many photo commitments this run has published (§20.7). */
+  PHOTO_COUNT: 0x04
+});
+const THREAD_MARK_FLAGS_KNOWN = THREAD_MARK_FLAG.LAST | THREAD_MARK_FLAG.REASONS | THREAD_MARK_FLAG.PHOTO_COUNT;
+
+/**
+ * How many per-stop reasons a record carries at most (§5.2.1).
+ *
+ * The list is cumulative, so it is bounded twice: by this count, and by
+ * whatever is left of the 213-byte body — `fitStopReasons` applies both,
+ * keeping the newest. 16 is the number that fits the day this channel is
+ * sized for. A 200-stop plan leaves 57 bytes (§5.2.2), and 16 entries
+ * cost 33 of them at one-byte stop indices and 49 at the widest a
+ * 200-stop plan can produce, so the cap is reachable at any point in the
+ * day without the reason list ever being the thing that does not fit. It
+ * is also 8 % of a 200-stop day, several times the non-delivery rate a
+ * courier fleet actually runs at.
+ */
+export const THREAD_MAX_REASONS = 16;
+/** Bit 7 of a reason byte: this mark carried a photo commitment (§20.7). */
+const REASON_PHOTO_BIT = 0x80;
+const REASON_CODE_MASK = 0x7f;
+
+/**
  * What a PMT1 record spends on framing around the sealed body: magic 4,
  * epochPrefix8 8, tag 8, `seq` varint ≤ 5, `ctLen` varint 2 (a body is
  * never under 128 nor over 16383 bytes), AEAD tag 16.
@@ -254,11 +288,45 @@ function photoHashBytes(value) {
 }
 
 /**
- * Encodes fields 1–20 — the signed preimage. The signature is appended
- * separately so a publisher signs exactly these bytes and a subscriber
- * verifies exactly these bytes.
+ * Validates a cumulative reason list and drops it into a canonical shape.
+ *
+ * Input order is **mark order** — oldest first — because that is what the
+ * cap evicts by. The wire order is by stop index, applied in the encoder.
  */
-export function encodeThreadBodyPreimage(body) {
+function normalizeStopReasons(value) {
+  if (!value || !value.length) return [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of value) {
+    const stopIndex = entry?.stopIndex;
+    if (!Number.isInteger(stopIndex) || stopIndex < 1) {
+      throw new Error(`A carried stop reason names a 1-based stop index; got ${stopIndex}.`);
+    }
+    if (seen.has(stopIndex)) {
+      throw new Error(`Stop ${stopIndex} appears twice in the carried reason list.`);
+    }
+    seen.add(stopIndex);
+    const reasonCode = entry.reasonCode ?? STOP_REASON.NONE;
+    if (!Number.isInteger(reasonCode) || reasonCode < 0 || reasonCode > REASON_CODE_MASK) {
+      throw new Error(`A carried reason code is 0..${REASON_CODE_MASK}; got ${reasonCode}.`);
+    }
+    out.push({ stopIndex, reasonCode, photo: entry.photo === true });
+  }
+  return out;
+}
+
+/** What fields 20–21 cost on the wire, without building them. */
+function stopReasonBytes(reasons) {
+  let bytes = varintLength(reasons.length);
+  for (const entry of reasons) bytes += varintLength(entry.stopIndex) + 1;
+  return bytes;
+}
+
+/**
+ * Builds the signed preimage without checking that it fits, so the size
+ * check and `fitStopReasons` can both measure the same bytes.
+ */
+function buildThreadBodyPreimage(body) {
   const out = [];
   pushMagic(out, THREAD_MAGIC.PMTP);
   pushVarint(out, body.unixSeconds);
@@ -279,13 +347,24 @@ export function encodeThreadBodyPreimage(body) {
   pushVarint(out, outcomes.length);
   pushBytes(out, packed);
 
+  // Field 14 is a flag byte whose bit 0 is the boolean it used to be, so
+  // a record with nothing new to say encodes to exactly the bytes it
+  // always did.
+  const last = body.lastOutcome || null;
+  // Ascending by stop index on the wire — deterministic, and it lets the
+  // decoder reject a duplicate or a reordering with one comparison. The
+  // caller's ordering is mark order and matters only to the cap.
+  const reasons = normalizeStopReasons(body.stopReasons).sort((a, b) => a.stopIndex - b.stopIndex);
+  const photoCount = Math.max(0, Math.trunc(body.photoCount || 0));
+  let flags = 0;
+  if (last) flags |= THREAD_MARK_FLAG.LAST;
+  if (reasons.length) flags |= THREAD_MARK_FLAG.REASONS;
+  if (photoCount) flags |= THREAD_MARK_FLAG.PHOTO_COUNT;
+  out.push(flags);
+
   // The most recent explicit mark, so a follower can render "stop 7
   // skipped — customer absent" without diffing two bitmaps.
-  const last = body.lastOutcome || null;
-  if (!last) {
-    out.push(0);
-  } else {
-    out.push(1);
+  if (last) {
     pushVarint(out, last.stopIndex);
     out.push(last.outcome & 0xff);
     out.push(last.reasonCode & 0xff);
@@ -299,10 +378,43 @@ export function encodeThreadBodyPreimage(body) {
     if (photoHash) pushBytes(out, photoHash);
   }
 
+  // §5.2.1 the cumulative reason list: one entry for **every** stop the
+  // map says is skipped or failed, sparse because delivered and pending
+  // stops have nothing to say. Carrying reason 0 explicitly is what makes
+  // a gap in this list mean "I never learned why" rather than "no reason
+  // was given" — see `stopReasonFor`.
+  if (reasons.length) {
+    pushVarint(out, reasons.length);
+    for (const entry of reasons) {
+      pushVarint(out, entry.stopIndex);
+      // Bit 7 says the mark carried a photo commitment. Free — the code
+      // itself needs six bits — and it is the whole of what a subscriber
+      // can be told about a commitment it never received (§20.7).
+      out.push((entry.reasonCode & REASON_CODE_MASK) | (entry.photo ? REASON_PHOTO_BIT : 0));
+    }
+  }
+
+  // §20.7. How many distinct photo commitments this run has published.
+  // One byte for any realistic day, and it is the only thing that makes a
+  // *missing* commitment countable: a subscriber that holds fewer
+  // distinct hashes than this knows exactly how many proofs it will never
+  // be able to fetch, rather than believing it has them all.
+  if (photoCount) pushVarint(out, photoCount);
+
   const note = body.note || new Uint8Array(0);
   if (note.length > THREAD_MAX_NOTE_BYTES) throw new Error("Thread note exceeds 64 bytes.");
   pushVarint(out, note.length);
   pushBytes(out, note);
+  return { bytes: out, outcomes, packed, note, reasons };
+}
+
+/**
+ * Encodes fields 1–23 — the signed preimage. The signature is appended
+ * separately so a publisher signs exactly these bytes and a subscriber
+ * verifies exactly these bytes.
+ */
+export function encodeThreadBodyPreimage(body) {
+  const { bytes: out, outcomes, packed, note, reasons } = buildThreadBodyPreimage(body);
 
   // 256 bytes is a hard wire limit, and the body is signed and sealed
   // before it is ever framed — so a run whose plan is too large to
@@ -313,11 +425,42 @@ export function encodeThreadBodyPreimage(body) {
     throw new Error(
       `PMTP body is ${preimageLength + 64} bytes and a PMT1 record allows ${THREAD_MAX_BODY_BYTES}: `
       + `${outcomes.length} plan stops cost ${packed.length} bytes of outcome map `
-      + `and this note costs ${note.length}. With a ${note.length}-byte note a run plan `
+      + `and this note costs ${note.length}`
+      + (reasons.length ? `, and ${reasons.length} carried reasons cost ${stopReasonBytes(reasons)}` : "")
+      + `. With a ${note.length}-byte note a run plan `
       + `may carry at most ${stopsThatFit(fixed)} stops.`
     );
   }
   return Uint8Array.from(out);
+}
+
+/**
+ * The most recent carried reasons that fit, oldest evicted first.
+ *
+ * **Bounded, never refused**, and that asymmetry with the plan-size check
+ * above is deliberate. A plan's size is known before the run starts, so
+ * refusing it is a configuration error caught once. A reason list grows
+ * during the day, out of things the driver does at doors — refusing to
+ * encode at 09:41 because the twelfth stop failed would take the outcome
+ * map, the position and the whole rest of the record down with it, which
+ * is a far worse loss than the reason it was protecting.
+ *
+ * **Oldest first** because the list is cumulative and self-healing. A
+ * subscriber that has been listening has already received the early
+ * reasons; the ones it is most likely still missing are the newest, so
+ * the newest are what every record spends its bytes re-stating.
+ *
+ * `body.stopReasons` is in mark order — oldest first — since that is the
+ * order this evicts by; the encoder sorts by stop index for the wire.
+ */
+export function fitStopReasons(body, { max = THREAD_MAX_REASONS } = {}) {
+  const all = normalizeStopReasons(body.stopReasons);
+  let kept = all.length > max ? all.slice(all.length - max) : all;
+  while (kept.length
+    && buildThreadBodyPreimage({ ...body, stopReasons: kept }).bytes.length + 64 > THREAD_MAX_BODY_BYTES) {
+    kept = kept.slice(1);
+  }
+  return kept;
 }
 
 export function encodeThreadBody(body, signature) {
@@ -345,9 +488,15 @@ export function decodeThreadBody(bytes) {
   const stopCount = readVarint(bytes, state);
   const packed = readBytes(bytes, state, Math.ceil(stopCount / 4));
   const outcomes = unpackOutcomes(packed, stopCount);
-  const lastPresent = readU8(bytes, state);
+  const flags = readU8(bytes, state);
+  // Reserved bits are refused rather than skipped: a record whose unknown
+  // bit means "and then four more fields" would otherwise decode as a
+  // short body with trailing bytes, or worse, not.
+  if (flags & ~THREAD_MARK_FLAGS_KNOWN) {
+    throw new Error(`PMTP mark flags ${flags} set a reserved bit.`);
+  }
   let lastOutcome = null;
-  if (lastPresent) {
+  if (flags & THREAD_MARK_FLAG.LAST) {
     const lastStopIndex = readVarint(bytes, state);
     const outcome = readU8(bytes, state);
     const reasonCode = readU8(bytes, state);
@@ -362,6 +511,26 @@ export function decodeThreadBody(bytes) {
       : null;
     lastOutcome = { stopIndex: lastStopIndex, outcome, reasonCode, photoHash };
   }
+  const stopReasons = [];
+  if (flags & THREAD_MARK_FLAG.REASONS) {
+    const reasonCount = readVarint(bytes, state);
+    let previous = 0;
+    for (let i = 0; i < reasonCount; i++) {
+      const entryStop = readVarint(bytes, state);
+      // Strictly increasing, which is both the canonical order and the
+      // duplicate check: two entries for one stop would let a link holder
+      // craft a record whose meaning depends on which one a reader wins.
+      if (entryStop <= previous) throw new Error("PMTP carried reasons must be strictly increasing by stop index.");
+      previous = entryStop;
+      const packedReason = readU8(bytes, state);
+      stopReasons.push({
+        stopIndex: entryStop,
+        reasonCode: packedReason & REASON_CODE_MASK,
+        photo: (packedReason & REASON_PHOTO_BIT) !== 0
+      });
+    }
+  }
+  const photoCount = (flags & THREAD_MARK_FLAG.PHOTO_COUNT) ? readVarint(bytes, state) : 0;
   const noteLen = readVarint(bytes, state);
   const note = readBytes(bytes, state, noteLen);
   const preimageEnd = state.pos;
@@ -383,6 +552,16 @@ export function decodeThreadBody(bytes) {
     // happened at that stop, never "the vehicle has not reached it".
     outcomes,
     lastOutcome,
+    /**
+     * §5.2.1. One entry per stop the map says is skipped or failed, in
+     * stop order — reason code, and whether that mark carried a photo
+     * commitment. Cumulative like the map, and capped like it is not:
+     * a **gap** here against a skipped stop means the reason was lost,
+     * which `stopReasonFor` reports rather than guessing at.
+     */
+    stopReasons,
+    /** §20.7. Distinct photo commitments this run has published, 0 if none. */
+    photoCount,
     note,
     signature,
     preimage: bytes.subarray(0, preimageEnd),
@@ -403,6 +582,46 @@ export function decodeThreadBody(bytes) {
       : `${leafCell}/${geomRef >>> 1}/${geomRef & 1}`,
     ratio: ratioQ12 / 4096
   };
+}
+
+/**
+ * What one stop's record says, and — the point of this function —
+ * whether it says anything at all.
+ *
+ * "Stop 3 skipped, no reason given" and "stop 3 skipped, and I never
+ * learned why" are different sentences to put in front of a dispatcher,
+ * and before the carried reason list they were the same three bytes on
+ * the wire. They are told apart by `reasonKnown`:
+ *
+ * - `reasonKnown: true, reasonCode: 0` — the driver marked it and stated
+ *   no reason. That is a complete answer.
+ * - `reasonKnown: false` — this stop is resolved-not-delivered and no
+ *   record we hold carries its reason. Either the run marked it before
+ *   this build's reason list existed, or the mark's reason aged out of
+ *   the cap (§5.2.1). Missing, not empty.
+ *
+ * `hasPhoto` follows the same discipline: `true`/`false` when the reason
+ * list covers the stop, `null` when nothing does — never a cheerful
+ * `false` for a proof that may well exist (§20.7).
+ */
+export function stopReasonFor(body, stopIndex) {
+  const outcome = body?.outcomes?.[stopIndex - 1] ?? STOP_OUTCOME.PENDING;
+  // Pending and delivered stops have no reason to carry, so nothing is
+  // missing and nothing is unknown.
+  if (outcome !== STOP_OUTCOME.SKIPPED && outcome !== STOP_OUTCOME.FAILED) {
+    return { outcome, reasonCode: null, reasonKnown: true, hasPhoto: null };
+  }
+  const entry = body?.stopReasons?.find(item => item.stopIndex === stopIndex) ?? null;
+  if (entry) {
+    return { outcome, reasonCode: entry.reasonCode, reasonKnown: true, hasPhoto: entry.photo };
+  }
+  // A record written before the list existed still answers for the one
+  // stop it happens to be about.
+  const last = body?.lastOutcome;
+  if (last && last.stopIndex === stopIndex) {
+    return { outcome, reasonCode: last.reasonCode, reasonKnown: true, hasPhoto: last.photoHash != null };
+  }
+  return { outcome, reasonCode: null, reasonKnown: false, hasPhoto: null };
 }
 
 // --- §21 PMTC day certificate ---------------------------------------------

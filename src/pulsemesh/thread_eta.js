@@ -7,7 +7,7 @@
 // learns which stop anyone cares about — unlike every server-side ETA,
 // which necessarily knows each recipient's address.
 
-import { STOP_OUTCOME, THREAD_STATE, THREAD_TRAVEL_MODE } from "./thread_codec.js";
+import { STOP_OUTCOME, THREAD_STATE, THREAD_TRAVEL_MODE, stopReasonFor } from "./thread_codec.js";
 import { THREAD_CONSTANTS } from "./thread_publish.js";
 
 const TRAVEL_MODE_NAMES = Object.freeze({
@@ -113,6 +113,7 @@ export async function estimateArrival({
   const mine = outcomeOf(myStopIndex);
   if (mine === STOP_OUTCOME.DELIVERED) return null; // already served
   if (mine === STOP_OUTCOME.SKIPPED || mine === STOP_OUTCOME.FAILED) {
+    const why = stopReasonFor(update, myStopIndex);
     return {
       arrivalMillis: null,
       secondsFromObservation: null,
@@ -120,12 +121,19 @@ export async function estimateArrival({
       stopsAway: null,
       outcome: mine,
       outcomeName: OUTCOME_NAMES[mine],
-      // The wire carries one reason, for the most recent mark. When that
-      // mark was not this stop the reason is genuinely unknown here
-      // rather than inferrable, and null says so.
-      reasonCode: update.lastOutcome?.stopIndex === myStopIndex
-        ? update.lastOutcome.reasonCode
-        : null,
+      // The cumulative reason list answers for any stop it covers, not
+      // only the most recent mark (§5.2.1) — so a customer whose parcel
+      // was refused at 09:12 still gets told why at 16:00.
+      //
+      // `null` remains possible and now means something exact: the reason
+      // aged out of the cap, or the run predates the list. `reasonKnown`
+      // is what separates that from a mark with no reason given, and a UI
+      // that renders "no reason given" for both is lying about one of
+      // them.
+      reasonCode: why.reasonCode,
+      reasonKnown: why.reasonKnown,
+      /** §20.7: true, false, or null when nothing we hold says (§5.2.1). */
+      hasPhoto: why.hasPhoto,
       basis: "marked",
       positionBasis: "none",
       observationAgeSeconds: ageSeconds,
@@ -191,6 +199,10 @@ export async function estimateArrival({
     outcome: STOP_OUTCOME.PENDING,
     outcomeName: OUTCOME_NAMES[STOP_OUTCOME.PENDING],
     reasonCode: null,
+    // A pending stop has no reason to have lost: nothing is missing, so
+    // the pair reads the same on both arms of the union.
+    reasonKnown: true,
+    hasPhoto: null,
     // Honest provenance for the UI, mirroring §12's four rows.
     basis: live ? "live-traffic" : "static-metric",
     positionBasis: originIsExact ? "reported-position" : "last-stop",
