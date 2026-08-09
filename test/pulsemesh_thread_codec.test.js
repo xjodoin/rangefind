@@ -418,10 +418,12 @@ test("a 200-stop outcome map, travelMode and lastOutcome survive the wire", asyn
     outcome: STOP_OUTCOME.SKIPPED,
     reasonCode: STOP_REASON.CUSTOMER_ABSENT,
     // §20.7: a mark always says whether it carries a photo, and this one
-    // does not. One byte, and it is what makes the commitment's presence
-    // part of the signed preimage rather than an optional trailer.
-    photoHash: null
+    // does not. One byte, and it is what makes a proof's *existence* part
+    // of the signed preimage rather than an optional trailer. Which proof
+    // is the accumulator's job (§20.7.1).
+    hasPhoto: false
   });
+  assert.equal(parsed.photoChain, null, "a run that has taken no photo carries no accumulator");
   // 50 bytes for the day: the whole point of the packed map.
   assert.equal(preimage.length - encodeThreadBodyPreimage(VECTOR_BODY).length, 50 + 2 + 4 + 1,
     "50 map bytes, a 2-byte count, a 4-byte lastOutcome, and a wider stopIndex");
@@ -496,11 +498,14 @@ test("a plan too large to encode is refused, with the number that fits", () => {
     /allows 213/su
   );
 
-  // §20.7: a photo commitment is 32 of those bytes, and it comes out of
-  // the same budget. The same 200-stop day with one attached leaves 25.
+  // §20.7.1: the photo accumulator is 32 of those bytes, and it comes out
+  // of the same budget the single commitment used to. The same 200-stop
+  // day with photos leaves 25 — the number field 19 left, for a field
+  // that binds every commitment rather than the newest.
   const withPhoto = {
     ...worst,
-    lastOutcome: { ...worst.lastOutcome, photoHash: "d3".repeat(32) },
+    lastOutcome: { ...worst.lastOutcome, hasPhoto: true },
+    photoChain: "d3".repeat(32),
     outcomes: new Array(200).fill(1)
   };
   assert.ok(encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(25) }).length + 64

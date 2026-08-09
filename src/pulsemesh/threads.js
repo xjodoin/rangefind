@@ -76,6 +76,7 @@
 // advertised.
 
 export {
+  PHOTO_CHAIN_ZERO,
   PHOTO_SEAL_OVERHEAD,
   THREAD_MAX_PHOTO_BYTES,
   THREAD_TOPIC_PREFIX,
@@ -86,6 +87,8 @@ export {
   nativeX25519Available,
   openPhoto,
   openThreadBody,
+  photoChainOf,
+  photoChainStep,
   photoCommitment,
   photoHashBytes,
   photoHashHex,
@@ -101,6 +104,7 @@ export {
   threadTagsForWindows,
   threadTopic,
   threadWindow,
+  verifyPhotoChain,
   verifyThread,
   x25519PublicKey,
   x25519SharedSecret
@@ -142,6 +146,7 @@ export {
   THREAD_MAGIC,
   THREAD_MARK_FLAG,
   THREAD_MAX_REASONS,
+  THREAD_MAX_PHOTO_LIST,
   THREAD_MAX_BOOTSTRAP_ADDRESSES,
   THREAD_MAX_BOOTSTRAP_BYTES,
   THREAD_MAX_URL_BOOTSTRAP,
@@ -155,6 +160,8 @@ export {
   THREAD_STATE,
   THREAD_TRAVEL_MODE,
   decodeDayCertificate,
+  decodePhotoListRequest,
+  decodePhotoListResponse,
   decodePhotoRequest,
   decodePhotoResponse,
   decodeThreadBody,
@@ -164,6 +171,8 @@ export {
   decodeThreadResponse,
   encodeDayCertificate,
   encodeDayCertificatePreimage,
+  encodePhotoListRequest,
+  encodePhotoListResponse,
   encodePhotoRequest,
   encodePhotoResponse,
   encodeThreadBody,

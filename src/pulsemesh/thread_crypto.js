@@ -23,6 +23,7 @@
 // discovered by an exception on every call. setThreadCryptoImplementation
 // still overrides everything for a host that would rather bring its own.
 
+import { pushVarint } from "../binary.js";
 import { fromHex, sha256, toHex } from "./sha256.js";
 import { utf8Bytes } from "./codec.js";
 import { ed25519PublicKeyFromSeed, ed25519Sign, ed25519Verify } from "./ed25519.js";
@@ -229,8 +230,8 @@ export async function photoKeyFor(privateSeed, planRef, stopIndex) {
  * addressed by one, and is fetched out of band by content hash — so
  * there is nothing to derive a nonce from and the IV has to travel.
  * There is no AAD for the same reason: the binding a record needs comes
- * from the signed commitment on the wire (§5.2 field 18), not from the
- * blob's own framing.
+ * from the signed accumulator over the commitment (§5.2 field 21), not
+ * from the blob's own framing.
  */
 export async function sealPhoto(key, plaintext, { iv = null } = {}) {
   const nonce = iv || globalThis.crypto.getRandomValues(new Uint8Array(12));
@@ -301,6 +302,100 @@ export function photoHashBytes(hash) {
 /** Hex for a commitment given as hex or bytes. */
 export function photoHashHex(hash) {
   return normalizeHash(hash);
+}
+
+// --- §20.7.1 the photo accumulator ----------------------------------------
+//
+// One 32-byte field in the signed body binds **every** commitment the run
+// has published, in order, each to the stop it was taken at. The record
+// carries the head; the list is fetched from the publisher and checked
+// against a head the publisher already signed and gossiped.
+//
+// That is what keeps the evidence property §20.7 exists for. A publisher
+// restating its own list is the party who might lie — but it is restating
+// it against a value it committed to at the door, inside a record whose
+// `unixSeconds` and `seq` place it there. Insert, drop, reorder or
+// backdate anything and the chain no longer reproduces that value.
+
+const PHOTO_CHAIN_INFO = "pulsemesh/photo-chain/1";
+
+/** A₀: the accumulator of a run that has published no photos. */
+export const PHOTO_CHAIN_ZERO = "0".repeat(64);
+
+/**
+ * Aᵢ = SHA-256( "pulsemesh/photo-chain/1" ‖ Aᵢ₋₁ ‖ varint(stopIndex) ‖ commitmentᵢ ).
+ *
+ * The stop index is inside the hash, not merely alongside it: a
+ * commitment names a blob, and which door that blob was taken at is
+ * exactly what a dispute is about. It is also the second half of the
+ * photo key (§20.7), so binding it here means a list entry cannot be
+ * re-pointed at another stop without the chain breaking first.
+ */
+export function photoChainStep(previous, stopIndex, commitment) {
+  if (!Number.isInteger(stopIndex) || stopIndex < 1) {
+    throw new Error(`A photo chain entry names a 1-based plan stop, not ${stopIndex}.`);
+  }
+  const head = photoHashBytes(previous ?? PHOTO_CHAIN_ZERO);
+  const varint = [];
+  pushVarint(varint, stopIndex);
+  const info = utf8Bytes(PHOTO_CHAIN_INFO);
+  const commitmentBytes = photoHashBytes(commitment);
+  const message = new Uint8Array(info.length + 32 + varint.length + 32);
+  message.set(info, 0);
+  message.set(head, info.length);
+  message.set(varint, info.length + 32);
+  message.set(commitmentBytes, info.length + 32 + varint.length);
+  return toHex(sha256(message));
+}
+
+/** The head after folding `entries` — `[{ stopIndex, commitment }]` — into A₀. */
+export function photoChainOf(entries) {
+  let head = PHOTO_CHAIN_ZERO;
+  for (const entry of entries || []) head = photoChainStep(head, entry.stopIndex, entry.commitment);
+  return head;
+}
+
+/**
+ * Splits a publisher's list at the point a signed accumulator vouches for
+ * it (§20.7.1).
+ *
+ * A holder's accumulator comes from whatever record it last accepted, so
+ * it is routinely *older* than the list it is handed. That is not a
+ * failure and it is not all-or-nothing: the prefix that reproduces the
+ * held head is exactly as good as evidence as it ever was, and everything
+ * past it is a claim the holder has not yet seen signed. They are
+ * returned apart, with stop indices, so a caller can neither accept the
+ * unverified ones by accident nor be told nothing about them.
+ *
+ * `matchedAt === 0` with a non-empty list means no prefix reproduces the
+ * head: the list belongs to another run, or the publisher rewrote it.
+ * Nothing in it is verified.
+ */
+export function verifyPhotoChain(entries, accumulator) {
+  const wanted = accumulator == null ? PHOTO_CHAIN_ZERO : normalizeHash(accumulator);
+  const list = [...(entries || [])];
+  let head = PHOTO_CHAIN_ZERO;
+  let matchedAt = wanted === PHOTO_CHAIN_ZERO ? 0 : -1;
+  for (let i = 0; i < list.length && matchedAt < 0; i++) {
+    head = photoChainStep(head, list[i].stopIndex, list[i].commitment);
+    // First match wins. A second position holding the same head would be
+    // a SHA-256 collision, not an ambiguity worth resolving.
+    if (head === wanted) matchedAt = i + 1;
+  }
+  const cut = matchedAt < 0 ? 0 : matchedAt;
+  return {
+    matchedAt: cut,
+    /** Bound by a head the publisher signed. Safe to fetch and to believe. */
+    verified: list.slice(0, cut).map(entry => ({
+      stopIndex: entry.stopIndex,
+      commitment: photoHashHex(entry.commitment)
+    })),
+    /** Published after the newest record this holder has. Named, never accepted. */
+    unverified: list.slice(cut).map(entry => ({
+      stopIndex: entry.stopIndex,
+      commitment: photoHashHex(entry.commitment)
+    }))
+  };
 }
 
 // --- Ed25519 --------------------------------------------------------------

@@ -453,10 +453,12 @@ export async function createThreadSubscriber({
       // `stopReasonFor` rather than searching this by hand — it is the
       // thing that keeps "no reason given" and "reason lost" apart.
       stopReasons: latest?.stopReasons ?? [],
-      // §20.7. How many photo commitments the run says it has published.
-      // Fewer distinct commitments held than this is exactly how many
-      // proofs of delivery this device can never fetch.
-      photoCount: latest?.photoCount ?? 0,
+      // §20.7.1. The head of the run's photo chain, or null if it has
+      // taken none. Hand it to `fetchPhotoList` to recover **every**
+      // commitment the run has published — including the ones whose
+      // records never reached this device — and to check the answer
+      // against a value the publisher already signed.
+      photoChain: latest?.photoChain ?? null,
       travelMode: latest?.travelMode ?? 0,
       // The claim the UI is allowed to make, spelled out so it cannot be
       // accidentally upgraded.

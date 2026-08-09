@@ -153,18 +153,18 @@ test("two stops marked in a dead zone come back with their reasons", async () =>
   // `lastOutcome` is still one mark and still the most recent one — the
   // list did not replace it, it stopped it being the only copy.
   assert.equal(update.lastOutcome.stopIndex, 3);
-  assert.equal(update.lastOutcome.photoHash?.length, 64);
+  assert.equal(update.lastOutcome.hasPhoto, true);
 
-  // §20.7: the commitments themselves did not survive, and the record
-  // says so rather than letting the board believe it has everything.
-  assert.equal(update.photoCount, 2, "the run says it has published two commitments");
+  // §20.7.1: the commitments survived too, in one 32-byte accumulator
+  // that binds both of them — including stop 2's, whose record reached
+  // nobody and whose mark was superseded before coverage returned.
+  assert.match(update.photoChain, /^[0-9a-f]{64}$/u);
+  assert.equal(update.photoChain, run.publisher.photoChain(),
+    "the head the follower holds is the head the run is on");
   assert.equal(update.stopReasons.filter(entry => entry.photo).length, 2,
-    "and names the two stops they belong to");
-  const held = new Set([update.lastOutcome.photoHash]);
-  assert.equal(update.photoCount - held.size, 1,
-    "one proof of delivery is countably missing, which is the honest answer");
+    "and the list names the two stops they belong to");
 
-  // A record with two carried reasons and a photo count is a handful of
+  // A record with two carried reasons and an accumulator is a handful of
   // bytes bigger than one with none, not a different protocol.
   assert.ok(run.subscriber.latest(), "and it is an ordinary 256-byte record");
 });
@@ -236,7 +236,11 @@ test("a normal day costs exactly what it costs today", async () => {
     note: new Uint8Array(0)
   };
   const today = encodeThreadBodyPreimage(body);
-  for (const extra of [{}, { stopReasons: [] }, { photoCount: 0 }, { stopReasons: [], photoCount: 0 }]) {
+  for (const extra of [{}, { stopReasons: [] }, { photoChain: null }, { stopReasons: [], photoChain: null },
+    // A₀ passed in explicitly is the same statement as "no photos", and
+    // must not turn the flag bit on: a publisher folding an empty list
+    // arrives at 32 zero bytes honestly.
+    { photoChain: "0".repeat(64) }]) {
     assert.deepEqual(
       [...encodeThreadBodyPreimage({ ...body, ...extra })], [...today],
       "an all-delivered day encodes to the bytes it always did"
@@ -248,18 +252,23 @@ test("a normal day costs exactly what it costs today", async () => {
   const quiet = { ...body, outcomes: [], lastOutcome: null };
   assert.equal(encodeThreadBodyPreimage(quiet).length, 31, "the §16.4 vector's length, unmoved");
 
-  // What the outage day pays: a count, two pairs, and one byte of photo
-  // counter. Six bytes to make the most valuable record of the day
-  // survive being published into a dead zone.
-  const carrying = encodeThreadBodyPreimage({
+  // What the outage day pays. The reasons are a count and two pairs:
+  // five bytes to make the most valuable sentence of the day survive
+  // being published into a dead zone.
+  const outage = {
     ...body,
     stopReasons: [
       { stopIndex: 2, reasonCode: STOP_REASON.CUSTOMER_ABSENT, photo: true },
       { stopIndex: 3, reasonCode: STOP_REASON.PARCEL_MISSING, photo: true }
-    ],
-    photoCount: 2
-  });
-  assert.equal(carrying.length - today.length, 6);
+    ]
+  };
+  assert.equal(encodeThreadBodyPreimage(outage).length - today.length, 5);
+
+  // The two proofs behind them cost 32 more — the accumulator, which is
+  // what the single commitment used to cost and now binds both of them
+  // and everything else the run publishes (§20.7.1).
+  const carrying = encodeThreadBodyPreimage({ ...outage, photoChain: "d3".repeat(32) });
+  assert.equal(carrying.length - today.length, 37);
 });
 
 test("the cap keeps the newest reasons and the record keeps fitting", async () => {
@@ -330,7 +339,7 @@ test("carried reasons are signed, ordered, and refused when malformed", async ()
       { stopIndex: 4, reasonCode: STOP_REASON.OTHER, photo: true },
       { stopIndex: 2, reasonCode: STOP_REASON.CUSTOMER_ABSENT }
     ],
-    photoCount: 1,
+    photoChain: "a1".repeat(32),
     note: new Uint8Array(0)
   };
   const preimage = encodeThreadBodyPreimage(body);
@@ -340,7 +349,7 @@ test("carried reasons are signed, ordered, and refused when malformed", async ()
     { stopIndex: 2, reasonCode: STOP_REASON.CUSTOMER_ABSENT, photo: false },
     { stopIndex: 4, reasonCode: STOP_REASON.OTHER, photo: true }
   ], "the wire is ascending by stop index whatever order the caller marked in");
-  assert.equal(parsed.photoCount, 1);
+  assert.equal(parsed.photoChain, "a1".repeat(32), "and the accumulator round-trips as hex");
 
   // Inside the signature, so a link holder cannot rewrite why a parcel
   // came back — which is the whole reason it is not a side channel.
@@ -359,7 +368,7 @@ test("carried reasons are signed, ordered, and refused when malformed", async ()
   // A body that carries none of the three optional blocks ends
   // `… flags noteLen signature`, so the flag byte is at a known offset
   // and can be poked without hunting for it.
-  const bare = { ...body, lastOutcome: null, stopReasons: [], photoCount: 0 };
+  const bare = { ...body, lastOutcome: null, stopReasons: [], photoChain: null };
   const barePreimage = encodeThreadBodyPreimage(bare);
   const flagAt = barePreimage.length - 2;
   assert.equal(barePreimage[flagAt], 0, "no optional block, no flags set");
@@ -443,7 +452,15 @@ test("what the outage costs on the wire, in bytes the encoder produces", async (
 
   // Unchanged: a day that carries no reasons pays nothing for them.
   assert.equal(noteRoom(worst), 57, "the published 200-stop headroom is where it was");
-  const withPhoto = { ...worst, lastOutcome: { ...worst.lastOutcome, photoHash: "d3".repeat(32) } };
+
+  // §20.7.1: the accumulator costs exactly what the single commitment it
+  // replaced cost. Same 32 bytes, same 25 bytes of headroom left — and
+  // every commitment of the run bound instead of the newest one.
+  const withPhoto = {
+    ...worst,
+    lastOutcome: { ...worst.lastOutcome, hasPhoto: true },
+    photoChain: "d3".repeat(32)
+  };
   assert.equal(noteRoom(withPhoto), 25);
 
   // Each reason is a stop-index varint and one byte, plus one for the
@@ -451,15 +468,27 @@ test("what the outage costs on the wire, in bytes the encoder produces", async (
   const reasons = n => Array.from({ length: n }, (_, i) => ({ stopIndex: 7 + i, reasonCode: 1 }));
   assert.equal(noteRoom({ ...worst, stopReasons: reasons(3) }), 57 - 7);
   assert.equal(noteRoom({ ...worst, stopReasons: reasons(16) }), 57 - 33);
-  assert.equal(noteRoom({ ...worst, photoCount: 4 }), 57 - 1);
+  assert.equal(noteRoom({ ...withPhoto, stopReasons: reasons(3) }), 57 - 7 - 32);
   // A 200-stop day with a full 16-entry list at the widest stop indices.
   const wide = Array.from({ length: 16 }, (_, i) => ({ stopIndex: 150 + i, reasonCode: 1 }));
-  assert.equal(noteRoom({ ...worst, stopReasons: wide, photoCount: 9 }), 57 - 49 - 1);
+  assert.equal(noteRoom({ ...worst, stopReasons: wide }), 57 - 49);
+
+  // The chain and a full reason list do **not** both fit a 200-stop day,
+  // and that is the one number this pass moved: 49 + 32 is 81 against 57
+  // bytes of headroom. `fitStopReasons` is what makes it a trim rather
+  // than a refusal — it keeps the newest 8 instead of all 16.
+  assert.equal(noteRoom({ ...withPhoto, stopReasons: wide }), -1);
+  assert.equal(fitStopReasons({ ...withPhoto, stopReasons: wide }).length, 8);
+  assert.deepEqual(
+    fitStopReasons({ ...withPhoto, stopReasons: wide }).map(entry => entry.stopIndex),
+    wide.slice(8).map(entry => entry.stopIndex),
+    "the newest survive; the oldest were already delivered when they were new"
+  );
 
   // And the whole thing still frames into one PMT1.
+  const trimmed = { ...withPhoto, stopReasons: fitStopReasons({ ...withPhoto, stopReasons: wide }) };
   assert.ok(
-    encodeThreadBodyPreimage({ ...worst, stopReasons: wide, photoCount: 9 }).length + 64
-      + 43 <= THREAD_MAX_RECORD_BYTES,
+    encodeThreadBodyPreimage(trimmed).length + 64 + 43 <= THREAD_MAX_RECORD_BYTES,
     "body plus signature plus the 43 bytes of PMT1 framing"
   );
 });

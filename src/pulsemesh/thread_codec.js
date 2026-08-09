@@ -24,6 +24,13 @@ export const THREAD_MAGIC = Object.freeze({
   // naming the record rather than a version digit.
   PMTF: "PMTF",
   PMTB: "PMTB",
+  // §20.7.1 the commitment list, on the same protocol id and by the same
+  // naming: `L` asks for the list, `A` answers with it. They belong here
+  // rather than beside PMR1/PMM1 because they have the photo protocol's
+  // shape and not catch-up's — only the peer publishing the run can ever
+  // answer one, and the answer is a prelude to fetching a blob.
+  PMTL: "PMTL",
+  PMTA: "PMTA",
   // §21 day certificate. Same reasoning as the two above, one step
   // further: this is not a record on the wire at all, it is an **inner
   // sealed body** — the exact shape PMTP is — so it belongs to the
@@ -84,8 +91,19 @@ export const STOP_REASON = Object.freeze({
 
 export const THREAD_MAX_RECORD_BYTES = 256;
 export const THREAD_MAX_NOTE_BYTES = 64;
-/** The commitment a mark may carry (§20.7): SHA-256 of the sealed blob. */
+/** A photo commitment (§20.7) and the accumulator over them are both SHA-256. */
 export const THREAD_PHOTO_HASH_BYTES = 32;
+
+/**
+ * How many entries a PMTA commitment list may carry (§20.7.1).
+ *
+ * A bound on what a *responder* can make a holder chew on, not on what a
+ * run can take: a plan tops out at a few hundred stops (§5.2.2) and only
+ * a re-mark adds an entry beyond one per stop, so no honest run comes
+ * near this. 1024 entries is 34 KB — a third of one photo, and the list
+ * is only ever fetched as the prelude to fetching those.
+ */
+export const THREAD_MAX_PHOTO_LIST = 1024;
 
 /**
  * §5.2 field 14, the mark block's flags. Bit 0 is the byte that used to
@@ -94,14 +112,14 @@ export const THREAD_PHOTO_HASH_BYTES = 32;
  * the §16.4 vector.
  */
 export const THREAD_MARK_FLAG = Object.freeze({
-  /** Fields 15–19: the most recent mark. */
+  /** Fields 15–18: the most recent mark. */
   LAST: 0x01,
-  /** Fields 20–21: the cumulative reason list (§5.2.1). */
+  /** Fields 19–20: the cumulative reason list (§5.2.1). */
   REASONS: 0x02,
-  /** Field 22: how many photo commitments this run has published (§20.7). */
-  PHOTO_COUNT: 0x04
+  /** Field 21: the photo accumulator, over every commitment (§20.7.1). */
+  PHOTO_CHAIN: 0x04
 });
-const THREAD_MARK_FLAGS_KNOWN = THREAD_MARK_FLAG.LAST | THREAD_MARK_FLAG.REASONS | THREAD_MARK_FLAG.PHOTO_COUNT;
+const THREAD_MARK_FLAGS_KNOWN = THREAD_MARK_FLAG.LAST | THREAD_MARK_FLAG.REASONS | THREAD_MARK_FLAG.PHOTO_CHAIN;
 
 /**
  * How many per-stop reasons a record carries at most (§5.2.1).
@@ -268,7 +286,8 @@ function unpackOutcomes(packed, count) {
 }
 
 /**
- * A mark's photo commitment as bytes, from bytes or 64 hex characters.
+ * A photo commitment or accumulator as bytes, from bytes or 64 hex
+ * characters.
  *
  * The wire carries bytes and `decodeThreadBody` hands back **hex**, so a
  * decoded body has to survive being re-encoded: accepting both here is
@@ -285,6 +304,23 @@ function photoHashBytes(value) {
     throw new Error("A photo commitment is 32 bytes or 64 hex characters.");
   }
   return fromHex(text);
+}
+
+const PHOTO_CHAIN_ZERO_HEX = "0".repeat(64);
+
+/**
+ * The accumulator, or null for a run that has published no photos.
+ *
+ * A₀ is 32 zero bytes and a run sitting on it writes **nothing**: the
+ * flag bit stays clear, and an all-delivered day pays not one byte for a
+ * mechanism it never used (§5.2.2). Zeros passed in explicitly mean the
+ * same thing rather than being an error — a publisher folding an empty
+ * list arrives at them honestly.
+ */
+function photoChainField(value) {
+  const bytes = photoHashBytes(value);
+  if (!bytes) return null;
+  return toHex(bytes) === PHOTO_CHAIN_ZERO_HEX ? null : bytes;
 }
 
 /**
@@ -355,11 +391,11 @@ function buildThreadBodyPreimage(body) {
   // decoder reject a duplicate or a reordering with one comparison. The
   // caller's ordering is mark order and matters only to the cap.
   const reasons = normalizeStopReasons(body.stopReasons).sort((a, b) => a.stopIndex - b.stopIndex);
-  const photoCount = Math.max(0, Math.trunc(body.photoCount || 0));
+  const photoChain = photoChainField(body.photoChain);
   let flags = 0;
   if (last) flags |= THREAD_MARK_FLAG.LAST;
   if (reasons.length) flags |= THREAD_MARK_FLAG.REASONS;
-  if (photoCount) flags |= THREAD_MARK_FLAG.PHOTO_COUNT;
+  if (photoChain) flags |= THREAD_MARK_FLAG.PHOTO_CHAIN;
   out.push(flags);
 
   // The most recent explicit mark, so a follower can render "stop 7
@@ -368,14 +404,13 @@ function buildThreadBodyPreimage(body) {
     pushVarint(out, last.stopIndex);
     out.push(last.outcome & 0xff);
     out.push(last.reasonCode & 0xff);
-    // §20.7: a *commitment*, never the image. 32 bytes of SHA-256 over
-    // the sealed blob, inside the signed preimage, so the driver is
-    // bound to one specific photo and the bytes travel on demand over
-    // their own protocol. A record stays 256 bytes whether or not a
-    // photo exists, which is the entire point.
-    const photoHash = photoHashBytes(last.photoHash);
-    out.push(photoHash ? 1 : 0);
-    if (photoHash) pushBytes(out, photoHash);
+    // One byte: **whether** this mark carried a proof, not which one.
+    // Inside the signature, so a photo cannot be attached to a record
+    // after the fact nor stripped off it, and it is what lets a card say
+    // "proof attached" from a single record with no fetch at all. The
+    // commitment itself is in the accumulator below — see §20.7.1 for
+    // why 32 bytes buys every commitment here rather than the newest.
+    out.push(last.hasPhoto ? 1 : 0);
   }
 
   // §5.2.1 the cumulative reason list: one entry for **every** stop the
@@ -394,12 +429,16 @@ function buildThreadBodyPreimage(body) {
     }
   }
 
-  // §20.7. How many distinct photo commitments this run has published.
-  // One byte for any realistic day, and it is the only thing that makes a
-  // *missing* commitment countable: a subscriber that holds fewer
-  // distinct hashes than this knows exactly how many proofs it will never
-  // be able to fetch, rather than believing it has them all.
-  if (photoCount) pushVarint(out, photoCount);
+  // §20.7.1 the photo accumulator: 32 bytes binding **every** commitment
+  // the run has published, in order, each to its stop. Re-stated in every
+  // record exactly as the outcome map is, and for the same reason — a
+  // holder that heard none of an outage needs a head it can check a list
+  // against, and the only heads it will ever have are the ones in the
+  // records it did receive.
+  //
+  // It costs what the single commitment it replaced cost, and it is the
+  // whole record of the run's proofs rather than the newest one.
+  if (photoChain) pushBytes(out, photoChain);
 
   const note = body.note || new Uint8Array(0);
   if (note.length > THREAD_MAX_NOTE_BYTES) throw new Error("Thread note exceeds 64 bytes.");
@@ -500,16 +539,12 @@ export function decodeThreadBody(bytes) {
     const lastStopIndex = readVarint(bytes, state);
     const outcome = readU8(bytes, state);
     const reasonCode = readU8(bytes, state);
-    const photoPresent = readU8(bytes, state);
-    // Hex, not bytes, and deliberately: this is a content address the
-    // consuming side uses as a Map key, puts in a DOM dataset, compares
-    // for equality and logs. Bytes would make every one of those a
-    // conversion, and `photoHashBytes` on the encoder side keeps the
-    // round trip working.
-    const photoHash = photoPresent
-      ? toHex(readBytes(bytes, state, THREAD_PHOTO_HASH_BYTES))
-      : null;
-    lastOutcome = { stopIndex: lastStopIndex, outcome, reasonCode, photoHash };
+    // Whether a proof exists, signed. Which proof is the accumulator's
+    // job (§20.7.1), and resolving it to a commitment takes one list
+    // fetch — but "there is a photo for this stop" needs no fetch and is
+    // the claim a card makes first.
+    const hasPhoto = readU8(bytes, state) !== 0;
+    lastOutcome = { stopIndex: lastStopIndex, outcome, reasonCode, hasPhoto };
   }
   const stopReasons = [];
   if (flags & THREAD_MARK_FLAG.REASONS) {
@@ -530,7 +565,21 @@ export function decodeThreadBody(bytes) {
       });
     }
   }
-  const photoCount = (flags & THREAD_MARK_FLAG.PHOTO_COUNT) ? readVarint(bytes, state) : 0;
+  // Hex, not bytes, and deliberately: an accumulator is compared for
+  // equality, cached by value, keyed on and logged, exactly as a
+  // commitment is — and `photoChainField` on the encoder side accepts it
+  // back, so a decoded body re-encodes to the same bytes.
+  const photoChain = (flags & THREAD_MARK_FLAG.PHOTO_CHAIN)
+    ? toHex(readBytes(bytes, state, THREAD_PHOTO_HASH_BYTES))
+    : null;
+  // A₀ on the wire is not something an encoder can produce — the flag bit
+  // is what says "this run has photographed something", and a run that
+  // has not leaves it clear. Refused rather than tolerated, so a decoded
+  // body re-encodes to the same bytes and a holder is never handed an
+  // accumulator that names every run at once.
+  if (photoChain === PHOTO_CHAIN_ZERO_HEX) {
+    throw new Error("PMTP sets the photo-chain flag over an empty accumulator.");
+  }
   const noteLen = readVarint(bytes, state);
   const note = readBytes(bytes, state, noteLen);
   const preimageEnd = state.pos;
@@ -560,8 +609,14 @@ export function decodeThreadBody(bytes) {
      * which `stopReasonFor` reports rather than guessing at.
      */
     stopReasons,
-    /** §20.7. Distinct photo commitments this run has published, 0 if none. */
-    photoCount,
+    /**
+     * §20.7.1. The hash chain over every photo commitment this run has
+     * published, or null for a run that has published none. A holder
+     * hands it to `fetchPhotoList` and the returned list is verified
+     * against it — which is what makes a commitment published into a
+     * dead zone recoverable rather than lost.
+     */
+    photoChain,
     note,
     signature,
     preimage: bytes.subarray(0, preimageEnd),
@@ -619,7 +674,7 @@ export function stopReasonFor(body, stopIndex) {
   // stop it happens to be about.
   const last = body?.lastOutcome;
   if (last && last.stopIndex === stopIndex) {
-    return { outcome, reasonCode: last.reasonCode, reasonKnown: true, hasPhoto: last.photoHash != null };
+    return { outcome, reasonCode: last.reasonCode, reasonKnown: true, hasPhoto: last.hasPhoto === true };
   }
   return { outcome, reasonCode: null, reasonKnown: false, hasPhoto: null };
 }
@@ -886,6 +941,84 @@ export function decodePhotoResponse(bytes) {
   const sealed = readBytes(bytes, state, length);
   assertNoTrailing(bytes, state, "PMTB response");
   return { magic: THREAD_MAGIC.PMTB, sealed: length ? sealed : null };
+}
+
+// --- §20.7.1 the commitment list ------------------------------------------
+
+/**
+ * PMTL. A magic and an accumulator, and nothing else.
+ *
+ * The accumulator names the run, and that is the whole of the addressing.
+ * No epochPrefix8 and no tag, for PMTF's reason and one more: a tag is a
+ * stable-for-300-seconds name a prober could correlate, while an
+ * accumulator is a SHA-256 that changes with every photo and can only be
+ * obtained by opening a record — which takes `P`. Asking with one is
+ * already proof of being in the audience.
+ *
+ * A₀ is refused: a run with no photos has no list, and zeros would match
+ * every run at once.
+ */
+export function encodePhotoListRequest({ accumulator }) {
+  const bytes = photoChainField(accumulator);
+  if (!bytes) throw new Error("A photo list request needs a non-zero 32-byte accumulator.");
+  const out = [];
+  pushMagic(out, THREAD_MAGIC.PMTL);
+  pushBytes(out, bytes);
+  return Uint8Array.from(out);
+}
+
+export function decodePhotoListRequest(bytes) {
+  const state = { pos: 0 };
+  expectMagic(bytes, state, THREAD_MAGIC.PMTL);
+  const accumulator = toHex(readBytes(bytes, state, THREAD_PHOTO_HASH_BYTES));
+  assertNoTrailing(bytes, state, "PMTL request");
+  if (accumulator === PHOTO_CHAIN_ZERO_HEX) throw new Error("PMTL names the empty accumulator.");
+  return { magic: THREAD_MAGIC.PMTL, accumulator };
+}
+
+/**
+ * PMTA. The commitment list **in publication order**, which is the order
+ * the chain folds them in — a responder that sorts or dedupes this has
+ * produced a list that verifies against nothing.
+ *
+ * Count 0 means "not held", and is also the answer to an accumulator this
+ * peer has never seen: the PMM1 rule again, so a prober cannot tell "I am
+ * not publishing that run" from "no such run".
+ */
+export function encodePhotoListResponse({ entries = [] } = {}) {
+  if (entries.length > THREAD_MAX_PHOTO_LIST) {
+    throw new Error(`A photo list carries at most ${THREAD_MAX_PHOTO_LIST} entries; this one has ${entries.length}.`);
+  }
+  const out = [];
+  pushMagic(out, THREAD_MAGIC.PMTA);
+  pushVarint(out, entries.length);
+  for (const entry of entries) {
+    if (!Number.isInteger(entry.stopIndex) || entry.stopIndex < 1) {
+      throw new Error(`A photo list entry names a 1-based stop index; got ${entry.stopIndex}.`);
+    }
+    pushVarint(out, entry.stopIndex);
+    const commitment = photoHashBytes(entry.commitment);
+    if (!commitment) throw new Error("A photo list entry needs a 32-byte commitment.");
+    pushBytes(out, commitment);
+  }
+  return Uint8Array.from(out);
+}
+
+export function decodePhotoListResponse(bytes) {
+  const state = { pos: 0 };
+  expectMagic(bytes, state, THREAD_MAGIC.PMTA);
+  const count = readVarint(bytes, state);
+  if (count > THREAD_MAX_PHOTO_LIST) {
+    throw new Error(`PMTA claims ${count} entries and the cap is ${THREAD_MAX_PHOTO_LIST}.`);
+  }
+  const entries = [];
+  for (let i = 0; i < count; i++) {
+    const stopIndex = readVarint(bytes, state);
+    if (stopIndex < 1) throw new Error("A photo list entry names a 1-based stop index.");
+    entries.push({ stopIndex, commitment: toHex(readBytes(bytes, state, THREAD_PHOTO_HASH_BYTES)) });
+  }
+  assertNoTrailing(bytes, state, "PMTA response");
+  return { magic: THREAD_MAGIC.PMTA, entries };
 }
 
 // --- §5.4 the link --------------------------------------------------------

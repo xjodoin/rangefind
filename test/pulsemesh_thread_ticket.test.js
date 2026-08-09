@@ -211,7 +211,7 @@ test("a bike round stays a bike round from the ticket to the follower's ETA", as
   await run.markStop(1, STOP_OUTCOME.SKIPPED, { reason: STOP_REASON.INACCESSIBLE });
   await until(() => follow.latest()?.lastOutcome != null);
   assert.deepEqual(follow.latest().lastOutcome, {
-    stopIndex: 1, outcome: STOP_OUTCOME.SKIPPED, reasonCode: STOP_REASON.INACCESSIBLE, photoHash: null
+    stopIndex: 1, outcome: STOP_OUTCOME.SKIPPED, reasonCode: STOP_REASON.INACCESSIBLE, hasPhoto: false
   });
   assert.deepEqual(follow.latest().outcomes, [STOP_OUTCOME.SKIPPED, STOP_OUTCOME.PENDING]);
 

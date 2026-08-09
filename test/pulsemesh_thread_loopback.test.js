@@ -366,7 +366,7 @@ test("T2: an outcome is asserted, never inferred, and reaches the follower at on
   assert.deepEqual(subscriber.latest().outcomes, [1, 0, 0, 0, 0]);
   assert.equal(subscriber.latest().stopIndex, 1);
   assert.deepEqual(subscriber.latest().lastOutcome,
-    { stopIndex: 1, outcome: STOP_OUTCOME.DELIVERED, reasonCode: STOP_REASON.NONE, photoHash: null });
+    { stopIndex: 1, outcome: STOP_OUTCOME.DELIVERED, reasonCode: STOP_REASON.NONE, hasPhoto: false });
 
   // A delivery further down the run is an outcome, not an arrival. The
   // customer at stop 5 rang ahead and the parcel went to a neighbour; the
@@ -389,7 +389,7 @@ test("T2: an outcome is asserted, never inferred, and reaches the follower at on
   assert.deepEqual(late.outcomes, [1, 0, 2, 0, 1]);
   assert.equal(late.stopIndex, 1, "marking an earlier stop never regresses progress…");
   assert.deepEqual(late.lastOutcome,
-    { stopIndex: 3, outcome: STOP_OUTCOME.SKIPPED, reasonCode: STOP_REASON.CUSTOMER_ABSENT, photoHash: null });
+    { stopIndex: 3, outcome: STOP_OUTCOME.SKIPPED, reasonCode: STOP_REASON.CUSTOMER_ABSENT, hasPhoto: false });
 
   // Resolving stop 2 — the one the run is actually on — advances by one
   // and then hops the stop already marked behind it. Progress is the

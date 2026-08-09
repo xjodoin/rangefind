@@ -25,9 +25,11 @@ import {
   threadRecordAad
 } from "./thread_codec.js";
 import {
+  PHOTO_CHAIN_ZERO,
   PHOTO_SEAL_OVERHEAD,
   THREAD_MAX_PHOTO_BYTES,
   deriveThreadKeys,
+  photoChainStep,
   photoCommitment,
   photoKeyFor,
   publicKeyFromSeed,
@@ -217,6 +219,25 @@ export async function createThreadPublisher({
   // per photo (THREAD_MAX_PHOTO_BYTES) and the run's own lifetime.
   const photos = new Map();
 
+  /**
+   * §20.7.1. Every commitment this run has published, in publication
+   * order, and the accumulator over them.
+   *
+   * `photos` is keyed by commitment and so knows *what* the run holds;
+   * this knows the **order** it committed to them in, which is the thing
+   * the chain binds and the thing a publisher would have to lie about to
+   * pass off a photo taken later as a proof from earlier. The list is
+   * served to holders on request (PMTL) and is only useful because they
+   * can check it against a head that is inside a signature.
+   *
+   * `chainHeads` is every intermediate head, so a request naming an
+   * accumulator from *any* record this run ever published is recognised —
+   * not merely one naming the current head.
+   */
+  const photoChainEntries = [];
+  const chainHeads = new Set();
+  let photoChain = PHOTO_CHAIN_ZERO;
+
   function metersBetween(a, b) {
     const toRad = Math.PI / 180;
     const dLat = (b.lat - a.lat) * toRad;
@@ -330,11 +351,12 @@ export async function createThreadPublisher({
       outcomes: [...outcomes],
       lastOutcome: lastOutcome ? { ...lastOutcome } : null,
       stopReasons: [...reasonMarks.values()],
-      // Not `reasonMarks.size` and not a counter of its own: `photos` is
-      // keyed by commitment, so its size is exactly "distinct commitments
-      // this run has published" — the number a subscriber checks its own
-      // collection against to learn how many proofs it has missed (§20.7).
-      photoCount: photos.size,
+      // §20.7.1. The head of the photo chain as of this record. Written
+      // into every record, not just the ones that follow a photo: the
+      // whole point is that a holder which heard *none* of an outage can
+      // check a commitment list against something it holds, and the only
+      // heads it will ever hold are the ones it received.
+      photoChain,
       note: noteBytes(note)
     };
     // Trimmed against this body's own remaining budget rather than a
@@ -444,6 +466,12 @@ export async function createThreadPublisher({
     const sealed = await sealPhoto(key, photo);
     const hash = toHex(photoCommitment(sealed));
     photos.set(hash, sealed);
+    // Appended, never rewritten. A re-mark adds an entry rather than
+    // replacing one: the chain is the history of what this run committed
+    // to, and a history that can be edited is not evidence (§20.7.1).
+    photoChainEntries.push({ stopIndex: index, commitment: hash });
+    photoChain = photoChainStep(photoChain, index, hash);
+    chainHeads.add(photoChain);
     return hash;
   }
 
@@ -515,7 +543,11 @@ export async function createThreadPublisher({
     }
     const photoHash = photo ? await attachPhoto(index, photo, allowCoarsePhoto) : null;
     outcomes[index - 1] = outcome;
-    lastOutcome = { stopIndex: index, outcome, reasonCode, photoHash };
+    // `photoHash` is kept for this device's own use — it is the key into
+    // `photos` — but only `hasPhoto` goes on the wire. Which commitment
+    // is the accumulator's job, and 32 bytes there buys every one of them
+    // rather than the newest (§20.7.1).
+    lastOutcome = { stopIndex: index, outcome, reasonCode, photoHash, hasPhoto: photoHash != null };
     // §5.2.1. `lastOutcome` holds one mark and the next one replaces it,
     // so a reason published into a dead zone used to be gone the moment
     // the next stop was marked. Every resolved-not-delivered stop keeps
@@ -581,6 +613,27 @@ export async function createThreadPublisher({
     photoStore: photos,
     /** One sealed blob by commitment (hex), or null. */
     photoFor: hash => photos.get(String(hash || "").toLowerCase()) ?? null,
+    /** §20.7.1. The accumulator as of now — what the next record carries. */
+    photoChain: () => photoChain,
+    /** Every commitment published, in order. Copied; the chain binds this order. */
+    photoChainEntries: () => photoChainEntries.map(entry => ({ ...entry })),
+    /**
+     * The list, if `accumulator` is a head this run actually published.
+     *
+     * Any head, not only the current one: a holder's newest record may be
+     * several photos old, and answering only the current head would make
+     * recovery depend on being up to date — which is precisely the state
+     * an outage leaves a holder out of. Verification is the holder's, and
+     * it works from any head (§20.7.1).
+     *
+     * An unknown accumulator gets null, which the transport turns into
+     * the same empty answer an unknown photo hash gets.
+     */
+    photoListFor: accumulator => (
+      chainHeads.has(String(accumulator || "").toLowerCase())
+        ? photoChainEntries.map(entry => ({ ...entry }))
+        : null
+    ),
     get seq() { return seq; },
     get state() { return state; },
     get stopIndex() { return stopIndex; },
