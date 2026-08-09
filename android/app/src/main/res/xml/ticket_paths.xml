@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <!-- Tickets written out for handover, and nothing else. The cache is the
-         right home for them: the file is a copy of a capability the app is
-         already holding, so losing it to a cache sweep costs one more tap. -->
-    <cache-path name="tickets" path="tickets/" />
-</paths>

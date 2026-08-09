@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <!-- Only the trace directory is ever shared, never the region indexes or
-         anything else the app keeps in its private storage. -->
-    <files-path name="traces" path="traces/" />
-</paths>

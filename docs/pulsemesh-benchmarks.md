@@ -660,7 +660,7 @@ Three behaviours are pinned by tests rather than left to an integrator:
 - **The reticent profile is the mobile default** rather than an opt-in,
   because a phone's owner did not sign up to publish a trajectory.
 
-It is wired into the Android app (`android/`): the engine interface gained
+It is wired into the Wayfind Android app, in its own repository: the engine interface gained
 `pulseMeshStatus`, `setContributing` and `offerLocation`; the WebView
 bridge exposes a `pulseMesh` method; `MapsViewModel` feeds every
 `LocationManager` fix through it and routes under the live metric when

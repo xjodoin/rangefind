@@ -179,7 +179,7 @@ mesh.setContributing(true);                                  // until asked
 ```
 
 Three things a host has to get right, all learned the hard way in
-`android/`:
+the Wayfind Android app (a separate product repository):
 
 - **Drive the clock yourself.** `mesh.start()` schedules its own
   maintenance, which is right in a page and wrong in an app host. A

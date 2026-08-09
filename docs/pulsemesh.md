@@ -471,7 +471,7 @@ and calls `session.tick()` on its own cadence.
 
 ### What the two shipped hosts do with it
 
-| | Web demo (`examples/osm-geo`) | Android (`android/`) |
+| | Web demo (`examples/osm-geo`) | Android (Wayfind) |
 |---|---|---|
 | Role | consumer; read-only on the wire (§11.6) | consumer, contributor when asked |
 | Transport | loopback with simulated vehicles, or libp2p/WSS to a keeper via `?keeper=` | loopback demo transport, or libp2p/WSS via `BuildConfig.PULSEMESH_BOOTSTRAP` |
