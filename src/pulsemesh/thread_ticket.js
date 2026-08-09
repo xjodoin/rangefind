@@ -63,16 +63,20 @@ import { pushVarint, readVarint } from "../binary.js";
 import { sha256, toHex } from "./sha256.js";
 import { utf8Bytes } from "./codec.js";
 import {
+  DAY_CERT_BYTES,
+  DAY_CERT_VERSION,
   LINK_BYTES,
   THREAD_MAX_BOOTSTRAP_ADDRESSES,
   THREAD_MAX_BOOTSTRAP_BYTES,
   THREAD_MODE,
   THREAD_TRAVEL_MODE,
+  decodeDayCertificate,
   decodeThreadLink,
   encodeThreadLink,
   normalizeBootstrapAddresses,
   threadLinkUrl
 } from "./thread_codec.js";
+import { deriveDaySeed, routeFollowLink, verifyDayCertificate } from "./thread_route.js";
 import {
   base64UrlToBytes,
   bytesToBase64Url,
@@ -104,7 +108,32 @@ export const JOB_OFFER_VERSION = 1;
 export const TICKET_FLAG_SEED = 0x01;
 /** flags bit1: the issuer named bootstrap addresses for reaching the mesh (§20.10). */
 export const TICKET_FLAG_BOOTSTRAP = 0x02;
-const TICKET_FLAG_MASK = TICKET_FLAG_SEED | TICKET_FLAG_BOOTSTRAP;
+/**
+ * flags bit2: this ticket hands over one **service day** of a recurring
+ * route (§21.11), and the field it adds is the PMTC day certificate. The
+ * seed in field 9 is then the *day* seed rather than a run seed.
+ *
+ * The certificate is what makes reusing PMK1 sufficient rather than
+ * merely convenient. It already carries `rootPublicKey` (the route's
+ * permanent identity), `dayPublicKey` (what the seed must match),
+ * `serviceDay` and the validity window — so one sealed artifact gives the
+ * driver identity, authority, and the proof to publish alongside its
+ * records, with no second file to lose.
+ */
+export const TICKET_FLAG_DAY = 0x04;
+const TICKET_FLAG_MASK = TICKET_FLAG_SEED | TICKET_FLAG_BOOTSTRAP | TICKET_FLAG_DAY;
+
+/**
+ * Why a route-day ticket was refused. Stable strings, alongside the
+ * `CERT_ERROR` codes `verifyDayCertificate` returns — a host shows a
+ * different sentence for "the depot sent the wrong day" than for "this
+ * certificate expired last night".
+ */
+export const TICKET_ERROR = Object.freeze({
+  DAY_SEED_MISMATCH: "ticket-day-seed-mismatch",
+  DAY_FOREIGN_ROOT: "ticket-day-foreign-root",
+  DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry"
+});
 export const THREAD_MAX_LABEL_BYTES = 48;
 /** §20.8 per-stop delivery metadata. Driver-side only — never on the wire. */
 export const THREAD_MAX_ORDER_REF_BYTES = 24;
@@ -399,7 +428,8 @@ export function planRefOf(planBytes) {
 // --- §20.2 PMK1 ticket -----------------------------------------------------
 
 function ticketPreimage({
-  flags, mode, epochPrefix8, notAfter, issuerPublicKey, planBytes, privateSeed, bootstrap = []
+  flags, mode, epochPrefix8, notAfter, issuerPublicKey, planBytes, privateSeed,
+  bootstrap = [], dayCertificateBytes = null
 }) {
   const out = [];
   pushMagic(out, TICKET_MAGIC.PMK1);
@@ -422,6 +452,17 @@ function ticketPreimage({
       pushBytes(out, bytes);
     }
   }
+  // §21.11. Fixed width and no length prefix: a PMTC is exactly
+  // DAY_CERT_BYTES and says so in its own magic and version byte, so a
+  // length here would be a second statement of a constant — and every
+  // byte of it is charged to the QR budget (§20.8).
+  //
+  // Inside the preimage, for the same reason a bootstrap address is
+  // (§20.10) and a sharper one: the certificate is *which day of which
+  // route* the issuer granted. A certificate that could be swapped in
+  // flight would let anyone who can rewrite an envelope point a driver at
+  // another route's authority, or extend yesterday's into tomorrow.
+  if (dayCertificateBytes) pushBytes(out, dayCertificateBytes);
   return Uint8Array.from(out);
 }
 
@@ -460,6 +501,65 @@ function normalizeEpochPrefix8(epochPrefix8, epoch32) {
 }
 
 /**
+ * The day seed a route-day ticket must carry, checked against the one
+ * §21.2 says it is — and re-derived when the depot did not pass one.
+ *
+ * This is the mint-time half of the `planRef` reconciliation. §21.2
+ * derives a day seed from `(rootSeed, planRef, serviceDay)`, but the
+ * certificate carries no `planRef`, so **nothing downstream can check
+ * that the plan in the ticket is the plan the day key was scoped to** —
+ * a driver's device holds neither the root nor an inverse of HKDF. The
+ * one party that *can* check is the issuer, and by the issuer-equals-root
+ * rule the issuer always holds the root seed. So the check happens here,
+ * once, where it is possible: the dispatched plan's `planRef` must be the
+ * `planRef` the day seed was derived under, or the depot minted a
+ * certificate for one round and dispatched another.
+ *
+ * The consequence is worth stating: a route-day ticket must carry the
+ * **term's plan byte for byte**. A depot that wants to hand one driver a
+ * subset of the stops has changed `planRef`, which is a different day key
+ * and needs its own certificate.
+ */
+async function dayTicketSeed({ cert, issuerSeed, issuerPublicKey, planBytes, privateSeed }) {
+  if (cert.version !== DAY_CERT_VERSION) {
+    throw new Error(`Unsupported PMTC day certificate version ${cert.version}.`);
+  }
+  // Only the route's owner grants a day of it. This is not a tightening
+  // for its own sake: minting the certificate and deriving the day seed
+  // both need the root seed, so any party able to issue this ticket
+  // already holds the root — signing as anyone else would only let a
+  // holder of one day's authority re-dispatch it under a name of its own
+  // choosing, which is exactly the accountability the ticket signature
+  // exists to provide.
+  if (!sameBytes(cert.rootPublicKey, issuerPublicKey)) {
+    throw new Error(
+      "A route-day ticket is issued by the route root itself: this certificate names a different root."
+    );
+  }
+  const expected = await deriveDaySeed({
+    rootSeed: issuerSeed, planRef: planRefOf(planBytes), serviceDay: cert.serviceDay
+  });
+  const seed = privateSeed || expected;
+  if (!sameBytes(seed, expected)) {
+    throw new Error(
+      "This day seed is not the one this plan and service day derive (§21.2): the certificate was "
+      + "minted for a different planRef."
+    );
+  }
+  // The authoritative form of the same check, and the one that catches a
+  // depot that minted for another `planRef` without passing a seed at
+  // all: the seed this ticket will carry has to be the key the
+  // certificate vouches for, or the driver holds a day they cannot sign.
+  if (!sameBytes(await publicKeyFromSeed(seed), cert.dayPublicKey)) {
+    throw new Error(
+      "This certificate does not vouch for the day seed this plan and service day derive (§21.2): "
+      + "it was minted for a different planRef."
+    );
+  }
+  return seed;
+}
+
+/**
  * Issues a ticket, or — with `seedless` — a runless PMK1.
  *
  * **The bytes this returns MUST NOT leave the process unsealed.** They
@@ -486,6 +586,15 @@ function normalizeEpochPrefix8(epochPrefix8, epoch32) {
  * public follow link. Putting it there is a decision the dispatcher
  * makes per link with `threadLinkUrl(baseUrl, link, { bootstrap })`, not
  * a side effect of issuing a job.
+ *
+ * `dayCertificate` makes this a **route-day ticket** (§21.11): one
+ * service day of a recurring route, handed to whoever is driving it
+ * today. `issuerSeed` is then the route **root** seed — it has to be,
+ * because only the root can derive the day seed and sign the certificate
+ * in the first place — and `privateSeed` is the *day* seed, re-derived
+ * here when the caller does not pass one. Everything a driver needs
+ * travels in the one sealed artifact, and `link` comes back as the
+ * **term's** v2 link over the root, never a link over the day key.
  */
 export async function issueTicket({
   issuerSeed,
@@ -498,6 +607,7 @@ export async function issueTicket({
   privateSeed = null,
   seedless = false,
   bootstrap = null,
+  dayCertificate = null,
   baseUrl = null
 } = {}) {
   if (!issuerSeed || issuerSeed.length !== 32) throw new Error("An issuer seed is 32 bytes.");
@@ -508,21 +618,32 @@ export async function issueTicket({
     throw new Error("A ticket's mode is THREAD_MODE.COARSE or THREAD_MODE.FINE.");
   }
   if (seedless && privateSeed) throw new Error("A seedless ticket carries no run seed.");
+  if (seedless && dayCertificate) {
+    throw new Error("A route-day ticket is the day seed plus its certificate; a seedless one publishes nothing.");
+  }
   const prefix = normalizeEpochPrefix8(epochPrefix8, epoch32);
   const encodedPlan = planBytes || encodeThreadPlan(plan);
   if (!encodedPlan?.length) throw new Error("A dispatch ticket needs a run plan.");
-  const runSeed = seedless ? null : (privateSeed || (await generateThreadKeypair()).privateSeed);
-  const addresses = normalizeBootstrapAddresses(bootstrap, { what: "ticket bootstrap address" });
   const issuerPublicKey = await publicKeyFromSeed(issuerSeed);
+  const cert = dayCertificate
+    ? (dayCertificate instanceof Uint8Array ? decodeDayCertificate(dayCertificate) : dayCertificate)
+    : null;
+  const runSeed = cert
+    ? await dayTicketSeed({ cert, issuerSeed, issuerPublicKey, planBytes: encodedPlan, privateSeed })
+    : (seedless ? null : (privateSeed || (await generateThreadKeypair()).privateSeed));
+  const addresses = normalizeBootstrapAddresses(bootstrap, { what: "ticket bootstrap address" });
   const preimage = ticketPreimage({
-    flags: (seedless ? 0 : TICKET_FLAG_SEED) | (addresses.length ? TICKET_FLAG_BOOTSTRAP : 0),
+    flags: (seedless ? 0 : TICKET_FLAG_SEED)
+      | (addresses.length ? TICKET_FLAG_BOOTSTRAP : 0)
+      | (cert ? TICKET_FLAG_DAY : 0),
     mode,
     epochPrefix8: prefix,
     notAfter,
     issuerPublicKey,
     planBytes: encodedPlan,
     privateSeed: runSeed,
-    bootstrap: addresses
+    bootstrap: addresses,
+    dayCertificateBytes: cert?.bytes || null
   });
   const signature = await signThread(ticketSigningMessage(preimage), issuerSeed);
   const bytes = concat(preimage, signature);
@@ -642,6 +763,32 @@ export function decodeThreadTicket(bytesOrBase64url) {
     // written.
     normalizeBootstrapAddresses(bootstrap, { what: "ticket bootstrap address" });
   }
+  // §21.11. Everything a route day needs beyond the seed: the root this
+  // run publishes *as*, the day key the seed must be, the service day and
+  // the window. Decoded here rather than left as bytes, because the two
+  // checks below are what stop a ticket that cannot possibly work from
+  // looking like one that can.
+  let dayCertificate = null;
+  if (flags & TICKET_FLAG_DAY) {
+    if (!seedPresent) {
+      throw new Error("A route-day ticket carries the day seed its certificate vouches for; this one has none.");
+    }
+    dayCertificate = decodeDayCertificate(readBytes(bytes, state, DAY_CERT_BYTES));
+    if (dayCertificate.version !== DAY_CERT_VERSION) {
+      throw new Error(`Unsupported PMTC day certificate version ${dayCertificate.version}.`);
+    }
+    // Only the route's owner grants a day of it (§21.11). A byte
+    // comparison, so it belongs here rather than in the async verify: a
+    // ticket whose issuer is not the certificate's root is not a
+    // well-formed route-day ticket at all, and refusing it by name beats
+    // handing a host something it will discover is unusable later.
+    if (!sameBytes(dayCertificate.rootPublicKey, issuerPublicKey)) {
+      throw new Error(
+        "A route-day ticket is issued by the route root itself: this one's issuer is not the "
+        + "certificate's root."
+      );
+    }
+  }
   const preimageEnd = state.pos;
   const signature = readBytes(bytes, state, 64);
   assertNoTrailing(bytes, state, "PMK1 ticket");
@@ -658,6 +805,12 @@ export function decodeThreadTicket(bytesOrBase64url) {
     // §20.10. Empty when the issuer named none — a device with its own
     // remembered peers needs nothing here, and most do after day one.
     bootstrap,
+    // §21.11. Null on an ordinary job. When present, `privateSeed` above
+    // is the **day** seed and this is the proof that goes on the wire
+    // with the run's records.
+    dayCertificate,
+    routeDay: dayCertificate !== null,
+    serviceDay: dayCertificate?.serviceDay ?? null,
     signature,
     preimage: bytes.subarray(0, preimageEnd),
     bytes
@@ -668,6 +821,15 @@ export function decodeThreadTicket(bytesOrBase64url) {
  * Signature, expiry, epoch, and — when the host pins one — the issuer.
  * `expectedIssuerHex` is how a driver app refuses a ticket that is
  * perfectly well-formed and came from someone it does not work for.
+ *
+ * A **route-day** ticket (§21.11) is checked twice over, because the two
+ * artifacts it fuses can disagree. The certificate must stand up on its
+ * own — signed by the root it names, a sane window, inside
+ * `THREAD_MAX_CERT_SECONDS`, live now — and the seed must actually be the
+ * one it vouches for. A seed that is not the certificate's `dayPublicKey`
+ * is a ticket that cannot sign a single record, and it is refused here,
+ * **by name**, rather than discovered at the first `handleFix` with a
+ * driver already sitting in the bus.
  */
 export async function verifyThreadTicket(ticket, {
   epochPrefix8 = null,
@@ -693,18 +855,79 @@ export async function verifyThreadTicket(ticket, {
   if (expectedIssuerHex && toHex(decoded.issuerPublicKey) !== String(expectedIssuerHex).toLowerCase()) {
     return { ok: false, reason: "the ticket was issued by a different issuer" };
   }
+  if (decoded.dayCertificate) {
+    const verdict = await verifyRouteDayTicket(decoded, nowMillis);
+    if (!verdict.ok) return verdict;
+  }
+  return { ok: true };
+}
+
+async function verifyRouteDayTicket(decoded, nowMillis) {
+  const cert = decoded.dayCertificate;
+  // Re-checked here as well as at decode, because `toTicket` accepts an
+  // already-decoded object from an internal caller and this rule is not
+  // one a caller may hold wrong (§21.11).
+  if (!sameBytes(cert.rootPublicKey, decoded.issuerPublicKey)) {
+    return {
+      ok: false,
+      code: TICKET_ERROR.DAY_FOREIGN_ROOT,
+      reason: "the day certificate names a different route root than the ticket's issuer"
+    };
+  }
+  const certVerdict = await verifyDayCertificate(cert, {
+    rootPublicKey: cert.rootPublicKey, nowSeconds: Math.floor(nowMillis / 1000)
+  });
+  if (!certVerdict.ok) {
+    return { ok: false, code: certVerdict.code, reason: `the day certificate ${certVerdict.reason}` };
+  }
+  // §21.5 rule 7, with the ticket's own expiry standing in for the link's:
+  // a day that starts after the artifact carrying it dies is nobody's day.
+  if (cert.notBefore > decoded.notAfter) {
+    return {
+      ok: false,
+      code: TICKET_ERROR.DAY_AFTER_TICKET_EXPIRY,
+      reason: "the day certificate begins after the ticket expires"
+    };
+  }
+  if (!sameBytes(await publicKeyFromSeed(decoded.privateSeed), cert.dayPublicKey)) {
+    return {
+      ok: false,
+      code: TICKET_ERROR.DAY_SEED_MISMATCH,
+      reason: "the seed in this ticket is not the day key its certificate vouches for"
+    };
+  }
   return { ok: true };
 }
 
 /**
- * The customer's 45-byte follow link, derivable the moment the ticket
- * exists and before any driver does. This is the property the whole
- * primitive is for.
+ * The 45-byte follow link this ticket's run publishes under.
+ *
+ * For an ordinary job that is the run key's own link, derivable the
+ * moment the ticket exists and before any driver does — the property the
+ * whole primitive is for.
+ *
+ * For a **route-day** ticket it is emphatically *not* the seed's link,
+ * and that difference is the entire reason §21.11 exists. Sealing a bare
+ * day seed into an ordinary PMK1 makes every downstream derivation —
+ * topic tag, `K_content`, these 45 bytes — come off the **day** public
+ * key, so the run publishes onto a topic no parent is subscribed to. It
+ * looks perfectly healthy at the driver's end and every existing link
+ * goes silent. So this reads the identity out of the certificate and
+ * returns the route's own v2 link (§21.4): one branch, in the one place
+ * every caller already goes through, rather than a rule for each of them
+ * to remember.
  */
 export async function ticketFollowLink(ticket) {
   const decoded = toTicket(ticket);
   if (!decoded.privateSeed) {
     throw new Error("This ticket carries no run seed, so it has no follow link yet.");
+  }
+  if (decoded.dayCertificate) {
+    return routeFollowLink({
+      rootPublicKey: decoded.dayCertificate.rootPublicKey,
+      epochPrefix8: decoded.epochPrefix8,
+      notAfter: decoded.notAfter
+    });
   }
   const publicKey = await publicKeyFromSeed(decoded.privateSeed);
   return encodeThreadLink({
@@ -1253,8 +1476,18 @@ const UNREADABLE_SEED =
  * sealed for a device, and if this is not that device the fix is
  * enrolment. That is a different sentence from "unreadable", and it is
  * the one a host with no key must show.
+ *
+ * A **route-day** ticket (§21.11) is likewise still `kind: "ticket"`,
+ * because it goes to the same screen and is opened by the same key — but
+ * it is a different sentence again, and `routeDay` plus `serviceDay` are
+ * what let a host say "tomorrow's run of a route" instead of "a job".
+ * `routeDay` is `null`, never `false`, whenever the artifact is a ticket
+ * this function could not read: a sealed PME1 hides which kind it is by
+ * design, and answering `false` there would be an invented claim of
+ * exactly the sort §20.8's flags byte exists to avoid.
  */
 export function classifyThreadArtifact(fragmentOrBytes) {
+  const nothing = { kind: null, reason: null, sealed: false, routeDay: false, serviceDay: null };
   let bytes = null;
   if (fragmentOrBytes instanceof Uint8Array) {
     bytes = fragmentOrBytes;
@@ -1265,29 +1498,37 @@ export function classifyThreadArtifact(fragmentOrBytes) {
     const raw = fragmentOrBytes.trim();
     const hash = raw.lastIndexOf("#");
     const fragment = (hash >= 0 ? raw.slice(hash + 1) : raw).replace(/\s+/gu, "");
-    if (!fragment) return { kind: null, reason: null, sealed: false };
+    if (!fragment) return { ...nothing };
     try {
       bytes = base64UrlToBytes(fragment);
     } catch {
-      return { kind: null, reason: null, sealed: false };
+      return { ...nothing };
     }
   }
-  if (!bytes?.length) return { kind: null, reason: null, sealed: false };
+  if (!bytes?.length) return { ...nothing };
 
   if (hasMagic(bytes, SEAL_MAGIC.PME1)) {
+    // Which kind of job is inside is ciphertext, and saying so is the
+    // point: `routeDay: null` means "not knowable without the key".
     try {
       decodeSealedTicketHeader(bytes);
-      return { kind: "ticket", reason: SEALED_TICKET, sealed: true };
+      return { kind: "ticket", reason: SEALED_TICKET, sealed: true, routeDay: null, serviceDay: null };
     } catch {
-      return { kind: "ticket", reason: UNREADABLE_TICKET, sealed: true };
+      return { kind: "ticket", reason: UNREADABLE_TICKET, sealed: true, routeDay: null, serviceDay: null };
     }
   }
   if (hasMagic(bytes, TICKET_MAGIC.PMK1)) {
     try {
-      decodeThreadTicket(bytes);
-      return { kind: "ticket", reason: null, sealed: false };
+      const ticket = decodeThreadTicket(bytes);
+      return {
+        kind: "ticket",
+        reason: null,
+        sealed: false,
+        routeDay: ticket.routeDay,
+        serviceDay: ticket.serviceDay
+      };
     } catch {
-      return { kind: "ticket", reason: UNREADABLE_TICKET, sealed: false };
+      return { kind: "ticket", reason: UNREADABLE_TICKET, sealed: false, routeDay: null, serviceDay: null };
     }
   }
   // An offer is its own kind, not a ticket that happens to be missing
@@ -1298,9 +1539,9 @@ export function classifyThreadArtifact(fragmentOrBytes) {
   if (hasMagic(bytes, TICKET_MAGIC.PMJ1)) {
     try {
       decodeJobOffer(bytes);
-      return { kind: "offer", reason: null, sealed: false };
+      return { ...nothing, kind: "offer" };
     } catch {
-      return { kind: "offer", reason: UNREADABLE_OFFER, sealed: false };
+      return { ...nothing, kind: "offer", reason: UNREADABLE_OFFER };
     }
   }
   // A seed card is the one artifact here that is a **location** rather
@@ -1310,9 +1551,9 @@ export function classifyThreadArtifact(fragmentOrBytes) {
   if (hasMagic(bytes, SEED_MAGIC.PMH1)) {
     try {
       decodeSeedCard(bytes);
-      return { kind: "seed", reason: null, sealed: false };
+      return { ...nothing, kind: "seed" };
     } catch {
-      return { kind: "seed", reason: UNREADABLE_SEED, sealed: false };
+      return { ...nothing, kind: "seed", reason: UNREADABLE_SEED };
     }
   }
   // A link has no magic — it is 45 bytes opening with a version byte, and
@@ -1320,12 +1561,12 @@ export function classifyThreadArtifact(fragmentOrBytes) {
   if (bytes.length === LINK_BYTES) {
     try {
       decodeThreadLink(bytes);
-      return { kind: "link", reason: null, sealed: false };
+      return { ...nothing, kind: "link" };
     } catch {
-      return { kind: "link", reason: UNREADABLE_LINK, sealed: false };
+      return { ...nothing, kind: "link", reason: UNREADABLE_LINK };
     }
   }
-  return { kind: null, reason: null, sealed: false };
+  return { ...nothing };
 }
 
 function hasMagic(bytes, magic) {

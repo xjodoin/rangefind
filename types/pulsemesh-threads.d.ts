@@ -675,6 +675,21 @@ export declare const JOB_OFFER_VERSION: 1;
 export declare const TICKET_FLAG_SEED: 1;
 /** flags bit1: the issuer named bootstrap addresses (§20.10). */
 export declare const TICKET_FLAG_BOOTSTRAP: 2;
+/**
+ * flags bit2: this ticket hands over one service day of a recurring
+ * route (§21.11). The field it adds is the PMTC day certificate, and
+ * `privateSeed` is then the **day** seed rather than a run seed.
+ */
+export declare const TICKET_FLAG_DAY: 4;
+/**
+ * Why a route-day ticket was refused, alongside the `CERT_ERROR` codes
+ * the embedded certificate can fail with (§21.11).
+ */
+export declare const TICKET_ERROR: Readonly<{
+  DAY_SEED_MISMATCH: "ticket-day-seed-mismatch";
+  DAY_FOREIGN_ROOT: "ticket-day-foreign-root";
+  DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry";
+}>;
 export declare const THREAD_MAX_LABEL_BYTES: 48;
 /** §20.8 per-stop delivery metadata caps, in UTF-8 bytes. */
 export declare const THREAD_MAX_ORDER_REF_BYTES: 24;
@@ -755,8 +770,19 @@ export interface DispatchTicket {
    * a bootstrap address is a claim the dispatcher is making.
    */
   bootstrap: string[];
+  /**
+   * §21.11. Null on an ordinary job. When present this ticket hands over
+   * one service day of a recurring route: identity comes from the
+   * certificate's `rootPublicKey`, authority from `privateSeed` (which is
+   * then the **day** seed), and the certificate itself is what the run
+   * publishes alongside its records.
+   */
+  dayCertificate: DayCertificate | null;
+  routeDay: boolean;
+  /** The certificate's `YYYYMMDD`, or null on an ordinary job. */
+  serviceDay: number | null;
   signature: Uint8Array;
-  /** Magic through the bootstrap block — exactly what the issuer signed. */
+  /** Magic through the day certificate — exactly what the issuer signed. */
   preimage: Uint8Array;
   bytes: Uint8Array;
 }
@@ -796,6 +822,14 @@ export declare function issueTicket(options: {
    * It is deliberately **not** placed in `url`, the public follow link.
    */
   bootstrap?: string | string[] | null;
+  /**
+   * §21.11: makes this a **route-day ticket**. `issuerSeed` is then the
+   * route root seed — only the root can mint this certificate or derive
+   * the day seed — and `privateSeed` is the day seed, re-derived here
+   * when it is not passed. `link` comes back as the term's v2 link over
+   * the root, never a link over the day key.
+   */
+  dayCertificate?: DayCertificate | Uint8Array | null;
   baseUrl?: string | null;
 }): Promise<IssuedTicket>;
 
@@ -835,6 +869,8 @@ export declare function issueSealedTicket(options: {
   privateSeed?: Uint8Array | null;
   /** §20.10 bootstrap addresses, signed inside the sealed ticket. */
   bootstrap?: string | string[] | null;
+  /** §21.11: one service day of a recurring route. See `issueTicket`. */
+  dayCertificate?: DayCertificate | Uint8Array | null;
   baseUrl?: string | null;
   recipients: Array<Uint8Array | string | { publicKey: Uint8Array }>;
 }): Promise<SealedIssuedTicket>;
@@ -849,15 +885,38 @@ export declare function decodeThreadTicket(bytesOrBase64url: Uint8Array | string
  */
 export declare function classifyThreadArtifact(
   fragmentOrBytes: Uint8Array | string | null | undefined
-): { kind: "ticket" | "offer" | "link" | "seed" | null; reason: string | null; sealed: boolean };
+): {
+  kind: "ticket" | "offer" | "link" | "seed" | null;
+  reason: string | null;
+  sealed: boolean;
+  /**
+   * §21.11. True for a route-day ticket, false for an ordinary one, and
+   * **null** whenever the artifact is a ticket this function could not
+   * read — a sealed PME1 hides which kind it is by design.
+   */
+  routeDay: boolean | null;
+  serviceDay: number | null;
+};
 
-/** Signature, expiry, epoch, and — when a host pins one — the issuer. */
+/**
+ * Signature, expiry, epoch, and — when a host pins one — the issuer. A
+ * route-day ticket (§21.11) is checked twice over: the embedded
+ * certificate must stand up on its own, and the seed must be the day key
+ * it vouches for. `code` carries the stable reason for those, from
+ * `TICKET_ERROR` or `CERT_ERROR`.
+ */
 export declare function verifyThreadTicket(
   ticket: DispatchTicket | Uint8Array | string,
   options?: { epochPrefix8?: Uint8Array | null; expectedIssuerHex?: string | null; nowMillis?: number }
-): Promise<{ ok: true } | { ok: false; reason: string }>;
+): Promise<{ ok: true } | { ok: false; reason: string; code?: string | null }>;
 
-/** The 45-byte follow link. Throws on a seedless ticket — there is no run. */
+/**
+ * The 45-byte follow link this ticket's run publishes under. Throws on a
+ * seedless ticket — there is no run. On a route-day ticket it is the
+ * route's **v2 link over the root** (§21.11), never a link over the day
+ * key: deriving one from the day key would publish the route where no
+ * subscriber is listening.
+ */
 export declare function ticketFollowLink(ticket: DispatchTicket | Uint8Array | string): Promise<Uint8Array>;
 
 /**
@@ -1354,6 +1413,11 @@ export declare function createThreadChannel(options: {
    *
    * Hosts pass the sealed PME1 bytes plus `devicePrivateKey` (§20.9);
    * an already-opened inner ticket is accepted for internal callers.
+   *
+   * A **route-day** ticket (§21.11) is routed down the §21 delegated
+   * path automatically: topics and sealing derive from the certificate's
+   * root and the day seed only signs, so the run lands on the route's
+   * permanent address and the term link never moves.
    */
   publishTicket(ticket: Uint8Array | string | DispatchTicket, options?: {
     baseUrl?: string | null;
@@ -1364,6 +1428,13 @@ export declare function createThreadChannel(options: {
     travelMode?: number | null;
     /** Required to open a sealed PME1 job (§20.9). */
     devicePrivateKey?: Uint8Array | null;
+    /**
+     * The term's link, for a host that holds the exact 45 bytes the
+     * depot published (§21.11). Omit and it is rebuilt from the
+     * certificate's root — identical bytes whenever the ticket's
+     * `notAfter` is the term's.
+     */
+    link?: Uint8Array | null;
   }): Promise<{
     publisher: unknown;
     link: Uint8Array;

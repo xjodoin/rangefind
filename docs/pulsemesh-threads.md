@@ -1381,6 +1381,36 @@ behaviour, not where the code merely looks right.
       the day seed and its certificate alone, keeps the term's link
       rather than minting one, and a follower holding only those 45 bytes
       tracks the day with nothing dropped (§21).
+- [x] A **route-day ticket** round-trips issue → seal → open → verify →
+      publish and lands on the **root's** topic: a subscriber built from
+      the term link before the day key existed accepts every record and
+      drops none, and the link the run publishes under is byte-identical
+      to the one minted in September. The same day seed sealed into an
+      ordinary ticket reaches that subscriber not at all — the silent
+      failure the artifact exists to make unrepresentable (§21.11).
+- [x] A day ticket hands over: re-sealing the inner bytes to a second
+      enrolled device works, the first device can no longer open them,
+      and the spare publishes on the same root topic (§21.11, §20.9).
+- [x] A day ticket whose seed is not the certificate's `dayPublicKey` is
+      refused **by name** (`ticket-day-seed-mismatch`) at verification and
+      again by the publisher, and cannot be minted at all — the issuer
+      re-derives it from the plan's `planRef` and the service day
+      (§21.11, §21.2).
+- [x] Only the route root grants a day of it: a certificate naming
+      another root is refused at issue and at decode, and one claiming
+      this root but signed by another fails as `cert-bad-signature`
+      (§21.11).
+- [x] An expired certificate, a window over `THREAD_MAX_CERT_SECONDS`
+      signed correctly by the real root, and one beginning after the
+      ticket expires are each refused with their own §21.5 code — the
+      ticket is a verifier, not merely a carrier (§21.11).
+- [x] `classifyThreadArtifact` reports `routeDay` and `serviceDay`, says
+      `false` for an ordinary job and **null** for a sealed one, and the
+      flag is read from the artifact rather than inferred (§21.11).
+- [x] The measured QR cost of a day certificate is 145 bytes and four
+      stops — 8 address-only stops fit a scannable QR against 12 without,
+      and one more does not, asserted with `encodeQr` at `maxVersion: 25`
+      (§20.8, §21.11).
 
 ## 20. Dispatch tickets (handover)
 
@@ -1490,23 +1520,28 @@ out of band.
 | --- | --- | --- | --- |
 | 1 | magic | `"PMK1"` | |
 | 2 | version | u8 | 1 |
-| 3 | flags | u8 | bit0 = run seed present; other bits reserved, MUST be 0. A seedless PMK1 is **not** an offer (§20.4) |
+| 3 | flags | u8 | bit0 = run seed present, bit1 = bootstrap addresses (§20.10), bit2 = day certificate (§21.11); bits 3–7 reserved, MUST be 0. A seedless PMK1 is **not** an offer (§20.4) |
 | 4 | mode | u8 | 1 coarse, 2 fine — the issuer's §11 decision |
 | 5 | epochPrefix8 | bytes(8) | |
 | 6 | notAfter | uint32be | absolute expiry, unix seconds |
 | 7 | issuerPublicKey | bytes(32) | Ed25519, the dispatcher's identity |
 | 8 | planLen ‖ planBytes | varint ‖ bytes | §20.2 |
-| 9 | privateSeed | bytes(32) | present iff flags bit0 |
-| 10 | signature | bytes(64) | Ed25519 over `utf8("pulsemesh/ticket/1")` ‖ fields 1–9 |
+| 9 | privateSeed | bytes(32) | iff bit0. The **day** seed when bit2 is set (§21.11) |
+| 10 | count ‖ per address: len ‖ bytes | varint ‖ varint ‖ bytes | iff bit1. 1–3 multiaddrs, each ≤96 bytes (§20.10) |
+| 11 | dayCertificate | bytes(145) | iff bit2. A PMTC (§21.3), fixed width, no length prefix |
+| 12 | signature | bytes(64) | Ed25519 over `utf8("pulsemesh/ticket/1")` ‖ fields 1–11 |
+
+Optional fields appear in **ascending flag-bit order**, as §20.8's stop
+metadata does, so a ticket has exactly one encoding.
 
 Reserved flag bits are rejected rather than ignored: forward
 compatibility on this channel is the version byte's job, and a reader
 that skips a bit it does not understand is a reader that can have a
 capability silently widened underneath it.
 
-The preimage covers flags, mode, epoch, expiry, plan **and** seed, so
-nothing in a ticket is malleable. A decoder MUST reject trailing bytes,
-as everywhere else (§5).
+The preimage covers flags, mode, epoch, expiry, plan, seed, addresses
+**and** certificate, so nothing in a ticket is malleable. A decoder MUST
+reject trailing bytes, as everywhere else (§5).
 
 A ticket and a 45-byte follow link (§5.4) arrive by the same carrier — a
 URL fragment — so every host has to tell them apart before doing
@@ -1914,7 +1949,15 @@ tests assert them; nothing here is arithmetic done by hand.
 Metadata therefore costs two stops off a scannable round in the typical
 case, and takes a maximal one down to two. Since §20.10 a ticket may also
 carry the fleet's seed address, which costs 84 bytes and two to three
-stops more; that table is in §20.10 and is measured the same way.
+stops more; that table is in §20.10 and is measured the same way. Since
+§21.11 it may instead carry a **day certificate**, which is a fixed 145
+bytes and costs **four stops**:
+
+| Ticket carries | Signed-ticket budget | Address-only stops in a scannable QR |
+| --- | --- | --- |
+| a plan (§20.8) | 605 | 12 |
+| a plan + a day certificate (§21.11) | 460 | 8 |
+
 **A day that exceeds the QR
 ceiling travels as the `.wayfindjob` file** (§20.5) — the identical
 sealed bytes, no protocol difference, and the only carrier once a plan
@@ -2111,7 +2154,10 @@ a PME1 blob, with the sealed-for-a-device sentence as its `reason`. A
 host with no device key gets the honest answer — *this is a job, it is
 sealed to a device, enrol this one if it is not that device* — and never
 "this is not a capability", which was the wrong sentence and sent the
-driver to the wrong screen.
+driver to the wrong screen. It also reports `routeDay` and `serviceDay`
+(§21.11), and on a sealed blob `routeDay` is **null** rather than false:
+which sort of job is inside is ciphertext, and answering "an ordinary
+one" would be a claim nobody made.
 
 `publishTicket` takes the sealed bytes and the device private key,
 opens, and proceeds exactly as before: **the seal is confidentiality and
@@ -2666,7 +2712,10 @@ certificate's `notAfter`, up to 48 h and normally one shift. Shortening
 | the **root seed** | everything above, for every day of the term | mint any day, past or future; re-derive every day seed; forge any certificate | the term — and the only fix is a new root, which is a new link for every parent |
 
 The middle row is what makes the design worth its complexity. Before
-§21, the only publish credential *was* the bottom row.
+§21, the only publish credential *was* the bottom row. A leaked
+**route-day ticket** (§21.11) is that middle row plus the plan it
+carries, and nothing else — it cannot mint a day, re-derive one, or move
+the route's identity.
 
 The photo key (§20.7) derives from the signing seed, so on a route it is
 the day seed: one leaked day opens one day of doorstep photos, and the
@@ -2706,6 +2755,157 @@ Everything in §4.2, §5.1, §5.2, §5.5, §7 steps 1–4 and 8–9, §8, §9, �
 plan, ordinary records and ordinary catch-up; the certificate is one more
 sealed body on the same topic, and the only edits to the pipeline are a
 magic check at step 5 and a signer lookup at step 6. It also does not
-change §20: a dispatched one-off job is still a ticket, still v1, and
-still self-signed. Tickets answer "who is driving this delivery"; §21
-answers "who is driving this route today", and they do not overlap.
+change §20 for a one-off job: a dispatched delivery is still a ticket,
+still v1, and still self-signed.
+
+What §21.11 adds is a *carrier*, not a second answer. Tickets answer "who
+is driving this", and a route-day ticket answers it for one service day
+of a route — the same PMK1, the same seal, the same enrolment, with the
+day's certificate inside it and a flag saying so. The two artifacts share
+everything except which key the run's identity comes from, and that one
+difference is decided by the certificate rather than by the caller.
+
+### 21.11 Handover: the route-day ticket
+
+Everything above defines how to *run* a service day and nothing at all
+about how a day reaches the person driving it. A dispatcher who has
+minted tomorrow's seed and certificate is holding two loose values — 32
+bytes and 145 bytes — with no artifact to hand over, no carrier, and no
+refusal for the ways of getting it wrong. That gap is what this
+subsection closes.
+
+**Why sealing a bare day seed is wrong, and why it is the mistake
+everyone makes first.** The obvious move is to put the day seed into an
+ordinary PMK1 (§20.3) and seal it: it is a 32-byte Ed25519 seed, the
+ticket takes one, the sealing and enrolment machinery all work. It even
+runs. But a ticket's seed is the run's *identity* — `publishTicket`
+derives the topic tag, `K_content` and the 45-byte link from **its**
+public key — and §21.2's whole point is that on a route the identity
+stays with the **root** so a parent's link never moves. So the bus
+publishes, correctly signed and correctly sealed, onto a topic derived
+from the **day** key: an address nobody is subscribed to and nobody ever
+will be, because it changes again tomorrow.
+
+Nothing errors. The driver's phone shows a healthy run with a rising
+`seq`. The depot's dashboard, if it follows the link it just derived from
+the same ticket, shows the bus moving. Every parent's link — the one
+minted in September, the one the whole of §21 exists to keep still — goes
+silent, and the only symptom is a support queue. It is the worst shape a
+protocol failure can take: invisible on the side that would notice,
+undiagnosable on the side that suffers.
+
+So the day is carried by an artifact that cannot be published that way.
+
+**The shape.** A route-day ticket is an ordinary PMK1 with `flags` bit2
+set (§20.3 field 11), carrying the **PMTC day certificate** inside the
+signed preimage, and whose `privateSeed` is the **day** seed. Reusing
+PMK1 rather than inventing a parallel artifact is the point: sealing
+(§20.9), device enrolment, the `.wayfindjob` file, the QR carrier,
+handover by re-sealing and every refusal already work on it, unchanged.
+
+The certificate is what makes that sufficient. It already carries
+`rootPublicKey`, `dayPublicKey`, `serviceDay` and the window, so one
+sealed artifact hands the driver all three of the things a day needs —
+**identity** from the certificate's root, **authority** from the seed,
+and the **proof** to publish beside its records — with no second file to
+lose and no ordering problem between them. It costs a fixed 145 bytes,
+inside the preimage for the same reason a bootstrap address is (§20.10)
+and a sharper one: the certificate is *which day of which route* the
+issuer granted, and one that could be edited in flight would let anyone
+who can rewrite an envelope point a driver at another route's authority.
+
+**`publishTicket` routes it, so no caller can forget to.** The branch is
+made from the artifact rather than from an argument: a ticket carrying a
+certificate opens a publisher with `daySeed` and `certificate` — the
+§21.2 delegated path, deriving topics and sealing from the **root** and
+signing with the day key — and one without carries on exactly as before.
+`ticketFollowLink` is the single place a ticket's 45 bytes are derived,
+and it returns the route's own v2 link (§21.4) for a day ticket, so
+there is no arm of the library that can produce a link over a day key.
+The run's bound comes from the certificate's `notAfter` rather than the
+ticket's, because the ticket's is the *term*.
+
+**Validation, and where each rule lives.** Structural checks are at
+decode, so a ticket that cannot work never reaches a host as one that
+can; the checks needing a key agreement or a clock are in
+`verifyThreadTicket`, which `publishTicket` runs before it opens
+anything.
+
+| Rule | Refused as | Where |
+| --- | --- | --- |
+| bit2 without bit0 — a day with no seed | *carries the day seed its certificate vouches for; this one has none* | decode |
+| the embedded PMTC does not parse, or is not v1 | the PMTC decoder's own complaint | decode |
+| `issuerPublicKey ≠ certificate.rootPublicKey` | *issued by the route root itself* | decode **and** verify |
+| the certificate fails §21.5 rules 3–6 | `cert-empty-window`, `cert-window-too-long`, `cert-bad-signature`, `cert-not-yet-valid`, `cert-expired` | verify |
+| `notBefore >` the ticket's `notAfter` | `cert-after-link-expiry` | verify |
+| the seed is not the certificate's `dayPublicKey` | `ticket-day-seed-mismatch` | verify |
+
+The last one is worth its own sentence. A seed that is not the key the
+certificate vouches for is a ticket that cannot sign a single record any
+subscriber will accept, and the failure would otherwise surface as a
+driver five stops into a round whose parents see nothing. It is refused
+**by name**, before the publisher exists, and the publisher refuses it
+again (§21.2) so neither layer is load-bearing alone.
+
+**The issuer is the root, and that is not a tightening.** Only the route's
+owner grants a day of it. It looks strict — everywhere else in §20 the
+issuer is a dispatcher identity that need not be anything else — but it
+costs nothing that was available anyway: minting the certificate and
+deriving the day seed both require the root *seed*, so any party able to
+issue a route-day ticket already holds the root by construction. What it
+buys is that a holder of one day's authority cannot re-dispatch it under
+a name of its own choosing, which is the accountability the ticket
+signature exists for; and a driver's app that pins `expectedIssuerHex`
+is pinning the route itself, the same key that is in the term link. The
+accepted cost is that an operator who wanted a separate per-depot
+signing identity on these tickets cannot have one.
+
+**`planRef`, and what §21 leaves unverifiable.** §21.2 derives the day
+seed from `(rootSeed, planRef, serviceDay)`, and a day ticket carries a
+plan because the driver needs the stops — so the two must agree. They
+are reconciled at **mint**: `issueTicket` re-derives the day seed from
+the issuer's root seed, the dispatched plan's `planRef` and the
+certificate's `serviceDay`, and refuses a ticket whose seed is not that
+one (it will also derive it when the depot passes none). This is the
+only place the check is possible. **The certificate does not carry
+`planRef`**, and HKDF does not invert, so a driver's device — holding
+neither the root nor the plan the certificate was minted against — cannot
+check it at all. That is a real gap in §21.3: `planRef` is in the
+derivation to keep a morning loop and an afternoon loop apart, but
+nothing downstream can *verify* which loop a day key was scoped to. The
+mint-time check is what keeps the two honest, and it has a consequence
+worth stating out loud: **a route-day ticket carries the term's plan byte
+for byte.** A depot that wants to hand one driver a subset of the stops
+has changed `planRef`, which is a different day key needing its own
+certificate.
+
+**What a leaked route-day ticket is worth.** Exactly the middle row of
+§21.8 plus the plan, and no more. It opens to one day's publish authority
+over one route, expiring at that certificate's `notAfter` — ≤48 h, in
+practice one shift — and it discloses the round's stops and whatever
+§20.8 metadata the plan carries. It is **not** a root: it cannot mint
+another day, cannot re-derive any other day's seed, and cannot move the
+route's identity, so a lost driver phone still costs a day and never a
+term. Against the alternative the gap forced — a day seed pasted into a
+message, or an app-level file invented outside the protocol — the ticket
+is strictly better: it is sealed to an enrolled device (§20.9), so a
+photographed screen is ciphertext, and it is signed, so a driver can tell
+which depot sent it.
+
+**Size, measured.** The certificate is a flat 145 bytes against the
+§20.8 QR budget, which leaves 460 bytes of a single-recipient sealed
+ticket for the plan: **8 address-only stops in a scannable QR, against
+12 without** — measured with `encodeQr` at `maxVersion: 25`, EC level
+`M`, and asserted by the tests. So a school route, a milk run or a
+morning of eight drops still travels as a QR code on a depot noticeboard.
+Anything larger travels as the `.wayfindjob` file, which is the same
+sealed bytes and no protocol difference — the answer a hundred-drop
+delivery day has always had.
+
+`classifyThreadArtifact` reports `routeDay` and `serviceDay` beside
+`kind`, so a host can say *"route 8A, Tuesday's run"* rather than *"a
+job"*. `kind` stays `"ticket"`, because it is one and it goes to the same
+screen and opens with the same key. On a sealed PME1, `routeDay` is
+`null` rather than `false`: which sort of job is inside is ciphertext,
+and a UI that rendered "an ordinary job" there would be inventing a claim
+nobody made — the same rule §20.8 applies to an unstated parcel count.

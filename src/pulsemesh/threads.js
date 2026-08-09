@@ -52,6 +52,21 @@
 //   // on the driver's phone, holding only those two:
 //   await channel.publishRouteDay({ daySeed, certificate, plan });
 //
+// Getting those two *to* the phone is a **route-day ticket** (§21.11):
+// the same sealed PMK1 the dispatch channel already uses, carrying the
+// day certificate under `TICKET_FLAG_DAY` and the day seed as its
+// `privateSeed`. One artifact, sealed to an enrolled device, holding
+// identity (the certificate's root), authority (the seed) and the proof
+// to publish with. `publishTicket` routes it down the §21 delegated path
+// on its own, so a driver's records land on the route's own topic and
+// the parents' term link never moves:
+//
+//   const job = await issueSealedTicket({
+//     issuerSeed: rootSeed, epoch32, plan, notAfter: termEnd,
+//     dayCertificate: certificate, recipients: [driverDeviceKey]
+//   });
+//   await channel.publishTicket(job.sealed, { devicePrivateKey });
+//
 // A **job offer** (PMJ1, §20.4) is the mirror image: public and unsealed
 // by design, because it is broadcast to couriers nobody has enrolled
 // yet. `issueJobOffer` publishes a commitment to the plan plus coarse
@@ -207,7 +222,9 @@ export {
   THREAD_MAX_OFFER_LABEL_BYTES,
   THREAD_MAX_ORDER_REF_BYTES,
   THREAD_STOP_FIELD,
+  TICKET_ERROR,
   TICKET_FLAG_BOOTSTRAP,
+  TICKET_FLAG_DAY,
   TICKET_FLAG_SEED,
   TICKET_MAGIC,
   TICKET_VERSION,

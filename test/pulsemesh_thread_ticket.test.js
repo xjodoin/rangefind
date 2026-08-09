@@ -447,11 +447,13 @@ test("an unreadable ticket is reported as a ticket, not as a broken link", async
 
   assert.deepEqual(
     classifyThreadArtifact(bytesToBase64Url(issued.bytes)),
-    { kind: "ticket", reason: null, sealed: false }
+    // §21.11: an ordinary job is a job, and says so — `routeDay: false`
+    // here is a read answer, not the absence of one.
+    { kind: "ticket", reason: null, sealed: false, routeDay: false, serviceDay: null }
   );
   assert.deepEqual(
     classifyThreadArtifact(bytesToBase64Url(issued.link)),
-    { kind: "link", reason: null, sealed: false },
+    { kind: "link", reason: null, sealed: false, routeDay: false, serviceDay: null },
     "and 45 bytes is a link"
   );
   assert.equal(issued.link.length, 45);
@@ -460,6 +462,7 @@ test("an unreadable ticket is reported as a ticket, not as a broken link", async
   const truncated = issued.bytes.subarray(0, issued.bytes.length - 40);
   const stale = classifyThreadArtifact(truncated);
   assert.equal(stale.kind, "ticket", "the magic is the identity, decoding is not");
+  assert.equal(stale.routeDay, null, "and which kind of ticket it is, unread, is not knowable");
   assert.match(stale.reason, /ticket/iu);
   assert.match(stale.reason, /dispatcher/iu, "and it says what to do about it");
   assert.doesNotMatch(stale.reason, /45 bytes/u, "never the other artifact's complaint");
@@ -467,10 +470,16 @@ test("an unreadable ticket is reported as a ticket, not as a broken link", async
   // Neither magic, and neither width: nothing to claim.
   assert.deepEqual(
     classifyThreadArtifact("not-a-capability-at-all"),
-    { kind: null, reason: null, sealed: false }
+    { kind: null, reason: null, sealed: false, routeDay: false, serviceDay: null }
   );
-  assert.deepEqual(classifyThreadArtifact(""), { kind: null, reason: null, sealed: false });
-  assert.deepEqual(classifyThreadArtifact(null), { kind: null, reason: null, sealed: false });
+  assert.deepEqual(
+    classifyThreadArtifact(""),
+    { kind: null, reason: null, sealed: false, routeDay: false, serviceDay: null }
+  );
+  assert.deepEqual(
+    classifyThreadArtifact(null),
+    { kind: null, reason: null, sealed: false, routeDay: false, serviceDay: null }
+  );
 
   // Same three forms every host takes, wrapped by a mail client.
   const text = bytesToBase64Url(issued.bytes);

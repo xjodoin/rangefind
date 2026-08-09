@@ -547,13 +547,23 @@ export function createThreadChannel({
    * internal callers and tests that hold one — but a host that reaches
    * for that path is handing plaintext tickets around, which is the
    * thing §20.9 exists to stop.
+   *
+   * A **route-day** ticket (§21.11) arrives here too, and it must not go
+   * down the ordinary path. Its seed is a *day* key, so deriving topics
+   * and content keys from it would publish the route onto an address no
+   * parent is subscribed to — a run that looks healthy on the driver's
+   * phone while every term link goes silent. The branch is made here,
+   * from the artifact, rather than left to a caller to route by hand:
+   * `link` and the publisher come off the certificate's **root**, and
+   * the day seed only signs.
    */
   async function publishTicket(input, {
     baseUrl = null,
     onPublish = null,
     catchUp: doCatchUp = true,
     travelMode = null,
-    devicePrivateKey = null
+    devicePrivateKey = null,
+    link: termLink = null
   } = {}) {
     // A string is base64url, possibly hard-wrapped by a mail client and
     // possibly still wearing its `wayfind://ticket#` prefix — decoded to
@@ -579,10 +589,19 @@ export function createThreadChannel({
     if (!ticket.privateSeed) {
       throw new Error("This ticket carries no run seed: an offer is not a publish capability.");
     }
-    const link = await ticketFollowLink(ticket);
+    // The term's 45 bytes on a route day, the run key's own on a job —
+    // `ticketFollowLink` reads which from the certificate, so there is
+    // no arm of this function that can derive a link from a day key.
+    const link = termLink || await ticketFollowLink(ticket);
     const startSeq = doCatchUp ? await resumeSeq(link) : 0;
     const run = await openRun({
-      privateSeed: ticket.privateSeed,
+      // §21.11: identity from the certificate's root, authority from the
+      // seed. Passing the day seed as `privateSeed` would make the *day*
+      // key the run's identity, which is the silent-parent failure the
+      // route-day ticket exists to make unrepresentable.
+      privateSeed: ticket.dayCertificate ? null : ticket.privateSeed,
+      daySeed: ticket.dayCertificate ? ticket.privateSeed : null,
+      certificate: ticket.dayCertificate,
       mode: ticket.mode,
       plan: ticket.plan,
       link,
@@ -594,8 +613,14 @@ export function createThreadChannel({
       // mid-afternoon, mid-route, with customers still watching. Clamped
       // at 24 h because `notAfter` is a uint32 a dispatcher can fat-finger
       // into next year, and no run should outlive a shift by that much.
+      //
+      // A route day is bounded by its *certificate* instead, as
+      // `publishRouteDay` is: the ticket's `notAfter` is the term there,
+      // and a run that outlived the day's authority would go on emitting
+      // records no subscriber can verify. The 24 h clamp still applies —
+      // a certificate may span 48 h (§21.5) and no shift does.
       maxRunSeconds: Math.min(
-        Math.max(0, ticket.notAfter - Math.floor(clock() / 1000)),
+        Math.max(0, (ticket.dayCertificate?.notAfter ?? ticket.notAfter) - Math.floor(clock() / 1000)),
         MAX_TICKET_RUN_SECONDS
       ),
       baseUrl,

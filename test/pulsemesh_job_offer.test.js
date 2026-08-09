@@ -136,7 +136,7 @@ test("a broadcast offer carries no address, no label and no §20.8 metadata", as
   // driver's accept screen by accident.
   assert.deepEqual(
     classifyThreadArtifact(jobOfferUrl(issued.bytes)),
-    { kind: "offer", reason: null, sealed: false }
+    { kind: "offer", reason: null, sealed: false, routeDay: false, serviceDay: null }
   );
 });
 

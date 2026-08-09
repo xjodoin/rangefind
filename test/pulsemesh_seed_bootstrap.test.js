@@ -163,8 +163,15 @@ test("a set bootstrap flag with nothing behind it is refused, and so are reserve
   assert.throws(() => decodeThreadTicket(lying), /bootstrap address|truncated|trailing/u);
 
   const reserved = Uint8Array.from(issued.bytes);
-  reserved[5] |= 0x04;
+  reserved[5] |= 0x08;
   assert.throws(() => decodeThreadTicket(reserved), /reserved flag bits must be zero/u);
+
+  // Bit 2 is no longer reserved — it is §21.11's day certificate — and it
+  // is refused the same way the bootstrap bit is: a set flag with
+  // signature noise behind it never decodes as a route day.
+  const claimingADay = Uint8Array.from(issued.bytes);
+  claimingADay[5] |= 0x04;
+  assert.throws(() => decodeThreadTicket(claimingADay), /PMTC|truncated|trailing/u);
 });
 
 // --- 2. the seal hides them ------------------------------------------------
@@ -301,8 +308,9 @@ test("a seed card round-trips and classifies as a seed", () => {
   // A host branches on the magic, exactly as it does for a ticket or an
   // offer: a seed is a location and goes to "add this peer", never to a
   // job screen and never to a map.
-  assert.deepEqual(classifyThreadArtifact(url), { kind: "seed", reason: null, sealed: false });
-  assert.deepEqual(classifyThreadArtifact(card), { kind: "seed", reason: null, sealed: false });
+  const asSeed = { kind: "seed", reason: null, sealed: false, routeDay: false, serviceDay: null };
+  assert.deepEqual(classifyThreadArtifact(url), asSeed);
+  assert.deepEqual(classifyThreadArtifact(card), asSeed);
   const broken = Uint8Array.from(card);
   broken[4] = 9; // an unsupported version
   assert.equal(classifyThreadArtifact(broken).kind, "seed");
