@@ -79,6 +79,15 @@ import {
 // than that is cached anywhere.
 const CATCHUP_PEERS = 8;
 
+/**
+ * How often a follow that has heard nothing looks for the run again, and
+ * how many times. Ten seconds is well under the patience of somebody
+ * staring at a tracking link, and twenty attempts covers a driver who
+ * accepts the job a few minutes after the customer opened theirs.
+ */
+const FIND_RUN_INTERVAL_MS = 10_000;
+const FIND_RUN_ATTEMPTS = 20;
+
 /** The sanity ceiling on a ticket-bounded run (§20.6). */
 const MAX_TICKET_RUN_SECONDS = 86400;
 
@@ -857,6 +866,10 @@ export function createThreadChannel({
         for (const topic of entry.topics) unsubscribe(topic);
         entry.topics.clear();
         entry.discovery?.stop();
+        if (entry.seekTimer) {
+          clearInterval(entry.seekTimer);
+          entry.seekTimer = null;
+        }
         follows.delete(entry);
       }
     };
@@ -868,6 +881,31 @@ export function createThreadChannel({
     if (host?.contentRouting) {
       entry.discovery = await startDiscovery(entry.subscriber.keys);
       await entry.discovery?.connect().catch(() => []);
+      // **And keep looking, until something is heard.**
+      //
+      // One lookup at follow time assumes the run is already advertised,
+      // and the ordinary sequence is the other way round: a dispatcher
+      // sends the link when the job is created, the driver accepts it
+      // later, and the driver is not reachable until a relay grants a
+      // reservation after that. A customer who opens their link in that
+      // window — which is most customers — would find nobody and never
+      // ask again, leaving a page that is correctly wired and silent
+      // forever.
+      //
+      // Stops on the first record, because from then on gossip carries
+      // the run and re-dialling is noise. Bounded so a link to a run that
+      // never starts does not search for the rest of the day.
+      let attempts = 0;
+      entry.seekTimer = setInterval(() => {
+        if (entry.subscriber.latest() || attempts >= FIND_RUN_ATTEMPTS) {
+          clearInterval(entry.seekTimer);
+          entry.seekTimer = null;
+          return;
+        }
+        attempts++;
+        void entry.discovery?.connect().catch(() => []);
+      }, FIND_RUN_INTERVAL_MS);
+      if (typeof entry.seekTimer.unref === "function") entry.seekTimer.unref();
     }
     // A follow that starts mid-run has a hole by definition. Filling it
     // from other followers is the whole of §8 path 2 — the alternative
