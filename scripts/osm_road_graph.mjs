@@ -944,6 +944,135 @@ class GrowUint8 {
   }
 }
 
+class GrowTyped {
+  constructor(Type, capacity = 1 << 14) {
+    this.Type = Type;
+    this.data = new Type(capacity);
+    this.length = 0;
+  }
+  push(value) {
+    if (this.length >= this.data.length) {
+      const next = new this.Type(this.data.length * 2);
+      next.set(this.data);
+      this.data = next;
+    }
+    this.data[this.length++] = value;
+  }
+  set(index, value) {
+    this.data[index] = value;
+  }
+}
+
+const EMPTY_LANES = new Uint8Array(0);
+
+/**
+ * Compact retained-way storage for the two-pass extractor.
+ *
+ * Country extracts keep millions of ways alive between the way and node
+ * passes. One JavaScript object plus two lane arrays per way made that table
+ * several GiB and forced long garbage-collection pauses. Numeric columns keep
+ * the same values in typed arrays, while the uncommon lane data shares one
+ * byte spool. A single mutable view is reused by each hot loop below.
+ */
+class PackedWayStore {
+  constructor() {
+    this.id = new GrowTyped(Float64Array);
+    this.refStart = new GrowTyped(Uint32Array);
+    this.refCount = new GrowTyped(Uint32Array);
+    this.speedFwd = new GrowTyped(Float64Array);
+    this.speedBwd = new GrowTyped(Float64Array);
+    this.postedFwd = new GrowTyped(Uint8Array);
+    this.postedBwd = new GrowTyped(Uint8Array);
+    this.condRule = new GrowTyped(Uint32Array);
+    this.oneway = new GrowTyped(Int8Array);
+    this.nameId = new GrowTyped(Uint32Array);
+    this.signFwd = new GrowTyped(Uint32Array);
+    this.signBwd = new GrowTyped(Uint32Array);
+    this.flags = new GrowTyped(Uint8Array);
+    this.ferryDurationSeconds = new GrowTyped(Float64Array);
+    this.ferryWaitSeconds = new GrowTyped(Float64Array);
+    this.classCode = new GrowTyped(Uint8Array);
+    this.laneStartFwd = new GrowTyped(Uint32Array);
+    this.laneCountFwd = new GrowTyped(Uint8Array);
+    this.laneStartBwd = new GrowTyped(Uint32Array);
+    this.laneCountBwd = new GrowTyped(Uint8Array);
+    this.laneBytes = new GrowUint8(1 << 14);
+  }
+
+  get length() {
+    return this.id.length;
+  }
+
+  push(way) {
+    this.id.push(way.id);
+    this.refStart.push(way.refStart);
+    this.refCount.push(way.refCount);
+    this.speedFwd.push(way.speedFwd);
+    this.speedBwd.push(way.speedBwd);
+    this.postedFwd.push(way.postedFwd);
+    this.postedBwd.push(way.postedBwd);
+    this.condRule.push(way.condRule);
+    this.oneway.push(way.oneway);
+    this.nameId.push(way.nameId);
+    this.signFwd.push(way.signFwd);
+    this.signBwd.push(way.signBwd);
+    this.flags.push((way.roundabout ? 1 : 0) | (way.ferry ? 2 : 0));
+    this.ferryDurationSeconds.push(way.ferryDurationSeconds);
+    this.ferryWaitSeconds.push(way.ferryWaitSeconds);
+    this.classCode.push(way.classCode);
+    this.pushLanes(way.lanes.forward, this.laneStartFwd, this.laneCountFwd);
+    this.pushLanes(way.lanes.backward, this.laneStartBwd, this.laneCountBwd);
+  }
+
+  pushLanes(lanes, starts, counts) {
+    starts.push(this.laneBytes.length);
+    counts.push(Math.min(lanes.length, 255));
+    this.laneBytes.ensure(lanes.length);
+    for (let i = 0; i < lanes.length && i < 255; i++) {
+      this.laneBytes.data[this.laneBytes.length++] = lanes[i] & 0xff;
+    }
+  }
+
+  read(index, target, includeLanes = true) {
+    target.id = this.id.data[index];
+    target.refStart = this.refStart.data[index];
+    target.refCount = this.refCount.data[index];
+    target.speedFwd = this.speedFwd.data[index];
+    target.speedBwd = this.speedBwd.data[index];
+    target.postedFwd = this.postedFwd.data[index];
+    target.postedBwd = this.postedBwd.data[index];
+    target.condRule = this.condRule.data[index];
+    target.oneway = this.oneway.data[index];
+    target.nameId = this.nameId.data[index];
+    target.signFwd = this.signFwd.data[index];
+    target.signBwd = this.signBwd.data[index];
+    const flags = this.flags.data[index];
+    target.roundabout = (flags & 1) !== 0;
+    target.ferry = (flags & 2) !== 0;
+    target.ferryDurationSeconds = this.ferryDurationSeconds.data[index];
+    target.ferryWaitSeconds = this.ferryWaitSeconds.data[index];
+    target.classCode = this.classCode.data[index];
+    if (includeLanes) {
+      if (!target.lanes) target.lanes = {};
+      target.lanes.forward = this.lanesAt(index, this.laneStartFwd, this.laneCountFwd);
+      target.lanes.backward = this.lanesAt(index, this.laneStartBwd, this.laneCountBwd);
+    }
+    return target;
+  }
+
+  lanesAt(index, starts, counts) {
+    const count = counts.data[index];
+    if (!count) return EMPTY_LANES;
+    const start = starts.data[index];
+    return this.laneBytes.data.subarray(start, start + count);
+  }
+
+  setSpeeds(index, forward, backward) {
+    this.speedFwd.set(index, forward);
+    this.speedBwd.set(index, backward);
+  }
+}
+
 function pushVarint(out, value) {
   let n = Math.max(0, Math.floor(value));
   while (n >= 0x80) {
@@ -965,6 +1094,61 @@ function sortedUnique(values) {
     if (i === 0 || sorted[i] !== sorted[i - 1]) sorted[count++] = sorted[i];
   }
   return sorted.subarray(0, count);
+}
+
+/**
+ * Sort one reference spool once and derive both its unique values and the
+ * values that occur more than once. Road extraction used to sort this very
+ * large spool twice: once for used node ids and again to discover junctions.
+ * On country-sized extracts that duplicated hundreds of MiB of memory and a
+ * full O(n log n) typed-array sort.
+ */
+export function sortedUniqueAndDuplicates(values, duplicates) {
+  const sorted = Float64Array.from(values);
+  sorted.sort();
+  let count = 0;
+  let previous = 0;
+  let repeated = false;
+  for (let i = 0; i < sorted.length; i++) {
+    const value = sorted[i];
+    if (i === 0 || value !== previous) {
+      sorted[count++] = value;
+      previous = value;
+      repeated = false;
+    } else if (!repeated) {
+      duplicates.push(value);
+      repeated = true;
+    }
+  }
+  return sorted.subarray(0, count);
+}
+
+function lowerBound(sorted, value) {
+  let low = 0;
+  let high = sorted.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (sorted[mid] < value) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+/**
+ * Finds ids in a mostly ascending stream with a single forward cursor.
+ * Geofabrik node records are ordered, so the coordinate pass becomes O(n)
+ * instead of doing a binary search for every PBF node. A lower-bound reset
+ * preserves correctness if a source contains an out-of-order block.
+ */
+export function createMonotonicLookup(sorted) {
+  let cursor = 0;
+  let previous = -Infinity;
+  return value => {
+    if (value < previous) cursor = lowerBound(sorted, value);
+    else while (cursor < sorted.length && sorted[cursor] < value) cursor++;
+    previous = value;
+    return cursor < sorted.length && sorted[cursor] === value ? cursor : -1;
+  };
 }
 
 function binarySearch(sorted, value) {
@@ -994,8 +1178,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // Pass 1: allowed ways and turn-restriction relations. Refs go into one
   // shared spool; endpoints are pushed twice so the duplicate scan below
   // marks them as graph nodes for free.
-  const refSpool = new GrowFloat64();
-  const junctionSpool = new GrowFloat64();
+  let refSpool = new GrowFloat64();
+  let junctionSpool = new GrowFloat64();
   // Distinct conditional windows, shared across the whole extract. Declared
   // with the way spool because the way pass is what fills it.
   const conditionalTable = makeConditionalTable();
@@ -1003,7 +1187,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // repeat a few thousand between them, so a table plus a per-edge index is
   // the whole cost of carrying what the green panels say.
   const signTable = makeSignTable();
-  const ways = [];
+  let ways = new PackedWayStore();
   // One-way carriageways that share a painted centre left-turn lane with the
   // line facing them, collected for [linkCentreTurnLanes].
   const centreTurnWays = new Set();
@@ -1019,7 +1203,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
       if (refs.length < 2 || !profile.allowed(tags)) return;
       const speeds = waySpeeds(tags, profile);
       const signs = waySigns(tags);
-      const isFerry = wayClass(tags) === FERRY_CLASS;
+      const className = wayClass(tags);
+      const isFerry = className === FERRY_CLASS;
+      const oneway = isFerry ? 0 : profile.oneway(tags);
       if (isFerry) ferryWays++;
       const name = tags.get("name") || tags.get("ref") || "";
       let nameId = nameIds.get(name);
@@ -1030,7 +1216,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
       }
       // Only a one-way line needs the crossing opened: where the way itself
       // runs both directions the left turn was never in question.
-      if (profile.oneway(tags) !== 0 && centreTurnLane(tags)) centreTurnWays.add(id);
+      if (oneway !== 0 && centreTurnLane(tags)) centreTurnWays.add(id);
       const refStart = refSpool.length;
       const seen = new Set();
       for (const ref of refs) {
@@ -1051,8 +1237,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
         postedFwd: speeds.postedForward,
         postedBwd: speeds.postedBackward,
         condRule: conditionalTable.idFor(speeds.conditional),
-        oneway: isFerry ? 0 : profile.oneway(tags),
-        lanes: wayLanes(tags, profile.oneway(tags)),
+        oneway,
+        lanes: wayLanes(tags, oneway),
         nameId,
         signFwd: signTable.idFor(signs.forward),
         signBwd: signTable.idFor(signs.backward),
@@ -1065,7 +1251,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
         ferry: isFerry,
         ferryDurationSeconds: isFerry ? parseDuration(tags.get("duration")) : 0,
         ferryWaitSeconds: isFerry ? ferryWaitSeconds(tags) : 0,
-        classCode: classCodes.get(wayClass(tags)) ?? 0
+        classCode: classCodes.get(className) ?? 0
       });
     },
     onRelation(id, members, tags) {
@@ -1091,34 +1277,29 @@ export function extractRoadGraph(pbfPath, options = {}) {
   log(`restrictions: ${restrictions.length - viaWayKept} via-node + ${viaWayKept} via-way kept, ${viaWayRestrictions} oversized-via skipped`);
 
   // Junctions: any ref appearing more than once across the kept ways.
-  const allRefs = refSpool.view();
-  const usedIds = sortedUnique(allRefs);
-  {
-    const sorted = Float64Array.from(allRefs);
-    sorted.sort();
-    for (let i = 1; i < sorted.length; i++) {
-      if (sorted[i] === sorted[i - 1] && (i < 2 || sorted[i] !== sorted[i - 2])) junctionSpool.push(sorted[i]);
-    }
-  }
-  const junctionIds = sortedUnique(junctionSpool.view());
+  let allRefs = refSpool.view();
+  let usedIds = sortedUniqueAndDuplicates(allRefs, junctionSpool);
+  let junctionIds = sortedUnique(junctionSpool.view());
+  junctionSpool = null;
   log(`nodes: ${usedIds.length} used, ${junctionIds.length} junctions`);
 
   // Pass 2: coordinates and junction penalties for every used node.
-  const latE7 = new Int32Array(usedIds.length);
-  const lonE7 = new Int32Array(usedIds.length);
-  const found = new Uint8Array(usedIds.length);
-  const penaltyDs = new Uint16Array(usedIds.length);
-  const kindCode = new Uint8Array(usedIds.length);
+  let latE7 = new Int32Array(usedIds.length);
+  let lonE7 = new Int32Array(usedIds.length);
+  let found = new Uint8Array(usedIds.length);
+  let penaltyDs = new Uint16Array(usedIds.length);
+  let kindCode = new Uint8Array(usedIds.length);
   // Which approach each tagged node governs, so a stop sign facing the side
   // street is not shown to the traffic that has right of way.
-  const kindFaces = new Uint8Array(usedIds.length).fill(FACES_BOTH);
+  let kindFaces = new Uint8Array(usedIds.length).fill(FACES_BOTH);
   // Exit numbers, from the `motorway_junction` node the slip road leaves.
   // 1,326 of Québec's 1,798 such nodes carry one, which is the most reliable
   // source there is for the number on the green panel.
   const exitRefByNode = new Map();
+  const findUsedNode = createMonotonicLookup(usedIds);
   scanPbf(pbfPath, {
     onNode(id, lat, lon, tags) {
-      const index = binarySearch(usedIds, id);
+      const index = findUsedNode(id);
       if (index < 0) return;
       latE7[index] = toE7(lat);
       lonE7[index] = toE7(lon);
@@ -1139,8 +1320,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // Penalties are charged per direction of travel, because a sign is charged
   // to the driver who faces it. The two runs write into separate arrays; the
   // shared `penaltyDs` is only the source they are copied from.
-  const penaltyFwd = Uint16Array.from(penaltyDs);
-  const penaltyBwd = Uint16Array.from(penaltyDs);
+  let penaltyFwd = Uint16Array.from(penaltyDs);
+  let penaltyBwd = Uint16Array.from(penaltyDs);
   chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyFwd, kindCode, log, kindFaces, FACES_FORWARD);
   chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyBwd, kindCode, log, kindFaces, FACES_BACKWARD);
 
@@ -1148,16 +1329,51 @@ export function extractRoadGraph(pbfPath, options = {}) {
   const kindFor = (index, facing) =>
     (kindFaces[index] & facing) !== 0 ? kindCode[index] : 0;
 
+  // Graph nodes are junctions with a known coordinate, numbered by sorted id.
+  // Keep the mapping in a dense typed column keyed by used-node index. The old
+  // Map held more than ten million boxed keys for Brazil and was queried once
+  // per retained ref during edge construction.
+  let graphNodeByUsed = new Int32Array(usedIds.length).fill(-1);
+  const nodeLat = [];
+  const nodeLon = [];
+  for (let i = 0; i < junctionIds.length; i++) {
+    const used = binarySearch(usedIds, junctionIds[i]);
+    if (used < 0 || !found[used]) continue;
+    graphNodeByUsed[used] = nodeLat.length;
+    nodeLat.push(latE7[used]);
+    nodeLon.push(lonE7[used]);
+  }
+  // Restriction expansion only needs via nodes, not every graph junction.
+  // Resolve those few ids now so the large used-id and graph-node columns can
+  // be released before turn expansion reaches its own memory peak.
+  const nodeIndex = new Map();
+  for (const restriction of restrictions) {
+    if (restriction.viaNode == null || nodeIndex.has(restriction.viaNode)) continue;
+    const used = binarySearch(usedIds, restriction.viaNode);
+    if (used < 0) continue;
+    const graphNode = graphNodeByUsed[used];
+    if (graphNode >= 0) nodeIndex.set(restriction.viaNode, graphNode);
+  }
+
+  // Resolve each retained OSM node id exactly once. From here on the shared
+  // spool contains used-node indexes, so both ferry costing and edge creation
+  // use direct typed-array access instead of repeated binary searches.
+  for (let i = 0; i < allRefs.length; i++) {
+    allRefs[i] = binarySearch(usedIds, allRefs[i]);
+  }
+
   // Ferry crossings are priced from their own `duration` rather than from a
   // class speed: the whole point of the tag is that a boat's pace is not a
   // road's. Done here because it needs the coordinates pass 2 just landed.
   let ferryTimed = 0;
-  for (const way of ways) {
+  const ferryWay = {};
+  for (let wayIndex = 0; wayIndex < ways.length; wayIndex++) {
+    const way = ways.read(wayIndex, ferryWay, false);
     if (!way.ferry || way.ferryDurationSeconds <= 0) continue;
     let meters = 0;
     let previous = -1;
     for (let i = 0; i < way.refCount; i++) {
-      const used = binarySearch(usedIds, allRefs[way.refStart + i]);
+      const used = allRefs[way.refStart + i];
       if (used < 0 || !found[used]) continue;
       if (previous >= 0) {
         meters += haversineMetersE7(latE7[previous], lonE7[previous], latE7[used], lonE7[used]);
@@ -1166,23 +1382,10 @@ export function extractRoadGraph(pbfPath, options = {}) {
     }
     if (meters <= 0) continue;
     const kmh = Math.max(1, (meters / 1000) / (way.ferryDurationSeconds / 3600));
-    way.speedFwd = kmh;
-    way.speedBwd = kmh;
+    ways.setSpeeds(wayIndex, kmh, kmh);
     ferryTimed++;
   }
   if (ferryWays) log(`ferries: ${ferryWays} crossings, ${ferryTimed} timed from duration`);
-
-  // Graph nodes are junctions with a known coordinate, numbered by sorted id.
-  const nodeIndex = new Map();
-  const nodeLat = [];
-  const nodeLon = [];
-  for (let i = 0; i < junctionIds.length; i++) {
-    const used = binarySearch(usedIds, junctionIds[i]);
-    if (used < 0 || !found[used]) continue;
-    nodeIndex.set(junctionIds[i], nodeLat.length);
-    nodeLat.push(latE7[used]);
-    nodeLon.push(lonE7[used]);
-  }
 
   // Split ways into directed edges at junction nodes.
   const edgeFrom = [];
@@ -1264,7 +1467,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
     });
   };
   const isLinkClass = (classCode) => classTable[classCode]?.endsWith("_link") === true;
-  for (const way of ways) {
+  const retainedWay = {};
+  for (let wayIndex = 0; wayIndex < ways.length; wayIndex++) {
+    const way = ways.read(wayIndex, retainedWay);
     segment.length = 0;
     let fromNode = -1;
     let fromUsed = -1;
@@ -1293,8 +1498,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
       segKindBwd = 0;
     };
     for (let i = 0; i < way.refCount; i++) {
-      const ref = allRefs[way.refStart + i];
-      const used = binarySearch(usedIds, ref);
+      const used = allRefs[way.refStart + i];
       if (used < 0 || !found[used]) {
         // Missing node (clipped extract): break the segment here.
         segment.length = 0;
@@ -1311,8 +1515,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
         lengthMeters += haversineMetersE7(prev[0], prev[1], lat, lon);
       }
       segment.push([lat, lon]);
-      const graphNode = nodeIndex.get(ref);
-      if (graphNode == null) {
+      const graphNode = graphNodeByUsed[used];
+      if (graphNode < 0) {
         segPenaltyFwd += penaltyFwd[used];
         segPenaltyBwd += penaltyBwd[used];
         const forwardKind = kindFor(used, FACES_FORWARD);
@@ -1389,6 +1593,29 @@ export function extractRoadGraph(pbfPath, options = {}) {
     }
   }
   log(`edges: ${edgeFrom.length} directed`);
+
+  // Everything below works on collapsed graph nodes and edges. Drop the raw
+  // country-scale extraction columns before turn expansion allocates its
+  // edge-based graph; otherwise both representations overlap at peak RSS.
+  if (retainedWay.lanes) {
+    retainedWay.lanes.forward = EMPTY_LANES;
+    retainedWay.lanes.backward = EMPTY_LANES;
+  }
+  ways = null;
+  allRefs = null;
+  refSpool = null;
+  usedIds = null;
+  junctionIds = null;
+  graphNodeByUsed = null;
+  latE7 = null;
+  lonE7 = null;
+  found = null;
+  penaltyDs = null;
+  penaltyFwd = null;
+  penaltyBwd = null;
+  kindCode = null;
+  kindFaces = null;
+  exitRefByNode.clear();
 
   // A painted centre turn lane is a left turn the road allows and the two
   // drawn lines deny. Opened before turn handling, so restrictions and turn

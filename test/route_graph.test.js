@@ -136,6 +136,29 @@ function referenceSeconds(graph, csr, forwardSeeds, backwardSeeds, sameEdgeWeigh
   return best / 10;
 }
 
+test("road reference preparation sorts once and marks each junction once", async () => {
+  const {
+    createMonotonicLookup,
+    sortedUniqueAndDuplicates
+  } = await import("../scripts/osm_road_graph.mjs");
+  const duplicates = [];
+  const unique = sortedUniqueAndDuplicates(
+    Float64Array.from([9, 2, 5, 2, 9, 9, 12, 5]),
+    { push: value => duplicates.push(value) }
+  );
+  assert.deepEqual([...unique], [2, 5, 9, 12]);
+  assert.deepEqual(duplicates, [2, 5, 9]);
+
+  const find = createMonotonicLookup(unique);
+  assert.deepEqual(
+    [find(1), find(2), find(4), find(5), find(12), find(20)],
+    [-1, 0, -1, 1, 3, -1]
+  );
+  // An out-of-order PBF block resets through lower-bound lookup rather than
+  // inheriting the cursor from the preceding higher-id block.
+  assert.deepEqual([find(2), find(9), find(8), find(9)], [0, 2, -1, 2]);
+});
+
 // Mirrors the engine's seed construction so reference and engine agree on
 // snapping by construction.
 function seedsFromSnap(snapResult, side) {
