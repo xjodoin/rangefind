@@ -1133,6 +1133,35 @@ export function createPulseMeshDemo({
   function stopFollowing() {
     follow?.stop();
     follow = null;
+    photoChainSeen = null;
+    verifiedCommitments.clear();
+  }
+
+  /**
+   * §20.7.1. Commitments this tab has recovered *and verified*, by stop.
+   *
+   * A record says a mark carried a proof; it does not say which bytes,
+   * because 32 bytes of accumulator buy every commitment the run has
+   * published instead of the newest one. Resolving a commitment is one
+   * list fetch from the publisher, checked against the accumulator in a
+   * record this tab already accepted — so it happens here, in the
+   * background, once per accumulator, rather than on the render path.
+   */
+  let photoChainSeen = null;
+  const verifiedCommitments = new Map();
+
+  async function refreshPhotoCommitments() {
+    const head = follow?.latest()?.photoChain ?? null;
+    if (!head || head === photoChainSeen) return;
+    // Claimed before the await so a second tick does not fire a second
+    // fetch for the same head.
+    photoChainSeen = head;
+    const list = await follow.fetchPhotoList().catch(() => null);
+    if (!list) return;
+    // Only the prefix the held accumulator vouches for. Entries past it
+    // are real and the publisher says so, but nothing here has seen them
+    // signed yet, and an unverified commitment is not evidence.
+    for (const entry of list.verified) verifiedCommitments.set(entry.stopIndex, entry.commitment);
   }
 
   /**
@@ -1222,6 +1251,7 @@ export function createPulseMeshDemo({
   async function tickThreads() {
     if (threads) await threads.tick().catch(() => {});
     if (viewerThreads) await viewerThreads.tick().catch(() => {});
+    await refreshPhotoCommitments().catch(() => {});
     // Connections come and go; the point of remembering them is that the
     // seed stops mattering after first contact, so the list is refreshed
     // from whatever this host is actually connected to now.
@@ -1230,13 +1260,38 @@ export function createPulseMeshDemo({
 
   // --- What the page reads -----------------------------------------------
 
+  /**
+   * The followed run's status, with the newest mark's commitment filled
+   * in when this tab has recovered and verified one for that stop.
+   *
+   * Deliberately without a `claim`: §12's sentence depends on whether
+   * *this device* also has live traffic, which the page knows and this
+   * controller does not. One claim, composed in one place.
+   *
+   * `photoHash` is null until the list fetch lands, and stays null for a
+   * stop whose commitment the held accumulator cannot vouch for. Either
+   * way the mark's own `hasPhoto` is what says a proof exists — that
+   * needs no fetch and comes straight out of the signature.
+   */
+  function followingSnapshot() {
+    if (!follow) return null;
+    const { claim, ...rest } = follow.status();
+    if (rest.lastOutcome?.hasPhoto) {
+      rest.lastOutcome = {
+        ...rest.lastOutcome,
+        photoHash: verifiedCommitments.get(rest.lastOutcome.stopIndex) ?? null
+      };
+    }
+    return rest;
+  }
+
   const snapshot = () => ({
     mode: activeMode,
     sharing: run ? { url: run.url, seq: run.seq, state: run.state, notAfter: run.notAfter } : null,
     // Deliberately without a `claim`: §12's sentence depends on whether
     // *this device* also has live traffic, which the page knows and this
     // controller does not. One claim, composed in one place.
-    following: follow ? (({ claim, ...rest }) => rest)(follow.status()) : null,
+    following: followingSnapshot(),
     threads: threads?.stats ?? null,
     viewer: viewerThreads?.stats ?? null,
     simulating: simTimer != null,
