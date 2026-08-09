@@ -132,7 +132,8 @@ const TICKET_FLAG_MASK = TICKET_FLAG_SEED | TICKET_FLAG_BOOTSTRAP | TICKET_FLAG_
 export const TICKET_ERROR = Object.freeze({
   DAY_SEED_MISMATCH: "ticket-day-seed-mismatch",
   DAY_FOREIGN_ROOT: "ticket-day-foreign-root",
-  DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry"
+  DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry",
+  DAY_OUTLIVES_TICKET: "cert-outlives-link"
 });
 export const THREAD_MAX_LABEL_BYTES = 48;
 /** §20.8 per-stop delivery metadata. Driver-side only — never on the wire. */
@@ -887,6 +888,21 @@ async function verifyRouteDayTicket(decoded, nowMillis) {
       ok: false,
       code: TICKET_ERROR.DAY_AFTER_TICKET_EXPIRY,
       reason: "the day certificate begins after the ticket expires"
+    };
+  }
+  // The other half of the same rule, and the one that fails quietly. A
+  // ticket that dies before its own day is over is accepted by everything
+  // here and works all afternoon: the driver is already publishing, and
+  // the seed in hand keeps signing. It fails the next time the artifact is
+  // opened — a phone restarted mid-shift, a day resumed after the app was
+  // killed — and by then the run has stopped, every parent's link has gone
+  // quiet, and nothing anywhere said why. Refuse it at the only moment
+  // somebody can still fix it.
+  if (cert.notAfter > decoded.notAfter) {
+    return {
+      ok: false,
+      code: TICKET_ERROR.DAY_OUTLIVES_TICKET,
+      reason: "the ticket expires before the day it carries is over"
     };
   }
   if (!sameBytes(await publicKeyFromSeed(decoded.privateSeed), cert.dayPublicKey)) {

@@ -439,6 +439,44 @@ test("an expired or over-long day certificate is refused", async () => {
   });
   assert.equal(shortVerdict.ok, false);
   assert.equal(shortVerdict.code, TICKET_ERROR.DAY_AFTER_TICKET_EXPIRY);
+
+  // The other half of rule 7, and the half that fails quietly. This ticket
+  // is live right now — the day has begun, the driver is publishing — and
+  // it expires an hour before the day ends. Nothing about today looks
+  // wrong. It breaks the next time the artifact is opened: a phone
+  // restarted mid-shift cannot reopen its own day, the run stops, and
+  // every follower's link goes quiet with no error anywhere.
+  const today = await dispatchFor(root.privateSeed, now);
+  const outlived = await issueTicket({
+    issuerSeed: root.privateSeed,
+    epoch32: EPOCH32,
+    plan: PLAN,
+    notAfter: today.certificate.notAfter - 3600,
+    dayCertificate: today.certificate
+  });
+  // Mid-day: inside the certificate's window and inside the ticket's own
+  // expiry, so every other check here passes.
+  const middayMillis = (today.certificate.notBefore + 3600) * 1000;
+  assert.ok(Math.floor(middayMillis / 1000) < outlived.ticket.notAfter);
+  const outlivedVerdict = await verifyThreadTicket(outlived.ticket, {
+    epochPrefix8: EPOCH_PREFIX8, nowMillis: middayMillis
+  });
+  assert.equal(outlivedVerdict.ok, false);
+  assert.equal(outlivedVerdict.code, TICKET_ERROR.DAY_OUTLIVES_TICKET);
+
+  // And the honest version of the same shape is still accepted: a ticket
+  // that outlives its day is what a term-long route ticket looks like.
+  const covering = await issueTicket({
+    issuerSeed: root.privateSeed,
+    epoch32: EPOCH32,
+    plan: PLAN,
+    notAfter: TERM_END,
+    dayCertificate: today.certificate
+  });
+  const coveringVerdict = await verifyThreadTicket(covering.ticket, {
+    epochPrefix8: EPOCH_PREFIX8, nowMillis: middayMillis
+  });
+  assert.equal(coveringVerdict.ok, true);
 });
 
 test("a route-day ticket says so, and an ordinary one says it is ordinary", async () => {
