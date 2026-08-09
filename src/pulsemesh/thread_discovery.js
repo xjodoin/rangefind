@@ -70,6 +70,11 @@ export async function threadAddresses({ keys, epoch32, epochPrefix16hex, nowMill
  * normal outcome on a small mesh, and the caller falls back to its
  * ordinary bootstrap peers.
  */
+/** How often to re-check for an address while a run is still unreachable. */
+const REACHABLE_POLL_MS = 2000;
+/** How long to keep checking before leaving it to the ordinary interval. */
+const REACHABLE_WAIT_MS = 60_000;
+
 export function createThreadDiscovery({
   host,
   keys,
@@ -81,7 +86,13 @@ export function createThreadDiscovery({
   findTimeoutMs = 10_000
 } = {}) {
   const provided = new Map(); // cid string -> millis last advertised
-  const stats = { provideCalls: 0, provideErrors: 0, provideTimeouts: 0, lookups: 0, peersFound: 0 };
+  const stats = {
+    provideCalls: 0, provideErrors: 0, provideTimeouts: 0, lookups: 0, peersFound: 0,
+    // Advertisements withheld because this host had no address yet.
+    provideSkipped: 0
+  };
+  let lastFingerprint = "";
+  let reachableTimer = null;
   let timer = null;
 
   // A DHT operation must never block its caller. `provide` in particular
@@ -97,10 +108,50 @@ export function createThreadDiscovery({
     return threadAddresses({ keys, epoch32, epochPrefix16hex, nowMillis });
   }
 
+  /**
+   * Every address this host currently believes it can be reached on.
+   *
+   * A phone and a browser tab have none of their own — they get one when
+   * a relay grants a reservation, and not before.
+   */
+  function reachable() {
+    try {
+      return (host.getMultiaddrs?.() ?? []).map(String);
+    } catch {
+      return [];
+    }
+  }
+
   /** Advertises this peer as a provider for every current window. */
   async function provide({ nowMillis = clock() } = {}) {
     const routing = host.contentRouting;
     if (!routing) return 0;
+
+    // **Do not advertise a peer nobody can dial.**
+    //
+    // A provider record is worth exactly the addresses attached to it, and
+    // a peer behind NAT has none until a relay reservation lands. Publish
+    // before that and the record names a peer id with nowhere to reach it:
+    // the lookup *succeeds*, the dial fails, and the thread reads as
+    // undiscoverable when it is merely not reachable yet. Worse, the
+    // record is then cached across the DHT in that useless state.
+    //
+    // A driver's phone publishes its first record within a second of
+    // accepting a job and gets its reservation some time after, so this is
+    // the normal order of events rather than an edge case.
+    const addressesNow = reachable();
+    if (!addressesNow.length) {
+      stats.provideSkipped++;
+      return 0;
+    }
+    // Re-advertise from scratch when the address set changes, so a run
+    // that started unreachable and later got a circuit replaces the
+    // record instead of sitting behind the interval with the old one.
+    const fingerprint = addressesNow.slice().sort().join("|");
+    if (fingerprint !== lastFingerprint) {
+      provided.clear();
+      lastFingerprint = fingerprint;
+    }
     let announced = 0;
     for (const address of await addresses(nowMillis)) {
       const key = address.cid.toString();
@@ -190,11 +241,32 @@ export function createThreadDiscovery({
     tick();
     timer = setInterval(tick, constants.THREAD_PROVIDE_INTERVAL * 1000);
     if (typeof timer.unref === "function") timer.unref();
+
+    // A run opens before its relay reservation lands, so the *first*
+    // advertisement is normally the one withheld above. Waiting a whole
+    // provide interval to try again would leave the thread undiscoverable
+    // for that entire window — which is most of a short delivery. Poll
+    // briefly instead, and stop the moment there is an address to
+    // advertise or the wait has clearly failed, so a peer that will never
+    // be reachable does not poll for the life of the run.
+    let waited = 0;
+    reachableTimer = setInterval(() => {
+      waited += REACHABLE_POLL_MS;
+      if (lastFingerprint || waited >= REACHABLE_WAIT_MS) {
+        clearInterval(reachableTimer);
+        reachableTimer = null;
+        return;
+      }
+      provide().catch(() => {});
+    }, REACHABLE_POLL_MS);
+    if (typeof reachableTimer.unref === "function") reachableTimer.unref();
   }
 
   function stop() {
     if (timer) clearInterval(timer);
+    if (reachableTimer) clearInterval(reachableTimer);
     timer = null;
+    reachableTimer = null;
   }
 
   return { addresses, provide, findPeers, connect, start, stop, stats,
