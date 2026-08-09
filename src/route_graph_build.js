@@ -132,14 +132,15 @@ function readGeomZigzag(bytes, state) {
 // strictly shrink), and road-network cliques typically sparsify several-fold.
 function pruneCliqueTriples(boundary, triples) {
   const count = boundary.length;
-  if (count < 3 || !triples.length) return triples;
+  if (count < 3 || !triples.length) return Uint32Array.from(triples);
   const index = new Map();
   for (let i = 0; i < count; i++) index.set(boundary[i], i);
   const dist = new Float64Array(count * count).fill(Infinity);
   for (let t = 0; t < triples.length; t += 3) {
     dist[index.get(triples[t]) * count + index.get(triples[t + 1])] = triples[t + 2];
   }
-  const kept = [];
+  const kept = new Uint32Array(triples.length);
+  let keptLength = 0;
   for (let t = 0; t < triples.length; t += 3) {
     const i = index.get(triples[t]);
     const j = index.get(triples[t + 1]);
@@ -153,9 +154,13 @@ function pruneCliqueTriples(boundary, triples) {
         break;
       }
     }
-    if (!redundant) kept.push(triples[t], triples[t + 1], direct);
+    if (!redundant) {
+      kept[keptLength++] = triples[t];
+      kept[keptLength++] = triples[t + 1];
+      kept[keptLength++] = direct;
+    }
   }
-  return kept;
+  return kept.slice(0, keptLength);
 }
 
 // Dijkstra over a local CSR from one source; returns distances (Infinity
@@ -192,6 +197,14 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const log = options.log || (() => {});
   const nodeCount = graph.nodeLat.length;
   const edgeCount = graph.edgeFrom.length;
+  // Hash before optional source release. The production indexer does not use
+  // the extracted columns after this build, so it can hand their backing
+  // stores back to GC as soon as the locality-ordered equivalents exist.
+  const sourceHash = createHash("sha256")
+    .update(Buffer.from(graph.nodeLat.buffer, graph.nodeLat.byteOffset, graph.nodeLat.byteLength))
+    .update(Buffer.from(graph.edgeFrom.buffer, graph.edgeFrom.byteOffset, graph.edgeFrom.byteLength))
+    .update(Buffer.from(graph.edgeWeightDs.buffer, graph.edgeWeightDs.byteOffset, graph.edgeWeightDs.byteLength))
+    .digest("hex");
 
   // 1. Partition and renumber into a locality-preserving order.
   const { perm, leaves } = kdPartition(graph.nodeLat, graph.nodeLon, leafNodes);
@@ -203,6 +216,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     latE7[i] = graph.nodeLat[perm[i]];
     lonE7[i] = graph.nodeLon[perm[i]];
   }
+  if (options.releaseSource === true) {
+    graph.nodeLat = null;
+    graph.nodeLon = null;
+  }
   const edgeFrom = new Uint32Array(edgeCount);
   const edgeTo = new Uint32Array(edgeCount);
   for (let i = 0; i < edgeCount; i++) {
@@ -210,10 +227,15 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     edgeTo[i] = newId[graph.edgeTo[i]];
   }
   const csr = buildCsr(nodeCount, edgeFrom, edgeTo);
+  if (options.releaseSource === true) {
+    graph.edgeFrom = null;
+    graph.edgeTo = null;
+  }
   const leafOfNode = new Uint32Array(nodeCount);
   for (let leaf = 0; leaf < leaves.length; leaf++) {
     leafOfNode.fill(leaf, leaves[leaf][0], leaves[leaf][1]);
   }
+  log(`partition: ${nodeCount.toLocaleString()} nodes into ${leaves.length.toLocaleString()} leaves`);
 
   // 2. Level structure: group leaves by fanout until the top stays small.
   const levelFanouts = [];
@@ -250,6 +272,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     if (lca > maxLca[from]) maxLca[from] = lca;
     if (lca > maxLca[to]) maxLca[to] = lca;
   }
+  log(`topology: ${edgeCount.toLocaleString()} edges across ${levelCount + 1} overlay level(s)`);
 
   // 4. Time-of-day buckets: bucket 0 is the base metric; extra buckets scale
   // edge weights by per-class time factors, and get their own exact cliques.
@@ -307,6 +330,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         leafCliques.set(leaf, pruneCliqueTriples(boundary.map(node => start + node), triples));
       }
       cliques.push(leafCliques);
+      log(`overlays (${buckets[bucket].name}): leaf cliques complete`);
     }
 
     // Overlay graphs per parent cell, and cliques over them for the next
@@ -314,50 +338,88 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     // targetIndex, weights, isClique } for cells at `level`.
     const overlays = [];
     const buildOverlayGraphs = (level) => {
-      const byCell = new Map();
       const cellOf = (node) => cellAtLevel(node, level);
-      const entry = (cell) => {
-        let value = byCell.get(cell);
-        if (!value) {
-          value = { nodes: [], edges: [] };
-          byCell.set(cell, value);
-        }
-        return value;
-      };
+      const cellCount = level <= levelCount ? cellsPerLevel[level - 1] : 1;
+      const nodeCounts = new Uint32Array(cellCount);
       for (let node = 0; node < nodeCount; node++) {
-        if (maxLca[node] >= level) entry(cellOf(node)).nodes.push(node);
+        if (maxLca[node] >= level) nodeCounts[cellOf(node)]++;
       }
-      const childCliques = cliques[level - 1];
-      for (const [, triples] of [...childCliques.entries()].sort((a, b) => a[0] - b[0])) {
-        for (let i = 0; i < triples.length; i += 3) {
-          entry(cellOf(triples[i])).edges.push([triples[i], triples[i + 1], triples[i + 2], 1]);
+      const nodesByCell = Array.from(nodeCounts, count => new Uint32Array(count));
+      const nodeCursor = new Uint32Array(cellCount);
+      for (let node = 0; node < nodeCount; node++) {
+        if (maxLca[node] >= level) {
+          const cell = cellOf(node);
+          nodesByCell[cell][nodeCursor[cell]++] = node;
         }
       }
-      for (let i = 0; i < edgeCount; i++) {
-        if (edgeLca[i] !== level) continue;
-        entry(cellOf(edgeFrom[i])).edges.push([edgeFrom[i], edgeTo[i], weightOf(i, bucket), 0]);
+      // Every retained node belongs to one cell at this level. A flat lookup
+      // avoids a Map entry (and boxed key/value pair) for every boundary node.
+      const localIndex = new Uint32Array(nodeCount);
+      for (let cell = 0; cell < cellCount; cell++) {
+        const nodes = nodesByCell[cell];
+        for (let i = 0; i < nodes.length; i++) localIndex[nodes[i]] = i;
+      }
+
+      // Count once and allocate exact typed columns. Country-scale overlays
+      // can contain tens of millions of arcs; nested `[u,v,w,flag]` JS arrays
+      // cost several GiB before CSR conversion and were the Brazil builder's
+      // dominant peak.
+      const edgeCounts = new Uint32Array(cellCount);
+      const childCliques = cliques[level - 1];
+      for (const triples of childCliques.values()) {
+        for (let i = 0; i < triples.length; i += 3) {
+          edgeCounts[cellOf(triples[i])]++;
+        }
+      }
+      for (let node = 0; node < nodeCount; node++) {
+        for (let e = csr.rowStart[node]; e < csr.rowStart[node + 1]; e++) {
+          if (edgeLca[csr.edgeIds[e]] === level) edgeCounts[cellOf(node)]++;
+        }
+      }
+      const columnsByCell = Array.from(edgeCounts, count => ({
+        from: new Uint32Array(count),
+        to: new Uint32Array(count),
+        weights: new Uint32Array(count),
+        isClique: new Uint8Array(count)
+      }));
+      const edgeCursor = new Uint32Array(cellCount);
+      for (const triples of childCliques.values()) {
+        for (let i = 0; i < triples.length; i += 3) {
+          const cell = cellOf(triples[i]);
+          const cursor = edgeCursor[cell]++;
+          const columns = columnsByCell[cell];
+          columns.from[cursor] = localIndex[triples[i]];
+          columns.to[cursor] = localIndex[triples[i + 1]];
+          columns.weights[cursor] = triples[i + 2];
+          columns.isClique[cursor] = 1;
+        }
+      }
+      for (let node = 0; node < nodeCount; node++) {
+        for (let e = csr.rowStart[node]; e < csr.rowStart[node + 1]; e++) {
+          const edgeId = csr.edgeIds[e];
+          if (edgeLca[edgeId] !== level) continue;
+          const cell = cellOf(node);
+          const cursor = edgeCursor[cell]++;
+          const columns = columnsByCell[cell];
+          columns.from[cursor] = localIndex[node];
+          columns.to[cursor] = localIndex[csr.targets[e]];
+          columns.weights[cursor] = weightOf(edgeId, bucket);
+        }
       }
       const result = new Map();
-      for (const [cell, { nodes, edges }] of [...byCell.entries()].sort((a, b) => a[0] - b[0])) {
-        nodes.sort((a, b) => a - b);
-        const index = new Map(nodes.map((node, i) => [node, i]));
-        const from = new Uint32Array(edges.length);
-        const to = new Uint32Array(edges.length);
-        for (let i = 0; i < edges.length; i++) {
-          from[i] = index.get(edges[i][0]);
-          to[i] = index.get(edges[i][1]);
+      for (let cell = 0; cell < cellCount; cell++) {
+        const nodes = nodesByCell[cell];
+        if (!nodes.length) continue;
+        const columns = columnsByCell[cell];
+        const local = buildCsr(nodes.length, columns.from, columns.to);
+        const weights = new Uint32Array(columns.weights.length);
+        const isClique = new Uint8Array(columns.isClique.length);
+        for (let i = 0; i < local.edgeIds.length; i++) {
+          const edgeId = local.edgeIds[i];
+          weights[i] = columns.weights[edgeId];
+          isClique[i] = columns.isClique[edgeId];
         }
-        const local = buildCsr(nodes.length, from, to);
-        const weights = new Uint32Array(edges.length);
-        const isClique = new Uint8Array(edges.length);
-        const targetIndex = new Uint32Array(edges.length);
-        for (let i = 0; i < edges.length; i++) {
-          const edge = edges[local.edgeIds[i]];
-          weights[i] = edge[2];
-          isClique[i] = edge[3];
-          targetIndex[i] = local.targets[i];
-        }
-        result.set(cell, { nodes: Uint32Array.from(nodes), rowStart: local.rowStart, targetIndex, weights, isClique });
+        result.set(cell, { nodes, rowStart: local.rowStart, targetIndex: local.targets, weights, isClique });
       }
       return result;
     };
@@ -365,6 +427,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     for (let level = 1; level <= levelCount + 1; level++) {
       const graphs = buildOverlayGraphs(level);
       overlays.push(graphs);
+      log(`overlays (${buckets[bucket].name}): level ${level}/${levelCount + 1} graph complete`);
       if (level > levelCount) break;
       const levelCliques = new Map();
       for (const [cell, overlay] of graphs) {
@@ -553,6 +616,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       geometryEntry: writtenGeometry
     });
   }
+  log(`packing: ${leaves.length.toLocaleString()} leaf cell(s) complete`);
 
   const emptyOverlay = {
     nodes: new Uint32Array(0),
@@ -579,6 +643,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     }
     levelEntries.push(entries);
   }
+  log(`packing: ${levelCount.toLocaleString()} overlay level(s) complete`);
 
   // Top overlay per bucket: connects the top-child cells; lives in its own
   // directory so sharded deployments publish one shared boundary artifact.
@@ -607,12 +672,6 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const namesHash = createHash("sha256").update(namesGz).digest("hex").slice(0, OBJECT_NAME_HASH_LENGTH);
   const namesFile = `names.${namesHash}.bin.gz`;
   writeFileSync(join(outDir, namesFile), namesGz);
-
-  const sourceHash = createHash("sha256")
-    .update(Buffer.from(graph.nodeLat.buffer, graph.nodeLat.byteOffset, graph.nodeLat.byteLength))
-    .update(Buffer.from(graph.edgeFrom.buffer, graph.edgeFrom.byteOffset, graph.edgeFrom.byteLength))
-    .update(Buffer.from(graph.edgeWeightDs.buffer, graph.edgeWeightDs.byteOffset, graph.edgeWeightDs.byteLength))
-    .digest("hex");
 
   const shards = writers.map((writer, s) => ({
     id: shardCount === 1 ? "all" : `shard-${String(s).padStart(2, "0")}`,
@@ -715,32 +774,45 @@ function writeShard(writer, key, compressed, logicalLength) {
 // top overlay object (they are disjoint node sets plus the crossing edges
 // whose LCA is the top region, already grouped under the root cell 0..n).
 function mergeOverlayGraphs(graphs, level) {
-  const nodeList = [];
-  const edges = [];
-  for (const [, overlay] of [...graphs.entries()].sort((a, b) => a[0] - b[0])) {
+  let nodeCount = 0;
+  let edgeCount = 0;
+  let maxNode = 0;
+  for (const overlay of graphs.values()) {
+    nodeCount += overlay.nodes.length;
+    edgeCount += overlay.targetIndex.length;
+    for (const node of overlay.nodes) if (node > maxNode) maxNode = node;
+  }
+  const nodes = new Uint32Array(nodeCount);
+  let nodeCursor = 0;
+  for (const overlay of graphs.values()) {
+    nodes.set(overlay.nodes, nodeCursor);
+    nodeCursor += overlay.nodes.length;
+  }
+  nodes.sort();
+  const index = new Uint32Array(maxNode + 1);
+  for (let i = 0; i < nodes.length; i++) index[nodes[i]] = i;
+  const from = new Uint32Array(edgeCount);
+  const to = new Uint32Array(edgeCount);
+  const sourceWeights = new Uint32Array(edgeCount);
+  const sourceIsClique = new Uint8Array(edgeCount);
+  let edgeCursor = 0;
+  for (const overlay of graphs.values()) {
     for (let i = 0; i < overlay.nodes.length; i++) {
       for (let e = overlay.rowStart[i]; e < overlay.rowStart[i + 1]; e++) {
-        edges.push([overlay.nodes[i], overlay.nodes[overlay.targetIndex[e]], overlay.weights[e], overlay.isClique[e]]);
+        from[edgeCursor] = index[overlay.nodes[i]];
+        to[edgeCursor] = index[overlay.nodes[overlay.targetIndex[e]]];
+        sourceWeights[edgeCursor] = overlay.weights[e];
+        sourceIsClique[edgeCursor] = overlay.isClique[e];
+        edgeCursor++;
       }
     }
-    for (const node of overlay.nodes) nodeList.push(node);
-  }
-  nodeList.sort((a, b) => a - b);
-  const nodes = Uint32Array.from(nodeList);
-  const index = new Map();
-  for (let i = 0; i < nodes.length; i++) index.set(nodes[i], i);
-  const from = new Uint32Array(edges.length);
-  const to = new Uint32Array(edges.length);
-  for (let i = 0; i < edges.length; i++) {
-    from[i] = index.get(edges[i][0]);
-    to[i] = index.get(edges[i][1]);
   }
   const csr = buildCsr(nodes.length, from, to);
-  const weights = new Uint32Array(edges.length);
-  const isClique = new Uint8Array(edges.length);
-  for (let i = 0; i < edges.length; i++) {
-    weights[i] = edges[csr.edgeIds[i]][2];
-    isClique[i] = edges[csr.edgeIds[i]][3];
+  const weights = new Uint32Array(edgeCount);
+  const isClique = new Uint8Array(edgeCount);
+  for (let i = 0; i < edgeCount; i++) {
+    weights[i] = sourceWeights[csr.edgeIds[i]];
+    isClique[i] = sourceIsClique[csr.edgeIds[i]];
   }
   return { level, cellId: 0, nodes, rowStart: csr.rowStart, targetIndex: csr.targets, weights, isClique };
 }

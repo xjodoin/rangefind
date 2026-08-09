@@ -664,6 +664,25 @@ test("sharded build routes identically to the monolithic build", async (t) => {
   }
 });
 
+test("production builds can release consumed source columns without changing output", (t) => {
+  const retained = syntheticGraph(12, 10, 123);
+  const releasable = syntheticGraph(12, 10, 123);
+  const retainedDir = mkdtempSync(join(tmpdir(), "rangefind-route-retained-source-"));
+  const releasedDir = mkdtempSync(join(tmpdir(), "rangefind-route-released-source-"));
+  t.after(() => {
+    rmSync(retainedDir, { recursive: true, force: true });
+    rmSync(releasedDir, { recursive: true, force: true });
+  });
+  const options = { leafNodes: 32, fanout: 4, topMaxCells: 4 };
+  const baseline = buildRouteGraph(retained, retainedDir, options);
+  const compact = buildRouteGraph(releasable, releasedDir, { ...options, releaseSource: true });
+  assert.equal(compact.rootFile, baseline.rootFile);
+  assert.equal(releasable.nodeLat, null);
+  assert.equal(releasable.nodeLon, null);
+  assert.equal(releasable.edgeFrom, null);
+  assert.equal(releasable.edgeTo, null);
+});
+
 test("far-off points fail with a coded snap error", async (t) => {
   const graph = syntheticGraph(8, 8, 11);
   const dir = mkdtempSync(join(tmpdir(), "rangefind-route-snap-"));
