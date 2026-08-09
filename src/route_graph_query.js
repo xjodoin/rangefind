@@ -667,6 +667,60 @@ export async function openRouteGraph(options) {
     return { segment, points, meters };
   }
 
+  /**
+   * Every road in a bounding box, as drawable polylines.
+   *
+   * This is what lets a map exist without a tile server. The geometry is
+   * already here — it is the same polylines the router walks and the same
+   * ones `geometryOf` returns for a single segment — so a basemap costs
+   * the leaves in view and nothing else. No account, no third party, and
+   * no possibility of drawing a road the router does not believe in.
+   *
+   * Bounded rather than open-ended: a viewport zoomed out over a country
+   * would ask for every leaf in it, so `maxLeaves` caps the work and the
+   * caller is told what it did not get instead of quietly receiving a
+   * partial map that looks complete.
+   */
+  async function roadsIn(bbox, { maxLeaves = 24 } = {}) {
+    const minLat = Math.round(bbox.minLat * 1e7);
+    const maxLat = Math.round(bbox.maxLat * 1e7);
+    const minLon = Math.round(bbox.minLon * 1e7);
+    const maxLon = Math.round(bbox.maxLon * 1e7);
+    const hits = [];
+    for (let leaf = 0; leaf < root.leaves.length; leaf++) {
+      const box = root.leaves[leaf]?.bbox;
+      if (!box) continue;
+      if (box.minLat > maxLat || box.maxLat < minLat) continue;
+      if (box.minLon > maxLon || box.maxLon < minLon) continue;
+      hits.push(leaf);
+    }
+    const truncated = hits.length > maxLeaves;
+    const roads = [];
+    for (const leaf of hits.slice(0, maxLeaves)) {
+      const [cell, geometry] = await Promise.all([loadCell(leaf), loadCellGeometry(leaf)])
+        .catch(() => [null, null]);
+      if (!cell || !geometry) continue;
+      // One entry per physical polyline, not per edge: a one-way pair is
+      // two edges over one piece of road, and drawing it twice doubles
+      // every stroke's weight for no extra information.
+      const classOfPolyline = new Map();
+      for (let edge = 0; edge < cell.geomRefs.length; edge++) {
+        const polyline = Math.floor(cell.geomRefs[edge] / 2);
+        if (!classOfPolyline.has(polyline)) {
+          classOfPolyline.set(polyline, root.classes?.[cell.classes[edge]] || "");
+        }
+      }
+      for (let polyline = 0; polyline < geometry.polylines.length; polyline++) {
+        const raw = edgePolyline(polyline * 2, geometry);
+        if (!raw || raw.length < 4) continue;
+        const points = [];
+        for (let i = 0; i + 1 < raw.length; i += 2) points.push([raw[i] / 1e7, raw[i + 1] / 1e7]);
+        roads.push({ points, roadClass: classOfPolyline.get(polyline) ?? "" });
+      }
+    }
+    return { roads, leaves: Math.min(hits.length, maxLeaves), truncated };
+  }
+
   const factsCache = new Map();
   /**
    * The static facts about one leaf's edges, keyed by the geomRef that
@@ -2306,7 +2360,7 @@ export async function openRouteGraph(options) {
   }
 
   return {
-    root, route, matrix, itinerary, snap, locate, geometryOf, cellFacts,
+    root, route, matrix, itinerary, snap, locate, geometryOf, roadsIn, cellFacts,
     stats: statsSnapshot, resetStats, clearCaches
   };
 }
