@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -157,6 +157,40 @@ test("road reference preparation sorts once and marks each junction once", async
   // An out-of-order PBF block resets through lower-bound lookup rather than
   // inheriting the cursor from the preceding higher-id block.
   assert.deepEqual([find(2), find(9), find(8), find(9)], [0, 2, -1, 2]);
+});
+
+test("road graph writer replaces atomically without concatenating sections", async (t) => {
+  const graph = syntheticGraph(4, 3, 71);
+  const edgeCount = graph.edgeFrom.length;
+  graph.edgeJunction = new Uint8Array(edgeCount);
+  graph.edgeSpeed = new Uint8Array(edgeCount);
+  graph.edgeCond = new Uint8Array(edgeCount);
+  graph.edgeSign = new Uint32Array(edgeCount);
+  graph.edgeFlags = new Uint8Array(edgeCount);
+  graph.laneOffsets = new Uint32Array(edgeCount + 1);
+  graph.laneBytes = new Uint8Array(0);
+  graph.condRules = [];
+  graph.signs = [];
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-road-write-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "graph.bin");
+  writeFileSync(path, "incomplete old graph");
+
+  const { readRoadGraph, writeRoadGraph } = await import("../scripts/osm_road_graph.mjs");
+  writeRoadGraph(path, graph);
+  assert.deepEqual(readdirSync(dir), ["graph.bin"], "temporary output is renamed, not left behind");
+
+  const decoded = await readRoadGraph(path);
+  assert.equal(decoded.profile, graph.profile);
+  assert.deepEqual(decoded.names, graph.names);
+  for (const key of [
+    "nodeLat", "nodeLon", "edgeFrom", "edgeTo", "edgeWeightDs", "edgeDistDm",
+    "edgeName", "edgeClass", "edgeJunction", "edgeSpeed", "edgeCond", "edgeSign",
+    "edgeFlags", "laneOffsets", "laneBytes", "geomOffsets", "geomBytes"
+  ]) {
+    assert.deepEqual(decoded[key], graph[key], `${key} round trips`);
+  }
 });
 
 // Mirrors the engine's seed construction so reference and engine agree on

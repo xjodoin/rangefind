@@ -10,7 +10,7 @@
 // node can reach every other retained node; oneway pockets and disconnected
 // fragments would otherwise poison random-pair benchmarks.
 
-import { writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { scanPbf } from "./osm_pbf.mjs";
 
 const EARTH_RADIUS_METERS = 6371008.7714;
@@ -2834,11 +2834,38 @@ export function writeRoadGraph(path, graph) {
     }))
   };
   const headerBytes = new TextEncoder().encode(JSON.stringify(header) + "\n");
-  const chunks = [headerBytes];
-  for (const [, array] of sections) {
-    chunks.push(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
+
+  // Do not Buffer.concat the graph. Brazil's expanded car graph is multiple
+  // GiB; concatenating every section retained the graph and allocated a full
+  // second copy before issuing the first write, which pushed the production
+  // worker above MemoryHigh and left it indefinitely cgroup-throttled. Write
+  // zero-copy typed-array views in format order instead. A sibling temporary
+  // file keeps the destination atomic if the process is interrupted.
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+  let fd = -1;
+  const writeAll = bytes => {
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
+    }
+  };
+  try {
+    fd = openSync(temporary, "wx");
+    writeAll(headerBytes);
+    for (const [, array] of sections) {
+      writeAll(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
+    }
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = -1;
+    renameSync(temporary, path);
+  } catch (error) {
+    if (fd >= 0) {
+      try { closeSync(fd); } catch {}
+    }
+    try { unlinkSync(temporary); } catch {}
+    throw error;
   }
-  writeFileSync(path, Buffer.concat(chunks.map(chunk => Buffer.from(chunk))));
 }
 
 const TYPED_ARRAYS = { Int32Array, Uint32Array, Uint8Array };
