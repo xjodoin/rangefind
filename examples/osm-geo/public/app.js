@@ -3,6 +3,7 @@ import {
   decodePolyline,
   matchPointToRoute,
   prepareRoute,
+  resolveOsmSuggestion,
   reverseGeocodeOsm,
   searchOsmQuery,
   suggestOsmQuery
@@ -88,7 +89,8 @@ const RESOLVED_LOCATION_LANES = new Set([
   "osmReverseGeocodeFallback",
   "osmReverseGeocodeLocality",
   "osmStreetLocality",
-  "osmCoordinates"
+  "osmCoordinates",
+  "osmSuggestEntity"
 ]);
 
 const LOCATION_TYPE_LABELS = new Map([
@@ -110,7 +112,8 @@ const PLANNER_LABELS = new Map([
   ["osmReverseGeocodeFallback", "coordinate"],
   ["osmReverseGeocodeLocality", "nearby locality"],
   ["osmStreetLocality", "street authority"],
-  ["osmCoordinates", "coordinate"]
+  ["osmCoordinates", "coordinate"],
+  ["osmSuggestEntity", "direct place"]
 ]);
 
 const TRACE_LABELS = new Map([
@@ -505,6 +508,12 @@ function hidePlaceLens() {
   selectedPlace = null;
 }
 
+// Dim (never clear) the previous answer while a new one is in flight.
+function setResultsLoading(loading) {
+  resultList.classList.toggle("is-loading", Boolean(loading));
+  placeLens.classList.toggle("is-loading", Boolean(loading));
+}
+
 function setMapPickActive(active) {
   mapPickActive = Boolean(active);
   mapPickButton.setAttribute("aria-pressed", String(mapPickActive));
@@ -810,7 +819,6 @@ async function runSearch({ fit = false } = {}) {
   if (addressLookup && areaWasChecked) areaToggle.checked = false;
   clearButton.hidden = !q;
   searchPanel.classList.toggle("has-query", Boolean(q));
-  hidePlaceLens();
 
   const params = {
     ...(queryOverride?.params || { q }),
@@ -836,6 +844,7 @@ async function runSearch({ fit = false } = {}) {
   if (anchor) params.near = { lat: anchor.lat, lon: anchor.lon };
   if (!q && !useArea) {
     anchoredQueryActive = false;
+    hidePlaceLens();
     queryReceipt.hidden = true;
     resultList.replaceChildren();
     clearMarkers();
@@ -846,6 +855,9 @@ async function runSearch({ fit = false } = {}) {
   }
 
   beginQueryReceipt();
+  // Previous results and the place card stay visible (dimmed) while the new
+  // answer streams in — a slow query should read as "working", not "wiped".
+  setResultsLoading(true);
   setStatus("Scanning static byte ranges…", "loading");
   mapHudText.textContent = q ? `Searching “${q}”` : "Scanning this viewport";
   const started = performance.now();
@@ -857,6 +869,8 @@ async function runSearch({ fit = false } = {}) {
     if (resolvedLocation) areaToggle.checked = false;
     // A view-anchored result (not a named place): panning re-runs it.
     anchoredQueryActive = Boolean(anchor) && !resolvedLocation;
+    setResultsLoading(false);
+    hidePlaceLens();
     renderResults(response.results, {
       fit: fit || resolvedLocation || (addressLookup && areaWasChecked),
       query: q
@@ -897,6 +911,8 @@ async function runSearch({ fit = false } = {}) {
   } catch (error) {
     if (token !== searchToken) return;
     anchoredQueryActive = false;
+    setResultsLoading(false);
+    hidePlaceLens();
     const message = error?.message || "Search failed";
     interruptQueryReceipt();
     setStatus(message, "error");
@@ -942,7 +958,47 @@ function chooseSuggestion(suggestion) {
   clearButton.hidden = false;
   hideSuggestions();
   areaToggle.checked = false;
+  // An entity suggestion names exactly one document: hydrate it directly
+  // (a couple of small range reads) instead of re-running the query as a
+  // search. Anything else — categories, streets, ambiguous names — still
+  // needs the planner.
+  if (item.selection?.doc) {
+    runEntitySelection(item, query);
+    return;
+  }
   runSearch({ fit: true });
+}
+
+async function runEntitySelection(item, query) {
+  if (!engine) return;
+  if (mapPickActive) setMapPickActive(false);
+  const token = ++searchToken;
+  searchPanel.classList.add("has-query");
+  beginQueryReceipt();
+  setResultsLoading(true);
+  setStatus("Resolving the place from its suggestion…", "loading");
+  mapHudText.textContent = `Locating “${query}”`;
+  const started = performance.now();
+  try {
+    const response = await resolveOsmSuggestion(engine, item);
+    if (token !== searchToken) return;
+    if (!response.results.length) throw new Error("entity suggestion resolved to no document");
+    const place = response.results[0];
+    anchoredQueryActive = false;
+    setResultsLoading(false);
+    hidePlaceLens();
+    renderResults(response.results, { fit: true, query });
+    const ms = Math.round(performance.now() - started);
+    setStatus(`Showing 1 of 1 matches · ${(ms / 1000).toFixed(1)}s · ${PLANNER_LABELS.get("osmSuggestEntity")}`);
+    renderQueryReceipt(response, 1);
+    openPlaceLens(place);
+    mapHudText.textContent = `${place.name || query} · direct from the suggestion`;
+  } catch {
+    if (token !== searchToken) return;
+    // Fail open: the classic suggestion-to-search path still answers.
+    setResultsLoading(false);
+    runSearch({ fit: true });
+  }
 }
 
 function suggestionRegionLabel(shards) {

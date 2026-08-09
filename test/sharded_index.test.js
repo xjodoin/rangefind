@@ -235,8 +235,19 @@ test("sharded index matches the monolithic build exactly", { timeout: 120000 }, 
     assert.equal(routedSuggest.stats.textRouting?.selected, 1);
     assert.ok(routedSuggest.suggestions.length > 0);
     assert.ok(routedSuggest.suggestions.every(item => item.text.startsWith("borealunique")));
-    assert.deepEqual(routedSuggest.suggestions.map(({ shards, ...item }) => item), monoRoutedSuggest.suggestions);
+    // Doc ordinals are engine-local (a shard's ordinal space is not the
+    // monolithic index's), so compare suggestions without provenance and
+    // then prove both docs hydrate to the same document.
+    const stripProvenance = ({ shards, doc, ...item }) => item;
+    assert.deepEqual(
+      routedSuggest.suggestions.map(stripProvenance),
+      monoRoutedSuggest.suggestions.map(stripProvenance)
+    );
     assert.deepEqual(routedSuggest.suggestions[0].shards, ["band-2"]);
+    const [shardHydrated] = await sharded.hydrateRows([[routedSuggest.suggestions[0].doc, 0]], { shard: "band-2" });
+    const [monoHydrated] = await mono.hydrateRows([[monoRoutedSuggest.suggestions[0].doc, 0]]);
+    assert.equal(shardHydrated.id, monoHydrated.id);
+    assert.equal(shardHydrated.shard, "band-2");
 
     const unroutedSuggest = await sharded.suggest({ q: "borealuniqxe" });
     assert.equal(unroutedSuggest.stats.shardsQueried, 3);

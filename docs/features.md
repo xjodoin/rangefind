@@ -251,6 +251,25 @@ const { suggestions } = await engine.suggest({ q: "eiff", size: 8 });
 const exact = await engine.authorityLookup("Tour Eiffel", { size: 4 });
 ```
 
+Each suggestion also names the best document behind its surface (`doc`, a doc
+ordinal) when that is unambiguous — single-index engines always, sharded
+fan-out when exactly one shard owns the winning rank. Selecting such a
+suggestion should hydrate the document directly instead of re-running the
+query as a search:
+
+```js
+const picked = suggestions[0];
+if (picked.doc != null) {
+  const [place] = await engine.hydrateRows([[picked.doc, 0]]); // 1-2 small reads
+}
+```
+
+The OSM integration wraps the same contract as `selection.doc` plus
+`resolveOsmSuggestion(engine, suggestion)`, which returns a one-result search
+response (`plannerLane: "osmSuggestEntity"`). Root-routed suggestions on
+sharded planets carry no `doc` (the root artifact stores shard ordinals);
+selection falls back to the shard-scoped search there.
+
 `authorityLookup()` returns every canonical display whose normalized surface is
 equal to the input. On sharded roots, root-level suggest routing supplies shard
 provenance, allowing the selected prediction to scope its follow-up query

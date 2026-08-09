@@ -739,9 +739,14 @@ early-stopped totals and sampled facet counts.
 - **`engine.count({ q })`** — exact match count for a text-only query (no
   filters/sort/geo/vector). Returns `{ total, totalExact, approximate, stats }`.
 - **`engine.suggest({ q, size = 8 })`** — autocomplete. Returns
-  `{ q, prefix, suggestions: [{ text, weight, count }], stats }`. `size`
+  `{ q, prefix, suggestions: [{ text, weight, count, doc? }], stats }`. `size`
   clamped to 50. Sources are fixed at build time: the `suggest` config when
-  present, otherwise a single `title` authority field when available.
+  present, otherwise a single `title` authority field when available. `doc` is
+  the ordinal of the best document behind the surface, present when its owner
+  is unambiguous (always on single-index engines; on sharded fan-out only when
+  one shard owns the winning rank; never from the root routing artifact or on
+  generational engines) — hydrate it with `engine.hydrateRows` instead of
+  re-running the selection as a search.
 - **`engine.vectorSearch({ vector, field?, k = 10, nprobe = 8, refineFactor = 8,
   refine = true, includeResults })`** — pure vector top-k with real cosine
   scores. `k` clamped to 200, `nprobe` to the cluster count, `refineFactor` to
@@ -760,8 +765,12 @@ early-stopped totals and sampled facet counts.
   speculative fetch is retried by the next real access. Single/generational
   engines expose the doc-values half directly as
   **`engine.prefetchDocValues()`**.
-- **`engine.hydrateRows(rows)`** — hydrate `[index, score]` rows into display
-  results (used internally by the generational layer).
+- **`engine.hydrateRows(rows, context?)`** — hydrate `[index, score]` rows into
+  display results without running a query (also used internally by the
+  generational layer). On sharded roots pass `context.shard` (the owning shard
+  id, e.g. from suggestion provenance) since doc ordinals are shard-local;
+  results come back shard-stamped. This is the direct-selection path for
+  suggestions carrying `doc`. Generational engines do not expose it.
 - **`engine.loadBuildTelemetry()`**, **`loadIndexOptimizer()`**, and
   **`loadSegmentManifest()`** — lazily load optional diagnostics. These are
   available on a single/generational engine when the corresponding artifacts
@@ -1070,7 +1079,13 @@ const addresses = await reverseGeocodeOsm(engine, {
 
 `suggestOsmQuery` returns legacy `text`/`weight` fields plus structured
 `mainText`, `secondaryText`, `matchedRanges`, `types`, and `selection`.
-`selection.shards` can scope the selected follow-up search.
+`selection.shards` can scope the selected follow-up search. When a suggestion
+names exactly one document in one shard (an entity, not a street/category/
+shared surface), `selection.doc = { index, shard? }` is present and
+`resolveOsmSuggestion(engine, suggestion)` hydrates it into a one-result
+response (`plannerLane: "osmSuggestEntity"`) in a couple of range reads — no
+search. It throws when `selection.doc` is absent; fall back to
+`searchOsmQuery` with `selection.query`/`selection.shards` there.
 
 For existing Google Places/Geocoding clients, `rangefind/osm` also exports
 `createRangefindMapsAdapter(engine, options)`. It provides promise-based

@@ -1465,6 +1465,16 @@ function structuredSuggestion(item, input) {
     ? String(item.locality || "")
     : comma > 0 ? text.slice(comma + 1).trim() : "";
   const kind = item.type || "place";
+  // An entity suggestion — one specific place, unambiguously backed by a
+  // single document in a single shard — carries a direct doc reference so
+  // selection can hydrate the place instead of re-running a search. Streets,
+  // category compositions, and shared surfaces (count > 1) stay query-only.
+  const entityDoc = kind === "place"
+    && item.doc != null
+    && Number(item.count) === 1
+    && (item.shards == null || item.shards.length === 1)
+    ? { index: item.doc, ...(item.shards?.length === 1 ? { shard: item.shards[0] } : {}) }
+    : null;
   return {
     ...item,
     description: text,
@@ -1475,7 +1485,42 @@ function structuredSuggestion(item, input) {
     types: item.category ? [item.category] : kind === "street" ? ["route"] : [kind],
     selection: {
       query: text,
-      ...(item.shards?.length ? { shards: item.shards } : {})
+      ...(item.shards?.length ? { shards: item.shards } : {}),
+      ...(entityDoc ? { doc: entityDoc } : {})
+    }
+  };
+}
+
+/**
+ * Hydrate an entity suggestion straight into a one-result response — the
+ * "Place Details" step of the suggest contract. Requires a suggestion whose
+ * `selection.doc` was stamped by suggestOsmQuery (unambiguous single-doc
+ * surface); throws otherwise so callers fall back to searchOsmQuery.
+ */
+export async function resolveOsmSuggestion(engine, suggestion = {}) {
+  const selection = suggestion.selection || suggestion;
+  const doc = selection.doc;
+  const index = Math.floor(Number(doc?.index));
+  if (!doc || !Number.isFinite(index) || index < 0) {
+    throw new TypeError("resolveOsmSuggestion requires a suggestion carrying selection.doc");
+  }
+  if (typeof engine?.hydrateRows !== "function") {
+    throw new TypeError("resolveOsmSuggestion requires an engine exposing hydrateRows");
+  }
+  const results = await engine.hydrateRows([[index, 0]], doc.shard ? { shard: doc.shard } : {});
+  const result = results?.[0];
+  const query = String(selection.query || suggestion.text || "");
+  return {
+    total: result ? 1 : 0,
+    page: 1,
+    size: 1,
+    approximate: false,
+    results: result ? [result] : [],
+    resolvedQuery: query || (result?.name ?? ""),
+    stats: {
+      plannerLane: "osmSuggestEntity",
+      osmSuggestEntityIndex: index,
+      ...(doc.shard ? { osmSuggestEntityShard: doc.shard } : {})
     }
   };
 }

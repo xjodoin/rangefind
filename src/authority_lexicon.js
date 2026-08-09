@@ -79,13 +79,25 @@ export function autocompleteEntrySummary(key, rows, options = {}) {
   const parsed = parseAutocompleteKey(key);
   if (!parsed) return null;
   let maxWeight = 0;
-  for (const row of rows || []) maxWeight = Math.max(maxWeight, Number(row[1]) || 0);
+  let topDoc = null;
+  for (const row of rows || []) {
+    const weight = Number(row[1]) || 0;
+    const doc = Number(row[0]);
+    // Same order as the codec's kept rows (weight desc, doc asc): the row
+    // that owns the surface's rank also names its best document.
+    if (topDoc === null || weight > maxWeight || (weight === maxWeight && doc < topDoc)) topDoc = doc;
+    maxWeight = Math.max(maxWeight, weight);
+  }
   const item = {
     key,
     ...parsed,
     weight: maxWeight || rows.length,
     count: rows.length,
-    full: suggestKey(parsed.display) === parsed.normalized
+    full: suggestKey(parsed.display) === parsed.normalized,
+    // Only when the caller vouches rows are [doc, weight] — root routing
+    // artifacts pass [shard ordinal, weight] rows, which must never be
+    // mistaken for document ids.
+    ...(options.docRows && rows?.length ? { doc: topDoc } : {})
   };
   item.rank = autocompleteRank(item, options.weighted);
   return item;
@@ -305,15 +317,21 @@ export function parseAuthorityLexiconSegment(buffer, options = {}) {
   };
 }
 
+// Version 2 hot lists append each entry's best doc ordinal (offset by one,
+// zero meaning "none") so hot-lane suggestions resolve to documents exactly
+// like lexicon-lane ones. Root routing hot lists carry no doc by design.
+const AUTHORITY_HOT_DOC_VERSION = 2;
+
 export function encodeAuthorityHotList(entries) {
   const out = [...AUTHORITY_HOT_MAGIC];
-  pushVarint(out, AUTHORITY_LEXICON_VERSION);
+  pushVarint(out, AUTHORITY_HOT_DOC_VERSION);
   pushVarint(out, entries.length);
   for (const entry of entries) {
     pushUtf8(out, entry.normalized);
     pushUtf8(out, entry.display);
     pushVarint(out, entry.weight);
     pushVarint(out, entry.count);
+    pushVarint(out, entry.doc == null ? 0 : entry.doc + 1);
   }
   return Buffer.from(Uint8Array.from(out));
 }
@@ -323,16 +341,23 @@ export function parseAuthorityHotList(buffer) {
   assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
   const state = { pos: AUTHORITY_HOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION) {
+    throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  }
   const count = readVarint(bytes, state);
   const entries = new Array(count);
   for (let index = 0; index < count; index++) {
-    entries[index] = {
+    const entry = {
       normalized: readUtf8(bytes, state),
       display: readUtf8(bytes, state),
       weight: readVarint(bytes, state),
       count: readVarint(bytes, state)
     };
+    if (version >= AUTHORITY_HOT_DOC_VERSION) {
+      const doc = readVarint(bytes, state);
+      if (doc > 0) entry.doc = doc - 1;
+    }
+    entries[index] = entry;
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind authority hot list has trailing bytes.");
   return entries;

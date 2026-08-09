@@ -4,6 +4,23 @@
 
 ### Added
 
+- Suggestions resolve directly to their document. Per-shard authority
+  artifacts (codec v4) keep each autocomplete surface's best `[doc, score]`
+  row instead of discarding it, hot lists carry the same doc, and
+  `engine.suggest()` now returns `doc` whenever the owning document is
+  unambiguous — always on single-index engines, on sharded fan-out when
+  exactly one shard owns the winning rank. Sharded engines gained
+  `hydrateRows(rows, { shard })`. The OSM layer stamps `selection.doc` on
+  entity suggestions (one doc, one shard) and adds
+  `resolveOsmSuggestion(engine, suggestion)`, which hydrates the selection
+  into a one-result response (`plannerLane: "osmSuggestEntity"`) in a couple
+  of range reads. The osm-geo demo uses it: clicking an entity suggestion
+  drops the pin and opens the place card without re-running the query as a
+  search, and slow searches now dim the previous answer instead of blanking
+  it. Older (v2) authority sidecars keep working — suggestions just carry no
+  `doc`, and selection falls back to the search path, as it also does for
+  root-routed suggestions on sharded planets.
+
 - PulseMesh protocol v1, the anonymous peer-to-peer live-traffic channel
   (`src/pulsemesh/`): wire codecs (PMC1/PMB1/PMI1/PMD1/PMG1/PMQ1/PMS1/PMF1)
   byte-identical to the specification's test vectors, dependency-free

@@ -8119,7 +8119,9 @@ export async function createSearch(options = {}) {
   // Suggestion payload for a lexicon candidate. Ordinal rows are written
   // weight-descending, so the leading rows that tie the winning weight name
   // the federation shard(s) responsible for the suggestion's rank — the same
-  // provenance the fan-out merge derives from per-shard responses.
+  // provenance the fan-out merge derives from per-shard responses. Doc rows
+  // (per-shard rfauth v4) instead name the best document behind the surface,
+  // so a selected suggestion can hydrate directly via hydrateRows.
   function lexiconSuggestion(candidate) {
     const suggestion = { text: candidate.display, weight: candidate.weight, count: candidate.count };
     if (candidate.rows?.length) {
@@ -8131,6 +8133,7 @@ export async function createSearch(options = {}) {
       }
       suggestion.ordinals = ordinals;
     }
+    if (candidate.docRows?.length) suggestion.doc = candidate.docRows[0][0];
     return suggestion;
   }
 
@@ -8152,7 +8155,10 @@ export async function createSearch(options = {}) {
         full: suggestKey(parsed.display) === parsed.normalized,
         // Root suggest-routing artifacts store [shard ordinal, weight] rows
         // on autocomplete entries; provenance travels with the candidate.
-        ...(entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {})
+        // Per-shard doc-row artifacts store the best [doc, weight] row so an
+        // unambiguous suggestion resolves straight to its document.
+        ...(entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {}),
+        ...(entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {})
       };
       candidate.rank = autocompleteRank(candidate, weighted);
       list.push(candidate);
@@ -8182,7 +8188,7 @@ export async function createSearch(options = {}) {
         return {
           q,
           prefix,
-          suggestions: hot.slice(0, size).map(({ display, weight, count }) => ({ text: display, weight, count })),
+          suggestions: hot.slice(0, size).map(({ display, weight, count, doc }) => ({ text: display, weight, count, ...(doc != null ? { doc } : {}) })),
           stats: {
             exact: true,
             suggestLane: "authority-hot",
@@ -9337,8 +9343,12 @@ async function createGenerationalSearch(root, options, baseUrl) {
         if (existing) {
           existing.count += item.count;
           existing.weight = Math.max(existing.weight, item.weight);
+          // A doc ordinal is only meaningful inside its own generation, and
+          // merged suggestions carry no generation provenance — drop it.
+          delete existing.doc;
         } else {
-          merged.set(item.text, { ...item });
+          const { doc, ...rest } = item;
+          merged.set(item.text, rest);
         }
       }
     }
@@ -10231,11 +10241,17 @@ async function createShardedSearch(root, options, baseUrl) {
           if (item.weight > existing.weight) {
             existing.weight = item.weight;
             existing.shards = [shard.id];
+            // The doc ordinal is shard-local: it must travel with the shard
+            // that owns the winning rank or not at all.
+            if (item.doc != null) existing.doc = item.doc;
+            else delete existing.doc;
           } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
             // Route a selected suggestion only to the shard(s) responsible
             // for its winning rank. Weak same-text rows elsewhere contribute
             // to `count` but should not reopen those regions on selection.
             existing.shards.push(shard.id);
+            // A cross-shard rank tie makes the doc's owner ambiguous.
+            delete existing.doc;
           }
         } else {
           // Preserve the top-level shard provenance so a selected suggestion
@@ -10321,6 +10337,24 @@ async function createShardedSearch(root, options, baseUrl) {
     }
   }
 
+  // Doc ordinals are shard-local, so hydrating on a sharded root requires the
+  // owning shard: `context.shard` names it (a shard id, as carried by
+  // suggestion provenance). Results are shard-stamped like search hits.
+  async function hydrateRows(rows, context = {}) {
+    const id = String(context.shard || "");
+    const index = shardIdIndex.get(id);
+    if (index === undefined) {
+      throw new Error(`Rangefind: hydrateRows on a sharded index requires context.shard naming one shard (got "${id}").`);
+    }
+    const engine = await engineAt(index);
+    if (typeof engine.hydrateRows !== "function") {
+      throw new Error(`Rangefind: shard "${id}" does not support hydrateRows.`);
+    }
+    const { shard, ...rest } = context;
+    const docs = await engine.hydrateRows(rows, rest);
+    return docs.map(doc => stampShard(doc, index));
+  }
+
   // Fire-and-forget warm-up: instantiating a shard engine fetches and parses
   // its manifest, the longest single serial leg of a cold scoped query.
   // Callers that already know which shards a query will hit (the OSM anchored
@@ -10354,6 +10388,7 @@ async function createShardedSearch(root, options, baseUrl) {
     suggest,
     count,
     authorityLookup,
+    hydrateRows,
     vectorSearch,
     loadFacetValues,
     prefetchShards

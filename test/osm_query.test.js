@@ -4,6 +4,7 @@ import {
   parseCoordinateIntent,
   parseNearbyCategoryIntent,
   parseOsmQueryIntent,
+  resolveOsmSuggestion,
   reverseGeocodeOsm,
   searchOsmQuery,
   suggestOsmQuery
@@ -259,6 +260,65 @@ test("OSM autocomplete honors the cursor offset and returns selection metadata",
   assert.equal(response.inputOffset, 4);
   assert.deepEqual(response.suggestions[0].selection, { query: "Montréal", shards: ["quebec"] });
   assert.deepEqual(response.suggestions[0].matchedRanges, [{ start: 0, end: 4 }]);
+});
+
+test("OSM autocomplete marks unambiguous single-doc suggestions as entities", async () => {
+  const engine = {
+    async suggest() {
+      return {
+        suggestions: [
+          // One doc, one shard: a true entity — selection carries the doc.
+          { text: "Pharmacie Jean Coutu, Rosemère", count: 1, weight: 12, doc: 4821, shards: ["quebec"] },
+          // Shared surface: many docs behind the name, no direct resolution.
+          { text: "Pharmacie Jean Coutu", count: 37, weight: 90, doc: 11, shards: ["quebec"] },
+          // Ambiguous provenance: doc without a single owning shard.
+          { text: "Springfield", count: 1, weight: 5, doc: 7, shards: ["ontario", "quebec"] },
+          // Single-index engines have no shards field at all.
+          { text: "Tour Eiffel Restaurant", count: 1, weight: 3, doc: 99 }
+        ],
+        stats: {}
+      };
+    }
+  };
+  const response = await suggestOsmQuery(engine, { q: "pharmacie", size: 8 });
+  const byText = text => response.suggestions.find(item => item.text === text);
+  const entity = byText("Pharmacie Jean Coutu, Rosemère");
+  const shared = byText("Pharmacie Jean Coutu");
+  const ambiguous = byText("Springfield");
+  const single = byText("Tour Eiffel Restaurant");
+  assert.deepEqual(entity.selection.doc, { index: 4821, shard: "quebec" });
+  assert.equal(shared.selection.doc, undefined);
+  assert.equal(ambiguous.selection.doc, undefined);
+  assert.deepEqual(single.selection.doc, { index: 99 });
+});
+
+test("OSM entity suggestions hydrate their document instead of searching", async () => {
+  const calls = [];
+  const engine = {
+    async search() {
+      throw new Error("entity selection must not run a search");
+    },
+    async hydrateRows(rows, context) {
+      calls.push({ rows, context });
+      return [{ id: "node/1", name: "Pharmacie Jean Coutu", title: "Pharmacie Jean Coutu", lat: 45.64, lon: -73.8, index: 4821, score: 0 }];
+    }
+  };
+  const response = await resolveOsmSuggestion(engine, {
+    text: "Pharmacie Jean Coutu, Rosemère",
+    selection: { query: "Pharmacie Jean Coutu, Rosemère", shards: ["quebec"], doc: { index: 4821, shard: "quebec" } }
+  });
+  assert.deepEqual(calls, [{ rows: [[4821, 0]], context: { shard: "quebec" } }]);
+  assert.equal(response.total, 1);
+  assert.equal(response.results[0].name, "Pharmacie Jean Coutu");
+  assert.equal(response.resolvedQuery, "Pharmacie Jean Coutu, Rosemère");
+  assert.equal(response.stats.plannerLane, "osmSuggestEntity");
+
+  // Suggestions without a doc reference refuse loudly so callers fall back
+  // to the classic suggestion-to-search path.
+  await assert.rejects(
+    resolveOsmSuggestion(engine, { text: "Springfield", selection: { query: "Springfield" } }),
+    /selection\.doc/
+  );
 });
 
 test("OSM autocomplete composes a category with matching locality suggestions", async () => {

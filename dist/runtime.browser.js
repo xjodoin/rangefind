@@ -2622,21 +2622,29 @@ function parseAuthorityLexiconSegment(buffer, options = {}) {
     last: entries.at(-1)?.shard || ""
   };
 }
+var AUTHORITY_HOT_DOC_VERSION = 2;
 function parseAuthorityHotList(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
   const state = { pos: AUTHORITY_HOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION) {
+    throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  }
   const count = readVarint(bytes, state);
   const entries = new Array(count);
   for (let index = 0; index < count; index++) {
-    entries[index] = {
+    const entry = {
       normalized: readUtf8(bytes, state),
       display: readUtf8(bytes, state),
       weight: readVarint(bytes, state),
       count: readVarint(bytes, state)
     };
+    if (version >= AUTHORITY_HOT_DOC_VERSION) {
+      const doc = readVarint(bytes, state);
+      if (doc > 0) entry.doc = doc - 1;
+    }
+    entries[index] = entry;
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind authority hot list has trailing bytes.");
   return entries;
@@ -2880,6 +2888,7 @@ var SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v1";
 var AUTHORITY_VERSION = 2;
 var AUTHORITY_LEGACY_VERSION = 1;
 var AUTHORITY_ORDINAL_ROWS_VERSION = 3;
+var AUTHORITY_DOC_ROWS_VERSION = 4;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
@@ -2943,10 +2952,11 @@ function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION) {
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
   const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
+  const docRows = version === AUTHORITY_DOC_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = /* @__PURE__ */ new Map();
   let previous = "";
@@ -2958,12 +2968,19 @@ function parseAuthorityShard(buffer) {
     if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
       const autocompleteWeight = readVarint(bytes, state);
       let rows2 = [];
-      if (ordinalRows) {
+      if (ordinalRows || docRows) {
         const rowCount2 = readVarint(bytes, state);
         rows2 = new Array(rowCount2);
         for (let j = 0; j < rowCount2; j++) rows2[j] = [readVarint(bytes, state), readVarint(bytes, state)];
       }
-      entries.set(key, { total, complete: true, rows: rows2, autocompleteWeight, ...ordinalRows ? { ordinalRows: true } : {} });
+      entries.set(key, {
+        total,
+        complete: true,
+        rows: rows2,
+        autocompleteWeight,
+        ...ordinalRows ? { ordinalRows: true } : {},
+        ...docRows ? { docRows: true } : {}
+      });
       previous = key;
       continue;
     }
@@ -11945,6 +11962,7 @@ async function createSearch(options = {}) {
       }
       suggestion.ordinals = ordinals;
     }
+    if (candidate.docRows?.length) suggestion.doc = candidate.docRows[0][0];
     return suggestion;
   }
   function autocompleteCandidatesForShard(shard, weighted) {
@@ -11961,7 +11979,10 @@ async function createSearch(options = {}) {
         full: suggestKey(parsed.display) === parsed.normalized,
         // Root suggest-routing artifacts store [shard ordinal, weight] rows
         // on autocomplete entries; provenance travels with the candidate.
-        ...entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {}
+        // Per-shard doc-row artifacts store the best [doc, weight] row so an
+        // unambiguous suggestion resolves straight to its document.
+        ...entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {},
+        ...entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {}
       };
       candidate.rank = autocompleteRank(candidate, weighted);
       list.push(candidate);
@@ -11989,7 +12010,7 @@ async function createSearch(options = {}) {
         return {
           q,
           prefix,
-          suggestions: hot.slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
+          suggestions: hot.slice(0, size).map(({ display, weight, count: count2, doc }) => ({ text: display, weight, count: count2, ...doc != null ? { doc } : {} })),
           stats: {
             exact: true,
             suggestLane: "authority-hot",
@@ -12931,8 +12952,10 @@ async function createGenerationalSearch(root, options, baseUrl) {
         if (existing) {
           existing.count += item.count;
           existing.weight = Math.max(existing.weight, item.weight);
+          delete existing.doc;
         } else {
-          merged.set(item.text, { ...item });
+          const { doc, ...rest } = item;
+          merged.set(item.text, rest);
         }
       }
     }
@@ -13659,8 +13682,11 @@ async function createShardedSearch(root, options, baseUrl) {
           if (item.weight > existing.weight) {
             existing.weight = item.weight;
             existing.shards = [shard.id];
+            if (item.doc != null) existing.doc = item.doc;
+            else delete existing.doc;
           } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
             existing.shards.push(shard.id);
+            delete existing.doc;
           }
         } else {
           merged.set(item.text, { ...item, shards: [shard.id] });
@@ -13731,6 +13757,20 @@ async function createShardedSearch(root, options, baseUrl) {
       return null;
     }
   }
+  async function hydrateRows(rows, context = {}) {
+    const id = String(context.shard || "");
+    const index = shardIdIndex.get(id);
+    if (index === void 0) {
+      throw new Error(`Rangefind: hydrateRows on a sharded index requires context.shard naming one shard (got "${id}").`);
+    }
+    const engine = await engineAt(index);
+    if (typeof engine.hydrateRows !== "function") {
+      throw new Error(`Rangefind: shard "${id}" does not support hydrateRows.`);
+    }
+    const { shard, ...rest } = context;
+    const docs = await engine.hydrateRows(rows, rest);
+    return docs.map((doc) => stampShard(doc, index));
+  }
   function prefetchShards(names, { docValues = false } = {}) {
     let picked;
     try {
@@ -13754,6 +13794,7 @@ async function createShardedSearch(root, options, baseUrl) {
     suggest,
     count,
     authorityLookup,
+    hydrateRows,
     vectorSearch,
     loadFacetValues,
     prefetchShards

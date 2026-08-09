@@ -16,6 +16,10 @@ const AUTHORITY_LEGACY_VERSION = 1;
 // but also carry rows, whose "doc" column holds a federation shard ordinal
 // instead of a document index — provenance for merged suggestions.
 const AUTHORITY_ORDINAL_ROWS_VERSION = 3;
+// Version 4 is the per-shard layout of the same idea: autocomplete entries
+// keep their best [doc, score] rows so a selected suggestion can hydrate its
+// document directly instead of re-running the query as a search.
+const AUTHORITY_DOC_ROWS_VERSION = 4;
 const SURFACE_PREFIX = "r|";
 const EXACT_PREFIX = "x|";
 const TOKEN_PREFIX = "t|";
@@ -137,9 +141,16 @@ function compareRows(left, right) {
 export function buildAuthorityShard(entries, options = {}) {
   const maxRows = Math.max(1, Math.floor(Number(options.maxRows || 16)));
   const ordinalRows = options.ordinalRows === true;
+  const docRows = !ordinalRows && options.docRows === true;
+  // A suggestion only resolves directly to a document when it is unambiguous,
+  // so autocomplete entries keep just their best row(s) — the byte cost stays
+  // a few varints per surface.
+  const maxAutocompleteRows = docRows
+    ? Math.max(1, Math.floor(Number(options.maxAutocompleteRows || 1)))
+    : maxRows;
   const out = new AuthorityByteWriter();
   for (const byte of AUTHORITY_SHARD_MAGIC) out.push(byte);
-  pushVarint(out, ordinalRows ? AUTHORITY_ORDINAL_ROWS_VERSION : AUTHORITY_VERSION);
+  pushVarint(out, ordinalRows ? AUTHORITY_ORDINAL_ROWS_VERSION : docRows ? AUTHORITY_DOC_ROWS_VERSION : AUTHORITY_VERSION);
   pushVarint(out, entries.length);
   let previous = "";
   for (const [key, rows, meta] of entries) {
@@ -155,10 +166,13 @@ export function buildAuthorityShard(entries, options = {}) {
     if (autocomplete) {
       // Ordinal-row artifacts append the rows after the summary weight so
       // readers can recover which federation shards back the suggestion.
+      // Doc-row artifacts append the best [doc, score] rows so a selected
+      // suggestion can hydrate its document without a search.
       pushVarint(out, autocomplete.weight);
-      if (ordinalRows) {
-        pushVarint(out, kept.length);
-        for (const [doc, score] of kept) {
+      if (ordinalRows || docRows) {
+        const keptAutocomplete = kept.slice(0, maxAutocompleteRows);
+        pushVarint(out, keptAutocomplete.length);
+        for (const [doc, score] of keptAutocomplete) {
           pushVarint(out, doc);
           pushVarint(out, score);
         }
@@ -181,10 +195,12 @@ export function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION) {
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION
+    && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
   const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
+  const docRows = version === AUTHORITY_DOC_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = new Map();
   let previous = "";
@@ -196,12 +212,19 @@ export function parseAuthorityShard(buffer) {
     if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
       const autocompleteWeight = readVarint(bytes, state);
       let rows = [];
-      if (ordinalRows) {
+      if (ordinalRows || docRows) {
         const rowCount = readVarint(bytes, state);
         rows = new Array(rowCount);
         for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
       }
-      entries.set(key, { total, complete: true, rows, autocompleteWeight, ...(ordinalRows ? { ordinalRows: true } : {}) });
+      entries.set(key, {
+        total,
+        complete: true,
+        rows,
+        autocompleteWeight,
+        ...(ordinalRows ? { ordinalRows: true } : {}),
+        ...(docRows ? { docRows: true } : {})
+      });
       previous = key;
       continue;
     }

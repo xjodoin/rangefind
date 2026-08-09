@@ -218,7 +218,7 @@ function suggestFixtureDocs() {
 // compute top-k by full scan, deduped by display.
 function oracleSuggest(docs, q, size) {
   const rows = new Map();
-  for (const doc of docs) {
+  for (const [ordinal, doc] of docs.entries()) {
     const display = String(doc.title || "").trim().replace(/\s+/gu, " ");
     const normalized = suggestKey(display);
     const keys = [normalized];
@@ -228,11 +228,15 @@ function oracleSuggest(docs, q, size) {
       if (key.length > 1 && !keys.includes(key)) keys.push(key);
       start = normalized.indexOf(" ", start + 1);
     }
+    const docWeight = Number(doc.population) || 0;
     for (const key of keys) {
       const mapKey = `${key}\0${display}`;
-      const previous = rows.get(mapKey) || { key, display, weight: 0, count: 0, full: key === normalized };
+      const previous = rows.get(mapKey) || { key, display, weight: 0, count: 0, full: key === normalized, doc: null };
       previous.count++;
-      previous.weight = Math.max(previous.weight, Number(doc.population) || 0);
+      // The suggestion's doc is the row owning the surface's rank: highest
+      // weight, first (lowest) ordinal on ties — mirroring compareRows.
+      if (previous.doc === null || docWeight > previous.weight) previous.doc = ordinal;
+      previous.weight = Math.max(previous.weight, docWeight);
       rows.set(mapKey, previous);
     }
   }
@@ -259,7 +263,7 @@ function oracleSuggest(docs, q, size) {
       || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
       || (a.display < b.display ? -1 : a.display > b.display ? 1 : 0))
     .slice(0, size)
-    .map(entry => ({ text: entry.display, weight: entry.weight, count: entry.count }));
+    .map(entry => ({ text: entry.display, weight: entry.weight, count: entry.count, doc: entry.doc }));
 }
 
 async function runSuggestOracleSuite(configOverrides, assertManifest) {
@@ -306,6 +310,11 @@ async function runSuggestOracleSuite(configOverrides, assertManifest) {
     // Weighted places outrank fillers; popularity ranks the chains.
     const mont = await engine.suggest({ q: "mont", size: 3 });
     assert.equal(mont.suggestions[0].text, "Montréal");
+    // The suggestion's doc row hydrates to the exact document it advertises —
+    // the direct selection path that replaces a re-search.
+    assert.equal(typeof mont.suggestions[0].doc, "number");
+    const [montDoc] = await engine.hydrateRows([[mont.suggestions[0].doc, 0]]);
+    assert.equal(montDoc.title, "Montréal");
     const mo = await engine.suggest({ q: "mo", size: 3 });
     assert.equal(mo.stats.suggestLane, "authority-hot");
     assert.equal(mo.stats.suggestShardsVisited, 0);

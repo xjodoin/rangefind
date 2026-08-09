@@ -3074,6 +3074,7 @@ function structuredSuggestion(item, input) {
   const mainText = item.type === "category-locality" ? String(item.category || text).replaceAll("_", " ") : comma > 0 ? text.slice(0, comma).trim() : text;
   const secondaryText = item.type === "category-locality" ? String(item.locality || "") : comma > 0 ? text.slice(comma + 1).trim() : "";
   const kind = item.type || "place";
+  const entityDoc = kind === "place" && item.doc != null && Number(item.count) === 1 && (item.shards == null || item.shards.length === 1) ? { index: item.doc, ...item.shards?.length === 1 ? { shard: item.shards[0] } : {} } : null;
   return {
     ...item,
     description: text,
@@ -3084,7 +3085,35 @@ function structuredSuggestion(item, input) {
     types: item.category ? [item.category] : kind === "street" ? ["route"] : [kind],
     selection: {
       query: text,
-      ...item.shards?.length ? { shards: item.shards } : {}
+      ...item.shards?.length ? { shards: item.shards } : {},
+      ...entityDoc ? { doc: entityDoc } : {}
+    }
+  };
+}
+async function resolveOsmSuggestion(engine, suggestion = {}) {
+  const selection = suggestion.selection || suggestion;
+  const doc = selection.doc;
+  const index = Math.floor(Number(doc?.index));
+  if (!doc || !Number.isFinite(index) || index < 0) {
+    throw new TypeError("resolveOsmSuggestion requires a suggestion carrying selection.doc");
+  }
+  if (typeof engine?.hydrateRows !== "function") {
+    throw new TypeError("resolveOsmSuggestion requires an engine exposing hydrateRows");
+  }
+  const results = await engine.hydrateRows([[index, 0]], doc.shard ? { shard: doc.shard } : {});
+  const result = results?.[0];
+  const query = String(selection.query || suggestion.text || "");
+  return {
+    total: result ? 1 : 0,
+    page: 1,
+    size: 1,
+    approximate: false,
+    results: result ? [result] : [],
+    resolvedQuery: query || (result?.name ?? ""),
+    stats: {
+      plannerLane: "osmSuggestEntity",
+      osmSuggestEntityIndex: index,
+      ...doc.shard ? { osmSuggestEntityShard: doc.shard } : {}
     }
   };
 }
@@ -4758,6 +4787,7 @@ export {
   placeDetails,
   placeDoc,
   prepareRoute,
+  resolveOsmSuggestion,
   retainedAddressTagEntries,
   reverseGeocodeOsm,
   routeMatchPublic,

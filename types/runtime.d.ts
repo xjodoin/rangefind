@@ -116,6 +116,12 @@ export interface Suggestion {
   text: string;
   count: number;
   weight: number;
+  /**
+   * Best document ordinal behind this surface (rfauth v4 doc rows). Present
+   * on single-index and single-shard-provenance suggestions; resolve it with
+   * `engine.hydrateRows([[doc, 0]])` instead of re-running a search.
+   */
+  doc?: number;
   /** OSM integration: structured prediction fields. */
   description?: string;
   mainText?: string;
@@ -123,7 +129,15 @@ export interface Suggestion {
   matchedRanges?: Array<{ start: number; end: number }>;
   kind?: string;
   types?: string[];
-  selection?: { query: string; shards?: string[] };
+  selection?: {
+    query: string;
+    shards?: string[];
+    /**
+     * Entity suggestion: this surface names exactly one document. Hydrate it
+     * directly (resolveOsmSuggestion / hydrateRows) — no search needed.
+     */
+    doc?: { index: number; shard?: string };
+  };
   [key: string]: unknown;
 }
 
@@ -173,6 +187,13 @@ export interface SearchEngine {
   } | null>;
   vectorSearch(params?: Record<string, unknown>): Promise<SearchResponse>;
   loadFacetValues(field: string): Promise<FacetValue[]>;
+  /**
+   * Hydrate `[docOrdinal, score]` rows into display records without running a
+   * query. Sharded roots require `context.shard` (the owning shard id, as
+   * carried by suggestion provenance) since ordinals are shard-local;
+   * generational engines do not expose it.
+   */
+  hydrateRows?(rows: Array<[number, number]>, context?: { shard?: string; [key: string]: unknown }): Promise<SearchResult[]>;
   /** Sharded engines: the shard descriptors (id, path, total, bbox). */
   shards?: Array<{ id: string; path: string; total: number; bbox: number[] | null }>;
   [key: string]: unknown;

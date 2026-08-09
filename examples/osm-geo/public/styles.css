@@ -950,6 +950,14 @@ a { color: inherit; }
   scrollbar-width: thin;
 }
 #resultList[hidden] { display: none; }
+/* A stale answer dims while its replacement is in flight — the previous
+   results stay put instead of blanking. */
+#resultList.is-loading,
+#placeLens.is-loading {
+  opacity: 0.45;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
 #resultList li + li { margin-top: 4px; }
 .result-card {
   display: grid;

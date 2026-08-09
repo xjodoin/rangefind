@@ -262,7 +262,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
       onPartition: (partition) => {
         const autocomplete = partition.entries
           .filter(([key]) => isAutocompleteKey(key))
-          .map(([key, rows]) => autocompleteEntrySummary(key, rows, { weighted: autocompleteWeighted }));
+          .map(([key, rows]) => autocompleteEntrySummary(key, rows, { weighted: autocompleteWeighted, docRows: true }));
         if (autocomplete.length) {
           let maxRank = 0;
           let rows = 0;
@@ -279,7 +279,10 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
           autocompleteKeyCount += autocomplete.length;
           autocompleteRowCount += rows;
         }
-        const buffer = buildAuthorityShard(partition.entries, { maxRows: config.authorityMaxRowsPerKey });
+        // docRows keeps each autocomplete surface's best [doc, score] row so
+        // an unambiguous suggestion can hydrate its document on selection
+        // instead of re-running the query as a search.
+        const buffer = buildAuthorityShard(partition.entries, { maxRows: config.authorityMaxRowsPerKey, docRows: true });
         const entry = writePackedShard(packWriter, partition.name, gzipSync(buffer, { level: 6 }), {
           kind: "authority-shard",
           codec: AUTHORITY_FORMAT,
