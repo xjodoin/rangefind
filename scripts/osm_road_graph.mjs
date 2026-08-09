@@ -1662,10 +1662,37 @@ export function extractRoadGraph(pbfPath, options = {}) {
   applyTurnRestrictions(context);
 
   if (useTurnCosts) {
+    // Restriction compilation may append edges, so compact only after it is
+    // finished. Replacing each boxed source column one at a time keeps the
+    // conversion peak bounded and leaves turn expansion with typed inputs.
+    // India carries 42M base edges; retaining those as fourteen ordinary JS
+    // arrays consumed several GiB of the heap before expansion even started.
+    const compact = (key, Type) => {
+      const value = Type.from(context[key].view ? context[key].view() : context[key]);
+      context[key] = value;
+      return value;
+    };
+    nodeLat = compact("nodeLat", Int32Array);
+    nodeLon = compact("nodeLon", Int32Array);
+    edgeFrom = compact("edgeFrom", Uint32Array);
+    edgeTo = compact("edgeTo", Uint32Array);
+    edgeWeightDs = compact("edgeWeightDs", Uint32Array);
+    edgeDistDm = compact("edgeDistDm", Uint32Array);
+    edgeName = compact("edgeName", Uint32Array);
+    edgeWay = compact("edgeWay", Float64Array);
+    edgeClass = compact("edgeClass", Uint8Array);
+    edgeJunction = compact("edgeJunction", Uint8Array);
+    edgeSpeed = compact("edgeSpeed", Uint8Array);
+    edgeCond = compact("edgeCond", Uint8Array);
+    edgeSign = compact("edgeSign", Uint32Array);
+    edgeFlags = compact("edgeFlags", Uint8Array);
+    geomOffsets = compact("geomOffsets", Uint32Array);
+    laneOffsets = compact("laneOffsets", Uint32Array);
+
     const expanded = expandTurnCosts({ ...context, restrictions }, profile.turnCosts);
-    // Turn expansion produces growable JavaScript columns. Convert and release
-    // one at a time so the 72M-edge Brazil graph never keeps both complete
-    // representations alive through SCC filtering.
+    // The expansion already returns exact typed columns. `take` remains
+    // tolerant of growable/array callers used by focused tests and custom
+    // integrations, but never copies the production result.
     const prepared = {
       nodeLat: expanded.nodeLat,
       nodeLon: expanded.nodeLon,
@@ -1677,7 +1704,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
     };
     const take = (key, Type, fallback = []) => {
       const source = expanded[key] || fallback;
-      prepared[key] = Type.from(source.view ? source.view() : source);
+      prepared[key] = source instanceof Type
+        ? source
+        : Type.from(source.view ? source.view() : source);
       expanded[key] = null;
     };
     take("edgeFrom", Uint32Array);
@@ -2539,19 +2568,29 @@ export function expandTurnCosts(context, turnCosts) {
     return left ? turnCosts.left : turnCosts.right;
   };
 
-  // Via-node restrictions grouped by (junction, approach way).
+  // Via-node restrictions grouped by junction, then approach way. Looking up
+  // a `${junction}:${way}` string for every candidate turn created hundreds
+  // of millions of short-lived strings on country graphs. Nested numeric
+  // maps keep the hot loop allocation-free.
   const byVia = new Map();
+  let restrictedApproaches = 0;
   for (const restriction of restrictions) {
     if (restriction.viaWays != null || restriction.viaNode == null) continue;
     const via = nodeIndex.get(restriction.viaNode);
     if (via == null) continue;
-    const key = `${via}:${restriction.fromWay}`;
-    let group = byVia.get(key);
-    if (!group) byVia.set(key, (group = { onlys: [], nos: [] }));
+    let byWay = byVia.get(via);
+    if (!byWay) byVia.set(via, (byWay = new Map()));
+    let group = byWay.get(restriction.fromWay);
+    if (!group) {
+      byWay.set(restriction.fromWay, (group = { onlys: [], nos: [] }));
+      restrictedApproaches++;
+    }
     (restriction.only ? group.onlys : group.nos).push(restriction);
   }
   const allowed = (inEdge, outEdge) => {
-    const group = byVia.get(`${edgeFrom[outEdge]}:${edgeWay[inEdge]}`);
+    const byWay = byVia.get(edgeFrom[outEdge]);
+    if (!byWay) return true;
+    const group = byWay.get(edgeWay[inEdge]);
     if (!group) return true;
     const way = edgeWay[outEdge];
     if (group.onlys.length) return group.onlys.some(only => way === only.toWay);
@@ -2580,62 +2619,93 @@ export function expandTurnCosts(context, turnCosts) {
     newLat[e] = nodeLat[edgeTo[e]];
     newLon[e] = nodeLon[edgeTo[e]];
   }
-  const newFrom = [];
-  const newTo = [];
-  const newWeight = [];
-  const newDist = [];
-  const newName = [];
-  const newClass = [];
-  const newJunction = [];
-  const newSpeed = [];
-  const newCond = [];
-  const newSign = [];
-  const newFlags = [];
-  const newGeomOffsets = [0];
-  const newGeomBytes = new GrowUint8();
-  const newLaneOffsets = [0];
-  const newLaneBytes = new GrowUint8();
   const laneData = laneBytes ? laneBytes.view() : null;
+
+  // Count exact output sizes first. India expands 42M base edges into roughly
+  // 120M turn edges: growing thirteen ordinary JS arrays until then exhausted
+  // the 16 GiB V8 heap before conversion could begin. The count pass is cheap
+  // compared with geometry decoding and lets every result column be allocated
+  // once, at its final typed width.
+  let expandedEdgeCount = 0;
+  let expandedGeomBytes = 0;
+  let expandedLaneBytes = 0;
   let filteredTurns = 0;
   for (let out = 0; out < edgeCount; out++) {
     const junction = edgeFrom[out];
+    const geomLength = geomOffsets[out + 1] - geomOffsets[out];
+    const laneLength = laneData && laneOffsets
+      ? laneOffsets[out + 1] - laneOffsets[out]
+      : 1;
     for (let slot = inStart[junction]; slot < inStart[junction + 1]; slot++) {
       const inEdge = inEdges[slot];
       if (!allowed(inEdge, out)) {
         filteredTurns++;
         continue;
       }
-      newFrom.push(inEdge);
-      newTo.push(out);
-      newWeight.push(edgeWeightDs[out] + turnCostFor(inEdge, out));
-      newDist.push(edgeDistDm[out]);
-      newName.push(edgeName[out]);
-      newClass.push(edgeClass[out]);
-      newJunction.push(edgeJunction ? edgeJunction[out] : 0);
-      newSpeed.push(edgeSpeed ? edgeSpeed[out] : 0);
-      newCond.push(edgeCond ? edgeCond[out] : 0);
-      newSign.push(edgeSign ? edgeSign[out] : 0);
-      newFlags.push(edgeFlags ? edgeFlags[out] : 0);
+      expandedEdgeCount++;
+      expandedGeomBytes += geomLength;
+      expandedLaneBytes += laneLength;
+    }
+  }
+  if (expandedEdgeCount > 0xffffffff) {
+    throw new Error(`Turn-expanded graph has ${expandedEdgeCount} edges; rfroute source format supports at most 4,294,967,295.`);
+  }
+  if (expandedGeomBytes > 0xffffffff || expandedLaneBytes > 0xffffffff) {
+    throw new Error("Turn-expanded geometry or lane payload exceeds the 4 GiB source-column limit.");
+  }
+
+  const newFrom = new Uint32Array(expandedEdgeCount);
+  const newTo = new Uint32Array(expandedEdgeCount);
+  const newWeight = new Uint32Array(expandedEdgeCount);
+  const newDist = new Uint32Array(expandedEdgeCount);
+  const newName = new Uint32Array(expandedEdgeCount);
+  const newClass = new Uint8Array(expandedEdgeCount);
+  const newJunction = new Uint8Array(expandedEdgeCount);
+  const newSpeed = new Uint8Array(expandedEdgeCount);
+  const newCond = new Uint8Array(expandedEdgeCount);
+  const newSign = new Uint32Array(expandedEdgeCount);
+  const newFlags = new Uint8Array(expandedEdgeCount);
+  const newGeomOffsets = new Uint32Array(expandedEdgeCount + 1);
+  const newGeomBytes = new Uint8Array(expandedGeomBytes);
+  const newLaneOffsets = new Uint32Array(expandedEdgeCount + 1);
+  const newLaneBytes = new Uint8Array(expandedLaneBytes);
+  let edgeCursor = 0;
+  let geomCursor = 0;
+  let laneCursor = 0;
+  for (let out = 0; out < edgeCount; out++) {
+    const junction = edgeFrom[out];
+    for (let slot = inStart[junction]; slot < inStart[junction + 1]; slot++) {
+      const inEdge = inEdges[slot];
+      if (!allowed(inEdge, out)) continue;
+      newFrom[edgeCursor] = inEdge;
+      newTo[edgeCursor] = out;
+      newWeight[edgeCursor] = edgeWeightDs[out] + turnCostFor(inEdge, out);
+      newDist[edgeCursor] = edgeDistDm[out];
+      newName[edgeCursor] = edgeName[out];
+      newClass[edgeCursor] = edgeClass[out];
+      newJunction[edgeCursor] = edgeJunction ? edgeJunction[out] : 0;
+      newSpeed[edgeCursor] = edgeSpeed ? edgeSpeed[out] : 0;
+      newCond[edgeCursor] = edgeCond ? edgeCond[out] : 0;
+      newSign[edgeCursor] = edgeSign ? edgeSign[out] : 0;
+      newFlags[edgeCursor] = edgeFlags ? edgeFlags[out] : 0;
       const start = geomOffsets[out];
       const end = geomOffsets[out + 1];
-      newGeomBytes.ensure(end - start);
-      newGeomBytes.data.set(geomData.subarray(start, end), newGeomBytes.length);
-      newGeomBytes.length += end - start;
-      newGeomOffsets.push(newGeomBytes.length);
+      newGeomBytes.set(geomData.subarray(start, end), geomCursor);
+      geomCursor += end - start;
       if (laneData && laneOffsets) {
         const laneStart = laneOffsets[out];
         const laneEnd = laneOffsets[out + 1];
-        newLaneBytes.ensure(laneEnd - laneStart);
-        newLaneBytes.data.set(laneData.subarray(laneStart, laneEnd), newLaneBytes.length);
-        newLaneBytes.length += laneEnd - laneStart;
+        newLaneBytes.set(laneData.subarray(laneStart, laneEnd), laneCursor);
+        laneCursor += laneEnd - laneStart;
       } else {
-        newLaneBytes.ensure(1);
-        newLaneBytes.data[newLaneBytes.length++] = 0;
+        newLaneBytes[laneCursor++] = 0;
       }
-      newLaneOffsets.push(newLaneBytes.length);
+      edgeCursor++;
+      newGeomOffsets[edgeCursor] = geomCursor;
+      newLaneOffsets[edgeCursor] = laneCursor;
     }
   }
-  log(`turn costs: ${edgeCount} junction copies, ${newFrom.length} expanded edges, ${filteredTurns} restricted turns filtered, ${byVia.size} restricted approaches`);
+  log(`turn costs: ${edgeCount} junction copies, ${expandedEdgeCount} expanded edges, ${filteredTurns} restricted turns filtered, ${restrictedApproaches} restricted approaches`);
   return {
     nodeLat: newLat,
     nodeLon: newLon,
@@ -2749,17 +2819,19 @@ export function filterLargestScc(graph, log) {
   for (let i = 0; i < nodeCount; i++) {
     remap[i] = remap[i] === bestComponent ? keptNodes++ : -1;
   }
-  const nodeLat = new Int32Array(keptNodes);
-  const nodeLon = new Int32Array(keptNodes);
+  // Compact into the source buffers. The retained node/edge order is stable,
+  // and every destination index is at or before its source index, so forward
+  // writes cannot clobber unread input. Keeping subarray views avoids holding
+  // a second country-sized graph at the end of SCC filtering.
   for (let i = 0; i < nodeCount; i++) {
     if (remap[i] >= 0) {
-      nodeLat[remap[i]] = graph.nodeLat[i];
-      nodeLon[remap[i]] = graph.nodeLon[i];
+      graph.nodeLat[remap[i]] = graph.nodeLat[i];
+      graph.nodeLon[remap[i]] = graph.nodeLon[i];
     }
   }
-  // Count once, then write directly into exact typed output. The previous
-  // push-then-Uint32Array.from path boxed hundreds of millions of numbers and
-  // attempted another full graph copy after SCC.
+  // Count payload sizes for format-limit validation and diagnostics. The
+  // second pass compacts all columns and payloads into their existing buffers
+  // rather than materializing an equally large retained graph beside them.
   let keptEdges = 0;
   let geomByteCount = 0;
   let laneByteCount = 0;
@@ -2775,21 +2847,15 @@ export function filterLargestScc(graph, log) {
       laneByteCount++;
     }
   }
-  const edgeFrom = new Uint32Array(keptEdges);
-  const edgeTo = new Uint32Array(keptEdges);
-  const edgeWeightDs = new Uint32Array(keptEdges);
-  const edgeDistDm = new Uint32Array(keptEdges);
-  const edgeName = new Uint32Array(keptEdges);
-  const edgeClass = new Uint8Array(keptEdges);
-  const edgeJunction = new Uint8Array(keptEdges);
-  const edgeSpeed = new Uint8Array(keptEdges);
-  const edgeCond = new Uint8Array(keptEdges);
-  const edgeSign = new Uint32Array(keptEdges);
-  const edgeFlags = new Uint8Array(keptEdges);
-  const geomOffsets = new Uint32Array(keptEdges + 1);
-  const geomBytes = new Uint8Array(geomByteCount);
-  const laneOffsets = new Uint32Array(keptEdges + 1);
-  const laneBytes = new Uint8Array(laneByteCount);
+  if (geomByteCount > 0xffffffff || laneByteCount > 0xffffffff) {
+    throw new Error("Retained SCC geometry or lane payload exceeds the 4 GiB source-column limit.");
+  }
+  const edgeSpeed = graph.edgeSpeed || new Uint8Array(graph.edgeFrom.length);
+  const edgeCond = graph.edgeCond || new Uint8Array(graph.edgeFrom.length);
+  const edgeSign = graph.edgeSign || new Uint32Array(graph.edgeFrom.length);
+  const edgeFlags = graph.edgeFlags || new Uint8Array(graph.edgeFrom.length);
+  const laneOffsets = graph.laneOffsets || new Uint32Array(graph.edgeFrom.length + 1);
+  const laneBytes = graph.laneBytes || new Uint8Array(graph.edgeFrom.length);
   let edgeIndex = 0;
   let geomOffset = 0;
   let laneOffset = 0;
@@ -2797,51 +2863,55 @@ export function filterLargestScc(graph, log) {
     const from = remap[graph.edgeFrom[i]];
     const to = remap[graph.edgeTo[i]];
     if (from < 0 || to < 0) continue;
-    edgeFrom[edgeIndex] = from;
-    edgeTo[edgeIndex] = to;
-    edgeWeightDs[edgeIndex] = graph.edgeWeightDs[i];
-    edgeDistDm[edgeIndex] = graph.edgeDistDm[i];
-    edgeName[edgeIndex] = graph.edgeName[i];
-    edgeClass[edgeIndex] = graph.edgeClass[i];
-    edgeJunction[edgeIndex] = graph.edgeJunction[i];
+    graph.edgeFrom[edgeIndex] = from;
+    graph.edgeTo[edgeIndex] = to;
+    graph.edgeWeightDs[edgeIndex] = graph.edgeWeightDs[i];
+    graph.edgeDistDm[edgeIndex] = graph.edgeDistDm[i];
+    graph.edgeName[edgeIndex] = graph.edgeName[i];
+    graph.edgeClass[edgeIndex] = graph.edgeClass[i];
+    graph.edgeJunction[edgeIndex] = graph.edgeJunction[i];
     edgeSpeed[edgeIndex] = graph.edgeSpeed ? graph.edgeSpeed[i] : 0;
     edgeCond[edgeIndex] = graph.edgeCond ? graph.edgeCond[i] : 0;
     edgeSign[edgeIndex] = graph.edgeSign ? graph.edgeSign[i] : 0;
     edgeFlags[edgeIndex] = graph.edgeFlags ? graph.edgeFlags[i] : 0;
     const geomStart = graph.geomOffsets[i];
     const geomEnd = graph.geomOffsets[i + 1];
-    geomBytes.set(graph.geomBytes.subarray(geomStart, geomEnd), geomOffset);
+    if (geomOffset !== geomStart) {
+      graph.geomBytes.copyWithin(geomOffset, geomStart, geomEnd);
+    }
     geomOffset += geomEnd - geomStart;
     if (graph.laneOffsets && graph.laneBytes) {
       const laneStart = graph.laneOffsets[i];
       const laneEnd = graph.laneOffsets[i + 1];
-      laneBytes.set(graph.laneBytes.subarray(laneStart, laneEnd), laneOffset);
+      if (laneOffset !== laneStart) {
+        laneBytes.copyWithin(laneOffset, laneStart, laneEnd);
+      }
       laneOffset += laneEnd - laneStart;
     } else {
       laneBytes[laneOffset++] = 0;
     }
     edgeIndex++;
-    geomOffsets[edgeIndex] = geomOffset;
+    graph.geomOffsets[edgeIndex] = geomOffset;
     laneOffsets[edgeIndex] = laneOffset;
   }
   return {
-    nodeLat,
-    nodeLon,
-    edgeFrom,
-    edgeTo,
-    edgeWeightDs,
-    edgeDistDm,
-    edgeName,
-    edgeClass,
-    edgeJunction,
-    edgeSpeed,
-    edgeCond,
-    edgeSign,
-    edgeFlags,
-    laneOffsets,
-    laneBytes,
-    geomOffsets,
-    geomBytes,
+    nodeLat: graph.nodeLat.subarray(0, keptNodes),
+    nodeLon: graph.nodeLon.subarray(0, keptNodes),
+    edgeFrom: graph.edgeFrom.subarray(0, keptEdges),
+    edgeTo: graph.edgeTo.subarray(0, keptEdges),
+    edgeWeightDs: graph.edgeWeightDs.subarray(0, keptEdges),
+    edgeDistDm: graph.edgeDistDm.subarray(0, keptEdges),
+    edgeName: graph.edgeName.subarray(0, keptEdges),
+    edgeClass: graph.edgeClass.subarray(0, keptEdges),
+    edgeJunction: graph.edgeJunction.subarray(0, keptEdges),
+    edgeSpeed: edgeSpeed.subarray(0, keptEdges),
+    edgeCond: edgeCond.subarray(0, keptEdges),
+    edgeSign: edgeSign.subarray(0, keptEdges),
+    edgeFlags: edgeFlags.subarray(0, keptEdges),
+    laneOffsets: laneOffsets.subarray(0, keptEdges + 1),
+    laneBytes: laneBytes.subarray(0, laneByteCount),
+    geomOffsets: graph.geomOffsets.subarray(0, keptEdges + 1),
+    geomBytes: graph.geomBytes.subarray(0, geomByteCount),
     names: graph.names,
     profile: graph.profile,
     classes: graph.classes,
