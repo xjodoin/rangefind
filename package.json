@@ -1,6 +1,6 @@
 {
   "name": "rangefind",
-  "version": "0.4.19",
+  "version": "0.4.20",
   "description": "Range-packed static search for large sites with no search server.",
   "type": "module",
   "license": "MIT",
@@ -81,7 +81,7 @@
     },
     "./route": {
       "types": "./types/route.d.ts",
-      "default": "./src/route_graph_query.js"
+      "default": "./src/route.js"
     },
     "./route/node": {
       "types": "./types/route.d.ts",
@@ -198,6 +198,7 @@
     "bench:quality": "npm run build:example && node scripts/bench_quality.mjs",
     "bench:performance": "npm run build:example && node scripts/bench_performance.mjs",
     "bench:matrix": "node scripts/bench_matrix.mjs",
+    "bench:route-federation": "node scripts/route_federation_bench.mjs",
     "bench:directories": "node scripts/bench_directory_layouts.mjs",
     "bench:frwiki": "node scripts/frwiki_fixture.mjs all",
     "bench:osm-geo": "node scripts/osm_fixture.mjs all --region=luxembourg && node scripts/osm_geo_bench.mjs --root=examples/osm-geo",

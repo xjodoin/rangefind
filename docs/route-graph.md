@@ -113,6 +113,64 @@ overlay is the cross-shard boundary artifact. A query touches the source
 shard, the target shard, and `top/` — never the rest of the planet. Sharded
 and monolithic builds return identical results by construction.
 
+## Inter-region routing
+
+`openRouteGraphUrl()` opens one regional graph. `openRouteCatalogUrl()` opens
+the mutable `rangefind-route-catalog-v1` discovery root and federates those
+graphs without introducing a routing service or a continent-sized download:
+
+```js
+import { openRouteCatalogUrl } from "rangefind/route";
+
+const roads = await openRouteCatalogUrl(
+  "https://osm.rangefind.dev/routes/catalog.json",
+  { profile: "car" }
+);
+const route = await roads.route({
+  from: { lat: 45.5019, lon: -73.5674 }, // Montreal
+  to: { lat: 43.6532, lon: -79.3832 }    // Toronto
+});
+// route.federated === true
+// route.regions: ["quebec", "ontario"]
+// route.transitions[0].osmNodeId is the proven shared handoff
+```
+
+Every regional build publishes an immutable, content-addressed
+`rfrouteportals-v1` gzip sidecar. It contains only junctions inside candidate
+neighbor coverage. A transition is legal only when both independently built
+sidecars contain the same original OSM node id at the same coordinate; nearby
+roads are never joined by proximity. Coverage bboxes find candidates, not
+connections. This uses Geofabrik's documented extract invariant that Osmium
+keeps ways crossing an extract border complete
+([technical details](https://download.geofabrik.de/technical.html)).
+
+For a cross-region query the client:
+
+1. resolves endpoint regions (ambiguous overlapping bboxes are verified by a
+   real road snap);
+2. enumerates a bounded number of catalog paths and intersects only the portal
+   sidecars on those paths;
+3. keeps a spatially diverse portal set per boundary (eight by default);
+4. evaluates portal combinations with the actual regional road metric, not
+   straight-line distance;
+5. opens regional roots lazily, reuses their object caches, and unpacks geometry
+   only for the winning legs;
+6. merges geometry, steps, junctions, statistics, and region-qualified segment
+   ids into one normal route result.
+
+`maxPortalsPerBorder`, `maxRegionPaths`, `maxRegionHops`,
+`maxRegionExpansions`, and `portalConcurrency` bound CPU and transfer for
+unusual topology. Catalog BFS expands only portal-proven edges, so overlapping
+bboxes with no shared road cannot crowd a real multi-region path out of the
+candidate budget. `fromRegion`
+and `toRegion` can pin endpoint coverage when an application already resolved
+administrative membership. `matrix()` uses the same federated route planner.
+
+This is different from an internal shard crossing. Internal shards share one
+top overlay and are exact by construction. Regional graphs have independent
+overlays and are connected only at verified OSM portals; a missing shared id
+returns `RANGEFIND_ROUTE_REGIONS_DISCONNECTED` rather than inventing a bridge.
+
 ## API
 
 ```js
@@ -192,7 +250,7 @@ node scripts/route_bench.mjs build quebec.graph.bin ./route-graph --shards 4
 ```
 
 A reader requires the exact format version it was built for — cell v8, root
-v5, source `rfroutesrc-v7` — and there are no compatibility shims. Carrying
+v5, source `rfroutesrc-v8` — and there are no compatibility shims. Carrying
 older shapes means a branch per field per version, and every one of those is a
 place to read a byte that is really the next field. An index is derived data
 and reproducing it is two commands, so a format change is a rebuild, not an

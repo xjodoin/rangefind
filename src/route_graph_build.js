@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import {
+  MinHeap,
   ROUTE_GRAPH_FORMAT,
   bucketWeight,
   encodeRouteCell,
@@ -22,6 +23,7 @@ import {
 } from "./route_graph.js";
 
 const OBJECT_NAME_HASH_LENGTH = 24;
+export const ROUTE_PORTAL_FORMAT = "rfrouteportals-v1";
 
 function kdPartition(latE7, lonE7, leafNodes) {
   const nodeCount = latE7.length;
@@ -203,6 +205,13 @@ export class IntegerRadixHeap {
   }
 }
 
+class ReusableMinHeap extends MinHeap {
+  clear() {
+    this.weights.length = 0;
+    this.values.length = 0;
+  }
+}
+
 // Computes only irreducible boundary arcs. While Dijkstra runs, witnessed[v]
 // records whether an equally-short route from the source to v already passes
 // through another boundary. This is equivalent to the old O(B^3) post-pass
@@ -258,11 +267,12 @@ function boundaryClique(
   globalNodes,
   globalOffset,
   arenas,
-  heap
+  heaps
 ) {
   if (boundary.length < 2) return new Uint32Array(0);
   arenas.ensure(nodeCount);
   const { dist, boundaryMask, witnessed } = arenas;
+  const heap = nodeCount >= heaps.radixMinNodes ? heaps.radix : heaps.binary;
   boundaryMask.fill(0, 0, nodeCount);
   for (const node of boundary) boundaryMask[node] = 1;
   const triples = [];
@@ -408,7 +418,11 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   // 5. Bottom-up cliques per bucket. cliques[level] maps cellId -> flat
   // [u, v, w, ...] triples over nodes with maxLca > level, exact within the
   // cell for that bucket's metric.
-  const heap = new IntegerRadixHeap();
+  const heaps = {
+    binary: new ReusableMinHeap(),
+    radix: new IntegerRadixHeap(),
+    radixMinNodes: Math.max(0, Number(options.overlayRadixMinNodes ?? 4096))
+  };
   const cliqueArenas = {
     dist: new Float64Array(leafNodes + 8),
     boundaryMask: new Uint8Array(leafNodes + 8),
@@ -475,7 +489,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           null,
           start,
           cliqueArenas,
-          heap
+          heaps
         ));
       }
       cliques.push(leafCliques);
@@ -596,7 +610,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           overlay.nodes,
           0,
           cliqueArenas,
-          heap
+          heaps
         ));
       }
       cliques.push(levelCliques);
@@ -848,6 +862,23 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const namesFile = `names.${namesHash}.bin.gz`;
   writeFileSync(join(outDir, namesFile), namesGz);
 
+  // Build-time federation metadata stays outside the range packs: clients
+  // fetch it only when an endpoint lies in a different regional graph. Each
+  // neighbor list contains flat [osmNodeId, latE7, lonE7] triples. The peer
+  // sidecar must contain the same OSM id before it is accepted as a portal.
+  const portalNeighbors = Object.fromEntries(
+    Object.entries(graph.portals || {}).filter(([, values]) => Array.isArray(values) && values.length >= 3)
+  );
+  const portalsJson = Buffer.from(JSON.stringify({
+    format: ROUTE_PORTAL_FORMAT,
+    profile: graph.profile || "car",
+    neighbors: portalNeighbors
+  }), "utf8");
+  const portalsGz = gzipSync(portalsJson, { level: 6 });
+  const portalsHash = createHash("sha256").update(portalsGz).digest("hex").slice(0, OBJECT_NAME_HASH_LENGTH);
+  const portalsFile = `portals.${portalsHash}.json.gz`;
+  writeFileSync(join(outDir, portalsFile), portalsGz);
+
   const shards = writers.map((writer, s) => ({
     id: shardCount === 1 ? "all" : `shard-${String(s).padStart(2, "0")}`,
     dir: shardDirs[s],
@@ -915,7 +946,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     leaves: leaves.length,
     levels: levelFanouts,
     buckets: buckets.map(bucket => bucket.name),
-    shards: shards.length - 1
+    shards: shards.length - 1,
+    portals: portalsFile,
+    portalCandidates: Object.values(portalNeighbors).reduce((sum, values) => sum + values.length / 3, 0)
   }, null, 2));
 
   let overlayNodes = 0;

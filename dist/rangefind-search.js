@@ -2623,21 +2623,29 @@ function parseAuthorityLexiconSegment(buffer, options = {}) {
     last: entries.at(-1)?.shard || ""
   };
 }
+var AUTHORITY_HOT_DOC_VERSION = 2;
 function parseAuthorityHotList(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
   const state = { pos: AUTHORITY_HOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_LEXICON_VERSION) throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION) {
+    throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
+  }
   const count = readVarint(bytes, state);
   const entries = new Array(count);
   for (let index = 0; index < count; index++) {
-    entries[index] = {
+    const entry = {
       normalized: readUtf8(bytes, state),
       display: readUtf8(bytes, state),
       weight: readVarint(bytes, state),
       count: readVarint(bytes, state)
     };
+    if (version >= AUTHORITY_HOT_DOC_VERSION) {
+      const doc = readVarint(bytes, state);
+      if (doc > 0) entry.doc = doc - 1;
+    }
+    entries[index] = entry;
   }
   if (state.pos !== bytes.length) throw new Error("Rangefind authority hot list has trailing bytes.");
   return entries;
@@ -2881,6 +2889,7 @@ var SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v1";
 var AUTHORITY_VERSION = 2;
 var AUTHORITY_LEGACY_VERSION = 1;
 var AUTHORITY_ORDINAL_ROWS_VERSION = 3;
+var AUTHORITY_DOC_ROWS_VERSION = 4;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
@@ -2944,10 +2953,11 @@ function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION) {
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
   const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
+  const docRows = version === AUTHORITY_DOC_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = /* @__PURE__ */ new Map();
   let previous = "";
@@ -2959,12 +2969,19 @@ function parseAuthorityShard(buffer) {
     if (version >= AUTHORITY_VERSION && isAutocompleteKey(key)) {
       const autocompleteWeight = readVarint(bytes, state);
       let rows2 = [];
-      if (ordinalRows) {
+      if (ordinalRows || docRows) {
         const rowCount2 = readVarint(bytes, state);
         rows2 = new Array(rowCount2);
         for (let j = 0; j < rowCount2; j++) rows2[j] = [readVarint(bytes, state), readVarint(bytes, state)];
       }
-      entries.set(key, { total, complete: true, rows: rows2, autocompleteWeight, ...ordinalRows ? { ordinalRows: true } : {} });
+      entries.set(key, {
+        total,
+        complete: true,
+        rows: rows2,
+        autocompleteWeight,
+        ...ordinalRows ? { ordinalRows: true } : {},
+        ...docRows ? { docRows: true } : {}
+      });
       previous = key;
       continue;
     }
@@ -4002,6 +4019,127 @@ function routeMatchPublic(match) {
   };
 }
 
+// src/doc_value_manifest.js
+var DOC_VALUE_MANIFEST_MAGIC = [82, 70, 86, 77];
+var FORMAT_VERSION3 = 1;
+var CHECKSUM_ROW_BYTES = 32;
+function readZigzag2(bytes, state) {
+  const encoded = readVarint(bytes, state);
+  return encoded % 2 === 1 ? -(encoded + 1) / 2 : encoded / 2;
+}
+function readBitmap(bytes, state, count) {
+  const bits = new Array(count);
+  const byteCount = Math.ceil(count / 8);
+  for (let i = 0; i < count; i++) {
+    bits[i] = bytes[state.pos + (i >> 3)] >> (i & 7) & 1;
+  }
+  state.pos += byteCount;
+  return bits;
+}
+function decodeChunkSection(bytes, state, view, { chunkSize, total, packs, nextChecksumRow }) {
+  const count = readVarint(bytes, state);
+  const chunks = new Array(count);
+  let packIndex = 0;
+  let offset = 0;
+  for (let i = 0; i < count; i++) {
+    packIndex += readZigzag2(bytes, state);
+    offset += readZigzag2(bytes, state);
+    const length = readVarint(bytes, state);
+    const width = bytes[state.pos++];
+    const start = i * chunkSize;
+    chunks[i] = {
+      start,
+      count: Math.min(chunkSize, total - start),
+      pack: packs[packIndex],
+      packIndex,
+      offset,
+      length,
+      width,
+      min: null,
+      max: null,
+      words: null,
+      ...nextChecksumRow ? { checksumRow: nextChecksumRow.row++ } : {}
+    };
+  }
+  const flags = bytes[state.pos++];
+  if (flags & 1) {
+    const present = readBitmap(bytes, state, count);
+    for (let i = 0; i < count; i++) {
+      if (!present[i]) continue;
+      chunks[i].min = view.getFloat64(state.pos, true);
+      chunks[i].max = view.getFloat64(state.pos + 8, true);
+      state.pos += 16;
+    }
+  }
+  if (flags & 2) {
+    const wordsLen = readVarint(bytes, state);
+    const present = readBitmap(bytes, state, count);
+    for (let i = 0; i < count; i++) {
+      if (!present[i]) continue;
+      const words = new Array(wordsLen);
+      for (let j = 0; j < wordsLen; j++) {
+        words[j] = view.getUint32(state.pos, true);
+        state.pos += 4;
+      }
+      chunks[i].words = words;
+    }
+  }
+  return chunks;
+}
+function parseDocValueManifest(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  assertMagic(bytes, DOC_VALUE_MANIFEST_MAGIC, "Unsupported Rangefind doc-value manifest");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const state = { pos: DOC_VALUE_MANIFEST_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== FORMAT_VERSION3) {
+    throw new Error(`Unsupported Rangefind doc-value manifest version ${version}`);
+  }
+  const chunkSize = readVarint(bytes, state);
+  const lookupChunkSize = readVarint(bytes, state);
+  const total = readVarint(bytes, state);
+  const storage = readUtf8(bytes, state);
+  const compression = readUtf8(bytes, state);
+  const format = readUtf8(bytes, state);
+  const checksumsFile = readUtf8(bytes, state);
+  const checksumAlgorithm = readUtf8(bytes, state);
+  const packCount = readVarint(bytes, state);
+  const packs = new Array(packCount);
+  for (let i = 0; i < packCount; i++) packs[i] = readUtf8(bytes, state);
+  const nextChecksumRow = checksumsFile ? { row: 0 } : null;
+  const fieldCount = readVarint(bytes, state);
+  const fields = {};
+  for (let i = 0; i < fieldCount; i++) {
+    const name = readUtf8(bytes, state);
+    const kind = readUtf8(bytes, state);
+    const type = readUtf8(bytes, state);
+    const words = readVarint(bytes, state);
+    const hasLookup = bytes[state.pos++] === 1;
+    const chunks = decodeChunkSection(bytes, state, view, { chunkSize, total, packs, nextChecksumRow });
+    const lookupChunks = hasLookup ? decodeChunkSection(bytes, state, view, { chunkSize: lookupChunkSize, total, packs, nextChecksumRow }) : null;
+    fields[name] = {
+      name,
+      kind,
+      type,
+      words,
+      chunks,
+      ...lookupChunks ? { lookup_chunks: lookupChunks } : {}
+    };
+  }
+  if (state.pos !== bytes.length) throw new Error("Rangefind doc-value manifest has trailing bytes.");
+  return {
+    storage,
+    compression,
+    format,
+    chunk_size: chunkSize,
+    lookup_chunk_size: lookupChunkSize,
+    total,
+    fields,
+    packs: packs.map((file) => ({ file })),
+    ...checksumsFile ? { checksum_rows: { file: checksumsFile, algorithm: checksumAlgorithm, rowBytes: CHECKSUM_ROW_BYTES } } : {}
+  };
+}
+
 // src/highlight.js
 var WORD_RE2 = /[\p{L}\p{M}\p{N}ー々]+/gu;
 function highlightTermSet(query, correctedQuery = "", analyzer = DEFAULT_ANALYZER) {
@@ -4096,7 +4234,7 @@ function applyHighlights(results, termSet, options = {}) {
 // src/vector_index.js
 var VECTOR_ROOT_FORMAT = "rfvecroot-v1";
 var VECTOR_CLUSTER_PAGE_FORMAT = "rfveccluster-v1";
-var FORMAT_VERSION3 = 1;
+var FORMAT_VERSION4 = 1;
 function vectorFromValue(value, dims) {
   if (value == null || value === "") return null;
   let out;
@@ -4149,7 +4287,7 @@ function decodeVectorClusterPage(buffer, expected = {}) {
   assertMagic(bytes, VECTOR_CLUSTER_PAGE_MAGIC, "Unsupported Rangefind vector cluster page");
   const state = { pos: VECTOR_CLUSTER_PAGE_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind vector cluster page version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind vector cluster page version ${version}`);
   const field = readUtf8(bytes, state);
   if (expected.name && expected.name !== field) throw new Error(`Rangefind vector cluster page field mismatch: ${field}`);
   const clusterIndex = readVarint(bytes, state);
@@ -4173,7 +4311,7 @@ function parseVectorRoot(buffer) {
   assertMagic(bytes, VECTOR_ROOT_MAGIC, "Unsupported Rangefind vector root");
   const state = { pos: VECTOR_ROOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== FORMAT_VERSION3) throw new Error(`Unsupported Rangefind vector root version ${version}`);
+  if (version !== FORMAT_VERSION4) throw new Error(`Unsupported Rangefind vector root version ${version}`);
   const field = readUtf8(bytes, state);
   const metric = readUtf8(bytes, state);
   const dims = readVarint(bytes, state);
@@ -4842,7 +4980,17 @@ async function traceSpan(name, fn) {
     recordTraceSpan(trace, name, nowMs() - started);
   }
 }
-async function traceFetch(bucket, fn) {
+function defaultTraceFetchBytes(response) {
+  return Number(response?.headers?.get?.("content-length") || 0);
+}
+function recordTraceBytes(name, bytes) {
+  const trace = activeRuntimeTrace;
+  if (!trace || !Number.isFinite(bytes) || bytes <= 0) return;
+  const current = trace.spans.get(name) || { name, count: 0, totalMs: 0, maxMs: 0, bytes: 0 };
+  current.bytes += bytes;
+  trace.spans.set(name, current);
+}
+async function traceFetch(bucket, fn, measureBytes = defaultTraceFetchBytes) {
   const trace = activeRuntimeTrace;
   if (!trace) return fn();
   const started = nowMs();
@@ -4851,8 +4999,7 @@ async function traceFetch(bucket, fn) {
     response = await fn();
     return response;
   } finally {
-    const bytes = Number(response?.headers?.get?.("content-length") || 0);
-    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, bytes);
+    recordTraceSpan(trace, `${bucket}.fetch`, nowMs() - started, measureBytes(response));
   }
 }
 function traceSpanSync(name, fn) {
@@ -4917,10 +5064,11 @@ async function fetchGzipArrayBuffer(url) {
 }
 async function fetchRange(url, offset, length) {
   const bucket = traceBucketFromUrl(url);
+  const rangeBytes = (response) => response?.status === 206 ? defaultTraceFetchBytes(response) : 0;
   for (let attempt = 0; ; attempt++) {
     const response = await traceFetch(bucket, () => fetchImpl(url, {
       headers: { Range: `bytes=${offset}-${offset + length - 1}` }
-    }));
+    }), rangeBytes);
     if (response.status === 206) {
       return traceSpan(`${bucket}.read`, () => response.arrayBuffer());
     }
@@ -4928,6 +5076,7 @@ async function fetchRange(url, offset, length) {
       const total = Number(response.headers.get("content-length") || 0);
       if (total > 0 && total <= Math.max(length * 4, 1 << 20)) {
         const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
+        recordTraceBytes(`${bucket}.fetch`, body.byteLength || total);
         return body.slice(offset, offset + length);
       }
       try {
@@ -4942,8 +5091,16 @@ async function fetchRange(url, offset, length) {
     throw new Error(`Range request failed for ${url}`);
   }
 }
+var multiRangeUnsupportedOrigins = /* @__PURE__ */ new Set();
+function urlOrigin(url) {
+  try {
+    return new URL(String(url)).origin;
+  } catch {
+    return "";
+  }
+}
 async function fetchRanges(url, ranges, options = {}) {
-  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false) {
+  if (ranges.length <= 1 || !fetchSupportsMultiRange || options.multiRangeRequests === false || multiRangeUnsupportedOrigins.has(urlOrigin(url))) {
     return Promise.all(ranges.map((range) => fetchRange(url, range.offset, range.length)));
   }
   const maxRanges = Math.max(2, Math.min(64, Math.floor(Number(options.multiRangeMaxRanges || 32))));
@@ -4961,13 +5118,14 @@ async function fetchRanges(url, ranges, options = {}) {
       headers: {
         Range: `bytes=${ranges.map((range) => `${range.offset}-${range.offset + range.length - 1}`).join(",")}`
       }
-    }));
+    }), (fetched) => fetched?.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(fetched.headers?.get?.("content-type") || "") ? defaultTraceFetchBytes(fetched) : 0);
     const contentType = response.headers?.get?.("content-type") || "";
     if (response.status === 206 && /^multipart\/byteranges(?:;|$)/iu.test(contentType)) {
       const body = await traceSpan(`${bucket}.read`, () => response.arrayBuffer());
       const parts = parseMultipartByteRanges(body, contentType);
       return selectMultipartByteRanges(parts, ranges);
     }
+    multiRangeUnsupportedOrigins.add(urlOrigin(url));
   } catch {
   }
   try {
@@ -5138,10 +5296,13 @@ async function createSearch(options = {}) {
   }
   async function ensureDocValuesManifest() {
     if (docValues) return docValues;
+    const binaryPath = options.docValuesBinaryManifest !== false ? manifest.lazy_manifests?.doc_values_v2 : null;
     const path = manifest.lazy_manifests?.doc_values;
-    if (!path) return null;
+    if (!binaryPath && !path) return null;
     if (!docValuesPromise) {
-      docValuesPromise = fetchManifestJsonIfOk(path).then((meta) => {
+      const loadJson = () => path ? fetchManifestJsonIfOk(path) : null;
+      const loadBinary = () => fetchGzipArrayBuffer(new URL(binaryPath, baseUrl)).then((buffer) => traceSpanSync("manifest.parse", () => parseDocValueManifest(buffer)));
+      docValuesPromise = (binaryPath ? loadBinary().catch(loadJson) : Promise.resolve(loadJson())).then((meta) => {
         docValues = meta || null;
         if (docValues) manifest.doc_values = docValues;
         return docValues;
@@ -5445,6 +5606,34 @@ async function createSearch(options = {}) {
   function docValueCacheKey(field, index, lookup = false) {
     return `${field}\0${lookup ? "lookup" : "chunk"}\0${index}`;
   }
+  async function attachDocValueChecksumRows(pending) {
+    const meta = docValues?.checksum_rows;
+    if (!verifyChecksums || !meta?.file) return;
+    const rowBytes = Number(meta.rowBytes) || 32;
+    const items = pending.filter((item) => !item.entry.checksum && Number.isInteger(item.entry.checksumRow));
+    if (!items.length) return;
+    const rows = [...new Set(items.map((item) => item.entry.checksumRow))].sort((a, b) => a - b);
+    const ranges = [];
+    for (const row of rows) {
+      const last = ranges[ranges.length - 1];
+      if (last && row * rowBytes === last.offset + last.length) last.length += rowBytes;
+      else ranges.push({ offset: row * rowBytes, length: rowBytes });
+    }
+    const buffers = await fetchRanges(new URL(meta.file, baseUrl), ranges, options);
+    const valueByRow = /* @__PURE__ */ new Map();
+    ranges.forEach((range, index) => {
+      const bytes = new Uint8Array(buffers[index]);
+      for (let at = 0; at + rowBytes <= bytes.length; at += rowBytes) {
+        let value = "";
+        for (let i = 0; i < rowBytes; i++) value += bytes[at + i].toString(16).padStart(2, "0");
+        valueByRow.set((range.offset + at) / rowBytes, value);
+      }
+    });
+    for (const item of items) {
+      const value = valueByRow.get(item.entry.checksumRow);
+      if (value) item.entry.checksum = { algorithm: meta.algorithm || "sha256", value };
+    }
+  }
   async function loadDocValueChunks(requests) {
     return traceSpan("docValues.loadChunks", async () => {
       if (!docValues || !requests.length) return;
@@ -5465,6 +5654,15 @@ async function createSearch(options = {}) {
         });
         docValueCache.set(key, promise);
         pending.push({ field: request.field, index: request.index, lookup: Boolean(request.lookup), entry: chunk, resolve, reject });
+      }
+      try {
+        await attachDocValueChecksumRows(pending);
+      } catch (error) {
+        for (const item of pending) {
+          docValueCache.delete(docValueCacheKey(item.field, item.index, item.lookup));
+          item.reject(error);
+        }
+        return;
       }
       await readRangeGroups(
         rangeGroups(pending),
@@ -11338,6 +11536,8 @@ async function createSearch(options = {}) {
     const analyzedTerms = queryAnalysis.analyzedTerms;
     const baseTerms = queryAnalysis.baseTerms;
     if (geoPlan?.sort || geoPlan?.routeSort) {
+      loadGeoTreeRoot(geoPlan.field).catch(() => {
+      });
       const match = await collectTextMatchDocs(baseTerms);
       if (!match) {
         const budgetError = new Error("Rangefind: text geo sort exceeds the geoTextSortMaxDf posting budget; narrow the query or rank by relevance with geo.boost.");
@@ -11755,6 +11955,7 @@ async function createSearch(options = {}) {
       }
       suggestion.ordinals = ordinals;
     }
+    if (candidate.docRows?.length) suggestion.doc = candidate.docRows[0][0];
     return suggestion;
   }
   function autocompleteCandidatesForShard(shard, weighted) {
@@ -11771,7 +11972,10 @@ async function createSearch(options = {}) {
         full: suggestKey(parsed.display) === parsed.normalized,
         // Root suggest-routing artifacts store [shard ordinal, weight] rows
         // on autocomplete entries; provenance travels with the candidate.
-        ...entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {}
+        // Per-shard doc-row artifacts store the best [doc, weight] row so an
+        // unambiguous suggestion resolves straight to its document.
+        ...entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {},
+        ...entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {}
       };
       candidate.rank = autocompleteRank(candidate, weighted);
       list.push(candidate);
@@ -11799,7 +12003,7 @@ async function createSearch(options = {}) {
         return {
           q,
           prefix,
-          suggestions: hot.slice(0, size).map(({ display, weight, count: count2 }) => ({ text: display, weight, count: count2 })),
+          suggestions: hot.slice(0, size).map(({ display, weight, count: count2, doc }) => ({ text: display, weight, count: count2, ...doc != null ? { doc } : {} })),
           stats: {
             exact: true,
             suggestLane: "authority-hot",
@@ -12330,6 +12534,13 @@ async function createSearch(options = {}) {
     const store = await valueStoreForDocs(fields, indexes);
     return indexes.map((index) => Object.fromEntries(fields.map((field) => [field, valueForDoc(store, field, index)])));
   }
+  function prefetchDocValues() {
+    try {
+      Promise.resolve(ensureDocValuesManifest()).catch(() => {
+      });
+    } catch {
+    }
+  }
   return {
     manifest,
     analyzer,
@@ -12341,6 +12552,7 @@ async function createSearch(options = {}) {
     hydrateRows,
     searchAddressAuthority,
     loadDocValues,
+    prefetchDocValues,
     loadBuildTelemetry,
     loadIndexOptimizer,
     loadSegmentManifest,
@@ -12733,8 +12945,10 @@ async function createGenerationalSearch(root, options, baseUrl) {
         if (existing) {
           existing.count += item.count;
           existing.weight = Math.max(existing.weight, item.weight);
+          delete existing.doc;
         } else {
-          merged.set(item.text, { ...item });
+          const { doc, ...rest } = item;
+          merged.set(item.text, rest);
         }
       }
     }
@@ -13461,8 +13675,11 @@ async function createShardedSearch(root, options, baseUrl) {
           if (item.weight > existing.weight) {
             existing.weight = item.weight;
             existing.shards = [shard.id];
+            if (item.doc != null) existing.doc = item.doc;
+            else delete existing.doc;
           } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
             existing.shards.push(shard.id);
+            delete existing.doc;
           }
         } else {
           merged.set(item.text, { ...item, shards: [shard.id] });
@@ -13533,6 +13750,36 @@ async function createShardedSearch(root, options, baseUrl) {
       return null;
     }
   }
+  async function hydrateRows(rows, context = {}) {
+    const id = String(context.shard || "");
+    const index = shardIdIndex.get(id);
+    if (index === void 0) {
+      throw new Error(`Rangefind: hydrateRows on a sharded index requires context.shard naming one shard (got "${id}").`);
+    }
+    const engine = await engineAt(index);
+    if (typeof engine.hydrateRows !== "function") {
+      throw new Error(`Rangefind: shard "${id}" does not support hydrateRows.`);
+    }
+    const { shard, ...rest } = context;
+    const docs = await engine.hydrateRows(rows, rest);
+    return docs.map((doc) => stampShard(doc, index));
+  }
+  function prefetchShards(names, { docValues = false } = {}) {
+    let picked;
+    try {
+      picked = candidateShards({ shards: names });
+    } catch {
+      return;
+    }
+    for (const shard of picked) {
+      const promise = engineAt(shard.index);
+      Promise.resolve(promise).then((shardEngine) => {
+        if (docValues) shardEngine.prefetchDocValues?.();
+      }, () => {
+        if (engines[shard.index] === promise) engines[shard.index] = null;
+      });
+    }
+  }
   return {
     manifest: root,
     shards: shards.map((shard) => ({ id: shard.id, path: shard.path, total: shard.total, bbox: shard.bbox })),
@@ -13540,8 +13787,10 @@ async function createShardedSearch(root, options, baseUrl) {
     suggest,
     count,
     authorityLookup,
+    hydrateRows,
     vectorSearch,
-    loadFacetValues
+    loadFacetValues,
+    prefetchShards
   };
 }
 

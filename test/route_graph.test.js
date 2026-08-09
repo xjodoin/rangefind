@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { closeSync, mkdtempSync, openSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import {
   MinHeap,
   bucketWeight,
@@ -195,6 +196,7 @@ test("road graph writer replaces atomically without concatenating sections", asy
   graph.laneBytes = new Uint8Array(0);
   graph.condRules = [];
   graph.signs = [];
+  graph.portals = { neighbor: [123, 455000000, -736000000] };
 
   const dir = mkdtempSync(join(tmpdir(), "rangefind-road-write-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -208,6 +210,7 @@ test("road graph writer replaces atomically without concatenating sections", asy
   const decoded = await readRoadGraph(path);
   assert.equal(decoded.profile, graph.profile);
   assert.deepEqual(decoded.names, graph.names);
+  assert.deepEqual(decoded.portals, graph.portals);
   for (const key of [
     "nodeLat", "nodeLon", "edgeFrom", "edgeTo", "edgeWeightDs", "edgeDistDm",
     "edgeName", "edgeClass", "edgeJunction", "edgeSpeed", "edgeCond", "edgeSign",
@@ -215,6 +218,38 @@ test("road graph writer replaces atomically without concatenating sections", asy
   ]) {
     assert.deepEqual(decoded[key], graph[key], `${key} round trips`);
   }
+});
+
+test("route builds publish immutable compact federation portal sidecars", (t) => {
+  const graph = syntheticGraph(4, 4, 72);
+  graph.portals = { neighbor: [123, graph.nodeLat[0], graph.nodeLon[0]] };
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-portals-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 16, fanout: 4, topMaxCells: 4 });
+  const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
+  assert.match(manifest.portals, /^portals\.[a-f0-9]{24}\.json\.gz$/u);
+  assert.equal(manifest.portalCandidates, 1);
+  const portals = JSON.parse(gunzipSync(readFileSync(join(dir, manifest.portals))).toString("utf8"));
+  assert.equal(portals.format, "rfrouteportals-v1");
+  assert.deepEqual(portals.neighbors, graph.portals);
+});
+
+test("federation portal extraction keeps only valid neighboring OSM junction ids", async () => {
+  const { collectFederationPortals } = await import("../scripts/osm_road_graph.mjs");
+  const portals = collectFederationPortals({
+    junctionIds: new Float64Array([11, 22, 33, 44]),
+    usedIds: new Float64Array([11, 22, 33, 44]),
+    graphNodeByUsed: new Int32Array([0, 1, -1, 2]),
+    found: new Uint8Array([1, 1, 1, 0]),
+    latE7: new Int32Array([45e7, 46e7, 47e7, 48e7]),
+    lonE7: new Int32Array([-75e7, -74e7, -73e7, -72e7]),
+    portalRegions: [
+      { id: "west", bbox: [44, -76, 45.5, -74.5] },
+      { id: "east", bbox: [45.5, -74.5, 47.5, -72.5] }
+    ]
+  });
+  assert.deepEqual(portals.west, [11, 45e7, -75e7]);
+  assert.deepEqual(portals.east, [22, 46e7, -74e7]);
 });
 
 test("road graph reader uses positional reads beyond Node's 2 GiB whole-file limit", async (t) => {

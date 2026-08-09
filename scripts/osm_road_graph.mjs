@@ -13,6 +13,8 @@
 import { closeSync, fstatSync, fsyncSync, openSync, readSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { scanPbf } from "./osm_pbf.mjs";
 
+export const ROAD_SOURCE_FORMAT = "rfroutesrc-v8";
+
 const EARTH_RADIUS_METERS = 6371008.7714;
 
 /**
@@ -1164,6 +1166,28 @@ function binarySearch(sorted, value) {
   return -1;
 }
 
+function appendFederationPortal(portals, nodeId, latE7, lonE7, portalRegions) {
+  const lat = latE7 / 1e7;
+  const lon = lonE7 / 1e7;
+  for (const neighbor of portalRegions) {
+    const bbox = neighbor.bbox;
+    const inside = lat >= bbox[0] && lat <= bbox[2] && (bbox[1] <= bbox[3]
+      ? lon >= bbox[1] && lon <= bbox[3]
+      : lon >= bbox[1] || lon <= bbox[3]);
+    if (inside) portals[neighbor.id].push(nodeId, latE7, lonE7);
+  }
+}
+
+export function collectFederationPortals({ junctionIds, usedIds, graphNodeByUsed, found, latE7, lonE7, portalRegions }) {
+  const portals = Object.fromEntries(portalRegions.map(neighbor => [neighbor.id, []]));
+  for (let i = 0; i < junctionIds.length && portalRegions.length; i++) {
+    const used = binarySearch(usedIds, junctionIds[i]);
+    if (used < 0 || graphNodeByUsed[used] < 0 || !found[used]) continue;
+    appendFederationPortal(portals, junctionIds[i], latE7[used], lonE7[used], portalRegions);
+  }
+  return portals;
+}
+
 export function extractRoadGraph(pbfPath, options = {}) {
   const log = options.log || (() => {});
   const profileName = options.profile || "car";
@@ -1174,6 +1198,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // Turn restrictions target motor vehicles; bicycles are commonly excepted
   // and pedestrians always are, so only the car profile applies them.
   const useRestrictions = profile.name === "car";
+  const portalRegions = (options.portalRegions || []).filter(region => (
+    region && region.id && Array.isArray(region.bbox) && region.bbox.length === 4
+  ));
 
   // Pass 1: allowed ways and turn-restriction relations. Refs go into one
   // shared spool; endpoints are pushed twice so the duplicate scan below
@@ -1336,12 +1363,23 @@ export function extractRoadGraph(pbfPath, options = {}) {
   let graphNodeByUsed = new Int32Array(usedIds.length).fill(-1);
   let nodeLat = [];
   let nodeLon = [];
+  const portals = Object.fromEntries(portalRegions.map(neighbor => [neighbor.id, []]));
   for (let i = 0; i < junctionIds.length; i++) {
     const used = binarySearch(usedIds, junctionIds[i]);
     if (used < 0 || !found[used]) continue;
     graphNodeByUsed[used] = nodeLat.length;
     nodeLat.push(latE7[used]);
     nodeLon.push(lonE7[used]);
+    appendFederationPortal(portals, junctionIds[i], latE7[used], lonE7[used], portalRegions);
+  }
+  // Inter-region routing does not guess that two nearby roads connect. Keep
+  // the original OSM junction ids that fall inside a neighboring extract's
+  // coverage bbox; the two independently built sidecars are intersected at
+  // query time, so only an id present in both graphs becomes a zero-cost
+  // handoff. Bboxes are merely a compact candidate filter.
+  if (portalRegions.length) {
+    const candidates = Object.values(portals).reduce((sum, values) => sum + values.length / 3, 0);
+    log(`federation: ${candidates.toLocaleString()} shared-id candidates for ${portalRegions.length} neighboring bbox(es)`);
   }
   // Restriction expansion only needs via nodes, not every graph junction.
   // Resolve those few ids now so the large used-id and graph-node columns can
@@ -1700,7 +1738,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
       profile: profile.name,
       classes: classTable,
       condRules: conditionalTable.rules,
-      signs: signTable.signs
+      signs: signTable.signs,
+      portals
     };
     const take = (key, Type, fallback = []) => {
       const source = expanded[key] || fallback;
@@ -1775,7 +1814,8 @@ export function extractRoadGraph(pbfPath, options = {}) {
     profile: profile.name,
     classes: classTable,
     condRules: conditionalTable.rules,
-    signs: signTable.signs
+    signs: signTable.signs,
+    portals
   }, log);
 }
 
@@ -2916,12 +2956,14 @@ export function filterLargestScc(graph, log) {
     profile: graph.profile,
     classes: graph.classes,
     condRules: graph.condRules || [],
-    signs: graph.signs || []
+    signs: graph.signs || [],
+    portals: graph.portals || {}
   };
 }
 
 export function writeRoadGraph(path, graph) {
   const namesBytes = new TextEncoder().encode(JSON.stringify(graph.names));
+  const portalsBytes = new TextEncoder().encode(JSON.stringify(graph.portals || {}));
   const sections = [
     ["nodeLat", graph.nodeLat],
     ["nodeLon", graph.nodeLon],
@@ -2940,10 +2982,11 @@ export function writeRoadGraph(path, graph) {
     ["laneBytes", graph.laneBytes],
     ["geomOffsets", graph.geomOffsets],
     ["geomBytes", graph.geomBytes],
-    ["namesBytes", namesBytes]
+    ["namesBytes", namesBytes],
+    ["portalsBytes", portalsBytes]
   ];
   const header = {
-    format: "rfroutesrc-v7",
+    format: ROAD_SOURCE_FORMAT,
     // The distinct conditional windows an edge's condRule indexes into. A
     // whole province shares a handful, so they ride in the header rather than
     // being repeated per edge.
@@ -3039,7 +3082,7 @@ export async function readRoadGraph(path) {
   try {
     const fileBytes = fstatSync(fd).size;
     const { header, dataOffset } = readRoadGraphHeader(fd, fileBytes);
-    if (header.format !== "rfroutesrc-v7") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
+    if (header.format !== ROAD_SOURCE_FORMAT) throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
     const graph = {
       profile: header.profile || "car",
       classes: header.classes || [],
@@ -3055,6 +3098,10 @@ export async function readRoadGraph(path) {
       offset += section.bytes;
       if (section.name === "namesBytes") {
         graph.names = JSON.parse(Buffer.from(bytes.buffer).toString("utf8"));
+        continue;
+      }
+      if (section.name === "portalsBytes") {
+        graph.portals = JSON.parse(Buffer.from(bytes.buffer).toString("utf8"));
         continue;
       }
       const Type = TYPED_ARRAYS[section.type];

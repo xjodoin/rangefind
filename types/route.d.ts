@@ -32,6 +32,8 @@ export interface RouteFetchStats {
   /** Actual merged Range requests after same-file coalescing. */
   httpRequests: number;
   shardsTouched: string[];
+  /** Regional graph ids touched by a federated route. */
+  regionsTouched?: string[];
 }
 
 export interface RouteEndpointInfo {
@@ -103,6 +105,17 @@ export interface RouteEdgeRef {
 }
 
 export interface RouteResult {
+  /** True when independently published regional graphs were stitched. */
+  federated?: boolean;
+  /** Regional graph ids traversed in order. */
+  regions?: string[];
+  /** Exact shared-OSM-node handoffs between consecutive regions. */
+  transitions?: Array<{
+    osmNodeId: number;
+    point: RoutePoint;
+    fromRegion: string;
+    toRegion: string;
+  }>;
   seconds: number;
   /** Name of the time bucket this result was computed under. */
   bucket: string;
@@ -293,6 +306,40 @@ export declare function createRouteGraphHttpIo(baseUrl: string, options?: {
 export declare function openRouteGraphUrl(baseUrl: string, options?: Partial<OpenRouteGraphOptions> & {
   fetch?: typeof fetch;
 }): Promise<RouteGraphEngine>;
+
+export interface RouteCatalogIndex {
+  region: string;
+  profile: string;
+  base: string;
+  bbox: [number, number, number, number];
+  portals?: string;
+  neighbors?: string[];
+  manifest?: { portals?: string; [key: string]: unknown };
+}
+
+export interface FederatedRouteEngine {
+  catalog: { format: "rangefind-route-catalog-v1"; indexes: RouteCatalogIndex[]; [key: string]: unknown };
+  profile: string;
+  route(params: RouteParams & { fromRegion?: string; toRegion?: string }): Promise<RouteResult>;
+  matrix(params: { points: RoutePoint[]; bucket?: string; departureTime?: string | number | Date }): Promise<MatrixResult>;
+  regionFor(point: RoutePoint): string;
+  clearCaches(): void;
+}
+
+export declare function openRouteCatalogUrl(catalogUrl: string, options?: {
+  profile?: "car" | "bike" | "foot";
+  fetch?: typeof fetch;
+  /** Gzip inflate override for immutable portal sidecars. */
+  inflate?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+  graphOptions?: Partial<OpenRouteGraphOptions>;
+  maxPortalsPerBorder?: number;
+  maxRegionPaths?: number;
+  maxRegionHops?: number;
+  /** Maximum portal-proven regional nodes expanded while finding catalog paths. */
+  maxRegionExpansions?: number;
+  portalConcurrency?: number;
+  openGraph?: (index: RouteCatalogIndex, baseUrl: string) => RouteGraphEngine | Promise<RouteGraphEngine>;
+}): Promise<FederatedRouteEngine>;
 
 /**
  * Reference LiveTrafficProvider serving a fixed (or lazily computed) state

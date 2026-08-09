@@ -22,9 +22,10 @@ await build({
 });
 
 await build({
-  // The rfroutegraph-v1 query engine is dependency-free browser-safe ESM;
-  // bundling folds in its ./route_graph.js codec so demos can import one file.
-  entryPoints: [resolve("src/route_graph_query.js")],
+  // The regional and federated rfroutegraph-v1 query engines are
+  // dependency-free browser-safe ESM; one bundle exposes both
+  // openRouteGraphUrl() and openRouteCatalogUrl().
+  entryPoints: [resolve("src/route.js")],
   outfile: resolve(outdir, "route.browser.js"),
   bundle: true,
   format: "esm",

@@ -17,6 +17,7 @@ const columns = Number(option("columns", "1000"));
 const modulePath = option("module", new URL("../src/route_graph_build.js", import.meta.url).pathname);
 const expectedRoot = option("expect-root", "");
 const expectedSha256 = option("expect-sha256", "");
+const radixMinNodes = Number(option("radix-min-nodes", "4096"));
 if (!Number.isSafeInteger(rows) || rows < 2 || !Number.isSafeInteger(columns) || columns < 2) {
   throw new Error("--rows and --columns must be integers of at least 2");
 }
@@ -92,6 +93,7 @@ try {
     fanout: 8,
     topMaxCells: 8,
     shards: 4,
+    overlayRadixMinNodes: radixMinNodes,
     releaseSource: true,
     collectGarbage: globalThis.gc,
     log: message => phases.push({
