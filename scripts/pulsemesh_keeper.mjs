@@ -222,12 +222,26 @@ if (!bridging && admit && bootstrap.length) {
 // the thread's topic is derived from a capability this host never holds.
 const relay = String(args.relay ?? "on").toLowerCase() !== "off";
 
+const listenAddress = String(args.listen || "/ip4/127.0.0.1/tcp/0");
+// A relay that nobody can be *found* through is only half a keeper.
+// Threads are discovered by content routing (threads §4.2): a publisher
+// advertises the rendezvous key derived from its rotating tag, a holder
+// of the link derives the same key and asks who provides it. Somebody has
+// to answer that, and on a fleet's own island the keeper is the only peer
+// that is always up. Its scope follows its own listen address for the
+// reason in the library: the public mapper strips private addresses, so a
+// depot LAN with the default would form connections and no routing table.
+const dhtScope = /\/ip4\/(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/u.test(listenAddress)
+  ? "lan"
+  : "public";
+
 const host = await createPulseMeshHost({
-  listen: [String(args.listen || "/ip4/127.0.0.1/tcp/0")],
+  listen: [listenAddress],
   // With bridging on, --bootstrap belongs to the upstream host below:
   // this one faces the island and dials nobody.
   bootstrapPeers: bridging ? [] : bootstrap,
-  relay
+  relay,
+  dht: { scope: dhtScope, clientMode: false }
 });
 const network = createLibp2pNetwork(host);
 const node = new MeshNode({

@@ -111,14 +111,32 @@ export async function createPulseMeshHost({
 
   const transports = [];
   if (browser) {
-    const [{ webSockets }, { webRTC }, { circuitRelayTransport }] = await Promise.all([
+    const [{ webSockets }, filters, { webRTC }, { circuitRelayTransport }] = await Promise.all([
       import("@libp2p/websockets"),
+      import("@libp2p/websockets/filters"),
       import("@libp2p/webrtc"),
       import("@libp2p/circuit-relay-v2")
     ]);
     // WebSockets reaches keepers over WSS; WebRTC carries browser↔browser
     // once a relay has introduced them.
-    transports.push(webSockets(), webRTC(), circuitRelayTransport({ discoverRelays: 1 }));
+    //
+    // `filters.all` rather than the default, which is `wss` only. That
+    // default silently makes every plain-`ws` keeper undialable from a
+    // browser — a depot's own seed on its own LAN, and every development
+    // machine — and it fails as a bare "WebSocket connection failed" with
+    // no hint that the address was refused rather than unreachable.
+    //
+    // This is not the downgrade it looks like: **the browser already
+    // enforces the rule that matters**. A page served over https cannot
+    // open a ws:// socket whatever we pass here, so an https deployment
+    // is still wss-only, by the one mechanism an attacker cannot argue
+    // with. What the default actually blocks is the http page talking to
+    // the machine on its own desk.
+    transports.push(
+      webSockets({ filter: filters.all }),
+      webRTC(),
+      circuitRelayTransport({ discoverRelays: 1 })
+    );
   } else {
     // TCP for keeper↔keeper. WebSockets **as well**, because it is the
     // only transport a browser or a WebView driver can dial and a keeper
