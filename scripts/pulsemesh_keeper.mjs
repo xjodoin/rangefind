@@ -79,6 +79,13 @@ Mesh
                           NETWORK, dialled by a second, listen-less host — never
                           by the island side. With --bridge=off it is the plain
                           keeper meaning: peers this one host joins.
+  --relay=on|off          be a Circuit Relay v2 server (default on). This is how
+                          a driver's phone and a customer's browser reach each
+                          other at all: both can dial this keeper and neither can
+                          accept a connection. The circuit is opaque here — two
+                          peer ids and an encrypted stream, no topic, no
+                          capability. Turn it off only to stop spending this
+                          machine's bandwidth on other people's traffic.
   --zones=x/y,...         z9 zones to pin (default: every zone in the graph)
   --store-cap=<n>         STORE_CONTRIB_CAP (default 1048576)
   --stats-seconds=<n>     stats line period (default 30)
@@ -205,11 +212,22 @@ if (!bridging && admit && bootstrap.length) {
 
 // --- Host + node ----------------------------------------------------------
 
+// A keeper relays unless told not to. Neither end of the pair this
+// product exists to connect can accept an inbound connection — a driver's
+// phone is behind carrier NAT, a customer's tab has no socket at all — so
+// without a relay in the middle they reach this keeper, they never reach
+// each other, and the driver publishes into a void while every screen
+// looks healthy. Relaying costs this machine bandwidth and reveals
+// nothing: the circuit is an encrypted stream between two peer ids, and
+// the thread's topic is derived from a capability this host never holds.
+const relay = String(args.relay ?? "on").toLowerCase() !== "off";
+
 const host = await createPulseMeshHost({
   listen: [String(args.listen || "/ip4/127.0.0.1/tcp/0")],
   // With bridging on, --bootstrap belongs to the upstream host below:
   // this one faces the island and dials nobody.
-  bootstrapPeers: bridging ? [] : bootstrap
+  bootstrapPeers: bridging ? [] : bootstrap,
+  relay
 });
 const network = createLibp2pNetwork(host);
 const node = new MeshNode({
@@ -313,6 +331,10 @@ console.log(JSON.stringify({
   storeCap: constants.STORE_CONTRIB_CAP,
   bondBits: constants.BOND_BIRTHDAY_BITS,
   seedCard: Boolean(args["seed-card"]),
+  // Said out loud because its absence is invisible: with relaying off, a
+  // driver and a customer both connect here, both look connected, and
+  // nothing passes between them.
+  relay,
   bridge: bridgePolicy,
   admit: admit === ADMIT_CONNECTED ? "connected" : admit ? admit.length : null,
   upstreamPeerId: upstreamHost ? upstreamHost.peerId.toString() : null,

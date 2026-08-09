@@ -46,6 +46,14 @@ const REQUEST_TIMEOUT_MS = 10_000;
 // free.
 const SERVE_TIMEOUT_MS = 15_000;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+/**
+ * Opt in to running over a relayed circuit, which libp2p classifies as a
+ * "limited" connection and otherwise refuses protocols on. Applied to
+ * both ends of every stream this file opens or answers: for a phone or a
+ * browser tab the circuit is the only connection there is, so a protocol
+ * that declines one does not degrade, it disappears.
+ */
+const LIMITED_OK = Object.freeze({ runOnLimitedConnection: true });
 
 /**
  * Creates a libp2p host with the §5.1 profile (TCP for keepers and
@@ -72,7 +80,25 @@ export async function createPulseMeshHost({
   // Thread discovery (threads §4.2) needs content routing. Off by
   // default: the traffic channel finds peers by zone and does not want
   // the extra chatter.
-  dht = false
+  dht = false,
+  // Be a Circuit Relay v2 *server*, so peers that cannot accept an
+  // inbound connection can be reached through this one.
+  //
+  // This is the hop the whole product rests on and it did not exist: a
+  // driver's phone and a customer's browser can each reach a keeper and
+  // neither can reach the other, and a keeper cannot bridge them with
+  // GossipSub because a thread's topic is derived from the capability —
+  // which a keeper must never hold — and GossipSub does not forward for
+  // topics it has not joined. Relaying needs none of that. The keeper
+  // moves an encrypted stream between two peer ids and never learns the
+  // topic, which is the same bargain it already makes with everything
+  // else it carries.
+  //
+  // Off by default because it spends this machine's bandwidth on other
+  // people's traffic, and that is a decision an operator makes. A keeper
+  // turns it on (scripts/pulsemesh_keeper.mjs), because a keeper nobody
+  // can be reached through is a keeper that carries nothing.
+  relay = false
 } = {}) {
   const browser = profile === "browser";
   const [{ createLibp2p }, { noise }, { yamux }, { identify }, { gossipsub }] = await Promise.all([
@@ -94,8 +120,26 @@ export async function createPulseMeshHost({
     // once a relay has introduced them.
     transports.push(webSockets(), webRTC(), circuitRelayTransport({ discoverRelays: 1 }));
   } else {
-    const { tcp } = await import("@libp2p/tcp");
-    transports.push(tcp());
+    // TCP for keeper↔keeper. WebSockets **as well**, because it is the
+    // only transport a browser or a WebView driver can dial and a keeper
+    // that cannot listen on one is a keeper no product client can reach:
+    // the browser profile above ships webSockets/webRTC/circuit-relay and
+    // shares nothing with a TCP-only listener. `webSockets()` listens in
+    // Node and is inert until a `/ws` or `/wss` address is passed to
+    // `listen`, so a plain TCP keeper is unchanged.
+    const [{ tcp }, { webSockets }, { circuitRelayTransport }] = await Promise.all([
+      import("@libp2p/tcp"),
+      import("@libp2p/websockets"),
+      import("@libp2p/circuit-relay-v2")
+    ]);
+    // Circuit relay on the node side as well, because "cannot accept an
+    // inbound connection" is not a browser condition — it is a NAT
+    // condition. A fleet seed on the depot's own box behind a home router
+    // is the documented deployment (§12.1) and has exactly the same
+    // problem a phone does. A host listening on "/p2p-circuit" takes a
+    // reservation on a relay it can reach and becomes dialable through
+    // it; one that listens on a real socket never needs to.
+    transports.push(tcp(), webSockets(), circuitRelayTransport({ discoverRelays: 1 }));
   }
 
   const services = {
@@ -104,9 +148,42 @@ export async function createPulseMeshHost({
       globalSignaturePolicy: "StrictNoSign",
       msgIdFn: message => sha256(message.data).subarray(0, 20),
       allowPublishToZeroTopicPeers: true,
-      emitSelf: false
+      emitSelf: false,
+      // libp2p marks a relayed connection "limited" and refuses to run
+      // protocols over it unless they say so. For this mesh the relayed
+      // connection is not a fallback, it is *the* connection: a driver's
+      // phone and a customer's tab can reach a keeper and never each
+      // other, so a gossip mesh that declines to form over a circuit is a
+      // gossip mesh that never forms at all. Without this the reservation
+      // succeeds, the dial succeeds, and not one record crosses.
+      //
+      // The bytes are small — a thread record is tens of bytes and the
+      // relay's own limits bound the rest — so what is being spent here
+      // is the relay's allowance, deliberately, on the only path there is.
+      runOnLimitedConnection: true
     })
   };
+  if (relay && !browser) {
+    // A tab cannot be a relay — it has no socket to accept the hop on —
+    // so this is a node-only service and asking for it in a browser is a
+    // configuration mistake, not something to half-do silently.
+    const { circuitRelayServer } = await import("@libp2p/circuit-relay-v2");
+    services.relay = circuitRelayServer({
+      reservations: {
+        // A keeper's whole job is availability, and the v2 defaults are
+        // sized for an incidental relay: 15 reservations and a two-minute
+        // circuit would put a depot's drivers in a queue and cut their
+        // customers off mid-round. A run lasts a shift, so the circuit
+        // has to as well.
+        maxReservations: 512,
+        reservationTtl: 60 * 60 * 1000,
+        defaultDataLimit: BigInt(1 << 30),
+        defaultDurationLimit: 8 * 60 * 60 * 1000
+      }
+    });
+  } else if (relay && browser) {
+    throw new Error("A browser cannot be a Circuit Relay server; only a node host can relay.");
+  }
   if (dht) {
     const { kadDHT, passthroughMapper, removePrivateAddressesMapper } = await import("@libp2p/kad-dht");
     const options = typeof dht === "object" ? dht : {};
@@ -353,7 +430,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
     if (!connection) return;
     presentedTo.add(peerIdStr);
     try {
-      const stream = await connection.newStream(BOND_PROTOCOL);
+      const stream = await connection.newStream(BOND_PROTOCOL, LIMITED_OK);
       await stream.sink((async function* () {
         yield framed(ownBondBytes);
       })());
@@ -526,7 +603,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
     stats.requests++;
     let stream;
     try {
-      stream = await connection.newStream(protocol);
+      stream = await connection.newStream(protocol, LIMITED_OK);
     } catch {
       return null;
     }
@@ -568,11 +645,19 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
   // here rather than left floating: an unhandled one — from a duplicate
   // protocol registration, say — would take the process down.
   let registrationError = null;
+  // Every one of these has to be willing to run over a relayed circuit,
+  // for the same reason the gossip mesh does: for a phone or a tab the
+  // circuit is not a degraded path, it is the only path. A handler that
+  // declines one is a §5.5 catch-up that recovers nothing, a §20.7 photo
+  // that cannot be fetched, and a §5.4 bond that never gets presented —
+  // each failing silently, because "the peer did not answer" and "the
+  // peer was never asked" look identical from here.
+
   const ready = Promise.all([
-    Promise.resolve(host.handle(SYNC_PROTOCOL, onSyncStream)),
-    Promise.resolve(host.handle(BOND_PROTOCOL, onBondStream)),
-    Promise.resolve(host.handle(THREAD_PROTOCOL, onThreadStream)),
-    Promise.resolve(host.handle(PHOTO_PROTOCOL, onPhotoStream))
+    Promise.resolve(host.handle(SYNC_PROTOCOL, onSyncStream, LIMITED_OK)),
+    Promise.resolve(host.handle(BOND_PROTOCOL, onBondStream, LIMITED_OK)),
+    Promise.resolve(host.handle(THREAD_PROTOCOL, onThreadStream, LIMITED_OK)),
+    Promise.resolve(host.handle(PHOTO_PROTOCOL, onPhotoStream, LIMITED_OK))
   ]).catch(error => { registrationError = error; });
   const scheduled = new Set();
 

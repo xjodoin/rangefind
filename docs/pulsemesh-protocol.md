@@ -21,7 +21,8 @@ Status of each layer:
 | Engine consumption (`route({ live })`, segment ids, descend-where-dirty) | implemented, tested |
 | §2–§9 codecs, store, aggregation, provider adapter | **implemented, tested** (`src/pulsemesh/`) |
 | §10–§12 contributor/consumer/keeper behavior | **implemented, tested** |
-| §5.1 wire transport (js-libp2p, GossipSub, sync streams) | **implemented, tested** (`src/pulsemesh/libp2p.js`; TCP profile — browser transports and Circuit Relay are deployment wiring on the same adapter) |
+| §5.1 wire transport (js-libp2p, GossipSub, sync streams) | **implemented, tested** (`src/pulsemesh/libp2p.js`) |
+| §5.1 Circuit Relay v2 — a keeper carrying a thread between two peers that cannot dial each other | **implemented, tested** (`test/pulsemesh_relay.test.js`: the publisher listens on nothing, and the negative control with the relay off recovers the original failure) |
 | Blind tokens (proof type 2) | reserved, phase 4 |
 | Thread channel (PMT1/PMTP/PMR1/PMM1) | **implemented, tested**; separate spec, [pulsemesh-threads.md](pulsemesh-threads.md) |
 
@@ -454,6 +455,25 @@ policy altered in transit; an absent field means no suppression.
 - Transports: WebRTC (browser↔browser), WebTransport or WSS
   (browser↔keeper), TCP (keeper↔keeper). Circuit Relay v2 for NAT
   traversal — and product copy never calls relayed traffic anonymous.
+- **A keeper MUST be a Circuit Relay v2 server unless its operator turns
+  that off.** This is not an optimisation for awkward networks; it is the
+  only path the two ends of a thread have to each other. A driver's phone
+  is behind carrier NAT and a customer's browser has no socket at all, so
+  both can reach a keeper and neither can reach the other. A keeper cannot
+  bridge them with GossipSub instead: the topic is derived from the
+  capability (§20.1), a keeper never holds one, and GossipSub does not
+  forward for topics it has not joined. Relaying needs none of that — the
+  keeper moves an encrypted stream between two peer ids and learns neither
+  the topic nor the capability.
+- **Every protocol here MUST be willing to run over a relayed circuit.**
+  libp2p classifies one as a "limited" connection and refuses protocols
+  that have not opted in. For a phone or a tab the circuit is not a
+  fallback, it is the only connection, so a handler that declines one does
+  not degrade — it disappears, and silently: "the peer did not answer" and
+  "the peer was never asked" are indistinguishable from the caller. This
+  covers the gossip mesh and every stream protocol below (`sync`, `bond`,
+  `thread`, `photo`), because §5.5 catch-up, §5.4 admission and §20.7
+  photo fetch each fail closed and quietly without it.
 - Pubsub: GossipSub v1.1. Message signing **disabled** (records are
   self-validating; peer identity is deliberately not bound to data).
   Message id = first 20 bytes of SHA-256 of the payload. Max payload

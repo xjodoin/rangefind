@@ -289,17 +289,16 @@ Never transmitted in the clear.
 | 11 | planRef | bytes(8) | SHA-256 prefix of the run plan, zeros = none |
 | 12 | stopCount | varint | plan stops the outcome map covers, 0 = none |
 | 13 | outcomes | bytes(⌈stopCount/4⌉) | 2 bits per stop, LSB-first (§5.2.1) |
-| 14 | markFlags | u8 | bit 0 → fields 15–19, bit 1 → fields 20–21, bit 2 → field 22; other bits reserved and **refused** |
+| 14 | markFlags | u8 | bit 0 → fields 15–18, bit 1 → fields 19–20, bit 2 → field 21; other bits reserved and **refused** |
 | 15 | lastStopIndex | varint | present iff bit 0 |
 | 16 | lastOutcome | u8 | present iff bit 0 |
 | 17 | lastReason | u8 | present iff bit 0 (§5.2.1) |
-| 18 | lastPhoto | u8 | present iff bit 0; 0 none, 1 followed by field 19 (§20.7) |
-| 19 | photoHash | bytes(32) | present iff field 18 is 1; SHA-256 of the **sealed** blob |
-| 20 | reasonCount | varint | present iff bit 1; carried reasons (§5.2.1) |
-| 21 | reasons | (varint ‖ u8) × reasonCount | stopIndex, then reason in bits 0–6 and "this mark had a photo" in bit 7. Strictly increasing by stopIndex |
-| 22 | photoCount | varint | present iff bit 2; distinct photo commitments this run has published (§20.7) |
-| 23 | noteLen ‖ note | varint ‖ bytes | operator message, ≤ 64 bytes UTF-8 |
-| 24 | signature | bytes(64) | Ed25519 over fields 1–23 |
+| 18 | lastPhoto | u8 | present iff bit 0; whether this mark carried a proof, 0 or 1 (§20.7) |
+| 19 | reasonCount | varint | present iff bit 1; carried reasons (§5.2.1) |
+| 20 | reasons | (varint ‖ u8) × reasonCount | stopIndex, then reason in bits 0–6 and "this mark had a photo" in bit 7. Strictly increasing by stopIndex |
+| 21 | photoChain | bytes(32) | present iff bit 2; the accumulator over **every** photo commitment this run has published (§20.7.1) |
+| 22 | noteLen ‖ note | varint ‖ bytes | operator message, ≤ 64 bytes UTF-8 |
+| 23 | signature | bytes(64) | Ed25519 over fields 1–22 |
 
 Field 14 was a plain `lastPresent` boolean and bit 0 is still exactly
 that boolean, so a record with no carried reasons and no photos encodes
@@ -396,14 +395,19 @@ customer absent" from a single record.
 `lastOutcome` holds **one** mark and the next mark replaces it. That is
 a data-loss gap, and it is the one this channel is least able to afford.
 A driver marks stop 3 skipped, customer absent, with a doorstep photo,
-in a dead zone; marks stop 4 before coverage returns; and stop 3's
-reason and photo commitment are gone from the wire permanently, because
+in a dead zone; marks stop 4 before coverage returns; and everything
+that lived only in stop 3's record is gone from the wire, because
 nothing re-sends a record and §5.5 catch-up reaches back only
 `THREAD_MAX_AGE`. The board self-heals to "stop 3 skipped" from the
 cumulative map and can never say why. For a courier fleet that sentence
 is the most valuable record of the day.
 
-So fields 20–21 carry the reason for **every** stop the map says is
+Two things lived only in that record: the reason, and the photo
+commitment. Both are carried cumulatively now — the reason as a sparse
+list below, the commitment inside an accumulator (§20.7.1) — and the
+argument is the same for each.
+
+So fields 19–20 carry the reason for **every** stop the map says is
 skipped or failed, sparsely, in every record:
 
 ```
@@ -417,8 +421,9 @@ does: one record after the outage restates the lot.
 
 The reason byte is not just the code. Bits 0–6 are the `lastReason`
 value; **bit 7 says that mark carried a photo commitment** (§20.7). That
-bit is free — the code needs six — and it is the whole of what a
-subscriber can be told about a commitment that never reached it.
+bit is free — the code needs six — and it tells a subscriber which
+skipped or failed stops have proofs behind them without waiting on the
+commitment list (§20.7.1) to say so.
 
 **Reason `0` is carried explicitly, not omitted.** That is what makes a
 *gap* in the list mean something. Against a stop the map says is skipped:
@@ -440,8 +445,8 @@ mark in the record they were holding.
 ##### The cap: bounded, never refused
 
 The list is bounded twice — by `THREAD_MAX_REASONS` (16), and by
-whatever is left of the 213-byte body once the plan, the note and any
-photo commitment have taken theirs. `fitStopReasons` applies both.
+whatever is left of the 213-byte body once the plan, the note and the
+photo accumulator have taken theirs. `fitStopReasons` applies both.
 
 It is **bounded rather than refused**, and the asymmetry with §5.2.2's
 plan-size refusal is deliberate. A plan's size is known before the run
@@ -464,10 +469,20 @@ mechanism exists for.
 
 The 16 is sized on the day the channel is built for. A 200-stop plan
 leaves 57 bytes (§5.2.2); 16 entries cost 33 of them at one-byte stop
-indices and 49 at the widest a 200-stop plan can produce, so the cap is
-reachable at any hour without the reason list ever being the field that
-does not fit. It is also 8 % of a 200-stop day, several times the
-non-delivery rate a courier fleet actually runs at.
+indices and 49 at the widest a 200-stop plan can produce, so on a run
+that takes no photos the cap is reachable at any hour without the reason
+list ever being the field that does not fit. It is also 8 % of a
+200-stop day, several times the non-delivery rate a courier fleet
+actually runs at.
+
+**A run that takes photos reaches the body bound first, and that is the
+one number this design moved.** The accumulator (§20.7.1) is 32 of those
+57 bytes for the life of the run, so a 200-stop day with photos holds 12
+reasons at one-byte stop indices and 8 at the widest — measured, not
+estimated. That is `fitStopReasons` doing exactly what it exists for:
+the newest 8 are kept and the oldest are dropped, and the oldest are the
+ones a listening subscriber almost certainly already received. The gap
+this bound is protecting against is a recent one.
 
 A long **note** can squeeze the list, and is allowed to. Notes are
 operator announcements on the occasional record, not a per-fix field, so
@@ -482,27 +497,51 @@ the driver said so.
 Re-marking a stop overwrites it. A failed attempt that is retried and
 delivered is an ordinary day, not a protocol violation.
 
-Field 19 is a **commitment, never content**: 32 bytes naming a
-proof-of-delivery photo whose bytes travel elsewhere, on demand, over
-§20.7's own protocol. Field 18 is written whenever bit 0 of field 14 is,
-so a mark always says whether a photo exists and the answer is inside the
-signature — a record cannot have a photo attached to it after the fact,
+Field 18 is one byte and it is written whenever bit 0 of field 14 is, so
+a mark always says **whether** a proof exists and the answer is inside
+the signature — a photo cannot be attached to a record after the fact,
 and one cannot be stripped off without breaking the signature. A
-subscriber exposes it as `lastOutcome.photoHash`: lowercase hex, or
-`null`. Hex rather than bytes because every consumer of it uses it as a
-content address — a map key, a DOM attribute, an equality test — and
-none of them wants a `Uint8Array`.
+subscriber exposes it as `lastOutcome.hasPhoto`. It says nothing about
+*which* proof, and needs no fetch to be read, which is the division of
+labour: existence is one signed byte on the mark, identity is the
+accumulator's job.
 
-**Commitments are not carried cumulatively, and cannot be.** A
-commitment is 32 bytes; a second one does not fit the day this channel
-is sized for (§5.2.2 leaves 25 bytes beside the first). §20.7 works the
-consequence through, including the fetch-by-stop design that was
-rejected for it. What the record carries instead is field 22: how many
-distinct commitments the run has published so far. A subscriber holding
-fewer distinct hashes than that knows **exactly how many** proofs it can
-never fetch, and bit 7 of the reason byte names which skipped or failed
-stops they belong to. The loss is real and it is visible, which is the
-most this budget can honestly buy.
+##### Commitments are carried cumulatively too, in one accumulator
+
+The same argument that makes reasons cumulative applies to the proofs
+behind them, and the same 32 bytes that used to name the newest
+commitment now bind every one of them.
+
+Field 21 is a hash chain over every photo commitment the run has
+published:
+
+```
+A₀ = 32 zero bytes
+Aᵢ = SHA-256( "pulsemesh/photo-chain/1" ‖ Aᵢ₋₁ ‖ varint(stopIndex) ‖ commitmentᵢ )
+```
+
+It is re-stated in every record, exactly as the outcome map is, and for
+the same reason: a holder that heard none of an outage needs a value it
+can check a list against, and the only values it will ever have are the
+ones in the records it did receive. The commitment list itself is
+fetched from the publisher over §20.7's protocol and verified against
+that head — §20.7.1 is the whole mechanism, including why a publisher
+restating its own list is not the publisher marking its own homework.
+
+A subscriber exposes it as `photoChain`: lowercase hex, or `null` for a
+run that has taken no photo. Hex rather than bytes because every
+consumer of it uses it as a value — a cache key, an equality test, a log
+line — and none of them wants a `Uint8Array`.
+
+The stop index is inside the hash and not merely alongside it. A
+commitment names a blob; *which door that blob was taken at* is what a
+dispute is about, and it is also the second half of the photo key
+(§20.7), so a list entry cannot be re-pointed at another stop without
+breaking the chain first.
+
+**A run that takes no photo writes nothing.** A₀ is 32 zero bytes, the
+flag bit stays clear, and an all-delivered day pays not one byte for a
+mechanism it never used — §16.4's vector included.
 
 #### 5.2.2 How large a plan can be
 
@@ -516,33 +555,42 @@ varint ≤ 5, `ctLen` varint 2, AEAD tag 16 — leaves **213 bytes** for the
 plaintext body, signature included. Against the widest position varints
 a planet-scale leaf index can produce:
 
-| Note | Max plan stops | …with a photo commitment (§20.7) |
+| Note | Max plan stops | …on a run that has taken a photo (§20.7.1) |
 | --- | --- | --- |
 | none | 428 | 300 |
 | 32 bytes | 300 | 172 |
 | 64 bytes (the maximum) | 172 | 48 |
 
 A 200-stop day — the size this feature is scaled for — fits with **57
-bytes** of note left over, or **25** when the mark carries a photo
-commitment. **A full 64-byte note and a 200-stop plan do not both fit**,
-with or without a photo, and the encoder says so rather than truncating
-either. That is the honest ceiling of a 256-byte record, and raising it
-would mean giving up the fixed record size the whole channel's flood
+bytes** of note left over, or **25** once the run has taken a photo.
+**A full 64-byte note and a 200-stop plan do not both fit**, with or
+without photos, and the encoder says so rather than truncating either.
+That is the honest ceiling of a 256-byte record, and raising it would
+mean giving up the fixed record size the whole channel's flood
 resistance rests on.
 
 Two of those 32 bytes' worth of arithmetic is worth stating plainly.
 The photo flag (field 18) costs one byte on **every** mark, photo or
 not, which is why the no-note figure moved from 432 to 428 and the
-200-stop headroom from 58 to 57; and a commitment costs exactly as much
-as 32 bytes of note, which is why each cell in the third column is the
-row below it in the second. A dispatcher who wants both a full note and
-a 200-stop day with photos has to give something up, and the encoder
+200-stop headroom from 58 to 57; and the accumulator costs exactly as
+much as 32 bytes of note, which is why each cell in the third column is
+the row below it in the second. A dispatcher who wants both a full note
+and a 200-stop day with photos has to give something up, and the encoder
 tells them which.
+
+**The third column is where it was when the record carried a single
+commitment**, and that is the point of §20.7.1: the same 32 bytes, and
+every proof of the run bound rather than the newest one. What changed is
+*when* they are spent. A commitment was written only on the records
+following a mark that carried a photo; the accumulator is written on
+every record for the rest of the run, because a holder needs a head it
+can check a list against and the only heads it has are the ones it
+received. A run that never takes a photo is unaffected either way.
 
 **Every number above is unchanged by the carried reason list**, and that
 is the point of putting it behind a flag bit rather than a count byte. A
 run with nothing skipped or failed and no photos writes none of fields
-20–22 and encodes to the bytes it did before they existed.
+19–21 and encodes to the bytes it did before they existed.
 
 What they cost when a day does need them, measured out of the same
 200-stop body, against its 57 bytes of headroom:
@@ -551,21 +599,24 @@ What they cost when a day does need them, measured out of the same
 | --- | --- | --- |
 | nothing (an all-delivered day) | 0 | 57 |
 | 3 reasons | 7 | 50 |
-| 3 reasons + photo counter | 8 | 49 |
+| 3 reasons + the photo accumulator | 39 | 18 |
 | 16 reasons (`THREAD_MAX_REASONS`), stops < 128 | 33 | 24 |
 | 16 reasons, stops 128–16383 | 49 | 8 |
-| 16 reasons + photo counter, widest | 50 | 7 |
+| 16 reasons + accumulator, widest | 81 | **does not fit** |
 
 One reason entry is a stop-index varint and one byte; the list adds a
-count varint on top; the photo counter is one byte for any run under 128
-photos. The outage this exists for — two stops marked in a dead zone,
-both with reasons and both with photos — costs **six bytes**: a count,
-two pairs, and the counter.
+count varint on top; the accumulator is a flat 32 whatever the run has
+photographed. The outage this exists for — two stops marked in a dead
+zone, both with reasons and both with photos — costs **37 bytes**: a
+count, two pairs, and the accumulator that makes both proofs
+recoverable.
 
-`fitStopReasons` spends only what is there. On a body with no room left
-it keeps the newest entries that fit and drops the rest (§5.2.1); it
-never refuses, and the plan-size refusal above is unchanged and still
-the only thing that does.
+The last row is the only place the two mechanisms compete, and
+`fitStopReasons` is what makes that a trim rather than a refusal: it
+spends only what is there, keeping the newest entries that fit and
+dropping the rest (§5.2.1) — 8 of the 16 on a 200-stop day at the widest
+stop indices. It never refuses, and the plan-size refusal above is
+unchanged and still the only thing that does.
 
 ### 5.3 States
 
@@ -660,11 +711,14 @@ perfectly indistinguishable from real ones. Even a peer that holds the
 same thread cannot tell which of 8 tags a given requester came for.
 
 §20.7 adds a sibling protocol, `/rangefind/pulsemesh/1/photo`, for
-proof-of-delivery blobs. It is deliberately *not* a second magic on this
-one: the two have opposite shapes — catch-up serves 256-byte records to
-anyone from a shared relay cache and gets cheaper as the audience grows,
-while a photo is one ~100 KB transfer that only the publisher can ever
-answer.
+proof-of-delivery blobs and the commitment lists that name them —
+`PMTF`/`PMTB` for a blob, `PMTL`/`PMTA` for a list (§20.7.1),
+magic-discriminated on the one protocol id. It is deliberately *not* a
+second magic on **this** one: the two have opposite shapes — catch-up
+serves 256-byte records to anyone from a shared relay cache and gets
+cheaper as the audience grows, while a photo fetch and the list that
+precedes it can only ever be answered by the publisher, and one of them
+is a ~100 KB transfer.
 
 ## 6. Constants
 
@@ -688,6 +742,7 @@ answer.
 | `THREAD_CACHE_RATE` | 1 rec / 3 s / tag | yes | relay cache admission rate |
 | `THREAD_MAX_REASONS` | 16 | no | carried per-stop reasons in one record; also bounded by whatever the body has left (§5.2.1) |
 | `THREAD_MAX_PHOTO_BYTES` | 131072 | yes | largest sealed proof-of-delivery blob (§20.7) |
+| `THREAD_MAX_PHOTO_LIST` | 1024 | no | entries a PMTA commitment list may carry (§20.7.1). A bound on what a responder can make a holder chew on, not on what a run can take: 1024 entries is 34 KB, a third of one photo |
 | `THREAD_CERT_INTERVAL` | 60 s | yes | how often a route-day publisher re-emits its PMTC (§21) |
 | `THREAD_HELD_RECORDS` | 32 | yes | records held awaiting the day's certificate (§21) |
 | `THREAD_MAX_CERT_SECONDS` | 172800 (48 h) | **tighten only** | longest certificate window a subscriber honours (§21.5). Unset in `THREAD_CONSTANTS`; a host that sets it lower wins, higher is ignored |
@@ -1233,17 +1288,18 @@ ea6ddf8df6554e6a47f074ca1de7227eae05ceeeeb8fc01365a1e9bab637909e
 
 ```
 src/pulsemesh/thread_crypto.js   HKDF-from-P, tag/rendezvous, seal/open, Ed25519,
-                                 the seed-derived photo key schedule       (§4, §5.1, §20.7)
+                                 the seed-derived photo key schedule, the photo
+                                 accumulator                    (§4, §5.1, §20.7, §20.7.1)
 src/pulsemesh/ed25519.js         RFC 8032 + SHA-512 fallback for hosts without it    (§5.1)
 src/pulsemesh/x25519.js          RFC 7748 fallback for hosts without WebCrypto X25519  (§20.9)
-src/pulsemesh/thread_codec.js    PMT1/PMTP/PMTC/PMR1/PMM1/PMTF/PMTB + link encode/decode
-                                                                          (§5, §20.7, §21)
+src/pulsemesh/thread_codec.js    PMT1/PMTP/PMTC/PMR1/PMM1/PMTF/PMTB/PMTL/PMTA + link
+                                 encode/decode                            (§5, §20.7, §21)
 src/pulsemesh/thread_publish.js  publisher state machine, snap-driven, modes         (§5.3, §11)
 src/pulsemesh/thread_consume.js  validation, seq ledger, staleness                   (§7)
 src/pulsemesh/thread_cache.js    catch-up ring buffers, padded PMR1, admission caps  (§5.5, §8)
 src/pulsemesh/thread_session.js  the channel wired to a transport: gossip tap, tag
-                                 rotation, relaying, catch-up, discovery, photo
-                                 fetch and serve                      (§4.2, §5.5, §6, §20.7)
+                                 rotation, relaying, catch-up, discovery, photo and
+                                 commitment-list fetch and serve      (§4.2, §5.5, §6, §20.7)
 src/pulsemesh/thread_ticket.js   PMP1 run plan, PMK1 ticket, PMJ1 job offer, jobId   (§20)
 src/pulsemesh/thread_seal.js     PMV1 device card, PME1 sealed ticket, enrolment    (§20.9)
 src/pulsemesh/thread_seed.js     PMH1 seed card, dialability filter               (§20.10)
@@ -1428,11 +1484,15 @@ behaviour, not where the code merely looks right.
 - [x] A plan too large to encode is refused at encode time with the
       number of stops that would have fitted, rather than producing a
       record over `THREAD_MAX_RECORD_BYTES` (§5.2.2).
-- [x] **A dead zone costs no reasons.** A publisher marks two stops with
-      reasons and photos while its transport drops every record; on
-      reconnection a subscriber that heard none of it recovers both
-      stops' outcomes *and* both reasons from the next ordinary record,
-      which is not a retransmission of anything (§5.2.1).
+- [x] **A dead zone costs no reasons and no proofs.** A publisher marks
+      three stops with reasons and photos while its transport drops every
+      record; on reconnection a subscriber that heard none of it recovers
+      every stop's outcome *and* reason from the next ordinary record,
+      which is not a retransmission of anything, and recovers **all
+      three commitments** from the publisher's list checked against the
+      accumulator in that one record — then fetches a sealed blob and
+      verifies it against a commitment it never received directly
+      (§5.2.1, §20.7.1).
 - [x] Reasons are carried for every skipped or failed stop and for no
       other, reason `0` included — so a gap in the list is a **lost**
       reason and `stopReasonFor` reports `reasonKnown: false` rather than
@@ -1445,18 +1505,23 @@ behaviour, not where the code merely looks right.
       overflowing 213 bytes (§5.2.1).
 - [x] The common case pays nothing: an all-delivered day and a run with
       nothing marked encode **byte-identically** to the same body without
-      fields 20–22, the §16.4 vector's 31-byte preimage included, and the
-      whole §5.2.2 stop table is unmoved. The outage day costs six bytes
-      (§5.2.2).
+      fields 19–21, the §16.4 vector's 31-byte preimage included, and the
+      whole §5.2.2 stop table is unmoved — including its photo column,
+      because the accumulator costs what the single commitment cost. The
+      outage day costs 37 bytes: 5 for two reasons, 32 for every proof
+      the run will ever publish (§5.2.2).
 - [x] Carried reasons are inside the signature, ascend strictly by stop
       index whatever order the driver marked in, and a duplicated entry,
       a zero stop index, an over-wide reason code and a reserved bit in
       the mark-flags byte are each refused rather than skipped (§5.2).
-- [x] A superseded photo commitment is lost **visibly**: the record says
-      how many commitments the run has published and which skipped or
-      failed stops carried one, `hasPhoto` is `null` rather than `false`
-      where nothing says, and no fetch-by-stop exists that would let a
-      publisher restate a commitment after the fact (§20.7.1).
+- [x] A superseded photo commitment is **recoverable**, and only against
+      a value the publisher signed at the door: a list that inserts,
+      drops, reorders, substitutes or re-doors an entry reaches no signed
+      accumulator and is refused in full, over the wire as well as in the
+      codec. A holder with a stale accumulator verifies the matching
+      prefix and returns the rest as `unverified`, named by stop, rather
+      than accepting or hiding it. No fetch-by-stop exists that would let
+      a publisher restate a commitment against nothing (§20.7.1).
 - [x] Stops marked skipped or failed leave the ETA chain, and the
       subscriber's own stop, so marked, yields a result with no arrival
       time in it at all (§9.1).
@@ -1476,12 +1541,14 @@ behaviour, not where the code merely looks right.
       the ciphertext, a wrap or the ephemeral key fails to open (§20.9).
       X25519 matches RFC 7748 §5.2 and §6.1 and agrees with WebCrypto
       where the host has it.
-- [x] A proof-of-delivery photo puts a 32-byte commitment inside the
-      signed record and never a byte of image on gossip; the sealed bytes
-      travel only on request; the key derives from the run seed, so a
-      holder of the 45-byte link cannot open one; fetched bytes are
-      refused unless they hash to the commitment; an oversized photo and
-      a photo on a coarse run are both refused at `markStop` (§20.7).
+- [x] A proof-of-delivery photo binds its commitment inside the signed
+      record — through the 32-byte accumulator, which is the same 32
+      bytes the single commitment cost and covers the whole run — and
+      never puts a byte of image on gossip; the sealed bytes travel only
+      on request; the key derives from the run seed, so a holder of the
+      45-byte link cannot open one; fetched bytes are refused unless they
+      hash to the commitment; an oversized photo and a photo on a coarse
+      run are both refused at `markStop` (§20.7).
 - [x] A bootstrap address rides **inside the signed preimage**: it
       round-trips at 1 and 3 addresses, the count, byte and
       not-a-multiaddr caps are refused by name, a set flag with nothing
@@ -1922,8 +1989,10 @@ that photo against the job. Nothing about that requires putting an image
 on a gossip mesh, and putting one there would end the channel.
 
 **The rule: the record carries a commitment, the bytes travel
-separately.** A mark's field 19 is `SHA-256` of the *sealed* blob, 32
-bytes, inside the signed preimage (§5.2). The blob itself is fetched on
+separately.** A commitment is `SHA-256` of the *sealed* blob, 32 bytes,
+and it is inside the signed preimage — bound there by field 21's
+accumulator, which covers every commitment the run has published
+(§5.2.1, §20.7.1). The blob itself is fetched on
 demand over `/rangefind/pulsemesh/1/photo`, and only by someone who
 asks. That keeps every property the 256-byte record buys: flood
 resistance rests on a fixed record size, `THREAD_CACHE_RING` caches 240
@@ -1937,76 +2006,135 @@ bound to one specific set of bytes at the moment of the mark; a photo
 substituted afterwards fails the hash, and a photo removed afterwards
 fails the signature.
 
-#### 20.7.1 A commitment published into a dead zone is lost, and says so
+#### 20.7.1 A commitment published into a dead zone is recovered, not lost
 
-The record carries **one** commitment, for the most recent mark, and the
-next mark replaces it. A driver who photographs stop 3 and then marks
-stop 4 before regaining coverage has published stop 3's commitment to
-nobody, and it is gone: the photo is still on the device, and no longer
-addressable by anyone who wants it, because the thing that addressed it
-was the commitment.
+A record used to carry **one** commitment, for the most recent mark, and
+the next mark replaced it. A driver who photographed stop 3 and then
+marked stop 4 before regaining coverage had published stop 3's
+commitment to nobody, and it was gone: the photo was still on the
+device, and no longer addressable by anyone who wanted it, because the
+thing that addressed it was the commitment.
 
 §5.2.1 fixes the *reason* half of that by carrying reasons cumulatively.
-The commitment half cannot be fixed the same way, and the honest
-statement of why is worth more than a mechanism that pretends otherwise.
+This is the other half, and it costs the same 32 bytes the single
+commitment did.
 
-**Carrying the most recent K commitments.** A commitment is 32 bytes.
-§5.2.2 leaves a 200-stop day 25 bytes of headroom *with* the first one,
-so K = 2 does not fit the day the feature exists for, let alone K = 4.
-Made budget-adaptive it collapses back to K = 1 on exactly the days it
-was supposed to help. Rejected: it buys nothing where it is needed and
-costs 32 bytes where it is not.
+**The accumulator.** Field 21 is a hash chain over every photo
+commitment the run has published, in publication order:
 
-**Making a photo addressable by `(planRef, stopIndex)` in the fetch
-protocol.** Tempting — a dispatcher could then ask for "the photo for
-stop 3" without holding its commitment — and rejected, because it
-quietly trades away the property this whole section exists for. The
-commitment is evidence *because a signed record committed to it before
-it was fetched*. A fetch keyed on the stop has to return something the
-requester can check, so the publisher would have to state the hash in
-the response — and the publisher is the party who might lie. That is not
-a verification, it is the publisher marking its own homework: the driver
-could photograph a doorstep at 18:00 and serve it as stop 3's proof, and
-the dispatcher would have no way to tell. A *signed* re-statement is no
-better; it is still a statement made after the fact, and the temporal
-binding — committed at the door, inside a record whose `unixSeconds` and
-`seq` place it there — is the entire value in a dispute. **Convenience
-is not worth the evidence property**, and a fetch-by-stop that returned
-un-verifiable bytes would be worse than no fetch, because a dispatcher
-would believe it.
+```
+A₀ = 32 zero bytes
+Aᵢ = SHA-256( "pulsemesh/photo-chain/1" ‖ Aᵢ₋₁ ‖ varint(stopIndex) ‖ commitmentᵢ )
+```
 
-**What is implemented instead: the loss is made countable and visible.**
+It lives in the signed preimage and is re-stated in every record, like
+the outcome map. One field, one size, whatever the run has photographed.
 
-- Field 22 carries **how many distinct commitments the run has
-  published**. A subscriber that holds fewer distinct hashes than that
-  knows exactly how many proofs it will never be able to fetch. One byte
-  for any realistic day, and it is written only by a run that has taken
-  a photo at all.
-- Bit 7 of each carried reason byte (§5.2.1) says **that mark had a
-  photo**, so a skipped or failed stop whose commitment was superseded
-  is identifiable by name, not merely by a count.
-- Nothing reports a missing proof as an absent one. `stopReasonFor`
-  returns `hasPhoto: null` where nothing it holds says, never `false`.
+**Recovery.** A holder asks the publisher for the commitment list
+(`PMTL`, below), naming an accumulator it holds. The publisher answers
+with `[(stopIndex, commitment), …]` in publication order. The holder
+recomputes the chain from A₀ and checks it reaches the accumulator —
+which came out of a record the publisher **signed and gossiped at the
+door**. Then each sealed blob is fetched and verified against its now
+trusted commitment exactly as before.
 
-So the residue is stated rather than hidden: **the commitment for a mark
-that was superseded before its record reached anyone is unrecoverable,
-and the driver's device should re-mark the stop.** Re-marking overwrites
-(§5.2.1), re-seals under the same per-stop key and publishes a fresh
-commitment, and the sealed blob it names is still on the device — the
-publisher evicts nothing for the life of the run. That is a real
-operational answer, and it is one the dispatcher can now know to ask
-for, which before this it could not.
+**Why this is not the publisher marking its own homework.** The
+fetch-by-stop design rejected below has the publisher state a hash in a
+response, after the fact, with nothing to check it against; a dispatcher
+who believed it could be handed a doorstep photographed at 18:00 as stop
+3's proof. Here the publisher also restates commitments — and every one
+of them is checked against a value it committed to *before anyone asked*,
+inside a record whose `unixSeconds` and `seq` place it at the door.
+Insert an entry, drop one, reorder two, swap a commitment, or move one to
+another stop index, and the chain no longer reaches a value the publisher
+already signed. The temporal binding, which is the entire value in a
+dispute, is unchanged: what moved is *where the bytes travel*, not when
+the commitment was made.
 
-A UI that shows a delivery board SHOULD surface the shortfall rather
-than a clean-looking page: "2 of 5 proofs unavailable" is the true
-statement, and "no photo" is not.
+The stop index is inside the hash, which closes the one substitution the
+commitment alone would not: the same blob offered as the proof for a
+different door. It is also the second half of the photo key (§20.7), so
+an entry that lies about its stop names a key that opens nothing.
 
-**Wire.** Two records, magic-discriminated as everywhere else. `PMTF`
-and `PMTB` rather than a `PMx1` pair, because the traffic channel
-already owns `PMF1` (cell fetch) and `PMG1` (digest) and every `PMx1`
-slot the thread channel reserves is taken; these follow `PMTP`'s
-precedent instead — a `PMT` prefix a traffic-only implementation already
-ignores (§1), with a fourth letter naming the record.
+**A stale accumulator verifies a prefix, and says so.** A holder's
+newest record is routinely older than the newest photo — that is the
+normal state of a lossy channel, not an exceptional one. So verification
+is not all-or-nothing: the prefix of the list that reproduces the held
+accumulator *is* evidence, and everything past it is a claim the holder
+has not yet seen signed. `verifyPhotoChain` returns them apart, with stop
+indices on both:
+
+```js
+const { matchedAt, verified, unverified } = await follow.fetchPhotoList();
+```
+
+`matchedAt` is where the held head landed. `verified` is safe to fetch
+and to believe; `unverified` is named so a board can say *which* proofs
+it cannot yet vouch for, and must not be fetched on. `matchedAt === 0`
+against a non-empty list means no prefix reaches the head at all: the
+list belongs to another run, or the publisher rewrote it, and nothing in
+it is accepted.
+
+**What was rejected.**
+
+- **Carrying the most recent K commitments.** A commitment is 32 bytes.
+  §5.2.2 leaves a 200-stop day 25 bytes of headroom *with* one, so K = 2
+  does not fit the day the feature exists for, let alone K = 4. Made
+  budget-adaptive it collapses back to K = 1 on exactly the days it was
+  supposed to help. It buys nothing where it is needed and costs 32 bytes
+  where it is not — and the accumulator covers *all* of them for those
+  same 32.
+
+- **Truncating: 8-byte prefixes of several commitments instead of a
+  chain.** Second-preimage resistance at 64 bits is genuinely strong for
+  this threat model, so that is not why this was rejected. Coverage is:
+  four 8-byte prefixes cover the newest four photos, and a 200-stop day
+  with 40 of them still loses most. It also breaks the addressing —
+  `PMTF` is keyed by a full SHA-256 of ciphertext, and a prefix would
+  make it a prefix lookup where the publisher chooses which blob to hand
+  back. The chain recovers *every* commitment, at a flat 32 bytes,
+  without touching content addressing.
+
+- **A Merkle root instead of a chain.** It would let a publisher prove
+  one entry in O(log n) rather than restating the list — but the list is
+  at most a few hundred entries (~7 KB, §5.2.2 bounds the plan), which is
+  a fraction of the one ~100 KB blob it exists to make fetchable. Nothing
+  to buy, and a sibling-path format to specify.
+
+- **Making a photo addressable by `(planRef, stopIndex)` in the fetch
+  protocol.** Tempting — a dispatcher could then ask for "the photo for
+  stop 3" holding nothing at all — and still rejected, for the reason
+  above: a fetch keyed on the stop has to return something the requester
+  can check, and the publisher's own re-statement is not that. A *signed*
+  re-statement is no better; it is still a statement made after the fact.
+  **Convenience is not worth the evidence property**, and a fetch-by-stop
+  that returned un-verifiable bytes would be worse than no fetch, because
+  a dispatcher would believe it. The accumulator gives the same
+  convenience without the trade, because the check exists.
+
+**Field 22's photo counter is gone**, and was removed rather than kept.
+It existed to make an unrecoverable loss countable — "you are missing
+two proofs you will never fetch" — and there is no such loss to count
+now. A verified list *is* the count, and keeping a separate signed
+integer beside it would be a second source of truth that can disagree
+with the chain and cannot be checked against it.
+
+A UI that shows a delivery board SHOULD still distinguish what it has
+verified from what it merely knows exists: a mark's `hasPhoto` says a
+proof exists with no fetch at all, `verified` says which ones this device
+can vouch for, and `unverified` says which are newer than anything it
+holds. `stopReasonFor` keeps its own discipline unchanged — `hasPhoto:
+null` where nothing it holds says, never a cheerful `false`.
+
+**Wire.** Four records, magic-discriminated as everywhere else, on the
+one protocol id. `PMTF`/`PMTB` rather than a `PMx1` pair, because the
+traffic channel already owns `PMF1` (cell fetch) and `PMG1` (digest) and
+every `PMx1` slot the thread channel reserves is taken; these follow
+`PMTP`'s precedent instead — a `PMT` prefix a traffic-only
+implementation already ignores (§1), with a fourth letter naming the
+record. `PMTL`/`PMTA` take the same shape one step further: `F` fetches
+a blob and `B` is the blob, `L` asks for the list and `A` is the
+accumulator's list.
 
 - **PMTF** (request): `"PMTF"` ‖ commitment bytes(32). No `epochPrefix8`,
   unlike PMR1: a tag only means something inside an epoch, while a
@@ -2016,6 +2144,32 @@ ignores (§1), with a fourth letter naming the record.
   length means "not held"**, and is also the answer to a hash this peer
   has never seen — the PMM1 rule again: a responder MUST NOT let a prober
   distinguish "I am not publishing that run" from "no such photo".
+- **PMTL** (request): `"PMTL"` ‖ accumulator bytes(32) — §20.7.1's chain
+  head, which is the whole of the addressing. No `epochPrefix8` and no
+  tag, for PMTF's reason and one more: a tag is a stable-for-300-seconds
+  name a prober could correlate, while an accumulator changes with every
+  photo and can only be obtained by opening a record, which takes `P`.
+  Asking with one is already proof of being in the audience. A₀ is
+  **refused** at both ends: a run with no photos has no list, and zeros
+  would match every run at once.
+- **PMTA** (response): `"PMTA"` ‖ count varint ‖ count × ( stopIndex
+  varint ‖ commitment bytes(32) ), **in publication order** — a responder
+  that sorts or dedupes this has produced a list that verifies against
+  nothing. **Count 0 means "not held"**, the PMM1 rule again, and is also
+  the answer to an accumulator this peer has never seen. `count` is
+  bounded by `THREAD_MAX_PHOTO_LIST` (§6).
+
+A publisher answers a `PMTL` naming **any** head it has ever published,
+not only its current one — a holder's newest record may be several
+photos old, and answering only the current head would make recovery
+depend on being up to date, which is exactly the state an outage leaves
+a holder out of.
+
+The list is served whole rather than incrementally. A `sinceCount` in
+the shape of PMR1's `sinceSeq` was considered and is not worth its
+complexity here: verification anchors at A₀, so a holder recomputes the
+prefix regardless, and the largest list a plan can produce is ~7 KB
+against the ~100 KB blob it is the prelude to.
 
 **Sealing.** AES-256-GCM under a per-stop key, with a fresh CSPRNG
 12-byte IV **prepended** to the ciphertext. This deliberately breaks the
@@ -2023,7 +2177,8 @@ ignores (§1), with a fourth letter naming the record.
 transmitted, and it has to: a photo has no sequence number and is
 addressed by content hash, so there is nothing to derive a nonce from.
 There is no AAD for the same reason — the binding a record needs comes
-from the signed commitment, not from the blob's framing.
+from the signed accumulator over the commitment, not from the blob's
+framing.
 
 ```
 K_photo = HKDF-SHA256(ikm = privateSeed, salt = "",
@@ -2039,8 +2194,8 @@ minting the ticket — the named inversion of §4.1. A customer holds the
 seed is not in it, is not derivable from it, and never appears on the
 wire. **A customer therefore cannot open a delivery photo, whatever they
 do with the bytes.** A UI shown to a link-only holder should say a photo
-is attached — the commitment is public and honest — and must not attempt
-the fetch. Giving customers their own photos is a real product question
+is attached — the mark's `hasPhoto` is public and honest — and must not
+attempt the fetch. Giving customers their own photos is a real product question
 and a v2 one: it needs a second wrapping to a subscriber-held key, and
 that is a key-distribution problem this protocol does not currently
 have.
@@ -2091,16 +2246,32 @@ loud rather than happening because nobody thought about it.
 
 ```js
 await run.markStop(3, STOP_OUTCOME.DELIVERED, { photo });   // photo: Uint8Array, already compressed
-// …on the dispatcher, holding the ticket's seed:
-const sealed = await follow.fetchPhoto(update.lastOutcome.photoHash);
-const bytes = await openPhoto(sealed, { privateSeed, planRef, stopIndex, hash });
+
+// …on the dispatcher, holding the ticket's seed. One list fetch, checked
+// against the accumulator in the newest record this follow accepted:
+const { verified, unverified } = await follow.fetchPhotoList();
+for (const { stopIndex, commitment } of verified) {
+  const sealed = await follow.fetchPhoto(commitment);
+  const bytes = await openPhoto(sealed, { privateSeed, planRef, stopIndex, hash: commitment });
+}
 ```
+
+`fetchPhotoList` defaults to the newest accumulator the follow holds —
+the strongest one available, and the one that leaves the fewest entries
+unverified. It recomputes the chain before returning and refuses a list
+no prefix of which reaches that head, counting the refusal rather than
+throwing so one lying peer cannot end the fetch.
 
 `fetchPhoto` verifies the commitment before returning and skips a peer
 that answers with anything else; `openPhoto` checks it again, first,
 before importing a key, and throws rather than returning null — a caller
 rendering a proof of delivery must not be able to ignore the failure by
 accident.
+
+The list costs one round trip that the single commitment did not, and it
+is a round trip per *accumulator*, not per photo: a board caches the
+verified commitments and refetches only when the head moves. A run that
+takes no photos never makes the request at all.
 
 ### 20.8 Per-stop delivery metadata
 
@@ -2484,6 +2655,19 @@ kind of over-engineering that stops a small operator ever shipping. Ten
 drivers who can all dial one known machine have a working mesh: gossip
 finds the topics, catch-up finds the history, and there is nothing for a
 DHT to discover because every participant already has one peer in common.
+
+**With one correction, learned the hard way.** "Every participant has one
+peer in common" is not by itself a mesh, and believing it was cost a
+working demo: a real driver reached a real keeper, a real browser reached
+the same keeper, and nothing crossed. Sharing a peer only connects two
+devices if that peer carries what passes between them, and a keeper
+*cannot* do that with gossip — the topic is derived from the capability,
+which it must never hold, and GossipSub does not forward for topics it
+has not joined. What makes the sentence true is Circuit Relay v2: the
+keeper relays, driver and customer take reservations, and they dial each
+other *through* it. The keeper still learns nothing — two peer ids and an
+encrypted stream. It is on by default in the keeper (`--relay=off` to
+decline) and everything on this page assumes it.
 **The seed is that peer.** `scripts/pulsemesh_keeper.mjs` already *is*
 it — headless, `--listen`, `--bootstrap`, the same store and the same
 validation, availability and never authority (§12) — and what §20.10 adds
