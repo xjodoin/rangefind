@@ -416,11 +416,15 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     stamp: new Uint32Array(leafNodes + 8),
     generation: 0,
     ensure(size) {
-      if (this.dist.length >= size) return;
-      this.dist = new Float64Array(size);
-      this.boundaryMask = new Uint8Array(size);
-      this.witnessed = new Uint8Array(size);
-      this.stamp = new Uint32Array(size);
+      if (this.dist.length < size) {
+        this.dist = new Float64Array(size);
+        this.boundaryMask = new Uint8Array(size);
+        this.witnessed = new Uint8Array(size);
+      }
+      if (this.stamp.length < size) this.stamp = new Uint32Array(size);
+    },
+    resetStamp() {
+      this.stamp.fill(0);
       this.generation = 0;
     },
     nextGeneration() {
@@ -437,6 +441,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   // 160 MiB column at each of India's five levels.
   let overlayLocalIndex;
   const computeBucketOverlays = (bucket) => {
+    cliqueArenas.resetStamp();
     const cliques = [];
     {
       const leafCliques = new Map();
@@ -572,6 +577,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       overlays.push(graphs);
       log(`overlays (${buckets[bucket].name}): level ${level}/${levelCount + 1} graph complete`);
       if (level > levelCount) break;
+      // buildOverlayGraphs has just used the shared column as its global to
+      // local lookup. Clear it once, then reuse the same 160 MiB India arena
+      // as generation stamps for every boundary search at this level.
+      cliqueArenas.resetStamp();
       const levelCliques = new Map();
       for (const [cell, overlay] of graphs) {
         const boundary = [];
@@ -775,6 +784,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   }
 
   overlayLocalIndex = new Uint32Array(nodeCount);
+  cliqueArenas.stamp = overlayLocalIndex;
   const bucketOverlays = buckets.map((_, bucket) => computeBucketOverlays(bucket));
   const overlays = bucketOverlays[0];
   if (options.releaseSource === true) {
