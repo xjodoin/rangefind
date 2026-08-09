@@ -679,6 +679,358 @@ nothing back.
   bridge does not widen it, and the allowlist narrows it for fleets that
   want the trade.
 
+## Bootstrapping a region: the ingest node
+
+A region's live layer needs contributors, and contributors need a live
+layer worth opening the app for. `scripts/pulsemesh_ingest.mjs` (module:
+`src/pulsemesh/ingest.js`) breaks that circle with infrastructure that
+already measures the roads: municipal detector feeds, camera analytics
+APIs, 511-style event feeds. It is a bonded peer like any other — its
+records are ordinary proofless PMC1/PMI1 bytes, validated by every
+receiver's §6 rules, rate-limited by rule 7, and trust-charged when they
+are wrong. Like a keeper, it adds availability, never authority.
+
+```
+node scripts/pulsemesh_ingest.mjs --epoch=<sourceHash> --graph=<dir> \
+  --config=./sources.mjs --bootstrap=<a keeper's multiaddr>
+```
+
+Sources are plain objects in the config module (see
+`examples/pulsemesh-ingest/sources.example.mjs`): either declarative
+(`{ id, intervalSeconds, url, map }` — a JSON GET the script wraps) or
+imperative (`{ id, intervalSeconds, fetch }` — anything else: XML,
+protobuf, an SDK). Both resolve to flow observations (`lat`, `lon`,
+`speedKmh`, optional `bearingDeg` to pick the approach) or incident
+observations (`lat`, `lon`, a §2.6 type). The module owns everything
+after that: `snap()` map-matching, leaf-fact warming, class gating and
+the rule 10 clamp, encoding, and pacing. A config may also export
+`options` (re-emit window, copies, gates) which the CLI passes through,
+so a region's tuning lives next to its feeds.
+
+A worked region config ships for Québec — the initial test zone, graph
+`bench/route/quebec-index` —
+(`examples/pulsemesh-ingest/sources.quebec.mjs`), reading the MTMD's
+public WFS behind Québec 511
+(`ws.mapserver.transports.gouv.qc.ca/swtq`, GeoJSON with
+`srsname=EPSG:4326`): `ms:evenements` (live events, cause/entrave
+vocabulary mapped onto §2.6, free-text advisories deliberately dropped),
+`ms:chantiers_mtmdet` (works registry filtered to its active window and
+to closures + major hindrances, capped per fetch), and
+`ms:conditions_routieres` (winter surface/visibility, empty all summer).
+Québec publishes no live speed feed, so this region bootstraps with
+incident pins only; the compass `direction` field ("SUD et NORD" — both
+carriageways; a single word resolves to a bearing against the feature's
+own geometry) picks the approach.
+
+The honest constraints, designed in rather than worked around:
+
+- **Copies are stated repetition, not witnesses.** A flow observation is
+  published as `--copies` records (default `AGG_MIN_REPORTS`, 3) with
+  fresh `reportId`s, because a receiver aggregates nothing below 2
+  records and caps confidence as a hint below 3. That is one operator
+  saying the same thing three times over one bond — the records ride the
+  same delivering peer, and rules 10–12 charge that peer for every one
+  of them that lies.
+- **Incidents cap at hint tier, structurally.** §8.5 scores
+  `min(raw, distinct delivering peers)`: a single ingest node's crash
+  report can never reach `INCIDENT_SHOW_SCORE`, never routes, and
+  multiplying records changes nothing. The node publishes them anyway —
+  a hint pin is useful — but the *speed* records are what carry the
+  authority, which is exactly the "measurements ratify claims" rule
+  working as intended.
+- **Congestion only, by default.** A free-flowing road is what the
+  static metric already says; publishing it spends the rule 7 budget
+  (2 records/s sustained per delivering peer at every receiver) on
+  noise. The node publishes jams, plus recovery readings on segments it
+  recently reported congested so a cleared jam decays by evidence, not
+  only by TTL. `--publish-free` turns the gate off. When the budget
+  still bites, jams drain before free flow and shed backlog is counted
+  in stats, never silent.
+- **Feed staleness is bounded, then re-stamped.** Records are stamped at
+  publish time — MAX_AGE_RECEIPT (45 s) would reject most polling
+  cadences otherwise — and the `--max-feed-age` gate (default 300 s) is
+  what keeps that stamp honest: an event a feed has stopped refreshing
+  stops being republished as current.
+
+An ingest node stakes its bond on its feeds. A feed that reports
+implausible speeds costs the node −500 trust per record at every
+leaf-holding receiver, and a floored peer forfeits its bond (§8.4) — so
+a bad feed silences its operator, not the mesh.
+
+### Registry closures become routable speed states
+
+An incident pin from one peer never routes (hint tier, and §9's penalty
+is anchored on speed aggregates anyway), and protocol v1 has no hard
+closure — closures are expressed through speed. So a source may mark an
+incident `closedRoad: true` — reserved for **full closures stated by
+the road authority** — and the ingest node additionally maintains a
+near-zero speed state (`closureSpeedKmh`, default 2 km/h, `copies`
+records re-emitted inside CONTRIB_TTL) on the matched approach(es). The
+router prices the segment as impassable and routes around it — exactly
+"closures are exact under the live metric wherever states exist". This
+deliberately synthesizes a measurement from a claim; the operator's
+bond carries it, and the state stops being refreshed the moment the
+feed stops asserting the closure (one poll plus TTL and it is gone).
+On the demo map closures draw as a no-entry sign labeled "Road closed"
+rather than a generic incident dot.
+
+### Cameras: count the cars, let the road price itself
+
+For regions whose only speed-shaped signal is traffic cameras,
+`src/pulsemesh/ingest_camera.js` turns frames into flow observations:
+`createCameraTrafficSource` (fetch frame → analyze → observation, with
+per-camera failure isolation) around a pluggable `analyze` seam.
+
+The default analyzer needs **no AI model and no external service**:
+`createPixelCameraAnalyzer` (`src/pulsemesh/ingest_camera_pixels.js`,
+pure JS; JPEG decoding via the optional peer dependency `jpeg-js`, or
+inject your own `decode`). A fixed camera is the easiest CV setting
+there is — the road never moves — so a per-camera running-median
+background, foreground blobs, and an area correction for merged queues
+yield a vehicle count; identical foreground across two polls minutes
+apart is a standing queue and reports "stopped" outright. On the
+classic I-80 congestion photo it finds 47 distinct vehicles at 27.9%
+road occupancy (area-corrected estimate 70). It refuses what it cannot
+judge — night frames, a PTZ preset change (whole-scene diff resets the
+background), warm-up — and a refused frame publishes nothing.
+
+The count is not the congestion; the **road graph is what interprets
+it**. A `vehicleCount` observation is extrapolated against the matched
+segment's own capacity: lanes from its class (per-camera override),
+`visibleMeters` from the camera, density = count / (lanes × visible
+km), and Greenshields' fundamental diagram (v/vf = 1 − k/k_jam,
+k_jam 140 veh/lane-km) against the segment's free-flow. Twelve cars on
+the A-40 and twelve cars on a village street produce different, honest
+speeds.
+
+**Direction is stated, never inferred.** A count carries no direction of
+its own, and at a snapped point on a divided road the two carriageways
+and their approaches are four candidate segments within a metre or two —
+so an undirected observation would land on one of them by float
+ordering. A camera therefore declares `directions: [{ name, roi,
+bearingDeg, lanes }]`, one entry per carriageway in view. Each is
+analyzed as its own view of the frame — its own region, its own
+background model — and becomes its own observation, resolved to the
+approach matching its heading and priced against *that* approach's
+free-flow. This matters more than it sounds: in the fixture graph the
+two directions of one road have free-flow speeds of 89 and 29 km/h, so
+the busy carriageway can legitimately read faster than the quiet one.
+A camera on an undivided road sets `bothDirections: true` instead, and
+its count is **split** between the two approaches rather than duplicated
+onto each — a count is extensive, while a congestion ratio or a speed is
+intensive and applies to both unchanged. A camera that states none of
+the three is skipped and tallied in `stats.undirected`, the same
+fail-closed rule the analyzer applies to a frame it cannot read.
+Per-camera calibration, in order of leverage: `roi` (which pixels are
+that carriageway), `bearingDeg`, `visibleMeters`, `lanes`.
+
+`createClaudeCameraAnalyzer` (Claude Haiku vision, structured-output
+enum, optional peer dep `@anthropic-ai/sdk`, ~$0.002/frame) remains as
+an alternative analyzer for cameras the pixel path refuses too often —
+its classification rides the same seam as a `congestionRatio`
+observation.
+
+### Reaching camera images
+
+Where a feed serves images only to a browser session,
+`src/pulsemesh/ingest_camera_browser.js` supplies the `fetchImage` seam
+(optional peer dep `playwright`) in two shapes:
+
+- `createGalleryImageFetcher` — **the one to prefer.** It opens the
+  operator's own gallery page in a real browser and keeps the pictures
+  that page loads by itself. The URLs are the operator's, any
+  cache-busting token they mint is theirs, and one page view yields
+  every camera on that page — the same load as one person looking at
+  it. Requests are serialised and a page's pictures are reused until
+  `refreshMillis` elapses.
+- `createBrowserImageFetcher` — the general case, for feeds whose images
+  can be requested directly: one request at a time, a floor on their
+  spacing, and a single re-session before a refusal is reported as one.
+
+Both drive a **real** browser rather than imitating one. Neither forges
+a URL, answers a challenge the browser itself cannot, rotates identity
+to get around a refusal, nor touches anything behind a login; a block is
+reported, not worked around. Headless is refused outright by some
+operators (Québec 511 among them — the page itself 403s), and making a
+headless browser look otherwise would be exactly the impersonation this
+avoids, so the gallery reader defaults to a real window.
+
+For Québec the whole path is derivable from the open data:
+`ms:infos_cameras` gives each camera its position, route and
+`NumeroCamera`; the number's first letter names the diffusion server
+(M→Montreal, Q→Quebec, T→TroisRivieres, G→Gatineau) and the rest is the
+image filename; the route gives the gallery page. All **675 cameras
+across 72 route galleries**, with no scraping needed to find them.
+`createQuebecCameraSource()` in
+`examples/pulsemesh-ingest/sources.quebec.mjs` wires that together.
+Direction calibration is per camera and human: `CAMERA_CALIBRATION`
+carries the per-carriageway regions for cameras you have looked at, and
+anything absent falls back to the stated coarse default
+(`bothDirections`, count split between approaches) rather than a guess.
+
+### Buying only what the mesh cannot answer
+
+Cameras and 511 feeds bootstrap a region cheaply but unevenly: they
+cover the roads somebody chose to instrument, and nothing else. The gap
+is fillable from a commercial flow API, but paying for a whole region
+continuously is the opposite of what a mesh is for — and most of what
+you would buy back is a free-flowing road, which is what the static
+metric already says.
+
+`src/pulsemesh/ingest_tomtom.js` therefore buys nothing on a schedule.
+It is **demand-driven**: hand `createRouteBackfill()` an itinerary
+somebody actually asked for, and it works out which of that itinerary's
+edges the mesh cannot price, discards the ones where a live speed could
+not change the routing answer, and probes only what is left. The results
+are published as ordinary PMC1 records, so the *second* person to ask
+about that corridor is served by the mesh and costs nothing.
+
+Five gates cut, in order:
+
+1. **Mesh sufficiency.** An edge whose aggregate already holds
+   `AGG_MIN_REPORTS` fresh reports is answered. Below that the protocol
+   itself calls the aggregate a confidence-capped hint (§8.3) — the
+   honest line between knowing and guessing.
+2. **Recently asked.** Every answer is cached per segment for
+   `CONTRIB_TTL`, so a corridor is bought at most once per TTL however
+   many itineraries cross it. Failures cache too, shorter.
+3. **Class.** Only where congestion changes which way the router goes.
+   A jammed residential street is still the fastest way through that
+   block; buying it burns quota to learn nothing.
+4. **Length.** Contiguous same-class gaps merge into runs, split into
+   chunks, and a chunk too short to move a decision is dropped.
+5. **Budget.** Per-route probe cap, per-route published-segment cap,
+   rolling daily cap, minimum interval between calls.
+
+What survives is ranked by length × class weight — being wrong on a
+motorway costs more than on a secondary, so the motorway is bought
+first — and `backfill()` returns `states` in `LiveSegmentState` shape so
+the request that paid for the probes can use them immediately, while the
+mesh copies land for whoever asks next.
+
+Two things it refuses to do. A reading is **never spread past the chunk
+it was taken on**, however much better the coverage would look for the
+same money: that would publish a speed nobody measured onto road nobody
+looked at, under this operator's bond. And when the API's free-flow
+disagrees with the segment's own by more than `maxFreeflowMismatch`, the
+reading is **dropped as a map-match failure** rather than published —
+asked for a point, the API answers for whatever road *it* matched there,
+which beside a service road is routinely not the edge you meant.
+
+`scripts/pulsemesh_backfill.mjs` prices one itinerary. Without `--buy`
+it calls nothing and spends nothing, printing only what it *would* buy —
+the mode to develop against, and to run before pointing a paid key at a
+new region. On an 18 km Luxembourg itinerary over a cold mesh it reports
+96.8% of the distance unpriced, 27 candidate chunks, and picks 8, all
+motorway.
+
+**Licensing is the operator's problem and it is a real one.** Records
+published here propagate peer-to-peer and are cached by every receiver
+for `CONTRIB_TTL`. That is redistribution of the vendor's traffic data,
+and standard commercial traffic-API terms restrict exactly that. The
+module is deliberately provider-agnostic — `probe` is a function, and
+`createTomTomProbe` is just one — so an authorized feed can be swapped
+in without touching any of the gating.
+
+### A route is priced once; a drive is not
+
+`route({ live })` calls `provider.fetch()` once, at query time, and
+nothing re-prices the answer afterwards. That is correct for a query and
+wrong for a drive: the jam that matters is the one that forms *after*
+you set off. Until this, the only thing that recomputed a route was the
+driver leaving it.
+
+`session.watchRoute(route, { onChange })` is the missing signal. It
+holds the route's own segments, and on each maintenance beat compares
+what the mesh now says about them against what it said before. What it
+reports is deliberately *not* every number that moves — a weighted
+median over a handful of reports jitters by a few km/h constantly, and a
+navigator that re-planned on that would thrash. The unit of change is
+the **congestion level** (free / slow / heavy / stopped), with a hard
+`debounceSeconds` floor under it.
+
+Two asymmetries are on purpose, and both are pinned by tests:
+
+- **A road merely confirmed clear is not news.** Most of a corridor is
+  uncovered most of the time; "the mesh now says this road is fine" must
+  never re-plan a drive. Only a first observation at `worsenLevel` or
+  above counts.
+- **Records expiring is not the jam clearing.** Contributions TTL out
+  constantly. Treating known → no-data as recovery would announce good
+  news nobody measured.
+
+The demo wires it to navigation: the watch drives a re-price when the
+corridor gets worse, with a 45 s timer underneath it for the road the
+mesh does not cover. *What to do with the answer* is
+`repriceDecision()` in `src/nav_reprice.js` — host-free, so it is
+testable without a browser — which returns one of three verdicts:
+
+- **switch** — a genuinely different way, fast enough to interrupt the
+  driver for. Adoption is reluctant: the router already returns the best
+  path from here, so a *different* answer is by construction no worse,
+  and the temptation is to take it every time. But switching costs
+  attention, so a new road must clear both a floor (60 s) and a share of
+  what is left (6%) — 60 s matters on a ten-minute drive and is noise on
+  a three-hour one.
+- **refresh** — the same way at a materially different cost. Re-install
+  so the ETA is honest, in *both* directions, because a drive quietly
+  getting longer is what a driver most wants to be told. Voice state
+  carries across on the **phrase**, never the boundary index:
+  re-planning from the current position renumbers every boundary, but
+  "turn left onto Rue Notre-Dame" is the same instruction and saying it
+  twice is the tell of a navigator re-planning behind the driver's back.
+- **keep** — leave the drive alone.
+
+Extracting that decision, and then simulating a jam against it, found
+three bugs the demo would otherwise have shipped. All three pass any
+test that only looks at one side of the comparison.
+
+**"Same way" was counted in edges.** A re-price starts at the driver's
+fix, so it always picks up a couple of short joining edges — two out of
+nineteen already fell under the 0.9 threshold and read as a detour. A
+detour is a **distance**, not a number of edges: two 30 m slip roads are
+10% of a twenty-edge candidate and 1% of its length. The comparison is
+weighted by metres now, with an absolute `minDetourMeters` floor under
+it so the tail of a journey — where those same few edges are a large
+share of very little road left — does not read as a detour either.
+
+**The diversion was judged against a stale belief.** `gain` was
+`remainingSeconds − candidateSeconds`, where `remainingSeconds` is what
+the drive believed before the jam. But the jam that prompts the re-price
+is exactly what makes every alternative slower than that belief, so the
+verdict was *always* "keep": a navigator that drives its user into every
+jam it can see. Measured across nine jammed corridors on the Luxembourg
+fixture, it refused all seven genuine diversions. The comparison is now
+against the road ahead priced under the same observations
+(`livePathSeconds`), and all seven become "switch".
+
+**Then the two halves were priced in different units.** `route.seconds`
+is the *unpenalized static* total of whatever path the live weights
+steered the search onto — live never appears in the reported duration.
+Comparing a live-priced current path against it manufactures a saving
+out of the unit mismatch, and every jam reads as a reason to divert.
+`repriceDecision` now takes `currentLiveSeconds` **and**
+`candidateLiveSeconds` and refuses to mix: with either missing it falls
+back to the reported pair, which errs toward refusing rather than
+inventing. Both are computed through `resolveLiveFactor`, lifted into
+`src/live_blend.js` and imported by the router and the decision alike,
+so the two cannot drift apart.
+
+One consequence worth stating, because it looks like a failure and is
+not: **a jam that already exists when the route is computed never
+triggers a re-price.** The router avoided it in the first place, so the
+honest verdict is "keep". The demo's simulated traffic is a fixed jam on
+a fixed corridor, which means every drive there starts on a path that is
+already clear of it — the re-price is silent, correctly. Watching a
+re-price fire needs a jam that forms *after* departure, which is what
+`test/nav_reprice_live.test.js` sets up.
+
+One bug fell out of writing this. `startNavReroute` was the only route
+call in the demo that did not spread `departureParams()`, so navigation
+reroutes ran on the static graph alone — while the comment on
+`departureParams()` claimed it reached "navigation reroutes alike". The
+one moment traffic matters most was the one that ignored it.
+
 ## Second channel: threads
 
 The traffic channel answers *"how fast is this road"* from many

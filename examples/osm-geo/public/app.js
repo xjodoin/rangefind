@@ -8,7 +8,15 @@ import {
   searchOsmQuery,
   suggestOsmQuery
 } from "./osm.browser.js";
-import { openRouteGraphUrl } from "./route.browser.js";
+import {
+  carriedVoice,
+  livePathSeconds,
+  openRouteGraphUrl,
+  remainingPath,
+  repriceDecision,
+  segmentsOf,
+  shouldRepriceNow
+} from "./route.browser.js";
 import { createPulseMeshDemo } from "./pulsemesh-demo.js";
 import { encodeQr, qrSvg } from "./qr.browser.js";
 import { geometryFeatureBounds, resultGeometryFeature } from "./result_geometry.js";
@@ -2570,7 +2578,38 @@ let meshLayersWaiting = false;
 let pendingMeshFeatures = null;
 let meshLayerError = null;
 
+// The international no-entry disc, canvas-drawn like the junction signs:
+// a closure is a statement about the road itself, and a generic incident
+// dot undersells the one incident type that means "you cannot pass".
+function addMeshClosureIcon() {
+  if (map.hasImage("mesh-closure")) return;
+  const scale = 2;
+  const size = 24 * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = 10 * scale;
+  ctx.fillStyle = "#d23b2f";
+  ctx.strokeStyle = "#faf9f2";
+  ctx.lineWidth = 1.8 * scale;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  const barWidth = 12 * scale;
+  const barHeight = 3.4 * scale;
+  ctx.beginPath();
+  ctx.roundRect(cx - barWidth / 2, cy - barHeight / 2, barWidth, barHeight, 1.2 * scale);
+  ctx.fill();
+  map.addImage("mesh-closure", ctx.getImageData(0, 0, size, size), { pixelRatio: scale });
+}
+
 function createMeshLayers() {
+  addMeshClosureIcon();
   map.addSource("pulsemeshLive", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
   // Under the route line, over the basemap: the road is being described,
   // not replaced.
@@ -2601,13 +2640,31 @@ function createMeshLayers() {
     id: "mesh-incident-dot",
     type: "circle",
     source: "pulsemeshLive",
-    filter: ["==", ["get", "kind"], "incident"],
+    filter: ["all", ["==", ["get", "kind"], "incident"], ["!=", ["get", "closure"], true]],
     paint: {
       "circle-radius": ["case", ["==", ["get", "tier"], "shown"], 8, 6],
       "circle-color": ["case", ["==", ["get", "tier"], "shown"], "#c0392b", "#e5b93c"],
       "circle-stroke-width": 2,
       "circle-stroke-color": "#faf9f2",
       "circle-opacity": ["case", ["==", ["get", "tier"], "shown"], 0.95, 0.7]
+    }
+  });
+  map.addLayer({
+    id: "mesh-closure-icon",
+    type: "symbol",
+    source: "pulsemeshLive",
+    filter: ["all", ["==", ["get", "kind"], "incident"], ["==", ["get", "closure"], true]],
+    layout: {
+      "icon-image": "mesh-closure",
+      "icon-size": ["case", ["==", ["get", "tier"], "shown"], 0.95, 0.8],
+      // A closure sign that collides with a label must still win: it is
+      // the strongest statement the layer makes.
+      "icon-allow-overlap": true
+    },
+    paint: {
+      // Same confidence honesty as everything else: an uncorroborated
+      // closure is visibly weaker than a shown one.
+      "icon-opacity": ["case", ["==", ["get", "tier"], "shown"], 1, 0.8]
     }
   });
   map.addLayer({
@@ -2692,12 +2749,17 @@ function meshFeatures(traffic, incidents, threadPoint) {
     });
   }
   for (const incident of incidents) {
+    // §2.6 type 3: closures get the no-entry sign and plain words — the
+    // map should say "road closed", not "closure report".
+    const closure = incident.type === 3;
+    const name = closure ? "Road closed" : incident.typeName;
     features.push({
       type: "Feature",
       properties: {
         kind: "incident",
         tier: incident.tier,
-        label: incident.tier === "shown" ? incident.typeName : `${incident.typeName} (unconfirmed)`
+        closure,
+        label: incident.tier === "shown" ? name : `${name} (unconfirmed)`
       },
       geometry: { type: "Point", coordinates: [incident.lon, incident.lat] }
     });
@@ -4942,7 +5004,7 @@ if (typeof window !== "undefined") {
     follow: () => pulseMesh?.follow ?? null,
     /** What actually reached the map, for checking the layer wiring. */
     drawn: () => ({
-      layers: ["mesh-traffic", "mesh-traffic-casing", "mesh-incident-dot", "mesh-thread"]
+      layers: ["mesh-traffic", "mesh-traffic-casing", "mesh-incident-dot", "mesh-closure-icon", "mesh-thread"]
         .filter(id => map.getLayer(id)),
       features: map.getSource("pulsemeshLive")?.serialize?.().data?.features?.length ?? 0,
       styleLoaded: map.isStyleLoaded(),
@@ -5375,7 +5437,7 @@ function classifyTurn(bearingIn, bearingOut) {
 
 // Precomputed per-route navigation model: the corridor-matched polyline, the
 // step boundaries mapped onto it, and a classified maneuver per boundary.
-function buildNavModel(route, destinationLabel) {
+function buildNavModel(route, destinationLabel, liveSeconds = null) {
   // prepareRoute reads coordinate ARRAYS in GeoJSON [lon, lat] order; route
   // geometry is [lat, lon] pairs, so hand it unambiguous {lat, lon} objects.
   const prepared = prepareRoute(route.geometry.map(([lat, lon]) => ({ lat, lon })), { corridorMeters: 1000 });
@@ -5402,7 +5464,15 @@ function buildNavModel(route, destinationLabel) {
   }
   maneuvers[0] = { type: "depart", side: "right", name: steps[0]?.name || "" };
   maneuvers[steps.length] = { type: "arrive", side: "right", name: destinationLabel || "" };
-  return { prepared, steps, starts, cumSeconds, totalSeconds, scale, maneuvers, total: prepared.totalMeters, junctions: route.junctions || [], geometry: route.geometry || null };
+  // `route.seconds` — and so these step timings — is the *static* cost of
+  // the path the router chose: live weights steer the search but never
+  // appear in the reported duration. When the caller has priced the path
+  // under live states, carry that as a scale so the ETA and the countdown
+  // are the honest ones rather than a free-flow fiction.
+  const timeScale = Number.isFinite(liveSeconds) && liveSeconds > 0 && totalSeconds > 0
+    ? liveSeconds / totalSeconds
+    : 1;
+  return { prepared, steps, starts, cumSeconds, totalSeconds, scale, timeScale, maneuvers, total: prepared.totalMeters, junctions: route.junctions || [], geometry: route.geometry || null };
 }
 
 // Boundary the vehicle is approaching: index i means the maneuver entering
@@ -5422,7 +5492,9 @@ function navRemainingSeconds(model, progress) {
   const stepMeters = (step?.meters || 0) * model.scale || 1;
   const within = Math.max(0, Math.min(1, (progress - stepStart) / stepMeters));
   const elapsed = model.cumSeconds[stepIndex] + (step?.seconds || 0) * within;
-  return Math.max(0, model.totalSeconds - elapsed);
+  // Scaling the remainder scales both halves alike, so a live-priced
+  // model counts down in live seconds without rewriting every step.
+  return Math.max(0, model.totalSeconds - elapsed) * (model.timeScale || 1);
 }
 
 function navSpeak(text) {
@@ -5629,12 +5701,18 @@ function updateNavHud() {
     nav.voicedLevels = 0;
   }
   if (maneuver.type !== "depart") {
+    // The phrase, not the boundary index, is what a live re-price can
+    // carry over: re-planning from the current position renumbers every
+    // boundary, but "turn left onto Rue Notre-Dame" is the same
+    // instruction and must not be spoken twice.
     if (!(nav.voicedLevels & 2) && distToManeuver <= 65) {
       nav.voicedLevels |= 3;
-      navSpeak(maneuverPhrase(maneuver, { spoken: true }));
+      nav.voicedPhrase = maneuverPhrase(maneuver, { spoken: true });
+      navSpeak(nav.voicedPhrase);
     } else if (!(nav.voicedLevels & 1) && distToManeuver <= 320 && distToManeuver > 65) {
       nav.voicedLevels |= 1;
-      navSpeak(`In ${Math.round(distToManeuver / 50) * 50} meters, ${maneuverPhrase(maneuver, { spoken: true })}`);
+      nav.voicedPhrase = maneuverPhrase(maneuver, { spoken: true });
+      navSpeak(`In ${Math.round(distToManeuver / 50) * 50} meters, ${nav.voicedPhrase}`);
     }
   }
 }
@@ -5759,13 +5837,32 @@ function navArrive() {
   showToast("You have arrived — nicely driven.", "info");
 }
 
-function installNavRoute(route) {
+function installNavRoute(route, { keepVoice = false, liveSeconds = null } = {}) {
+  const carried = keepVoice ? { phrase: nav.voicedPhrase, levels: nav.voicedLevels } : null;
   nav.route = route;
-  nav.model = buildNavModel(route, nav.destinationLabel);
+  nav.model = buildNavModel(route, nav.destinationLabel, liveSeconds);
   nav.progress = 0;
   nav.offRouteCount = 0;
   nav.voicedBoundary = -1;
   nav.voicedLevels = 0;
+  // A live re-price that lands on the same road ahead renumbers the
+  // boundaries but does not change the instruction. Match on the phrase
+  // and the driver is not told to turn left a second time.
+  if (carried?.phrase) {
+    const boundary = navNextBoundary(nav.model, 0);
+    const upcoming = nav.model.maneuvers[boundary];
+    const kept = carriedVoice({
+      previousPhrase: carried.phrase,
+      upcomingPhrase: upcoming ? maneuverPhrase(upcoming, { spoken: true }) : null,
+      previousLevels: carried.levels,
+      boundary
+    });
+    if (kept) {
+      nav.voicedBoundary = kept.boundary;
+      nav.voicedLevels = kept.levels;
+      nav.voicedPhrase = kept.phrase;
+    }
+  }
   if (nav.sim) {
     nav.sim.progress = 0;
     nav.sim.veer = null;
@@ -5773,6 +5870,100 @@ function installNavRoute(route) {
   drawNavRoute(route.geometry);
   renderNavSteps();
   updateNavHud();
+  navWatchCorridor(route);
+}
+
+// --- Live re-pricing -------------------------------------------------------
+//
+// A route is priced once, when it is computed: `route({ live })` takes a
+// snapshot and nothing re-prices it afterwards. Correct for a query,
+// wrong for a drive — the jam that matters is the one that forms after
+// you set off. Two things drive a re-price here: the mesh reporting that
+// a segment on this corridor crossed a congestion level
+// (`session.watchRoute`), and a slow timer underneath it for everything
+// the mesh does not cover.
+//
+// *What to do with the answer* is not decided here. That is
+// `repriceDecision` in src/nav_reprice.js — reluctance thresholds, what
+// counts as a different road, and the edge cases (a "faster" route that
+// came back slower, a re-price on a finished drive) that no amount of
+// clicking around a demo would reach. This function is the part that
+// talks to the driver.
+const NAV_REPRICE_SECONDS = 45;
+
+/** Watch the corridor this route runs on, replacing any previous watch. */
+function navWatchCorridor(route) {
+  nav.watch?.stop();
+  nav.watch = null;
+  nav.watch = pulseMesh?.watchRoute?.(route, {
+    debounceSeconds: 20,
+    onChange: change => {
+      if (nav && shouldRepriceNow(change)) startNavReprice().catch(() => {});
+    }
+  }) ?? null;
+}
+
+async function startNavReprice() {
+  if (!nav || !routeEngine || nav.rerouting || nav.repricing || nav.arrived) return;
+  const fix = nav.lastFix;
+  if (!fix) return;
+  nav.repricing = true;
+  const generation = nav.generation;
+  try {
+    const remainingSeconds = navRemainingSeconds(nav.model, nav.progress);
+    const candidate = await routeEngine.route({
+      from: { lat: fix.lat, lon: fix.lon },
+      to: nav.destination,
+      ...departureParams()
+    });
+    if (!nav || nav.generation !== generation || nav.rerouting || nav.arrived) return;
+
+    // Both paths have to be priced the same way or the comparison is
+    // meaningless — `route.seconds` is the *static* cost of whatever the
+    // live weights steered the search onto, so it cannot be weighed
+    // against a live-priced road. Price both through the router's own
+    // blend, over the states the candidate was routed with.
+    const provider = pulseMesh?.provider?.() ?? null;
+    const states = provider
+      ? await provider.fetch({ epoch: pulseMesh.epoch, areas: [], maxAgeSeconds: 120 }).catch(() => [])
+      : [];
+    if (!nav || nav.generation !== generation) return;
+    const nowMillis = Date.now();
+    const ahead = remainingPath(nav.route, nav.progress / (nav.model.scale || 1));
+    const candidatePath = remainingPath(candidate, 0);
+    const candidateLiveSeconds = states.length
+      ? livePathSeconds(candidatePath, states, { nowMillis })
+      : null;
+
+    const { action, gain, etaShift } = repriceDecision({
+      remainingSeconds,
+      candidateSeconds: candidate.seconds,
+      currentLiveSeconds: states.length ? livePathSeconds(ahead, states, { nowMillis }) : null,
+      candidateLiveSeconds,
+      currentSegments: segmentsOf(nav.route),
+      candidateSegments: candidatePath
+    });
+
+    if (action === "refresh") {
+      // The way ahead is the same; only what it costs has moved. Refresh
+      // the ETA the driver is watching, and say nothing about turns.
+      installNavRoute(candidate, { keepVoice: true, liveSeconds: candidateLiveSeconds });
+      showToast(etaShift < 0
+        ? `Traffic ahead · ${formatDuration(-etaShift)} added`
+        : `Clearing ahead · ${formatDuration(etaShift)} saved`, "info");
+      return;
+    }
+    if (action !== "switch") return;
+
+    routePlan = { kind: "pair", candidates: [candidate], active: 0 };
+    installNavRoute(candidate, { liveSeconds: candidateLiveSeconds });
+    showToast(`Faster route · ${formatDuration(gain)} saved`, "info");
+    navSpeak(`Faster route ahead, saving ${Math.max(1, Math.round(gain / 60))} minutes`);
+  } catch {
+    // A failed re-price is a missed opportunity, never a dead drive.
+  } finally {
+    if (nav && nav.generation === generation) nav.repricing = false;
+  }
 }
 
 async function startNavReroute(lat, lon) {
@@ -5790,7 +5981,11 @@ async function startNavReroute(lat, lon) {
     const route = await routeEngine.route({
       from: { lat, lon },
       to: nav.destination,
-      bucket: nav.route.bucket,
+      // Live traffic, like every other route call in this file. Leaving
+      // it off here priced the one moment it matters most — the driver
+      // is moving and has just left the plan — off the static graph
+      // alone, while departureParams() claimed otherwise.
+      ...departureParams(),
       onCoarseRoute: coarse => {
         if (nav && nav.generation === generation) drawNavRoute(coarse.geometry, { coarse: true });
       }
@@ -5871,15 +6066,26 @@ function startNavigation(source) {
     progress: 0,
     offRouteCount: 0,
     rerouting: false,
+    repricing: false,
     arrived: false,
     voicedBoundary: -1,
     voicedLevels: 0,
+    voicedPhrase: null,
     sim: null,
     simTimer: null,
     watchId: null,
+    // The mesh corridor watch, and the slow timer under it for road the
+    // mesh does not cover.
+    watch: null,
+    repriceTimer: null,
     puck: null
   };
   nav.model = buildNavModel(route, nav.destinationLabel);
+  // Watch the corridor from the first metre, and keep a slow beat under
+  // it: the mesh only speaks for road somebody is driving, and the rest
+  // of the route still has to be re-priced from time to time.
+  navWatchCorridor(route);
+  nav.repriceTimer = setInterval(() => { startNavReprice().catch(() => {}); }, NAV_REPRICE_SECONDS * 1000);
   cancelStopPick();
   hidePlaceLens();
   clearCorridorResults();
@@ -5975,6 +6181,8 @@ function hideSuggestionsForNav() {
 function endNavigation() {
   if (!nav) return;
   clearInterval(nav.simTimer);
+  clearInterval(nav.repriceTimer);
+  nav.watch?.stop();
   if (nav.watchId != null) navigator.geolocation.clearWatch(nav.watchId);
   if (typeof speechSynthesis !== "undefined") {
     try { speechSynthesis.cancel(); } catch { /* best effort */ }

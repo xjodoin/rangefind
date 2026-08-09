@@ -1295,6 +1295,12 @@ export function createPulseMeshDemo({
     snapshot,
     traffic: options => (session ? session.traffic(options) : Promise.resolve([])),
     incidents: options => (session ? session.incidents(options) : Promise.resolve([])),
+    /**
+     * Watch the corridor a drive is on and say when it changes under it.
+     * Returns null with no session, so a caller never has to branch on
+     * whether the mesh happens to be up.
+     */
+    watchRoute: (routes, options) => (session ? session.watchRoute(routes, options) : null),
     /** One GPS fix from the page (the demo drive, or real geolocation). */
     onLocation: fix => (session ? session.onLocation(fix) : Promise.resolve({ emitted: false })),
     report: options => (session ? session.reportIncident(options) : Promise.resolve({ emitted: false })),

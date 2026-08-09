@@ -20,6 +20,9 @@ import {
   decodeRouteRoot,
   edgePolyline
 } from "./route_graph.js";
+// Shared with the re-pricing decision, which has to cost the path already
+// being driven the same way the router costs the alternatives to it.
+import { resolveLiveFactor } from "./live_blend.js";
 
 const EARTH_RADIUS_METERS = 6371008.7714;
 const E7_RAD = Math.PI / 180 / 1e7;
@@ -406,34 +409,6 @@ export async function openRouteGraph(options) {
   function edgeSegmentId(cell, edge) {
     const ref = cell.geomRefs[edge];
     return `${cell.cellId}/${ref >>> 1}/${ref & 1}`;
-  }
-
-  // Blend an observed state into a time multiplier over the static edge
-  // weight: confidence decays with age, and a low-confidence report only
-  // nudges the cost toward the observation (PulseMesh section 14 blend).
-  function resolveLiveFactor(state, staticSeconds, nowMs) {
-    if (state.closed === true) return { factor: Infinity, penaltyDs: 0 };
-    let factor = Number(state.factor);
-    if (!Number.isFinite(factor) && Number.isFinite(state.speedMps) && state.speedMps > 0 && staticSeconds > 0) {
-      const meters = Number(state.meters);
-      // Without meters we cannot turn a speed into a time; providers that
-      // send speedMps should send meters too, or precompute `factor`.
-      factor = Number.isFinite(meters) && meters > 0
-        ? (meters / Math.max(1.4, state.speedMps)) / staticSeconds
-        : NaN;
-    }
-    if (!Number.isFinite(factor) || factor <= 0) return null;
-    let confidence = Number.isFinite(state.confidence) ? Math.max(0, Math.min(1, state.confidence)) : 1;
-    if (Number.isFinite(state.observedAt)) {
-      const ageSeconds = Math.max(0, (nowMs - state.observedAt) / 1000);
-      confidence *= Math.exp(-ageSeconds / 60);
-    }
-    const blended = confidence * factor + (1 - confidence);
-    const clamped = Math.max(0.25, Math.min(10, blended));
-    const penaltyDs = Number.isFinite(state.penaltySeconds) && state.penaltySeconds > 0
-      ? Math.round(Math.min(600, state.penaltySeconds) * 10)
-      : 0;
-    return { factor: clamped, penaltyDs };
   }
 
   // Resolves provider states into per-fetched-cell adjustment arrays.
@@ -2364,3 +2339,21 @@ export async function openRouteGraph(options) {
     stats: statsSnapshot, resetStats, clearCaches
   };
 }
+
+// Re-exported so a browser host that already loads the query engine gets
+// the re-pricing policy with it: `route()` returns a snapshot, and
+// deciding what to do when a later snapshot disagrees is the other half
+// of the same job. The logic itself is host-free and lives in
+// src/nav_reprice.js — import it directly on Node.
+export {
+  DEFAULT_REPRICE_POLICY,
+  carriedVoice,
+  livePathSeconds,
+  pathOf,
+  pathOverlap,
+  remainingPath,
+  repriceDecision,
+  segmentsOf,
+  sharedShare,
+  shouldRepriceNow
+} from "./nav_reprice.js";

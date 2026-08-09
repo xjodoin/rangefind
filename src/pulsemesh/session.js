@@ -131,6 +131,9 @@ export async function createMeshSession({
   // 10–12: they are probabilistic across peers by design.
   const facts = new Map();       // leaf -> facts
   const warming = new Map();     // leaf -> promise
+  // Live corridor watches (see watchRoute). Driven from tick() so a watch
+  // works with no wiring beyond start(); stopped ones are dropped there.
+  const watches = new Set();
 
   async function warmLeaves(leaves) {
     const wanted = [];
@@ -475,6 +478,125 @@ export async function createMeshSession({
    * as fact, "hint" ones are not, and a UI that renders them identically
    * is making a claim the mesh did not.
    */
+  // --- Corridor watch ----------------------------------------------------
+
+  /** free < slow < heavy < stopped; -1 is "the mesh has nothing here". */
+  const LEVEL_SEVERITY = { free: 0, slow: 1, heavy: 2, stopped: 3 };
+  const severityOf = level => (level in LEVEL_SEVERITY ? LEVEL_SEVERITY[level] : -1);
+
+  /**
+   * Watch the segments of a route the user is actually on, and say when
+   * the mesh changes under it in a way that could change the answer.
+   *
+   * A route is priced once, when it is computed — `route({ live })` takes
+   * a snapshot, and nothing re-prices it afterwards. That is correct for
+   * a query and wrong for a drive: the jam that matters is the one that
+   * forms after you set off. This is the missing signal.
+   *
+   * What it deliberately does NOT do is fire on every number that moves.
+   * A weighted median over a handful of reports jitters by a few km/h
+   * constantly, and a route that re-planned on that would thrash. So the
+   * unit of change is the *congestion level* (free / slow / heavy /
+   * stopped) — a crossing worth acting on — with a hard `debounceSeconds`
+   * floor underneath it.
+   *
+   * Two asymmetries are on purpose:
+   *
+   *  - A segment going from no-data to free or slow is not news. Most of
+   *    a corridor is uncovered most of the time, and "the mesh now
+   *    confirms this road is fine" must never trigger a re-plan. Only a
+   *    first observation at `worsenLevel` or above counts.
+   *  - A segment going from known to no-data is *expiry*, not recovery.
+   *    Records TTL out constantly; treating that as "the jam cleared"
+   *    would announce good news that nobody measured.
+   *
+   * `check()` is exposed so a host with a faster loop than the session's
+   * own maintenance beat (ANTI_ENTROPY_SECONDS, 10 s) can drive it; it is
+   * also called from `tick()` so a watch works with no extra wiring.
+   */
+  function watchRoute(routes, {
+    onChange = null,
+    debounceSeconds = 20,
+    minReports = constants.AGG_HINT_REPORTS,
+    maxAgeSeconds = constants.DISPLAY_MAX_AGE,
+    worsenLevel = "heavy"
+  } = {}) {
+    const list = (Array.isArray(routes) ? routes : [routes]).filter(Boolean);
+    const segKeys = [];
+    for (const route of list) {
+      for (const edge of route.edges || []) {
+        if (!edge?.segment) continue;
+        const { leafCell, geomRef } = parseSegment(edge.segment);
+        segKeys.push(`${leafCell}/${geomRef}`);
+      }
+    }
+    const watched = [...new Set(segKeys)];
+    const last = new Map();          // segKey -> level, as of the previous check
+    const worsenSeverity = severityOf(worsenLevel);
+    let baselined = false;
+    let lastFiredMillis = 0;
+    let live = true;
+
+    function levelOf(segKey, nowMillis) {
+      if (!node) return "unknown";
+      const entries = node.store.contributionsForSegment(segKey);
+      if (!entries.length) return "unknown";
+      const aggregate = aggregateSegment(entries, { nowMillis, constants });
+      if (!aggregate || aggregate.n < minReports) return "unknown";
+      if (Math.max(0, (nowMillis - aggregate.observedAt) / 1000) > maxAgeSeconds) return "unknown";
+      return congestionLevel(congestionRatio(aggregate, freeflowKmhOf(segKey)));
+    }
+
+    /**
+     * One comparison against the previous one. Returns the change set,
+     * or null when nothing crossed a level or the debounce still holds.
+     */
+    function check(nowMillis = clock()) {
+      if (!live || !node) return null;
+      const worsened = [];
+      const improved = [];
+      for (const segKey of watched) {
+        const level = levelOf(segKey, nowMillis);
+        const previous = last.get(segKey) ?? "unknown";
+        last.set(segKey, level);
+        if (!baselined || level === previous) continue;
+        const before = severityOf(previous);
+        const after = severityOf(level);
+        if (after < 0) continue;                          // expiry, not recovery
+        if (before < 0) {
+          if (after >= worsenSeverity) worsened.push({ segKey, from: previous, to: level });
+          continue;                                       // first sight of a clear road is not news
+        }
+        (after > before ? worsened : improved).push({ segKey, from: previous, to: level });
+      }
+      if (!baselined) {
+        // The first pass only establishes what "unchanged" means; firing
+        // here would announce the whole corridor as new information.
+        baselined = true;
+        return null;
+      }
+      if (!worsened.length && !improved.length) return null;
+      if (nowMillis - lastFiredMillis < debounceSeconds * 1000) return null;
+      lastFiredMillis = nowMillis;
+      const change = { worsened, improved, segments: watched.length, nowMillis };
+      if (onChange) {
+        // A handler that throws must not kill the maintenance loop that
+        // called it.
+        try { onChange(change); } catch { /* the caller's problem */ }
+      }
+      return change;
+    }
+
+    const watch = {
+      check,
+      stop() { live = false; },
+      get watching() { return live; },
+      get segments() { return watched.length; }
+    };
+    watches.add(watch);
+    return watch;
+  }
+
   async function incidents({ nowMillis = clock(), includeHints = true } = {}) {
     if (!node) return [];
     const scored = node.provider.displayIncidents({ nowMillis });
@@ -527,6 +649,12 @@ export async function createMeshSession({
   async function tick(nowMillis = clock()) {
     if (node) await node.tick(nowMillis);
     if (!node) return;
+    // Corridor watches run before the warm: a driver wants to hear about
+    // the jam ahead on this beat, not the next one.
+    for (const watch of watches) {
+      if (!watch.watching) { watches.delete(watch); continue; }
+      watch.check(nowMillis);
+    }
     const cold = [];
     for (const segKey of node.store.liveSegmentKeys()) {
       const parts = splitSegKey(segKey);
@@ -616,6 +744,7 @@ export async function createMeshSession({
     epoch,
     onLocation,
     followRoute,
+    watchRoute,
     warmLeaves,
     reportIncident,
     answerIncident,

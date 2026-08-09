@@ -112,6 +112,18 @@
       "types": "./types/pulsemesh-bridge.d.ts",
       "default": "./src/pulsemesh/bridge.js"
     },
+    "./pulsemesh/ingest": {
+      "default": "./src/pulsemesh/ingest.js"
+    },
+    "./pulsemesh/ingest/camera": {
+      "default": "./src/pulsemesh/ingest_camera.js"
+    },
+    "./pulsemesh/ingest/camera-pixels": {
+      "default": "./src/pulsemesh/ingest_camera_pixels.js"
+    },
+    "./pulsemesh/ingest/tomtom": {
+      "default": "./src/pulsemesh/ingest_tomtom.js"
+    },
     "./pulsemesh/libp2p": {
       "types": "./types/pulsemesh-libp2p.d.ts",
       "node": "./src/pulsemesh/libp2p.js",
@@ -131,9 +143,13 @@
       "default": "./src/qr.js"
     },
     "./analysis": "./src/analysis.js",
+    "./nav-reprice": "./src/nav_reprice.js",
     "./terms": "./src/terms.js",
     "./link-graph": "./src/link_graph.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./pulsemesh/ingest/camera-browser": {
+      "default": "./src/pulsemesh/ingest_camera_browser.js"
+    }
   },
   "files": [
     "bin/",
@@ -212,6 +228,7 @@
     "bench:pulsemesh:all": "node scripts/pulsemesh_bench.mjs && node scripts/pulsemesh_sim.mjs --scenario=all && node scripts/pulsemesh_wire_bench.mjs && node scripts/pulsemesh_thread_bench.mjs && node scripts/pulsemesh_bond_bench.mjs",
     "demo:pulsemesh": "node scripts/pulsemesh_demo.mjs",
     "pulsemesh:keeper": "node scripts/pulsemesh_keeper.mjs",
+    "pulsemesh:ingest": "node scripts/pulsemesh_ingest.mjs",
     "bench:frwiki:quality": "node scripts/frwiki_quality.mjs",
     "bench:frwiki:lucene-quality": "node scripts/frwiki_lucene_quality.mjs",
     "bench:frwiki:search-game": "node scripts/search_benchmark_game.mjs",
@@ -239,6 +256,9 @@
     "rangefind": "file:."
   },
   "peerDependencies": {
+    "@anthropic-ai/sdk": "*",
+    "jpeg-js": "^0.4.4",
+    "playwright": "*",
     "@chainsafe/libp2p-gossipsub": "^14.1.2",
     "@chainsafe/libp2p-noise": "^16.1.5",
     "@chainsafe/libp2p-yamux": "^7.0.4",
@@ -247,6 +267,12 @@
     "libp2p": "^2.10.0"
   },
   "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "jpeg-js": {
+      "optional": true
+    },
     "@chainsafe/libp2p-gossipsub": {
       "optional": true
     },
@@ -263,6 +289,9 @@
       "optional": true
     },
     "libp2p": {
+      "optional": true
+    },
+    "playwright": {
       "optional": true
     }
   },
