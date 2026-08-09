@@ -236,6 +236,12 @@ test("SCC filtering writes retained edges directly into exact typed columns", as
     condRules: [],
     signs: []
   };
+  const sourceBuffers = {
+    nodeLat: graph.nodeLat.buffer,
+    edgeFrom: graph.edgeFrom.buffer,
+    geomBytes: graph.geomBytes.buffer,
+    laneBytes: graph.laneBytes.buffer
+  };
   const messages = [];
   const filtered = filterLargestScc(graph, message => messages.push(message));
   assert.deepEqual(filtered.nodeLat, new Int32Array([100, 200]));
@@ -246,6 +252,10 @@ test("SCC filtering writes retained edges directly into exact typed columns", as
   assert.deepEqual(filtered.geomBytes, new Uint8Array([1, 2, 3]));
   assert.deepEqual(filtered.laneOffsets, new Uint32Array([0, 1, 3]));
   assert.deepEqual(filtered.laneBytes, new Uint8Array([6, 7, 8]));
+  assert.equal(filtered.nodeLat.buffer, sourceBuffers.nodeLat, "node columns compact in place");
+  assert.equal(filtered.edgeFrom.buffer, sourceBuffers.edgeFrom, "edge columns compact in place");
+  assert.equal(filtered.geomBytes.buffer, sourceBuffers.geomBytes, "geometry compacts in place");
+  assert.equal(filtered.laneBytes.buffer, sourceBuffers.laneBytes, "lane payload compacts in place");
   assert.match(messages.at(-1), /largest 2 of 3 nodes/);
 });
 
@@ -464,6 +474,10 @@ test("junction expansion prices turns by bearing and filters restrictions", asyn
   });
   const costs = { uturn: 150, left: 40, right: 15, slightLeft: 20, slightRight: 8 };
   const expanded = expandTurnCosts(makeContext([]), costs);
+  assert.ok(expanded.edgeFrom instanceof Uint32Array);
+  assert.ok(expanded.edgeClass instanceof Uint8Array);
+  assert.ok(expanded.geomOffsets instanceof Uint32Array);
+  assert.ok(expanded.geomBytes instanceof Uint8Array);
   // From the west approach (edge 0: 0->4), find each turn's added cost.
   const added = new Map();
   for (let i = 0; i < expanded.edgeFrom.length; i++) {
@@ -484,6 +498,60 @@ test("junction expansion prices turns by bearing and filters restrictions", asyn
     assert.notEqual(restricted.edgeTo[i], 6, "restricted left turn filtered");
     assert.notEqual(restricted.edgeTo[i], 5, "restricted way-200 turn filtered");
   }
+});
+
+test("high-degree turn expansion allocates exact typed columns", async () => {
+  const { expandTurnCosts } = await import("../scripts/osm_road_graph.mjs");
+  const spokes = 256;
+  const nodeLat = new Int32Array(spokes + 1);
+  const nodeLon = new Int32Array(spokes + 1);
+  const edgeFrom = new Uint32Array(spokes * 2);
+  const edgeTo = new Uint32Array(spokes * 2);
+  const edgeWay = new Float64Array(spokes * 2);
+  for (let i = 0; i < spokes; i++) {
+    const leaf = i + 1;
+    nodeLat[leaf] = Math.round(Math.sin(i) * 100000);
+    nodeLon[leaf] = Math.round(Math.cos(i) * 100000);
+    edgeFrom[i * 2] = leaf;
+    edgeTo[i * 2] = 0;
+    edgeFrom[i * 2 + 1] = 0;
+    edgeTo[i * 2 + 1] = leaf;
+    edgeWay[i * 2] = i + 1;
+    edgeWay[i * 2 + 1] = i + 1;
+  }
+  const edgeCount = edgeFrom.length;
+  const expanded = expandTurnCosts({
+    restrictions: [],
+    nodeIndex: new Map(),
+    nodeLat,
+    nodeLon,
+    edgeFrom,
+    edgeTo,
+    edgeWeightDs: new Uint32Array(edgeCount).fill(10),
+    edgeDistDm: new Uint32Array(edgeCount).fill(100),
+    edgeName: new Uint32Array(edgeCount),
+    edgeWay,
+    edgeClass: new Uint8Array(edgeCount),
+    edgeJunction: new Uint8Array(edgeCount),
+    edgeSpeed: new Uint8Array(edgeCount),
+    edgeCond: new Uint8Array(edgeCount),
+    edgeSign: new Uint32Array(edgeCount),
+    edgeFlags: new Uint8Array(edgeCount),
+    geomOffsets: Uint32Array.from({ length: edgeCount + 1 }, (_, i) => i),
+    geomBytes: { data: new Uint8Array(edgeCount), length: edgeCount },
+    laneOffsets: Uint32Array.from({ length: edgeCount + 1 }, (_, i) => i),
+    laneBytes: { data: new Uint8Array(edgeCount), length: edgeCount, view() { return this.data; } },
+    log: () => {}
+  }, { uturn: 150, left: 40, right: 15, slightLeft: 20, slightRight: 8 });
+  assert.equal(expanded.edgeFrom.length, spokes * spokes + spokes);
+  for (const key of ["edgeFrom", "edgeTo", "edgeWeightDs", "edgeDistDm", "edgeName", "edgeSign", "geomOffsets", "laneOffsets"]) {
+    assert.ok(expanded[key] instanceof Uint32Array, `${key} is compact`);
+  }
+  for (const key of ["edgeClass", "edgeJunction", "edgeSpeed", "edgeCond", "edgeFlags", "geomBytes", "laneBytes"]) {
+    assert.ok(expanded[key] instanceof Uint8Array, `${key} is compact`);
+  }
+  assert.equal(expanded.geomBytes.length, expanded.edgeFrom.length);
+  assert.equal(expanded.laneBytes.length, expanded.edgeFrom.length);
 });
 
 test("multi-via-way restrictions resolve through the way union", async () => {
