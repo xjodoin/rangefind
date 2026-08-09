@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -190,6 +190,23 @@ test("road graph writer replaces atomically without concatenating sections", asy
     "edgeFlags", "laneOffsets", "laneBytes", "geomOffsets", "geomBytes"
   ]) {
     assert.deepEqual(decoded[key], graph[key], `${key} round trips`);
+  }
+});
+
+test("road graph reader uses positional reads beyond Node's 2 GiB whole-file limit", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-road-large-read-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "sparse.graph.bin");
+  const position = 2 ** 31 + 123;
+  const expected = new Uint8Array([17, 34, 51, 68]);
+  const fd = openSync(path, "w+");
+  try {
+    writeSync(fd, expected, 0, expected.byteLength, position);
+    const { readRoadGraphBytes } = await import("../scripts/osm_road_graph.mjs");
+    const actual = readRoadGraphBytes(fd, new Uint8Array(expected.byteLength), position, 2);
+    assert.deepEqual(actual, expected);
+  } finally {
+    closeSync(fd);
   }
 });
 

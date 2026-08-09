@@ -10,7 +10,7 @@
 // node can reach every other retained node; oneway pockets and disconnected
 // fragments would otherwise poison random-pair benchmarks.
 
-import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, openSync, readSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { scanPbf } from "./osm_pbf.mjs";
 
 const EARTH_RADIUS_METERS = 6371008.7714;
@@ -2927,34 +2927,76 @@ export function writeRoadGraph(path, graph) {
 }
 
 const TYPED_ARRAYS = { Int32Array, Uint32Array, Uint8Array };
+const ROAD_GRAPH_READ_CHUNK_BYTES = 64 * 1024 * 1024;
+const ROAD_GRAPH_MAX_HEADER_BYTES = 64 * 1024 * 1024;
+
+/** Read exactly one graph section without asking Node to create a whole-file Buffer. */
+export function readRoadGraphBytes(fd, target, position, chunkBytes = ROAD_GRAPH_READ_CHUNK_BYTES) {
+  let offset = 0;
+  while (offset < target.byteLength) {
+    const length = Math.min(chunkBytes, target.byteLength - offset);
+    const read = readSync(fd, target, offset, length, position + offset);
+    if (read === 0) throw new Error(`Truncated road graph at byte ${position + offset}.`);
+    offset += read;
+  }
+  return target;
+}
+
+function readRoadGraphHeader(fd, fileBytes) {
+  const chunks = [];
+  let position = 0;
+  while (position < fileBytes && position < ROAD_GRAPH_MAX_HEADER_BYTES) {
+    const length = Math.min(64 * 1024, fileBytes - position, ROAD_GRAPH_MAX_HEADER_BYTES - position);
+    const chunk = Buffer.allocUnsafe(length);
+    const read = readSync(fd, chunk, 0, length, position);
+    if (read === 0) break;
+    const newline = chunk.subarray(0, read).indexOf(0x0a);
+    if (newline >= 0) {
+      chunks.push(chunk.subarray(0, newline));
+      return {
+        header: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+        dataOffset: position + newline + 1
+      };
+    }
+    chunks.push(chunk.subarray(0, read));
+    position += read;
+  }
+  throw new Error(`Road graph header is missing or exceeds ${ROAD_GRAPH_MAX_HEADER_BYTES} bytes.`);
+}
 
 export async function readRoadGraph(path) {
-  const { readFileSync } = await import("node:fs");
-  const bytes = readFileSync(path);
-  const newline = bytes.indexOf(0x0a);
-  const header = JSON.parse(bytes.subarray(0, newline).toString("utf8"));
-  if (header.format !== "rfroutesrc-v7") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
-  const graph = {
-    profile: header.profile || "car",
-    classes: header.classes || [],
-    condRules: header.condRules || [],
-    signs: header.signs || []
-  };
-  let offset = newline + 1;
-  for (const section of header.sections) {
-    const slice = bytes.subarray(offset, offset + section.bytes);
-    offset += section.bytes;
-    if (section.name === "namesBytes") {
-      graph.names = JSON.parse(Buffer.from(slice).toString("utf8"));
-      continue;
+  const fd = openSync(path, "r");
+  try {
+    const fileBytes = fstatSync(fd).size;
+    const { header, dataOffset } = readRoadGraphHeader(fd, fileBytes);
+    if (header.format !== "rfroutesrc-v7") throw new Error(`Unsupported road graph format: ${header.format} (re-run the extractor).`);
+    const graph = {
+      profile: header.profile || "car",
+      classes: header.classes || [],
+      condRules: header.condRules || [],
+      signs: header.signs || []
+    };
+    let offset = dataOffset;
+    for (const section of header.sections) {
+      if (!Number.isSafeInteger(section.bytes) || section.bytes < 0 || offset + section.bytes > fileBytes) {
+        throw new Error(`Invalid or truncated road graph section: ${section.name}.`);
+      }
+      const bytes = readRoadGraphBytes(fd, new Uint8Array(section.bytes), offset);
+      offset += section.bytes;
+      if (section.name === "namesBytes") {
+        graph.names = JSON.parse(Buffer.from(bytes.buffer).toString("utf8"));
+        continue;
+      }
+      const Type = TYPED_ARRAYS[section.type];
+      if (!Type || section.bytes % Type.BYTES_PER_ELEMENT !== 0) {
+        throw new Error(`Invalid road graph section type: ${section.name} (${section.type}).`);
+      }
+      graph[section.name] = new Type(bytes.buffer);
     }
-    const Type = TYPED_ARRAYS[section.type];
-    // Copy so alignment does not depend on header length.
-    const copy = new Uint8Array(section.bytes);
-    copy.set(slice);
-    graph[section.name] = new Type(copy.buffer);
+    return graph;
+  } finally {
+    closeSync(fd);
   }
-  return graph;
 }
 
 const invokedAsScript = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());
