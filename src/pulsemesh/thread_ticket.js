@@ -130,6 +130,17 @@ const TICKET_FLAG_MASK = TICKET_FLAG_SEED | TICKET_FLAG_BOOTSTRAP | TICKET_FLAG_
  * certificate expired last night".
  */
 export const TICKET_ERROR = Object.freeze({
+  /**
+   * The ticket names a graph other than the one loaded.
+   *
+   * Coded rather than only worded because it is the one refusal a caller can
+   * *act* on: every other reason here means the ticket is wrong, but this one
+   * usually means the right ticket met the wrong map. Told which graph it
+   * wants, an app can fetch that graph and carry on; told only a sentence, all
+   * it can do is show the driver a hex string in a van. The verdict therefore
+   * carries `wantedEpoch` and `loadedEpoch` alongside the code.
+   */
+  GRAPH_EPOCH: "ticket-graph-epoch",
   DAY_SEED_MISMATCH: "ticket-day-seed-mismatch",
   DAY_FOREIGN_ROOT: "ticket-day-foreign-root",
   DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry",
@@ -851,7 +862,17 @@ export async function verifyThreadTicket(ticket, {
   if (!verified) return { ok: false, reason: "the issuer signature does not verify" };
   if (Math.floor(nowMillis / 1000) > decoded.notAfter) return { ok: false, reason: "the ticket has expired" };
   if (epochPrefix8 && !sameBytes(epochPrefix8.subarray(0, 8), decoded.epochPrefix8)) {
-    return { ok: false, reason: "the ticket is bound to a different graph epoch" };
+    return {
+      ok: false,
+      code: TICKET_ERROR.GRAPH_EPOCH,
+      reason: "the ticket is bound to a different graph epoch",
+      // Both sides, because a caller that only knows what it wants cannot
+      // tell "I have the wrong map loaded" from "this ticket is for another
+      // region entirely" — and those need different sentences, and different
+      // actions. Named for what they are, not which is at fault: neither is.
+      wantedEpoch: toHex(decoded.epochPrefix8),
+      loadedEpoch: toHex(epochPrefix8.subarray(0, 8))
+    };
   }
   if (expectedIssuerHex && toHex(decoded.issuerPublicKey) !== String(expectedIssuerHex).toLowerCase()) {
     return { ok: false, reason: "the ticket was issued by a different issuer" };

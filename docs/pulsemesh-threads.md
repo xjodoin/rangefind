@@ -1971,6 +1971,21 @@ epoch that rolls in one is a job that becomes unpublishable halfway
 through — the same failure §18 flags for links, arriving earlier
 because a ticket is composed before the run rather than at its start.
 
+An epoch mismatch is refused with the code `ticket-graph-epoch`, and the
+verdict carries **both** epochs — `wantedEpoch` (the ticket's) and
+`loadedEpoch` (the graph the verifier holds). This is the one refusal a
+caller can act on. Every other ticket refusal means the ticket is wrong;
+this one usually means the right ticket met the wrong map, and an
+implementation told which graph to fetch can fetch it and carry on. Both
+sides are given because "I have the wrong region loaded" and "this ticket
+is for somewhere I do not operate" need different sentences and different
+actions, and a verifier that knows only what it wants cannot tell them
+apart. Implementations SHOULD NOT resolve the wanted epoch to a URL and
+load it without re-checking: whatever chose the URL, the graph that comes
+back MUST be verified against `wantedEpoch` before it is routed on, or
+"switch map automatically" becomes a way to point a driver's routing — and
+the topic namespace their run publishes on — at whatever answered.
+
 `notAfter` is also what bounds the **run**. A ticket-born publisher runs
 until the ticket expires, clamped to 24 hours — the clamp is there
 because `notAfter` is a uint32 a dispatcher can fat-finger into next
@@ -3247,6 +3262,7 @@ anything.
 | `issuerPublicKey ≠ certificate.rootPublicKey` | *issued by the route root itself* | decode **and** verify |
 | the certificate fails §21.5 rules 3–6 | `cert-empty-window`, `cert-window-too-long`, `cert-bad-signature`, `cert-not-yet-valid`, `cert-expired` | verify |
 | `notBefore >` the ticket's `notAfter` | `cert-after-link-expiry` | verify |
+| the ticket names another graph | `ticket-graph-epoch` | verify |
 | the seed is not the certificate's `dayPublicKey` | `ticket-day-seed-mismatch` | verify |
 
 The last one is worth its own sentence. A seed that is not the key the

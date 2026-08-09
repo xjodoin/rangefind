@@ -30,6 +30,7 @@ import {
   THREAD_MAX_ORDER_REF_BYTES,
   THREAD_MAX_OFFER_LABEL_BYTES,
   THREAD_STOP_FIELD,
+  TICKET_ERROR,
   awardMatchesOffer,
   classifyThreadArtifact,
   decodeJobOffer,
@@ -268,6 +269,16 @@ test("a ticket survives base64url, and nothing in it is malleable", async () => 
 
   const wrongEpoch = await verifyThreadTicket(ticket, { epochPrefix8: new Uint8Array(8) });
   assert.match(wrongEpoch.reason, /different graph epoch/);
+  // Coded and two-sided, because this is the one refusal a caller can act
+  // on: the right ticket met the wrong map far more often than a ticket is
+  // actually wrong, and an app told which graph to fetch can carry on. A
+  // driver told only a sentence is stuck in a van with a hex string.
+  assert.equal(wrongEpoch.code, TICKET_ERROR.GRAPH_EPOCH);
+  assert.equal(wrongEpoch.wantedEpoch, toHex(EPOCH32.subarray(0, 8)));
+  assert.equal(wrongEpoch.loadedEpoch, "0000000000000000");
+  // The two must be distinguishable: "wrong map loaded" and "ticket for
+  // another region" need different sentences and different actions.
+  assert.notEqual(wrongEpoch.wantedEpoch, wrongEpoch.loadedEpoch);
 
   // Issuer pinning: a perfectly valid ticket from someone this host does
   // not work for is still refused.
