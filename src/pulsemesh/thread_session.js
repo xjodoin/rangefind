@@ -45,14 +45,18 @@ import {
 } from "./thread_cache.js";
 import {
   decodeDayCertificate,
+  decodePhotoListRequest,
+  decodePhotoListResponse,
   decodePhotoRequest,
   decodePhotoResponse,
   decodeThreadRecord,
+  encodePhotoListRequest,
+  encodePhotoListResponse,
   encodePhotoRequest,
   encodePhotoResponse
 } from "./thread_codec.js";
 import { routeFollowLink } from "./thread_route.js";
-import { photoCommitment, photoHashHex } from "./thread_crypto.js";
+import { photoCommitment, photoHashHex, verifyPhotoChain } from "./thread_crypto.js";
 import {
   decodeThreadTicket,
   jobIdHexOf,
@@ -146,7 +150,8 @@ export function createThreadChannel({
   const stats = {
     delivered: 0, accepted: 0, dropped: 0, published: 0,
     cached: 0, served: 0, caughtUp: 0, catchUpRounds: 0, provided: 0,
-    photosServed: 0, photosFetched: 0, photosRefused: 0
+    photosServed: 0, photosFetched: 0, photosRefused: 0,
+    photoListsServed: 0, photoListsFetched: 0, photoListsRefused: 0
   };
   // §5.5. Holds sealed bytes for our own threads *and*, when relaying,
   // for tags we cannot open — the second is what lets a stranger's late
@@ -321,10 +326,104 @@ export function createThreadChannel({
     return null;
   }
 
+  /**
+   * Answers a PMTL (§20.7.1): every commitment a run has published, in
+   * publication order, for a holder that names one of its accumulators.
+   *
+   * Same protocol id and same seam as PMTF, magic-discriminated, because
+   * it has the photo protocol's shape and not catch-up's: only the peer
+   * publishing the run can answer, and the answer exists to make the
+   * blobs behind it fetchable.
+   *
+   * An accumulator we do not recognise gets an empty list, exactly as an
+   * unknown photo hash gets a zero-length blob — a prober must not be
+   * able to tell "not publishing that run" from "no such run".
+   */
+  function servePhotoList(payload) {
+    let request;
+    try {
+      request = decodePhotoListRequest(payload);
+    } catch {
+      return null; // not a PMTL: silence, and the next seam gets a turn
+    }
+    for (const run of runs) {
+      const entries = run.publisher.photoListFor(request.accumulator);
+      if (entries) {
+        stats.photoListsServed++;
+        return encodePhotoListResponse({ entries });
+      }
+    }
+    return encodePhotoListResponse({});
+  }
+
+  /**
+   * Fetches and **verifies** the commitment list behind an accumulator.
+   *
+   * This is what makes a commitment published into a dead zone
+   * recoverable (§20.7.1). The publisher restates its list, which on its
+   * own would be the publisher marking its own homework — so nothing here
+   * trusts it: the chain is recomputed from A₀ and the prefix that
+   * reproduces the accumulator the caller holds is the part that is
+   * evidence. That accumulator came out of a signed record, so a
+   * publisher that inserts, drops, reorders or backdates an entry cannot
+   * reach it.
+   *
+   * Entries past the match are returned as `unverified` rather than
+   * dropped: a holder whose newest record predates the last two photos
+   * should be told those two exist and that it cannot yet vouch for
+   * them. Fetch nothing on their strength.
+   */
+  async function fetchPhotoList(accumulator, { peers: given = null } = {}) {
+    const wanted = photoHashHex(accumulator);
+    const empty = { matchedAt: 0, verified: [], unverified: [] };
+    const mine = photoListLocally(wanted);
+    if (mine) return verifyPhotoChain(mine, wanted);
+    if (!network?.requestPhoto) return empty;
+    const peers = (given ?? network.peersOf?.(id) ?? []).filter(peer => peer !== id);
+    const request = encodePhotoListRequest({ accumulator: wanted });
+    for (const peer of peers) {
+      const response = await Promise.resolve(network.requestPhoto(id, peer, request)).catch(() => null);
+      if (!response) continue;
+      let decoded;
+      try {
+        decoded = decodePhotoListResponse(response);
+      } catch {
+        continue;
+      }
+      if (!decoded.entries.length) continue;
+      const checked = verifyPhotoChain(decoded.entries, wanted);
+      if (!checked.matchedAt) {
+        // No prefix reaches the accumulator we hold, so none of it is
+        // this run's list. Counted rather than thrown: one lying peer
+        // must not end the fetch, and the next may be honest.
+        stats.photoListsRefused++;
+        continue;
+      }
+      stats.photoListsFetched++;
+      return checked;
+    }
+    return empty;
+  }
+
+  function photoListLocally(accumulator) {
+    for (const run of runs) {
+      const entries = run.publisher.photoListFor(accumulator);
+      if (entries) return entries;
+    }
+    return null;
+  }
+
   if (node) {
     const previousPhoto = node.onPhotoStream;
+    // Both photo records share one seam, discriminated by magic — PMTF
+    // for a blob, PMTL for the commitment list behind an accumulator.
+    // Neither invents transport: the list is the prelude to the fetch and
+    // travels the same way (§20.7.1).
     node.onPhotoStream = (payload, fromPeer, nowMillis) =>
-      servePhoto(payload, nowMillis) ?? previousPhoto?.(payload, fromPeer, nowMillis) ?? null;
+      servePhoto(payload, nowMillis)
+      ?? servePhotoList(payload)
+      ?? previousPhoto?.(payload, fromPeer, nowMillis)
+      ?? null;
     const previousStream = node.onOtherStream;
     node.onOtherStream = (payload, fromPeer, nowMillis) =>
       serveCatchUp(payload, nowMillis) ?? previousStream?.(payload, fromPeer, nowMillis) ?? null;
@@ -358,6 +457,10 @@ export function createThreadChannel({
     baseUrl = null,
     onPublish = null
   }) {
+    // The topics this run has joined in order to publish on them. Held
+    // for the life of the run and released when it ends — see the note
+    // in `publish` below for why an unsubscribed publisher is silent.
+    const publishedTopics = new Set();
     const publisher = await createThreadPublisher({
       privateSeed,
       daySeed,
@@ -378,7 +481,29 @@ export function createThreadChannel({
         : null,
       publish: async emitted => {
         stats.published++;
-        network?.publish(threadTopic(epochPrefix16hex, emitted.tag), emitted.bytes, id);
+        const topic = threadTopic(epochPrefix16hex, emitted.tag);
+        // **A publisher subscribes to its own topic**, and without this
+        // the run publishes into nothing at all.
+        //
+        // GossipSub only maintains a mesh for topics a peer has joined.
+        // An unsubscribed publisher has no mesh for this topic, so
+        // `publish` succeeds locally — `allowPublishToZeroTopicPeers` is
+        // on, deliberately, for the genuinely-alone case — and the bytes
+        // reach nobody. That is silent by construction: the driver's own
+        // seq keeps climbing, its stats look healthy, and every follower
+        // sees a van that never moved. It is the exact shape of the
+        // failure that survived a real Android driver, a real keeper and
+        // a real browser all being up at once and connected.
+        //
+        // Refcounted through the same map the follows use, and held for
+        // the run rather than the record, because the tag rotates every
+        // five minutes (§4.2) and dropping the old one immediately would
+        // cut the mesh at each boundary.
+        if (!publishedTopics.has(topic)) {
+          subscribe(topic);
+          publishedTopics.add(topic);
+        }
+        network?.publish(topic, emitted.bytes, id);
         // The publisher is the best catch-up source there is: it holds
         // every record by construction. Cached as `openable` so the
         // relay budget never evicts a run this device is publishing.
@@ -390,6 +515,32 @@ export function createThreadChannel({
         await onPublish?.(emitted);
       }
     });
+    // Join the topic **before** the first record rather than on it.
+    //
+    // Subscribing inside `publish` is too late by one mesh heartbeat:
+    // GossipSub grafts asynchronously, so the records emitted in the
+    // first second leave before there is anywhere for them to go. A run
+    // that reports a few fixes and then sits still — a van parked at its
+    // first drop — could publish its whole existence into that gap.
+    //
+    // All three windows, matching what a follow subscribes to, so the
+    // five-minute tag rotation never lands on a topic this run has not
+    // joined yet.
+    try {
+      const { threadAddresses } = await import("./thread_discovery.js");
+      const addresses = await threadAddresses({
+        keys: publisher.keys, epoch32, epochPrefix16hex, nowMillis: clock()
+      });
+      for (const address of addresses) {
+        if (publishedTopics.has(address.topic)) continue;
+        subscribe(address.topic);
+        publishedTopics.add(address.topic);
+      }
+    } catch {
+      // Falls back to subscribing on first publish, below. A run that
+      // cannot pre-join still publishes; it just loses the first record
+      // to mesh formation, which §5.5 catch-up can recover.
+    }
     const discovery = await startDiscovery(publisher.keys);
     const run = {
       publisher,
@@ -416,12 +567,21 @@ export function createThreadChannel({
       outcomes: () => publisher.outcomes(),
       /** The sealed blobs this run committed to (§20.7), by commitment. */
       photoFor: hash => publisher.photoFor(hash),
+      /** §20.7.1. The accumulator this run's records currently carry. */
+      photoChain: () => publisher.photoChain(),
+      /** Every commitment published, in the order the chain binds them in. */
+      photoChainEntries: () => publisher.photoChainEntries(),
       async finish(options) {
         const emitted = await publisher.finish(options);
         // The final record still needs to reach anyone catching up, so
         // the run leaves the set but its bytes stay in the cache until
         // THREAD_CACHE_TTL sweeps them.
         discovery?.stop();
+        // Let the topics go. A device that finishes a round and keeps
+        // the subscription is relaying somebody else's thread traffic
+        // for nothing, and on a phone that is battery.
+        for (const topic of publishedTopics) unsubscribe(topic);
+        publishedTopics.clear();
         runs.delete(run);
         return emitted;
       },
@@ -675,6 +835,21 @@ export function createThreadChannel({
        * 45-byte link cannot. Null when nobody reachable holds it.
        */
       fetchPhoto: (hash, options) => fetchPhoto(hash, options),
+      /**
+       * Every commitment the run has published, recovered from the
+       * publisher and checked against an accumulator this follow holds
+       * (§20.7.1). Defaults to the newest accumulator in the newest
+       * record — the strongest one available, and the one that leaves
+       * the fewest entries unverified.
+       *
+       * Returns `{ matchedAt, verified, unverified }`. Fetch photos on
+       * the strength of `verified` only.
+       */
+      fetchPhotoList: (accumulator = null, options) => {
+        const head = accumulator ?? subscriber.latest()?.photoChain ?? null;
+        if (!head) return Promise.resolve({ matchedAt: 0, verified: [], unverified: [] });
+        return fetchPhotoList(head, options);
+      },
       get stats() { return subscriber.stats; },
       lastCatchUpMillis: -Infinity,
       discovery: null,
@@ -832,8 +1007,12 @@ export function createThreadChannel({
     serveCatchUp,
     /** Answers a PMTF directly, for the same reason (§20.7). */
     servePhoto,
+    /** Answers a PMTL — the commitment list behind an accumulator (§20.7.1). */
+    servePhotoList,
     /** Fetches one sealed photo by commitment; verifies before returning. */
     fetchPhoto,
+    /** Fetches a commitment list and verifies it against a signed accumulator. */
+    fetchPhotoList,
     cache,
     /** For hosts that receive thread bytes off some other transport. */
     deliver
