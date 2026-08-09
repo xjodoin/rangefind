@@ -13,9 +13,23 @@ const MIME = {
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".gz": "application/gzip",
-  ".bin": "application/octet-stream"
+  ".bin": "application/octet-stream",
+  // SVG needs its real type or a browser refuses to render it in an
+  // <img>: octet-stream downloads instead of drawing, which looks like a
+  // missing file rather than a missing header. Every brand asset here is
+  // an SVG, so the fallback made logos silently disappear.
+  ".svg": "image/svg+xml",
+  ".webmanifest": "application/manifest+json",
+  ".woff2": "font/woff2",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".ico": "image/x-icon",
+  ".txt": "text/plain; charset=utf-8"
 };
-const GZIP_TYPES = new Set([".html", ".js", ".css", ".json"]);
+// SVG compresses like the text it is; the binary image formats above are
+// already compressed and re-zipping them costs CPU for nothing.
+const GZIP_TYPES = new Set([".html", ".js", ".css", ".json", ".svg", ".txt"]);
 
 function parseRange(header, size) {
   const match = /^bytes=(\d*)-(\d*)$/u.exec(String(header || ""));
