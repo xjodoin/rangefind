@@ -11,7 +11,7 @@ import {
   encodeRouteCell,
   encodeRouteOverlay
 } from "../src/route_graph.js";
-import { buildRouteGraph } from "../src/route_graph_build.js";
+import { IntegerRadixHeap, buildRouteGraph } from "../src/route_graph_build.js";
 import { openRouteGraphDir } from "../src/route_graph_node.js";
 
 // Deterministic LCG so the synthetic graph is stable across runs.
@@ -22,6 +22,30 @@ function lcg(seed) {
     return state / 0x100000000;
   };
 }
+
+test("integer radix heap orders duplicate and 53-bit monotone distances", () => {
+  const heap = new IntegerRadixHeap();
+  for (const [weight, value] of [
+    [2 ** 40 + 7, "large"],
+    [5, "five-a"],
+    [2 ** 32 + 1, "wide"],
+    [5, "five-b"],
+    [2 ** 48 + 3, "largest"]
+  ]) heap.push(weight, value);
+
+  const weights = [];
+  while (heap.size) {
+    weights.push(heap.peekWeight());
+    heap.pop();
+  }
+  assert.deepEqual(weights, [5, 5, 2 ** 32 + 1, 2 ** 40 + 7, 2 ** 48 + 3]);
+
+  heap.clear();
+  heap.push(20, "twenty");
+  assert.equal(heap.peekWeight(), 20);
+  heap.pop();
+  assert.throws(() => heap.push(19, "past"), /monotone safe-integer/);
+});
 
 // Grid road network around Montreal-ish coordinates. Every neighbor pair is
 // connected in both directions with independent random weights, which keeps
@@ -743,12 +767,22 @@ test("production builds can release consumed source columns without changing out
   });
   const options = { leafNodes: 32, fanout: 4, topMaxCells: 4 };
   const baseline = buildRouteGraph(retained, retainedDir, options);
-  const compact = buildRouteGraph(releasable, releasedDir, { ...options, releaseSource: true });
+  const collected = [];
+  const compact = buildRouteGraph(releasable, releasedDir, {
+    ...options,
+    releaseSource: true,
+    collectGarbage: phase => collected.push(phase)
+  });
   assert.equal(compact.rootFile, baseline.rootFile);
-  assert.equal(releasable.nodeLat, null);
-  assert.equal(releasable.nodeLon, null);
-  assert.equal(releasable.edgeFrom, null);
-  assert.equal(releasable.edgeTo, null);
+  assert.deepEqual(collected, ["topology", "leaf-packing", "overlays"]);
+  for (const column of [
+    "nodeLat", "nodeLon", "edgeFrom", "edgeTo", "edgeWeightDs",
+    "edgeDistDm", "edgeName", "edgeClass", "edgeJunction", "edgeSpeed",
+    "edgeCond", "edgeSign", "edgeFlags", "geomOffsets", "geomBytes",
+    "laneOffsets", "laneBytes"
+  ]) {
+    assert.equal(releasable[column], null, `${column} should be released`);
+  }
 });
 
 test("far-off points fail with a coded snap error", async (t) => {

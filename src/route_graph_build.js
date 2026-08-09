@@ -13,7 +13,6 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
 import {
-  MinHeap,
   ROUTE_GRAPH_FORMAT,
   bucketWeight,
   encodeRouteCell,
@@ -101,12 +100,17 @@ function buildCsr(nodeCount, from, to) {
   for (let i = 0; i < nodeCount; i++) rowStart[i + 1] += rowStart[i];
   const targets = new Uint32Array(from.length);
   const edgeIds = new Uint32Array(from.length);
-  const cursor = Uint32Array.from(rowStart.subarray(0, nodeCount));
-  for (let i = 0; i < from.length; i++) {
-    const slot = cursor[from[i]]++;
+  // Fill each row backwards from its cumulative end. Walking the source
+  // backwards preserves its stable order inside every row and lets rowStart
+  // itself serve as the cursor, avoiding one node-sized scratch column. Once
+  // filled, the decremented ends are shifted back into canonical row starts.
+  for (let i = from.length - 1; i >= 0; i--) {
+    const slot = --rowStart[from[i] + 1];
     targets[slot] = to[i];
     edgeIds[slot] = i;
   }
+  for (let i = 1; i < nodeCount; i++) rowStart[i] = rowStart[i + 1];
+  rowStart[nodeCount] = from.length;
   return { rowStart, targets, edgeIds };
 }
 
@@ -126,63 +130,164 @@ function readGeomZigzag(bytes, state) {
   return raw % 2 === 1 ? -(raw + 1) / 2 : raw / 2;
 }
 
-// Drops clique edges that another boundary node realizes exactly:
-// (u, v) is redundant when d(u, x) + d(x, v) === d(u, v) for some boundary
-// x. Distances are preserved (weights are >= 1, so witness decompositions
-// strictly shrink), and road-network cliques typically sparsify several-fold.
-function pruneCliqueTriples(boundary, triples) {
-  const count = boundary.length;
-  if (count < 3 || !triples.length) return Uint32Array.from(triples);
-  const index = new Map();
-  for (let i = 0; i < count; i++) index.set(boundary[i], i);
-  const dist = new Float64Array(count * count).fill(Infinity);
-  for (let t = 0; t < triples.length; t += 3) {
-    dist[index.get(triples[t]) * count + index.get(triples[t + 1])] = triples[t + 2];
+// Dijkstra pushes monotonically increasing non-negative integer distances.
+// A radix heap replaces O(log n) binary-heap maintenance with 54 small
+// buckets while retaining exact Number-safe distances (up to 2^53 - 1).
+export class IntegerRadixHeap {
+  constructor() {
+    this.bucketWeights = Array.from({ length: 54 }, () => []);
+    this.bucketValues = Array.from({ length: 54 }, () => []);
+    this.last = 0;
+    this.length = 0;
   }
-  const kept = new Uint32Array(triples.length);
-  let keptLength = 0;
-  for (let t = 0; t < triples.length; t += 3) {
-    const i = index.get(triples[t]);
-    const j = index.get(triples[t + 1]);
-    const direct = triples[t + 2];
-    let redundant = false;
-    for (let k = 0; k < count; k++) {
-      if (k === i || k === j) continue;
-      const viaK = dist[i * count + k] + dist[k * count + j];
-      if (viaK <= direct) {
-        redundant = true;
-        break;
-      }
-    }
-    if (!redundant) {
-      kept[keptLength++] = triples[t];
-      kept[keptLength++] = triples[t + 1];
-      kept[keptLength++] = direct;
-    }
+  get size() {
+    return this.length;
   }
-  return kept.slice(0, keptLength);
+  clear() {
+    for (let i = 0; i < this.bucketWeights.length; i++) {
+      this.bucketWeights[i].length = 0;
+      this.bucketValues[i].length = 0;
+    }
+    this.last = 0;
+    this.length = 0;
+  }
+  bucket(weight) {
+    if (weight <= 0xffffffff && this.last <= 0xffffffff) {
+      const difference = ((weight >>> 0) ^ (this.last >>> 0)) >>> 0;
+      return difference ? 1 + (31 - Math.clz32(difference)) : 0;
+    }
+    const high = Math.floor(weight / 0x100000000);
+    const lastHigh = Math.floor(this.last / 0x100000000);
+    const highDifference = (high ^ lastHigh) >>> 0;
+    if (highDifference) return 33 + (31 - Math.clz32(highDifference));
+    const lowDifference = ((weight >>> 0) ^ (this.last >>> 0)) >>> 0;
+    return lowDifference ? 1 + (31 - Math.clz32(lowDifference)) : 0;
+  }
+  push(weight, value) {
+    if (weight < this.last || weight > Number.MAX_SAFE_INTEGER) {
+      throw new Error(`Radix heap requires monotone safe-integer weights (got ${weight} after ${this.last})`);
+    }
+    const bucket = this.bucket(weight);
+    this.bucketWeights[bucket].push(weight);
+    this.bucketValues[bucket].push(value);
+    this.length++;
+  }
+  prepareFirstBucket() {
+    if (this.bucketWeights[0].length || !this.length) return;
+    let bucket = 1;
+    while (!this.bucketWeights[bucket].length) bucket++;
+    const weights = this.bucketWeights[bucket];
+    const values = this.bucketValues[bucket];
+    let next = Infinity;
+    for (let i = 0; i < weights.length; i++) {
+      if (weights[i] < next) next = weights[i];
+    }
+    this.last = next;
+    for (let i = 0; i < weights.length; i++) {
+      const target = this.bucket(weights[i]);
+      this.bucketWeights[target].push(weights[i]);
+      this.bucketValues[target].push(values[i]);
+    }
+    weights.length = 0;
+    values.length = 0;
+  }
+  peekWeight() {
+    this.prepareFirstBucket();
+    return this.length ? this.last : Infinity;
+  }
+  pop() {
+    this.prepareFirstBucket();
+    this.length--;
+    this.bucketWeights[0].pop();
+    return this.bucketValues[0].pop();
+  }
 }
 
-// Dijkstra over a local CSR from one source; returns distances (Infinity
-// when unreachable). Used for cliques over small per-cell graphs.
-function localDijkstra(nodeCount, rowStart, targets, weights, source, dist, heap) {
-  dist.fill(Infinity, 0, nodeCount);
+// Computes only irreducible boundary arcs. While Dijkstra runs, witnessed[v]
+// records whether an equally-short route from the source to v already passes
+// through another boundary. This is equivalent to the old O(B^3) post-pass
+// test d(u,x) + d(x,v) === d(u,v), but needs no B-by-B distance matrix and no
+// cubic scan. Positive weights make witness state final before a node settles.
+function localBoundaryDijkstra(
+  rowStart,
+  targets,
+  weights,
+  source,
+  dist,
+  heap,
+  boundaryMask,
+  boundaryCount,
+  witnessed,
+  stamp,
+  generation
+) {
   dist[source] = 0;
-  heap.weights.length = 0;
-  heap.values.length = 0;
+  witnessed[source] = 0;
+  stamp[source] = generation;
+  heap.clear();
   heap.push(0, source);
+  let remaining = boundaryCount - 1;
   while (heap.size) {
     const weight = heap.peekWeight();
     const node = heap.pop();
-    if (weight !== dist[node]) continue;
+    if (stamp[node] !== generation || weight !== dist[node]) continue;
+    if (node !== source && boundaryMask[node] && --remaining === 0) break;
+    const passesBoundary = witnessed[node] || (node !== source && boundaryMask[node]) ? 1 : 0;
     for (let e = rowStart[node]; e < rowStart[node + 1]; e++) {
       const next = weight + weights[e];
-      if (next < dist[targets[e]]) {
-        dist[targets[e]] = next;
-        heap.push(next, targets[e]);
+      const target = targets[e];
+      const previous = stamp[target] === generation ? dist[target] : Infinity;
+      if (next < previous) {
+        dist[target] = next;
+        witnessed[target] = passesBoundary;
+        stamp[target] = generation;
+        heap.push(next, target);
+      } else if (next === previous && passesBoundary) {
+        witnessed[target] = 1;
       }
     }
   }
+}
+
+function boundaryClique(
+  nodeCount,
+  rowStart,
+  targets,
+  weights,
+  boundary,
+  globalNodes,
+  globalOffset,
+  arenas,
+  heap
+) {
+  if (boundary.length < 2) return new Uint32Array(0);
+  arenas.ensure(nodeCount);
+  const { dist, boundaryMask, witnessed } = arenas;
+  boundaryMask.fill(0, 0, nodeCount);
+  for (const node of boundary) boundaryMask[node] = 1;
+  const triples = [];
+  for (const source of boundary) {
+    const generation = arenas.nextGeneration();
+    localBoundaryDijkstra(
+      rowStart,
+      targets,
+      weights,
+      source,
+      dist,
+      heap,
+      boundaryMask,
+      boundary.length,
+      witnessed,
+      arenas.stamp,
+      generation
+    );
+    const globalSource = globalNodes ? globalNodes[source] : globalOffset + source;
+    for (const target of boundary) {
+      if (target === source || arenas.stamp[target] !== generation || witnessed[target]) continue;
+      triples.push(globalSource, globalNodes ? globalNodes[target] : globalOffset + target, dist[target]);
+    }
+  }
+  return Uint32Array.from(triples);
 }
 
 export function buildRouteGraph(graph, outDir, options = {}) {
@@ -210,8 +315,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const { perm, leaves } = kdPartition(graph.nodeLat, graph.nodeLon, leafNodes);
   const newId = new Uint32Array(nodeCount);
   for (let i = 0; i < nodeCount; i++) newId[perm[i]] = i;
-  const latE7 = new Int32Array(nodeCount);
-  const lonE7 = new Int32Array(nodeCount);
+  let latE7 = new Int32Array(nodeCount);
+  let lonE7 = new Int32Array(nodeCount);
   for (let i = 0; i < nodeCount; i++) {
     latE7[i] = graph.nodeLat[perm[i]];
     lonE7[i] = graph.nodeLon[perm[i]];
@@ -220,8 +325,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     graph.nodeLat = null;
     graph.nodeLon = null;
   }
-  const edgeFrom = new Uint32Array(edgeCount);
-  const edgeTo = new Uint32Array(edgeCount);
+  let edgeFrom = new Uint32Array(edgeCount);
+  let edgeTo = new Uint32Array(edgeCount);
   for (let i = 0; i < edgeCount; i++) {
     edgeFrom[i] = newId[graph.edgeFrom[i]];
     edgeTo[i] = newId[graph.edgeTo[i]];
@@ -231,7 +336,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     graph.edgeFrom = null;
     graph.edgeTo = null;
   }
-  const leafOfNode = new Uint32Array(nodeCount);
+  // newId is dead after edge remapping. Reuse its backing store for the leaf
+  // assignment instead of retaining a third node-sized Uint32 column.
+  const leafOfNode = newId;
   for (let leaf = 0; leaf < leaves.length; leaf++) {
     leafOfNode.fill(leaf, leaves[leaf][0], leaves[leaf][1]);
   }
@@ -258,19 +365,29 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   // level 0 = same leaf, levelCount + 1 = only the top region.
   const edgeLca = new Uint8Array(edgeCount);
   const maxLca = new Uint8Array(nodeCount);
-  for (let i = 0; i < edgeCount; i++) {
-    const from = edgeFrom[i];
-    const to = edgeTo[i];
-    let lca = levelCount + 1;
-    for (let level = 0; level <= levelCount; level++) {
-      if (cellAtLevel(from, level) === cellAtLevel(to, level)) {
-        lca = level;
-        break;
+  // Traverse CSR so edgeFrom is no longer needed as an LCA input. Both
+  // remapped endpoint columns become unreachable at the end of this phase;
+  // India releases about 900 MiB before allocating its overlay graphs.
+  for (let from = 0; from < nodeCount; from++) {
+    for (let slot = csr.rowStart[from]; slot < csr.rowStart[from + 1]; slot++) {
+      const edgeId = csr.edgeIds[slot];
+      const to = csr.targets[slot];
+      let lca = levelCount + 1;
+      for (let level = 0; level <= levelCount; level++) {
+        if (cellAtLevel(from, level) === cellAtLevel(to, level)) {
+          lca = level;
+          break;
+        }
       }
+      edgeLca[edgeId] = lca;
+      if (lca > maxLca[from]) maxLca[from] = lca;
+      if (lca > maxLca[to]) maxLca[to] = lca;
     }
-    edgeLca[i] = lca;
-    if (lca > maxLca[from]) maxLca[from] = lca;
-    if (lca > maxLca[to]) maxLca[to] = lca;
+  }
+  edgeFrom = null;
+  edgeTo = null;
+  if (options.releaseSource === true && typeof options.collectGarbage === "function") {
+    options.collectGarbage("topology");
   }
   log(`topology: ${edgeCount.toLocaleString()} edges across ${levelCount + 1} overlay level(s)`);
 
@@ -291,12 +408,38 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   // 5. Bottom-up cliques per bucket. cliques[level] maps cellId -> flat
   // [u, v, w, ...] triples over nodes with maxLca > level, exact within the
   // cell for that bucket's metric.
-  const heap = new MinHeap();
+  const heap = new IntegerRadixHeap();
+  const cliqueArenas = {
+    dist: new Float64Array(leafNodes + 8),
+    boundaryMask: new Uint8Array(leafNodes + 8),
+    witnessed: new Uint8Array(leafNodes + 8),
+    stamp: new Uint32Array(leafNodes + 8),
+    generation: 0,
+    ensure(size) {
+      if (this.dist.length >= size) return;
+      this.dist = new Float64Array(size);
+      this.boundaryMask = new Uint8Array(size);
+      this.witnessed = new Uint8Array(size);
+      this.stamp = new Uint32Array(size);
+      this.generation = 0;
+    },
+    nextGeneration() {
+      this.generation = (this.generation + 1) >>> 0;
+      if (this.generation === 0) {
+        this.stamp.fill(0);
+        this.generation = 1;
+      }
+      return this.generation;
+    }
+  };
+  // Every level rebuilds the same global->cell-local lookup, and no retained
+  // overlay references it. One phase-owned arena avoids allocating another
+  // 160 MiB column at each of India's five levels.
+  let overlayLocalIndex;
   const computeBucketOverlays = (bucket) => {
     const cliques = [];
     {
       const leafCliques = new Map();
-      const dist = new Float64Array(leafNodes + 8);
       for (let leaf = 0; leaf < leaves.length; leaf++) {
         const [start, end] = leaves[leaf];
         const size = end - start;
@@ -318,16 +461,17 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         for (let node = start; node < end; node++) {
           if (maxLca[node] >= 1) boundary.push(node - start);
         }
-        const triples = [];
-        const localDist = size <= dist.length ? dist : new Float64Array(size);
-        for (const source of boundary) {
-          localDijkstra(size, local.rowStart, local.targets, localWeights, source, localDist, heap);
-          for (const target of boundary) {
-            if (target === source || localDist[target] === Infinity) continue;
-            triples.push(start + source, start + target, localDist[target]);
-          }
-        }
-        leafCliques.set(leaf, pruneCliqueTriples(boundary.map(node => start + node), triples));
+        leafCliques.set(leaf, boundaryClique(
+          size,
+          local.rowStart,
+          local.targets,
+          localWeights,
+          boundary,
+          null,
+          start,
+          cliqueArenas,
+          heap
+        ));
       }
       cliques.push(leafCliques);
       log(`overlays (${buckets[bucket].name}): leaf cliques complete`);
@@ -354,10 +498,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       }
       // Every retained node belongs to one cell at this level. A flat lookup
       // avoids a Map entry (and boxed key/value pair) for every boundary node.
-      const localIndex = new Uint32Array(nodeCount);
       for (let cell = 0; cell < cellCount; cell++) {
         const nodes = nodesByCell[cell];
-        for (let i = 0; i < nodes.length; i++) localIndex[nodes[i]] = i;
+        for (let i = 0; i < nodes.length; i++) overlayLocalIndex[nodes[i]] = i;
       }
 
       // Count once and allocate exact typed columns. Country-scale overlays
@@ -388,8 +531,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           const cell = cellOf(triples[i]);
           const cursor = edgeCursor[cell]++;
           const columns = columnsByCell[cell];
-          columns.from[cursor] = localIndex[triples[i]];
-          columns.to[cursor] = localIndex[triples[i + 1]];
+          columns.from[cursor] = overlayLocalIndex[triples[i]];
+          columns.to[cursor] = overlayLocalIndex[triples[i + 1]];
           columns.weights[cursor] = triples[i + 2];
           columns.isClique[cursor] = 1;
         }
@@ -401,8 +544,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           const cell = cellOf(node);
           const cursor = edgeCursor[cell]++;
           const columns = columnsByCell[cell];
-          columns.from[cursor] = localIndex[node];
-          columns.to[cursor] = localIndex[csr.targets[e]];
+          columns.from[cursor] = overlayLocalIndex[node];
+          columns.to[cursor] = overlayLocalIndex[csr.targets[e]];
           columns.weights[cursor] = weightOf(edgeId, bucket);
         }
       }
@@ -435,24 +578,22 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         for (let i = 0; i < overlay.nodes.length; i++) {
           if (maxLca[overlay.nodes[i]] >= level + 1) boundary.push(i);
         }
-        const dist = new Float64Array(overlay.nodes.length);
-        const triples = [];
-        for (const source of boundary) {
-          localDijkstra(overlay.nodes.length, overlay.rowStart, overlay.targetIndex, overlay.weights, source, dist, heap);
-          for (const target of boundary) {
-            if (target === source || dist[target] === Infinity) continue;
-            triples.push(overlay.nodes[source], overlay.nodes[target], dist[target]);
-          }
-        }
-        levelCliques.set(cell, pruneCliqueTriples(boundary.map(local => overlay.nodes[local]), triples));
+        levelCliques.set(cell, boundaryClique(
+          overlay.nodes.length,
+          overlay.rowStart,
+          overlay.targetIndex,
+          overlay.weights,
+          boundary,
+          overlay.nodes,
+          0,
+          cliqueArenas,
+          heap
+        ));
       }
       cliques.push(levelCliques);
     }
     return overlays;
   };
-  const bucketOverlays = buckets.map((_, bucket) => computeBucketOverlays(bucket));
-  const overlays = bucketOverlays[0];
-
   // 5. Shard assignment: contiguous top-child cell groups.
   const topChildren = cellsAtTop;
   const shardOfTopChild = new Uint32Array(topChildren);
@@ -617,6 +758,30 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     });
   }
   log(`packing: ${leaves.length.toLocaleString()} leaf cell(s) complete`);
+
+  // Leaf blocks are the sole consumers of display, geometry, and lane source
+  // columns. Retire them before overlay construction instead of retaining
+  // several GiB of payload beside every overlay generation. Computation moved
+  // earlier, but pack write order remains leaves then overlays, byte-for-byte.
+  if (options.releaseSource === true) {
+    for (const key of [
+      "edgeDistDm", "edgeName", "edgeJunction", "edgeSpeed", "edgeCond",
+      "edgeSign", "edgeFlags", "geomOffsets", "geomBytes", "laneOffsets",
+      "laneBytes"
+    ]) graph[key] = null;
+    latE7 = null;
+    lonE7 = null;
+    if (typeof options.collectGarbage === "function") options.collectGarbage("leaf-packing");
+  }
+
+  overlayLocalIndex = new Uint32Array(nodeCount);
+  const bucketOverlays = buckets.map((_, bucket) => computeBucketOverlays(bucket));
+  const overlays = bucketOverlays[0];
+  if (options.releaseSource === true) {
+    graph.edgeWeightDs = null;
+    graph.edgeClass = null;
+    if (typeof options.collectGarbage === "function") options.collectGarbage("overlays");
+  }
 
   const emptyOverlay = {
     nodes: new Uint32Array(0),
