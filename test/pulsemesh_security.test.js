@@ -124,7 +124,7 @@ test("thread gossip is authenticated and rate-limited before forwarding", async 
     publish: record => { emitted.push(record); }
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: keypair.publicKey,
+    threadSecret: keypair.threadSecret, rootPublicKey: keypair.publicKey,
     epochPrefix8: epoch32.subarray(0, 8),
     notAfter: Math.floor(now / 1000) + 3600
   }));
@@ -150,8 +150,11 @@ test("thread gossip is authenticated and rate-limited before forwarding", async 
     const junk = encodeThreadRecord({
       epochPrefix8: epoch32.subarray(0, 8),
       tag: honest.tag,
+      generation: 1,
       seq: 100 + index,
-      ciphertext: new Uint8Array(48)
+      previousHash: new Uint8Array(16),
+      ciphertext: new Uint8Array(48),
+      admissionTag: new Uint8Array(16)
     });
     assert.equal(await mesh.judgeGossip(topic, junk.bytes, "link-holder", now), GOSSIP_IGNORE);
   }

@@ -35,12 +35,13 @@ function fakeHost({ addresses = [] } = {}) {
 
 async function discoveryFor(host) {
   const keypair = await generateThreadKeypair(sha256Utf8("reach-keys"));
-  const keys = await deriveThreadKeys(keypair.publicKey);
+  const keys = await deriveThreadKeys(keypair.threadSecret);
   return createThreadDiscovery({
     host,
     keys,
     epoch32: fromHex(EPOCH),
     epochPrefix16hex: EPOCH.slice(0, 16),
+    advertise: true,
     constants: THREAD_CONSTANTS,
     clock: () => 1_760_000_000_000
   });

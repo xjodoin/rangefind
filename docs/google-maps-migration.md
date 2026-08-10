@@ -574,7 +574,7 @@ metric and still return a route.
 For the Fleet Engine journey- and shipment-sharing surface — "where is my
 delivery", "where is the school bus" — [PulseMesh threads](pulsemesh-threads.md)
 covers the tracking half: one authoritative publisher, a bounded audience, and
-a capability that is a 45-byte key rather than a URL pointing at a tracking
+a 78-byte capability-separated link rather than a URL pointing at a tracking
 server. The arrival estimate is computed on the recipient's own device from
 the broadcast position, so nothing server-side learns which stop a given
 subscriber is waiting at. It is not a dispatch backend: driver assignment,

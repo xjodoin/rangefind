@@ -74,6 +74,10 @@ export async function threadAddresses({ keys, epoch32, epochPrefix16hex, nowMill
 const REACHABLE_POLL_MS = 2000;
 /** How long to keep checking before leaving it to the ordinary interval. */
 const REACHABLE_WAIT_MS = 60_000;
+const MAX_PROVIDER_RESULTS = 8;
+const MAX_PROVIDER_DIALS = 3;
+const MAX_PROVIDER_ADDRESSES = 2;
+const DIAL_RETRY_MS = 30_000;
 
 export function createThreadDiscovery({
   host,
@@ -82,6 +86,7 @@ export function createThreadDiscovery({
   epochPrefix16hex,
   constants = THREAD_CONSTANTS,
   clock = Date.now,
+  advertise = false,
   provideTimeoutMs = 10_000,
   findTimeoutMs = 10_000
 } = {}) {
@@ -94,6 +99,7 @@ export function createThreadDiscovery({
   let lastFingerprint = "";
   let reachableTimer = null;
   let timer = null;
+  const dialedAt = new Map();
 
   // A DHT operation must never block its caller. `provide` in particular
   // waits on the K closest peers, which on a small or partitioned mesh
@@ -124,6 +130,10 @@ export function createThreadDiscovery({
 
   /** Advertises this peer as a provider for every current window. */
   async function provide({ nowMillis = clock() } = {}) {
+    if (!advertise) {
+      stats.provideSkipped++;
+      return 0;
+    }
     const routing = host.contentRouting;
     if (!routing) return 0;
 
@@ -180,11 +190,12 @@ export function createThreadDiscovery({
    * Providers for this thread right now, deduplicated by peer id and
    * excluding ourselves. `limit` bounds the DHT walk; `signal` aborts it.
    */
-  async function findPeers({ nowMillis = clock(), limit = 8, signal = null, timeoutMs = findTimeoutMs } = {}) {
+  async function findPeers({ nowMillis = clock(), limit = MAX_PROVIDER_RESULTS, signal = null, timeoutMs = findTimeoutMs } = {}) {
     const routing = host.contentRouting;
     if (!routing) return [];
     const abort = signal ?? deadline(timeoutMs);
     const found = new Map();
+    const boundedLimit = Math.max(1, Math.min(MAX_PROVIDER_RESULTS, limit));
     for (const address of await addresses(nowMillis)) {
       stats.lookups++;
       try {
@@ -194,12 +205,12 @@ export function createThreadDiscovery({
           if (!found.has(id)) {
             found.set(id, { id, multiaddrs: (provider.multiaddrs || []).map(String), window: address.window });
           }
-          if (found.size >= limit) break;
+          if (found.size >= boundedLimit) break;
         }
       } catch {
         // A lookup that finds nobody is normal on a small mesh.
       }
-      if (found.size >= limit) break;
+      if (found.size >= boundedLimit) break;
     }
     stats.peersFound += found.size;
     return [...found.values()];
@@ -210,15 +221,20 @@ export function createThreadDiscovery({
    * peers holding this thread with nothing but the link. Returns the peer
    * ids actually connected.
    */
-  async function connect({ nowMillis = clock(), limit = 8 } = {}) {
+  async function connect({ nowMillis = clock(), limit = MAX_PROVIDER_DIALS } = {}) {
     const peers = await findPeers({ nowMillis, limit });
     const connected = [];
-    for (const peer of peers) {
+    const boundedLimit = Math.max(1, Math.min(MAX_PROVIDER_DIALS, limit));
+    for (const peer of peers.slice(0, boundedLimit)) {
+      const lastDial = dialedAt.get(peer.id);
+      if (lastDial != null && nowMillis - lastDial < DIAL_RETRY_MS) continue;
+      dialedAt.set(peer.id, nowMillis);
+      while (dialedAt.size > MAX_PROVIDER_RESULTS * 4) dialedAt.delete(dialedAt.keys().next().value);
       try {
         const { multiaddr } = await import("@multiformats/multiaddr");
-        for (const address of peer.multiaddrs) {
+        for (const address of peer.multiaddrs.slice(0, MAX_PROVIDER_ADDRESSES)) {
           try {
-            await host.dial(multiaddr(address));
+            await host.dial(multiaddr(address), { signal: deadline(findTimeoutMs) });
             connected.push(peer.id);
             break;
           } catch {
@@ -235,6 +251,7 @@ export function createThreadDiscovery({
   /** Re-advertises every THREAD_PROVIDE_INTERVAL until stopped. */
   function start() {
     if (timer) return;
+    if (!advertise) return;
     const tick = () => {
       provide().catch(() => {});
     };

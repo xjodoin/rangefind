@@ -364,7 +364,7 @@ then the correct answer.
 
 **Recommendation, revised by the fuller data: keep both profiles and
 choose by route publicity — which is exactly what
-[threads §10 rule 3](pulsemesh-threads.md) already prescribes.** The
+[threads §13](pulsemesh-threads.md#13-cross-channel-isolation) prescribes.** The
 measurement validates that rule rather than overturning it:
 
 - **A published route** (transit, school runs, snow clearing) should use
@@ -517,10 +517,10 @@ WebCrypto path, so the same numbers apply in a browser.
 
 | Operation | Result |
 | --- | --- |
-| PMT1 record (fine mode, no run plan) | **145 bytes** |
+| PMT1 record (fine mode, no run plan) | **178 bytes** |
 | PMTP body | 95 bytes (31-byte preimage + 64-byte signature) |
-| Cumulative outcome map, per record | +16 B at 50 stops, +55 B at 200 |
-| The link — the entire capability | **45 bytes** |
+| Cumulative outcome map, per record | +17 B at 50 stops, +56 B at 200 |
+| Follow link — capability plus verification identity | **78 bytes** |
 | Key schedule from the capability | 0.06 ms, once per thread |
 | Sign (publisher) | 0.064 ms |
 | Verify (subscriber) | 0.066 ms |
@@ -546,24 +546,22 @@ the same shape as the traffic channel's proof-of-work asymmetry, reached
 by a different route: there the defence is that forging is expensive,
 here it is that addressing is impossible.
 
-**Bandwidth, against the §15 claims:**
+**Measured bandwidth:**
 
-| Claim in §15 | Measured |
+| Measure | Result |
 | --- | --- |
-| 26.6 B/s per fine thread | **26.6 B/s** |
-| 94 KB per thread-hour | **94 KB** |
-| ~46 MB for a 500-bus fleet-hour | **46 MB** |
+| Fine thread bandwidth | **35.6 B/s** |
+| Per thread-hour | **125 KB** |
+| 500-bus fleet-hour | **61 MB** |
 | Coarse "two orders of magnitude below" | **20.0% of fine** — one order, not two |
-| Subscriber cache ≈ 16 KB/thread | 31 KiB at the default ring |
+| Subscriber cache | 42 KiB at the default ring and measured record size |
 
-The spec's arithmetic holds everywhere except the coarse-mode claim,
-which was optimistic: coarse costs about a fifth of fine, not a
-hundredth. Still the right default for child transport — §11's argument
-was always about what a leaked capability is worth, not bytes — but the
-bandwidth line in §15 should say 5×, not 100×.
+Coarse costs about a fifth of fine. It remains the right default for child
+transport because the decision is about what a leaked capability reveals,
+not only bytes.
 
-**§18's first open question, answered — and it was aimed at the wrong
-variable.** The spec asks how many concurrent subscribers a run needs
+**Catch-up availability is controlled by peers asked, not audience size.**
+The benchmark asks how many concurrent subscribers a run needs
 before a late joiner reliably finds the gap. Modelling subscribers that
 sleep and wake independently (awake ~25% of the time), with every peer
 running the real cache and the real validator:
@@ -583,14 +581,12 @@ running the real cache and the real validator:
 decides everything.** Asking one peer succeeds about half the time
 whether the run has 2 subscribers or 100 — the odds that the peer you
 picked happened to be awake do not improve with audience. Asking three
-takes it to 83–95%, eight to 100%. So §8's "availability scales with
-audience size" is only true for a joiner that queries several providers,
-and the actionable rule is a floor on providers asked, not a cache
-incentive for small audiences.
+takes it to 83–95%, eight to 100%. The actionable rule is a floor on peers
+asked, not a cache incentive for small audiences.
 
 The same run pins a limit the design never stated: **catch-up can never
 recover more than `THREAD_MAX_AGE` of history** — two minutes — because
-§7 step 8 rejects anything older regardless of who cached it. "Catch-up"
+the freshness validator rejects anything older regardless of who cached it. "Catch-up"
 means the last two minutes, not the run so far, and a UI must not promise
 otherwise.
 
@@ -713,8 +709,8 @@ per-user scaling, not every server in the world.
 | M2 — loopback mesh | **done**: `test/pulsemesh_mesh.test.js` closes the contribute→gossip→aggregate→route loop on the real engine |
 | M3 — wire (js-libp2p transports) | **done**: `src/pulsemesh/libp2p.js` + `scripts/pulsemesh_keeper.mjs`; real-TCP convergence with PoW, churn without loss, padded late-joiner recovery, and a keeper child process converging with a contributor parent to byte-identical digests (`test/pulsemesh_wire.test.js`) |
 | M4 — simulation harness | **done**: §4–§7 above |
-| M5 — reticent profile measurement | **done**: §8 above; the answer validates threads §10 rule 3 rather than overturning it |
-| T1 — thread crypto, codecs, link | **done**: §16 vectors byte-identical through WebCrypto |
+| M5 — reticent profile measurement | **done**: §8 above; the answer validates threads §13 rather than overturning it |
+| T1 — thread crypto, codecs, link | **done**: current vectors byte-identical through WebCrypto |
 | T2 — loopback thread + local ETA | **done**: the ETA moves under a traffic-channel jam, on the real OSM graph |
 | T3 — catch-up and discovery | **done**: a late joiner recovers from another subscriber with no host (§9c) |
 | T4 — cross-channel contribution rules | **done**: including the dwell-bias failure rule 4 exists to prevent |
@@ -742,7 +738,7 @@ formation included.
 
 ## 13. Defects these measurements and the conformance audit found
 
-Building the harness and auditing the implementation against §15 turned
+Building the harness and auditing the implementation's wire budget turned
 up nine real defects, all now fixed and covered by tests. They are worth
 recording because several are the kind that a passing test suite happily
 hides:

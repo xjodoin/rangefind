@@ -1,7 +1,7 @@
 // PMH1 seed cards (threads §20.10): how a fleet hands out the one peer
 // its devices can dial.
 //
-// Everything else in this directory is a **capability** — 45 bytes that
+// Everything else in this directory is a **capability** — link bytes that
 // let you follow a run, or a sealed ticket that lets you publish one.
 // None of them say how to *reach* the mesh. That is not an oversight
 // (§5.4: "a link is a key, not a location"), but it leaves a real gap: a

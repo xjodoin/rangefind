@@ -261,9 +261,12 @@ test("thread_crypto falls back on its own, after one probe", async () => {
     assert.equal(ed25519Imports, 1, "one probe for the process, not one thrown error per call");
 
     // The rest of the key schedule never left WebCrypto.
-    const keys = await crypto7.deriveThreadKeys(publicKey);
+    const threadSecret = await crypto7.deriveThreadSecret(seed);
+    const keys = await crypto7.deriveThreadKeys(threadSecret);
     assert.equal(keys.contentKey.length, 32);
-    const aad = threadRecordAad(new Uint8Array(8), new Uint8Array(8), 1);
+    const aad = threadRecordAad(
+      new Uint8Array(8), new Uint8Array(8), 1, 1, new Uint8Array(16)
+    );
     const sealed = await crypto7.sealThreadBody(keys, 1, aad, message);
     assert.deepEqual(await crypto7.openThreadBody(keys, 1, aad, sealed), message);
   } finally {

@@ -463,8 +463,9 @@ test("a real dispatch ticket survives the screen", async () => {
       ]
     }
   });
-  // The size claim the demo is built on: ~168 bytes, ~224 characters.
-  assert.ok(issued.base64url.length >= 200 && issued.base64url.length <= 280, `${issued.base64url.length} chars`);
+  // The current capability-separated ticket is 228 bytes / 304 base64url
+  // characters for this two-stop plan, still within a camera-readable QR.
+  assert.ok(issued.base64url.length >= 300 && issued.base64url.length <= 320, `${issued.base64url.length} chars`);
 
   const url = `https://rangefind.dev/osm-geo/#${issued.base64url}`;
   const qr = encodeQr(url, { ecLevel: "M" });

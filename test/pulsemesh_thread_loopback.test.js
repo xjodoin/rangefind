@@ -30,6 +30,8 @@ import {
   generateThreadKeypair,
   sealThreadBody,
   signThread,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadTag,
   threadWindow
 } from "../src/pulsemesh/thread_crypto.js";
@@ -123,7 +125,7 @@ test("T2: publisher → subscriber over a loopback, with a live-traffic ETA", as
 
   // The link is the entire capability, and it is what a parent receives.
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey,
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
     epochPrefix8: epoch32.subarray(0, 8),
     notAfter: Math.floor(now / 1000) + 3600
   }));
@@ -224,7 +226,7 @@ test("T2: the delivery shape (one courier, one recipient) is live-aware", async 
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 1800
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 1800
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
 
@@ -281,7 +283,7 @@ test("T2: coarse mode withholds position and still estimates arrival", async t =
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
 
@@ -336,7 +338,7 @@ test("T2: an outcome is asserted, never inferred, and reaches the follower at on
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
   const feed = async () => {
@@ -445,7 +447,7 @@ test("T2: a skipped stop leaves the ETA chain, and never gets an arrival time", 
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
 
@@ -551,7 +553,7 @@ test("T2: pre-marking a far stop does not unserve the customers between", async 
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey,
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
     epochPrefix8: epoch32.subarray(0, 8),
     notAfter: Math.floor(now / 1000) + 3600
   }));
@@ -695,7 +697,7 @@ test("T2: subscriber rejects forgeries, replays, and expired links", async t => 
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 600
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 600
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
 
@@ -707,11 +709,11 @@ test("T2: subscriber rejects forgeries, replays, and expired links", async t => 
   // Replay of the same record: seq is no longer strictly increasing.
   const replay = await subscriber.accept(first.bytes, { nowMillis: now });
   assert.equal(replay.ok, false);
-  assert.equal(replay.step, 7, "replay caught by the sequence ledger");
+  assert.equal(replay.step, 8, "replay caught by the sequence ledger");
 
   // A link holder forging an update: seals correctly, signs with its own
   // key, and is caught at step 6.
-  const keys = await deriveThreadKeys(publisher.publicKey);
+  const keys = await deriveThreadKeys(publisher.threadSecret);
   const forger = await generateThreadKeypair();
   const forgedBody = {
     unixSeconds: Math.floor(now / 1000), state: THREAD_STATE.EN_ROUTE, mode: THREAD_MODE.FINE,
@@ -719,23 +721,28 @@ test("T2: subscriber rejects forgeries, replays, and expired links", async t => 
     planRef: new Uint8Array(8), note: new Uint8Array(0)
   };
   const preimage = encodeThreadBodyPreimage(forgedBody);
-  const body = encodeThreadBody(forgedBody, await signThread(preimage, forger.privateSeed));
   const tag = await threadTag(keys, epoch32, threadWindow(now));
-  const aad = threadRecordAad(epoch32.subarray(0, 8), tag, 500);
+  const previousHash = first.recordHash;
+  const aad = threadRecordAad(epoch32.subarray(0, 8), tag, 1, 500, previousHash);
+  const body = encodeThreadBody(
+    forgedBody,
+    await signThread(threadRecordSigningMessage(aad, preimage), forger.privateSeed)
+  );
+  const ciphertext = await sealThreadBody(keys, 500, aad, body);
   const record = encodeThreadRecord({
-    epochPrefix8: epoch32.subarray(0, 8), tag, seq: 500,
-    ciphertext: await sealThreadBody(keys, 500, aad, body)
+    epochPrefix8: epoch32.subarray(0, 8), tag, generation: 1, seq: 500,
+    previousHash, ciphertext, admissionTag: await threadAdmissionTag(keys, aad, ciphertext)
   });
   const forgery = await subscriber.accept(record.bytes, { nowMillis: now });
   assert.equal(forgery.ok, false);
-  assert.equal(forgery.step, 6, "a sealed-but-unsigned record is caught at the signature");
+  assert.equal(forgery.step, 7, "a sealed-but-unsigned record is caught at the signature");
   assert.equal(subscriber.stats.forgeries, 1, "and counted as an attack, not an error");
   assert.equal(subscriber.highestSeq, first.seq, "the forgery did not advance the sequence ledger");
 
   // An unknown tag is dropped before any crypto runs.
   const strangerRecord = encodeThreadRecord({
-    epochPrefix8: epoch32.subarray(0, 8), tag: new Uint8Array(8).fill(9), seq: 900,
-    ciphertext: new Uint8Array(32)
+    epochPrefix8: epoch32.subarray(0, 8), tag: new Uint8Array(8).fill(9), generation: 1, seq: 900,
+    previousHash: new Uint8Array(16), ciphertext: new Uint8Array(32), admissionTag: new Uint8Array(16)
   });
   const unknown = await subscriber.accept(strangerRecord.bytes, { nowMillis: now });
   assert.equal(unknown.step, 3, "unknown tags are the cheap drop");
@@ -745,7 +752,7 @@ test("T2: subscriber rejects forgeries, replays, and expired links", async t => 
   await publisher.handleFix({ lat: 45.55, lon: -76.58, speedMps: 10, nowMillis: now });
   const late = await subscriber.accept(emitted[emitted.length - 1].bytes, { nowMillis: now });
   assert.equal(late.ok, false);
-  assert.equal(late.step, 8, "updates past the link's expiry are refused");
+  assert.equal(late.step, 9, "updates past the link's expiry are refused");
   assert.ok(subscriber.expired(now));
 });
 
@@ -764,7 +771,7 @@ test("T2: §12 degradation rows are distinguishable, and stale is not live", asy
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 7200
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 7200
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
 
@@ -827,7 +834,7 @@ test("T2: a day that was abandoned says cancelled, and never says arrived", asyn
     publish: async record => emitted.push(record)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: epoch32.subarray(0, 8), notAfter: Math.floor(now / 1000) + 3600
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32, clock });
   const feed = async () => {

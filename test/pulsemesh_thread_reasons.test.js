@@ -81,7 +81,8 @@ async function fleet({ stopCount = 8, mode = THREAD_MODE.FINE } = {}) {
     }
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: nowSeconds + 7200
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
+    epochPrefix8: EPOCH_PREFIX8, notAfter: nowSeconds + 7200
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32: EPOCH32, clock });
   return {
@@ -316,7 +317,7 @@ test("the cap keeps the newest reasons and the record keeps fitting", async () =
     photoCount: 3,
     note: new Uint8Array(0)
   };
-  assert.equal(fitStopReasons(tight).length, 14, "14 fit a worst-case 200-stop day with no note");
+  assert.equal(fitStopReasons(tight).length, 16, "the complete bounded list fits a 200-stop day with no note");
   const noted = { ...tight, note: new Uint8Array(40) };
   const kept = fitStopReasons(noted);
   assert.ok(kept.length < THREAD_MAX_REASONS && kept.length > 0, `a 40-byte note squeezes it to ${kept.length}`);
@@ -324,7 +325,7 @@ test("the cap keeps the newest reasons and the record keeps fitting", async () =
   assert.ok(encodeThreadBodyPreimage({ ...noted, stopReasons: kept }).length + 64 <= THREAD_MAX_BODY_BYTES);
   // The note wins that fight, and it can, because the list is cumulative:
   // the next record — an ordinary fix with no note — carries them again.
-  assert.equal(fitStopReasons({ ...noted, note: new Uint8Array(0) }).length, 14);
+  assert.equal(fitStopReasons({ ...noted, note: new Uint8Array(0) }).length, 16);
 });
 
 test("carried reasons are signed, ordered, and refused when malformed", async () => {
@@ -453,7 +454,7 @@ test("what the outage costs on the wire, in bytes the encoder produces", async (
 
   // A day that carries no reasons pays nothing for them beyond PMT1's
   // transmitted nonce.
-  assert.equal(noteRoom(worst), 45, "the published 200-stop headroom includes the nonce");
+  assert.equal(noteRoom(worst), 64, "a 200-stop day permits the full note");
 
   // §20.7.1: the accumulator costs exactly what the single commitment it
   // replaced cost. Same 32 bytes, 13 bytes of headroom left — and
@@ -463,27 +464,28 @@ test("what the outage costs on the wire, in bytes the encoder produces", async (
     lastOutcome: { ...worst.lastOutcome, hasPhoto: true },
     photoChain: "d3".repeat(32)
   };
-  assert.equal(noteRoom(withPhoto), 13);
+  assert.equal(noteRoom(withPhoto), 40);
 
   // Each reason is a stop-index varint and one byte, plus one for the
   // count: three failed stops on a 200-stop day cost seven bytes.
   const reasons = n => Array.from({ length: n }, (_, i) => ({ stopIndex: 7 + i, reasonCode: 1 }));
-  assert.equal(noteRoom({ ...worst, stopReasons: reasons(3) }), 45 - 7);
-  assert.equal(noteRoom({ ...worst, stopReasons: reasons(16) }), 45 - 33);
-  assert.equal(noteRoom({ ...withPhoto, stopReasons: reasons(3) }), 45 - 7 - 32);
+  assert.equal(noteRoom({ ...worst, stopReasons: reasons(3) }), 64,
+    "three compact reasons still leave the full note");
+  assert.equal(noteRoom({ ...worst, stopReasons: reasons(16) }), 39);
+  assert.equal(noteRoom({ ...withPhoto, stopReasons: reasons(3) }), 33);
   // A 200-stop day with a full 16-entry list at the widest stop indices.
   const wide = Array.from({ length: 16 }, (_, i) => ({ stopIndex: 150 + i, reasonCode: 1 }));
-  assert.equal(noteRoom({ ...worst, stopReasons: wide }), -1);
+  assert.equal(noteRoom({ ...worst, stopReasons: wide }), 23);
 
   // The chain and a full reason list do **not** both fit a 200-stop day,
   // and that is the one number this pass moved: 49 + 32 is 81 against 45
   // bytes of headroom. `fitStopReasons` is what makes it a trim rather
   // than a refusal — it keeps the newest 4 instead of all 16.
   assert.equal(noteRoom({ ...withPhoto, stopReasons: wide }), -1);
-  assert.equal(fitStopReasons({ ...withPhoto, stopReasons: wide }).length, 4);
+  assert.equal(fitStopReasons({ ...withPhoto, stopReasons: wide }).length, 13);
   assert.deepEqual(
     fitStopReasons({ ...withPhoto, stopReasons: wide }).map(entry => entry.stopIndex),
-    wide.slice(12).map(entry => entry.stopIndex),
+    wide.slice(3).map(entry => entry.stopIndex),
     "the newest survive; the oldest were already delivered when they were new"
   );
 

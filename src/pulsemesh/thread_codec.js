@@ -1,5 +1,5 @@
 // PulseMesh thread wire formats (threads §5): PMT1 sealed update, PMTP
-// plaintext body, PMR1/PMM1 catch-up, and the 45-byte link.
+// plaintext body, PMR1/PMM1 catch-up, and the capability-separated link.
 //
 // Framing, varints, magic discipline, and the zero-trailing-bytes rule
 // are the traffic channel's §1 conventions unchanged — the two channels
@@ -89,8 +89,10 @@ export const STOP_REASON = Object.freeze({
   OTHER: 5
 });
 
-export const THREAD_MAX_RECORD_BYTES = 256;
+export const THREAD_MAX_RECORD_BYTES = 320;
 export const THREAD_MAX_NOTE_BYTES = 64;
+export const THREAD_CHAIN_HASH_BYTES = 16;
+export const THREAD_ADMISSION_TAG_BYTES = 16;
 /** A photo commitment (§20.7) and the accumulator over them are both SHA-256. */
 export const THREAD_PHOTO_HASH_BYTES = 32;
 
@@ -125,7 +127,7 @@ const THREAD_MARK_FLAGS_KNOWN = THREAD_MARK_FLAG.LAST | THREAD_MARK_FLAG.REASONS
  * How many per-stop reasons a record carries at most (§5.2.1).
  *
  * The list is cumulative, so it is bounded twice: by this count, and by
- * whatever is left of the 213-byte body — `fitStopReasons` applies both,
+ * whatever is left of the 228-byte body — `fitStopReasons` applies both,
  * keeping the newest. 16 is the number that fits the day this channel is
  * sized for. A 200-stop plan leaves 57 bytes (§5.2.2), and 16 entries
  * cost 33 of them at one-byte stop indices and 49 at the widest a
@@ -141,46 +143,31 @@ const REASON_CODE_MASK = 0x7f;
 
 /**
  * What a PMT1 record spends on framing around the sealed body: magic 4,
- * epochPrefix8 8, tag 8, `seq` varint ≤ 5, `ctLen` varint 2 (a body is
- * never under 128 nor over 16383 bytes), random GCM nonce 12, AEAD tag
- * 16.
+ * epochPrefix8 8, tag 8, authority generation and `seq` varints ≤ 5
+ * each, predecessor hash 16, `ctLen` varint 2, random GCM nonce 12,
+ * AEAD tag 16, and the outer admission MAC 16.
  *
  * Subtracting it gives the budget the *plaintext* body has, which is the
  * only number an encoder can check: the body is sealed before it is
- * framed, so a record that overflows 256 has already been signed.
+ * framed, so a record that overflows 320 has already been signed.
  */
-export const THREAD_RECORD_OVERHEAD = 55;
+export const THREAD_RECORD_OVERHEAD = 92;
 export const THREAD_MAX_BODY_BYTES = THREAD_MAX_RECORD_BYTES - THREAD_RECORD_OVERHEAD;
 
 /**
- * A **v1** link: the run key that the link carries signs the run's own
- * records. §4.1's original shape, and still the right one for anything
- * one-off — a self-started drive, a single delivery, a dispatched job
- * that dies at the door.
+ * The sole link version. Its flag distinguishes direct root authority
+ * from short-lived authority delegated by a root certificate.
  */
-export const LINK_VERSION_SELF = 1;
-/**
- * A **v2** link: records are signed by a *delegated day key*, and the
- * key in the link is the route **root** (§21). A holder must expect a
- * PMTC certificate on the thread and must refuse a record until one
- * covers the key that signed it.
- *
- * The version lives in the artifact rather than being guessed per
- * record on purpose: "this record verified under some key I was told
- * about" is not a security property. A holder has to know from the 45
- * bytes it was given whether the key in its hand is an authority or an
- * identity, or a downgrade is one forged record away.
- */
-export const LINK_VERSION_DELEGATED = 2;
-/** The highest link version this build understands. */
-export const LINK_VERSION = LINK_VERSION_DELEGATED;
-export const LINK_VERSIONS = Object.freeze([LINK_VERSION_SELF, LINK_VERSION_DELEGATED]);
-export const LINK_BYTES = 45;
+export const LINK_VERSION = 1;
+export const LINK_FLAG_DELEGATED = 0x01;
+const LINK_FLAG_MASK = LINK_FLAG_DELEGATED;
+/** version + flags + capability secret + root verification key + epoch + expiry. */
+export const LINK_BYTES = 78;
 
 /** §21. The version byte of a PMTC day certificate. */
 export const DAY_CERT_VERSION = 1;
-/** magic 4, version 1, two keys 64, three uint32be 12, signature 64. */
-export const DAY_CERT_BYTES = 145;
+/** magic 4, version 1, two keys 64, four uint32be 16, planRef 8, signature 64. */
+export const DAY_CERT_BYTES = 157;
 
 /**
  * §5.2's "position withheld" test. The spec words it as `leafCell = 0`,
@@ -456,7 +443,7 @@ function buildThreadBodyPreimage(body) {
 export function encodeThreadBodyPreimage(body) {
   const { bytes: out, outcomes, packed, note, reasons } = buildThreadBodyPreimage(body);
 
-  // 256 bytes is a hard wire limit, and the body is signed and sealed
+  // 320 bytes is the hard wire limit, and the body is signed and sealed
   // before it is ever framed — so a run whose plan is too large to
   // encode must be refused here, with the number that would fit.
   const preimageLength = out.length;
@@ -701,17 +688,25 @@ export function stopReasonFor(body, stopIndex) {
  * verifies exactly these bytes.
  */
 export function encodeDayCertificatePreimage(certificate) {
-  const { rootPublicKey, dayPublicKey } = certificate;
+  const { rootPublicKey, dayPublicKey, planRef } = certificate;
   if (rootPublicKey?.length !== 32) throw new Error("A route root is a 32-byte Ed25519 public key.");
   if (dayPublicKey?.length !== 32) throw new Error("A day key is a 32-byte Ed25519 public key.");
+  if (planRef?.length !== 8) throw new Error("A day certificate planRef is 8 bytes.");
   const out = [];
   pushMagic(out, THREAD_MAGIC.PMTC);
   out.push((certificate.version ?? DAY_CERT_VERSION) & 0xff);
   pushBytes(out, rootPublicKey);
   pushBytes(out, dayPublicKey);
-  for (const value of [certificate.serviceDay, certificate.notBefore, certificate.notAfter]) {
+  for (const value of [certificate.generation, certificate.serviceDay]) {
     if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
-      throw new Error(`A day certificate's serviceDay, notBefore and notAfter are uint32; got ${value}.`);
+      throw new Error(`A day certificate's generation, serviceDay, notBefore and notAfter are uint32; got ${value}.`);
+    }
+    pushBytes(out, uint32be(value));
+  }
+  pushBytes(out, planRef);
+  for (const value of [certificate.notBefore, certificate.notAfter]) {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      throw new Error(`A day certificate's notBefore and notAfter are uint32; got ${value}.`);
     }
     pushBytes(out, uint32be(value));
   }
@@ -733,7 +728,10 @@ export function decodeDayCertificate(bytes) {
   const version = readU8(bytes, state);
   const rootPublicKey = readBytes(bytes, state, 32);
   const dayPublicKey = readBytes(bytes, state, 32);
+  const generation = readU32be(bytes, state);
+  if (generation < 1) throw new Error("A day certificate generation must be positive.");
   const serviceDay = readU32be(bytes, state);
+  const planRef = readBytes(bytes, state, 8);
   const notBefore = readU32be(bytes, state);
   const notAfter = readU32be(bytes, state);
   const preimageEnd = state.pos;
@@ -744,7 +742,9 @@ export function decodeDayCertificate(bytes) {
     version,
     rootPublicKey,
     dayPublicKey,
+    generation,
     serviceDay,
+    planRef,
     notBefore,
     notAfter,
     signature,
@@ -767,26 +767,40 @@ export function threadBodyMagic(bytes) {
 
 // --- §5.1 PMT1 sealed update ----------------------------------------------
 
-/** AAD = fields 1–4 exactly as encoded (magic, epoch, tag, seq). */
-export function threadRecordAad(epochPrefix8, tag, seq) {
+/** AAD = every clear authenticated field before the ciphertext length. */
+export function threadRecordAad(epochPrefix8, tag, generation, seq, previousHash) {
+  if (!Number.isInteger(generation) || generation < 1 || generation > 0xffffffff) {
+    throw new Error("A PMT1 authority generation is a positive uint32.");
+  }
+  if (previousHash?.length !== THREAD_CHAIN_HASH_BYTES) {
+    throw new Error(`A PMT1 predecessor hash is ${THREAD_CHAIN_HASH_BYTES} bytes.`);
+  }
   const out = [];
   pushMagic(out, THREAD_MAGIC.PMT1);
   pushBytes(out, epochPrefix8);
   pushBytes(out, tag);
+  pushVarint(out, generation);
   pushVarint(out, seq);
+  pushBytes(out, previousHash);
   return Uint8Array.from(out);
 }
 
-export function encodeThreadRecord({ epochPrefix8, tag, seq, ciphertext }) {
+export function encodeThreadRecord({
+  epochPrefix8, tag, generation, seq, previousHash, ciphertext, admissionTag
+}) {
   if (epochPrefix8.length !== 8) throw new Error("epochPrefix8 must be 8 bytes.");
   if (tag.length !== 8) throw new Error("Thread tag must be 8 bytes.");
   if (ciphertext.length < 28) {
     throw new Error("PMT1 sealed body must include its 12-byte nonce and 16-byte authentication tag.");
   }
-  const aad = threadRecordAad(epochPrefix8, tag, seq);
+  if (admissionTag?.length !== THREAD_ADMISSION_TAG_BYTES) {
+    throw new Error(`PMT1 admission tag must be ${THREAD_ADMISSION_TAG_BYTES} bytes.`);
+  }
+  const aad = threadRecordAad(epochPrefix8, tag, generation, seq, previousHash);
   const out = [...aad];
   pushVarint(out, ciphertext.length);
   pushBytes(out, ciphertext);
+  pushBytes(out, admissionTag);
   const bytes = Uint8Array.from(out);
   return { bytes, aad };
 }
@@ -796,17 +810,24 @@ export function readThreadRecord(bytes, state) {
   expectMagic(bytes, state, THREAD_MAGIC.PMT1);
   const epochPrefix8 = readBytes(bytes, state, 8);
   const tag = readBytes(bytes, state, 8);
+  const generation = readVarint(bytes, state);
+  if (generation < 1 || generation > 0xffffffff) throw new Error("PMT1 authority generation is invalid.");
   const seq = readVarint(bytes, state);
+  const previousHash = readBytes(bytes, state, THREAD_CHAIN_HASH_BYTES);
   const aadEnd = state.pos;
   const ctLen = readVarint(bytes, state);
   if (ctLen < 28) throw new Error("PMT1 sealed body is too short.");
   const ciphertext = readBytes(bytes, state, ctLen);
+  const admissionTag = readBytes(bytes, state, THREAD_ADMISSION_TAG_BYTES);
   return {
     magic: THREAD_MAGIC.PMT1,
     epochPrefix8,
     tag,
+    generation,
     seq,
+    previousHash,
     ciphertext,
+    admissionTag,
     aad: bytes.subarray(start, aadEnd),
     bytes: bytes.subarray(start, state.pos)
   };
@@ -839,7 +860,11 @@ export function encodeThreadRequest({ epochPrefix8, entries }) {
   pushVarint(out, entries.length);
   for (const entry of entries) {
     if (entry.tag.length !== 8) throw new Error("Thread tag must be 8 bytes.");
+    if (!Number.isInteger(entry.sinceGeneration) || entry.sinceGeneration < 0 || entry.sinceGeneration > 0xffffffff) {
+      throw new Error("A PMR1 cursor generation is a uint32.");
+    }
     pushBytes(out, entry.tag);
+    pushVarint(out, entry.sinceGeneration);
     pushVarint(out, entry.sinceSeq);
   }
   return Uint8Array.from(out);
@@ -854,8 +879,10 @@ export function decodeThreadRequest(bytes) {
   const entries = [];
   for (let i = 0; i < count; i++) {
     const tag = readBytes(bytes, state, 8);
+    const sinceGeneration = readVarint(bytes, state);
+    if (sinceGeneration > 0xffffffff) throw new Error("A PMR1 cursor generation is invalid.");
     const sinceSeq = readVarint(bytes, state);
-    entries.push({ tag, sinceSeq });
+    entries.push({ tag, sinceGeneration, sinceSeq });
   }
   assertNoTrailing(bytes, state, "PMR1 request");
   return { magic: THREAD_MAGIC.PMR1, epochPrefix8, entries };
@@ -1029,47 +1056,37 @@ export function decodePhotoListResponse(bytes) {
 // --- §5.4 the link --------------------------------------------------------
 
 /**
- * 45 bytes: version, the capability `P`, the epoch it is bound to, and an
- * absolute expiry. No bootstrap address, no mailbox host, no plan URL —
- * a link is a key, not a location.
- *
- * `version` says what the key in field 2 **is**, not how new the writer
- * is, which is why the default did not move to 2 when §21 landed: a
- * one-off run's key really does sign its own records, and writing 2 over
- * it would be a lie about the artifact that a subscriber would then
- * enforce (it would sit waiting for a certificate that is never coming).
- * A recurring route passes `LINK_VERSION_DELEGATED` explicitly, and the
- * §16.3 vector — a v1 link — is byte-unchanged.
+ * The capability secret and root verification key are deliberately
+ * separate fields. Publishing either one can no longer accidentally
+ * publish the other, and authority can rotate without changing topic or
+ * content keys.
  */
-export function encodeThreadLink({ publicKey, epochPrefix8, notAfter, version = LINK_VERSION_SELF }) {
-  if (publicKey.length !== 32) throw new Error("A thread capability is a 32-byte public key.");
+export function encodeThreadLink({ threadSecret, rootPublicKey, epochPrefix8, notAfter, delegated = false }) {
+  if (threadSecret?.length !== 32) throw new Error("A thread capability secret is 32 bytes.");
+  if (rootPublicKey?.length !== 32) throw new Error("A thread root verification key is 32 bytes.");
   if (epochPrefix8.length !== 8) throw new Error("epochPrefix8 must be 8 bytes.");
-  if (!LINK_VERSIONS.includes(version)) {
-    throw new Error(`A thread link is version ${LINK_VERSIONS.join(" or ")}; got ${version}.`);
-  }
   const out = new Uint8Array(LINK_BYTES);
-  out[0] = version;
-  out.set(publicKey, 1);
-  out.set(epochPrefix8, 33);
-  out.set(uint32be(notAfter), 41);
+  out[0] = LINK_VERSION;
+  out[1] = delegated ? LINK_FLAG_DELEGATED : 0;
+  out.set(threadSecret, 2);
+  out.set(rootPublicKey, 34);
+  out.set(epochPrefix8, 66);
+  out.set(uint32be(notAfter), 74);
   return out;
 }
 
 export function decodeThreadLink(bytes) {
   if (bytes.length !== LINK_BYTES) throw new Error(`A thread link is ${LINK_BYTES} bytes.`);
-  if (!LINK_VERSIONS.includes(bytes[0])) throw new Error(`Unsupported thread link version ${bytes[0]}.`);
-  const notAfter = (bytes[41] * 2 ** 24) + (bytes[42] << 16) + (bytes[43] << 8) + bytes[44];
+  if (bytes[0] !== LINK_VERSION) throw new Error(`Unsupported thread link version ${bytes[0]}.`);
+  if (bytes[1] & ~LINK_FLAG_MASK) throw new Error("Thread link reserved flag bits must be zero.");
+  const notAfter = (bytes[74] * 2 ** 24) + (bytes[75] << 16) + (bytes[76] << 8) + bytes[77];
   return {
     version: bytes[0],
-    publicKey: bytes.subarray(1, 33),
-    epochPrefix8: bytes.subarray(33, 41),
+    threadSecret: bytes.subarray(2, 34),
+    rootPublicKey: bytes.subarray(34, 66),
+    epochPrefix8: bytes.subarray(66, 74),
     notAfter,
-    /**
-     * True when field 2 is a route **root** and records are signed by a
-     * delegated day key (§21). Read off the artifact, never inferred
-     * from what happens to arrive on the topic.
-     */
-    delegated: bytes[0] === LINK_VERSION_DELEGATED
+    delegated: (bytes[1] & LINK_FLAG_DELEGATED) !== 0
   };
 }
 
@@ -1089,7 +1106,7 @@ export const THREAD_MAX_BOOTSTRAP_ADDRESSES = 3;
 /**
  * How many a **URL** may hint at. Lower than the artifact's cap on
  * purpose: a link is typed, pasted, texted and printed, and two
- * addresses already cost more characters than the 45-byte capability
+ * addresses already cost more characters than the thread capability
  * they are riding beside.
  */
 export const THREAD_MAX_URL_BOOTSTRAP = 2;

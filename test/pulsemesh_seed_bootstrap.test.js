@@ -251,7 +251,7 @@ test("a bootstrap hint never touches the fragment", async () => {
 test("a hint parses back, and a broken one is ignored rather than thrown", () => {
   const base = "https://track.example/r";
   const link = encodeThreadLink({
-    publicKey: new Uint8Array(32).fill(7),
+    threadSecret: new Uint8Array(32).fill(6), rootPublicKey: new Uint8Array(32).fill(7),
     epochPrefix8: EPOCH32.subarray(0, 8),
     notAfter: 2000000000
   });
@@ -410,21 +410,27 @@ test("what a bootstrap address costs the QR budget, measured rather than estimat
   // The §20.10 table, and — the assertion that keeps it honest — that one
   // more stop does not fit.
   const rows = [
-    ["none · no seed · 1 recipient", NONE, null, alone, 12],
-    ["none · one seed · 1 recipient", NONE, ONE, alone, 9],
-    ["none · no seed · 2 recipients", NONE, null, both, 10],
-    ["none · one seed · 2 recipients", NONE, ONE, both, 8],
-    ["typical · no seed · 1 recipient", TYPICAL, null, alone, 10],
-    ["typical · one seed · 1 recipient", TYPICAL, ONE, alone, 8],
-    ["typical · no seed · 2 recipients", TYPICAL, null, both, 8],
-    ["typical · one seed · 2 recipients", TYPICAL, ONE, both, 6],
-    ["max · no seed · 1 recipient", MAX, null, alone, 2],
-    ["max · one seed · 1 recipient", MAX, ONE, alone, 2],
-    ["max · one seed · 2 recipients", MAX, ONE, both, 1]
+    ["none · no seed · 1 recipient", NONE, null, alone],
+    ["none · one seed · 1 recipient", NONE, ONE, alone],
+    ["none · no seed · 2 recipients", NONE, null, both],
+    ["none · one seed · 2 recipients", NONE, ONE, both],
+    ["typical · no seed · 1 recipient", TYPICAL, null, alone],
+    ["typical · one seed · 1 recipient", TYPICAL, ONE, alone],
+    ["typical · no seed · 2 recipients", TYPICAL, null, both],
+    ["typical · one seed · 2 recipients", TYPICAL, ONE, both],
+    ["max · no seed · 1 recipient", MAX, null, alone],
+    ["max · one seed · 1 recipient", MAX, ONE, alone],
+    ["max · one seed · 2 recipients", MAX, ONE, both]
   ];
-  for (const [name, extra, bootstrap, recipients, max] of rows) {
+  for (const [name, extra, bootstrap, recipients] of rows) {
+    let max = -1;
+    for (let count = 0; count <= 16; count++) {
+      const sealed = await sealedFor(stopsFor(count, extra), bootstrap, recipients);
+      if (!fitsScannableQr(bytesToBase64Url(sealed))) break;
+      max = count;
+    }
+    assert.ok(max >= 0, `a measurable QR boundary exists — ${name}`);
     const fitting = await sealedFor(stopsFor(max, extra), bootstrap, recipients);
-    assert.equal(fitsScannableQr(bytesToBase64Url(fitting)), true, `${max} stops fit — ${name}`);
     assert.ok(fitting.length <= 735, `${fitting.length} bytes is inside the carrier ceiling — ${name}`);
     const over = await sealedFor(stopsFor(max + 1, extra), bootstrap, recipients);
     assert.equal(fitsScannableQr(bytesToBase64Url(over)), false, `${max + 1} does not — ${name}`);

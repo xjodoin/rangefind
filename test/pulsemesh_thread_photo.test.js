@@ -1,10 +1,10 @@
 // T7 — proof-of-delivery photos (threads §20.7).
 //
 // The claim under test is that a photo is a *commitment* on the wire and
-// bytes somewhere else: the record stays inside 256 bytes, the sealed
+// bytes somewhere else: the record stays inside 320 bytes, the sealed
 // blob travels on demand over its own protocol, and the key that opens
 // it comes from the run seed — so the driver and the dispatcher can read
-// it and a customer holding the 45-byte link structurally cannot.
+// it and a customer holding the 78-byte link structurally cannot.
 //
 // And §20.7.1: the commitments survive a dead zone. One 32-byte
 // accumulator in every signed record binds every commitment the run has
@@ -92,7 +92,7 @@ async function pair({ mode = THREAD_MODE.FINE, clock, stops = 3 } = {}) {
     privateSeed: keypair.privateSeed, epoch32: EPOCH32, mode, plan: plan(stops), clock
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey,
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
     epochPrefix8: EPOCH_PREFIX8,
     notAfter: Math.floor(clock() / 1000) + 7200
   }));
@@ -100,7 +100,7 @@ async function pair({ mode = THREAD_MODE.FINE, clock, stops = 3 } = {}) {
   return { keypair, publisher, subscriber, link };
 }
 
-test("a photo key comes from the run seed, so the 45-byte link cannot derive it", async () => {
+test("a photo key comes from the run seed, so the 78-byte link cannot derive it", async () => {
   const keypair = await generateThreadKeypair();
 
   const first = await photoKeyFor(keypair.privateSeed, PLAN_REF, 3);
@@ -123,9 +123,9 @@ test("a photo key comes from the run seed, so the 45-byte link cannot derive it"
   // cryptographic proof, it is the reason no proof is needed — there is
   // nothing to attack, because the secret was never distributed.
   const link = encodeThreadLink({
-    publicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 2_000_000_000
+    threadSecret: keypair.threadSecret, rootPublicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 2_000_000_000
   });
-  assert.equal(link.length, 45);
+  assert.equal(link.length, 78);
   const linkHex = toHex(link);
   assert.ok(!linkHex.includes(toHex(keypair.privateSeed)), "the seed is not in the link");
   assert.ok(!linkHex.includes(toHex(first)), "nor is any photo key");
@@ -146,7 +146,7 @@ test("a photo key comes from the run seed, so the 45-byte link cannot derive it"
   );
 });
 
-test("a mark carries a signed accumulator, and the record still fits 256 bytes", async () => {
+test("a mark carries a signed accumulator, and the record still fits 320 bytes", async () => {
   let now = Math.floor(Date.now() / 1000) * 1000;
   const clock = () => now;
   const { publisher, subscriber, keypair } = await pair({ clock });

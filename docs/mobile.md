@@ -202,7 +202,7 @@ the Wayfind Android app (a separate product repository):
   validated stay, and age out on TTL like any others.
 
 `rangefind/pulsemesh/threads` adds the second channel — one vehicle, a
-bounded audience, a 45-byte capability in a URL fragment. It needs no
+bounded audience, a 78-byte capability-separated link in a URL fragment. It needs no
 admission bond and works in read-only mode, because thread records are
 authenticated end to end by the thread key rather than by membership.
 See [pulsemesh.md](pulsemesh.md) and

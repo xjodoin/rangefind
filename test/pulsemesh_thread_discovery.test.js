@@ -30,7 +30,7 @@ const EPOCH_PREFIX16 = toHex(EPOCH32).slice(0, 16);
 
 async function fixture() {
   const keypair = await generateThreadKeypair();
-  const keys = await deriveThreadKeys(keypair.publicKey);
+  const keys = await deriveThreadKeys(keypair.threadSecret);
   return { keypair, keys, epoch32: EPOCH32, epochPrefix16hex: EPOCH_PREFIX16 };
 }
 
@@ -45,7 +45,7 @@ test("the rendezvous CID is a deterministic function of the link", async () => {
   assert.equal(first.toString(), second.toString(), "same key, same CID — no coordination needed");
 
   // A different thread addresses a different point in the keyspace.
-  const stranger = await deriveThreadKeys((await generateThreadKeypair()).publicKey);
+  const stranger = await deriveThreadKeys((await generateThreadKeypair()).threadSecret);
   const strangerTag = await threadTag(stranger, EPOCH32, window);
   const strangerCid = await rendezvousCid(threadRendezvous(threadTopic(EPOCH_PREFIX16, strangerTag)));
   assert.notEqual(strangerCid.toString(), first.toString());
@@ -110,7 +110,7 @@ test("a holder finds the thread's peers from the link alone", async t => {
   assert.ok(publisherHost.services.dht.routingTable.size > 0, "DHT routing table populated");
 
   const context = await fixture();
-  const publisher = createThreadDiscovery({ host: publisherHost, ...context });
+  const publisher = createThreadDiscovery({ host: publisherHost, ...context, advertise: true });
   // The subscriber knows nothing but the link — same `P`, hence the same
   // derived addresses, computed independently.
   const subscriber = createThreadDiscovery({ host: subscriberHost, ...context });
@@ -146,6 +146,7 @@ test("discovery degrades quietly when the DHT cannot help", async t => {
   t.after(() => host.stop().catch(() => {}));
   const discovery = createThreadDiscovery({ host, ...(await fixture()) });
   assert.equal(await discovery.provide(), 0);
+  assert.ok(discovery.stats.provideSkipped > 0, "followers never announce that they hold a private thread");
   assert.deepEqual(await discovery.findPeers(), []);
   assert.deepEqual(await discovery.connect(), []);
 
@@ -154,7 +155,7 @@ test("discovery degrades quietly when the DHT cannot help", async t => {
   const lonely = await createPulseMeshHost({ dht: { scope: "local" } });
   t.after(() => lonely.stop().catch(() => {}));
   const alone = createThreadDiscovery({
-    host: lonely, ...(await fixture()), provideTimeoutMs: 500, findTimeoutMs: 500
+    host: lonely, ...(await fixture()), advertise: true, provideTimeoutMs: 500, findTimeoutMs: 500
   });
   const started = Date.now();
   await alone.provide();

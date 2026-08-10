@@ -15,6 +15,8 @@ import {
   openThreadBody,
   sealThreadBody,
   signThread,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadRendezvous,
   threadTag,
   threadTopic,
@@ -99,19 +101,25 @@ const OUTCOME_PLAN_SIZES = [50, 200];
 
 {
   const keypair = await generateThreadKeypair();
-  const keys = await deriveThreadKeys(keypair.publicKey);
+  const keys = await deriveThreadKeys(keypair.threadSecret);
   const tag = await threadTag(keys, EPOCH32, threadWindow(Date.now()));
   const preimage = encodeThreadBodyPreimage(VECTOR_BODY);
-  const signature = await signThread(preimage, keypair.privateSeed);
+  const previousHash = new Uint8Array(16);
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1, 1, previousHash);
+  const signedMessage = threadRecordSigningMessage(aad, preimage);
+  const signature = await signThread(signedMessage, keypair.privateSeed);
   const body = encodeThreadBody(VECTOR_BODY, signature);
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1);
   const ciphertext = await sealThreadBody(keys, 1, aad, body);
-  const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 1, ciphertext });
+  const admissionTag = await threadAdmissionTag(keys, aad, ciphertext);
+  const record = encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8, tag, generation: 1, seq: 1,
+    previousHash, ciphertext, admissionTag
+  });
 
-  const derive = await timeAsync(() => deriveThreadKeys(keypair.publicKey), 500);
+  const derive = await timeAsync(() => deriveThreadKeys(keypair.threadSecret), 500);
   const tagCost = await timeAsync(i => threadTag(keys, EPOCH32, 5847552 + i), 2000);
-  const sign = await timeAsync(() => signThread(preimage, keypair.privateSeed), 500);
-  const verify = await timeAsync(() => verifyThread(preimage, signature, keypair.publicKey), 500);
+  const sign = await timeAsync(() => signThread(signedMessage, keypair.privateSeed), 500);
+  const verify = await timeAsync(() => verifyThread(signedMessage, signature, keypair.publicKey), 500);
   const seal = await timeAsync(i => sealThreadBody(keys, i + 2, aad, body), 2000);
   const open = await timeAsync(() => openThreadBody(keys, 1, aad, ciphertext), 2000);
 
@@ -121,10 +129,14 @@ const OUTCOME_PLAN_SIZES = [50, 200];
     const decoded = decodeThreadRecord(record.bytes);
     const opened = await openThreadBody(keys, decoded.seq, decoded.aad, decoded.ciphertext);
     const parsed = decodeThreadBody(opened);
-    return verifyThread(parsed.preimage, parsed.signature, keypair.publicKey);
+    return verifyThread(
+      threadRecordSigningMessage(decoded.aad, parsed.preimage),
+      parsed.signature,
+      keypair.publicKey
+    );
   }, 500);
 
-  const link = encodeThreadLink({ publicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 1754294400 });
+  const link = encodeThreadLink({ threadSecret: keypair.threadSecret, rootPublicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 1754294400 });
   // What a delivery round pays for carrying the whole day's outcomes in
   // every record — the price of a follower who joins at lunchtime still
   // learning that stop 7 was skipped at ten (§5.2.1).
@@ -159,7 +171,7 @@ const OUTCOME_PLAN_SIZES = [50, 200];
   // it is the number that decides whether a phone can be swamped.
   const keypair = await generateThreadKeypair();
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8,
+    threadSecret: keypair.threadSecret, rootPublicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8,
     notAfter: Math.floor(Date.now() / 1000) + 3600
   }));
   const subscriber = await createThreadSubscriber({ link, epoch32: EPOCH32 });
@@ -170,8 +182,11 @@ const OUTCOME_PLAN_SIZES = [50, 200];
     junk.push(encodeThreadRecord({
       epochPrefix8: EPOCH_PREFIX8,
       tag: Uint8Array.from({ length: 8 }, () => (i * 31 + 7) & 0xff),
+      generation: 1,
       seq: i + 1,
-      ciphertext: new Uint8Array(108)
+      previousHash: new Uint8Array(16),
+      ciphertext: new Uint8Array(108),
+      admissionTag: new Uint8Array(16)
     }).bytes);
   }
   const flood = await timeAsync(i => subscriber.accept(junk[i % junk.length], { knownTags }), 20000);
@@ -229,7 +244,7 @@ const OUTCOME_PLAN_SIZES = [50, 200];
     "500-bus fleet, one morning hour (fine)": `${(perThreadHourFine * 500 / 1024 / 1024).toFixed(0)} MB across the whole mesh`,
     "500-bus fleet, one morning hour (coarse)": `${(perThreadHourFine * 500 * (coarseBytes / Math.max(1, fineBytes)) / 1024 / 1024).toFixed(1)} MB`,
     "subscriber catch-up cache per thread": `${(THREAD_CONSTANTS.THREAD_CACHE_RING * (fineEmitted[0]?.bytes.length || 130) / 1024).toFixed(0)} KiB`,
-    "relay at THREAD_CACHE_TAGS capacity": `${(THREAD_CONSTANTS.THREAD_CACHE_TAGS * THREAD_CONSTANTS.THREAD_CACHE_RING * 130 / 1024 / 1024).toFixed(1)} MB`
+    "relay at THREAD_CACHE_TAGS capacity": `${(THREAD_CONSTANTS.THREAD_CACHE_TAGS * THREAD_CONSTANTS.THREAD_CACHE_RING * (fineEmitted[0]?.bytes.length || 320) / 1024 / 1024).toFixed(1)} MB`
   });
 }
 
@@ -272,7 +287,7 @@ const OUTCOME_PLAN_SIZES = [50, 200];
         privateSeed: keypair.privateSeed, epoch32: EPOCH32, mode: THREAD_MODE.FINE, clock: () => now
       });
       const link = decodeThreadLink(encodeThreadLink({
-        publicKey: publisher.publicKey, epochPrefix8: EPOCH_PREFIX8,
+        threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey, epochPrefix8: EPOCH_PREFIX8,
         notAfter: Math.floor(now / 1000) + 7200
       }));
       const caches = Array.from({ length: audience }, () => createThreadCache({ clock: () => now }));

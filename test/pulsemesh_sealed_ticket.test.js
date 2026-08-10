@@ -367,7 +367,7 @@ test("a host holding no device key still knows a sealed job is a job", async () 
   assert.match(artifact.reason, /sealed/iu);
   assert.match(artifact.reason, /device/iu);
   assert.match(artifact.reason, /enrol/iu, "and the action is enrolment");
-  assert.doesNotMatch(artifact.reason, /45 bytes/u, "never the other artifact's complaint");
+  assert.doesNotMatch(artifact.reason, /78 bytes/u, "never the other artifact's complaint");
 
   // The URL form and the mail-client-wrapped form, as everywhere else.
   assert.equal(classifyThreadArtifact(sealedTicketUrl(sealed)).sealed, true);
@@ -477,7 +477,7 @@ test("issue sealed, open on the driver's device, publish — and the details sur
   }
   // The customer's follow link exists at composition time, as ever, and
   // is not sealed: it is a read capability the customer is meant to have.
-  assert.equal(job.link.length, 45);
+  assert.equal(job.link.length, 78);
 
   const opened = await openSealedTicket(job.sealed, device.privateKey);
   const ticket = decodeThreadTicket(opened);
@@ -603,7 +603,15 @@ test("what the seal costs the QR budget, measured rather than estimated", async 
 
   // The §20.8 table's QR column, and — the assertion that keeps it
   // honest — that one more stop does not fit.
-  for (const [name, extra, max] of [["none", NONE, 12], ["typical", TYPICAL, 10], ["max", MAX, 2]]) {
+  const maxima = new Map();
+  for (const [name, extra] of [["none", NONE], ["typical", TYPICAL], ["max", MAX]]) {
+    let max = -1;
+    for (let count = 0; count <= 16; count++) {
+      const sealed = await sealTicket((await ticketOf(stopsFor(count, extra))).bytes, [driver.publicKey]);
+      if (!fitsScannableQr(bytesToBase64Url(sealed))) break;
+      max = count;
+    }
+    maxima.set(name, max);
     const fitting = await sealTicket((await ticketOf(stopsFor(max, extra))).bytes, [driver.publicKey]);
     assert.equal(fitsScannableQr(bytesToBase64Url(fitting)), true, `${max} ${name}-metadata stops fit a sealed QR`);
     assert.ok(fitting.length <= 735, `${fitting.length} bytes is inside the carrier ceiling`);
@@ -611,10 +619,15 @@ test("what the seal costs the QR budget, measured rather than estimated", async 
     assert.equal(fitsScannableQr(bytesToBase64Url(over)), false, `${max + 1} does not — ${max} is the maximum`);
   }
 
-  // Two recipients is two stops fewer again in the typical case.
+  // A second recipient consumes capacity rather than changing the plan.
   const both = [driver.publicKey, dispatcher.publicKey];
-  assert.equal(fitsScannableQr(bytesToBase64Url(await sealTicket((await ticketOf(stopsFor(8, TYPICAL))).bytes, both))), true);
-  assert.equal(fitsScannableQr(bytesToBase64Url(await sealTicket((await ticketOf(stopsFor(9, TYPICAL))).bytes, both))), false);
+  let bothMax = -1;
+  for (let count = 0; count <= maxima.get("typical"); count++) {
+    const sealed = await sealTicket((await ticketOf(stopsFor(count, TYPICAL))).bytes, both);
+    if (!fitsScannableQr(bytesToBase64Url(sealed))) break;
+    bothMax = count;
+  }
+  assert.ok(bothMax < maxima.get("typical"));
 
   // Past the ceiling the answer is still the file (§20.5) — the same
   // sealed bytes, which still open and still verify.

@@ -1,47 +1,33 @@
 // Recurring routes (threads §21): identity split from authority.
 //
-// §4.1 makes one Ed25519 keypair the whole of a run — it is the address,
-// the content key, and the publish authority at once. For a run that
-// dies at the door that is exactly right. For a **school bus route** it
-// is the bug: the plan is fixed for a term, the driver changes some days
-// and not most, and rotating the authority for a new driver rotates the
-// key, which rotates the topic, the content key and the 45-byte link —
-// so every parent has to resubscribe to keep watching the same bus.
+// A recurring route keeps one verification identity and capability for
+// a term while its publishing authority changes with the driver:
 //
-// So this splits the two the way TLS does:
+//   identity   = the long-lived root Ed25519 verification key;
+//   capability = a separate secret for discovery, admission and content;
+//   authority  = a CSPRNG-generated, short-lived day key certified by the
+//                root and scoped to one plan and generation.
 //
-//   identity  = the **root** key. Topic tags, content key and the link
-//               all keep deriving from the root public key, so a
-//               subscriber's link never moves for the life of the route.
-//   authority = a short-lived **day key**, derived by the depot from the
-//               root, certified by the root, and handed to whoever is
-//               driving today.
-//
-// The derivation is deterministic, which is the operational point: a
-// depot with 40 buses and a 180-day term does not store 7,200 secrets
-// and does not have a recovery story for losing them. It stores one root
-// per route and re-derives. Recovery is re-derivation.
-//
-// Everything here is **depot-side**. `deriveDaySeed` and
-// `mintDayCertificate` take the root seed; nothing that runs on a
+// Everything here is depot-side. `mintDayCertificate` takes the root
+// seed; nothing that runs on a
 // driver's phone may call them, and `createThreadPublisher` refuses a
 // root seed on a route run for exactly that reason. A phone that held
 // the root would be a phone whose compromise costs the whole term, which
 // is the failure short-lived certificates exist to prevent.
 
-import { utf8Bytes } from "./codec.js";
 import {
   DAY_CERT_VERSION,
-  LINK_VERSION_DELEGATED,
   decodeDayCertificate,
   encodeDayCertificate,
   encodeDayCertificatePreimage,
   encodeThreadLink
 } from "./thread_codec.js";
-import { hkdfBytes, publicKeyFromSeed, signThread, uint32be, verifyThread } from "./thread_crypto.js";
-
-/** The HKDF label. Versioned, so a v2 schedule cannot collide with this one. */
-export const ROUTE_DAY_INFO = "pulsemesh/route-day/1";
+import {
+  deriveThreadSecret,
+  publicKeyFromSeed,
+  signThread,
+  verifyThread
+} from "./thread_crypto.js";
 
 /**
  * The longest certificate window a **subscriber** will honour: 48 hours.
@@ -132,27 +118,6 @@ export function serviceDayOf(year, month, day) {
 }
 
 /**
- * `daySeed = HKDF-SHA256(rootSeed, "pulsemesh/route-day/1" ‖ planRef ‖ serviceDay)`
- *
- * `planRef` is in the info string so the same root driving two rounds —
- * a morning loop and an afternoon loop under one route identity — does
- * not hand both to whoever holds one; the term's plan is what a day key
- * is scoped to, alongside the day.
- *
- * The direction of this is what makes a leaked day seed cheap: HKDF is
- * one-way, so a day seed does not invert to the root, and holding
- * Tuesday's tells you nothing about Wednesday's. A depot goes root →
- * day; nobody goes back.
- */
-export async function deriveDaySeed({ rootSeed, planRef = null, serviceDay }) {
-  if (rootSeed?.length !== 32) throw new Error("A route root is a 32-byte Ed25519 seed.");
-  assertServiceDay(serviceDay);
-  const ref = planRef && planRef.length === 8 ? planRef : new Uint8Array(8);
-  const info = new Uint8Array([...utf8Bytes(ROUTE_DAY_INFO), ...ref, ...uint32be(serviceDay)]);
-  return hkdfBytes(rootSeed, info, 32);
-}
-
-/**
  * Mints one day's authority. **Depot-side**: this is the only function
  * in the channel that takes a root seed and produces something to send.
  *
@@ -169,12 +134,19 @@ export async function mintDayCertificate({
   rootSeed,
   planRef = null,
   serviceDay,
+  generation = serviceDay,
+  daySeed = null,
   notBefore,
   notAfter,
   maxSeconds = THREAD_MAX_CERT_SECONDS
 }) {
   if (rootSeed?.length !== 32) throw new Error("A route root is a 32-byte Ed25519 seed.");
   assertServiceDay(serviceDay);
+  const scopedPlanRef = planRef ?? new Uint8Array(8);
+  if (scopedPlanRef.length !== 8) throw new Error("A route planRef is 8 bytes.");
+  if (!Number.isInteger(generation) || generation < 1 || generation > 0xffffffff) {
+    throw new Error("A day authority generation is a positive uint32.");
+  }
   for (const [name, value] of [["notBefore", notBefore], ["notAfter", notAfter]]) {
     if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
       throw new Error(`A day certificate's ${name} is unix seconds as a uint32; got ${value}.`);
@@ -188,20 +160,30 @@ export async function mintDayCertificate({
       + "is a root key with extra steps."
     );
   }
-  const daySeed = await deriveDaySeed({ rootSeed, planRef, serviceDay });
-  const [rootPublicKey, dayPublicKey] = await Promise.all([
+  const authoritySeed = daySeed ?? globalThis.crypto.getRandomValues(new Uint8Array(32));
+  if (authoritySeed.length !== 32) throw new Error("A day authority seed is 32 bytes.");
+  const [rootPublicKey, dayPublicKey, threadSecret] = await Promise.all([
     publicKeyFromSeed(rootSeed),
-    publicKeyFromSeed(daySeed)
+    publicKeyFromSeed(authoritySeed),
+    deriveThreadSecret(rootSeed)
   ]);
   const fields = {
-    version: DAY_CERT_VERSION, rootPublicKey, dayPublicKey, serviceDay, notBefore, notAfter
+    version: DAY_CERT_VERSION,
+    rootPublicKey,
+    dayPublicKey,
+    generation,
+    serviceDay,
+    planRef: scopedPlanRef,
+    notBefore,
+    notAfter
   };
   const signature = await signThread(encodeDayCertificatePreimage(fields), rootSeed);
   return {
-    daySeed,
+    daySeed: authoritySeed,
     certificate: decodeDayCertificate(encodeDayCertificate(fields, signature)),
     rootPublicKey,
-    dayPublicKey
+    dayPublicKey,
+    threadSecret
   };
 }
 
@@ -263,7 +245,8 @@ export async function verifyDayCertificate(certificate, {
 }
 
 /**
- * The term-long follow link: a v2 link over the route **root**.
+ * The term-long follow link: a delegated capability with the route root
+ * as its stable verification identity.
  *
  * Minted once, by the depot, at the start of the term. `notAfter` is the
  * end of the term rather than the end of a run — that is the whole
@@ -271,8 +254,8 @@ export async function verifyDayCertificate(certificate, {
  * anything a subscriber will accept without a certificate whose own
  * window is at most 48 h.
  */
-export function routeFollowLink({ rootPublicKey, epochPrefix8, notAfter }) {
+export function routeFollowLink({ threadSecret, rootPublicKey, epochPrefix8, notAfter }) {
   return encodeThreadLink({
-    publicKey: rootPublicKey, epochPrefix8, notAfter, version: LINK_VERSION_DELEGATED
+    threadSecret, rootPublicKey, epochPrefix8, notAfter, delegated: true
   });
 }

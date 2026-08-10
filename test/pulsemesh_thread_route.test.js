@@ -1,7 +1,7 @@
 // §21 — recurring routes: identity split from authority.
 //
 // The headline test is the whole feature and everything else supports it:
-// **the same 45-byte link works on day 1 and on day 40**. A school bus
+// **the same 78-byte link works on day 1 and on day 40**. A school bus
 // keeps one plan for a term, the driver changes some days and not most,
 // and a parent must never have to resubscribe. Today a run's keypair is
 // its identity *and* its publish authority, so rotating the authority
@@ -19,8 +19,7 @@ import {
   DAY_CERT_BYTES,
   DAY_CERT_VERSION,
   LINK_BYTES,
-  LINK_VERSION_DELEGATED,
-  LINK_VERSION_SELF,
+  LINK_FLAG_DELEGATED,
   THREAD_MAGIC,
   THREAD_MODE,
   decodeDayCertificate,
@@ -38,7 +37,6 @@ import {
 import {
   CERT_ERROR,
   THREAD_MAX_CERT_SECONDS,
-  deriveDaySeed,
   mintDayCertificate,
   routeFollowLink,
   serviceDayOf,
@@ -46,11 +44,14 @@ import {
 } from "../src/pulsemesh/thread_route.js";
 import {
   bytesToBase64Url,
+  deriveThreadSecret,
   deriveThreadKeys,
   generateThreadKeypair,
   publicKeyFromSeed,
   sealThreadBody,
   signThread,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadTag,
   threadWindow
 } from "../src/pulsemesh/thread_crypto.js";
@@ -94,8 +95,8 @@ async function dispatchFor(rootSeed, atMillis) {
  * content key — which `deriveThreadKeys(publicKey)` hands to anyone with
  * the link — carrying a body signed by a foreign seed.
  */
-async function forgeRecord(publicKey, foreignSeed, atMillis) {
-  const keys = await deriveThreadKeys(publicKey);
+async function forgeRecord(threadSecret, foreignSeed, atMillis) {
+  const keys = await deriveThreadKeys(threadSecret);
   const window = threadWindow(atMillis);
   const tag = await threadTag(keys, EPOCH32, window);
   const body = {
@@ -113,19 +114,35 @@ async function forgeRecord(publicKey, foreignSeed, atMillis) {
     lastOutcome: null,
     note: new Uint8Array(0)
   };
-  const signature = await signThread(encodeThreadBodyPreimage(body), foreignSeed);
   const seq = 1;
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, seq);
+  const previousHash = new Uint8Array(16);
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1, seq, previousHash);
+  const signature = await signThread(
+    threadRecordSigningMessage(aad, encodeThreadBodyPreimage(body)), foreignSeed
+  );
   const ciphertext = await sealThreadBody(keys, seq, aad, encodeThreadBody(body, signature));
-  return encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq, ciphertext }).bytes;
+  const admissionTag = await threadAdmissionTag(keys, aad, ciphertext);
+  return encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8, tag, generation: 1, seq, previousHash, ciphertext, admissionTag
+  }).bytes;
+}
+
+async function termLink(rootSeed, rootPublicKey, notAfter) {
+  return routeFollowLink({
+    threadSecret: await deriveThreadSecret(rootSeed),
+    rootPublicKey,
+    epochPrefix8: EPOCH_PREFIX8,
+    notAfter
+  });
 }
 
 /** A running day: the publisher a driver's phone would create. */
 async function driverFor(rootSeed, atMillis, { mode = THREAD_MODE.FINE, publish = null } = {}) {
-  const { daySeed, certificate } = await dispatchFor(rootSeed, atMillis);
+  const { daySeed, certificate, threadSecret } = await dispatchFor(rootSeed, atMillis);
   const publisher = await createThreadPublisher({
     daySeed,
     certificate,
+    threadSecret,
     epoch32: EPOCH32,
     mode,
     plan: PLAN,
@@ -136,16 +153,14 @@ async function driverFor(rootSeed, atMillis, { mode = THREAD_MODE.FINE, publish 
   return { publisher, certificate, daySeed };
 }
 
-test("the same 45-byte link works on day 1 and on day 40", async () => {
+test("the same capability-separated link works on day 1 and on day 40", async () => {
   const root = await generateThreadKeypair(sha256Utf8("route-8a-root"));
   const termEnd = Math.floor(DAY_ONE / 1000) + 180 * 86400;
 
   // Minted once, at the depot, at the start of the term.
-  const link = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: termEnd
-  });
+  const link = await termLink(root.privateSeed, root.publicKey, termEnd);
   assert.equal(link.length, LINK_BYTES);
-  assert.equal(link[0], LINK_VERSION_DELEGATED);
+  assert.equal(link[1], LINK_FLAG_DELEGATED);
 
   // The parent subscribes once, on day 1, and never again.
   let now = DAY_ONE;
@@ -189,10 +204,8 @@ test("the same 45-byte link works on day 1 and on day 40", async () => {
   assert.equal(toHex(day1.certificate.rootPublicKey), toHex(day40.certificate.rootPublicKey));
 
   // And the identity really did not: the link is the same *bytes*.
-  const rebuilt = routeFollowLink({
-    rootPublicKey: day40.certificate.rootPublicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: termEnd
-  });
-  assert.deepEqual([...rebuilt], [...link], "the 45 bytes a parent holds never moved");
+  const rebuilt = await termLink(root.privateSeed, day40.certificate.rootPublicKey, termEnd);
+  assert.deepEqual([...rebuilt], [...link], "the capability a parent holds never moved");
 
   // The subscriber built on day 1 kept accepting, and needed nothing new
   // to do it: no second link, no fetched certificate bundle, no
@@ -236,40 +249,25 @@ test("recurring days and restarts never reuse a GCM nonce", async () => {
   assert.notEqual(toHex(restarted.nonce), toHex(tomorrow.nonce));
 });
 
-test("a day seed is deterministic and does not invert to the root", async () => {
-  const root = await generateThreadKeypair(sha256Utf8("route-determinism"));
-  const serviceDay = 20260908;
-
-  const a = await deriveDaySeed({ rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay });
-  const b = await deriveDaySeed({ rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay });
-  assert.equal(toHex(a), toHex(b), "the depot re-derives rather than stores 180 secrets");
-
-  // A different day, a different plan, or a different root — all
-  // unrelated. This is what makes one leaked day worth one day.
-  const nextDay = await deriveDaySeed({ rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay: 20260909 });
-  const otherPlan = await deriveDaySeed({
-    rootSeed: root.privateSeed, planRef: sha256Utf8("route-8b").subarray(0, 8), serviceDay
-  });
-  const otherRoot = await generateThreadKeypair(sha256Utf8("route-determinism-2"));
-  const foreign = await deriveDaySeed({ rootSeed: otherRoot.privateSeed, planRef: PLAN_REF, serviceDay });
-  for (const other of [nextDay, otherPlan, foreign]) {
-    assert.notEqual(toHex(a), toHex(other));
-  }
-
-  // The structural property, which is all a test can assert: the day
-  // seed is not the root seed, and the day key is not the root key.
-  // HKDF's one-wayness is what makes it uninvertible; nothing here
-  // proves that, and nothing here needs to.
-  assert.notEqual(toHex(a), toHex(root.privateSeed));
-  const dayPublicKey = await publicKeyFromSeed(a);
-  assert.notEqual(toHex(dayPublicKey), toHex(root.publicKey));
-  // Nothing the driver is handed contains the root seed.
-  const { daySeed, certificate } = await mintDayCertificate({
-    rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay, notBefore: 1000, notAfter: 1000 + 16 * 3600
-  });
-  const handed = new Uint8Array([...daySeed, ...certificate.bytes]);
-  const rootHex = toHex(root.privateSeed);
-  assert.equal(toHex(handed).includes(rootHex), false, "the root seed is in nothing the driver holds");
+test("authority generations are random, plan-scoped, and reveal no root material", async () => {
+  const root = await generateThreadKeypair(sha256Utf8("route-authority-isolation"));
+  const fields = {
+    rootSeed: root.privateSeed,
+    planRef: PLAN_REF,
+    serviceDay: 20260908,
+    notBefore: 1000,
+    notAfter: 1000 + 16 * 3600
+  };
+  const first = await mintDayCertificate(fields);
+  const second = await mintDayCertificate(fields);
+  assert.notEqual(toHex(first.daySeed), toHex(second.daySeed),
+    "minting twice never recreates a compromised authority seed");
+  assert.notEqual(toHex(first.daySeed), toHex(root.privateSeed));
+  assert.deepEqual(first.certificate.planRef, PLAN_REF);
+  assert.notEqual(toHex(first.certificate.dayPublicKey), toHex(root.publicKey));
+  const handed = new Uint8Array([...first.daySeed, ...first.certificate.bytes]);
+  assert.equal(toHex(handed).includes(toHex(root.privateSeed)), false,
+    "the root seed is in nothing the driver holds");
 });
 
 test("a route-day publisher refuses the root seed and a mismatched day seed", async () => {
@@ -286,16 +284,17 @@ test("a route-day publisher refuses the root seed and a mismatched day seed", as
     () => createThreadPublisher({ daySeed, epoch32: EPOCH32 }),
     /without its certificate/u
   );
-  const otherDay = await deriveDaySeed({
-    rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay: 20261225
-  });
+  const otherDay = (await generateThreadKeypair(sha256Utf8("route-other-day"))).privateSeed;
   await assert.rejects(
     () => createThreadPublisher({ daySeed: otherDay, certificate, epoch32: EPOCH32 }),
     /not the one the certificate vouches for/u
   );
 
   // And the identity the publisher adopts is the root, never the day key.
-  const publisher = await createThreadPublisher({ daySeed, certificate, epoch32: EPOCH32, plan: PLAN });
+  const publisher = await createThreadPublisher({
+    daySeed, certificate, threadSecret: await deriveThreadSecret(root.privateSeed),
+    epoch32: EPOCH32, plan: PLAN
+  });
   assert.equal(toHex(publisher.publicKey), toHex(root.publicKey));
   assert.equal(toHex(publisher.dayPublicKey), toHex(certificate.dayPublicKey));
 });
@@ -303,9 +302,7 @@ test("a route-day publisher refuses the root seed and a mismatched day seed", as
 test("a record signed by an uncertified key is refused with its own reason", async () => {
   const root = await generateThreadKeypair(sha256Utf8("route-uncertified"));
   const now = DAY_ONE;
-  const link = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 86400
-  });
+  const link = await termLink(root.privateSeed, root.publicKey, Math.floor(now / 1000) + 86400);
   const subscriber = await createThreadSubscriber({
     link: decodeThreadLink(link), epoch32: EPOCH32, clock: () => now
   });
@@ -323,30 +320,31 @@ test("a record signed by an uncertified key is refused with its own reason", asy
 
   const verdict = await subscriber.accept(dataRecords[0].bytes, { nowMillis: now });
   assert.equal(verdict.ok, false);
-  assert.equal(verdict.step, 6);
+  assert.equal(verdict.step, 7);
   assert.equal(verdict.code, THREAD_DROP.AWAITING_CERTIFICATE);
   assert.match(verdict.reason, /waiting for the day's certificate/u);
   assert.notEqual(verdict.code, THREAD_DROP.BAD_SIGNATURE);
   assert.equal(subscriber.stats.forgeries, 0, "a joiner who has not heard the cert is not a forgery");
   assert.equal(subscriber.heldCount, 1, "and its record is held, not discarded");
 
-  // The distinction is only worth anything if a v1 link still calls a
+  // The distinction is only worth anything if a direct-authority link still calls a
   // real forgery a forgery. A link holder can seal — it has `K_content`
   // — but it cannot sign, so this is a record with the run's content key
   // and somebody else's signature.
   const oneOff = await generateThreadKeypair(sha256Utf8("route-one-off"));
-  const v1Link = encodeThreadLink({
-    publicKey: oneOff.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 3600
+  const directLink = encodeThreadLink({
+    threadSecret: oneOff.threadSecret, rootPublicKey: oneOff.publicKey,
+    epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 3600
   });
-  const v1Subscriber = await createThreadSubscriber({
-    link: decodeThreadLink(v1Link), epoch32: EPOCH32, clock: () => now
+  const directSubscriber = await createThreadSubscriber({
+    link: decodeThreadLink(directLink), epoch32: EPOCH32, clock: () => now
   });
-  const forged = await forgeRecord(oneOff.publicKey, sha256Utf8("route-wrong-signer"), now);
-  const forgery = await v1Subscriber.accept(forged, { nowMillis: now });
+  const forged = await forgeRecord(oneOff.threadSecret, sha256Utf8("route-wrong-signer"), now);
+  const forgery = await directSubscriber.accept(forged, { nowMillis: now });
   assert.equal(forgery.ok, false);
-  assert.equal(forgery.step, 6);
+  assert.equal(forgery.step, 7);
   assert.equal(forgery.code, THREAD_DROP.BAD_SIGNATURE);
-  assert.equal(v1Subscriber.stats.forgeries, 1);
+  assert.equal(directSubscriber.stats.forgeries, 1);
 });
 
 test("a certificate with an over-long window is refused by the subscriber", async () => {
@@ -367,13 +365,14 @@ test("a certificate with an over-long window is refused by the subscriber", asyn
   // …but the bound that matters is the one the *verifier* applies, so
   // build the over-long certificate the way a hostile or buggy depot
   // would: straight through the codec, correctly signed by the real root.
+  const hostileAuthority = await generateThreadKeypair(sha256Utf8("route-long-window-authority"));
   const fields = {
     version: DAY_CERT_VERSION,
     rootPublicKey: root.publicKey,
-    dayPublicKey: await publicKeyFromSeed(await deriveDaySeed({
-      rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay: 20260908
-    })),
+    dayPublicKey: hostileAuthority.publicKey,
+    generation: 20260908,
     serviceDay: 20260908,
+    planRef: PLAN_REF,
     notBefore,
     notAfter: notBefore + 365 * 86400
   };
@@ -391,16 +390,15 @@ test("a certificate with an over-long window is refused by the subscriber", asyn
   // …and through the subscriber, which is where it counts: a root that
   // mints a permanent day key gets nothing.
   const now = DAY_ONE + 60000;
-  const link = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: notBefore + 200 * 86400
-  });
+  const link = await termLink(root.privateSeed, root.publicKey, notBefore + 200 * 86400);
   const subscriber = await createThreadSubscriber({
     link: decodeThreadLink(link), epoch32: EPOCH32, clock: () => now
   });
   const emitted = [];
   const publisher = await createThreadPublisher({
-    daySeed: await deriveDaySeed({ rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay: 20260908 }),
+    daySeed: hostileAuthority.privateSeed,
     certificate: forever,
+    threadSecret: await deriveThreadSecret(root.privateSeed),
     epoch32: EPOCH32,
     mode: THREAD_MODE.FINE,
     plan: PLAN,
@@ -448,7 +446,9 @@ test("a certificate signed by the wrong root, or outside its window, is refused 
     version: DAY_CERT_VERSION,
     rootPublicKey: root.publicKey,
     dayPublicKey: other.certificate.dayPublicKey,
+    generation: 20260908,
     serviceDay: 20260908,
+    planRef: PLAN_REF,
     notBefore,
     notAfter: notBefore + 16 * 3600
   };
@@ -489,9 +489,7 @@ test("a certificate signed by the wrong root, or outside its window, is refused 
 test("catch-up delivers the certificate to a late joiner, which then releases held records", async () => {
   const root = await generateThreadKeypair(sha256Utf8("route-late-joiner"));
   const now = DAY_ONE;
-  const link = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 90 * 86400
-  });
+  const link = await termLink(root.privateSeed, root.publicKey, Math.floor(now / 1000) + 90 * 86400);
   const subscriber = await createThreadSubscriber({
     link: decodeThreadLink(link), epoch32: EPOCH32, clock: () => now
   });
@@ -539,9 +537,7 @@ test("catch-up delivers the certificate to a late joiner, which then releases he
 test("the held-record buffer is bounded, and a held forgery is evicted rather than accepted", async () => {
   const root = await generateThreadKeypair(sha256Utf8("route-buffer-bound"));
   const now = DAY_ONE;
-  const link = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 86400
-  });
+  const link = await termLink(root.privateSeed, root.publicKey, Math.floor(now / 1000) + 86400);
   const subscriber = await createThreadSubscriber({
     link: decodeThreadLink(link), epoch32: EPOCH32, clock: () => now
   });
@@ -563,7 +559,7 @@ test("the held-record buffer is bounded, and a held forgery is evicted rather th
   // certificate covers — a link holder trying to publish — is held and
   // then evicted. It is never accepted, and the certificate arriving
   // does not vindicate it.
-  const forged = await forgeRecord(root.publicKey, sha256Utf8("route-buffer-impostor"), now);
+  const forged = await forgeRecord(await deriveThreadSecret(root.privateSeed), sha256Utf8("route-buffer-impostor"), now);
   const held = await subscriber.accept(forged, { nowMillis: now });
   assert.equal(held.code, THREAD_DROP.AWAITING_CERTIFICATE);
   assert.equal(subscriber.heldCount, THREAD_CONSTANTS.THREAD_HELD_RECORDS, "the bound holds under a forgery too");
@@ -595,13 +591,14 @@ test("the held-record buffer is bounded, and a held forgery is evicted rather th
   assert.equal(late.stats.accepted, 0);
 });
 
-test("a v1 one-off run still works end to end, and the two versions do not mix", async () => {
+test("a direct-authority run works end to end and refuses delegated certificates", async () => {
   const keypair = await generateThreadKeypair(sha256Utf8("route-v1-still-works"));
   const now = DAY_ONE;
   const link = encodeThreadLink({
-    publicKey: keypair.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 3600
+    threadSecret: keypair.threadSecret, rootPublicKey: keypair.publicKey,
+    epochPrefix8: EPOCH_PREFIX8, notAfter: Math.floor(now / 1000) + 3600
   });
-  assert.equal(link[0], LINK_VERSION_SELF, "the default link version did not move");
+  assert.equal(link[1], 0, "direct authority uses no delegation flag");
   const decoded = decodeThreadLink(link);
   assert.equal(decoded.delegated, false);
 
@@ -637,20 +634,17 @@ test("a v1 one-off run still works end to end, and the two versions do not mix",
   // Re-seal that certificate under *this* run's content key, which is
   // what a publisher confused about its own artifact would do.
   const confused = [];
+  const confusedMint = await mintDayCertificate({
+    rootSeed: keypair.privateSeed,
+    planRef: PLAN_REF,
+    serviceDay: serviceDayAt(now),
+    notBefore: Math.floor(now / 1000) - 60,
+    notAfter: Math.floor(now / 1000) + 3600
+  });
   const confusedPublisher = await createThreadPublisher({
-    daySeed: await deriveDaySeed({
-      rootSeed: keypair.privateSeed, planRef: PLAN_REF, serviceDay: serviceDayAt(now)
-    }),
-    certificate: await (async () => {
-      const minted = await mintDayCertificate({
-        rootSeed: keypair.privateSeed,
-        planRef: PLAN_REF,
-        serviceDay: serviceDayAt(now),
-        notBefore: Math.floor(now / 1000) - 60,
-        notAfter: Math.floor(now / 1000) + 3600
-      });
-      return minted.certificate;
-    })(),
+    daySeed: confusedMint.daySeed,
+    certificate: confusedMint.certificate,
+    threadSecret: keypair.threadSecret,
     epoch32: EPOCH32,
     mode: THREAD_MODE.FINE,
     plan: PLAN,
@@ -661,7 +655,7 @@ test("a v1 one-off run still works end to end, and the two versions do not mix",
   const certRecord = confused.find(record => record.certificate);
   const rejected = await subscriber.accept(certRecord.bytes, { nowMillis: now });
   assert.equal(rejected.ok, false);
-  assert.equal(rejected.code, THREAD_DROP.CERT_ON_V1_LINK);
+  assert.equal(rejected.code, THREAD_DROP.CERT_ON_DIRECT_LINK);
   assert.equal(certificate.version, DAY_CERT_VERSION);
 });
 
@@ -677,9 +671,7 @@ test("the channel publishes a route day and a follower on the term link tracks i
   // The depot mints the term link once, and each morning's authority
   // separately. Only the second pair ever reaches the bus.
   const termEnd = Math.floor(now / 1000) + 180 * 86400;
-  const link = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: termEnd
-  });
+  const link = await termLink(root.privateSeed, root.publicKey, termEnd);
   const url = `https://track.example/r#${bytesToBase64Url(link)}`;
 
   const updates = [];

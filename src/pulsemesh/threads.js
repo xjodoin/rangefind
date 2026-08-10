@@ -5,16 +5,15 @@
 // specific vehicle, and when does it reach my stop" for an audience that
 // is authorized to know and for nobody else. See docs/pulsemesh-threads.md.
 //
-// A run's whole capability is one Ed25519 public key, 45 bytes in a URL
-// fragment. The private key signs, so no link holder can impersonate the
-// publisher; the public key derives the content key, the rotating topic
-// tag, and the DHT rendezvous key, so holding the link is what lets you
-// find, decrypt, and verify the thread. Nothing else is in the link — no
-// host, no mailbox, no bootstrap address.
+// A link separates two roles: a random thread secret derives discovery,
+// admission and content keys, while an Ed25519 public key only verifies.
+// Holding the link lets a follower find and decrypt the thread but never
+// sign it. The fragment contains no host, mailbox, or bootstrap address.
 //
 //   const publisher = await createThreadPublisher({ privateSeed, epoch32, plan });
 //   const url = threadLinkUrl("https://track.example/r", encodeThreadLink({
-//     publicKey: publisher.publicKey, epochPrefix8, notAfter
+//     threadSecret: publisher.threadSecret,
+//     rootPublicKey: publisher.rootPublicKey, epochPrefix8, notAfter
 //   }));
 //   // …the subscriber, holding only that URL:
 //   const subscriber = await createThreadSubscriber({ link: parseThreadLinkUrl(url), epoch32 });
@@ -37,20 +36,20 @@
 // driver. A school bus keeps one plan for a term; the driver changes some
 // days and not most; and a parent must be able to watch the same link all
 // term without ever resubscribing. So identity and authority come apart:
-// the *root* key stays the identity — it derives the topic tag, the
-// content key and the 45-byte link, none of which ever move — while a
-// short-lived **day key**, derived from the root and certified by it,
-// carries the publish authority. The driver's phone holds the day seed and
+// the *root* key stays the verification identity while a separate thread
+// secret keeps discovery and encryption stable. A CSPRNG-generated,
+// short-lived **day key**, scoped and certified by the root, carries the
+// publish authority. The driver's phone holds the day seed and
 // its PMTC certificate and never the root, so a lost phone costs a day.
 //
 //   // at the depot, once a term:
-//   const link = routeFollowLink({ rootPublicKey, epochPrefix8, notAfter: termEnd });
-//   // at the depot, each morning — deterministic, so it re-derives rather than stores:
-//   const { daySeed, certificate } = await mintDayCertificate({
+//   const link = routeFollowLink({ threadSecret, rootPublicKey, epochPrefix8, notAfter: termEnd });
+//   // at the depot, each morning — a fresh, independently random authority:
+//   const { daySeed, certificate, threadSecret } = await mintDayCertificate({
 //     rootSeed, planRef, serviceDay: 20260908, notBefore, notAfter
 //   });
 //   // on the driver's phone, holding only those two:
-//   await channel.publishRouteDay({ daySeed, certificate, plan });
+//   await channel.publishRouteDay({ daySeed, certificate, threadSecret, plan });
 //
 // Getting those two *to* the phone is a **route-day ticket** (§21.11):
 // the same sealed PMK1 the dispatch channel already uses, carrying the
@@ -82,7 +81,9 @@ export {
   THREAD_TOPIC_PREFIX,
   base64UrlToBytes,
   bytesToBase64Url,
+  deriveThreadSecret,
   deriveThreadKeys,
+  equalThreadAuth,
   generateThreadKeypair,
   nativeX25519Available,
   openPhoto,
@@ -98,6 +99,8 @@ export {
   sealThreadBody,
   setThreadCryptoImplementation,
   signThread,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadRendezvous,
   threadTag,
   threadTagsForWindows,
@@ -132,14 +135,41 @@ export {
 } from "./thread_seal.js";
 
 export {
+  SUBSCRIPTION_BYTES,
+  SUBSCRIPTION_FLAG_DELEGATED,
+  SUBSCRIPTION_MAGIC,
+  SUBSCRIPTION_VERSION,
+  decodeManagedSubscription,
+  encodeManagedSubscription,
+  encodeManagedSubscriptionPreimage,
+  issueManagedSubscription,
+  openManagedSubscription
+} from "./thread_subscription.js";
+
+export {
+  ASSIGNMENT_ID_BYTES,
+  ASSIGNMENT_MAGIC,
+  ASSIGNMENT_MAX_OFFER_BYTES,
+  ASSIGNMENT_RECIPIENT_COMMITMENT_BYTES,
+  ASSIGNMENT_VERSION,
+  JOB_CLAIM_BYTES,
+  awardFirstJobClaim,
+  createJobClaim,
+  decodeAssignmentOffer,
+  decodeJobClaim,
+  issueMultiRecipientJobOffer,
+  openMultiRecipientJobOffer,
+  verifyAssignmentOffer,
+  verifyJobClaim
+} from "./thread_assignment.js";
+
+export {
   BOOTSTRAP_QUERY_KEY,
   DAY_CERT_BYTES,
   DAY_CERT_VERSION,
   LINK_BYTES,
+  LINK_FLAG_DELEGATED,
   LINK_VERSION,
-  LINK_VERSIONS,
-  LINK_VERSION_DELEGATED,
-  LINK_VERSION_SELF,
   STOP_OUTCOME,
   STOP_REASON,
   THREAD_MAGIC,
@@ -194,15 +224,14 @@ export {
 
 // §21 recurring routes: identity (the root) split from authority (a
 // certified, short-lived day key), so a term-long link never moves.
-// `deriveDaySeed` and `mintDayCertificate` are **depot-side** — they take
-// the route root, which must never reach a driver's device.
+// `mintDayCertificate` is **depot-side** — it takes the route root, which
+// must never reach a driver's device. Authority keys are CSPRNG-generated,
+// so compromise of one generation cannot expose another.
 export {
   CERT_ERROR,
-  ROUTE_DAY_INFO,
   THREAD_CERT_SKEW,
   THREAD_MAX_CERT_SECONDS,
   assertServiceDay,
-  deriveDaySeed,
   mintDayCertificate,
   routeFollowLink,
   serviceDayOf,

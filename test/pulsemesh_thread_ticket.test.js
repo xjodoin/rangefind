@@ -235,7 +235,7 @@ test("a ticket survives base64url, and nothing in it is malleable", async () => 
 
   const ticket = decodeThreadTicket(issued.base64url);
   assert.deepEqual(ticket.bytes, issued.bytes, "base64url is the transport, not a second format");
-  assert.equal(ticket.version, 1);
+  assert.equal(ticket.version, 2);
   assert.equal(ticket.seedPresent, true);
   assert.equal(ticket.mode, THREAD_MODE.FINE, "the issuer decides what the link is worth (§11)");
   assert.equal(ticket.notAfter, notAfter);
@@ -430,11 +430,11 @@ test("a capability that came through a mail client is still a capability", async
   assert.notEqual(wrapped, encoded);
 
   const bare = await channel.follow(wrapped);
-  assert.deepEqual(bare.link.publicKey, await publicKeyFromSeed(issued.ticket.privateSeed));
+  assert.deepEqual(bare.link.rootPublicKey, await publicKeyFromSeed(issued.ticket.privateSeed));
   bare.stop();
 
   const fromUrl = await channel.follow(`https://order.example/t#${wrapped}`);
-  assert.deepEqual(fromUrl.link.publicKey, bare.link.publicKey, "and the same through a URL");
+  assert.deepEqual(fromUrl.link.rootPublicKey, bare.link.rootPublicKey, "and the same through a URL");
   fromUrl.stop();
 
   // The ticket decoder gets the same treatment from the demo's
@@ -451,7 +451,7 @@ test("an unreadable ticket is reported as a ticket, not as a broken link", async
   // The bug this pins: hosts used to try the ticket decoder, swallow its
   // error, try the link decoder, and surface *that* one — so a driver
   // holding a ticket minted before a wire change was told "a thread link
-  // is 45 bytes", which describes nothing they have. Identity comes from
+  // is 78 bytes", which describes nothing they have. Identity comes from
   // the magic; readability is a separate answer carried beside it.
   const now = Math.floor(Date.now() / 1000);
   const { issued } = await ticketFor(EPOCH32.subarray(0, 8), { notAfterSeconds: now + 3600 });
@@ -465,9 +465,9 @@ test("an unreadable ticket is reported as a ticket, not as a broken link", async
   assert.deepEqual(
     classifyThreadArtifact(bytesToBase64Url(issued.link)),
     { kind: "link", reason: null, sealed: false, routeDay: false, serviceDay: null },
-    "and 45 bytes is a link"
+    "and 78 bytes is a link"
   );
-  assert.equal(issued.link.length, 45);
+  assert.equal(issued.link.length, 78);
 
   // A PMK1 blob this build cannot read: the magic still says what it is.
   const truncated = issued.bytes.subarray(0, issued.bytes.length - 40);
@@ -476,7 +476,7 @@ test("an unreadable ticket is reported as a ticket, not as a broken link", async
   assert.equal(stale.routeDay, null, "and which kind of ticket it is, unread, is not knowable");
   assert.match(stale.reason, /ticket/iu);
   assert.match(stale.reason, /dispatcher/iu, "and it says what to do about it");
-  assert.doesNotMatch(stale.reason, /45 bytes/u, "never the other artifact's complaint");
+  assert.doesNotMatch(stale.reason, /78 bytes/u, "never the other artifact's complaint");
 
   // Neither magic, and neither width: nothing to claim.
   assert.deepEqual(
@@ -570,9 +570,9 @@ test("the customer gets the link before the courier gets the job", async t => {
     mode: THREAD_MODE.FINE,
     baseUrl: "https://order.example/t"
   });
-  assert.equal(issued.link.length, 45, "the follow link exists at composition time");
-  assert.match(issued.url, /#[A-Za-z0-9_-]{60}/);
-  assert.deepEqual(decodeThreadLink(issued.link).publicKey, await publicKeyFromSeed(issued.ticket.privateSeed));
+  assert.equal(issued.link.length, 78, "the follow link exists at composition time");
+  assert.match(issued.url, /#[A-Za-z0-9_-]{100,}/);
+  assert.deepEqual(decodeThreadLink(issued.link).rootPublicKey, await publicKeyFromSeed(issued.ticket.privateSeed));
 
   // The customer starts following a run that has no publisher at all.
   const updates = [];

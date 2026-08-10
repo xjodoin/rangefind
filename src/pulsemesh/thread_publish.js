@@ -14,6 +14,7 @@ import {
   STOP_REASON,
   THREAD_MAX_NOTE_BYTES,
   THREAD_MAX_REASONS,
+  THREAD_CHAIN_HASH_BYTES,
   THREAD_MODE,
   THREAD_STATE,
   THREAD_TRAVEL_MODE,
@@ -28,6 +29,7 @@ import {
   PHOTO_CHAIN_ZERO,
   PHOTO_SEAL_OVERHEAD,
   THREAD_MAX_PHOTO_BYTES,
+  deriveThreadSecret,
   deriveThreadKeys,
   photoChainStep,
   photoCommitment,
@@ -36,16 +38,18 @@ import {
   sealPhoto,
   sealThreadBody,
   signThread,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadTag,
   threadWindow
 } from "./thread_crypto.js";
 import { parseSegment, utf8Bytes } from "./codec.js";
-import { toHex } from "./sha256.js";
+import { sha256, toHex } from "./sha256.js";
 
 export const THREAD_CONSTANTS = Object.freeze({
   THREAD_UPDATE_FINE: 5,
   THREAD_COARSE_HEARTBEAT: 60,
-  THREAD_MAX_RECORD_BYTES: 256,
+  THREAD_MAX_RECORD_BYTES: 320,
   THREAD_MAX_AGE: 120,
   THREAD_MAX_FUTURE_SKEW: 15,
   THREAD_STALE: 90,
@@ -57,6 +61,8 @@ export const THREAD_CONSTANTS = Object.freeze({
   THREAD_MAX_RUN_SECONDS: 21600,
   THREAD_TAG_BUDGET: 32,
   THREAD_CACHE_RATE: 3,
+  THREAD_GLOBAL_BURST: 32,
+  THREAD_GLOBAL_RATE: 16,
   // §10 rule 4 stop suppression, in metres and seconds.
   THREAD_STOP_RADIUS: 40,
   THREAD_STOP_LINGER: 10,
@@ -88,15 +94,12 @@ export const THREAD_CONSTANTS = Object.freeze({
  *
  * Two credential shapes, and exactly one of them per publisher:
  *
- * - **One-off (§4.1).** `privateSeed` is the run's Ed25519 seed. Fresh
- *   per run; it never leaves the device, it signs the records, and the
- *   link carries its public key. This is a v1 link.
+ * - **One-off (§4.1).** `privateSeed` is the run's Ed25519 signing seed.
+ *   Its public key verifies records; a separate secret is the capability.
  * - **A route day (§21).** `daySeed` plus the `certificate` that vouches
  *   for it. The *root* public key comes out of the certificate and is
- *   what derives the topic tag and the content key — so the run
- *   publishes to the route's permanent address under a key that is good
- *   for one day. This is a v2 link, and it is the same 45 bytes on day 1
- *   and day 40.
+ *   the verification identity. The route's separate capability keeps the
+ *   topic and content key stable while the day key remains short-lived.
  *
  * Passing `privateSeed` alongside a certificate is refused rather than
  * ignored. The root seed has no business on a driver's phone: it is the
@@ -119,6 +122,8 @@ export async function createThreadPublisher({
   privateSeed = null,
   daySeed = null,
   certificate = null,
+  threadSecret = null,
+  generation = 1,
   epoch32,
   mode = THREAD_MODE.COARSE,
   plan = null,
@@ -127,6 +132,7 @@ export async function createThreadPublisher({
   clock = Date.now,
   snap = null,
   startSeq = 0,
+  startPreviousHash = null,
   maxRunSeconds = constants.THREAD_MAX_RUN_SECONDS,
   travelMode = null
 } = {}) {
@@ -162,9 +168,17 @@ export async function createThreadPublisher({
   }
   // Identity, not authority: on a route day the topic tag, the content
   // key and the link all keep deriving from the **root** public key, so
-  // a parent's 45 bytes are the same on day 1 and on day 40.
-  const publicKey = dayCertificate ? dayCertificate.rootPublicKey : await publicKeyFromSeed(privateSeed);
-  const keys = await deriveThreadKeys(publicKey);
+  // a parent's link bytes are the same on day 1 and on day 40.
+  const rootPublicKey = dayCertificate ? dayCertificate.rootPublicKey : await publicKeyFromSeed(privateSeed);
+  const capability = threadSecret ?? (dayCertificate ? null : await deriveThreadSecret(privateSeed));
+  if (capability?.length !== 32) {
+    throw new Error("A delegated publisher needs the 32-byte thread capability secret from its follow link.");
+  }
+  const authorityGeneration = dayCertificate?.generation ?? generation;
+  if (!Number.isInteger(authorityGeneration) || authorityGeneration < 1 || authorityGeneration > 0xffffffff) {
+    throw new Error("A publisher authority generation is a positive uint32.");
+  }
+  const keys = await deriveThreadKeys(capability);
   const epochPrefix8 = epoch32.subarray(0, 8);
   const planRef = plan?.planRef || new Uint8Array(8);
   const runTravelMode = travelMode ?? plan?.travelMode ?? THREAD_TRAVEL_MODE.UNSPECIFIED;
@@ -173,6 +187,10 @@ export async function createThreadPublisher({
   // second holder's first record is startSeq + 1 and no follower ever
   // sees a sequence regression.
   let seq = startSeq;
+  let previousHash = startPreviousHash ?? new Uint8Array(THREAD_CHAIN_HASH_BYTES);
+  if (previousHash.length !== THREAD_CHAIN_HASH_BYTES) {
+    throw new Error(`A publisher predecessor hash is ${THREAD_CHAIN_HASH_BYTES} bytes.`);
+  }
   let state = THREAD_STATE.SCHEDULED;
   // The last stop the run has *dealt with*, in plan order: visited and
   // resolved, or passed. Monotonic, and never a high-water mark of the
@@ -258,18 +276,47 @@ export async function createThreadPublisher({
     return best;
   }
 
-  /** Seals one already-encoded body into a nonce-safe PMT1 and hands it to the transport. */
-  async function emitPlaintext(plaintext, nowMillis, extra) {
+  async function nextEnvelope(nowMillis) {
     const window = threadWindow(nowMillis);
     const tag = await threadTag(keys, epoch32, window);
     seq += 1;
-    const aad = threadRecordAad(epochPrefix8, tag, seq);
+    const aad = threadRecordAad(epochPrefix8, tag, authorityGeneration, seq, previousHash);
+    return { window, tag, seq, aad, previousHash: Uint8Array.from(previousHash) };
+  }
+
+  /** Seals one body into a capability-MACed, chain-addressed PMT1. */
+  async function emitPlaintext(plaintext, nowMillis, extra, {
+    envelope = null,
+    advanceChain = false
+  } = {}) {
+    const current = envelope ?? await nextEnvelope(nowMillis);
+    const { window, tag, aad } = current;
     const ciphertext = await sealThreadBody(keys, seq, aad, plaintext);
-    const record = encodeThreadRecord({ epochPrefix8, tag, seq, ciphertext });
+    const admissionTag = await threadAdmissionTag(keys, aad, ciphertext);
+    const record = encodeThreadRecord({
+      epochPrefix8,
+      tag,
+      generation: authorityGeneration,
+      seq,
+      previousHash: current.previousHash,
+      ciphertext,
+      admissionTag
+    });
     if (record.bytes.length > constants.THREAD_MAX_RECORD_BYTES) {
       throw new Error(`PMT1 record exceeds ${constants.THREAD_MAX_RECORD_BYTES} bytes.`);
     }
-    const emitted = { bytes: record.bytes, tag, seq, window, ...extra };
+    const recordHash = sha256(record.bytes).subarray(0, THREAD_CHAIN_HASH_BYTES);
+    if (advanceChain) previousHash = Uint8Array.from(recordHash);
+    const emitted = {
+      bytes: record.bytes,
+      tag,
+      generation: authorityGeneration,
+      seq,
+      previousHash: current.previousHash,
+      recordHash,
+      window,
+      ...extra
+    };
     if (publish) await publish(emitted);
     return emitted;
   }
@@ -297,10 +344,11 @@ export async function createThreadPublisher({
     if (dayCertificate && nowMillis - lastCertMillis >= constants.THREAD_CERT_INTERVAL * 1000) {
       await emitCertificate(nowMillis);
     }
+    const envelope = await nextEnvelope(nowMillis);
     const preimage = encodeThreadBodyPreimage(body);
-    const signature = await signThread(preimage, secretSeed);
+    const signature = await signThread(threadRecordSigningMessage(envelope.aad, preimage), secretSeed);
     const plaintext = encodeThreadBody(body, signature);
-    const emitted = await emitPlaintext(plaintext, nowMillis, { body });
+    const emitted = await emitPlaintext(plaintext, nowMillis, { body }, { envelope, advanceChain: true });
     lastEmitMillis = nowMillis;
     lastStateEmitted = body.state;
     stats.published++;
@@ -583,7 +631,10 @@ export async function createThreadPublisher({
 
   return {
     /** The run's **identity**: on a route day, the root, not the day key. */
-    publicKey,
+    publicKey: rootPublicKey,
+    rootPublicKey,
+    threadSecret: capability,
+    generation: authorityGeneration,
     keys,
     handleFix,
     finish,
@@ -635,6 +686,7 @@ export async function createThreadPublisher({
         : null
     ),
     get seq() { return seq; },
+    get previousHash() { return Uint8Array.from(previousHash); },
     get state() { return state; },
     get stopIndex() { return stopIndex; },
     get mode() { return mode; },

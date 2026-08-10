@@ -47,6 +47,7 @@ function randomBytes(length) {
 export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.now, rng = Math.random } = {}) {
   const tags = new Map();       // tagHex -> { records: [], lastUsed, openable }
   const sourceBudget = new Map(); // peerId -> { window, newTags, admitted: Map(tagHex -> lastMillis) }
+  const globalBudget = new Map(); // tagHex -> host-wide token bucket
   const stats = { admitted: 0, rejected: 0, evictedTags: 0, served: 0, requests: 0 };
 
   function entryFor(tagHex, { openable = false, nowMillis = clock() } = {}) {
@@ -90,6 +91,24 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
     const known = tags.get(tagHex);
 
     if (fromPeer != null) {
+      const globalBurst = Math.max(1, constants.THREAD_GLOBAL_BURST ?? 32);
+      const globalRate = Math.max(1, constants.THREAD_GLOBAL_RATE ?? 16);
+      const global = globalBudget.get(tagHex) ?? { tokens: globalBurst, lastMillis: nowMillis };
+      const globalElapsed = Math.max(0, nowMillis - global.lastMillis);
+      global.tokens = Math.min(globalBurst, global.tokens + (globalElapsed / 1000) * globalRate);
+      global.lastMillis = nowMillis;
+      if (global.tokens < 1) {
+        globalBudget.set(tagHex, global);
+        stats.rejected++;
+        return { admitted: false, reason: "global-rate" };
+      }
+      global.tokens -= 1;
+      globalBudget.delete(tagHex);
+      globalBudget.set(tagHex, global);
+      while (globalBudget.size > constants.THREAD_CACHE_TAGS) {
+        globalBudget.delete(globalBudget.keys().next().value);
+      }
+
       const window = Math.floor(nowMillis / 1000 / 300);
       let budget = sourceBudget.get(fromPeer);
       if (!budget || budget.window !== window) {
@@ -128,11 +147,16 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
     if (!retain) return { admitted: true, retained: false };
 
     const entry = entryFor(tagHex, { openable, nowMillis });
-    if (entry.records.some(held => held.seq === decoded.seq)) {
+    if (entry.records.some(held => held.generation === decoded.generation && held.seq === decoded.seq)) {
       return { admitted: false, reason: "duplicate" };
     }
-    entry.records.push({ seq: decoded.seq, bytes: decoded.bytes, receivedAt: nowMillis });
-    entry.records.sort((a, b) => a.seq - b.seq);
+    entry.records.push({
+      generation: decoded.generation,
+      seq: decoded.seq,
+      bytes: decoded.bytes,
+      receivedAt: nowMillis
+    });
+    entry.records.sort((a, b) => a.generation - b.generation || a.seq - b.seq);
     if (entry.records.length > constants.THREAD_CACHE_RING) entry.records.shift();
     stats.admitted++;
     evictIfNeeded();
@@ -158,11 +182,14 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
     // `request.entries ? …` silently takes the wrong branch.
     const decoded = request instanceof Uint8Array ? decodeThreadRequest(request) : request;
     stats.requests++;
-    const entries = decoded.entries.map(({ tag, sinceSeq }) => {
+    const entries = decoded.entries.map(({ tag, sinceGeneration, sinceSeq }) => {
       const entry = tags.get(toHex(tag));
       if (!entry) return { tag, records: [] };
       entry.lastUsed = nowMillis;
-      const records = entry.records.filter(record => record.seq > sinceSeq).map(record => record.bytes);
+      const records = entry.records
+        .filter(record => record.generation > sinceGeneration
+          || (record.generation === sinceGeneration && record.seq > sinceSeq))
+        .map(record => record.bytes);
       stats.served += records.length;
       return { tag, records };
     });
@@ -200,9 +227,17 @@ export function buildThreadRequest({ epochPrefix8, wanted, rng = Math.random }) 
   if (!wanted.length) throw new Error("A catch-up request needs at least one wanted tag.");
   const size = THREAD_REQUEST_SIZES.find(candidate => candidate >= wanted.length);
   if (!size) throw new Error(`A catch-up request carries at most ${THREAD_REQUEST_SIZES.at(-1)} tags.`);
-  const entries = wanted.map(entry => ({ tag: entry.tag, sinceSeq: entry.sinceSeq ?? 0 }));
+  const entries = wanted.map(entry => ({
+    tag: entry.tag,
+    sinceGeneration: entry.sinceGeneration ?? 0,
+    sinceSeq: entry.sinceSeq ?? 0
+  }));
   while (entries.length < size) {
-    entries.push({ tag: randomBytes(8), sinceSeq: Math.floor(rng() * 64) });
+    entries.push({
+      tag: randomBytes(8),
+      sinceGeneration: Math.floor(rng() * 64),
+      sinceSeq: Math.floor(rng() * 64)
+    });
   }
   // Shuffle so position does not reveal which entries are real.
   for (let i = entries.length - 1; i > 0; i--) {
@@ -229,7 +264,7 @@ export async function applyThreadResponse(subscriber, payload, { nowMillis = Dat
     if (wanted && !wanted.has(toHex(entry.tag))) continue; // our decoys
     records.push(...entry.records);
   }
-  records.sort((a, b) => a.seq - b.seq);
+  records.sort((a, b) => a.generation - b.generation || a.seq - b.seq);
   let accepted = 0;
   for (const record of records) {
     const verdict = await subscriber.accept(record, { nowMillis });

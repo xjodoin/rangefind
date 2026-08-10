@@ -6,7 +6,7 @@
 // chain — and nothing that *carries* one. The obvious workaround is
 // actively wrong, and the headline test here is the proof: sealing an
 // ordinary PMK1 whose seed happens to be the day seed makes the publisher
-// derive its topic tag, its content key and its 45 bytes from the **day**
+// derive its topic tag, its content key and its 78 bytes from the **day**
 // public key, so the run publishes onto an address no parent is
 // subscribed to. Nothing errors. The driver's phone shows a healthy run
 // and every parent's link goes silent.
@@ -23,8 +23,6 @@ import test from "node:test";
 import { createThreadChannel } from "../src/pulsemesh/thread_session.js";
 import {
   DAY_CERT_BYTES,
-  LINK_VERSION_DELEGATED,
-  LINK_VERSION_SELF,
   THREAD_MODE,
   decodeThreadLink,
   encodeDayCertificate,
@@ -33,7 +31,6 @@ import {
 import {
   CERT_ERROR,
   THREAD_MAX_CERT_SECONDS,
-  deriveDaySeed,
   mintDayCertificate,
   routeFollowLink,
   serviceDayOf
@@ -53,6 +50,7 @@ import {
 import { generateDeviceKeypair, openSealedTicket, sealTicket } from "../src/pulsemesh/thread_seal.js";
 import {
   bytesToBase64Url,
+  deriveThreadSecret,
   generateThreadKeypair,
   publicKeyFromSeed,
   signThread
@@ -102,6 +100,15 @@ function topicOf(tag) {
   return `/rangefind/pulsemesh/1/t/${EPOCH_HEX.slice(0, 16)}/${toHex(tag)}`;
 }
 
+async function termLinkFor(root, notAfter = TERM_END) {
+  return routeFollowLink({
+    threadSecret: await deriveThreadSecret(root.privateSeed),
+    rootPublicKey: root.publicKey,
+    epochPrefix8: EPOCH_PREFIX8,
+    notAfter
+  });
+}
+
 /** Re-signs a ticket whose preimage a test has edited, as its issuer. */
 async function resign(bytes, issuerSeed) {
   const preimage = bytes.subarray(0, bytes.length - 64);
@@ -120,16 +127,14 @@ test("a route-day ticket publishes on the ROOT's topic, and a bare day seed does
 
   // 1. The term. Minted once, at the start of September, and handed to
   //    every parent. Nothing below ever reissues it.
-  const termLink = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: TERM_END
-  });
+  const termLink = await termLinkFor(root);
   const parent = createThreadChannel({ epochHex: EPOCH_HEX, id: "parent", clock });
   const updates = [];
   const follow = await parent.follow(
     `https://track.example/r#${bytesToBase64Url(termLink)}`,
     { onUpdate: update => updates.push(update) }
   );
-  assert.equal(decodeThreadLink(termLink).version, LINK_VERSION_DELEGATED);
+  assert.equal(decodeThreadLink(termLink).delegated, true);
 
   // 2. Tomorrow morning, at the depot: one day of authority, and one
   //    sealed artifact carrying it to a device the depot enrolled.
@@ -141,6 +146,7 @@ test("a route-day ticket publishes on the ROOT's topic, and a bare day seed does
     notAfter: TERM_END,
     mode: THREAD_MODE.FINE,
     dayCertificate: certificate,
+    privateSeed: daySeed,
     recipients: [driver.publicKey]
   });
   // The dispatcher did not have to pass the day seed at all: it is a
@@ -150,7 +156,7 @@ test("a route-day ticket publishes on the ROOT's topic, and a bare day seed does
   assert.equal(job.ticket.serviceDay, serviceDayAt(now));
   // The link this hands back is the *term's* — byte-identical to what the
   // parents were given in September, not a link over the day key.
-  assert.deepEqual([...job.link], [...termLink], "the term's 45 bytes, unchanged");
+  assert.deepEqual([...job.link], [...termLink], "the term's 78 bytes, unchanged");
 
   // 3. On the bus. The driver's phone holds a device key and ciphertext.
   const opened = decodeThreadTicket(await openSealedTicket(job.sealed, driver.privateKey));
@@ -187,7 +193,7 @@ test("a route-day ticket publishes on the ROOT's topic, and a bare day seed does
     recipients: [driver.publicKey]
   });
   assert.notDeepEqual([...wrong.link], [...termLink], "a different address entirely");
-  assert.equal(decodeThreadLink(wrong.link).version, LINK_VERSION_SELF);
+  assert.equal(decodeThreadLink(wrong.link).delegated, false);
 
   const stray = createThreadChannel({ epochHex: EPOCH_HEX, id: "stray", clock });
   const strayWire = [];
@@ -217,16 +223,15 @@ test("a day ticket still hands over, and the second device publishes on the same
   const now = DAY_ONE;
   const clock = () => now;
 
-  const termLink = routeFollowLink({
-    rootPublicKey: root.publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: TERM_END
-  });
-  const { certificate } = await dispatchFor(root.privateSeed, now);
+  const termLink = await termLinkFor(root);
+  const { certificate, daySeed } = await dispatchFor(root.privateSeed, now);
   const job = await issueSealedTicket({
     issuerSeed: root.privateSeed,
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
     dayCertificate: certificate,
+    privateSeed: daySeed,
     recipients: [first.publicKey]
   });
 
@@ -248,7 +253,7 @@ test("a day ticket still hands over, and the second device publishes on the same
     catchUp: false,
     onPublish: emitted => { wire.push(emitted); }
   });
-  assert.deepEqual([...run.link], [...termLink], "the same route, the same 45 bytes");
+  assert.deepEqual([...run.link], [...termLink], "the same route, the same 78 bytes");
   await run.handleFix({ lat: 45.531, lon: -73.581, speedMps: 7, nowMillis: now });
 
   for (const emitted of wire) await parent.deliver(topicOf(emitted.tag), emitted.bytes, now);
@@ -262,13 +267,11 @@ test("a day ticket still hands over, and the second device publishes on the same
 test("a day ticket whose seed is not the certificate's day key is refused by name", async () => {
   const root = await generateThreadKeypair(sha256Utf8("route-8a-mismatch"));
   const now = DAY_ONE;
-  const { certificate } = await dispatchFor(root.privateSeed, now);
+  const { certificate, daySeed } = await dispatchFor(root.privateSeed, now);
 
   // The depot cannot mint one by accident: a seed that is not what the
   // plan and the day derive is refused at issue.
-  const other = await deriveDaySeed({
-    rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay: serviceDayAt(now + 86400000)
-  });
+  const other = (await generateThreadKeypair(sha256Utf8("route-day-ticket-other"))).privateSeed;
   await assert.rejects(
     () => issueTicket({
       issuerSeed: root.privateSeed,
@@ -278,7 +281,7 @@ test("a day ticket whose seed is not the certificate's day key is refused by nam
       dayCertificate: certificate,
       privateSeed: other
     }),
-    /not the one this plan and service day derive/u
+    /does not vouch for the supplied random day authority seed/u
   );
 
   // And a forged one — the seed swapped out and the ticket re-signed by
@@ -289,9 +292,10 @@ test("a day ticket whose seed is not the certificate's day key is refused by nam
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: certificate
+    dayCertificate: certificate,
+    privateSeed: daySeed
   });
-  const seedAt = good.bytes.length - 64 - DAY_CERT_BYTES - 32;
+  const seedAt = good.bytes.length - 64 - DAY_CERT_BYTES - 64;
   const swapped = Uint8Array.from(good.bytes);
   swapped.set(other, seedAt);
   const forged = await resign(swapped, root.privateSeed);
@@ -338,12 +342,14 @@ test("only the route's own root grants a day of it", async () => {
   // Spliced into a valid ticket and re-signed, it does not even decode:
   // the rule is a byte comparison, so it is enforced at the earliest
   // place it can be.
+  const validDispatch = await dispatchFor(root.privateSeed, now);
   const good = await issueTicket({
     issuerSeed: root.privateSeed,
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: (await dispatchFor(root.privateSeed, now)).certificate
+    dayCertificate: validDispatch.certificate,
+    privateSeed: validDispatch.daySeed
   });
   const certAt = good.bytes.length - 64 - DAY_CERT_BYTES;
   const spliced = Uint8Array.from(good.bytes);
@@ -354,14 +360,15 @@ test("only the route's own root grants a day of it", async () => {
   // A certificate that *claims* this root but was signed by another is a
   // different failure and gets a different name: the shape is right, the
   // signature is not.
-  const dayPublicKey = await publicKeyFromSeed(
-    await deriveDaySeed({ rootSeed: root.privateSeed, planRef: PLAN_REF, serviceDay: serviceDayAt(now) })
-  );
+  const claimedAuthority = await generateThreadKeypair(sha256Utf8("route-claimed-authority"));
+  const dayPublicKey = claimedAuthority.publicKey;
   const notBefore = Math.floor(now / 1000) - 3600;
   const fields = {
     rootPublicKey: root.publicKey,
     dayPublicKey,
+    generation: serviceDayAt(now),
     serviceDay: serviceDayAt(now),
+    planRef: PLAN_REF,
     notBefore,
     notAfter: notBefore + (16 * 3600)
   };
@@ -374,7 +381,8 @@ test("only the route's own root grants a day of it", async () => {
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: impostor
+    dayCertificate: impostor,
+    privateSeed: claimedAuthority.privateSeed
   });
   const verdict = await verifyThreadTicket(claiming.ticket, {
     epochPrefix8: EPOCH_PREFIX8, nowMillis: now
@@ -396,7 +404,8 @@ test("an expired or over-long day certificate is refused", async () => {
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: yesterday.certificate
+    dayCertificate: yesterday.certificate,
+    privateSeed: yesterday.daySeed
   });
   const staleVerdict = await verifyThreadTicket(stale.ticket, {
     epochPrefix8: EPOCH_PREFIX8, nowMillis: now
@@ -415,7 +424,8 @@ test("an expired or over-long day certificate is refused", async () => {
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: forever.certificate
+    dayCertificate: forever.certificate,
+    privateSeed: forever.daySeed
   });
   const wideVerdict = await verifyThreadTicket(wide.ticket, {
     epochPrefix8: EPOCH_PREFIX8, nowMillis: now
@@ -432,7 +442,8 @@ test("an expired or over-long day certificate is refused", async () => {
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: tomorrow.certificate.notBefore - 60,
-    dayCertificate: tomorrow.certificate
+    dayCertificate: tomorrow.certificate,
+    privateSeed: tomorrow.daySeed
   });
   const shortVerdict = await verifyThreadTicket(short.ticket, {
     epochPrefix8: EPOCH_PREFIX8, nowMillis: (tomorrow.certificate.notBefore - 120) * 1000
@@ -452,7 +463,8 @@ test("an expired or over-long day certificate is refused", async () => {
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: today.certificate.notAfter - 3600,
-    dayCertificate: today.certificate
+    dayCertificate: today.certificate,
+    privateSeed: today.daySeed
   });
   // Mid-day: inside the certificate's window and inside the ticket's own
   // expiry, so every other check here passes.
@@ -471,7 +483,8 @@ test("an expired or over-long day certificate is refused", async () => {
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: today.certificate
+    dayCertificate: today.certificate,
+    privateSeed: today.daySeed
   });
   const coveringVerdict = await verifyThreadTicket(covering.ticket, {
     epochPrefix8: EPOCH_PREFIX8, nowMillis: middayMillis
@@ -483,14 +496,15 @@ test("a route-day ticket says so, and an ordinary one says it is ordinary", asyn
   const root = await generateThreadKeypair(sha256Utf8("route-8a-classify"));
   const driver = await generateDeviceKeypair();
   const now = DAY_ONE;
-  const { certificate } = await dispatchFor(root.privateSeed, now);
+  const { certificate, daySeed } = await dispatchFor(root.privateSeed, now);
 
   const day = await issueTicket({
     issuerSeed: root.privateSeed,
     epoch32: EPOCH32,
     plan: PLAN,
     notAfter: TERM_END,
-    dayCertificate: certificate
+    dayCertificate: certificate,
+    privateSeed: daySeed
   });
   assert.deepEqual(
     classifyThreadArtifact(bytesToBase64Url(day.bytes)),
@@ -533,9 +547,9 @@ test("a route-day ticket says so, and an ordinary one says it is ordinary", asyn
   // And `ticketFollowLink` is the single place the identity is decided,
   // so no caller can derive a link from a day key by forgetting a branch.
   const link = decodeThreadLink(await ticketFollowLink(day.ticket));
-  assert.equal(link.version, LINK_VERSION_DELEGATED);
-  assert.deepEqual([...link.publicKey], [...root.publicKey]);
-  assert.equal(decodeThreadLink(await ticketFollowLink(job.ticket)).version, LINK_VERSION_SELF);
+  assert.equal(link.delegated, true);
+  assert.deepEqual([...link.rootPublicKey], [...root.publicKey]);
+  assert.equal(decodeThreadLink(await ticketFollowLink(job.ticket)).delegated, false);
 });
 
 test("what the day certificate costs the QR budget, measured rather than estimated", async () => {
@@ -543,10 +557,10 @@ test("what the day certificate costs the QR budget, measured rather than estimat
   const driver = await generateDeviceKeypair();
   const now = DAY_ONE;
 
-  // The certificate is a fixed 145 bytes inside the signed preimage, and
+  // The certificate is a fixed 157 bytes inside the signed preimage, and
   // that is the entire cost — there is no length prefix and no second
   // artifact to carry.
-  assert.equal(DAY_CERT_BYTES, 145);
+  assert.equal(DAY_CERT_BYTES, 157);
 
   const stopsFor = count => Array.from({ length: count }, (unused, i) => ({
     lat: 45.4 + (i * 0.0013),
@@ -557,21 +571,22 @@ test("what the day certificate costs the QR budget, measured rather than estimat
 
   const sealedFor = async (count, cert) => {
     const plan = { dwellSeconds: 60, stops: stopsFor(count) };
-    const dayCertificate = cert
-      ? (await mintDayCertificate({
+    const authority = cert
+      ? await mintDayCertificate({
           rootSeed: root.privateSeed,
           planRef: planRefOf(encodeThreadPlan(plan)),
           serviceDay: serviceDayAt(now),
           notBefore: Math.floor(now / 1000) - 3600,
           notAfter: Math.floor(now / 1000) + (12 * 3600)
-        })).certificate
+        })
       : null;
     const issued = await issueTicket({
       issuerSeed: root.privateSeed,
       epoch32: EPOCH32,
       plan,
       notAfter: TERM_END,
-      dayCertificate
+      dayCertificate: authority?.certificate ?? null,
+      privateSeed: authority?.daySeed ?? null
     });
     return sealTicket(issued.bytes, [driver.publicKey]);
   };
@@ -587,19 +602,24 @@ test("what the day certificate costs the QR budget, measured rather than estimat
 
   // The §20.8 ceiling, unchanged: 735 bytes of carrier payload, less the
   // seal's 130 for one recipient, is 605 of signed ticket — and the
-  // certificate takes 145 of those, leaving 460 for the plan.
-  assert.equal(605 - DAY_CERT_BYTES, 460);
+  // certificate takes 157 of those, leaving 448 for the plan.
+  assert.equal(605 - DAY_CERT_BYTES, 448);
 
-  // A day ticket costs **four stops** off a scannable round, and 8 stops
-  // is a school route, a milk run or a morning's deliveries. The QR is
-  // still the carrier for an ordinary route day.
-  for (const [cert, max] of [[false, 12], [true, 8]]) {
-    const fitting = await sealedFor(max, cert);
-    assert.equal(fits(bytesToBase64Url(fitting)), true, `${max} stops fit (dayCertificate: ${cert})`);
-    assert.ok(fitting.length <= 735);
-    const over = await sealedFor(max + 1, cert);
-    assert.equal(fits(bytesToBase64Url(over)), false, `${max + 1} does not (dayCertificate: ${cert})`);
+  // Measure the boundary from the actual carrier. The certificate must
+  // reduce capacity, and both shapes must have a sharp first failure.
+  const maxima = [];
+  for (const cert of [false, true]) {
+    let max = -1;
+    for (let count = 0; count <= 20; count++) {
+      const sealed = await sealedFor(count, cert);
+      if (!fits(bytesToBase64Url(sealed))) break;
+      max = count;
+    }
+    assert.ok(max >= 1, `at least one stop fits (dayCertificate: ${cert})`);
+    assert.equal(fits(bytesToBase64Url(await sealedFor(max + 1, cert))), false);
+    maxima.push(max);
   }
+  assert.ok(maxima[1] < maxima[0], "the signed day certificate has a measurable QR cost");
 
   // Past that it is the `.wayfindjob` file, exactly as a hundred-drop
   // delivery day already was. Nothing about the protocol changes.

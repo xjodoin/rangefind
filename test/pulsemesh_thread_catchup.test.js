@@ -16,9 +16,11 @@ import { createThreadPublisher, THREAD_CONSTANTS } from "../src/pulsemesh/thread
 import { createThreadSubscriber } from "../src/pulsemesh/thread_consume.js";
 import {
   THREAD_MODE,
+  decodeThreadRecord,
   decodeThreadLink,
   decodeThreadRequest,
-  encodeThreadLink
+  encodeThreadLink,
+  encodeThreadRecord
 } from "../src/pulsemesh/thread_codec.js";
 import {
   generateThreadKeypair,
@@ -49,7 +51,7 @@ async function newRun(clock) {
     clock
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey,
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
     epochPrefix8: EPOCH_PREFIX8,
     notAfter: Math.floor(clock() / 1000) + 7200
   }));
@@ -141,7 +143,10 @@ test("T3: a responder cannot be probed for which threads it follows", async () =
   const strangerTag = new Uint8Array(8).fill(0xab);
   const request = decodeThreadRequest(buildThreadRequest({
     epochPrefix8: EPOCH_PREFIX8,
-    wanted: [{ tag: strangerTag, sinceSeq: 0 }, { tag: held, sinceSeq: 999 }],
+    wanted: [
+      { tag: strangerTag, sinceGeneration: 0, sinceSeq: 0 },
+      { tag: held, sinceGeneration: 1, sinceSeq: 999 }
+    ],
     rng: lcg(3)
   }).bytes);
   const answered = cache.answer(request, { nowMillis: now });
@@ -153,6 +158,37 @@ test("T3: a responder cannot be probed for which threads it follows", async () =
   assert.deepEqual(forStranger.records, [], "unknown tag: empty");
   assert.deepEqual(forHeld.records, [], "held tag with nothing newer: also empty");
   assert.equal(answered.entries.length, 4, "and every tag in the padded batch is answered");
+});
+
+test("T3: catch-up cursors cannot skip a rotated generation whose sequence restarted", () => {
+  const now = Math.floor(Date.now() / 1000) * 1000;
+  const cache = createThreadCache({ clock: () => now });
+  const tag = new Uint8Array(8).fill(0x41);
+  const makeRecord = (generation, seq) => encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8,
+    tag,
+    generation,
+    seq,
+    previousHash: new Uint8Array(16),
+    ciphertext: new Uint8Array(28),
+    admissionTag: new Uint8Array(16)
+  });
+
+  assert.ok(cache.admit(makeRecord(1, 50).bytes, { nowMillis: now }).admitted);
+  assert.ok(cache.admit(makeRecord(2, 1).bytes, { nowMillis: now }).admitted,
+    "generation and sequence together form the cache identity");
+
+  const answered = cache.answer({
+    entries: [{ tag, sinceGeneration: 1, sinceSeq: 50 }]
+  }, { nowMillis: now });
+  assert.deepEqual(
+    answered.entries[0].records.map(bytes => {
+      const record = decodeThreadRecord(bytes);
+      return [record.generation, record.seq];
+    }),
+    [[2, 1]],
+    "a newer generation compares after the complete older cursor even when its sequence is lower"
+  );
 });
 
 test("T3: relay caching is bounded, and its own threads are never evicted", async () => {
@@ -176,8 +212,11 @@ test("T3: relay caching is bounded, and its own threads are never evicted", asyn
     const junk = encodeThreadRecord({
       epochPrefix8: EPOCH_PREFIX8,
       tag: Uint8Array.from({ length: 8 }, () => i + 1),
+      generation: 1,
       seq: 1,
-      ciphertext: new Uint8Array(48)
+      previousHash: new Uint8Array(16),
+      ciphertext: new Uint8Array(48),
+      admissionTag: new Uint8Array(16)
     });
     const verdict = cache.admit(junk.bytes, { fromPeer: "flooder", nowMillis: now });
     if (!verdict.admitted && verdict.reason === "tag-budget") rejectedForBudget++;
@@ -188,8 +227,12 @@ test("T3: relay caching is bounded, and its own threads are never evicted", asyn
 
   // Per-tag admission rate.
   const same = Uint8Array.from({ length: 8 }, () => 0x55);
-  const first = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag: same, seq: 1, ciphertext: new Uint8Array(48) });
-  const second = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag: same, seq: 2, ciphertext: new Uint8Array(48) });
+  const junkRecord = seq => encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8, tag: same, generation: 1, seq,
+    previousHash: new Uint8Array(16), ciphertext: new Uint8Array(48), admissionTag: new Uint8Array(16)
+  });
+  const first = junkRecord(1);
+  const second = junkRecord(2);
   cache.admit(first.bytes, { fromPeer: "peer-b", nowMillis: now });
   const tooSoon = cache.admit(second.bytes, { fromPeer: "peer-b", nowMillis: now + 100 });
   assert.equal(tooSoon.reason, "rate", "per-tag admission is rate limited");

@@ -1,17 +1,8 @@
-// PulseMesh thread cryptography (threads §4, §5.1): everything derives
-// from one Ed25519 public key `P`, which is the entire capability.
-//
-//   private key -> write. Only the publisher can sign, so no link holder
-//                  can move the bus — and every subscriber holds the link.
-//   public key  -> read + find + verify. Confidentiality is AES-256-GCM
-//                  under a key derived from P; authenticity is the
-//                  signature verified with P.
-//
-// This treats a public key as a secret, which is unusual and load-bearing:
-// `P` is distributed, never published. It must not be logged, registered,
-// reused across runs, used as a peer identity, or put on the wire — the
-// topic tag is an HMAC under HKDF(P), the body is sealed, and the
-// signature lives inside the sealed body rather than the envelope.
+// PulseMesh thread cryptography (threads §4, §5.1): symmetric capability
+// material and signing identity are separate. A link holder receives a
+// random-looking thread secret for discovery/decryption/admission and a
+// root public key for verification. Publishing either value never
+// silently publishes the other.
 //
 // WebCrypto throughout, so one implementation covers Node, browsers, and
 // any mobile host with a compliant `crypto.subtle`. AES-GCM, HKDF and
@@ -32,7 +23,11 @@ import { x25519, x25519Base } from "./x25519.js";
 export const THREAD_TOPIC_PREFIX = "/rangefind/pulsemesh/1/t";
 const TAG_INFO = "pulsemesh/thread/topic/1";
 const CONTENT_INFO = "pulsemesh/thread/content/1";
+const ADMISSION_INFO = "pulsemesh/thread/admission/1";
+const CAPABILITY_INFO = "pulsemesh/thread/capability/1";
 const TAG_DOMAIN = "pulsemesh/thread/1";
+const ADMISSION_DOMAIN = "pulsemesh/thread/admission/1";
+const SIGNED_RECORD_DOMAIN = "pulsemesh/thread/record-signature/1";
 const PHOTO_INFO = "pulsemesh/photo/1";
 
 let injected = null;
@@ -101,13 +96,25 @@ async function hkdf(publicKey, info, lengthBytes) {
  * on the 32 bytes it got in a link and can then find, open, and verify
  * the thread — and do nothing else.
  */
-export async function deriveThreadKeys(publicKey) {
-  if (publicKey.length !== 32) throw new Error("A thread capability is a 32-byte Ed25519 public key.");
-  const [topicKey, contentKey] = await Promise.all([
-    hkdf(publicKey, TAG_INFO, 32),
-    hkdf(publicKey, CONTENT_INFO, 32)
+export async function deriveThreadKeys(threadSecret) {
+  if (threadSecret?.length !== 32) throw new Error("A thread capability secret is a 32-byte value.");
+  const [topicKey, contentKey, admissionKey] = await Promise.all([
+    hkdf(threadSecret, TAG_INFO, 32),
+    hkdf(threadSecret, CONTENT_INFO, 32),
+    hkdf(threadSecret, ADMISSION_INFO, 32)
   ]);
-  return { publicKey, topicKey, contentKey };
+  return { threadSecret, topicKey, contentKey, admissionKey };
+}
+
+/**
+ * Derives capability material from a root seed without reusing its
+ * Ed25519 public key as a symmetric secret. The link carries this value
+ * beside the root verification key; neither can substitute for the
+ * other after compromise or accidental publication.
+ */
+export async function deriveThreadSecret(rootSeed) {
+  if (rootSeed?.length !== 32) throw new Error("A thread root seed is 32 bytes.");
+  return hkdfBytes(rootSeed, utf8Bytes(CAPABILITY_INFO), 32);
 }
 
 // --- §4.2 finding the thread ----------------------------------------------
@@ -126,6 +133,36 @@ export async function threadTag(keys, epoch32, window) {
   const message = new Uint8Array([...utf8Bytes(TAG_DOMAIN), ...epoch32, ...uint64be(window)]);
   const mac = bytes(await subtle().sign("HMAC", key, message));
   return mac.subarray(0, 8);
+}
+
+/** Cheap capability check over a sealed record, before AEAD/signatures. */
+export async function threadAdmissionTag(keys, aad, ciphertext, length = 16) {
+  const key = await subtle().importKey("raw", keys.admissionKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const message = new Uint8Array(utf8Bytes(ADMISSION_DOMAIN).length + aad.length + ciphertext.length);
+  let offset = 0;
+  const domain = utf8Bytes(ADMISSION_DOMAIN);
+  message.set(domain, offset); offset += domain.length;
+  message.set(aad, offset); offset += aad.length;
+  message.set(ciphertext, offset);
+  return bytes(await subtle().sign("HMAC", key, message)).subarray(0, length);
+}
+
+/** Constant-time comparison for short authentication fields. */
+export function equalThreadAuth(left, right) {
+  if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array) || left.length !== right.length) return false;
+  let difference = 0;
+  for (let i = 0; i < left.length; i++) difference |= left[i] ^ right[i];
+  return difference === 0;
+}
+
+/**
+ * Binds the inner signed state to generation, sequence, predecessor,
+ * epoch and rotating topic. A link holder can re-encrypt a body but can
+ * no longer transplant a valid signature into a new envelope.
+ */
+export function threadRecordSigningMessage(aad, bodyPreimage) {
+  const domain = utf8Bytes(SIGNED_RECORD_DOMAIN);
+  return new Uint8Array([...domain, ...sha256(aad), ...bodyPreimage]);
 }
 
 export function threadTopic(epochPrefix16hex, tag) {
@@ -177,12 +214,6 @@ export async function sealThreadBody(keys, _seq, aad, plaintext, { nonce = null 
 /** Returns null on any AEAD failure — a wrong key, a tampered record. */
 export async function openThreadBody(keys, _seq, aad, ciphertext) {
   try {
-    const encodedSeq = [];
-    pushVarint(encodedSeq, _seq);
-    if (
-      aad.length !== 20 + encodedSeq.length
-      || encodedSeq.some((value, index) => aad[20 + index] !== value)
-    ) return null;
     if (ciphertext.length < THREAD_NONCE_BYTES + 16) return null;
     const iv = ciphertext.subarray(0, THREAD_NONCE_BYTES);
     const sealed = ciphertext.subarray(THREAD_NONCE_BYTES);
@@ -214,7 +245,8 @@ export const PHOTO_SEAL_OVERHEAD = 12 + 16;
  * The per-stop photo key, and the whole privacy model in one derivation.
  *
  * It comes from the run's **private seed**, not from the capability `P`.
- * A customer holds the 45-byte link (§5.4), which is `P` plus an epoch
+ * A customer holds the 78-byte link (§5.4), which carries a distinct
+ * thread secret and verification key plus an epoch
  * and an expiry — no seed — so a customer structurally cannot derive
  * this, whatever they do with the bytes they can see. The two parties
  * that can are the driver, who was handed the seed in the ticket, and
@@ -450,8 +482,11 @@ function nativeEd25519Available() {
 /** Generates a run's keypair. Fresh per run, from a CSPRNG (§4.1). */
 export async function generateThreadKeypair(seed = null) {
   const privateSeed = seed || globalThis.crypto.getRandomValues(new Uint8Array(32));
-  const publicKey = await publicKeyFromSeed(privateSeed);
-  return { privateSeed, publicKey };
+  const [publicKey, threadSecret] = await Promise.all([
+    publicKeyFromSeed(privateSeed),
+    deriveThreadSecret(privateSeed)
+  ]);
+  return { privateSeed, publicKey, threadSecret };
 }
 
 export async function publicKeyFromSeed(privateSeed) {

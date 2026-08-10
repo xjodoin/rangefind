@@ -14,7 +14,7 @@
 // So a ticket carries the run's Ed25519 private seed, deliberately,
 // under the issuer's signature. What that buys:
 //
-//   - **Links before drivers.** `ticketFollowLink` derives the 45-byte
+//   - **Links before drivers.** `ticketFollowLink` derives the follow
 //     link from the ticket alone, so the customer's link is printed on
 //     the order confirmation while the job is still unassigned.
 //   - **The dispatcher keeps cancel and reassign.** It holds the seed,
@@ -46,18 +46,19 @@
 // how many stops, how far, what travel mode, roughly where, and nothing
 // that names a door.
 //
-// The asymmetry is deliberate and runs the other way from §20.9. A
-// ticket goes to *one* device and is therefore always sealed; an offer
-// goes to strangers and is therefore never sealed. An offer is safe to
-// post in a group chat because there is nothing in it worth stealing,
-// not because it is encrypted.
+// The asymmetry is deliberate and runs the other way from §20.9. An
+// awarded ticket goes to exactly one device and is always sealed. PMJ1
+// itself is safe to post publicly because there is nothing in it worth
+// stealing; PMA1 can additionally seal it to a named candidate pool when
+// even the coarse commercial terms should remain private.
 //
 // `jobId` is the join key both artifacts share, and `awardMatchesOffer`
 // is what makes the commitment worth having: when the awarded ticket
 // finally arrives, the courier's device checks that the plan it was
 // handed is the plan that was advertised, so a dispatcher cannot offer
-// "3 stops downtown" and award thirty across the country. Claims,
-// bidding and payment are **not** in protocol v1 (§20).
+// "3 stops downtown" and award thirty across the country. Private
+// candidate assignment and authenticated claims are PMA1/PMQ1 in
+// thread_assignment.js; payment remains outside this protocol.
 
 import { pushVarint, readVarint } from "../binary.js";
 import { sha256, toHex } from "./sha256.js";
@@ -76,10 +77,11 @@ import {
   normalizeBootstrapAddresses,
   threadLinkUrl
 } from "./thread_codec.js";
-import { deriveDaySeed, routeFollowLink, verifyDayCertificate } from "./thread_route.js";
+import { routeFollowLink, verifyDayCertificate } from "./thread_route.js";
 import {
   base64UrlToBytes,
   bytesToBase64Url,
+  deriveThreadSecret,
   generateThreadKeypair,
   publicKeyFromSeed,
   signThread,
@@ -101,7 +103,7 @@ import { SEED_MAGIC, decodeSeedCard } from "./thread_seed.js";
 // ("expected PMJ1, found…"). `J` is unused, unambiguous, and reads as
 // the job the offer advertises — the same job `jobId` names.
 export const TICKET_MAGIC = Object.freeze({ PMP1: "PMP1", PMK1: "PMK1", PMJ1: "PMJ1" });
-export const TICKET_VERSION = 1;
+export const TICKET_VERSION = 2;
 export const PLAN_VERSION = 1;
 export const JOB_OFFER_VERSION = 1;
 /** flags bit0: the run seed is present (a ticket) rather than absent (an offer). */
@@ -143,6 +145,7 @@ export const TICKET_ERROR = Object.freeze({
   GRAPH_EPOCH: "ticket-graph-epoch",
   DAY_SEED_MISMATCH: "ticket-day-seed-mismatch",
   DAY_FOREIGN_ROOT: "ticket-day-foreign-root",
+  DAY_PLAN_MISMATCH: "ticket-day-plan-mismatch",
   DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry",
   DAY_OUTLIVES_TICKET: "cert-outlives-link"
 });
@@ -441,7 +444,7 @@ export function planRefOf(planBytes) {
 
 function ticketPreimage({
   flags, mode, epochPrefix8, notAfter, issuerPublicKey, planBytes, privateSeed,
-  bootstrap = [], dayCertificateBytes = null
+  threadSecret = null, bootstrap = [], dayCertificateBytes = null
 }) {
   const out = [];
   pushMagic(out, TICKET_MAGIC.PMK1);
@@ -453,7 +456,11 @@ function ticketPreimage({
   pushBytes(out, issuerPublicKey);
   pushVarint(out, planBytes.length);
   pushBytes(out, planBytes);
-  if (privateSeed) pushBytes(out, privateSeed);
+  if (privateSeed) {
+    pushBytes(out, privateSeed);
+    if (threadSecret?.length !== 32) throw new Error("A publishing ticket needs its 32-byte thread secret.");
+    pushBytes(out, threadSecret);
+  }
   // Ascending flag-bit order, as the stop metadata block is (§20.8), so
   // a ticket has exactly one encoding.
   if (bootstrap.length) {
@@ -513,32 +520,22 @@ function normalizeEpochPrefix8(epochPrefix8, epoch32) {
 }
 
 /**
- * The day seed a route-day ticket must carry, checked against the one
- * §21.2 says it is — and re-derived when the depot did not pass one.
- *
- * This is the mint-time half of the `planRef` reconciliation. §21.2
- * derives a day seed from `(rootSeed, planRef, serviceDay)`, but the
- * certificate carries no `planRef`, so **nothing downstream can check
- * that the plan in the ticket is the plan the day key was scoped to** —
- * a driver's device holds neither the root nor an inverse of HKDF. The
- * one party that *can* check is the issuer, and by the issuer-equals-root
- * rule the issuer always holds the root seed. So the check happens here,
- * once, where it is possible: the dispatched plan's `planRef` must be the
- * `planRef` the day seed was derived under, or the depot minted a
- * certificate for one round and dispatched another.
+ * The random day seed a route-day ticket carries. The certificate binds
+ * its public key and exact `planRef`, so both scope and possession are
+ * checked before the ticket can leave the depot.
  *
  * The consequence is worth stating: a route-day ticket must carry the
  * **term's plan byte for byte**. A depot that wants to hand one driver a
  * subset of the stops has changed `planRef`, which is a different day key
  * and needs its own certificate.
  */
-async function dayTicketSeed({ cert, issuerSeed, issuerPublicKey, planBytes, privateSeed }) {
+async function dayTicketSeed({ cert, issuerPublicKey, privateSeed, planRef }) {
   if (cert.version !== DAY_CERT_VERSION) {
     throw new Error(`Unsupported PMTC day certificate version ${cert.version}.`);
   }
   // Only the route's owner grants a day of it. This is not a tightening
-  // for its own sake: minting the certificate and deriving the day seed
-  // both need the root seed, so any party able to issue this ticket
+  // for its own sake: minting the certificate needs the root seed, so
+  // any party able to issue this ticket
   // already holds the root — signing as anyone else would only let a
   // holder of one day's authority re-dispatch it under a name of its own
   // choosing, which is exactly the accountability the ticket signature
@@ -548,24 +545,18 @@ async function dayTicketSeed({ cert, issuerSeed, issuerPublicKey, planBytes, pri
       "A route-day ticket is issued by the route root itself: this certificate names a different root."
     );
   }
-  const expected = await deriveDaySeed({
-    rootSeed: issuerSeed, planRef: planRefOf(planBytes), serviceDay: cert.serviceDay
-  });
-  const seed = privateSeed || expected;
-  if (!sameBytes(seed, expected)) {
-    throw new Error(
-      "This day seed is not the one this plan and service day derive (§21.2): the certificate was "
-      + "minted for a different planRef."
-    );
+  if (!sameBytes(cert.planRef, planRef)) {
+    throw new Error("This route-day certificate is scoped to a different planRef.");
   }
-  // The authoritative form of the same check, and the one that catches a
-  // depot that minted for another `planRef` without passing a seed at
-  // all: the seed this ticket will carry has to be the key the
+  if (!privateSeed) {
+    throw new Error("A route-day ticket needs the random authority seed returned when its certificate was minted.");
+  }
+  const seed = privateSeed;
+  // The seed this ticket will carry has to be the key the
   // certificate vouches for, or the driver holds a day they cannot sign.
   if (!sameBytes(await publicKeyFromSeed(seed), cert.dayPublicKey)) {
     throw new Error(
-      "This certificate does not vouch for the day seed this plan and service day derive (§21.2): "
-      + "it was minted for a different planRef."
+      "This certificate does not vouch for the supplied random day authority seed."
     );
   }
   return seed;
@@ -606,7 +597,7 @@ async function dayTicketSeed({ cert, issuerSeed, issuerPublicKey, planBytes, pri
  * in the first place — and `privateSeed` is the *day* seed, re-derived
  * here when the caller does not pass one. Everything a driver needs
  * travels in the one sealed artifact, and `link` comes back as the
- * **term's** v2 link over the root, never a link over the day key.
+ * **term's** delegated link over the root, never a link over the day key.
  */
 export async function issueTicket({
   issuerSeed,
@@ -641,8 +632,11 @@ export async function issueTicket({
     ? (dayCertificate instanceof Uint8Array ? decodeDayCertificate(dayCertificate) : dayCertificate)
     : null;
   const runSeed = cert
-    ? await dayTicketSeed({ cert, issuerSeed, issuerPublicKey, planBytes: encodedPlan, privateSeed })
+    ? await dayTicketSeed({ cert, issuerPublicKey, privateSeed, planRef: planRefOf(encodedPlan) })
     : (seedless ? null : (privateSeed || (await generateThreadKeypair()).privateSeed));
+  const threadSecret = runSeed
+    ? await deriveThreadSecret(cert ? issuerSeed : runSeed)
+    : null;
   const addresses = normalizeBootstrapAddresses(bootstrap, { what: "ticket bootstrap address" });
   const preimage = ticketPreimage({
     flags: (seedless ? 0 : TICKET_FLAG_SEED)
@@ -654,6 +648,7 @@ export async function issueTicket({
     issuerPublicKey,
     planBytes: encodedPlan,
     privateSeed: runSeed,
+    threadSecret,
     bootstrap: addresses,
     dayCertificateBytes: cert?.bytes || null
   });
@@ -689,7 +684,7 @@ export async function issueTicket({
  * keys (§20.7) and it can cancel the run. There is no field carrying
  * encodable plaintext bytes, so a host cannot reach one by accident.
  *
- * `link` and `url` are the customer's 45-byte follow link, which is
+ * `link` and `url` are the customer's 78-byte follow link, which is
  * *not* secret in the same way and is not sealed: it is a read
  * capability the customer is meant to have, and §5.4 already bounds what
  * it discloses.
@@ -749,6 +744,7 @@ export function decodeThreadTicket(bytesOrBase64url) {
   const planBytes = readBytes(bytes, state, planLen);
   const seedPresent = (flags & TICKET_FLAG_SEED) !== 0;
   const privateSeed = seedPresent ? readBytes(bytes, state, 32) : null;
+  const threadSecret = seedPresent ? readBytes(bytes, state, 32) : null;
   const bootstrap = [];
   if (flags & TICKET_FLAG_BOOTSTRAP) {
     const count = readVarint(bytes, state);
@@ -814,6 +810,7 @@ export function decodeThreadTicket(bytesOrBase64url) {
     planBytes,
     plan: decodeThreadPlan(planBytes),
     privateSeed,
+    threadSecret,
     // §20.10. Empty when the issuer named none — a device with its own
     // remembered peers needs nothing here, and most do after day one.
     bootstrap,
@@ -881,6 +878,13 @@ export async function verifyThreadTicket(ticket, {
     const verdict = await verifyRouteDayTicket(decoded, nowMillis);
     if (!verdict.ok) return verdict;
   }
+  if (
+    decoded.privateSeed
+    && !decoded.dayCertificate
+    && !sameBytes(await deriveThreadSecret(decoded.privateSeed), decoded.threadSecret)
+  ) {
+    return { ok: false, reason: "the ticket's thread secret does not belong to its publishing seed" };
+  }
   return { ok: true };
 }
 
@@ -894,6 +898,13 @@ async function verifyRouteDayTicket(decoded, nowMillis) {
       ok: false,
       code: TICKET_ERROR.DAY_FOREIGN_ROOT,
       reason: "the day certificate names a different route root than the ticket's issuer"
+    };
+  }
+  if (!sameBytes(cert.planRef, decoded.plan.planRef)) {
+    return {
+      ok: false,
+      code: TICKET_ERROR.DAY_PLAN_MISMATCH,
+      reason: "the day certificate is scoped to a different route plan"
     };
   }
   const certVerdict = await verifyDayCertificate(cert, {
@@ -937,7 +948,7 @@ async function verifyRouteDayTicket(decoded, nowMillis) {
 }
 
 /**
- * The 45-byte follow link this ticket's run publishes under.
+ * The 78-byte follow link this ticket's run publishes under.
  *
  * For an ordinary job that is the run key's own link, derivable the
  * moment the ticket exists and before any driver does — the property the
@@ -946,11 +957,12 @@ async function verifyRouteDayTicket(decoded, nowMillis) {
  * For a **route-day** ticket it is emphatically *not* the seed's link,
  * and that difference is the entire reason §21.11 exists. Sealing a bare
  * day seed into an ordinary PMK1 makes every downstream derivation —
- * topic tag, `K_content`, these 45 bytes — come off the **day** public
+ * topic tag and `K_content` — come off a separate thread secret rather
+ * than the **day** public
  * key, so the run publishes onto a topic no parent is subscribed to. It
  * looks perfectly healthy at the driver's end and every existing link
  * goes silent. So this reads the identity out of the certificate and
- * returns the route's own v2 link (§21.4): one branch, in the one place
+ * returns the route's delegated link (§21.4): one branch, in the one place
  * every caller already goes through, rather than a rule for each of them
  * to remember.
  */
@@ -961,14 +973,16 @@ export async function ticketFollowLink(ticket) {
   }
   if (decoded.dayCertificate) {
     return routeFollowLink({
+      threadSecret: decoded.threadSecret,
       rootPublicKey: decoded.dayCertificate.rootPublicKey,
       epochPrefix8: decoded.epochPrefix8,
       notAfter: decoded.notAfter
     });
   }
-  const publicKey = await publicKeyFromSeed(decoded.privateSeed);
+  const rootPublicKey = await publicKeyFromSeed(decoded.privateSeed);
   return encodeThreadLink({
-    publicKey,
+    threadSecret: decoded.threadSecret,
+    rootPublicKey,
     epochPrefix8: decoded.epochPrefix8,
     notAfter: decoded.notAfter
   });
@@ -976,9 +990,8 @@ export async function ticketFollowLink(ticket) {
 
 /**
  * 16 bytes identifying the job rather than the artifact. It hashes
- * neither the seed nor the signature, so an offer and the ticket that
- * fulfils it share one id — which is what a future claim or award record
- * would join on (§20, not in protocol v1).
+ * neither the seed nor the signature, so an offer, assignment, claim and
+ * the ticket that fulfils it share one job identity.
  */
 export function jobIdOf(ticket) {
   const decoded = toTicket(ticket);
@@ -1494,7 +1507,7 @@ const UNREADABLE_SEED =
  * in each host: a ladder decides what something is by whether it decodes,
  * so a ticket minted before a wire change falls through the ticket arm
  * and is reported with the *link* decoder's complaint — a driver holding
- * a stale ticket is told "a thread link is 45 bytes", which is true of
+ * a stale ticket is told "a thread link is 78 bytes", which is true of
  * nothing they are holding. Identity comes from the magic, which is
  * exactly what a magic is for; readability is a separate answer carried
  * beside it.
@@ -1593,7 +1606,7 @@ export function classifyThreadArtifact(fragmentOrBytes) {
       return { ...nothing, kind: "seed", reason: UNREADABLE_SEED };
     }
   }
-  // A link has no magic — it is 45 bytes opening with a version byte, and
+  // A link has no magic — it is 78 bytes opening with a version byte, and
   // that fixed width is its identity (§5.4).
   if (bytes.length === LINK_BYTES) {
     try {

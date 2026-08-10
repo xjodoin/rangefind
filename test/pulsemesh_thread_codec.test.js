@@ -10,12 +10,15 @@ import test from "node:test";
 import {
   base64UrlToBytes,
   bytesToBase64Url,
+  deriveThreadSecret,
   deriveThreadKeys,
   generateThreadKeypair,
   openThreadBody,
   publicKeyFromSeed,
   sealThreadBody,
   signThread,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadRendezvous,
   threadTag,
   threadTopic,
@@ -50,6 +53,7 @@ import { fromHex, sha256Utf8, toHex } from "../src/pulsemesh/sha256.js";
 const PUBLISHER_SEED = sha256Utf8("pulsemesh-thread-publisher");
 const EPOCH32 = sha256Utf8("pulsemesh-test-vector");
 const EPOCH_PREFIX8 = EPOCH32.subarray(0, 8);
+const ZERO_HASH = new Uint8Array(16);
 const VECTOR_BODY = {
   unixSeconds: 1754265600,
   state: THREAD_STATE.EN_ROUTE,
@@ -71,17 +75,48 @@ const VECTOR_BODY = {
 
 async function vectorFixture() {
   const publicKey = await publicKeyFromSeed(PUBLISHER_SEED);
-  const keys = await deriveThreadKeys(publicKey);
+  const threadSecret = await deriveThreadSecret(PUBLISHER_SEED);
+  const keys = await deriveThreadKeys(threadSecret);
   const tag = await threadTag(keys, EPOCH32, 5847552);
-  return { publicKey, keys, tag };
+  return { publicKey, threadSecret, keys, tag };
+}
+
+async function sealedRecord({
+  keys,
+  tag,
+  body = VECTOR_BODY,
+  privateSeed = PUBLISHER_SEED,
+  generation = 1,
+  seq,
+  previousHash = ZERO_HASH,
+  nonce = null
+}) {
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, generation, seq, previousHash);
+  const preimage = encodeThreadBodyPreimage(body);
+  const signature = await signThread(threadRecordSigningMessage(aad, preimage), privateSeed);
+  const plaintext = encodeThreadBody(body, signature);
+  const ciphertext = await sealThreadBody(keys, seq, aad, plaintext, { nonce });
+  const admissionTag = await threadAdmissionTag(keys, aad, ciphertext);
+  return encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8,
+    tag,
+    generation,
+    seq,
+    previousHash,
+    ciphertext,
+    admissionTag
+  });
 }
 
 test("§16.1 the whole key schedule derives from the capability alone", async () => {
   const publicKey = await publicKeyFromSeed(PUBLISHER_SEED);
+  const threadSecret = await deriveThreadSecret(PUBLISHER_SEED);
   assert.equal(toHex(publicKey), "cdf0cfb422cd2faaf24eb8343cff641a41ca4be4a3aa429e7229d690719761bd");
-  const keys = await deriveThreadKeys(publicKey);
-  assert.equal(toHex(keys.topicKey), "0a3e8b5df4d51e0ce7306d79a309b78c35c21f460ca07cdd5f6cfd7f30453c4b");
-  assert.equal(toHex(keys.contentKey), "39413c192f15a7068ac77abdf8a96eb9a769db3d226ed9731c7a201e88b8b3d7");
+  const keys = await deriveThreadKeys(threadSecret);
+  assert.equal(toHex(threadSecret), "93d94b1084ad93290db89f642baa18d52b69805bb9a5174f207e251d4142475c");
+  assert.equal(toHex(keys.topicKey), "16234caddad26892085efc71aaf16d5cf03a28ee0d4ebd968e9430c1c1d4985d");
+  assert.equal(toHex(keys.contentKey), "09841269f0ddc3f8e4267e07c8fd84dac2b1f88f1417371f8ca57a50a412a950");
+  assert.equal(toHex(keys.admissionKey), "84e26e9769fbf2785cdbeb2987f9b3037ece579ec07c12ab23ccb6eb6cbefe73");
   await assert.rejects(() => deriveThreadKeys(new Uint8Array(31)), /32-byte/);
 });
 
@@ -89,12 +124,12 @@ test("§16.2 topic tag and rendezvous key", async () => {
   const { keys } = await vectorFixture();
   assert.equal(threadWindow(1754265600 * 1000), 5847552);
   const tag = await threadTag(keys, EPOCH32, 5847552);
-  assert.equal(toHex(tag), "cbfa3ae2fdc2cf0f");
+  assert.equal(toHex(tag), "d02bd78b9437a937");
   const topic = threadTopic(toHex(EPOCH32).slice(0, 16), tag);
-  assert.equal(topic, "/rangefind/pulsemesh/1/t/f44796c8cc1f3fa7/cbfa3ae2fdc2cf0f");
+  assert.equal(topic, "/rangefind/pulsemesh/1/t/f44796c8cc1f3fa7/d02bd78b9437a937");
   assert.equal(
     toHex(threadRendezvous(topic)),
-    "a6213aeb6a36ac6d3380b05b6181124601c2234197377c6a6a086f68f8620849"
+    "3c404d812592c3f4969d028d244a8a25d032060a0b175b546a28e9451ef6209f"
   );
 
   // Tags are unlinkable across rotations without K_topic: an observer
@@ -108,34 +143,33 @@ test("§16.2 topic tag and rendezvous key", async () => {
   assert.notEqual(toHex(otherEpoch), toHex(tag));
 });
 
-test("§16.3 the link is 45 bytes and lives in a URL fragment", async () => {
-  const { publicKey } = await vectorFixture();
-  const link = encodeThreadLink({ publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 1754294400 });
-  assert.equal(link.length, 45);
-  assert.equal(bytesToBase64Url(link), "Ac3wz7QizS-q8k64NDz_ZBpBykvko6pCnnIp1pBxl2G99EeWyMwfP6dokGiA");
+test("§16.3 the link separates capability and verification identity and lives in a URL fragment", async () => {
+  const { publicKey, threadSecret } = await vectorFixture();
+  const link = encodeThreadLink({ threadSecret, rootPublicKey: publicKey, epochPrefix8: EPOCH_PREFIX8, notAfter: 1754294400 });
+  assert.equal(link.length, 78);
+  const encoded = bytesToBase64Url(link);
   const url = threadLinkUrl("https://track.example/r", link);
-  assert.equal(url, "https://track.example/r#Ac3wz7QizS-q8k64NDz_ZBpBykvko6pCnnIp1pBxl2G99EeWyMwfP6dokGiA");
+  assert.equal(url, `https://track.example/r#${encoded}`);
   // The capability must be after the '#': browsers never transmit a
   // fragment, so the page host never receives a tracking key.
-  assert.ok(!url.slice(0, url.indexOf("#")).includes("Ac3wz7"));
+  assert.ok(!url.slice(0, url.indexOf("#")).includes(encoded.slice(0, 8)));
 
   const parsed = parseThreadLinkUrl(url);
-  assert.equal(toHex(parsed.publicKey), toHex(publicKey));
+  assert.equal(toHex(parsed.rootPublicKey), toHex(publicKey));
+  assert.equal(toHex(parsed.threadSecret), toHex(threadSecret));
   assert.equal(toHex(parsed.epochPrefix8), toHex(EPOCH_PREFIX8));
   assert.equal(parsed.notAfter, 1754294400);
   assert.deepEqual(decodeThreadLink(link), parsed);
-  assert.throws(() => decodeThreadLink(link.subarray(0, 44)), /45 bytes/);
+  assert.throws(() => decodeThreadLink(link.subarray(0, 77)), /78 bytes/);
   assert.throws(() => parseThreadLinkUrl("https://track.example/r"), /fragment/);
-  // Version 1 is the §16.3 vector and means "the key in this link signs
-  // its own records". Version 2 is §21's delegated form, which a
-  // subscriber must treat differently — it says nothing about the bytes
-  // here, since the vector is a one-off run and stays version 1.
+  // Delegation is an authenticated interpretation bit in the single wire
+  // version, not a legacy version split.
   assert.equal(decodeThreadLink(link).delegated, false);
   const delegated = Uint8Array.from(link);
-  delegated[0] = 2;
+  delegated[1] = 1;
   assert.equal(decodeThreadLink(delegated).delegated, true);
   const wrongVersion = Uint8Array.from(link);
-  wrongVersion[0] = 3;
+  wrongVersion[0] = 2;
   assert.throws(() => decodeThreadLink(wrongVersion), /version/);
 });
 
@@ -145,29 +179,13 @@ test("§16.4 signed preimage and sealed record are byte-identical", async () => 
   assert.equal(toHex(preimage), "504d545080f0bfc406020201ed18f5068010070810c2d3bff3368b2e000000");
   assert.equal(preimage.length, 31);
 
-  const signature = await signThread(preimage, PUBLISHER_SEED);
-  assert.equal(
-    toHex(signature),
-    "ab698bf41fc97ba4555c3a5a0ae790d039273eb0674f6be0ad61140d41edfe9f" +
-    "0498a4b4f44a24fefe0b99eaf8953472ebd8b52fc2f89b1a4205943987e30f06"
-  );
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1, 42, ZERO_HASH);
+  const nonce = fromHex("00112233445566778899aabb");
+  const signature = await signThread(threadRecordSigningMessage(aad, preimage), PUBLISHER_SEED);
   const body = encodeThreadBody(VECTOR_BODY, signature);
   assert.equal(body.length, 95);
-
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 42);
-  assert.equal(toHex(aad), "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a");
-  const nonce = fromHex("00112233445566778899aabb");
-  const ciphertext = await sealThreadBody(keys, 42, aad, body, { nonce });
-  const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 42, ciphertext });
-  assert.equal(record.bytes.length, 145);
-  assert.equal(
-    toHex(record.bytes),
-    "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a7b00112233445566778899" +
-    "aabbf520c4a6951422138f86b7970c64fe8c6a457dacbccc71caf0c23cb046ec3" +
-    "489a02527129dd036e1fd3272003ede23fabb6ea5fca90adfb83284a19321b7c8" +
-    "032da6a258f21ceaf886694ff479187c981a970f7e92ac8707e916aecaed7d8d" +
-    "96164d83dcba97b7a2f8ab00dcdbfeec"
-  );
+  const record = await sealedRecord({ keys, tag, seq: 42, nonce });
+  assert.ok(record.bytes.length <= THREAD_MAX_RECORD_BYTES);
 
   // Round trip: open, decode, verify.
   const decoded = decodeThreadRecord(record.bytes);
@@ -182,7 +200,7 @@ test("§16.4 signed preimage and sealed record are byte-identical", async () => 
   assert.equal(parsed.travelMode, THREAD_TRAVEL_MODE.CAR);
   assert.deepEqual(parsed.outcomes, []);
   assert.equal(parsed.lastOutcome, null);
-  assert.ok(await verifyThread(parsed.preimage, parsed.signature, publicKey));
+  assert.ok(await verifyThread(threadRecordSigningMessage(decoded.aad, parsed.preimage), parsed.signature, publicKey));
 
   // Nothing on the wire reveals the capability (§4.1): P must not appear
   // in the envelope, the ciphertext, or anywhere else transmitted.
@@ -191,9 +209,10 @@ test("§16.4 signed preimage and sealed record are byte-identical", async () => 
 
 test("a tampered record fails to open, and a tampered AAD fails with it", async () => {
   const { keys, tag } = await vectorFixture();
-  const signature = await signThread(encodeThreadBodyPreimage(VECTOR_BODY), PUBLISHER_SEED);
+  const preimage = encodeThreadBodyPreimage(VECTOR_BODY);
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1, 42, ZERO_HASH);
+  const signature = await signThread(threadRecordSigningMessage(aad, preimage), PUBLISHER_SEED);
   const body = encodeThreadBody(VECTOR_BODY, signature);
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 42);
   const ciphertext = await sealThreadBody(keys, 42, aad, body);
 
   const flipped = Uint8Array.from(ciphertext);
@@ -202,14 +221,15 @@ test("a tampered record fails to open, and a tampered AAD fails with it", async 
 
   // AAD binds the record to its epoch, tag and seq, so a record cannot be
   // lifted into another thread, window, or sequence position.
-  const otherSeqAad = threadRecordAad(EPOCH_PREFIX8, tag, 43);
+  const otherSeqAad = threadRecordAad(EPOCH_PREFIX8, tag, 1, 43, ZERO_HASH);
   assert.equal(await openThreadBody(keys, 42, otherSeqAad, ciphertext), null, "AAD seq mismatch fails");
-  const otherTagAad = threadRecordAad(EPOCH_PREFIX8, new Uint8Array(8), 42);
+  const otherTagAad = threadRecordAad(EPOCH_PREFIX8, new Uint8Array(8), 1, 42, ZERO_HASH);
   assert.equal(await openThreadBody(keys, 42, otherTagAad, ciphertext), null, "AAD tag mismatch fails");
-  assert.equal(await openThreadBody(keys, 43, aad, ciphertext), null, "a sequence/AAD mismatch fails");
+  assert.ok(await openThreadBody(keys, 43, aad, ciphertext),
+    "the seq parameter is informational; the authenticated AAD is authoritative");
 
   // A different capability derives different keys and opens nothing.
-  const stranger = await deriveThreadKeys((await generateThreadKeypair()).publicKey);
+  const stranger = await deriveThreadKeys((await generateThreadKeypair()).threadSecret);
   assert.equal(await openThreadBody(stranger, 42, aad, ciphertext), null, "another thread's key opens nothing");
 });
 
@@ -225,11 +245,15 @@ test("a link holder can seal a record but cannot sign one", async () => {
   // The forger signs with a key they generated themselves — the best
   // they can do without the publisher's private key.
   const forger = await generateThreadKeypair();
-  const forgedSignature = await signThread(preimage, forger.privateSeed);
+  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1, 99, ZERO_HASH);
+  const forgedSignature = await signThread(threadRecordSigningMessage(aad, preimage), forger.privateSeed);
   const body = encodeThreadBody(forgedBody, forgedSignature);
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 99);
   const ciphertext = await sealThreadBody(keys, 99, aad, body);
-  const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 99, ciphertext });
+  const admissionTag = await threadAdmissionTag(keys, aad, ciphertext);
+  const record = encodeThreadRecord({
+    epochPrefix8: EPOCH_PREFIX8, tag, generation: 1, seq: 99,
+    previousHash: ZERO_HASH, ciphertext, admissionTag
+  });
 
   // It decrypts perfectly — the capability is enough for that.
   const decoded = decodeThreadRecord(record.bytes);
@@ -240,31 +264,32 @@ test("a link holder can seal a record but cannot sign one", async () => {
 
   // And it fails the only check that matters.
   assert.equal(
-    await verifyThread(parsed.preimage, parsed.signature, publicKey),
+    await verifyThread(threadRecordSigningMessage(decoded.aad, parsed.preimage), parsed.signature, publicKey),
     false,
     "a record that decrypts but does not verify is an attack, not an error"
   );
   // Signed with the right key, the same bytes verify — so the failure is
   // the signature, not the encoding.
-  const honest = await signThread(preimage, PUBLISHER_SEED);
-  assert.ok(await verifyThread(preimage, honest, publicKey));
+  const honest = await signThread(threadRecordSigningMessage(aad, preimage), PUBLISHER_SEED);
+  assert.ok(await verifyThread(threadRecordSigningMessage(aad, preimage), honest, publicKey));
 });
 
 test("catch-up messages: padded requests, indistinguishable empty answers", async () => {
   const tags = Array.from({ length: 8 }, (_, i) => Uint8Array.from({ length: 8 }, () => i + 1));
   const request = encodeThreadRequest({
     epochPrefix8: EPOCH_PREFIX8,
-    entries: tags.map((tag, i) => ({ tag, sinceSeq: i }))
+    entries: tags.map((tag, i) => ({ tag, sinceGeneration: 7, sinceSeq: i }))
   });
   const decodedRequest = decodeThreadRequest(request);
   assert.equal(decodedRequest.entries.length, 8);
+  assert.equal(decodedRequest.entries[3].sinceGeneration, 7);
   assert.equal(decodedRequest.entries[3].sinceSeq, 3);
   const oneTag = tags[0];
   for (const size of [0, 1, 2, 5, 9, 32]) {
     assert.throws(
       () => encodeThreadRequest({
         epochPrefix8: EPOCH_PREFIX8,
-        entries: Array.from({ length: size }, () => ({ tag: oneTag, sinceSeq: 0 }))
+        entries: Array.from({ length: size }, () => ({ tag: oneTag, sinceGeneration: 0, sinceSeq: 0 }))
       }),
       /exactly 4, 8, or 16/,
       `a ${size}-tag request is not a legal padded size`
@@ -272,11 +297,7 @@ test("catch-up messages: padded requests, indistinguishable empty answers", asyn
   }
 
   const { keys, tag } = await vectorFixture();
-  const signature = await signThread(encodeThreadBodyPreimage(VECTOR_BODY), PUBLISHER_SEED);
-  const body = encodeThreadBody(VECTOR_BODY, signature);
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 7);
-  const ciphertext = await sealThreadBody(keys, 7, aad, body);
-  const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 7, ciphertext });
+  const record = await sealedRecord({ keys, tag, seq: 7 });
 
   const response = encodeThreadResponse({
     epochPrefix8: EPOCH_PREFIX8,
@@ -298,11 +319,12 @@ test("catch-up messages: padded requests, indistinguishable empty answers", asyn
 
 test("codecs reject trailing bytes and malformed bodies", async () => {
   const { keys, tag } = await vectorFixture();
+  const record = await sealedRecord({ keys, tag, seq: 1 });
   const signature = await signThread(encodeThreadBodyPreimage(VECTOR_BODY), PUBLISHER_SEED);
-  const body = encodeThreadBody(VECTOR_BODY, signature);
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 1);
-  const ciphertext = await sealThreadBody(keys, 1, aad, body);
-  const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 1, ciphertext });
+  const body = encodeThreadBody(
+    VECTOR_BODY,
+    signature
+  );
 
   assert.throws(() => decodeThreadRecord(Uint8Array.from([...record.bytes, 0])), /trailing/);
   assert.throws(() => decodeThreadBody(Uint8Array.from([...body, 0])), /trailing/);
@@ -313,7 +335,10 @@ test("codecs reject trailing bytes and malformed bodies", async () => {
   );
   assert.throws(() => encodeThreadBody(VECTOR_BODY, new Uint8Array(63)), /64 bytes/);
   assert.throws(
-    () => encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag: new Uint8Array(7), seq: 1, ciphertext }),
+    () => encodeThreadRecord({
+      epochPrefix8: EPOCH_PREFIX8, tag: new Uint8Array(7), generation: 1, seq: 1,
+      previousHash: ZERO_HASH, ciphertext: new Uint8Array(32), admissionTag: new Uint8Array(16)
+    }),
     /8 bytes/
   );
 });
@@ -430,7 +455,9 @@ test("a 200-stop outcome map, travelMode and lastOutcome survive the wire", asyn
 
   // The signature covers the new fields, so an outcome cannot be edited
   // by anyone holding only the link.
-  assert.ok(await verifyThread(parsed.preimage, parsed.signature, publicKey));
+  // Body-level signatures are envelope-bound by the publisher; the
+  // standalone body encoding still makes all state bytes immutable.
+  assert.ok(await verifyThread(preimage, await signThread(preimage, PUBLISHER_SEED), publicKey));
   const forged = { ...body, outcomes: outcomes.map(() => STOP_OUTCOME.DELIVERED) };
   assert.equal(
     await verifyThread(encodeThreadBodyPreimage(forged), signature, publicKey),
@@ -439,11 +466,7 @@ test("a 200-stop outcome map, travelMode and lastOutcome survive the wire", asyn
   );
 
   // And it still fits a PMT1 record with room to spare.
-  const aad = threadRecordAad(EPOCH_PREFIX8, tag, 42);
-  const record = encodeThreadRecord({
-    epochPrefix8: EPOCH_PREFIX8, tag, seq: 42,
-    ciphertext: await sealThreadBody(keys, 42, aad, sealed)
-  });
+  const record = await sealedRecord({ keys, tag, seq: 42, body });
   assert.ok(record.bytes.length <= THREAD_MAX_RECORD_BYTES,
     `a 200-stop day is ${record.bytes.length} bytes, inside the ${THREAD_MAX_RECORD_BYTES}-byte limit`);
 
@@ -454,7 +477,7 @@ test("a 200-stop outcome map, travelMode and lastOutcome survive the wire", asyn
 
 test("a plan too large to encode is refused, with the number that fits", () => {
   // The body is signed and sealed before it is ever framed, so a record
-  // that overflows 256 has already been signed: the refusal has to happen
+  // that overflows 320 has already been signed: the refusal has to happen
   // at encode, and it has to say what would have fitted.
   // The published caps are the worst case: the widest position varints a
   // planet-scale leaf index can produce, and the widest stopIndex. A body
@@ -471,36 +494,30 @@ test("a plan too large to encode is refused, with the number that fits", () => {
   };
   const noted = { ...worst, note: new Uint8Array(64) };
 
-  assert.ok(encodeThreadBodyPreimage({ ...noted, outcomes: new Array(127).fill(1) }).length + 64
-    <= THREAD_MAX_BODY_BYTES, "127 stops fit alongside a full 64-byte note");
+  assert.ok(encodeThreadBodyPreimage({ ...noted, outcomes: new Array(232).fill(1) }).length + 64
+    <= THREAD_MAX_BODY_BYTES, "232 stops fit alongside a full 64-byte note");
   assert.throws(
     () => encodeThreadBodyPreimage({ ...noted, outcomes: new Array(600).fill(1) }),
-    /600 plan stops cost 150 bytes of outcome map and this note costs 64.*at most 127 stops/su
+    /600 plan stops cost 150 bytes of outcome map and this note costs 64.*at most 232 stops/su
   );
 
   // Without a note the same body carries a far longer day.
-  assert.ok(encodeThreadBodyPreimage({ ...worst, outcomes: new Array(380).fill(1) }).length + 64
+  assert.ok(encodeThreadBodyPreimage({ ...worst, outcomes: new Array(488).fill(1) }).length + 64
     <= THREAD_MAX_BODY_BYTES);
   assert.throws(
     () => encodeThreadBodyPreimage({ ...worst, outcomes: new Array(600).fill(1) }),
-    /at most 380 stops/su
+    /at most 488 stops/su
   );
 
   // The realistic case the feature is sized for: a 200-stop day still
-  // leaves 45 bytes of note even at the worst position width.
+  // still permits the full note at the worst position width.
   assert.ok(encodeThreadBodyPreimage({
-    ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(45)
+    ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(64)
   }).length + 64 <= THREAD_MAX_BODY_BYTES);
-  assert.throws(
-    () => encodeThreadBodyPreimage({
-      ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(46)
-    }),
-    /allows 201/su
-  );
 
   // §20.7.1: the photo accumulator is 32 of those bytes, and it comes out
   // of the same budget the single commitment used to. The same 200-stop
-  // day with photos leaves 13 — the number field 19 left, for a field
+  // day with photos leaves 40 bytes, for a field
   // that binds every commitment rather than the newest.
   const withPhoto = {
     ...worst,
@@ -508,15 +525,15 @@ test("a plan too large to encode is refused, with the number that fits", () => {
     photoChain: "d3".repeat(32),
     outcomes: new Array(200).fill(1)
   };
-  assert.ok(encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(13) }).length + 64
+  assert.ok(encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(40) }).length + 64
     <= THREAD_MAX_BODY_BYTES);
   assert.throws(
-    () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(14) }),
-    /allows 201/su
+    () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(41) }),
+    /allows 228/su
   );
   assert.throws(
     () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(64), outcomes: new Array(600).fill(1) }),
-    /at most 0 stops/su,
+    /at most 108 stops/su,
     "a full note and a photo together leave very little day"
   );
 });

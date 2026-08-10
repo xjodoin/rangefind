@@ -266,7 +266,7 @@ test("a sealed thread crosses the air and the bridge cannot read it", async () =
     publish: async emitted => busRadio.send(emitted.bytes)
   });
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey,
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
     epochPrefix8: PREFIX8,
     notAfter: Math.floor(now / 1000) + 3600
   }));

@@ -510,6 +510,7 @@ export function createThreadChannel({
     link,
     notAfter,
     startSeq = 0,
+    startPreviousHash = null,
     maxRunSeconds = constants.THREAD_MAX_RUN_SECONDS,
     travelMode = null,
     baseUrl = null,
@@ -519,14 +520,17 @@ export function createThreadChannel({
     // for the life of the run and released when it ends — see the note
     // in `publish` below for why an unsubscribed publisher is silent.
     const publishedTopics = new Set();
+    const decodedLink = link instanceof Uint8Array ? decodeThreadLink(link) : link;
     const publisher = await createThreadPublisher({
       privateSeed,
       daySeed,
       certificate,
+      threadSecret: decodedLink.threadSecret,
       epoch32,
       mode,
       plan,
       startSeq,
+      startPreviousHash,
       maxRunSeconds,
       travelMode,
       clock,
@@ -599,7 +603,7 @@ export function createThreadChannel({
       // cannot pre-join still publishes; it just loses the first record
       // to mesh formation, which §5.5 catch-up can recover.
     }
-    const discovery = await startDiscovery(publisher.keys);
+    const discovery = await startDiscovery(publisher.keys, { advertise: true });
     const run = {
       publisher,
       link,
@@ -655,7 +659,7 @@ export function createThreadChannel({
 
   /**
    * Starts publishing a run. Returns the capability URL, which is the
-   * only thing that ever needs to be shared: 45 bytes in a fragment, no
+   * only thing that ever needs to be shared: one capability in a fragment, no
    * host, no mailbox, no bootstrap address.
    */
   async function publish({
@@ -667,11 +671,14 @@ export function createThreadChannel({
     travelMode = null,
     onPublish = null
   } = {}) {
-    const keypair = privateSeed
-      ? { privateSeed, publicKey: await publicKeyFromSeed(privateSeed) }
-      : await generateThreadKeypair();
+    const keypair = await generateThreadKeypair(privateSeed);
     const notAfter = Math.floor(clock() / 1000) + ttlSeconds;
-    const link = encodeThreadLink({ publicKey: keypair.publicKey, epochPrefix8, notAfter });
+    const link = encodeThreadLink({
+      threadSecret: keypair.threadSecret,
+      rootPublicKey: keypair.publicKey,
+      epochPrefix8,
+      notAfter
+    });
     return openRun({
       privateSeed: keypair.privateSeed, mode, plan, link, notAfter, travelMode, baseUrl, onPublish
     });
@@ -684,7 +691,7 @@ export function createThreadChannel({
    * stays at the depot. The follow link is not minted here and must not
    * be: it is the term's link, made once by the depot from the root, and
    * the whole feature is that it does not move. Pass it in, or let this
-   * rebuild the identical 45 bytes from the certificate's root key.
+   * rebuild the identical link from the certificate root and thread secret.
    */
   async function publishRouteDay({
     baseUrl,
@@ -693,6 +700,7 @@ export function createThreadChannel({
     mode = THREAD_MODE.COARSE,
     plan = null,
     link = null,
+    threadSecret = null,
     notAfter = null,
     travelMode = null,
     onPublish = null
@@ -704,7 +712,10 @@ export function createThreadChannel({
     // that did not say how long the term is has not authorised one.
     const linkNotAfter = notAfter ?? cert.notAfter;
     const followLink = link || routeFollowLink({
-      rootPublicKey: cert.rootPublicKey, epochPrefix8, notAfter: linkNotAfter
+      threadSecret,
+      rootPublicKey: cert.rootPublicKey,
+      epochPrefix8,
+      notAfter: linkNotAfter
     });
     return openRun({
       daySeed,
@@ -732,13 +743,16 @@ export function createThreadChannel({
    * keep a subscription open on a thread this device is about to
    * publish. No peers is not a failure; a first assignment resumes at 0.
    */
-  async function resumeSeq(link, nowMillis = clock()) {
+  async function resumeAuthority(link, nowMillis = clock()) {
     const subscriber = await createThreadSubscriber({
       link: decodeThreadLink(link), epoch32, clock, constants
     });
     const entry = { link, subscriber, onUpdate: null, topics: new Set(), lastCatchUpMillis: -Infinity };
     await catchUp(entry, { nowMillis }).catch(() => 0);
-    return subscriber.highestSeq;
+    return {
+      seq: subscriber.highestSeq,
+      previousHash: subscriber.latest()?.recordHash ?? null
+    };
   }
 
   /**
@@ -807,11 +821,11 @@ export function createThreadChannel({
     if (!ticket.privateSeed) {
       throw new Error("This ticket carries no run seed: an offer is not a publish capability.");
     }
-    // The term's 45 bytes on a route day, the run key's own on a job —
+    // The term capability on a route day, the run's own on a job —
     // `ticketFollowLink` reads which from the certificate, so there is
     // no arm of this function that can derive a link from a day key.
     const link = termLink || await ticketFollowLink(ticket);
-    const startSeq = doCatchUp ? await resumeSeq(link) : 0;
+    const resume = doCatchUp ? await resumeAuthority(link) : { seq: 0, previousHash: null };
     const run = await openRun({
       // §21.11: identity from the certificate's root, authority from the
       // seed. Passing the day seed as `privateSeed` would make the *day*
@@ -824,7 +838,8 @@ export function createThreadChannel({
       plan: ticket.plan,
       link,
       notAfter: ticket.notAfter,
-      startSeq,
+      startSeq: resume.seq,
+      startPreviousHash: resume.previousHash,
       travelMode: ticket.plan?.travelMode || travelMode,
       // The ticket's expiry *is* the run bound: a dispatched delivery day
       // is 8–10 hours and the publisher's own 6 h default would stop it
@@ -851,7 +866,7 @@ export function createThreadChannel({
 
   /**
    * Follows a run from its link. `linkOrUrl` is a URL with the capability
-   * in its fragment, a raw 45-byte link, or an already-decoded one.
+   * in its fragment, a raw 78-byte link, or an already-decoded one.
    */
   async function follow(linkOrUrl, { onUpdate = null, cellContext = null } = {}) {
     const link = toThreadLink(linkOrUrl);
@@ -890,7 +905,7 @@ export function createThreadChannel({
        * (§20.7). Sealed, not open: only a holder of the run seed — the
        * driver, or the dispatcher who minted the ticket — can call
        * `openPhoto` on the result, and a follower holding only the
-       * 45-byte link cannot. Null when nobody reachable holds it.
+       * follow link cannot. Null when nobody reachable holds it.
        */
       fetchPhoto: (hash, options) => fetchPhoto(hash, options),
       /**
@@ -928,7 +943,7 @@ export function createThreadChannel({
     // finds and dials peers holding this thread from the capability
     // alone; without one it uses whatever peers the transport has.
     if (host?.contentRouting) {
-      entry.discovery = await startDiscovery(entry.subscriber.keys);
+      entry.discovery = await startDiscovery(entry.subscriber.keys, { advertise: false });
       await entry.discovery?.connect().catch(() => []);
       // **And keep looking, until something is heard.**
       //
@@ -979,12 +994,16 @@ export function createThreadChannel({
     const peers = (given ?? network.peersOf?.(id) ?? []).filter(peer => peer !== id);
     if (!peers.length) return 0;
     const tags = await entry.subscriber.currentTags(nowMillis);
-    const sinceSeq = entry.subscriber.highestSeq;
+    const cursor = entry.subscriber.cursor();
     let request;
     try {
       request = buildThreadRequest({
         epochPrefix8,
-        wanted: tags.map(tag => ({ tag, sinceSeq })),
+        wanted: tags.map(tag => ({
+          tag,
+          sinceGeneration: cursor.generation,
+          sinceSeq: cursor.seq
+        })),
         rng
       });
     } catch {
@@ -1015,15 +1034,15 @@ export function createThreadChannel({
 
   /**
    * DHT discovery for one thread, when the host has content routing.
-   * Both publishers and followers advertise: a follower that answers
-   * catch-up is a provider in exactly the same sense, and that is what
-   * makes a bigger audience easier to join rather than more expensive.
+   * Only publishers advertise. Followers can answer padded catch-up
+   * requests from connected peers without publishing their interest to
+   * the DHT.
    */
-  async function startDiscovery(keys) {
+  async function startDiscovery(keys, { advertise = false } = {}) {
     if (!host?.contentRouting) return null;
     const { createThreadDiscovery } = await import("./thread_discovery.js");
     const discovery = createThreadDiscovery({
-      host, keys, epoch32, epochPrefix16hex, constants, clock
+      host, keys, epoch32, epochPrefix16hex, constants, clock, advertise
     });
     discovery.start();
     stats.provided++;

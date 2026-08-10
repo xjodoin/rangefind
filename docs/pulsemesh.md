@@ -502,23 +502,23 @@ reserved `t` namespace, and hands it over through `onOtherTopic`.
 
 What it adds beyond delivery:
 
-- **Catch-up (§5.5, §8 path 2), which is not an optimisation.** A phone
+- **Catch-up (threads §8), which is not an optimisation.** A phone
   that slept for four minutes has a hole in a thread, and the only
   alternative to filling it from other peers is a mailbox host — the
   exact server this design exists to avoid. Every follower caches the
   sealed bytes it sees and answers PMR1 on
   `/rangefind/pulsemesh/1/thread` for the tags it holds, so
-  **availability scales with audience size**. A relay cannot open what it
+  availability improves when several connected peers retain the gap. A relay cannot open what it
   caches and does not need to be trusted: records travel verbatim, so
   tampering fails the AEAD, forgery fails the signature and replay fails
   `seq` — at the joiner, which validates everything itself. Requests are
   padded to 4/8/16 tags with CSPRNG decoys, which is free here because a
   tag is indistinguishable from random; a responder answers unknown tags
   with count 0 so a prober cannot learn which threads it follows.
-- **Discovery (§4.2)**, when the host has a DHT: publishers *and*
-  followers advertise the rendezvous key, so a bigger audience makes a
-  thread easier to join rather than more expensive.
-- **A fleet seed (threads §20.10), for when there is nothing to dial.**
+- **Discovery (threads §3)**, when the host has a DHT: only reachable
+  publishers advertise the rendezvous key. Followers look up bounded provider,
+  peer and address counts but never publish their interest in the thread.
+- **A fleet seed, for when there is nothing to dial.**
   Discovery finds a *thread*; it does not find the *mesh*. A capability
   is a key, not a location (§5.4), so a cold device holding a perfect
   follow link and no `bootstrapPeers` connects to nothing. At fleet scale
@@ -583,7 +583,7 @@ A §5.4 bond is a 256 MiB memory-hard solve. It is affordable because it
 is once per peer per day, and the cheap phone-sized variant was
 implemented, measured and **refuted** as a Sybil defence (benchmarks
 §14) — so "every courier phone mints one" was never on the table. The
-codebase already had the answer for exactly this shape: §16.3's LoRa
+codebase already had the answer for exactly this shape: the LoRa
 bridge admits radio senders who minted nothing, because a *different*
 admission applies to them and the security boundary is the bridge.
 
@@ -675,7 +675,7 @@ nothing back.
 - **Admission is only as good as the seal.** A leaked ticket is a device
   that can contribute under the fleet's bond until it is caught by rule
   10–12 or removed from an allowlist. That is the same exposure the
-  ticket already carried (it can publish as that vehicle, §20.5); the
+  ticket already carried (it can publish as that vehicle); the
   bridge does not widen it, and the allowlist narrows it for fleets that
   want the trade.
 
@@ -1061,28 +1061,26 @@ is compelling alone; together they replace the tracking servers these
 products run today, where continuous child or courier positions sit in
 a vendor database indefinitely, joined to accounts.
 
-**A link is a key, not a location.** A thread's whole capability is one
-Ed25519 public key, 45 bytes in a URL fragment — SMS, QR code, order
-email. The private key signs, so no one can impersonate the publisher;
-the public key derives the content key, the rotating topic tag, and the
-DHT rendezvous key, so holding the link is what lets you *find*,
-decrypt and verify the thread. Nothing else is in the link: no host, no
-mailbox, no bootstrap address. Late joiners catch up from other
-subscribers' caches, so availability scales with audience size instead
-of costing a server.
+**A link is a capability and an identity, not a location.** The 78-byte
+fragment carries an independent 32-byte thread secret for discovery,
+admission and encryption, plus a 32-byte Ed25519 root public key for
+verification. Publishing the verification identity therefore reveals no
+content or topic key. The private signing seed never appears in the link.
+Nothing else is embedded by default: no host, mailbox, or bootstrap address.
+Late joiners catch up from bounded peer caches using generation-aware cursors.
 
 **A recurring route splits identity from authority.** A school bus keeps
 one plan for a term and changes driver some days, so the run that
 *publishes* it cannot be the thing that *identifies* it — rotating the
-key for a new driver would rotate every parent's link. So the root key
-stays the identity (topic tag, content key, the 45 bytes), and a
-short-lived day key derived from it and certified by it carries the
-publish authority. The driver's phone holds one day of authority and
+key for a new driver would rotate every parent's link. So the root public key
+stays the verification identity while an independent thread secret keeps
+discovery and encryption stable. A fresh random short-lived day key certified
+by the root carries publish authority. The driver's phone holds one day of authority and
 never the root; the certificate rides the run's own topic, so host-free
 catch-up delivers it to a late joiner for free; and a subscriber refuses
 any certificate valid for more than 48 hours, so "short-lived" is a
 property the verifier enforces rather than one the depot promises.
-Details in [threads §21](pulsemesh-threads.md).
+Details are in [the current Threads protocol](pulsemesh-threads.md#9-recurring-authority-certificate-pmtc).
 
 **How the two touch.** Threads never feed traffic aggregates — a signed
 single-source record entering a corroborated aggregate would turn a
@@ -1162,12 +1160,12 @@ the record set and reports recovered-route fraction per gate.
 5. **Threads.** ✅ **Done through T4.** The tracking channel is
    implemented (`src/pulsemesh/thread_*.js`, exported as
    `rangefind/pulsemesh/threads`): crypto and codecs byte-identical to
-   the [threads §16](pulsemesh-threads.md) vectors, the publisher and
+   the [threads conformance tests](pulsemesh-threads.md#15-required-security-tests), the publisher and
    subscriber, host-free catch-up, and the cross-channel contribution
    rules. The local-ETA thesis is a test rather than a claim — a
    subscriber's arrival estimate moves when a jam is injected into the
    traffic channel, on the real OSM graph, with the subscriber sending
-   nothing. Recurring routes (threads §21) are implemented too: a
+   nothing. Recurring routes (threads §9) are implemented too: a
    term-long link that survives a daily change of driver, verified
    through a root-signed day certificate carried on the run's own topic.
    Its pilot (T5) is a coarse-mode school run and remains open.
@@ -1206,7 +1204,7 @@ the record set and reports recovered-route fraction per gate.
 - Whether a scheduled fleet's anonymous contributions leak anything
   about *deviations* from its published timetable, which is the one gap
   in the public-route argument that lets fleets contribute at all
-  ([threads §10](pulsemesh-threads.md#10-rules-between-the-two-channels)).
+  ([current Threads protocol](pulsemesh-threads.md)).
 - ~~Whether the reticent profile should simply be the only profile.~~
   **Answered — and the answer is no** ([benchmarks §8](pulsemesh-benchmarks.md),
   medians over 12 seeds). Privacy is decisive: cadence leaks 84.6–100% of
@@ -1215,7 +1213,7 @@ the record set and reports recovered-route fraction per gate.
   7.7% — median *and* worst case — everywhere. But cadence's latency
   argument survives: at density 12 it detects a jam in 40.5 s against
   reticence's 116.5 s, with every run detecting under both. So the right
-  axis is the one [threads §10 rule 3](pulsemesh-threads.md) already
+  axis is the route-publicity policy [the Threads protocol](pulsemesh-threads.md) already
   named — cadence where the route is published and correlation reveals
   nothing new, reticence mandatory where it is not. An earlier five-seed
   run, measured against a stricter detection threshold than the router

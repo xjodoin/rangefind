@@ -696,10 +696,10 @@ test("§11.6 + threads: a read-only home viewer follows a thread with zero bonds
     }
   });
 
-  // The link — a 45-byte capability in a URL fragment — is all the home
+  // The link — a 78-byte capability-separated fragment — is all the home
   // viewer holds.
   const link = decodeThreadLink(encodeThreadLink({
-    publicKey: publisher.publicKey,
+    threadSecret: publisher.threadSecret, rootPublicKey: publisher.rootPublicKey,
     epochPrefix8: epoch32.subarray(0, 8),
     notAfter: Math.floor(now / 1000) + 3600
   }));

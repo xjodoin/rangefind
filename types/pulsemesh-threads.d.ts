@@ -2,45 +2,53 @@
  * PulseMesh Threads — authenticated tracking of one moving thing for a
  * bounded audience. See docs/pulsemesh-threads.md.
  *
- * The capability model in one line: the private key writes, the public
- * key reads. `P` is distributed, never published — it must not be logged,
- * reused across runs, used as a peer identity, or put on the wire.
+ * Capability secrecy and signing identity are separate. A random thread
+ * secret finds, admits and decrypts; an Ed25519 public key only verifies.
  */
 
 /** Derived from the capability `P`; none of it is ever transmitted. */
 export interface ThreadKeys {
-  publicKey: Uint8Array;
+  threadSecret: Uint8Array;
   topicKey: Uint8Array;
   contentKey: Uint8Array;
-  noncePrefix: Uint8Array;
+  admissionKey: Uint8Array;
 }
 
 export interface ThreadKeypair {
   privateSeed: Uint8Array;
   publicKey: Uint8Array;
+  threadSecret: Uint8Array;
 }
 
 export declare const THREAD_TOPIC_PREFIX: string;
 
 export declare function generateThreadKeypair(seed?: Uint8Array | null): Promise<ThreadKeypair>;
 export declare function publicKeyFromSeed(privateSeed: Uint8Array): Promise<Uint8Array>;
-export declare function deriveThreadKeys(publicKey: Uint8Array): Promise<ThreadKeys>;
+export declare function deriveThreadSecret(rootSeed: Uint8Array): Promise<Uint8Array>;
+export declare function deriveThreadKeys(threadSecret: Uint8Array): Promise<ThreadKeys>;
 export declare function threadWindow(unixMillis: number): number;
 export declare function threadTag(keys: ThreadKeys, epoch32: Uint8Array, window: number): Promise<Uint8Array>;
 export declare function threadTagsForWindows(keys: ThreadKeys, epoch32: Uint8Array, windows: number[]): Promise<Uint8Array[]>;
 export declare function threadTopic(epochPrefix16hex: string, tag: Uint8Array): string;
 /** The DHT key holders advertise as providers for — what makes a link self-sufficient. */
 export declare function threadRendezvous(topic: string): Uint8Array;
-export declare function threadNonce(noncePrefix: Uint8Array, seq: number): Uint8Array;
-export declare function sealThreadBody(keys: ThreadKeys, seq: number, aad: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array>;
+export declare function sealThreadBody(
+  keys: ThreadKeys, seq: number, aad: Uint8Array, plaintext: Uint8Array,
+  options?: { nonce?: Uint8Array | null }
+): Promise<Uint8Array>;
 /** Returns null on any AEAD failure — a wrong key, a tampered record. */
 export declare function openThreadBody(keys: ThreadKeys, seq: number, aad: Uint8Array, ciphertext: Uint8Array): Promise<Uint8Array | null>;
+export declare function threadAdmissionTag(
+  keys: ThreadKeys, aad: Uint8Array, ciphertext: Uint8Array, length?: number
+): Promise<Uint8Array>;
+export declare function equalThreadAuth(left: Uint8Array, right: Uint8Array): boolean;
+export declare function threadRecordSigningMessage(aad: Uint8Array, bodyPreimage: Uint8Array): Uint8Array;
 
 /**
  * §20.7's per-stop photo key, and the whole privacy model in one line.
  *
- * It derives from the run's **private seed**, not from the capability
- * `P`. A customer holds the 45-byte link, which carries `P`, an epoch
+ * It derives from the run's **private seed**, not from the thread
+ * capability. A customer holds the 78-byte link, which carries a separate capability, an epoch
  * and an expiry — no seed — so a customer structurally cannot derive
  * this. The driver holds the seed from the ticket, and the dispatcher
  * kept it when minting that ticket (§20.1's inversion of §4.1), so
@@ -106,11 +114,11 @@ export declare const STOP_REASON: Readonly<{
   NONE: 0; CUSTOMER_ABSENT: 1; REFUSED: 2; INACCESSIBLE: 3; PARCEL_MISSING: 4; OTHER: 5;
 }>;
 export declare const THREAD_MAGIC: Readonly<Record<string, string>>;
-export declare const THREAD_MAX_RECORD_BYTES: 256;
-/** PMT1 framing around a sealed body: magic, epoch, tag, seq, ctLen, AEAD tag. */
-export declare const THREAD_RECORD_OVERHEAD: 43;
+export declare const THREAD_MAX_RECORD_BYTES: 320;
+/** PMT1 framing, generation, predecessor, nonce, AEAD tag, and admission MAC. */
+export declare const THREAD_RECORD_OVERHEAD: 92;
 /** What the plaintext body may spend, signature included. */
-export declare const THREAD_MAX_BODY_BYTES: 213;
+export declare const THREAD_MAX_BODY_BYTES: 228;
 export declare const THREAD_MAX_NOTE_BYTES: 64;
 /** SHA-256 of the sealed proof-of-delivery blob, on the mark (§20.7). */
 export declare const THREAD_PHOTO_HASH_BYTES: 32;
@@ -119,22 +127,12 @@ export declare const THREAD_MAX_PHOTO_BYTES: 131072;
 /** A photo seal's own bytes: a 12-byte IV plus the 16-byte GCM tag. */
 export declare const PHOTO_SEAL_OVERHEAD: 28;
 export declare const THREAD_REQUEST_SIZES: readonly number[];
-export declare const LINK_BYTES: 45;
-/** A v1 link: the key it carries signs the run's own records (§4.1). */
-export declare const LINK_VERSION_SELF: 1;
-/**
- * A v2 link: the key it carries is a route **root** and records are
- * signed by a certified, short-lived day key (§21). A holder knows this
- * from the artifact rather than from what turns up on the topic —
- * guessing per record would make a downgrade one forged record away.
- */
-export declare const LINK_VERSION_DELEGATED: 2;
-/** The highest link version this build understands. */
-export declare const LINK_VERSION: 2;
-export declare const LINK_VERSIONS: readonly [1, 2];
+export declare const LINK_BYTES: 78;
+export declare const LINK_VERSION: 1;
+export declare const LINK_FLAG_DELEGATED: 1;
 /** §21 PMTC day certificate: version byte and total size. */
 export declare const DAY_CERT_VERSION: 1;
-export declare const DAY_CERT_BYTES: 145;
+export declare const DAY_CERT_BYTES: 157;
 
 /** The most recent explicit mark, so a follower renders it without diffing. */
 export interface StopMark {
@@ -146,7 +144,7 @@ export interface StopMark {
    * §20.7: lowercase hex SHA-256 of the **sealed** proof-of-delivery
    * blob, or null. A commitment, never content — the bytes are fetched
    * on demand with `fetchPhoto` and opened with `openPhoto`, which needs
-   * the run seed. A holder of the 45-byte link has the commitment and
+   * the run seed. A holder of the 78-byte link has the commitment and
    * structurally cannot have the image.
    *
    * Hex rather than bytes because every consumer treats it as a content
@@ -164,12 +162,12 @@ export interface StopMark {
 export declare const THREAD_MARK_FLAG: Readonly<{
   LAST: 0x01;
   REASONS: 0x02;
-  PHOTO_COUNT: 0x04;
+  PHOTO_CHAIN: 0x04;
 }>;
 
 /**
  * §5.2.1. How many per-stop reasons one record carries. The list is also
- * bounded by whatever the 213-byte body has left, whichever is smaller.
+ * bounded by whatever the 228-byte body has left, whichever is smaller.
  */
 export declare const THREAD_MAX_REASONS: 16;
 
@@ -298,7 +296,7 @@ export interface ThreadBodyFields {
    * how many proofs of delivery it can never fetch (§20.7.1). Omitted
    * from the wire entirely when 0.
    */
-  photoCount?: number;
+  photoChain?: string | Uint8Array | null;
   note?: Uint8Array;
 }
 
@@ -308,7 +306,7 @@ export interface ThreadBody extends ThreadBodyFields {
   outcomes: number[];
   lastOutcome: StopMark | null;
   stopReasons: CarriedStopReason[];
-  photoCount: number;
+  photoChain: string | null;
   signature: Uint8Array;
   preimage: Uint8Array;
   /** Null when the position was withheld (§11). */
@@ -320,19 +318,22 @@ export interface ThreadRecord {
   magic: "PMT1";
   epochPrefix8: Uint8Array;
   tag: Uint8Array;
+  generation: number;
   seq: number;
+  previousHash: Uint8Array;
   ciphertext: Uint8Array;
+  admissionTag: Uint8Array;
   aad: Uint8Array;
   bytes: Uint8Array;
 }
 
 export interface ThreadLink {
   version: number;
-  /** The capability `P` — on a v2 link, the route **root** (§21). */
-  publicKey: Uint8Array;
+  threadSecret: Uint8Array;
+  rootPublicKey: Uint8Array;
   epochPrefix8: Uint8Array;
   notAfter: number;
-  /** True on a v2 link: records are signed by a certified day key. */
+  /** True when records are signed by a certified delegated key. */
   delegated: boolean;
 }
 
@@ -350,8 +351,11 @@ export interface DayCertificate {
   rootPublicKey: Uint8Array;
   /** The delegated signing key. Records verify against this, not the root. */
   dayPublicKey: Uint8Array;
+  generation: number;
   /** The operator's civil date for the run, as the integer YYYYMMDD. */
   serviceDay: number;
+  /** Exact plan this authority may publish. */
+  planRef: Uint8Array;
   notBefore: number;
   notAfter: number;
   signature: Uint8Array;
@@ -363,7 +367,9 @@ export declare function encodeDayCertificatePreimage(certificate: {
   version?: number;
   rootPublicKey: Uint8Array;
   dayPublicKey: Uint8Array;
+  generation: number;
   serviceDay: number;
+  planRef: Uint8Array;
   notBefore: number;
   notAfter: number;
 }): Uint8Array;
@@ -381,9 +387,12 @@ export declare function threadBodyMagic(bytes: Uint8Array | null | undefined): s
 export declare function encodeThreadBodyPreimage(body: ThreadBodyFields): Uint8Array;
 export declare function encodeThreadBody(body: ThreadBodyFields, signature: Uint8Array): Uint8Array;
 export declare function decodeThreadBody(bytes: Uint8Array): ThreadBody;
-export declare function threadRecordAad(epochPrefix8: Uint8Array, tag: Uint8Array, seq: number): Uint8Array;
+export declare function threadRecordAad(
+  epochPrefix8: Uint8Array, tag: Uint8Array, generation: number, seq: number, previousHash: Uint8Array
+): Uint8Array;
 export declare function encodeThreadRecord(fields: {
-  epochPrefix8: Uint8Array; tag: Uint8Array; seq: number; ciphertext: Uint8Array;
+  epochPrefix8: Uint8Array; tag: Uint8Array; generation: number; seq: number;
+  previousHash: Uint8Array; ciphertext: Uint8Array; admissionTag: Uint8Array;
 }): { bytes: Uint8Array; aad: Uint8Array };
 export declare function decodeThreadRecord(bytes: Uint8Array): ThreadRecord;
 /**
@@ -393,10 +402,11 @@ export declare function decodeThreadRecord(bytes: Uint8Array): ThreadRecord;
 export declare function isWithheldPosition(leafCell: number, geomRef: number, ratioQ12: number): boolean;
 
 export declare function encodeThreadRequest(request: {
-  epochPrefix8: Uint8Array; entries: Array<{ tag: Uint8Array; sinceSeq: number }>;
+  epochPrefix8: Uint8Array; entries: Array<{ tag: Uint8Array; sinceGeneration: number; sinceSeq: number }>;
 }): Uint8Array;
 export declare function decodeThreadRequest(bytes: Uint8Array): {
-  magic: "PMR1"; epochPrefix8: Uint8Array; entries: Array<{ tag: Uint8Array; sinceSeq: number }>;
+  magic: "PMR1"; epochPrefix8: Uint8Array;
+  entries: Array<{ tag: Uint8Array; sinceGeneration: number; sinceSeq: number }>;
 };
 export declare function encodeThreadResponse(response: {
   epochPrefix8: Uint8Array; entries: Array<{ tag: Uint8Array; records: Array<Uint8Array> }>;
@@ -415,13 +425,12 @@ export declare function decodePhotoResponse(bytes: Uint8Array): {
 };
 
 /**
- * `version` says what the key in field 2 **is**, not how new the writer
- * is — which is why the default is still 1. A one-off run's key really
- * does sign its own records, and a v2 link over it would leave every
- * subscriber waiting for a certificate that never comes.
+ * The only link version. `delegated` selects a certified short-lived
+ * authority; otherwise the root signs the run directly.
  */
 export declare function encodeThreadLink(fields: {
-  publicKey: Uint8Array; epochPrefix8: Uint8Array; notAfter: number; version?: 1 | 2;
+  threadSecret: Uint8Array; rootPublicKey: Uint8Array; epochPrefix8: Uint8Array;
+  notAfter: number; delegated?: boolean;
 }): Uint8Array;
 export declare function decodeThreadLink(bytes: Uint8Array): ThreadLink;
 /**
@@ -485,6 +494,9 @@ export interface ThreadConstants {
   THREAD_MAX_RUN_SECONDS: number;
   THREAD_TAG_BUDGET: number;
   THREAD_CACHE_RATE: number;
+  /** Host-wide bounds that cannot be bypassed by rotating peer identities. */
+  THREAD_GLOBAL_BURST: number;
+  THREAD_GLOBAL_RATE: number;
   THREAD_STOP_RADIUS: number;
   THREAD_STOP_LINGER: number;
   /** §21: how often a route-day publisher re-emits its certificate. */
@@ -520,7 +532,10 @@ export interface RunPlan {
 export interface ThreadEmission {
   bytes: Uint8Array;
   tag: Uint8Array;
+  generation: number;
   seq: number;
+  previousHash: Uint8Array;
+  recordHash: Uint8Array;
   window: number;
   body: ThreadBodyFields;
 }
@@ -541,6 +556,10 @@ export declare function createThreadPublisher(options: {
    * topic tag, the content key and the link stay where they were.
    */
   certificate?: DayCertificate | Uint8Array | null;
+  /** Capability secret from the follow link; required for delegated authority. */
+  threadSecret?: Uint8Array | null;
+  /** Direct-authority generation, or the certificate generation when delegated. */
+  generation?: number;
   epoch32: Uint8Array;
   mode?: number;
   plan?: RunPlan | null;
@@ -550,6 +569,8 @@ export declare function createThreadPublisher(options: {
   snap?: ((point: { lat: number; lon: number }) => Promise<unknown>) | null;
   /** Resume point for a §20 ticket handover; the first record is startSeq + 1. */
   startSeq?: number;
+  /** Hash of the record at `startSeq`, for a continuous handover. */
+  startPreviousHash?: Uint8Array | null;
   /**
    * How long this run may keep publishing, in seconds. Defaults to
    * `THREAD_MAX_RUN_SECONDS` (6 h), which is sized for a self-started
@@ -562,6 +583,9 @@ export declare function createThreadPublisher(options: {
 }): Promise<{
   /** The run's **identity**: on a route day the root, never the day key. */
   publicKey: Uint8Array;
+  rootPublicKey: Uint8Array;
+  threadSecret: Uint8Array;
+  generation: number;
   keys: ThreadKeys;
   /** §21: the certificate this run publishes under, or null on a one-off run. */
   certificate: DayCertificate | null;
@@ -609,12 +633,26 @@ export declare function createThreadPublisher(options: {
 /** Stable codes for the failures a host branches on, alongside the prose. */
 export declare const THREAD_DROP: Readonly<{
   BAD_SIGNATURE: "bad-signature";
+  BAD_ADMISSION: "bad-admission";
+  CHAIN_GAP: "chain-gap";
+  FORK: "authority-fork";
+  STALE_AUTHORITY: "stale-authority";
   AWAITING_CERTIFICATE: "awaiting-certificate";
-  CERT_ON_V1_LINK: "cert-on-self-signed-link";
+  CERT_ON_DIRECT_LINK: "cert-on-direct-link";
   CERT_AFTER_LINK_EXPIRY: "cert-after-link-expiry";
 }>;
 
-export type ThreadUpdate = ThreadBody & { seq: number; receivedAt: number };
+export type ThreadUpdate = ThreadBody & {
+  generation: number;
+  seq: number;
+  previousHash: Uint8Array;
+  recordHash: Uint8Array;
+  /** False after accepting a signed checkpoint whose omitted predecessors were unavailable. */
+  chainComplete: boolean;
+  /** True only on the update that first exposed such a gap. */
+  chainGap: boolean;
+  receivedAt: number;
+};
 
 export type ThreadAcceptResult =
   | { ok: true; update: ThreadUpdate; certificate?: undefined; released?: undefined }
@@ -654,12 +692,8 @@ export interface ThreadStatus {
    * read it through `stopReasonFor` rather than searching it by hand.
    */
   stopReasons: CarriedStopReason[];
-  /**
-   * §20.7. Distinct photo commitments the run says it has published.
-   * Fewer distinct commitments held than this is exactly how many proofs
-   * of delivery this device can never fetch (§20.7.1).
-   */
-  photoCount: number;
+  /** Signed accumulator over every photo commitment published so far. */
+  photoChain: string | null;
   travelMode: number;
   claim: string;
 }
@@ -682,9 +716,11 @@ export declare function createThreadSubscriber(options: {
     accepted: number; dropped: number; dropsByStep: Record<string, number>; forgeries: number;
     /** §21 counters: certificates accepted, and the held-record buffer. */
     certificates: number; held: number; heldEvicted: number; heldReleased: number;
+    forks: number; chainGaps: number;
   };
   latest(): ThreadUpdate | null;
   history(): ThreadUpdate[];
+  cursor(): { generation: number; seq: number };
   /** §21: true when this link delegates signing to certified day keys. */
   delegated: boolean;
   /** The live day certificates this subscriber holds. */
@@ -796,7 +832,7 @@ export declare function scheduledArrival(options: { plan: RunPlan; myStopIndex: 
 // --- Dispatch tickets (§20) ------------------------------------------------
 
 export declare const TICKET_MAGIC: Readonly<{ PMP1: "PMP1"; PMK1: "PMK1"; PMJ1: "PMJ1" }>;
-export declare const TICKET_VERSION: 1;
+export declare const TICKET_VERSION: 2;
 export declare const PLAN_VERSION: 1;
 export declare const JOB_OFFER_VERSION: 1;
 /** flags bit0: the run seed is present. A seedless PMK1 is not an offer (§20.4). */
@@ -816,6 +852,7 @@ export declare const TICKET_FLAG_DAY: 4;
 export declare const TICKET_ERROR: Readonly<{
   DAY_SEED_MISMATCH: "ticket-day-seed-mismatch";
   DAY_FOREIGN_ROOT: "ticket-day-foreign-root";
+  DAY_PLAN_MISMATCH: "ticket-day-plan-mismatch";
   DAY_AFTER_TICKET_EXPIRY: "cert-after-link-expiry";
 }>;
 export declare const THREAD_MAX_LABEL_BYTES: 48;
@@ -892,6 +929,8 @@ export interface DispatchTicket {
   planBytes: Uint8Array;
   plan: DecodedThreadPlan;
   privateSeed: Uint8Array | null;
+  /** Separate discovery/decryption/admission capability. */
+  threadSecret: Uint8Array | null;
   /**
    * §20.10. The peers the issuer says this device may dial to reach the
    * mesh; empty when it named none. Inside the signed preimage, because
@@ -952,10 +991,10 @@ export declare function issueTicket(options: {
   bootstrap?: string | string[] | null;
   /**
    * §21.11: makes this a **route-day ticket**. `issuerSeed` is then the
-   * route root seed — only the root can mint this certificate or derive
-   * the day seed — and `privateSeed` is the day seed, re-derived here
-   * when it is not passed. `link` comes back as the term's v2 link over
-   * the root, never a link over the day key.
+   * route root seed — only the root can mint this certificate — and
+   * `privateSeed` is the random day seed returned by
+   * `mintDayCertificate`, which is required. `link` comes back over the
+   * route root identity and separate route capability.
    */
   dayCertificate?: DayCertificate | Uint8Array | null;
   baseUrl?: string | null;
@@ -970,7 +1009,7 @@ export interface SealedIssuedTicket {
   driverUrl: string;
   /** The decoded artifact, in memory: the dispatcher keeps the run seed. */
   ticket: DispatchTicket;
-  /** The customer's 45-byte follow link — a read capability, not sealed. */
+  /** The customer's 78-byte follow link — a read capability, not sealed. */
   link: Uint8Array | null;
   url: string | null;
   jobIdHex: string;
@@ -1039,9 +1078,9 @@ export declare function verifyThreadTicket(
 ): Promise<{ ok: true } | { ok: false; reason: string; code?: string | null }>;
 
 /**
- * The 45-byte follow link this ticket's run publishes under. Throws on a
+ * The 78-byte follow link this ticket's run publishes under. Throws on a
  * seedless ticket — there is no run. On a route-day ticket it is the
- * route's **v2 link over the root** (§21.11), never a link over the day
+ * route's delegated link over the root (§21.11), never a link over the day
  * key: deriving one from the day key would publish the route where no
  * subscriber is listening.
  */
@@ -1049,9 +1088,8 @@ export declare function ticketFollowLink(ticket: DispatchTicket | Uint8Array | s
 
 /**
  * 16 bytes identifying the job, not the artifact: it hashes neither the
- * seed nor the signature, so a PMJ1 offer and the ticket that fulfils it
- * share one id. Claims and awards are not in protocol v1; this is what
- * they would join on.
+ * seed nor the signature, so PMJ1, PMA1, PMQ1 and the awarded ticket join
+ * on the same job without exposing publish authority.
  */
 export declare function jobIdOf(ticket: DispatchTicket | Uint8Array | string): Uint8Array;
 export declare function jobIdHexOf(ticket: DispatchTicket | Uint8Array | string): string;
@@ -1163,18 +1201,116 @@ export declare function awardMatchesOffer(
   ticket: DispatchTicket | Uint8Array | string
 ): { ok: true; reason: null } | { ok: false; reason: string };
 
+// --- Multi-recipient assignment and single-recipient award ----------------
+
+export declare const ASSIGNMENT_MAGIC: Readonly<{ PMA1: "PMA1"; PMQ1: "PMQ1" }>;
+export declare const ASSIGNMENT_VERSION: 1;
+export declare const ASSIGNMENT_RECIPIENT_COMMITMENT_BYTES: 16;
+export declare const ASSIGNMENT_ID_BYTES: 32;
+export declare const JOB_CLAIM_BYTES: 121;
+export declare const ASSIGNMENT_MAX_OFFER_BYTES: 2048;
+
+export interface AssignmentOffer {
+  version: number;
+  notAfter: number;
+  nonce: Uint8Array;
+  claimPublicKey: Uint8Array;
+  recipientCommitments: Uint8Array[];
+  offerBytes: Uint8Array;
+  offer: JobOffer;
+  signature: Uint8Array;
+  preimage: Uint8Array;
+  bytes: Uint8Array;
+  assignmentId: Uint8Array;
+  assignmentIdHex: string;
+}
+
+export interface JobClaim {
+  version: number;
+  assignmentId: Uint8Array;
+  assignmentIdHex: string;
+  devicePublicKey: Uint8Array;
+  claimedAt: number;
+  nonce: Uint8Array;
+  mac: Uint8Array;
+  preimage: Uint8Array;
+  bytes: Uint8Array;
+  claimIdHex: string;
+}
+
+export declare function issueMultiRecipientJobOffer(options: {
+  recipients: Array<Uint8Array | { publicKey: Uint8Array }>;
+  issuerSeed: Uint8Array;
+  claimNotAfter?: number | null;
+  nonce?: Uint8Array | null;
+  ticket?: DispatchTicket | Uint8Array | string | null;
+  epoch32?: Uint8Array | null;
+  epochPrefix8?: Uint8Array | null;
+  plan?: unknown;
+  planBytes?: Uint8Array | null;
+  notAfter?: number | null;
+  mode?: number;
+  totalMeters?: number;
+  payMinor?: number | null;
+  currency?: string | null;
+  label?: string | Uint8Array | null;
+}): Promise<{ assignment: AssignmentOffer; offer: JobOffer; bytes: Uint8Array; sealed: Uint8Array }>;
+
+export declare function decodeAssignmentOffer(bytes: Uint8Array): AssignmentOffer;
+export declare function verifyAssignmentOffer(
+  assignment: AssignmentOffer | Uint8Array,
+  options?: { epochPrefix8?: Uint8Array | null; expectedIssuerHex?: string | null; nowMillis?: number }
+): Promise<{ ok: true; assignment: AssignmentOffer } | { ok: false; reason: string }>;
+export declare function openMultiRecipientJobOffer(
+  sealed: Uint8Array | string,
+  devicePrivateKey: Uint8Array,
+  options?: { epochPrefix8?: Uint8Array | null; expectedIssuerHex?: string | null; nowMillis?: number }
+): Promise<AssignmentOffer>;
+export declare function decodeJobClaim(bytes: Uint8Array): JobClaim;
+export declare function createJobClaim(
+  assignment: AssignmentOffer | Uint8Array,
+  devicePrivateKey: Uint8Array,
+  options?: { claimedAt?: number; nonce?: Uint8Array | null }
+): Promise<JobClaim>;
+export declare function verifyJobClaim(
+  assignment: AssignmentOffer | Uint8Array,
+  claim: JobClaim | Uint8Array,
+  issuerSeed: Uint8Array,
+  options?: {
+    nowMillis?: number;
+    clockSkewSeconds?: number;
+    epochPrefix8?: Uint8Array | null;
+    expectedIssuerHex?: string | null;
+  }
+): Promise<
+  | { ok: true; assignment: AssignmentOffer; claim: JobClaim }
+  | { ok: false; reason: string; code?: string }
+>;
+export declare function awardFirstJobClaim(options: {
+  assignment: AssignmentOffer | Uint8Array;
+  claim: JobClaim | Uint8Array;
+  ticket: DispatchTicket | Uint8Array | string;
+  issuerSeed: Uint8Array;
+  claimOnce: (
+    assignmentIdHex: string,
+    winner: { claimIdHex: string; devicePublicKey: Uint8Array; receivedAt: number }
+  ) => boolean | Promise<boolean>;
+  nowMillis?: number;
+  offerOptions?: { epochPrefix8?: Uint8Array | null; expectedIssuerHex?: string | null };
+}): Promise<
+  | { ok: true; sealed: Uint8Array; assignment: AssignmentOffer; claim: JobClaim }
+  | { ok: false; reason: string; code?: string }
+>;
+
 // --- §21 recurring routes: identity split from authority --------------------
 //
 // A school bus keeps one plan for a term, the driver changes some days
 // and not most, and a parent must be able to watch the same link all term
 // without ever resubscribing. §4.1 makes one key the identity *and* the
 // publish authority, so rotating the authority rotates every parent's
-// link. This splits them: the **root** stays the identity — it derives
-// the topic tag, the content key and the 45 bytes — and a short-lived,
+// link. This splits them: the **root** stays the verification identity,
+// a separate thread secret derives discovery and content keys, and a short-lived,
 // certified **day key** carries the authority.
-
-/** The HKDF label for the day-seed schedule. */
-export declare const ROUTE_DAY_INFO: "pulsemesh/route-day/1";
 /**
  * The longest certificate window a **subscriber** honours: 48 h.
  *
@@ -1213,24 +1349,12 @@ export declare const CERT_ERROR: Readonly<{
  * work.
  *
  * Safe to leave to the operator because it is never compared against
- * anybody's clock: it is an HKDF input and a display label. The only
+ * anybody's clock: it is a signed scope and display label. The only
  * validity claim on the wire is `notBefore`/`notAfter` in absolute unix
  * seconds, which is unambiguous everywhere.
  */
 export declare function assertServiceDay(serviceDay: number): number;
 export declare function serviceDayOf(year: number, month: number, day: number): number;
-
-/**
- * `HKDF(rootSeed, "pulsemesh/route-day/1" ‖ planRef ‖ serviceDay)`.
- *
- * **Depot-side.** Deterministic, so a depot with 40 routes and a 180-day
- * term re-derives instead of storing 7,200 secrets, and recovery is
- * re-derivation. One-way, so a day seed does not invert to the root and
- * Tuesday's says nothing about Wednesday's.
- */
-export declare function deriveDaySeed(options: {
-  rootSeed: Uint8Array; planRef?: Uint8Array | null; serviceDay: number;
-}): Promise<Uint8Array>;
 
 /**
  * Mints one day's authority. **Depot-side** — the only function here
@@ -1244,6 +1368,9 @@ export declare function mintDayCertificate(options: {
   rootSeed: Uint8Array;
   planRef?: Uint8Array | null;
   serviceDay: number;
+  generation?: number;
+  /** Optional deterministic fixture input; production omits it for CSPRNG generation. */
+  daySeed?: Uint8Array | null;
   notBefore: number;
   notAfter: number;
   maxSeconds?: number;
@@ -1252,6 +1379,7 @@ export declare function mintDayCertificate(options: {
   certificate: DayCertificate;
   rootPublicKey: Uint8Array;
   dayPublicKey: Uint8Array;
+  threadSecret: Uint8Array;
 }>;
 
 /**
@@ -1273,14 +1401,14 @@ export declare function verifyDayCertificate(
 >;
 
 /**
- * The term-long follow link: a v2 link over the route **root**, minted
+ * The term-long follow link: a delegated link over the route **root**, minted
  * once by the depot. `notAfter` is the end of the term rather than the
  * end of a run — which is safe precisely because the root cannot publish
  * anything a subscriber accepts without a certificate whose own window
  * is at most 48 h.
  */
 export declare function routeFollowLink(fields: {
-  rootPublicKey: Uint8Array; epochPrefix8: Uint8Array; notAfter: number;
+  threadSecret: Uint8Array; rootPublicKey: Uint8Array; epochPrefix8: Uint8Array; notAfter: number;
 }): Uint8Array;
 
 // --- §20.9 sealed tickets and device enrolment -----------------------------
@@ -1370,6 +1498,60 @@ export declare function sealedTicketUrl(
   options?: { bootstrap?: string | string[] | null }
 ): string;
 
+// --- Managed subscriptions -------------------------------------------------
+
+export declare const SUBSCRIPTION_MAGIC: "PMS1";
+export declare const SUBSCRIPTION_VERSION: 1;
+export declare const SUBSCRIPTION_FLAG_DELEGATED: 1;
+export declare const SUBSCRIPTION_BYTES: 154;
+
+export interface ManagedSubscriptionGrant {
+  version: number;
+  delegated: boolean;
+  generation: number;
+  epochPrefix8: Uint8Array;
+  notBefore: number;
+  notAfter: number;
+  rootPublicKey: Uint8Array;
+  threadSecret: Uint8Array;
+  signature: Uint8Array;
+  preimage: Uint8Array;
+  bytes: Uint8Array;
+}
+
+export declare function encodeManagedSubscriptionPreimage(fields: {
+  generation: number;
+  epochPrefix8: Uint8Array;
+  notBefore: number;
+  notAfter: number;
+  rootPublicKey: Uint8Array;
+  threadSecret: Uint8Array;
+  delegated?: boolean;
+}): Uint8Array;
+export declare function encodeManagedSubscription(
+  fields: Parameters<typeof encodeManagedSubscriptionPreimage>[0], signature: Uint8Array
+): Uint8Array;
+export declare function decodeManagedSubscription(bytes: Uint8Array): ManagedSubscriptionGrant;
+export declare function issueManagedSubscription(options: {
+  rootSeed: Uint8Array;
+  recipients: Array<Uint8Array | string | { publicKey: Uint8Array }>;
+  generation: number;
+  epochPrefix8: Uint8Array;
+  notBefore: number;
+  notAfter: number;
+  delegated?: boolean;
+  threadSecret?: Uint8Array | null;
+}): Promise<{ grant: ManagedSubscriptionGrant; sealed: Uint8Array; link: Uint8Array }>;
+export declare function openManagedSubscription(
+  sealed: Uint8Array | string,
+  devicePrivateKey: Uint8Array,
+  options?: {
+    expectedRootPublicKey?: Uint8Array | null;
+    minimumGeneration?: number;
+    nowSeconds?: number;
+  }
+): Promise<{ grant: ManagedSubscriptionGrant; link: Uint8Array }>;
+
 // --- §20.10 PMH1 seed card -------------------------------------------------
 
 /**
@@ -1422,7 +1604,7 @@ export declare function createThreadCache(options?: {
     fromPeer?: string | null; openable?: boolean; nowMillis?: number;
   }): { admitted: boolean; reason?: string };
   /** Unknown tags answer exactly like held-but-empty ones. */
-  answer(request: Uint8Array | { entries: Array<{ tag: Uint8Array; sinceSeq: number }> }, options?: { nowMillis?: number }):
+  answer(request: Uint8Array | { entries: Array<{ tag: Uint8Array; sinceGeneration: number; sinceSeq: number }> }, options?: { nowMillis?: number }):
     { entries: Array<{ tag: Uint8Array; records: Uint8Array[] }> };
   sweep(nowMillis?: number): void;
   has(tag: Uint8Array): boolean;
@@ -1435,9 +1617,13 @@ export declare function createThreadCache(options?: {
 /** Padding is free here: a tag is indistinguishable from random bytes. */
 export declare function buildThreadRequest(params: {
   epochPrefix8: Uint8Array;
-  wanted: Array<{ tag: Uint8Array; sinceSeq?: number }>;
+  wanted: Array<{ tag: Uint8Array; sinceGeneration?: number; sinceSeq?: number }>;
   rng?: () => number;
-}): { bytes: Uint8Array; entries: Array<{ tag: Uint8Array; sinceSeq: number }>; realCount: number };
+}): {
+  bytes: Uint8Array;
+  entries: Array<{ tag: Uint8Array; sinceGeneration: number; sinceSeq: number }>;
+  realCount: number;
+};
 
 export declare function encodeThreadCacheResponse(
   epochPrefix8: Uint8Array,
@@ -1557,7 +1743,7 @@ export declare function createThreadChannel(options: {
     /** Required to open a sealed PME1 job (§20.9). */
     devicePrivateKey?: Uint8Array | null;
     /**
-     * The term's link, for a host that holds the exact 45 bytes the
+     * The term's link, for a host that holds the exact 78 bytes the
      * depot published (§21.11). Omit and it is rebuilt from the
      * certificate's root — identical bytes whenever the ticket's
      * `notAfter` is the term's.
@@ -1589,13 +1775,15 @@ export declare function createThreadChannel(options: {
    * Publishes one **service day** of a recurring route (§21). Takes the
    * day seed and its certificate — never the route root, which stays at
    * the depot. The follow link is the *term's* link and is not minted
-   * here: pass it, or let this rebuild the identical 45 bytes from the
+   * here: pass it, or let this rebuild the identical 78 bytes from the
    * certificate's root key.
    */
   publishRouteDay(options?: {
     baseUrl?: string;
     daySeed: Uint8Array;
     certificate: DayCertificate | Uint8Array;
+    /** Required when `link` is omitted; copied from the managed/term link. */
+    threadSecret?: Uint8Array | null;
     mode?: number;
     plan?: unknown;
     /** The term's link, minted once by the depot. */

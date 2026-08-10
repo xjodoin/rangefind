@@ -9,7 +9,7 @@
 
 import { THREAD_CONSTANTS } from "./thread_publish.js";
 import {
-  LINK_VERSION_DELEGATED,
+  THREAD_CHAIN_HASH_BYTES,
   THREAD_MAGIC,
   THREAD_STATE,
   decodeDayCertificate,
@@ -19,7 +19,10 @@ import {
 } from "./thread_codec.js";
 import {
   deriveThreadKeys,
+  equalThreadAuth,
   openThreadBody,
+  threadAdmissionTag,
+  threadRecordSigningMessage,
   threadTagsForWindows,
   threadTopic,
   threadRendezvous,
@@ -31,7 +34,7 @@ import {
   THREAD_MAX_CERT_SECONDS,
   verifyDayCertificate
 } from "./thread_route.js";
-import { toHex } from "./sha256.js";
+import { sha256, toHex } from "./sha256.js";
 
 const CLASS_CAP_KMH = 140; // §7 step 9 upper bound, absent leaf context.
 
@@ -48,8 +51,12 @@ const MAX_CERTIFICATES = 4;
 /** Stable codes for the failures a host branches on, alongside the prose. */
 export const THREAD_DROP = Object.freeze({
   BAD_SIGNATURE: "bad-signature",
+  BAD_ADMISSION: "bad-admission",
+  CHAIN_GAP: "chain-gap",
+  FORK: "authority-fork",
+  STALE_AUTHORITY: "stale-authority",
   AWAITING_CERTIFICATE: "awaiting-certificate",
-  CERT_ON_V1_LINK: "cert-on-self-signed-link",
+  CERT_ON_DIRECT_LINK: "cert-on-direct-link",
   CERT_AFTER_LINK_EXPIRY: "cert-after-link-expiry"
 });
 
@@ -71,7 +78,7 @@ export async function createThreadSubscriber({
   clock = Date.now,
   cellContext = null
 } = {}) {
-  const keys = await deriveThreadKeys(link.publicKey);
+  const keys = await deriveThreadKeys(link.threadSecret);
   const epochPrefix8 = epoch32.subarray(0, 8);
   for (let i = 0; i < 8; i++) {
     if (epochPrefix8[i] !== link.epochPrefix8[i]) {
@@ -87,7 +94,7 @@ export async function createThreadSubscriber({
    * certificate, so I will now accept delegated signatures" is a
    * downgrade an attacker performs by sending one.
    */
-  const delegated = link.version === LINK_VERSION_DELEGATED;
+  const delegated = link.delegated === true;
   /**
    * A host may tighten the certificate lifetime bound, never loosen it.
    * The 48 h cap is the reason the split is worth anything: without it a
@@ -105,6 +112,8 @@ export async function createThreadSubscriber({
   const history = [];
   /** Live day certificates, by day public key hex. */
   const certificates = new Map();
+  const authorityLedgers = new Map();
+  const forkedAuthorities = new Set();
   /**
    * §21. Records that opened and decoded but that no certificate we hold
    * yet verifies. A joiner who has not heard the day's certificate is
@@ -128,7 +137,9 @@ export async function createThreadSubscriber({
     certificates: 0,
     held: 0,
     heldEvicted: 0,
-    heldReleased: 0
+    heldReleased: 0,
+    forks: 0,
+    chainGaps: 0
   };
 
   function drop(step, reason, code = null) {
@@ -146,17 +157,20 @@ export async function createThreadSubscriber({
   }
 
   /**
-   * §7 step 6 under a v2 link: which certified day key signed this?
+   * Under a delegated link: which certified authority signed this?
    *
    * Every live certificate is tried. There are at most a handful, and a
    * record does not name its signer — deliberately, since a 256-byte
    * record has no room for 32 bytes of key it would only be repeating.
    */
-  async function signerFor(body) {
-    for (const cert of certificates.values()) {
-      if (await verifyThread(body.preimage, body.signature, cert.dayPublicKey)) return cert;
-    }
-    return null;
+  async function signerFor(record, body) {
+    const cert = [...certificates.values()].find(candidate => candidate.generation === record.generation) ?? null;
+    if (!cert) return null;
+    return await verifyThread(
+      threadRecordSigningMessage(record.aad, body.preimage),
+      body.signature,
+      cert.dayPublicKey
+    ) ? cert : null;
   }
 
   /** Tags for the current window and its neighbours (rotation overlap). */
@@ -199,19 +213,25 @@ export async function createThreadSubscriber({
     const tagHex = toHex(record.tag);
     if (!tags.some(tag => toHex(tag) === tagHex)) return drop(3, "unknown tag");
 
-    // 4. AEAD.
-    const opened = await openThreadBody(keys, record.seq, record.aad, record.ciphertext);
-    if (!opened) return drop(4, "AEAD failed");
+    // 4. Cheap capability admission before AEAD or Ed25519.
+    const expectedAdmission = await threadAdmissionTag(keys, record.aad, record.ciphertext);
+    if (!equalThreadAuth(expectedAdmission, record.admissionTag)) {
+      return drop(4, "admission MAC failed", THREAD_DROP.BAD_ADMISSION);
+    }
 
-    // 5. Inner body well-formed. One topic now carries two body shapes
+    // 5. AEAD.
+    const opened = await openThreadBody(keys, record.seq, record.aad, record.ciphertext);
+    if (!opened) return drop(5, "AEAD failed");
+
+    // 6. Inner body well-formed. One topic now carries two body shapes
     // (§21), so the magic decides the decoder before either runs.
     const bodyMagic = threadBodyMagic(opened);
-    if (bodyMagic === THREAD_MAGIC.PMTC) return acceptCertificate(opened, nowMillis);
+    if (bodyMagic === THREAD_MAGIC.PMTC) return acceptCertificate(record, opened, nowMillis);
     let body;
     try {
       body = decodeThreadBody(opened);
     } catch (error) {
-      return drop(5, error.message);
+      return drop(6, error.message);
     }
     return finishRecord(record, body, nowMillis, { mayHold: true });
   }
@@ -219,9 +239,9 @@ export async function createThreadSubscriber({
   /**
    * §7 step 7's ledger, scoped to **whoever signed**.
    *
-   * Under v1 there is one signer for the life of the run and this is the
-   * counter that has always been here. Under v2 each certified day key
-   * gets its own, and that is not a convenience — it is forced. A run
+   * Under direct authority there is one signer for the life of the run.
+   * Under delegated authority each certified day key gets its own, and
+   * that is not a convenience — it is forced. A run
    * ends at 16:40 and the next one starts at 07:00 the following
    * morning from a different device with a different day key; nothing
    * has been published in between, so §5.5 catch-up has nothing to
@@ -240,10 +260,6 @@ export async function createThreadSubscriber({
    * The per-signer counter lives on the certificate object, so it is
    * bounded and pruned by exactly the same rule the certificates are.
    */
-  function ledgerFor(signer) {
-    return signer ? (signer.highestSeq || 0) : highestSeq;
-  }
-
   /**
    * §21 step 5a — a day certificate arriving on the run's own topic.
    *
@@ -257,31 +273,34 @@ export async function createThreadSubscriber({
    * `K_content` can produce one at all, and a verbatim duplicate of a
    * certificate changes nothing.
    */
-  async function acceptCertificate(opened, nowMillis) {
+  async function acceptCertificate(record, opened, nowMillis) {
     if (!delegated) {
-      // A v1 link says the key in the link signs its own records. A
+      // A direct-authority link says its root signs its own records. A
       // certificate on that thread is the publisher and the artifact
       // disagreeing about what the run is, and the artifact wins.
-      return drop(5, "this link is self-signed and carries no delegated authority", THREAD_DROP.CERT_ON_V1_LINK);
+      return drop(6, "this link uses direct authority and carries no delegated authority", THREAD_DROP.CERT_ON_DIRECT_LINK);
     }
     let cert;
     try {
       cert = decodeDayCertificate(opened);
     } catch (error) {
-      return drop(5, error.message);
+      return drop(6, error.message);
+    }
+    if (record.generation !== cert.generation) {
+      return drop(7, "certificate generation does not match its PMT1 envelope");
     }
     const nowSeconds = Math.floor(nowMillis / 1000);
     const verdict = await verifyDayCertificate(cert, {
-      rootPublicKey: link.publicKey,
+      rootPublicKey: link.rootPublicKey,
       nowSeconds,
       maxSeconds: maxCertSeconds,
       skew: certSkew
     });
-    if (!verdict.ok) return drop(6, verdict.reason, verdict.code);
+    if (!verdict.ok) return drop(7, verdict.reason, verdict.code);
     // The link's own expiry still bounds everything. A certificate that
     // only starts after the term is over authorises nothing.
     if (cert.notBefore > link.notAfter) {
-      return drop(8, "the certificate begins after the link expires", THREAD_DROP.CERT_AFTER_LINK_EXPIRY);
+      return drop(9, "the certificate begins after the link expires", THREAD_DROP.CERT_AFTER_LINK_EXPIRY);
     }
 
     pruneCertificates(nowSeconds);
@@ -304,7 +323,7 @@ export async function createThreadSubscriber({
     // link holder tried to publish — an attack, not an error.
     let signer = null;
     if (delegated) {
-      signer = await signerFor(body);
+      signer = await signerFor(record, body);
       if (!signer) {
         // Under delegation these two are genuinely indistinguishable: a
         // record from today's driver that arrived before today's
@@ -316,35 +335,76 @@ export async function createThreadSubscriber({
         // admitted either.
         if (mayHold) hold(record, body, nowMillis);
         return drop(
-          6,
+          7,
           "waiting for the day's certificate — no certified day key covers this signature",
           THREAD_DROP.AWAITING_CERTIFICATE
         );
       }
-    } else if (!(await verifyThread(body.preimage, body.signature, link.publicKey))) {
+      const nowSeconds = Math.floor(nowMillis / 1000);
+      const highestActive = Math.max(0, ...[...certificates.values()]
+        .filter(cert => nowSeconds + certSkew >= cert.notBefore && nowSeconds - certSkew <= cert.notAfter)
+        .map(cert => cert.generation));
+      if (record.generation < highestActive) {
+        return drop(7, "record was signed by a superseded authority generation", THREAD_DROP.STALE_AUTHORITY);
+      }
+    } else if (
+      record.generation !== 1
+      || !(await verifyThread(
+        threadRecordSigningMessage(record.aad, body.preimage),
+        body.signature,
+        link.rootPublicKey
+      ))
+    ) {
       stats.forgeries++;
       return drop(
-        6,
+        7,
         "signature does not verify (a link holder tried to publish)",
         THREAD_DROP.BAD_SIGNATURE
       );
     }
 
-    // 7. Sequence: strictly increasing — replay and rollback protection.
-    if (record.seq <= ledgerFor(signer)) return drop(7, "seq not strictly increasing");
+    const authority = signer ? signer.generation : 1;
+    if (forkedAuthorities.has(authority)) {
+      return drop(8, "authority is frozen after equivocation", THREAD_DROP.FORK);
+    }
+    const recordHash = sha256(record.bytes).subarray(0, THREAD_CHAIN_HASH_BYTES);
+    let ledger = authorityLedgers.get(authority);
+    if (!ledger) {
+      ledger = { highestSeq: 0, lastHash: null, hashes: new Map(), chainComplete: true };
+      authorityLedgers.set(authority, ledger);
+    }
+    const knownHash = ledger.hashes.get(record.seq);
+    if (knownHash) {
+      if (toHex(knownHash) !== toHex(recordHash)) {
+        forkedAuthorities.add(authority);
+        stats.forks++;
+        return drop(8, "two different records claim the same authority sequence", THREAD_DROP.FORK);
+      }
+      return drop(8, "seq not strictly increasing");
+    }
+    if (record.seq <= ledger.highestSeq) return drop(8, "seq not strictly increasing");
+    let chainGap = !ledger.lastHash && record.seq > 1;
+    if (ledger.lastHash && toHex(record.previousHash) !== toHex(ledger.lastHash)) {
+      if (record.seq === ledger.highestSeq + 1) {
+        forkedAuthorities.add(authority);
+        stats.forks++;
+        return drop(8, "adjacent record does not continue the accepted authority chain", THREAD_DROP.FORK);
+      }
+      chainGap = true;
+    }
 
     // 8. Time window, and never past the link's expiry.
     const nowSeconds = Math.floor(nowMillis / 1000);
-    if (body.unixSeconds < nowSeconds - constants.THREAD_MAX_AGE) return drop(8, "update too old");
-    if (body.unixSeconds > nowSeconds + constants.THREAD_MAX_FUTURE_SKEW) return drop(8, "update from the future");
-    if (body.unixSeconds > link.notAfter) return drop(8, "past the link's notAfter");
+    if (body.unixSeconds < nowSeconds - constants.THREAD_MAX_AGE) return drop(9, "update too old");
+    if (body.unixSeconds > nowSeconds + constants.THREAD_MAX_FUTURE_SKEW) return drop(9, "update from the future");
+    if (body.unixSeconds > link.notAfter) return drop(9, "past the link's notAfter");
 
     // 9. Plausibility: implied speed between accepted updates, and the
     // segment existing in its leaf when we hold the cell.
     if (body.segment && cellContext) {
       const context = cellContext(body.leafCell);
       if (context && (body.geomRef >>> 1) >= context.polylineCount) {
-        return drop(9, "segment does not exist in leaf");
+        return drop(10, "segment does not exist in leaf");
       }
     }
     if (latest && body.segment && latest.segment && body.segment !== latest.segment) {
@@ -352,18 +412,37 @@ export async function createThreadSubscriber({
       if (seconds > 0 && typeof constants.impliedMetersBetween === "function") {
         const meters = constants.impliedMetersBetween(latest, body);
         if (meters != null && (meters / seconds) * 3.6 > CLASS_CAP_KMH * 1.15) {
-          return drop(9, "implied speed implausible");
+          return drop(10, "implied speed implausible");
         }
       }
     }
 
     if (signer) signer.highestSeq = record.seq;
+    ledger.highestSeq = record.seq;
+    ledger.lastHash = Uint8Array.from(recordHash);
+    if (chainGap) {
+      ledger.chainComplete = false;
+      stats.chainGaps++;
+    }
+    ledger.hashes.set(record.seq, Uint8Array.from(recordHash));
+    while (ledger.hashes.size > constants.THREAD_CACHE_RING) {
+      ledger.hashes.delete(ledger.hashes.keys().next().value);
+    }
     // The global figure stays a high-water mark across the whole thread:
     // it is what a §20.5 mid-run handover resumes above, and a
     // replacement device must not restart under the number the audience
     // has already seen today.
     highestSeq = Math.max(highestSeq, record.seq);
-    const update = { ...body, seq: record.seq, receivedAt: nowMillis };
+    const update = {
+      ...body,
+      generation: authority,
+      seq: record.seq,
+      previousHash: record.previousHash,
+      recordHash,
+      chainComplete: ledger.chainComplete,
+      chainGap,
+      receivedAt: nowMillis
+    };
     latest = update;
     history.push(update);
     if (history.length > constants.THREAD_CACHE_RING) history.shift();
@@ -484,6 +563,11 @@ export async function createThreadSubscriber({
     stats,
     latest: () => latest,
     history: () => [...history],
+    /** Catch-up cursor for the newest accepted signed state. */
+    cursor: () => ({
+      generation: latest?.generation ?? 0,
+      seq: latest?.seq ?? 0
+    }),
     /** §21. True when this link delegates signing to certified day keys. */
     delegated,
     /** The live day certificates this subscriber holds (§21). */
