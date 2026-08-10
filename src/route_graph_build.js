@@ -19,6 +19,7 @@ import {
   encodeRouteCell,
   encodeRouteGeometry,
   encodeRouteOverlay,
+  encodeRouteTopSlice,
   encodeRouteRoot
 } from "./route_graph.js";
 import {
@@ -211,6 +212,24 @@ export class IntegerRadixHeap {
   }
 }
 
+// Keep hierarchy objects within a phone-friendly working set. The returned
+// value is always an actual width obtainable by repeatedly grouping leaves
+// by `fanout`, so the ordinary level math and object directory stay intact.
+export function adaptiveTopMaxCells({ nodeCount, leafCount, fanout = 8, configured = 8, targetNodes = 128 * 1024 }) {
+  const minimum = Math.max(2, Math.floor(Number(configured) || 8));
+  const leaves = Math.max(1, Math.floor(Number(leafCount) || 1));
+  const width = Math.max(2, Math.floor(Number(fanout) || 8));
+  const target = Math.max(16 * 1024, Math.floor(Number(targetNodes) || 128 * 1024));
+  const desired = Math.max(minimum, Math.ceil(Math.max(0, Number(nodeCount) || 0) / target));
+  let cells = leaves;
+  while (cells > minimum) {
+    const next = Math.ceil(cells / width);
+    if (desired > minimum && next < desired) break;
+    cells = next;
+  }
+  return Math.max(minimum, cells);
+}
+
 class ReusableMinHeap extends MinHeap {
   clear() {
     this.weights.length = 0;
@@ -380,7 +399,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   // A small top keeps the always-fetched top overlay tiny; deeper levels
   // cost two extra mid-level objects per query but benched strictly better
   // on transfer and latency (see docs/route-graph.md).
-  const topMaxCells = Math.max(2, Math.floor(options.topMaxCells ?? 8));
+  const configuredTopMaxCells = Math.max(2, Math.floor(options.topMaxCells ?? 8));
   const shardCount = Math.max(1, Math.floor(options.shards ?? 1));
   const packBytes = Math.max(64 * 1024, Math.floor(options.packBytes ?? 2 * 1024 * 1024));
   const log = options.log || (() => {});
@@ -429,6 +448,13 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   log(`partition: ${nodeCount.toLocaleString()} nodes into ${leaves.length.toLocaleString()} leaves`);
 
   // 2. Level structure: group leaves by fanout until the top stays small.
+  const topMaxCells = adaptiveTopMaxCells({
+    nodeCount,
+    leafCount: leaves.length,
+    fanout,
+    configured: configuredTopMaxCells,
+    targetNodes: options.topCellTargetNodes
+  });
   const levelFanouts = [];
   let cellsAtTop = leaves.length;
   while (cellsAtTop > topMaxCells) {
@@ -442,6 +468,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const cellsPerLevel = [];
   for (let level = 1; level <= levelCount; level++) {
     cellsPerLevel.push(Math.ceil(leaves.length / cumFanout[level]));
+  }
+  if (cellsAtTop > configuredTopMaxCells) {
+    log(`hierarchy: widened top from ${configuredTopMaxCells.toLocaleString()} to ${cellsAtTop.toLocaleString()} cells for ${nodeCount.toLocaleString()} nodes`);
   }
 
   // 3. Edge LCA levels and per-node boundary requirements.
@@ -1075,18 +1104,51 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   }
   log(`packing: ${levelCount.toLocaleString()} overlay level(s) complete`);
 
-  // Top overlay per bucket: connects the top-child cells; lives in its own
-  // directory so sharded deployments publish one shared boundary artifact.
-  const topEntries = buckets.map((bucket, b) => {
-    const topOverlayGraph = mergeOverlayGraphs(bucketOverlays[b][levelCount], levelCount + 1);
-    const encodedTop = encodeRouteOverlay(topOverlayGraph);
-    const compressedTop = gzipSync(Buffer.from(encodedTop), { level: 6 });
-    return {
-      entry: writeShard(rootWriter, `top-overlay-${b}`, compressedTop, encodedTop.length),
-      nodes: topOverlayGraph.nodes.length
-    };
+  // The root graph used to be one always-fetched object. On Japan that one
+  // object exceeded both JavaScript's Array limit and any sensible mobile
+  // decode budget. Partition its source rows by top hierarchy cell and put
+  // every slice through the same immutable pack/range machinery as leaves
+  // and ordinary overlays. Targets remain global ids, so no unrelated slice
+  // has to be decoded merely to follow an outgoing edge.
+  const topGraphs = bucketOverlays.map(overlaysForBucket => (
+    overlaysForBucket[levelCount].get(0) || { level: levelCount + 1, cellId: 0, ...emptyOverlay }
+  ));
+  const topCells = [];
+  const topRows = topGraphs.map(graphForBucket => {
+    const rows = new Uint32Array(topChildren + 1);
+    let row = 0;
+    for (let cell = 0; cell < topChildren; cell++) {
+      rows[cell] = row;
+      while (
+        row < graphForBucket.nodes.length
+        && Math.floor(leafOfNode[graphForBucket.nodes[row]] / cumFanout[levelCount]) === cell
+      ) row++;
+    }
+    rows[topChildren] = row;
+    return rows;
   });
-  const topOverlayGraph = { nodes: { length: topEntries[0].nodes } };
+  let topOverlayBytes = 0;
+  let topOverlayEdges = 0;
+  for (let cell = 0; cell < topChildren; cell++) {
+    const written = buckets.map((bucket, b) => {
+      const graphForBucket = topGraphs[b];
+      const start = topRows[b][cell];
+      const end = topRows[b][cell + 1];
+      const encoded = encodeRouteTopSlice(graphForBucket, start, end, cell);
+      const compressed = gzipSync(Buffer.from(encoded), { level: 6 });
+      if (b === 0) {
+        topOverlayBytes += encoded.length;
+        topOverlayEdges += graphForBucket.rowStart[end] - graphForBucket.rowStart[start];
+      }
+      return writeShard(rootWriter, `top-slice-${b}-${cell}`, compressed, encoded.length);
+    });
+    const firstLeaf = cell * cumFanout[levelCount];
+    topCells.push({
+      firstLeaf,
+      leafCount: Math.min(cumFanout[levelCount], leaves.length - firstLeaf),
+      entries: written
+    });
+  }
 
   for (const writer of writers) finalizePackWriter(writer);
   for (const writer of geometryWriters) finalizePackWriter(writer);
@@ -1211,7 +1273,14 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       shardIndex: cell.shardIndex,
       pointers: cell.entries.map(entry => pointerOf(writers[cell.shardIndex], entry))
     }))),
-    topOverlay: { shardIndex: topShardIndex, pointers: topEntries.map(top => pointerOf(rootWriter, top.entry)) },
+    topOverlay: {
+      shardIndex: topShardIndex,
+      cells: topCells.map(cell => ({
+        firstLeaf: cell.firstLeaf,
+        leafCount: cell.leafCount,
+        pointers: cell.entries.map(entry => pointerOf(rootWriter, entry))
+      }))
+    },
     namesFile
   };
   const rootEncoded = encodeRouteRoot(root);
@@ -1245,7 +1314,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     levelFanouts,
     topChildren,
     overlayNodes,
-    topOverlayNodes: topOverlayGraph.nodes.length,
+    topOverlayNodes: topGraphs[0].nodes.length,
+    topOverlayEdges,
+    topOverlayBytes,
     buckets: buckets.map(bucket => bucket.name),
     shardCount,
     rootFile,
@@ -1259,51 +1330,4 @@ export function buildRouteGraph(graph, outDir, options = {}) {
 
 function writeShard(writer, key, compressed, logicalLength) {
   return writePackedShard(writer, key, compressed, { logicalLength, kind: "route-graph", codec: ROUTE_GRAPH_FORMAT });
-}
-
-// Merges the per-cell overlay graphs at the top child level into the single
-// top overlay object (they are disjoint node sets plus the crossing edges
-// whose LCA is the top region, already grouped under the root cell 0..n).
-function mergeOverlayGraphs(graphs, level) {
-  let nodeCount = 0;
-  let edgeCount = 0;
-  let maxNode = 0;
-  for (const overlay of graphs.values()) {
-    nodeCount += overlay.nodes.length;
-    edgeCount += overlay.targetIndex.length;
-    for (const node of overlay.nodes) if (node > maxNode) maxNode = node;
-  }
-  const nodes = new Uint32Array(nodeCount);
-  let nodeCursor = 0;
-  for (const overlay of graphs.values()) {
-    nodes.set(overlay.nodes, nodeCursor);
-    nodeCursor += overlay.nodes.length;
-  }
-  nodes.sort();
-  const index = new Uint32Array(maxNode + 1);
-  for (let i = 0; i < nodes.length; i++) index[nodes[i]] = i;
-  const from = new Uint32Array(edgeCount);
-  const to = new Uint32Array(edgeCount);
-  const sourceWeights = new Uint32Array(edgeCount);
-  const sourceIsClique = new Uint8Array(edgeCount);
-  let edgeCursor = 0;
-  for (const overlay of graphs.values()) {
-    for (let i = 0; i < overlay.nodes.length; i++) {
-      for (let e = overlay.rowStart[i]; e < overlay.rowStart[i + 1]; e++) {
-        from[edgeCursor] = index[overlay.nodes[i]];
-        to[edgeCursor] = index[overlay.nodes[overlay.targetIndex[e]]];
-        sourceWeights[edgeCursor] = overlay.weights[e];
-        sourceIsClique[edgeCursor] = overlay.isClique[e];
-        edgeCursor++;
-      }
-    }
-  }
-  const csr = buildCsr(nodes.length, from, to);
-  const weights = new Uint32Array(edgeCount);
-  const isClique = new Uint8Array(edgeCount);
-  for (let i = 0; i < edgeCount; i++) {
-    weights[i] = sourceWeights[csr.edgeIds[i]];
-    isClique[i] = sourceIsClique[csr.edgeIds[i]];
-  }
-  return { level, cellId: 0, nodes, rowStart: csr.rowStart, targetIndex: csr.targets, weights, isClique };
 }

@@ -12,9 +12,9 @@
 // - the root (RFRT): leaf bboxes, node ranges, shard and pack tables, and
 //   object pointers for every cell and overlay block.
 //
-// The query engine (route_graph_query.js) fetches a fixed, provably bounded
-// object set per query: the two leaf cells plus one overlay per ancestor
-// level per endpoint plus the shared top overlay.
+// The query engine (route_graph_query.js) fetches a bounded object set per
+// query: endpoint leaves and ancestors in one wave, then country-scale top
+// slices only when the search frontier reaches their hierarchy cells.
 
 import { fixedWidth, pushVarint, readFixedInt, readVarint, writeFixedInt } from "./binary.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
@@ -23,15 +23,15 @@ export const ROUTE_GRAPH_FORMAT = "rfroutegraph-v1";
 export const ROUTE_ROOT_MAGIC = [0x52, 0x46, 0x52, 0x54]; // RFRT
 export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
+export const ROUTE_TOP_SLICE_MAGIC = [0x52, 0x46, 0x54, 0x53]; // RFTS
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
-const ROOT_VERSION = 11;
+const ROOT_VERSION = 12;
 const CELL_VERSION = 14;
-// v5 cells carry no lane column. A published index is a large download that
-// A reader requires the version it was built for. Carrying older shapes means
-// a branch per field per version, and every one of those is a place to read a
-// byte that is really the next field. Rebuild and republish instead — the
-// index is derived data, and reproducing it is a command.
+// Cell blocks are rebuild-only derived data. Root v12 alone retains v11 read
+// compatibility so a rolling catalog can reference both generations while
+// country graphs publish independently.
 const OVERLAY_VERSION = 3;
+const TOP_SLICE_VERSION = 1;
 const GEOMETRY_VERSION = 1;
 
 // Integer time-of-day metric: factors are time multipliers scaled by 1000,
@@ -372,38 +372,194 @@ export function edgePolyline(geomRef, geometryBlock) {
 // endpoints live in different children.
 
 export function encodeRouteOverlay(overlay) {
-  const out = [...ROUTE_OVERLAY_MAGIC];
-  pushVarint(out, OVERLAY_VERSION);
-  pushVarint(out, overlay.level);
-  pushVarint(out, overlay.cellId);
-  pushVarint(out, overlay.nodes.length);
+  const varintLength = value => {
+    let number = Math.max(0, Math.floor(value));
+    let length = 1;
+    while (number >= 0x80) {
+      number = Math.floor(number / 0x80);
+      length++;
+    }
+    return length;
+  };
+  const zigzag = value => (value < 0 ? -value * 2 - 1 : value * 2);
+  const edgeCount = overlay.rowStart[overlay.nodes.length];
+
+  // A JavaScript Array has a hard 2^32-1 element ceiling and stores each
+  // byte as a tagged value. Japan's cycling top overlay crossed that ceiling
+  // after all expensive graph work was complete. Measure once and write into
+  // one exact byte column instead: identical wire bytes, no geometric array
+  // growth, and one byte of memory per encoded byte rather than eight.
+  let byteLength = ROUTE_OVERLAY_MAGIC.length
+    + varintLength(OVERLAY_VERSION)
+    + varintLength(overlay.level)
+    + varintLength(overlay.cellId)
+    + varintLength(overlay.nodes.length)
+    + varintLength(edgeCount);
   let previous = 0;
   for (const node of overlay.nodes) {
-    pushVarint(out, node - previous);
+    byteLength += varintLength(node - previous);
     previous = node;
   }
-  const edgeCount = overlay.rowStart[overlay.nodes.length];
-  pushVarint(out, edgeCount);
   for (let node = 0; node < overlay.nodes.length; node++) {
     const start = overlay.rowStart[node];
     const end = overlay.rowStart[node + 1];
-    pushVarint(out, end - start);
+    byteLength += varintLength(end - start);
     for (let e = start; e < end; e++) {
-      pushZigzag(out, overlay.targetIndex[e] - node);
-      pushVarint(out, overlay.weights[e] * 2 + (overlay.isClique[e] ? 1 : 0));
-      // The tightest thing standing over the path this arc replaces, as a
-      // 1-based index into the root's table. A shortcut is a whole path
-      // collapsed to one number and the low bridge is somewhere inside it;
-      // without this the hierarchy is a hole every restriction falls through.
-      // Zero on all but a handful of arcs, and one byte when it is.
-      pushVarint(out, overlay.limits ? overlay.limits[e] : 0);
-      // What the path behind this arc passes through — a toll booth, a boat.
-      // A preference to avoid either has to survive the collapse, or the
-      // hierarchy is a hole it falls straight through.
-      pushVarint(out, overlay.pathFlags ? overlay.pathFlags[e] : 0);
+      byteLength += varintLength(zigzag(overlay.targetIndex[e] - node));
+      byteLength += varintLength(overlay.weights[e] * 2 + (overlay.isClique[e] ? 1 : 0));
+      byteLength += varintLength(overlay.limits ? overlay.limits[e] : 0);
+      byteLength += varintLength(overlay.pathFlags ? overlay.pathFlags[e] : 0);
     }
   }
-  return Uint8Array.from(out);
+  if (!Number.isSafeInteger(byteLength)) throw new Error("Route overlay exceeds the safe binary length.");
+
+  const out = new Uint8Array(byteLength);
+  out.set(ROUTE_OVERLAY_MAGIC);
+  let cursor = ROUTE_OVERLAY_MAGIC.length;
+  const writeVarint = value => {
+    let number = Math.max(0, Math.floor(value));
+    while (number >= 0x80) {
+      out[cursor++] = (number % 0x80) | 0x80;
+      number = Math.floor(number / 0x80);
+    }
+    out[cursor++] = number;
+  };
+  writeVarint(OVERLAY_VERSION);
+  writeVarint(overlay.level);
+  writeVarint(overlay.cellId);
+  writeVarint(overlay.nodes.length);
+  previous = 0;
+  for (const node of overlay.nodes) {
+    writeVarint(node - previous);
+    previous = node;
+  }
+  writeVarint(edgeCount);
+  for (let node = 0; node < overlay.nodes.length; node++) {
+    const start = overlay.rowStart[node];
+    const end = overlay.rowStart[node + 1];
+    writeVarint(end - start);
+    for (let e = start; e < end; e++) {
+      writeVarint(zigzag(overlay.targetIndex[e] - node));
+      writeVarint(overlay.weights[e] * 2 + (overlay.isClique[e] ? 1 : 0));
+      writeVarint(overlay.limits ? overlay.limits[e] : 0);
+      writeVarint(overlay.pathFlags ? overlay.pathFlags[e] : 0);
+    }
+  }
+  if (cursor !== byteLength) throw new Error(`Route overlay encoder length mismatch (${cursor} != ${byteLength}).`);
+  return out;
+}
+
+// Country-scale roots use source-row slices rather than one monolithic
+// overlay. Targets stay as global node ids, so a slice is independently
+// useful and the query engine can fetch/inflate it only when its frontier
+// reaches that hierarchy cell.
+export function encodeRouteTopSlice(overlay, start, end, cellId) {
+  const varintLength = value => {
+    let number = Math.max(0, Math.floor(value));
+    let length = 1;
+    while (number >= 0x80) {
+      number = Math.floor(number / 0x80);
+      length++;
+    }
+    return length;
+  };
+  const zigzag = value => (value < 0 ? -value * 2 - 1 : value * 2);
+  let rowCount = 0;
+  let edgeCount = 0;
+  let previousNode = 0;
+  let byteLength = ROUTE_TOP_SLICE_MAGIC.length
+    + varintLength(TOP_SLICE_VERSION)
+    + varintLength(overlay.level)
+    + varintLength(cellId);
+  for (let row = start; row < end; row++) {
+    const degree = overlay.rowStart[row + 1] - overlay.rowStart[row];
+    if (!degree) continue;
+    const node = overlay.nodes[row];
+    rowCount++;
+    edgeCount += degree;
+    byteLength += varintLength(node - previousNode) + varintLength(degree);
+    previousNode = node;
+    for (let edge = overlay.rowStart[row]; edge < overlay.rowStart[row + 1]; edge++) {
+      const target = overlay.nodes[overlay.targetIndex[edge]];
+      byteLength += varintLength(zigzag(target - node));
+      byteLength += varintLength(overlay.weights[edge] * 2 + (overlay.isClique[edge] ? 1 : 0));
+      byteLength += varintLength(overlay.limits ? overlay.limits[edge] : 0);
+      byteLength += varintLength(overlay.pathFlags ? overlay.pathFlags[edge] : 0);
+    }
+  }
+  byteLength += varintLength(rowCount) + varintLength(edgeCount);
+  if (!Number.isSafeInteger(byteLength)) throw new Error("Route top slice exceeds the safe binary length.");
+
+  const out = new Uint8Array(byteLength);
+  out.set(ROUTE_TOP_SLICE_MAGIC);
+  let cursor = ROUTE_TOP_SLICE_MAGIC.length;
+  const writeVarint = value => {
+    let number = Math.max(0, Math.floor(value));
+    while (number >= 0x80) {
+      out[cursor++] = (number % 0x80) | 0x80;
+      number = Math.floor(number / 0x80);
+    }
+    out[cursor++] = number;
+  };
+  writeVarint(TOP_SLICE_VERSION);
+  writeVarint(overlay.level);
+  writeVarint(cellId);
+  writeVarint(rowCount);
+  writeVarint(edgeCount);
+  previousNode = 0;
+  for (let row = start; row < end; row++) {
+    const degree = overlay.rowStart[row + 1] - overlay.rowStart[row];
+    if (!degree) continue;
+    const node = overlay.nodes[row];
+    writeVarint(node - previousNode);
+    writeVarint(degree);
+    previousNode = node;
+    for (let edge = overlay.rowStart[row]; edge < overlay.rowStart[row + 1]; edge++) {
+      writeVarint(zigzag(overlay.nodes[overlay.targetIndex[edge]] - node));
+      writeVarint(overlay.weights[edge] * 2 + (overlay.isClique[edge] ? 1 : 0));
+      writeVarint(overlay.limits ? overlay.limits[edge] : 0);
+      writeVarint(overlay.pathFlags ? overlay.pathFlags[edge] : 0);
+    }
+  }
+  if (cursor !== byteLength) throw new Error(`Route top slice encoder length mismatch (${cursor} != ${byteLength}).`);
+  return out;
+}
+
+export function decodeRouteTopSlice(bytes) {
+  assertMagic(bytes, ROUTE_TOP_SLICE_MAGIC, "Invalid Rangefind route top slice.");
+  const state = { pos: ROUTE_TOP_SLICE_MAGIC.length };
+  const version = readVarint(bytes, state);
+  if (version !== TOP_SLICE_VERSION) throw new Error(`Unsupported route top slice version ${version}.`);
+  const level = readVarint(bytes, state);
+  const cellId = readVarint(bytes, state);
+  const rowCount = readVarint(bytes, state);
+  const edgeCount = readVarint(bytes, state);
+  const nodes = new Uint32Array(rowCount);
+  const rowStart = new Uint32Array(rowCount + 1);
+  const targets = new Uint32Array(edgeCount);
+  const weights = new Uint32Array(edgeCount);
+  const isClique = new Uint8Array(edgeCount);
+  const limits = new Uint32Array(edgeCount);
+  const pathFlags = new Uint8Array(edgeCount);
+  let previousNode = 0;
+  let cursor = 0;
+  for (let row = 0; row < rowCount; row++) {
+    previousNode += readVarint(bytes, state);
+    nodes[row] = previousNode;
+    const degree = readVarint(bytes, state);
+    rowStart[row + 1] = rowStart[row] + degree;
+    for (let i = 0; i < degree; i++) {
+      targets[cursor] = previousNode + readZigzag(bytes, state);
+      const packed = readVarint(bytes, state);
+      weights[cursor] = Math.floor(packed / 2);
+      isClique[cursor] = packed % 2;
+      limits[cursor] = readVarint(bytes, state);
+      pathFlags[cursor] = readVarint(bytes, state);
+      cursor++;
+    }
+  }
+  if (cursor !== edgeCount || state.pos !== bytes.length) throw new Error("Trailing or incomplete bytes in Rangefind route top slice.");
+  return { level, cellId, nodes, rowStart, targets, weights, isClique, limits, pathFlags };
 }
 
 export function decodeRouteOverlay(bytes) {
@@ -634,8 +790,19 @@ export function encodeRouteRoot(root) {
       for (const pointer of cell.pointers) pushPointer(out, pointer);
     }
   }
+  const topCells = root.topOverlay.cells || null;
+  pushVarint(out, topCells ? 1 : 0);
   pushVarint(out, root.topOverlay.shardIndex);
-  for (const pointer of root.topOverlay.pointers) pushPointer(out, pointer);
+  if (topCells) {
+    pushVarint(out, topCells.length);
+    for (const cell of topCells) {
+      pushVarint(out, cell.firstLeaf);
+      pushVarint(out, cell.leafCount);
+      for (const pointer of cell.pointers) pushPointer(out, pointer);
+    }
+  } else {
+    for (const pointer of root.topOverlay.pointers) pushPointer(out, pointer);
+  }
   pushUtf8(out, root.namesFile || "");
   return Uint8Array.from(out);
 }
@@ -644,7 +811,7 @@ export function decodeRouteRoot(bytes) {
   assertMagic(bytes, ROUTE_ROOT_MAGIC, "Invalid Rangefind route graph root.");
   const state = { pos: ROUTE_ROOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== ROOT_VERSION) throw new Error(`Unsupported route graph root version ${version}.`);
+  if (version !== 11 && version !== ROOT_VERSION) throw new Error(`Unsupported route graph root version ${version}.`);
   const format = readUtf8(bytes, state);
   if (format !== ROUTE_GRAPH_FORMAT) throw new Error(`Unsupported route graph format ${format}.`);
   const sourceHash = readUtf8(bytes, state);
@@ -763,9 +930,23 @@ export function decodeRouteRoot(bytes) {
     }
     levels.push(level);
   }
+  const topMode = version >= 12 ? readVarint(bytes, state) : 0;
   const topShardIndex = readVarint(bytes, state);
   const topPointers = [];
-  for (let b = 0; b < bucketCount; b++) topPointers.push(readPointer(bytes, state));
+  let topCells = null;
+  if (topMode === 1) {
+    const topCellCount = readVarint(bytes, state);
+    topCells = [];
+    for (let cell = 0; cell < topCellCount; cell++) {
+      const firstLeaf = readVarint(bytes, state);
+      const leafCount = readVarint(bytes, state);
+      const pointers = [];
+      for (let b = 0; b < bucketCount; b++) pointers.push(readPointer(bytes, state));
+      topCells.push({ firstLeaf, leafCount, pointers });
+    }
+  } else {
+    for (let b = 0; b < bucketCount; b++) topPointers.push(readPointer(bytes, state));
+  }
   const namesFile = readUtf8(bytes, state);
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route graph root.");
   return {
@@ -785,7 +966,9 @@ export function decodeRouteRoot(bytes) {
     shards,
     leaves,
     levels,
-    topOverlay: { shardIndex: topShardIndex, pointers: topPointers },
+    topOverlay: topCells
+      ? { shardIndex: topShardIndex, cells: topCells }
+      : { shardIndex: topShardIndex, pointers: topPointers },
     namesFile
   };
 }

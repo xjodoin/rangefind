@@ -1,9 +1,9 @@
 // Query engine for rfroutegraph-v1 static route graphs.
 //
-// A point-to-point query fetches a fixed, bounded object set computed from
-// the two endpoints alone — the snap leaf cells plus one overlay per
-// ancestor level per endpoint plus the shared top overlay — in one parallel
-// wave, then runs a multilevel bidirectional Dijkstra entirely client-side.
+// A point-to-point query fetches endpoint leaves and ancestors in one parallel
+// wave. Country-scale roots publish top source rows as independent range
+// objects; a forward Dijkstra loads them only as its frontier reaches their
+// hierarchy cells. Legacy roots retain the shared-top bidirectional path.
 // Path geometry is unpacked afterwards by expanding clique edges through
 // their child cells, which touches only the cells the route passes through.
 //
@@ -18,6 +18,7 @@ import {
   decodeRouteGeometry,
   decodeRouteOverlay,
   decodeRouteRoot,
+  decodeRouteTopSlice,
   edgePolyline
 } from "./route_graph.js";
 // Shared with the re-pricing decision, which has to cost the path already
@@ -453,6 +454,24 @@ export async function openRouteGraph(options) {
       });
       overlayCache.set(key, promise);
       promise.catch(() => overlayCache.delete(key));
+    }
+    return promise;
+  }
+
+  const topSliceCache = new Map();
+  function loadTopSlice(bucket, cellId) {
+    const key = `${bucket}:${cellId}`;
+    let promise = topSliceCache.get(key);
+    if (!promise) {
+      const cell = root.topOverlay.cells[cellId];
+      promise = fetchObject(root.topOverlay.shardIndex, cell.pointers[bucket], "overlay").then(bytes => {
+        const slice = decodeRouteTopSlice(bytes);
+        slice.index = new Map();
+        for (let i = 0; i < slice.nodes.length; i++) slice.index.set(slice.nodes[i], i);
+        return slice;
+      });
+      topSliceCache.set(key, promise);
+      promise.catch(() => topSliceCache.delete(key));
     }
     return promise;
   }
@@ -1031,11 +1050,17 @@ export async function openRouteGraph(options) {
         overlayPromises.push([`${level}:${cell}`, loadOverlay(bucket, level, cell)]);
       }
     }
-    overlayPromises.push([`top`, loadOverlay(bucket, levelCount + 1, 0)]);
+    if (!root.topOverlay.cells) overlayPromises.push([`top`, loadOverlay(bucket, levelCount + 1, 0)]);
+    const topSlicePromises = root.topOverlay.cells
+      ? [...new Set([...contexts.contextLeaves].map(leaf => cellAtLevel(leaf, levelCount)))]
+        .sort((a, b) => a - b)
+        .map(cell => loadTopSlice(bucket, cell))
+      : [];
     const cells = new Map();
     for (const [leaf, promise] of cellPromises) cells.set(leaf, await promise);
     const overlays = new Map();
     for (const [key, promise] of overlayPromises) overlays.set(key, await promise);
+    await Promise.all(topSlicePromises);
     return { cells, overlays };
   }
 
@@ -1129,7 +1154,174 @@ export async function openRouteGraph(options) {
       (vehicle?.hov3 ? 0 : EDGE_FLAG_HOV3_ONLY);
   }
 
+  async function searchLazyTopGraph(bucket, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, avoid) {
+    const INF = Infinity;
+    const penaltyFor = penalized
+      ? (from, to, weight) => (penalized.has(`${from}:${to}`) ? Math.round(weight * penalized.factor) : weight)
+      : (from, to, weight) => weight;
+    const limitTable = root.limits || [];
+    const admits = vehicle
+      ? (object, edge) => {
+        const id = object.limits ? object.limits[edge] : 0;
+        if (!id) return true;
+        const limit = limitTable[id - 1];
+        if (!limit) return true;
+        if (limit.heightCm && vehicle.heightCm > limit.heightCm) return false;
+        if (limit.widthCm && vehicle.widthCm > limit.widthCm) return false;
+        if (limit.lengthCm && vehicle.lengthCm > limit.lengthCm) return false;
+        if (limit.weightKg && vehicle.weightKg > limit.weightKg) return false;
+        return true;
+      }
+      : () => true;
+    const shutNow = (() => {
+      const rules = root.banRules || [];
+      const window = root.buckets[bucket]?.rules || [];
+      const shut = new Set();
+      if (!rules.length || !window.length) return shut;
+      for (let id = 1; id <= rules.length; id++) {
+        const ban = rules[id - 1];
+        const covered = window.every(rule =>
+          (rule.dayMask & ban.days) === rule.dayMask
+          && rule.startHour * 60 >= ban.startMinute
+          && rule.endHour * 60 <= ban.endMinute
+        );
+        if (covered) shut.add(id);
+      }
+      return shut;
+    })();
+    const openNow = shutNow.size
+      ? (cell, edge) => !(cell.bans && shutNow.has(cell.bans[edge]))
+      : () => true;
+    const avoidMask = avoidMaskFor(vehicle, avoid);
+    const wantedEdge = avoidMask
+      ? (cell, edge) => ((cell.flags ? cell.flags[edge] : 0) & avoidMask) === 0
+      : () => true;
+    const wantedArc = avoidMask
+      ? (overlay, edge) => ((overlay.pathFlags ? overlay.pathFlags[edge] : 0) & avoidMask) === 0
+      : () => true;
+    const cellList = [...fetched.cells.values()];
+    const overlayEntries = [...fetched.overlays.entries()].map(([key, overlay]) => {
+      const [levelText, cellText] = key.split(":");
+      return { overlay, level: Number(levelText), cell: Number(cellText) };
+    });
+    const membership = new Map();
+    const membershipOf = node => {
+      let entry = membership.get(node);
+      if (entry) return entry;
+      entry = { cells: null, overlays: null };
+      for (const cell of cellList) {
+        if (node >= cell.firstNode && node < cell.firstNode + cell.nodeCount) {
+          (entry.cells ??= []).push(cell);
+        } else if (reverseCell(cell).external.has(node)) {
+          (entry.cells ??= []).push(cell);
+        }
+      }
+      for (const overlayEntry of overlayEntries) {
+        if (overlayEntry.overlay.index.has(node)) (entry.overlays ??= []).push(overlayEntry);
+      }
+      membership.set(node, entry);
+      return entry;
+    };
+    const distF = new Map();
+    const prevF = new Map();
+    const distB = new Map();
+    const prevB = new Map();
+    const heap = new MinHeap();
+    for (const seed of backwardSeeds) {
+      if (seed.weight < (distB.get(seed.node) ?? INF)) {
+        distB.set(seed.node, seed.weight);
+        prevB.set(seed.node, { prev: -1, seed });
+      }
+    }
+    for (const seed of forwardSeeds) {
+      if (seed.weight < (distF.get(seed.node) ?? INF)) {
+        distF.set(seed.node, seed.weight);
+        prevF.set(seed.node, { prev: -1, seed });
+        heap.push(seed.weight, seed.node);
+      }
+    }
+    let best = INF;
+    let meeting = -1;
+    const settled = new Set();
+    const push = (from, target, next, step) => {
+      if (next >= (distF.get(target) ?? INF)) return;
+      distF.set(target, next);
+      prevF.set(target, { prev: from, ...step });
+      heap.push(next, target);
+    };
+    while (heap.size) {
+      const weight = heap.peekWeight();
+      if (weight >= best) break;
+      const node = heap.pop();
+      if (weight !== distF.get(node) || settled.has(node)) continue;
+      settled.add(node);
+      const tail = distB.get(node);
+      if (tail != null && weight + tail < best) {
+        best = weight + tail;
+        meeting = node;
+      }
+
+      const entry = membershipOf(node);
+      for (const cell of entry.cells || []) {
+        if (node < cell.firstNode || node >= cell.firstNode + cell.nodeCount) continue;
+        const local = node - cell.firstNode;
+        for (let edge = cell.rowStart[local]; edge < cell.rowStart[local + 1]; edge++) {
+          if (!admits(cell, edge) || !openNow(cell, edge) || !wantedEdge(cell, edge)) continue;
+          const target = cell.targets[edge];
+          const next = weight + penaltyFor(node, target, liveAdjustedWeight(live, cell, edge, cellEdgeWeight(cell, edge, factors)));
+          push(node, target, next, { kind: "raw", leaf: cell.cellId, edge });
+        }
+      }
+      for (const { overlay, level, cell } of entry.overlays || []) {
+        const index = overlay.index.get(node);
+        const dirtyChildKey = live?.dirtyKeys.size
+          ? `${level - 1}:${cellAtLevel(leafOfNode(node), level - 1)}`
+          : null;
+        for (let edge = overlay.rowStart[index]; edge < overlay.rowStart[index + 1]; edge++) {
+          if (dirtyChildKey && live.dirtyKeys.has(dirtyChildKey)) {
+            if (overlay.isClique[edge]) continue;
+            if (live.byCell.has(fetched.cells.get(leafOfNode(node)))) continue;
+          }
+          if (!admits(overlay, edge) || !wantedArc(overlay, edge)) continue;
+          const target = overlay.nodes[overlay.targetIndex[edge]];
+          push(node, target, weight + penaltyFor(node, target, overlay.weights[edge]), {
+            kind: overlay.isClique[edge] ? "clique" : "crossing",
+            level,
+            cell,
+            weight: overlay.weights[edge]
+          });
+        }
+      }
+
+      // This is the only dependent I/O in the country-scale path. Every
+      // source row belongs to one hierarchy cell, and objectCache makes a
+      // cell a one-time range read even across alternatives and unpacking.
+      const topCell = cellAtLevel(leafOfNode(node), levelCount);
+      const slice = await loadTopSlice(bucket, topCell);
+      const row = slice.index.get(node);
+      if (row != null) {
+        const level = levelCount + 1;
+        const dirtyChildKey = live?.dirtyKeys.size ? `${levelCount}:${topCell}` : null;
+        for (let edge = slice.rowStart[row]; edge < slice.rowStart[row + 1]; edge++) {
+          if (dirtyChildKey && live.dirtyKeys.has(dirtyChildKey) && slice.isClique[edge]) continue;
+          if (!admits(slice, edge) || !wantedArc(slice, edge)) continue;
+          const target = slice.targets[edge];
+          push(node, target, weight + penaltyFor(node, target, slice.weights[edge]), {
+            kind: slice.isClique[edge] ? "clique" : "crossing",
+            level,
+            cell: topCell,
+            weight: slice.weights[edge]
+          });
+        }
+      }
+    }
+    return { best, meeting, distF, distB, prevF, prevB, settled: settled.size };
+  }
+
   function searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, bucketIndex, avoid) {
+    if (root.topOverlay.cells) {
+      return searchLazyTopGraph(bucketIndex, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, avoid);
+    }
     const INF = Infinity;
     // Optional query-graph edge penalties (alternative-route computation):
     // multiplies specific (from, to) transitions without refetching.
@@ -2441,7 +2633,7 @@ export async function openRouteGraph(options) {
       return response;
     };
 
-    const primarySearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, null, live, vehicle, bucket, avoid);
+    const primarySearch = await searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, null, live, vehicle, bucket, avoid);
     let totalWeight = primarySearch.best;
     let usedSameEdge = false;
     if (sameEdge && sameEdge.weight <= totalWeight) {
@@ -2495,7 +2687,7 @@ export async function openRouteGraph(options) {
     const candidates = [primary];
     const searches = [primarySearch];
     for (let i = 0; i < alternativeCount; i++) {
-      const alternativeSearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, bucket, avoid);
+      const alternativeSearch = await searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, bucket, avoid);
       if (alternativeSearch.best === Infinity) break;
       // Recompute the alternative's true (unpenalized) weight from its path.
       const transitions = transitionsOf(alternativeSearch);
@@ -2527,7 +2719,7 @@ export async function openRouteGraph(options) {
   // stops. Exact for every pair by the same argument as the bidirectional
   // search: the union contains each pair's context, and every extra edge is
   // a real path length.
-  function forwardToTargets(contexts, fetched, seeds, targetSeeds, factors, live) {
+  async function forwardToTargets(bucket, contexts, fetched, seeds, targetSeeds, factors, live) {
     const INF = Infinity;
     const cellList = [...fetched.cells.values()];
     const overlayList = [...fetched.overlays.values()];
@@ -2598,6 +2790,21 @@ export async function openRouteGraph(options) {
           }
         }
       }
+      if (root.topOverlay.cells) {
+        const topCell = cellAtLevel(leafOfNode(node), levelCount);
+        const slice = await loadTopSlice(bucket, topCell);
+        const index = slice.index.get(node);
+        if (index != null) {
+          for (let e = slice.rowStart[index]; e < slice.rowStart[index + 1]; e++) {
+            const next = weight + slice.weights[e];
+            const target = slice.targets[e];
+            if (next < (dist.get(target) ?? INF)) {
+              dist.set(target, next);
+              heap.push(next, target);
+            }
+          }
+        }
+      }
     }
     return best;
   }
@@ -2654,7 +2861,7 @@ export async function openRouteGraph(options) {
     }));
     const targetSeeds = snaps.map(backwardSeedsOf);
     for (let i = 0; i < size; i++) {
-      const best = forwardToTargets(contexts, fetched, forwardSeedsOf(snaps[i]), targetSeeds, factors, live);
+      const best = await forwardToTargets(bucket, contexts, fetched, forwardSeedsOf(snaps[i]), targetSeeds, factors, live);
       for (let j = 0; j < size; j++) {
         if (i === j) continue;
         let weight = best[j];
