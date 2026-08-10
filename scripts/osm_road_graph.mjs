@@ -1425,7 +1425,8 @@ export function makeSignTable() {
     /** 0 means "no sign data"; anything else is a 1-based entry. */
     idFor(sign) {
       if (!sign || (!sign.ref && !sign.exit && !sign.destRef && !sign.dest)) return 0;
-      const key = `${sign.ref}\u0000${sign.exit}\u0000${sign.destRef}\u0000${sign.dest}`;
+      const key = `${sign.ref}\u0000${sign.exit}\u0000${sign.destRef}\u0000${sign.dest}` +
+        `\u0000${sign.network || ""}`;
       const existing = byKey.get(key);
       if (existing != null) return existing;
       signs.push(sign);
@@ -1470,12 +1471,53 @@ export function mergeRefs(own, relationRefs) {
   for (const value of [own, ...(relationRefs || [])]) {
     for (const part of String(value || "").split(";")) {
       const ref = part.trim();
-      if (!ref || seen.has(ref)) continue;
-      seen.add(ref);
+      // The same number, spelled two ways. A Luxembourg motorway carries
+      // `ref=A 1` on the way and `ref=A1` on its route relation, and reading
+      // those as two roads put "A 1;A1;E44" on the sign — the driver's own
+      // number, said twice, followed by the one they were looking for.
+      const key = refKey(ref);
+      if (!ref || seen.has(key)) continue;
+      // A bare number repeating one already listed with its letter is the
+      // same road again: a way tagged `N 4` collected by a relation whose
+      // own ref is `4`. Dropping the letter is not another road, and
+      // "N 4;4" on a sign is the driver's own number said twice.
+      if (!/[A-Za-z]/.test(ref) && digitsOf(ref) && seen.has(`#${digitsOf(ref)}`)) continue;
+      seen.add(key);
+      if (digitsOf(ref)) seen.add(`#${digitsOf(ref)}`);
       out.push(ref);
     }
   }
   return out.join(";");
+}
+
+/**
+ * A road number stripped to what makes it that number.
+ *
+ * Spacing and case are how the same road differs between a way and the
+ * relation that collects it; nothing else about a ref is optional.
+ */
+export function refKey(ref) {
+  return String(ref || "").toUpperCase().replace(/[\s\u00a0-]+/g, "");
+}
+
+/** Just the digits, for matching a number against a shorter spelling of it. */
+function digitsOf(ref) {
+  return String(ref || "").replace(/\D+/g, "");
+}
+
+/**
+ * Whether a ref's own letter and a network's road letter describe the same
+ * kind of road.
+ *
+ * `A 4` against `LU:N-road` is Autoroute 4 being offered route 4's marker.
+ * Where either side says nothing about its letter there is nothing to
+ * contradict, and the match stands.
+ */
+function schemesAgree(ref, network) {
+  const refLetter = (String(ref || "").match(/^([A-Za-z]+)/) || [])[1];
+  const netLetter = (String(network || "").match(/[:^]([A-Za-z]+)-road$/) || [])[1];
+  if (!refLetter || !netLetter) return true;
+  return refLetter.toUpperCase() === netLetter.toUpperCase();
 }
 
 export function waySigns(tags, relationRefs) {
@@ -2181,11 +2223,19 @@ export function extractRoadGraph(pbfPath, options = {}) {
       if (type === "route" && (tags.get("route") === "road" || tags.get("route") === "hgv")) {
         const ref = signText(tags.get("ref"));
         if (!ref) return;
+        // Which numbering scheme the number belongs to — `CA:QC:A`, `US:I`,
+        // `e-road`. A bare "15" is an autoroute here, an Interstate three
+        // hundred kilometres south and a *departmental* road in France, and
+        // they are posted on three different shields. Nothing else in the
+        // data says which, and without it a renderer can only guess.
+        const network = signText(tags.get("network"));
         for (const member of members) {
           if (member.type !== "way") continue;
           let refs = routeRefs.get(member.ref);
           if (!refs) routeRefs.set(member.ref, (refs = []));
-          if (refs.length < 4 && !refs.includes(ref)) refs.push(ref);
+          if (refs.length < 4 && !refs.some(entry => entry.ref === ref)) {
+            refs.push({ ref, network });
+          }
         }
         return;
       }
@@ -2229,8 +2279,34 @@ export function extractRoadGraph(pbfPath, options = {}) {
     for (let i = 0; i < ways.length; i++) {
       const refs = routeRefs.get(ways.id.data[i]);
       if (!refs || !refs.length) continue;
-      const merged = signText(mergeRefs(signTable.signs[ways.signFwd.data[i] - 1]?.ref, refs));
+      const merged = signText(mergeRefs(
+        signTable.signs[ways.signFwd.data[i] - 1]?.ref,
+        refs.map(entry => entry.ref)
+      ));
       if (!merged) continue;
+      // The shield belongs to the number that leads, which is the one a
+      // renderer will draw. A way carrying both A 4 and E 50 is posted on two
+      // shields and shows the first.
+      const leading = merged.split(";")[0].trim();
+      // Matched on the number rather than its spelling, or the way's own
+      // "A 1" would never find the relation that calls it "A1" — which is
+      // most of them, and is why the scheme was coming back empty.
+      const network =
+        refs.find(entry => refKey(entry.ref) === refKey(leading))?.network ||
+        // Or the relation that spells the same number without its letter,
+        // which is how Luxembourg's N-roads are collected: the way says
+        // "N 4", the relation says "4".
+        //
+        // Only where the letters agree, though. Autoroute 4 and route 4 are
+        // different roads that share a number, and matching on digits alone
+        // drew the motorway on the N-road's marker — a wrong shield, which
+        // is worse than the plain plate an unmatched road falls back to.
+        refs.find(entry =>
+          digitsOf(entry.ref) &&
+          digitsOf(entry.ref) === digitsOf(leading) &&
+          schemesAgree(leading, entry.network)
+        )?.network ||
+        "";
       for (const [column, id] of [["signFwd", ways.signFwd], ["signBwd", ways.signBwd]]) {
         const base = id.data[i] ? signTable.signs[id.data[i] - 1] : null;
         // A way with no sign at all still gains one: the number is the sign.
@@ -2238,6 +2314,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
         scratch.exit = base?.exit || "";
         scratch.destRef = base?.destRef || "";
         scratch.dest = base?.dest || "";
+        scratch.network = network;
         id.data[i] = signTable.idFor({ ...scratch });
       }
       numberedByRelation++;

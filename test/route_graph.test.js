@@ -2001,7 +2001,33 @@ test("what the signs say survives the index — number, exit, and where it leads
   // `destination:street` is the same promise in words where the target is a
   // street rather than a numbered route.
   assert.equal(waySigns(tags([["destination:street", "Boulevard Labelle"]])).forward.dest, "Boulevard Labelle");
+});
 
+test("the same number spelled two ways is one number, and knows its scheme", async () => {
+  const { mergeRefs, refKey } = await import("../scripts/osm_road_graph.mjs");
+
+  // A Luxembourg motorway carries `ref=A 1` on the way and `ref=A1` on the
+  // route relation that collects it. Read as two roads, the sign came back
+  // "A 1;A1;E44" — the driver's own number, said twice, in front of the one
+  // they were actually looking for.
+  assert.equal(mergeRefs("A 1", ["A1", "E44"]), "A 1;E44");
+  assert.equal(refKey("A 1"), refKey("a1"));
+  assert.equal(refKey("CR 191B"), "CR191B");
+
+  // The relation often drops the letter as well: the way says "N 4" and the
+  // relation says "4". A bare number repeating one already listed with its
+  // letter is that same road again.
+  assert.equal(mergeRefs("N 4", ["4"]), "N 4");
+  assert.equal(mergeRefs("N 11", ["11", "E29"]), "N 11;E29");
+
+  // Numbers that genuinely differ all survive, which is the whole point of
+  // reading the relations in the first place.
+  assert.equal(mergeRefs("A 4", ["E 50"]), "A 4;E 50");
+  assert.equal(mergeRefs("", ["E 25"]), "E 25");
+});
+
+test("a sign table gives one entry per distinct face", async (t) => {
+  const { makeSignTable } = await import("../scripts/osm_road_graph.mjs");
   const table = makeSignTable();
   assert.equal(table.idFor({ ref: "", exit: "", destRef: "", dest: "" }), 0, "a blank sign is no sign");
   const first = table.idFor({ ref: "40", exit: "", destRef: "", dest: "" });
