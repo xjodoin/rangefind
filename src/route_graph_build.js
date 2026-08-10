@@ -222,6 +222,18 @@ class ReusableMinHeap extends MinHeap {
 // through another boundary. This is equivalent to the old O(B^3) post-pass
 // test d(u,x) + d(x,v) === d(u,v), but needs no B-by-B distance matrix and no
 // cubic scan. Positive weights make witness state final before a node settles.
+/**
+ * The tighter of two posted limits, where zero means nothing was posted.
+ *
+ * Not `Math.min`: an unposted road is unlimited, and taking the minimum
+ * against zero would make every road in the country three metres high.
+ */
+function tighter(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return a < b ? a : b;
+}
+
 function localBoundaryDijkstra(
   rowStart,
   targets,
@@ -233,10 +245,20 @@ function localBoundaryDijkstra(
   boundaryCount,
   witnessed,
   stamp,
-  generation
+  generation,
+  limits,
+  edgeFlags,
+  arena
 ) {
   dist[source] = 0;
   witnessed[source] = 0;
+  if (arena) {
+    arena.flagsAlong[source] = 0;
+    arena.limH[source] = 0;
+    arena.limW[source] = 0;
+    arena.limL[source] = 0;
+    arena.limKg[source] = 0;
+  }
   stamp[source] = generation;
   heap.clear();
   heap.push(0, source);
@@ -254,6 +276,16 @@ function localBoundaryDijkstra(
       if (next < previous) {
         dist[target] = next;
         witnessed[target] = passesBoundary;
+        if (arena) {
+          arena.flagsAlong[target] = arena.flagsAlong[node] | (edgeFlags ? edgeFlags[e] : 0);
+          // The tightest thing over the path we just found, which is the
+          // tightest so far plus whatever stands over this edge.
+          const edge = limits ? limits[e] : null;
+          arena.limH[target] = tighter(arena.limH[node], edge ? edge.heightCm : 0);
+          arena.limW[target] = tighter(arena.limW[node], edge ? edge.widthCm : 0);
+          arena.limL[target] = tighter(arena.limL[node], edge ? edge.lengthCm : 0);
+          arena.limKg[target] = tighter(arena.limKg[node], edge ? edge.weightKg : 0);
+        }
         stamp[target] = generation;
         heap.push(next, target);
       } else if (next === previous && passesBoundary) {
@@ -263,6 +295,24 @@ function localBoundaryDijkstra(
   }
 }
 
+/**
+ * Boundary-to-boundary shortcuts for one cell, each carrying the tightest
+ * limit standing over the path it replaces.
+ *
+ * A shortcut is a whole path through a cell collapsed to one number, and the
+ * low bridge is somewhere inside it — so without this a restricted vehicle
+ * either has to abandon the hierarchy (and then cannot be routed beyond the
+ * few cells it has roads loaded for) or falls straight through the shortcut
+ * onto the bridge.
+ *
+ * What is recorded is the limit along the *shortest* path, which is safe and
+ * conservative rather than exact. A vehicle that clears it takes the shortcut
+ * and genuinely fits, because that is the path the shortcut stands for. A
+ * vehicle that does not is refused the shortcut, and may be sent around a
+ * cell it could in fact have crossed by some longer way inside. Being sent
+ * the long way round is a worse route; being sent under the bridge is a
+ * wedged van, and only one of those is allowed to be the error.
+ */
 function boundaryClique(
   nodeCount,
   rowStart,
@@ -272,7 +322,10 @@ function boundaryClique(
   globalNodes,
   globalOffset,
   arenas,
-  heaps
+  heaps,
+  edgeLimits,
+  edgeFlagsAlong,
+  limitTable
 ) {
   if (boundary.length < 2) return new Uint32Array(0);
   arenas.ensure(nodeCount);
@@ -280,7 +333,8 @@ function boundaryClique(
   const heap = nodeCount >= heaps.radixMinNodes ? heaps.radix : heaps.binary;
   boundaryMask.fill(0, 0, nodeCount);
   for (const node of boundary) boundaryMask[node] = 1;
-  const triples = [];
+  const quads = [];
+  const tracking = Boolean(limitTable);
   for (const source of boundary) {
     const generation = arenas.nextGeneration();
     localBoundaryDijkstra(
@@ -294,15 +348,29 @@ function boundaryClique(
       boundary.length,
       witnessed,
       arenas.stamp,
-      generation
+      generation,
+      edgeLimits,
+      edgeFlagsAlong,
+      tracking ? arenas : null
     );
     const globalSource = globalNodes ? globalNodes[source] : globalOffset + source;
     for (const target of boundary) {
       if (target === source || arenas.stamp[target] !== generation || witnessed[target]) continue;
-      triples.push(globalSource, globalNodes ? globalNodes[target] : globalOffset + target, dist[target]);
+      const limitId = tracking
+        ? limitTable.idFor(arenas.limH[target], arenas.limW[target], arenas.limL[target], arenas.limKg[target])
+        : 0;
+      quads.push(
+        globalSource,
+        globalNodes ? globalNodes[target] : globalOffset + target,
+        dist[target],
+        // The limit and what the path passed through, packed together: a
+        // shortcut has to carry both or it is a hole in one of them.
+        limitId,
+        tracking ? arenas.flagsAlong[target] : 0
+      );
     }
   }
-  return Uint32Array.from(triples);
+  return Uint32Array.from(quads);
 }
 
 export function buildRouteGraph(graph, outDir, options = {}) {
@@ -418,20 +486,119 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     }))
   ];
   const edgeClassOf = (edgeId) => (graph.edgeClass ? graph.edgeClass[edgeId] : 0);
-  const weightOf = (edgeId, bucket) => bucketWeight(graph.edgeWeightDs[edgeId], edgeClassOf(edgeId), buckets[bucket].factors);
+
+  /**
+   * Which buckets a timed turn ban is in force for.
+   *
+   * A ban is applied to a bucket only when the bucket's whole window sits
+   * *inside* the ban's — so a no-left-turn from 07:00 to 09:00 shuts the peak
+   * bucket, which is exactly those hours, and leaves the base metric alone.
+   *
+   * Containment rather than overlap, deliberately. Overlap would let an
+   * evening ban shut the base bucket, which is every other hour of the week,
+   * and send a driver the long way round at three in the morning to obey a
+   * sign that only applies at rush hour. Under containment a ban that matches
+   * no bucket is simply not applied — the same as before this existed, never
+   * worse — and adding a bucket for those hours is what turns it on. So the
+   * resolution of this is the resolution of the bucket table, and that is a
+   * dial rather than a limit.
+   */
+  const banRules = graph.banRules || [];
+  const bucketBans = buckets.map(bucket => {
+    const banned = new Set();
+    // The base bucket has no window of its own: it is whatever the others are
+    // not, so nothing can be contained in it and nothing is ever banned there.
+    if (!bucket.rules?.length) return banned;
+    for (let id = 1; id <= banRules.length; id++) {
+      const ban = banRules[id - 1];
+      const covered = bucket.rules.every(rule =>
+        (rule.dayMask & ban.days) === rule.dayMask &&
+        rule.startHour * 60 >= ban.startMinute &&
+        rule.endHour * 60 <= ban.endMinute
+      );
+      if (covered) banned.add(id);
+    }
+    return banned;
+  });
+  const bannedTurns = bucketBans.reduce((sum, set) => sum + set.size, 0);
+  if (banRules.length) {
+    log(`timed turns: ${banRules.length} window(s), ${bannedTurns} bucket application(s)`);
+  }
+
+  /**
+   * A shut turn is not a slow one. Priced out of the metric entirely rather
+   * than penalised, so no route can buy its way through a ban by being long
+   * enough elsewhere — and priced rather than deleted so the same topology
+   * serves every bucket, which is what lets the overlays stay exact.
+   */
+  const IMPASSABLE_DS = 0x3fffffff;
+  const weightOf = (edgeId, bucket) => {
+    const ban = graph.edgeBan ? graph.edgeBan[edgeId] : 0;
+    if (ban && bucketBans[bucket].has(ban)) return IMPASSABLE_DS;
+    return bucketWeight(graph.edgeWeightDs[edgeId], edgeClassOf(edgeId), buckets[bucket].factors);
+  };
 
   // 5. Bottom-up cliques per bucket. cliques[level] maps cellId -> flat
-  // [u, v, w, ...] triples over nodes with maxLca > level, exact within the
+  // [u, v, w, limitId, flags, ...] quints over nodes with maxLca > level, exact within the
   // cell for that bucket's metric.
   const heaps = {
     binary: new ReusableMinHeap(),
     radix: new IntegerRadixHeap(),
     radixMinNodes: Math.max(0, Number(options.overlayRadixMinNodes ?? 4096))
   };
+  /**
+   * The limit sets edges and shortcuts point at, growable during the build.
+   *
+   * Seeded from what the extractor found on the ways, and added to as
+   * shortcuts are formed: collapsing a path takes the tightest of everything
+   * along it, and that combination — a 3.2 m arch on a road with a 7.5 t
+   * bridge — need never have been posted anywhere as a single sign.
+   */
+  const limitTable = (() => {
+    const list = (graph.limits || []).map(limit => ({
+      heightCm: limit.heightCm || 0,
+      weightKg: limit.weightKg || 0,
+      widthCm: limit.widthCm || 0,
+      lengthCm: limit.lengthCm || 0
+    }));
+    const byKey = new Map();
+    list.forEach((limit, index) => {
+      byKey.set(`${limit.heightCm}/${limit.weightKg}/${limit.widthCm}/${limit.lengthCm}`, index + 1);
+    });
+    return {
+      list,
+      idFor(heightCm, widthCm, lengthCm, weightKg) {
+        if (!heightCm && !widthCm && !lengthCm && !weightKg) return 0;
+        const key = `${heightCm}/${weightKg}/${widthCm}/${lengthCm}`;
+        const existing = byKey.get(key);
+        if (existing) return existing;
+        list.push({ heightCm, weightKg, widthCm, lengthCm });
+        byKey.set(key, list.length);
+        return list.length;
+      },
+      /** The four numbers an id stands for, for propagating through a path. */
+      at(id) {
+        return id ? list[id - 1] : null;
+      }
+    };
+  })();
+
   const cliqueArenas = {
     dist: new Float64Array(leafNodes + 8),
     boundaryMask: new Uint8Array(leafNodes + 8),
     witnessed: new Uint8Array(leafNodes + 8),
+    // The tightest thing standing over the best path to each node, carried
+    // alongside the distance so a shortcut can say what its own interior
+    // will admit. Zero is "nothing posted", which is almost every path.
+    // What the best path to each node has passed through, OR-ed along it:
+    // a toll booth or a boat anywhere inside a shortcut is a toll booth or a
+    // boat on the shortcut, or "avoid ferries" falls through the hierarchy
+    // exactly the way a low bridge did.
+    flagsAlong: new Uint8Array(leafNodes + 8),
+    limH: new Uint32Array(leafNodes + 8),
+    limW: new Uint32Array(leafNodes + 8),
+    limL: new Uint32Array(leafNodes + 8),
+    limKg: new Uint32Array(leafNodes + 8),
     stamp: new Uint32Array(leafNodes + 8),
     generation: 0,
     ensure(size) {
@@ -439,6 +606,11 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         this.dist = new Float64Array(size);
         this.boundaryMask = new Uint8Array(size);
         this.witnessed = new Uint8Array(size);
+        this.flagsAlong = new Uint8Array(size);
+        this.limH = new Uint32Array(size);
+        this.limW = new Uint32Array(size);
+        this.limL = new Uint32Array(size);
+        this.limKg = new Uint32Array(size);
       }
       if (this.stamp.length < size) this.stamp = new Uint32Array(size);
     },
@@ -470,17 +642,30 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         const localFrom = [];
         const localTo = [];
         const localWeight = [];
+        const localLimit = [];
+        const localFlag = [];
         for (let node = start; node < end; node++) {
           for (let e = csr.rowStart[node]; e < csr.rowStart[node + 1]; e++) {
             if (edgeLca[csr.edgeIds[e]] !== 0) continue;
             localFrom.push(node - start);
             localTo.push(csr.targets[e] - start);
             localWeight.push(weightOf(csr.edgeIds[e], bucket));
+            localLimit.push(graph.edgeLimit ? graph.edgeLimit[csr.edgeIds[e]] : 0);
+            localFlag.push(graph.edgeFlags ? graph.edgeFlags[csr.edgeIds[e]] : 0);
           }
         }
         const local = buildCsr(size, Uint32Array.from(localFrom), Uint32Array.from(localTo));
         const localWeights = new Uint32Array(localFrom.length);
-        for (let i = 0; i < localFrom.length; i++) localWeights[i] = localWeight[local.edgeIds[i]];
+        // Resolved rather than kept as ids: the search takes minimums across
+        // four numbers per relaxation, and a table lookup in that loop is the
+        // one place this could cost anything.
+        const localLimits = new Array(localFrom.length);
+        const localFlags = new Uint8Array(localFrom.length);
+        for (let i = 0; i < localFrom.length; i++) {
+          localWeights[i] = localWeight[local.edgeIds[i]];
+          localLimits[i] = limitTable.at(localLimit[local.edgeIds[i]]);
+          localFlags[i] = localFlag[local.edgeIds[i]];
+        }
         const boundary = [];
         for (let node = start; node < end; node++) {
           if (maxLca[node] >= 1) boundary.push(node - start);
@@ -494,7 +679,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           null,
           start,
           cliqueArenas,
-          heaps
+          heaps,
+          localLimits,
+          localFlags,
+          limitTable
         ));
       }
       cliques.push(leafCliques);
@@ -533,9 +721,9 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       // dominant peak.
       const edgeCounts = new Uint32Array(cellCount);
       const childCliques = cliques[level - 1];
-      for (const triples of childCliques.values()) {
-        for (let i = 0; i < triples.length; i += 3) {
-          edgeCounts[cellOf(triples[i])]++;
+      for (const quints of childCliques.values()) {
+        for (let i = 0; i < quints.length; i += 5) {
+          edgeCounts[cellOf(quints[i])]++;
         }
       }
       for (let node = 0; node < nodeCount; node++) {
@@ -547,17 +735,23 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         from: new Uint32Array(count),
         to: new Uint32Array(count),
         weights: new Uint32Array(count),
+        // What the path behind this arc will admit, so the tightest point of
+        // a shortcut survives being collapsed into the level above it.
+        limits: new Uint32Array(count),
+        pathFlags: new Uint8Array(count),
         isClique: new Uint8Array(count)
       }));
       const edgeCursor = new Uint32Array(cellCount);
-      for (const triples of childCliques.values()) {
-        for (let i = 0; i < triples.length; i += 3) {
-          const cell = cellOf(triples[i]);
+      for (const quints of childCliques.values()) {
+        for (let i = 0; i < quints.length; i += 5) {
+          const cell = cellOf(quints[i]);
           const cursor = edgeCursor[cell]++;
           const columns = columnsByCell[cell];
-          columns.from[cursor] = overlayLocalIndex[triples[i]];
-          columns.to[cursor] = overlayLocalIndex[triples[i + 1]];
-          columns.weights[cursor] = triples[i + 2];
+          columns.from[cursor] = overlayLocalIndex[quints[i]];
+          columns.to[cursor] = overlayLocalIndex[quints[i + 1]];
+          columns.weights[cursor] = quints[i + 2];
+          columns.limits[cursor] = quints[i + 3];
+          columns.pathFlags[cursor] = quints[i + 4];
           columns.isClique[cursor] = 1;
         }
       }
@@ -571,6 +765,8 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           columns.from[cursor] = overlayLocalIndex[node];
           columns.to[cursor] = overlayLocalIndex[csr.targets[e]];
           columns.weights[cursor] = weightOf(edgeId, bucket);
+          columns.limits[cursor] = graph.edgeLimit ? graph.edgeLimit[edgeId] : 0;
+          columns.pathFlags[cursor] = graph.edgeFlags ? graph.edgeFlags[edgeId] : 0;
         }
       }
       const result = new Map();
@@ -580,13 +776,17 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         const columns = columnsByCell[cell];
         const local = buildCsr(nodes.length, columns.from, columns.to);
         const weights = new Uint32Array(columns.weights.length);
+        const limits = new Uint32Array(columns.limits.length);
+        const pathFlags = new Uint8Array(columns.pathFlags.length);
         const isClique = new Uint8Array(columns.isClique.length);
         for (let i = 0; i < local.edgeIds.length; i++) {
           const edgeId = local.edgeIds[i];
           weights[i] = columns.weights[edgeId];
+          limits[i] = columns.limits[edgeId];
+          pathFlags[i] = columns.pathFlags[edgeId];
           isClique[i] = columns.isClique[edgeId];
         }
-        result.set(cell, { nodes, rowStart: local.rowStart, targetIndex: local.targets, weights, isClique });
+        result.set(cell, { nodes, rowStart: local.rowStart, targetIndex: local.targets, weights, limits, pathFlags, isClique });
       }
       return result;
     };
@@ -615,7 +815,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
           overlay.nodes,
           0,
           cliqueArenas,
-          heaps
+          heaps,
+          Array.from(overlay.limits, id => limitTable.at(id)),
+          overlay.pathFlags,
+          limitTable
         ));
       }
       cliques.push(levelCliques);
@@ -664,10 +867,19 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     // What the signs over this edge say, as an index into the root's table,
     // and the flag byte that says whether it is inside a roundabout.
     const cellSigns = new Uint32Array(cellEdgeCount);
+    // What each edge physically will not admit, as an index into the root's
+    // table. Zero on nearly every edge, which is why it is an index.
+    const cellLimits = new Uint32Array(cellEdgeCount);
+    // When each turn is shut, for the few that are shut on a schedule.
+    const cellBans = new Uint32Array(cellEdgeCount);
+    const cellCharges = new Uint32Array(cellEdgeCount);
+    const cellLaneSigns = new Uint32Array(cellEdgeCount);
+    const cellLaneReach = new Uint32Array(cellEdgeCount);
     const cellFlags = new Uint8Array(cellEdgeCount);
     // Lane movements per edge, in the edge's own travel direction. Jagged,
     // and empty for the overwhelming majority of edges.
     const cellLanes = new Array(cellEdgeCount);
+    const cellLaneAccess = new Array(cellEdgeCount);
     const extLat = new Int32Array(cellEdgeCount);
     const extLon = new Int32Array(cellEdgeCount);
     const geomRefs = new Uint32Array(cellEdgeCount);
@@ -689,15 +901,29 @@ export function buildRouteGraph(graph, outDir, options = {}) {
         cellSpeeds[cursor] = graph.edgeSpeed ? graph.edgeSpeed[edgeId] : 0;
         cellCondRules[cursor] = graph.edgeCond ? graph.edgeCond[edgeId] : 0;
         cellSigns[cursor] = graph.edgeSign ? graph.edgeSign[edgeId] : 0;
+        cellLimits[cursor] = graph.edgeLimit ? graph.edgeLimit[edgeId] : 0;
+        cellBans[cursor] = graph.edgeBan ? graph.edgeBan[edgeId] : 0;
+        cellCharges[cursor] = graph.edgeCharge ? graph.edgeCharge[edgeId] : 0;
+        cellLaneSigns[cursor] = graph.edgeLaneSign ? graph.edgeLaneSign[edgeId] : 0;
+        cellLaneReach[cursor] = graph.edgeLaneMask ? graph.edgeLaneMask[edgeId] : 0;
         cellFlags[cursor] = graph.edgeFlags ? graph.edgeFlags[edgeId] : 0;
         if (graph.laneOffsets && graph.laneBytes) {
+          // `[count, movement × count, reason × count]`; a record written
+          // before reasons existed simply ends after the movements, and the
+          // slice comes back empty rather than wrong.
           const laneStart = graph.laneOffsets[edgeId];
           const laneCount = graph.laneBytes[laneStart] || 0;
+          const reasonStart = laneStart + 1 + laneCount;
+          const hasReasons = graph.laneOffsets[edgeId + 1] >= reasonStart + laneCount;
           cellLanes[cursor] = laneCount
-            ? Array.from(graph.laneBytes.subarray(laneStart + 1, laneStart + 1 + laneCount))
+            ? Array.from(graph.laneBytes.subarray(laneStart + 1, reasonStart))
+            : null;
+          cellLaneAccess[cursor] = laneCount && hasReasons
+            ? Array.from(graph.laneBytes.subarray(reasonStart, reasonStart + laneCount))
             : null;
         } else {
           cellLanes[cursor] = null;
+          cellLaneAccess[cursor] = null;
         }
         if (target < start || target >= end) {
           extLat[cursor] = latE7[target];
@@ -756,8 +982,14 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       speeds: cellSpeeds,
       condRules: cellCondRules,
       signs: cellSigns,
+      limits: cellLimits,
+      bans: cellBans,
+      charges: cellCharges,
+      laneSigns: cellLaneSigns,
+      laneReach: cellLaneReach,
       flags: cellFlags,
       lanes: cellLanes,
+      laneAccess: cellLaneAccess,
       junctions: cellJunctions,
       extLat,
       extLon,
@@ -957,6 +1189,10 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     // the whole graph the way conditional windows are: a route's steps read
     // them without another fetch.
     signs: graph.signs || [],
+    limits: limitTable.list,
+    banRules,
+    charges: graph.charges || [],
+    laneSigns: graph.laneSigns || [],
     classes,
     buckets,
     shards,

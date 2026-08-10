@@ -93,6 +93,66 @@ export interface RouteStep {
   roundabout?: boolean;
   /** Which exit of that roundabout the route leaves by; 0 when unknown. */
   roundaboutExit?: number;
+  /**
+   * How many *other* ways carried on from the junction this step begins at,
+   * setting off within about fifty degrees of the one the route takes.
+   *
+   * This is what identifies a fork, and no angle can: a motorway dividing
+   * bends about ten degrees, and so does a boundary where a street is
+   * renamed. Guidance reading only the geometry says nothing at either —
+   * right for the name change, and silence at the one moment a driver is
+   * looking at a Y with no way to tell which prong is theirs.
+   *
+   * A count of arms would not do it either. A crossroads driven straight
+   * through has three ways on and needs no instruction, because only one of
+   * them continues the road; measuring them against the route's own heading
+   * is what separates the two. Slip roads are excluded when the route is not
+   * itself on one, or every motorway exit passed would read as a fork.
+   *
+   * A junction with one of these is also never folded into the step before
+   * it: a fork keeps the road's name, which is precisely what used to make it
+   * disappear.
+   *
+   * **0 means unknown or none**, and is never grounds for saying anything.
+   */
+  forkArms?: number;
+  /**
+   * Nothing carries on the way the driver arrived: the road stops here and
+   * this step turns off the end of it.
+   *
+   * "Turn left" and "at the end of the road, turn left" are different
+   * instructions — one is a turning off a road that continues past it, the
+   * other is a road that simply stops — and the difference is not in the
+   * angle, which is identical.
+   */
+  endOfRoad?: boolean;
+  /**
+   * What the overhead panel says above each lane of the approach to this
+   * step, left to right, aligned with `lanes`.
+   *
+   * The arrows say which movements a lane allows; only this says where any
+   * of them goes. A driver on a five-lane approach with an interchange in
+   * ninety seconds is reading the panel, not the road.
+   */
+  laneDestinations?: string[];
+  /**
+   * Why each lane of that approach is not the driver's, left to right and
+   * aligned with `lanes`; 0 where it is theirs. Empty when the map never
+   * said, which is most roads.
+   *
+   * Bits: 1 bus or other public service vehicle, 2 car-pool of two, 4 taxi,
+   * 8 bicycle, 16 closed to motor traffic outright, 32 car-pool of three.
+   * A lane asks for one car-pool number or the other, never both, so 2 and
+   * 32 are alternatives rather than a value and a modifier. 16 is a marker
+   * rather than a class — a bus lane is normally tagged as both 1 and 16 —
+   * so a lane whose only bit is 16 is nobody's to drive in, and a lane that
+   * names a class is open to a driver who belongs to it.
+   *
+   * The arrows never say a lane is somebody else's: a reserved bus lane
+   * carries a straight-ahead arrow like every other lane, so guidance drawn
+   * from `lanes` alone will happily point a driver into one.
+   */
+  laneAccess?: number[];
 }
 
 /** 1 traffic signals, 2 stop, 3 give way, 4 level crossing, 5 crossing. */

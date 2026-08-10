@@ -28,8 +28,17 @@ const EARTH_RADIUS_METERS = 6371008.7714;
  */
 export const FERRY_CLASS = "ferry";
 
+/**
+ * A train that carries cars: the Chunnel, the Alpine tunnels, the Rocky
+ * Mountaineer's motorail. Routable exactly like a ferry — you drive on, you
+ * wait, you drive off — and unroutable without this, which cuts a country in
+ * half wherever one is the only way through a mountain.
+ */
+export const SHUTTLE_CLASS = "shuttle_train";
+
 export function wayClass(tags) {
   if (tags.get("route") === "ferry") return FERRY_CLASS;
+  if (tags.get("route") === "shuttle_train" || tags.get("route") === "shuttle") return SHUTTLE_CLASS;
   return tags.get("highway");
 }
 
@@ -53,7 +62,10 @@ const CAR_SPEEDS = {
   road: 30,
   // Nominal only: a crossing's real speed comes from its `duration` tag and
   // its real cost is mostly the wait for the next sailing. See ferryProfile.
-  [FERRY_CLASS]: 20
+  [FERRY_CLASS]: 20,
+  // Nominal only, like a ferry: what it really costs is the wait and the
+  // timetable, not the speed of the train.
+  [SHUTTLE_CLASS]: 60
 };
 
 // Effective cycling speeds, not the speed a bicycle is capable of. A
@@ -80,7 +92,10 @@ const BIKE_SPEEDS = {
   footway: 6,
   pedestrian: 6,
   road: 14,
-  [FERRY_CLASS]: 20
+  [FERRY_CLASS]: 20,
+  // Nominal only, like a ferry: what it really costs is the wait and the
+  // timetable, not the speed of the train.
+  [SHUTTLE_CLASS]: 60
 };
 
 /**
@@ -123,7 +138,10 @@ const FOOT_SPEEDS = {
   primary_link: 4,
   cycleway: 5,
   road: 5,
-  [FERRY_CLASS]: 20
+  [FERRY_CLASS]: 20,
+  // Nominal only, like a ferry: what it really costs is the wait and the
+  // timetable, not the speed of the train.
+  [SHUTTLE_CLASS]: 60
 };
 
 const ACCESS_DENIED = new Set(["no", "private", "delivery", "agricultural", "forestry", "military"]);
@@ -144,12 +162,101 @@ const ACCESS_DENIED = new Set(["no", "private", "delivery", "agricultural", "for
  */
 const ACCESS_DESTINATION_ONLY = new Set(["customers", "destination", "permit"]);
 
+/** Access values that mean "yes, this class may use this road". */
+const ACCESS_ALLOWS = new Set(["yes", "designated", "permissive", "official"]);
+
 function destinationOnly(tags) {
   for (const key of ["motor_vehicle", "vehicle", "access"]) {
     const value = tags.get(key);
     if (value != null) return ACCESS_DESTINATION_ONLY.has(value);
   }
   return false;
+}
+
+/**
+ * Barriers on a node, and who may pass them.
+ *
+ * A gate across a track, a bollard at the end of an alley, a kissing gate on
+ * a field path: these sever a way as completely as a missing road, and none
+ * of them was being read. Every one of them was a routable road — so a
+ * driver could be sent down a lane that ends at a locked gate, and told to
+ * turn into an alley a car has never been able to enter.
+ *
+ * Three kinds, because OSM's barriers behave in three ways:
+ *
+ * - **Impassable to everything.** A wall or a ditch is not a way through.
+ * - **Impassable to motor vehicles, open to people.** A bollard, a stile, a
+ *   kissing gate. This is the common case and the one that matters most for
+ *   a delivery van: an alley closed by bollards is a perfectly good footpath
+ *   and not a road at all.
+ * - **Gated but ordinarily passable.** A gate, a lift gate, a toll booth.
+ *   Open unless the tagging says otherwise, because most of them stand open
+ *   and refusing them all would cut up farm tracks and car parks everywhere.
+ *
+ * An explicit access tag on the node outranks the table in both directions,
+ * which is how a gate marked `foot=yes` stays a footpath and a bollard
+ * marked `motor_vehicle=yes` stays a road.
+ */
+const BARRIER_BLOCKS_ALL = new Set([
+  "wall", "fence", "hedge", "ditch", "jersey_barrier", "debris", "yes", "guard_rail"
+]);
+
+/**
+ * Barriers that stop a motor vehicle. Most of them exist for exactly that:
+ * a bollard is put there to keep cars out of a lane people still walk and
+ * cycle down, and reading it as a closure for everyone would delete the
+ * footpath along with the road.
+ */
+const BARRIER_BLOCKS_MOTOR = new Set([
+  "bollard", "block", "planter", "cycle_barrier", "motorcycle_barrier",
+  "sump_buster", "stile", "kissing_gate", "turnstile", "full-height_turnstile",
+  "wicket_gate", "hampshire_gate"
+]);
+
+/** Barriers people on foot get through but wheels do not. */
+const BARRIER_FOOT_ONLY = new Set([
+  "stile", "kissing_gate", "turnstile", "full-height_turnstile", "wicket_gate"
+]);
+
+/**
+ * Whether [profile] is stopped by the barrier on this node.
+ *
+ * Absence of a barrier tag is the overwhelmingly common case and returns
+ * false immediately; nothing else here runs for an ordinary junction.
+ */
+export function barrierBlocks(profileName, tags) {
+  if (!tags) return false;
+  const barrier = tags.get("barrier");
+  if (!barrier) return false;
+
+  // What the node itself says, most specific first. An explicit yes or no is
+  // the mapper telling us about this barrier in particular, and it wins.
+  const keys = profileName === "car"
+    ? ["motorcar", "motor_vehicle", "vehicle", "access"]
+    : profileName === "bike"
+      ? ["bicycle", "vehicle", "access"]
+      : ["foot", "access"];
+  for (const key of keys) {
+    const value = tags.get(key);
+    if (value == null) continue;
+    if (ACCESS_DENIED.has(value)) return true;
+    // `customers`/`destination` are a way in, not a way through; the way-level
+    // rules already slow those, so the barrier itself does not refuse them.
+    return false;
+  }
+  // A gate that is actually locked is a wall with hinges.
+  if (tags.get("locked") === "yes") return true;
+
+  if (BARRIER_BLOCKS_ALL.has(barrier)) return true;
+  // Everything left is something a person walks through — that is what a
+  // stile is for — so on foot none of it is a refusal.
+  if (profileName === "foot") return false;
+  // A cycle barrier is built to slow a bicycle, not to stop one; the rest of
+  // the foot-only barriers do stop one.
+  // On a bicycle only the ones built around a person stop you. A bollard is
+  // put there to let you through, and a cycle barrier to slow you down.
+  if (profileName === "bike") return BARRIER_FOOT_ONLY.has(barrier);
+  return BARRIER_BLOCKS_MOTOR.has(barrier);
 }
 
 /**
@@ -203,6 +310,11 @@ const FERRY_MAX_WAIT_SECONDS = 1800;
  * only — and they say so on themselves. Absent tags mean the usual: a ferry
  * route in the road network carries vehicles unless it says otherwise.
  */
+/** A crossing you board and wait for: a boat, or a train that takes cars. */
+export function isBoarded(cls) {
+  return cls === FERRY_CLASS || cls === SHUTTLE_CLASS;
+}
+
 function ferryAllowed(tags, profileName) {
   const keys = profileName === "car"
     ? ["motorcar", "motor_vehicle", "vehicle", "access"]
@@ -230,8 +342,10 @@ function motorroad(tags) {
 
 // Fixed junction penalties in deciseconds, applied to every edge entering a
 // tagged node. Signals dominate systematic urban ETA error.
-const CAR_NODE_PENALTIES = { traffic_signals: 100, stop: 20, give_way: 10, level_crossing: 60, crossing_signals: 50 };
-const BIKE_NODE_PENALTIES = { traffic_signals: 80, stop: 15, give_way: 5, level_crossing: 40, crossing_signals: 40 };
+// A mini-roundabout is a give-way that everybody slows for, so it costs a
+// little more than the painted triangle and far less than a signal.
+const CAR_NODE_PENALTIES = { traffic_signals: 100, stop: 20, give_way: 10, level_crossing: 60, crossing_signals: 50, mini_roundabout: 25 };
+const BIKE_NODE_PENALTIES = { traffic_signals: 80, stop: 15, give_way: 5, level_crossing: 40, crossing_signals: 40, mini_roundabout: 15 };
 const FOOT_NODE_PENALTIES = { traffic_signals: 60, level_crossing: 30, crossing_signals: 20 };
 
 /**
@@ -327,6 +441,154 @@ export function chargeEachIntersectionOnce(usedIds, latE7, lonE7, penaltyDs, kin
 /** Per-edge flags. Bit 0: the edge runs inside a roundabout. */
 export const EDGE_FLAG_ROUNDABOUT = 1;
 
+/**
+ * This road is tolled.
+ *
+ * A flag rather than a cost, because a toll is not slow — it is a decision.
+ * Some drivers pay it every day without thinking and some will drive twenty
+ * minutes to avoid two dollars, and a router that folds the money into the
+ * time has answered that question for both of them.
+ */
+export const EDGE_FLAG_TOLL = 2;
+
+/**
+ * This edge is a boat.
+ *
+ * The class already says so on the roads themselves, but a shortcut carries
+ * no class — and "avoid ferries" has to survive being collapsed into one, or
+ * the hierarchy is a hole the preference falls through exactly the way the
+ * height limits did.
+ */
+export const EDGE_FLAG_FERRY = 4;
+
+/**
+ * Dangerous goods are refused here.
+ *
+ * `hazmat=no` on a tunnel is not a preference and not a cost: a tanker in
+ * the Ville-Marie is a criminal matter, and the sign is there because the
+ * consequence of ignoring it is measured in lives rather than minutes. A
+ * flag, so a vehicle that declares it is carrying any is simply refused the
+ * road — and a vehicle that declares nothing is unaffected.
+ */
+export const EDGE_FLAG_NO_HAZMAT = 8;
+
+/**
+ * Goods vehicles are refused here.
+ *
+ * `hgv=no` is the most-mapped restriction in the world that this router had
+ * no way to read, and it is aimed squarely at the vehicle a delivery app is
+ * routing: a residential street signed against lorries, a bridge approach,
+ * a town centre closed to through freight. A van under 3.5 t is not an HGV
+ * and is not affected, which is why this is a flag on the road and a
+ * declaration on the vehicle rather than something baked into the profile —
+ * one index serves the car and the truck.
+ *
+ * `hgv=destination` is refused for the same reason `access=destination` is:
+ * the router cannot tell a delivery on this street from a shortcut through
+ * it, and guessing wrong sends a lorry down a road it is signed out of.
+ */
+export const EDGE_FLAG_NO_HGV = 16;
+
+/**
+ * A road reserved for public service vehicles, and one reserved for
+ * car-pools.
+ *
+ * These used to be deleted at extract time — `access=psv` meant the way
+ * never entered the graph — which is right for the car it was written for
+ * and leaves a bus or taxi driver unable to be routed down the very roads
+ * their job is on. Deleting also makes the decision unrecoverable: no
+ * option at query time can bring back a way that was never written.
+ *
+ * So the road stays and says who it is for, and the ordinary driver is
+ * refused it by the same mechanism that refuses them a toll or a ferry.
+ * Two bits rather than one because the entitlements differ: a car with a
+ * passenger may use an HOV lane and never a bus lane.
+ */
+export const EDGE_FLAG_PSV_ONLY = 32;
+export const EDGE_FLAG_HOV_ONLY = 64;
+
+/**
+ * A car-pool road that asks for three aboard rather than two.
+ *
+ * Not every reserved lane wants the same carful: Québec tags 109 ways with
+ * `hov:minimum` and 22 of them read 3. A driver with one passenger who is
+ * sent down one of those is in a reserved lane they do not qualify for,
+ * which is the fine this whole family of flags exists to avoid.
+ *
+ * Encoded as a second value rather than a modifier — a road is HOV-2 or
+ * HOV-3, never both — so it drops straight into the same refusal mask as
+ * everything else: a driver avoids whichever minimums they fall short of.
+ */
+export const EDGE_FLAG_HOV3_ONLY = 128;
+
+/**
+ * How many have to be aboard for a car-pool lane here.
+ *
+ * Two where the map does not say, that being what nearly every sign reads
+ * and what `hov=designated` means on its own.
+ */
+export const HOV_DEFAULT_MINIMUM = 2;
+
+export function hovMinimum(tags) {
+  const raw = Number(String(tags.get("hov:minimum") ?? "").trim());
+  return Number.isFinite(raw) && raw >= 2 ? Math.min(9, Math.round(raw)) : HOV_DEFAULT_MINIMUM;
+}
+
+/**
+ * Who a whole road is reserved for, as edge flags; 0 for an ordinary road.
+ *
+ * The same question [laneAccessList] asks of one lane, asked of the way.
+ */
+export function reservedFor(tags) {
+  const access = tags.get("access");
+  const carpool = hovMinimum(tags) >= 3 ? EDGE_FLAG_HOV3_ONLY : EDGE_FLAG_HOV_ONLY;
+  if (access === "psv" || access === "bus") return EDGE_FLAG_PSV_ONLY;
+  if (access === "hov") return carpool;
+  if (tags.get("motor_vehicle") === "psv" || tags.get("motorcar") === "psv") {
+    return EDGE_FLAG_PSV_ONLY;
+  }
+  // `hov=designated` with nothing said about cars is a car-pool lane; where
+  // `motorcar` is spelled out, that is the more specific claim and wins.
+  if (tags.get("hov") === "designated" && tags.get("motorcar") == null) {
+    return carpool;
+  }
+  return 0;
+}
+
+/**
+ * What passing here costs, in the smallest unit of its currency.
+ *
+ * OSM tags money as `charge=2.50 CAD` or `toll:charge=5 EUR`, and sometimes
+ * with a per-vehicle qualifier this deliberately ignores — a price that is
+ * only right for one class of vehicle is worse than no price, and the honest
+ * answer for a van is "there is a toll here" rather than a car's fare.
+ *
+ * Returns null when there is nothing usable, which is most tolled roads:
+ * `toll=yes` is mapped far more often than any price is.
+ */
+export function parseCharge(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  // A conditional or per-vehicle charge is a table, not a number.
+  if (text.includes("@") || text.includes(";")) return null;
+  const match = text.match(/^([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?$/);
+  if (!match) return null;
+  const amount = Number(match[1].replace(",", "."));
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return { cents: Math.round(amount * 100), currency: (match[2] || "").toUpperCase() };
+}
+
+/** Whether this way is tolled for the profile being built. */
+export function wayTolled(tags) {
+  for (const key of ["toll:motorcar", "toll"]) {
+    const value = tags.get(key);
+    if (value == null) continue;
+    return value === "yes" || value === "true" || value === "1";
+  }
+  return false;
+}
+
 /** Which way a sign faces: 1 forward along the way, 2 backward, 3 both. */
 export const FACES_FORWARD = 1;
 export const FACES_BACKWARD = 2;
@@ -371,14 +633,45 @@ function nodePenaltyDs(profile, tags) {
 // Junction kinds surfaced to navigation UIs (route results annotate where
 // an edge enters one): 0 none, 1 traffic signals, 2 stop, 3 give way,
 // 4 level crossing, 5 pedestrian crossing.
-export const JUNCTION_KINDS = { traffic_signals: 1, stop: 2, give_way: 3, level_crossing: 4, crossing: 5 };
+export const JUNCTION_KINDS = {
+  traffic_signals: 1, stop: 2, give_way: 3, level_crossing: 4, crossing: 5,
+  // A mini-roundabout is a painted circle on an ordinary crossroads: no arcs,
+  // no way to count exits from, and nothing in the geometry that says it is
+  // there at all. The turn angle through it is the real instruction, so this
+  // is drawn beside that turn rather than replacing it — "turn left" is still
+  // what the driver does, and the symbol says what they will be turning at.
+  mini_roundabout: 6
+};
 
-function nodeKindCode(tags) {
+/**
+ * Crossing values that mean there is something painted on the road.
+ *
+ * `uncontrolled` is the historical tag for a marked crossing without signals
+ * and still the commonest in North America; `zebra` and `marked` say it
+ * outright. Everything else — `unmarked` above all — is a place the footway
+ * meets the road and nothing is drawn there at all.
+ */
+const MARKED_CROSSINGS = new Set(["marked", "zebra", "uncontrolled", "traffic_signals"]);
+
+export function nodeKindCode(tags) {
   if (!tags) return 0;
   const highway = tags.get("highway");
   // A signal-controlled pedestrian crossing is a signal for a driver.
   if (highway === "crossing" && tags.get("crossing") === "traffic_signals") {
     return JUNCTION_KINDS.traffic_signals;
+  }
+  // Most crossing nodes in OSM are not crossings a driver would recognise:
+  // they exist to join a sidewalk or footpath to the roadway so pedestrian
+  // routing works at all, and nothing is painted there. Drawing them put a
+  // marker on the driver's map every few metres for something that is not on
+  // the road, which is exactly what was reported. Only a crossing that is
+  // actually marked is a feature of the road.
+  if (highway === "crossing") {
+    const crossing = tags.get("crossing");
+    const markings = tags.get("crossing:markings");
+    const marked = (crossing && MARKED_CROSSINGS.has(crossing)) ||
+      (markings != null && markings !== "no");
+    if (!marked) return 0;
   }
   if (highway && JUNCTION_KINDS[highway]) return JUNCTION_KINDS[highway];
   if (tags.get("railway") === "level_crossing") return JUNCTION_KINDS.level_crossing;
@@ -386,8 +679,8 @@ function nodeKindCode(tags) {
 }
 
 // Importance when several tagged nodes fall on one edge: signals > stop >
-// level crossing > give way > plain crossing.
-const JUNCTION_RANK = [0, 5, 4, 2, 3, 1];
+// level crossing > mini-roundabout > give way > plain crossing.
+const JUNCTION_RANK = [0, 6, 5, 2, 4, 1, 3];
 
 // Turn costs in deciseconds by geometric turn kind. Left turns cross
 // oncoming traffic under right-hand driving, so they cost more than right
@@ -420,8 +713,9 @@ export const PROFILES = {
     allowed(tags) {
       const highway = wayClass(tags);
       if (!highway || !(highway in BIKE_SPEEDS)) return false;
-      if (highway === FERRY_CLASS) return ferryAllowed(tags, "bike");
+      if (isBoarded(highway)) return ferryAllowed(tags, "bike");
       if (tags.get("area") === "yes") return false;
+      if (tags.get("ford") && tags.get("ford") !== "no") return false;
       const bicycle = tags.get("bicycle");
       // An explicit permission outranks everything below: a bridge that
       // carries a cycle track across an expressway says so on itself.
@@ -453,7 +747,7 @@ export const PROFILES = {
     allowed(tags) {
       const highway = wayClass(tags);
       if (!highway || !(highway in FOOT_SPEEDS)) return false;
-      if (highway === FERRY_CLASS) return ferryAllowed(tags, "foot");
+      if (isBoarded(highway)) return ferryAllowed(tags, "foot");
       if (tags.get("area") === "yes") return false;
       const foot = tags.get("foot");
       if (foot != null) return !ACCESS_DENIED.has(foot);
@@ -517,17 +811,17 @@ function parseMaxspeed(value) {
  * where `days` is a 7-bit mask from Monday and the month range is inclusive
  * and may wrap (Sep-Jun is a school year, not an error).
  */
-export function parseConditionalMaxspeed(value) {
-  if (!value) return null;
-  const text = String(value).trim();
-  const at = text.indexOf("@");
-  if (at < 0) return null;
-
-  const speedKmh = parseMaxspeed(text.slice(0, at));
-  if (!speedKmh) return null;
-
+/**
+ * The `@ (Mo-Fr 07:00-09:00)` half of a conditional tag, as a window.
+ *
+ * Shared by the two tags that carry one: a speed limit that drops on school
+ * mornings, and a turn that is banned during the peak. Null when there is no
+ * time range to act on — a condition like `@ wet` is real tagging and simply
+ * not something a clock can answer.
+ */
+export function parseConditionWindow(text) {
   // Parentheses are optional in the wild, and so are the separators inside.
-  let condition = text.slice(at + 1).trim().replace(/^\(|\)$/g, "").trim();
+  const condition = String(text || "").trim().replace(/^\(|\)$/g, "").trim();
   if (!condition) return null;
 
   const time = condition.match(/(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/);
@@ -541,7 +835,6 @@ export function parseConditionalMaxspeed(value) {
   const months = parseMonthRange(before);
 
   return {
-    speedKmh: Math.round(speedKmh),
     // No day range means every day, which is what a bare time range says.
     days: days ?? 0b1111111,
     startMinute,
@@ -549,6 +842,41 @@ export function parseConditionalMaxspeed(value) {
     monthStart: months ? months.start : 1,
     monthEnd: months ? months.end : 12
   };
+}
+
+export function parseConditionalMaxspeed(value) {
+  if (!value) return null;
+  const text = String(value).trim();
+  const at = text.indexOf("@");
+  if (at < 0) return null;
+
+  const speedKmh = parseMaxspeed(text.slice(0, at));
+  if (!speedKmh) return null;
+
+  const window = parseConditionWindow(text.slice(at + 1));
+  if (!window) return null;
+  return { speedKmh: Math.round(speedKmh), ...window };
+}
+
+/**
+ * A turn restriction that only applies at certain hours.
+ *
+ * `no_left_turn @ (Mo-Fr 07:00-09:00)` is one sign with two meanings, and the
+ * router had exactly one way of reading it: throw the whole relation away and
+ * let the turn stand at every hour, including the two it is banned in. That
+ * is the wrong direction to fail — a detour costs minutes, an illegal turn
+ * costs a ticket and sometimes more.
+ */
+export function parseConditionalRestriction(value) {
+  if (!value) return null;
+  const text = String(value).trim();
+  const at = text.indexOf("@");
+  if (at < 0) return null;
+  const kind = text.slice(0, at).trim().toLowerCase();
+  if (!/^(no_|only_)/.test(kind)) return null;
+  const window = parseConditionWindow(text.slice(at + 1));
+  if (!window) return null;
+  return { kind, ...window };
 }
 
 const DAY_NAMES = ["mo", "tu", "we", "th", "fr", "sa", "su"];
@@ -664,6 +992,113 @@ export function centreTurnLane(tags) {
 }
 
 /**
+ * Why a lane is not this driver's, as a bit set; 0 means it is theirs.
+ *
+ * Kept as reasons rather than a single "closed" bit because the reason is
+ * the instruction. "Bus lane" and "HOV lane" are different facts to a driver
+ * — one is never theirs, the other is theirs with a passenger — and a lane
+ * greyed out with no explanation reads as a rendering fault.
+ */
+export const LANE_BUS = 1;
+export const LANE_HOV = 2;
+export const LANE_TAXI = 4;
+export const LANE_BICYCLE = 8;
+/** Closed to motor traffic outright, by `motor_vehicle:lanes=no` and kin. */
+export const LANE_NO_MOTOR = 16;
+/**
+ * A car-pool lane wanting three aboard rather than two, per `hov:minimum`.
+ *
+ * A separate value from [LANE_HOV] rather than a modifier on it: a lane asks
+ * for one number or the other, and keeping them distinct means a driver with
+ * a single passenger is matched against 2 and refused 3 by the same test
+ * that handles buses and taxis. Québec tags 91 ways with both `hov:lanes`
+ * and a minimum, so this is where the number actually lives — whole-way
+ * car-pool roads are the rarity.
+ */
+export const LANE_HOV3 = 32;
+
+/**
+ * Values that mean the lane is *for* this class, rather than merely open to
+ * it.
+ *
+ * `bus:lanes=yes|yes` says buses may use both lanes, which is true of nearly
+ * every road on earth; reading it as "reserved" marked whole carriageways as
+ * somebody else's and left the driver with no lane at all. Only `designated`
+ * — and `official`, its formal twin — reserve a lane. The Tunnel Albert
+ * Bousser is the case in point: `bus:lanes:backward=yes|designated` with
+ * `access:lanes:backward=yes|no` is one ordinary lane and one bus lane, and
+ * the first cut called both of them buses'.
+ */
+const LANE_RESERVED_FOR = new Set(["designated", "official"]);
+
+/**
+ * The per-lane access tags, read into one reason byte per lane.
+ *
+ * OSM writes these exactly like `turn:lanes` — one entry per lane, left to
+ * right, "|"-separated — and Québec alone tags 2,554 ways with `bus:lanes`.
+ * Without them a reserved lane is drawn as an ordinary one, and an arrow
+ * saying "get right" points a driver into a lane they will be ticketed for
+ * using.
+ *
+ * A lane the driver may not use is a display fact rather than a routing one:
+ * the road is still theirs and it is only this lane of it that is not.
+ */
+export function laneAccessList(tags, suffix, laneCount) {
+  if (!laneCount) return null;
+  const pick = (key) => {
+    const specific = tags.get(`${key}:lanes${suffix}`);
+    if (specific != null) return specific;
+    // The unsuffixed form describes a one-way's only direction, or — on a
+    // two-way — the lanes running the way's own way, same as the turns do.
+    return suffix === ":backward" ? null : tags.get(`${key}:lanes`);
+  };
+  // `hov:minimum` is a property of the way rather than of one lane — the
+  // per-lane spelling is not mapped anywhere — so every car-pool lane on
+  // this way asks for the same carful.
+  const reserved = [
+    [pick("bus"), LANE_BUS],
+    [pick("psv"), LANE_BUS],
+    [pick("taxi"), LANE_TAXI],
+    [pick("hov"), hovMinimum(tags) >= 3 ? LANE_HOV3 : LANE_HOV],
+    [pick("bicycle"), LANE_BICYCLE]
+  ];
+  const denials = [pick("motor_vehicle"), pick("vehicle"), pick("access"), pick("motorcar")];
+  if (!reserved.some(([spec]) => spec) && !denials.some(Boolean)) return null;
+
+  const out = new Array(laneCount).fill(0);
+  for (const [spec, bit] of reserved) {
+    if (!spec) continue;
+    const parts = spec.split("|");
+    for (let i = 0; i < laneCount && i < parts.length; i++) {
+      if (LANE_RESERVED_FOR.has(parts[i].trim())) out[i] |= bit;
+    }
+  }
+  for (const spec of denials) {
+    if (!spec) continue;
+    const parts = spec.split("|");
+    for (let i = 0; i < laneCount && i < parts.length; i++) {
+      if (ACCESS_DENIED.has(parts[i].trim())) out[i] |= LANE_NO_MOTOR;
+    }
+  }
+  return out.some(Boolean) ? out : null;
+}
+
+/**
+ * Both directions' lane access, aligned to the lists [wayLanes] built.
+ *
+ * Alignment is the whole point: a reason byte at index 2 has to describe the
+ * same lane as the arrow at index 2, or the panel labels the wrong one. So
+ * the counts come from the turn lists rather than from the access tags,
+ * which are often the shorter of the two.
+ */
+export function wayLaneAccess(tags, lanes) {
+  return {
+    forward: laneAccessList(tags, ":forward", lanes.forward.length),
+    backward: laneAccessList(tags, ":backward", lanes.backward.length)
+  };
+}
+
+/**
  * Per-direction lane lists for a way.
  *
  * Unsuffixed `turn:lanes` describes a one-way's only direction, or — on a
@@ -683,6 +1118,65 @@ export function wayLanes(tags, oneway) {
   return {
     forward: laneListFrom(forwardSpec, forwardCount),
     backward: laneListFrom(backwardSpec, backwardCount)
+  };
+}
+
+/**
+ * What the overhead panel says above each lane, left to right.
+ *
+ * `destination:lanes=A 4;Montréal|A 4|Local` is the sign itself, lane by
+ * lane, and it is the difference between "keep left" and "the left two lanes
+ * are yours, the right one leaves". A driver on a five-lane approach with an
+ * exit in ninety seconds is reading the panel, not the road — and the arrows
+ * alone say which movements each lane allows without ever saying where any
+ * of them goes.
+ *
+ * The number outranks the name where both exist, the way the panel is
+ * painted: "40 Ouest" is above the lane and "Autoroute Félix-Leclerc" is
+ * nowhere a driver can see. Returned as one `|`-joined string per direction
+ * so a whole approach costs one table entry — a motorway repeats the same
+ * panel across every way of its run.
+ */
+export function laneDestinations(tags, oneway) {
+  const pick = (suffix) => {
+    const refs = tags.get(`destination:ref:lanes${suffix}`);
+    const names = tags.get(`destination:lanes${suffix}`);
+    if (!refs && !names) return "";
+    const refLanes = String(refs || "").split("|");
+    const nameLanes = String(names || "").split("|");
+    const count = Math.max(refLanes.length, nameLanes.length);
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const ref = (refLanes[i] || "").trim();
+      const name = (nameLanes[i] || "").trim();
+      // One destination per lane: a panel that lists three places above one
+      // lane is read for the first, and a chip has room for one answer.
+      const first = (text) => text.split(";")[0].trim();
+      out.push(ref ? first(ref) : first(name));
+    }
+    return out.some(Boolean) ? out.join("|") : "";
+  };
+  const shared = pick("");
+  return {
+    forward: pick(":forward") || shared,
+    backward: pick(":backward") || (oneway ? "" : shared)
+  };
+}
+
+/** The distinct lane panels edges point at, deduplicated. */
+export function makeLaneSignTable() {
+  const list = [];
+  const byKey = new Map();
+  return {
+    list,
+    idFor(text) {
+      if (!text) return 0;
+      const existing = byKey.get(text);
+      if (existing) return existing;
+      list.push(text);
+      byKey.set(text, list.length);
+      return list.length;
+    }
   };
 }
 
@@ -771,6 +1265,158 @@ export function waySpeeds(tags, profile) {
  * listed destinations to lead with is a presentation decision, and the client
  * is the only thing that knows how much room the banner has.
  */
+/**
+ * A physical dimension off a sign, in centimetres.
+ *
+ * OSM writes these however the sign does. Metres are the default and the
+ * common case ("3.5", "3.5 m"), but imperial countries post feet and inches
+ * and mappers copy them down as they appear: `12'6"`, `12 ft`, `12'`. A
+ * router that understands only the first of those sends a van under every
+ * bridge in North America, because an unparsed limit reads as no limit.
+ *
+ * Returns 0 for anything unusable — including `none`, `default`, and the
+ * relative values like `below_default` that say nothing measurable.
+ */
+export function parseLengthCm(value) {
+  if (value == null) return 0;
+  const text = String(value).trim().toLowerCase().replace(",", ".");
+  if (!text || text === "none" || text === "default" || text === "unsigned") return 0;
+
+  // Feet and inches: 12'6", 12'6, 12', 12 ft, 12ft 6in.
+  const feetInches = text.match(/^(\d+(?:\.\d+)?)\s*(?:'|ft|feet)\s*(?:(\d+(?:\.\d+)?)\s*(?:"|in|inch(?:es)?)?)?$/);
+  if (feetInches) {
+    const feet = Number(feetInches[1]);
+    const inches = feetInches[2] ? Number(feetInches[2]) : 0;
+    return Math.round((feet * 12 + inches) * 2.54);
+  }
+  const metres = text.match(/^(\d+(?:\.\d+)?)\s*(m|metre|meter|metres|meters)?$/);
+  if (metres) return Math.round(Number(metres[1]) * 100);
+  return 0;
+}
+
+/**
+ * A weight limit in kilograms.
+ *
+ * Tonnes are the default and what almost every sign in the world says;
+ * kilograms, pounds and short tons turn up where the sign does.
+ */
+export function parseWeightKg(value) {
+  if (value == null) return 0;
+  const text = String(value).trim().toLowerCase().replace(",", ".");
+  if (!text || text === "none" || text === "default" || text === "unsigned") return 0;
+  const match = text.match(/^(\d+(?:\.\d+)?)\s*(t|to?nnes?|kg|lbs?|st)?$/);
+  if (!match) return 0;
+  const amount = Number(match[1]);
+  switch (match[2]) {
+    case "kg": return Math.round(amount);
+    case "lb":
+    case "lbs": return Math.round(amount * 0.45359237);
+    case "st": return Math.round(amount * 907.18474);
+    default: return Math.round(amount * 1000);
+  }
+}
+
+/**
+ * What a way physically will not admit, or null when it admits everything.
+ *
+ * The `:physical` and `:signed` variants matter and are read first where
+ * they exist: `maxheight:physical` is the height of the arch itself, which
+ * is the number that decides whether a vehicle fits, while a bare
+ * `maxheight` may be a legal posting with clearance to spare. Where a way
+ * carries both, the physical one is the one that stops you.
+ */
+export function wayLimits(tags) {
+  const heightCm = parseLengthCm(tags.get("maxheight:physical")) || parseLengthCm(tags.get("maxheight"));
+  const widthCm = parseLengthCm(tags.get("maxwidth:physical")) || parseLengthCm(tags.get("maxwidth"));
+  const lengthCm = parseLengthCm(tags.get("maxlength"));
+  // `maxweight:hgv` stands in when there is no plain limit. Reading it as a
+  // general weight limit is exact rather than merely cautious: anything heavy
+  // enough to be stopped by an HGV weight limit is, by that fact, an HGV.
+  // The same trick does not work for height — a tall light van is not an HGV
+  // and an `maxheight:hgv` sign does not apply to it — so only weight folds.
+  const weightKg = parseWeightKg(tags.get("maxweight:signed")) ||
+    parseWeightKg(tags.get("maxweight")) ||
+    parseWeightKg(tags.get("maxweight:hgv")) ||
+    parseWeightKg(tags.get("maxweightrating:hgv"));
+  if (!heightCm && !widthCm && !lengthCm && !weightKg) return null;
+  return { heightCm, weightKg, widthCm, lengthCm };
+}
+
+/**
+ * The distinct limit sets edges point at, deduplicated.
+ *
+ * A province posts the same handful over and over — 3.5 t, 4.0 m, 2.6 m —
+ * so they are written to the root once and referenced by a one-byte index
+ * on the edges that carry them. Index 0 is "nothing posted", which is the
+ * overwhelming majority.
+ */
+/**
+ * The distinct windows conditional turn bans are in force during.
+ *
+ * Shaped exactly like the conditional speed table and for the same reason: a
+ * city posts the same handful of peak windows over and over, so they are
+ * written once and referenced by index. Id 0 is "never shut".
+ */
+export function makeBanTable() {
+  const list = [];
+  const byKey = new Map();
+  return {
+    list,
+    idFor(window) {
+      if (!window) return 0;
+      const key = `${window.days}/${window.startMinute}/${window.endMinute}/${window.monthStart}/${window.monthEnd}`;
+      const existing = byKey.get(key);
+      if (existing) return existing;
+      list.push(window);
+      byKey.set(key, list.length);
+      return list.length;
+    }
+  };
+}
+
+/**
+ * The distinct prices charged along a route, deduplicated.
+ *
+ * A crossing costs what it costs however many ways describe it, so the price
+ * is written once and referenced by index — and the route sums it once per
+ * stretch rather than once per way, because you pay a bridge to cross it,
+ * not per hundred metres of it.
+ */
+export function makeChargeTable() {
+  const list = [];
+  const byKey = new Map();
+  return {
+    list,
+    idFor(charge) {
+      if (!charge) return 0;
+      const key = `${charge.cents}/${charge.currency}`;
+      const existing = byKey.get(key);
+      if (existing) return existing;
+      list.push(charge);
+      byKey.set(key, list.length);
+      return list.length;
+    }
+  };
+}
+
+export function makeLimitTable() {
+  const list = [];
+  const byKey = new Map();
+  return {
+    list,
+    idFor(limits) {
+      if (!limits) return 0;
+      const key = `${limits.heightCm}/${limits.weightKg}/${limits.widthCm}/${limits.lengthCm}`;
+      const existing = byKey.get(key);
+      if (existing) return existing;
+      list.push(limits);
+      const id = list.length;
+      byKey.set(key, id);
+      return id;
+    }
+  };
+}
+
 export function makeSignTable() {
   const signs = [];
   const byKey = new Map();
@@ -804,8 +1450,36 @@ function signText(value) {
  * city. Slip roads are one-way, so in practice the plain form covers nearly
  * all of it.
  */
-export function waySigns(tags) {
-  const ref = signText(tags.get("ref"));
+/**
+ * The road numbers a way carries, from its own tag and from the route
+ * relations it belongs to.
+ *
+ * A way's `ref` is where North America puts the number, and much of the rest
+ * of the world does not: an autoroute in France carries `A 4` on the way and
+ * `E 50` only on a `type=route` relation, and the panel overhead says both.
+ * Guidance reading the way alone announces half of what the driver can see,
+ * and on a European motorway the half it drops is often the one they are
+ * following.
+ *
+ * The way's own number leads — it is the more local and the more specific —
+ * and relation numbers follow in the order the sign stacks them.
+ */
+export function mergeRefs(own, relationRefs) {
+  const seen = new Set();
+  const out = [];
+  for (const value of [own, ...(relationRefs || [])]) {
+    for (const part of String(value || "").split(";")) {
+      const ref = part.trim();
+      if (!ref || seen.has(ref)) continue;
+      seen.add(ref);
+      out.push(ref);
+    }
+  }
+  return out.join(";");
+}
+
+export function waySigns(tags, relationRefs) {
+  const ref = signText(mergeRefs(tags.get("ref"), relationRefs));
   const exit = signText(tags.get("junction:ref"));
   const pick = (key, suffix) =>
     signText(tags.get(`${key}:${suffix}`) || tags.get(key));
@@ -854,9 +1528,90 @@ export function makeConditionalTable() {
 // `restriction:motorcar`, minus anything excepted for cars, minus
 // conditional variants. Only single-via-node restrictions are supported
 // (via-way restrictions are rare and skipped with a counter).
+/**
+ * A guide sign at a junction, as the relation that describes one.
+ *
+ * `type=destination_sign` is the panel itself: which approach it faces, which
+ * turning it points at, and what is written on it. It is how an ordinary
+ * junction gets the "toward Montréal" that a motorway ramp gets from its own
+ * `destination` tag — and without it, the turn onto a numbered route is
+ * announced by a street name the driver will not find on any panel.
+ *
+ * Shaped exactly like a turn restriction — from, via, to — because it is a
+ * claim about the same thing: one movement through one junction.
+ */
+export function parseDestinationSign(tags, members) {
+  const text = signText(tags.get("destination"));
+  const ref = signText(tags.get("destination:ref") || tags.get("destination:symbol"));
+  if (!text && !ref) return null;
+  let fromWay = null;
+  let toWay = null;
+  let viaNode = null;
+  for (const member of members) {
+    if (member.role === "from" && member.type === "way") fromWay = member.ref;
+    else if (member.role === "to" && member.type === "way") toWay = member.ref;
+    // The junction the sign governs. `intersection` is the documented role;
+    // `via` turns up too, written by mappers who know the restriction shape.
+    else if ((member.role === "intersection" || member.role === "via") && member.type === "node") {
+      viaNode = member.ref;
+    }
+  }
+  if (fromWay == null || toWay == null || viaNode == null) return null;
+  return { fromWay, toWay, viaNode, ref, text };
+}
+
+/**
+ * Which lanes of the approach actually lead where the route goes.
+ *
+ * `type=connectivity` spells it out lane by lane —
+ * `connectivity=1:1|2:2,3|3:` reads "lane 1 goes to lane 1, lane 2 to lanes 2
+ * and 3, lane 3 goes nowhere on this turning". Guidance without it has to
+ * infer usable lanes from the arrows painted on them, which is a good guess
+ * and still a guess: an arrow says a movement is allowed from that lane, not
+ * that *this* turning is reachable from it.
+ *
+ * Returned as a mask of approach lanes, bit 0 being the leftmost.
+ */
+export function parseConnectivity(tags, members) {
+  const spec = tags.get("connectivity");
+  if (!spec) return null;
+  let fromWay = null;
+  let toWay = null;
+  let viaNode = null;
+  for (const member of members) {
+    if (member.role === "from" && member.type === "way") fromWay = member.ref;
+    else if (member.role === "to" && member.type === "way") toWay = member.ref;
+    else if (member.role === "via" && member.type === "node") viaNode = member.ref;
+  }
+  if (fromWay == null || toWay == null || viaNode == null) return null;
+
+  let mask = 0;
+  const lanes = String(spec).split("|");
+  for (let i = 0; i < lanes.length && i < 32; i++) {
+    const entry = lanes[i].trim();
+    if (!entry) continue;
+    // "2:3" — this lane leads somewhere on the far side. "3:" or "3:none"
+    // is a lane that does not, and is exactly what a driver must not be in.
+    const colon = entry.indexOf(":");
+    const leadsTo = colon < 0 ? entry : entry.slice(colon + 1);
+    const target = leadsTo.trim().toLowerCase();
+    if (!target || target === "none") continue;
+    mask |= 1 << i;
+  }
+  if (!mask) return null;
+  return { fromWay, toWay, viaNode, mask };
+}
+
 function parseRestriction(tags, members) {
-  const kind = tags.get("restriction:motorcar") || tags.get("restriction");
-  if (!kind || tags.get("restriction:conditional")) return null;
+  // A restriction that only applies at certain hours is still a restriction.
+  // Both spellings carry one, and the conditional form is read first because
+  // a relation that has both is describing the same turn twice — once for
+  // always and once for the window, and the window is the specific claim.
+  const conditional = parseConditionalRestriction(
+    tags.get("restriction:motorcar:conditional") || tags.get("restriction:conditional")
+  );
+  const kind = conditional?.kind || tags.get("restriction:motorcar") || tags.get("restriction");
+  if (!kind) return null;
   if (!/^(no_|only_)/.test(kind)) return null;
   const except = tags.get("except");
   if (except && /\b(motorcar|motor_vehicle|vehicle)\b/.test(except)) return null;
@@ -871,13 +1626,25 @@ function parseRestriction(tags, members) {
     else if (member.role === "via" && member.type === "way") viaWays.push(member.ref);
   }
   if (fromWay == null || toWay == null) return null;
+  // The window this restriction is in force during, or null for always. It
+  // rides along to the expansion, which keeps the turn and marks when it is
+  // shut rather than deleting it outright.
+  const window = conditional
+    ? {
+      days: conditional.days,
+      startMinute: conditional.startMinute,
+      endMinute: conditional.endMinute,
+      monthStart: conditional.monthStart,
+      monthEnd: conditional.monthEnd
+    }
+    : null;
   if (viaNode != null && !viaWays.length) {
-    return { kind, fromWay, toWay, viaNode, only: kind.startsWith("only_") };
+    return { kind, fromWay, toWay, viaNode, window, only: kind.startsWith("only_") };
   }
   // Via ways (possibly several, possibly with a via node on the chain that
   // we can ignore): the union of their edges defines the restricted path.
   if (viaWays.length >= 1 && viaWays.length <= 4) {
-    return { kind, fromWay, toWay, viaWays, only: kind.startsWith("only_") };
+    return { kind, fromWay, toWay, viaWays, window, only: kind.startsWith("only_") };
   }
   return viaWays.length ? { unsupportedVia: true } : null;
 }
@@ -894,11 +1661,34 @@ function parseOneway(tags) {
   return 0;
 }
 
+/**
+ * Roads a vehicle cannot or should not be sent down whatever its tags allow.
+ *
+ * A ford is a stream running over the road: passable in a pickup in summer
+ * and not in a van in April, and OSM cannot tell you which day it is. A
+ * seasonal or winter road is the same claim about the calendar. Neither is
+ * something to route a courier over on the strength of a `highway=` value.
+ *
+ * A bus lane and an HOV lane are different: they are perfectly good roads
+ * that this vehicle is not allowed on, and being sent down one is a fine.
+ */
+export function drivableSurface(tags) {
+  if (tags.get("ford") && tags.get("ford") !== "no") return false;
+  const seasonal = tags.get("seasonal");
+  if (seasonal && seasonal !== "no") return false;
+  if (tags.get("winter_road") === "yes") return false;
+  // Reserved for buses, taxis or car-pools is no longer a reason to drop the
+  // way: see [reservedFor], which flags it instead so the driver it *is* for
+  // can be routed down it.
+  return true;
+}
+
 function carAllowed(tags) {
   const highway = wayClass(tags);
   if (!highway || !(highway in CAR_SPEEDS)) return false;
-  if (highway === FERRY_CLASS) return ferryAllowed(tags, "car");
+  if (isBoarded(highway)) return ferryAllowed(tags, "car");
   if (tags.get("area") === "yes") return false;
+  if (!drivableSurface(tags)) return false;
   const motorVehicle = tags.get("motor_vehicle") ?? tags.get("vehicle");
   if (motorVehicle != null) return !ACCESS_DENIED.has(motorVehicle);
   const access = tags.get("access");
@@ -990,6 +1780,20 @@ class PackedWayStore {
     this.nameId = new GrowTyped(Uint32Array);
     this.signFwd = new GrowTyped(Uint32Array);
     this.signBwd = new GrowTyped(Uint32Array);
+    // What the way physically will not admit, as an index into the limit
+    // table. A column this store did not have was a field the way silently
+    // lost on the way in: the tags were read and the table was built, and
+    // every edge came out pointing at nothing.
+    this.limitId = new GrowTyped(Uint32Array);
+    // Costs money, and how much. Columns rather than fields, because a field
+    // this store does not know about is a field the way loses on the way in.
+    this.tolled = new GrowTyped(Uint8Array);
+    this.noHazmat = new GrowTyped(Uint8Array);
+    this.noHgv = new GrowTyped(Uint8Array);
+    this.reserved = new GrowTyped(Uint8Array);
+    this.chargeId = new GrowTyped(Uint32Array);
+    this.laneSignFwd = new GrowTyped(Uint32Array);
+    this.laneSignBwd = new GrowTyped(Uint32Array);
     this.flags = new GrowTyped(Uint8Array);
     this.ferryDurationSeconds = new GrowTyped(Float64Array);
     this.ferryWaitSeconds = new GrowTyped(Float64Array);
@@ -999,6 +1803,10 @@ class PackedWayStore {
     this.laneStartBwd = new GrowTyped(Uint32Array);
     this.laneCountBwd = new GrowTyped(Uint8Array);
     this.laneBytes = new GrowUint8(1 << 14);
+    // One reason byte per lane, at the same offsets as the movements above:
+    // sharing the starts and counts is what guarantees the arrow and the
+    // label always describe the same lane.
+    this.laneAccessBytes = new GrowUint8(1 << 14);
   }
 
   get length() {
@@ -1018,20 +1826,30 @@ class PackedWayStore {
     this.nameId.push(way.nameId);
     this.signFwd.push(way.signFwd);
     this.signBwd.push(way.signBwd);
+    this.limitId.push(way.limitId || 0);
+    this.tolled.push(way.tolled ? 1 : 0);
+    this.noHazmat.push(way.noHazmat ? 1 : 0);
+    this.noHgv.push(way.noHgv ? 1 : 0);
+    this.reserved.push(way.reserved || 0);
+    this.chargeId.push(way.chargeId || 0);
+    this.laneSignFwd.push(way.laneSigns?.forward || 0);
+    this.laneSignBwd.push(way.laneSigns?.backward || 0);
     this.flags.push((way.roundabout ? 1 : 0) | (way.ferry ? 2 : 0));
     this.ferryDurationSeconds.push(way.ferryDurationSeconds);
     this.ferryWaitSeconds.push(way.ferryWaitSeconds);
     this.classCode.push(way.classCode);
-    this.pushLanes(way.lanes.forward, this.laneStartFwd, this.laneCountFwd);
-    this.pushLanes(way.lanes.backward, this.laneStartBwd, this.laneCountBwd);
+    this.pushLanes(way.lanes.forward, way.laneAccess?.forward, this.laneStartFwd, this.laneCountFwd);
+    this.pushLanes(way.lanes.backward, way.laneAccess?.backward, this.laneStartBwd, this.laneCountBwd);
   }
 
-  pushLanes(lanes, starts, counts) {
+  pushLanes(lanes, access, starts, counts) {
     starts.push(this.laneBytes.length);
     counts.push(Math.min(lanes.length, 255));
     this.laneBytes.ensure(lanes.length);
+    this.laneAccessBytes.ensure(lanes.length);
     for (let i = 0; i < lanes.length && i < 255; i++) {
       this.laneBytes.data[this.laneBytes.length++] = lanes[i] & 0xff;
+      this.laneAccessBytes.data[this.laneAccessBytes.length++] = (access?.[i] || 0) & 0xff;
     }
   }
 
@@ -1047,6 +1865,14 @@ class PackedWayStore {
     target.oneway = this.oneway.data[index];
     target.nameId = this.nameId.data[index];
     target.signFwd = this.signFwd.data[index];
+    target.limitId = this.limitId.data[index];
+    target.tolled = this.tolled.data[index] === 1;
+    target.noHazmat = this.noHazmat.data[index] === 1;
+    target.noHgv = this.noHgv.data[index] === 1;
+    target.reserved = this.reserved.data[index];
+    target.chargeId = this.chargeId.data[index];
+    target.laneSignFwd = this.laneSignFwd.data[index];
+    target.laneSignBwd = this.laneSignBwd.data[index];
     target.signBwd = this.signBwd.data[index];
     const flags = this.flags.data[index];
     target.roundabout = (flags & 1) !== 0;
@@ -1058,15 +1884,19 @@ class PackedWayStore {
       if (!target.lanes) target.lanes = {};
       target.lanes.forward = this.lanesAt(index, this.laneStartFwd, this.laneCountFwd);
       target.lanes.backward = this.lanesAt(index, this.laneStartBwd, this.laneCountBwd);
+      target.laneAccess = {
+        forward: this.lanesAt(index, this.laneStartFwd, this.laneCountFwd, this.laneAccessBytes),
+        backward: this.lanesAt(index, this.laneStartBwd, this.laneCountBwd, this.laneAccessBytes)
+      };
     }
     return target;
   }
 
-  lanesAt(index, starts, counts) {
+  lanesAt(index, starts, counts, store = this.laneBytes) {
     const count = counts.data[index];
     if (!count) return EMPTY_LANES;
     const start = starts.data[index];
-    return this.laneBytes.data.subarray(start, start + count);
+    return store.data.subarray(start, start + count);
   }
 
   setSpeeds(index, forward, backward) {
@@ -1195,6 +2025,16 @@ export function extractRoadGraph(pbfPath, options = {}) {
   if (!profile) throw new Error(`Unknown routing profile "${profileName}" (car, bike, foot).`);
   const classTable = Object.keys(profile.speeds);
   const classCodes = new Map(classTable.map((name, index) => [name, index]));
+  const ferryClassCode = classCodes.get(FERRY_CLASS);
+  const shuttleClassCode = classCodes.get(SHUTTLE_CLASS);
+  const chargeTable = makeChargeTable();
+  const laneSignTable = makeLaneSignTable();
+  const junctionSigns = [];
+  const laneConnections = [];
+  // Way id -> the numbers its route relations carry. Relations come after
+  // ways in a PBF, so these are collected during the same pass and stitched
+  // onto the ways afterwards rather than being read too late to use.
+  const routeRefs = new Map();
   // Turn restrictions target motor vehicles; bicycles are commonly excepted
   // and pedestrians always are, so only the car profile applies them.
   const useRestrictions = profile.name === "car";
@@ -1214,6 +2054,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // repeat a few thousand between them, so a table plus a per-edge index is
   // the whole cost of carrying what the green panels say.
   const signTable = makeSignTable();
+  const limitTable = makeLimitTable();
   let ways = new PackedWayStore();
   // One-way carriageways that share a painted centre left-turn lane with the
   // line facing them, collected for [linkCentreTurnLanes].
@@ -1231,7 +2072,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
       const speeds = waySpeeds(tags, profile);
       const signs = waySigns(tags);
       const className = wayClass(tags);
-      const isFerry = className === FERRY_CLASS;
+      const isFerry = isBoarded(className);
       const oneway = isFerry ? 0 : profile.oneway(tags);
       if (isFerry) ferryWays++;
       const name = tags.get("name") || tags.get("ref") || "";
@@ -1244,6 +2085,10 @@ export function extractRoadGraph(pbfPath, options = {}) {
       // Only a one-way line needs the crossing opened: where the way itself
       // runs both directions the left turn was never in question.
       if (oneway !== 0 && centreTurnLane(tags)) centreTurnWays.add(id);
+      // Built once and shared, because the access bytes are indexed against
+      // exactly these lists: recomputing them apart is how the arrow and the
+      // label end up describing different lanes.
+      const wayLaneList = wayLanes(tags, oneway);
       const refStart = refSpool.length;
       const seen = new Set();
       for (const ref of refs) {
@@ -1265,10 +2110,55 @@ export function extractRoadGraph(pbfPath, options = {}) {
         postedBwd: speeds.postedBackward,
         condRule: conditionalTable.idFor(speeds.conditional),
         oneway,
-        lanes: wayLanes(tags, oneway),
+        lanes: wayLaneList,
+        // Which of those lanes are somebody else's, and why.
+        laneAccess: wayLaneAccess(tags, wayLaneList),
+        // What the panel says above each of those lanes. Same shape as the
+        // lane arrows and read at the same moment, because a driver deciding
+        // which lane to be in is reading both at once.
+        laneSigns: (() => {
+          const signs = laneDestinations(tags, oneway);
+          return {
+            forward: laneSignTable.idFor(signs.forward),
+            backward: laneSignTable.idFor(signs.backward)
+          };
+        })(),
         nameId,
         signFwd: signTable.idFor(signs.forward),
         signBwd: signTable.idFor(signs.backward),
+        // What this way physically will not admit. Both directions of one
+        // road share it: an arch is the same height whichever way you drive
+        // under it.
+        limitId: limitTable.idFor(wayLimits(tags)),
+        // Whether this costs money to use, and how much where OSM says.
+        // `toll=yes` is mapped far more often than any price is, so the two
+        // are separate facts: one decides routes, the other decides receipts.
+        tolled: wayTolled(tags),
+        noHazmat: (() => {
+          const hazmat = tags.get("hazmat");
+          return hazmat != null && hazmat !== "yes" && hazmat !== "designated";
+        })(),
+        // Who the whole road is for, when it is not for everybody.
+        reserved: reservedFor(tags),
+        noHgv: (() => {
+          const hgv = tags.get("hgv") || tags.get("goods");
+          // `hgv=destination` is not a refusal, and treating it as one is
+          // backwards for the vehicle this router exists to send: a town
+          // centre signed against through freight is signed *for* the lorry
+          // delivering into it. A whole country's worth of last streets
+          // would otherwise come back "no route this vehicle fits through",
+          // which is both wrong and the one answer a courier cannot use.
+          // Destination-only access is already handled as a slowdown that
+          // keeps a street off through-routes while leaving it reachable,
+          // and hgv follows the same rule rather than inventing a harsher one.
+          if (hgv == null) return false;
+          return !ACCESS_ALLOWS.has(hgv) && !ACCESS_DESTINATION_ONLY.has(hgv);
+        })(),
+        chargeId: chargeTable.idFor(
+          parseCharge(tags.get("charge")) ||
+          parseCharge(tags.get("toll:charge")) ||
+          parseCharge(tags.get("fee"))
+        ),
         // A roundabout is a maneuver, not a road, and the only thing that
         // says so is this tag. Without it the circle arrives as two or three
         // nameless forty-metre steps with turn angles that describe the
@@ -1282,7 +2172,34 @@ export function extractRoadGraph(pbfPath, options = {}) {
       });
     },
     onRelation(id, members, tags) {
-      if (!useRestrictions || tags.get("type") !== "restriction") return;
+      const type = tags.get("type");
+      // A sign and a lane connection are claims about one movement through
+      // one junction, exactly like a restriction — and they need the same
+      // via node promoted to a graph node to be attachable at all.
+      // A road route: the number lives on the relation rather than on the
+      // ways, which is how E-roads and most European numbering is mapped.
+      if (type === "route" && (tags.get("route") === "road" || tags.get("route") === "hgv")) {
+        const ref = signText(tags.get("ref"));
+        if (!ref) return;
+        for (const member of members) {
+          if (member.type !== "way") continue;
+          let refs = routeRefs.get(member.ref);
+          if (!refs) routeRefs.set(member.ref, (refs = []));
+          if (refs.length < 4 && !refs.includes(ref)) refs.push(ref);
+        }
+        return;
+      }
+      if (type === "destination_sign" || type === "connectivity") {
+        const parsed = type === "destination_sign"
+          ? parseDestinationSign(tags, members)
+          : parseConnectivity(tags, members);
+        if (!parsed) return;
+        (type === "destination_sign" ? junctionSigns : laneConnections).push(parsed);
+        junctionSpool.push(parsed.viaNode);
+        junctionSpool.push(parsed.viaNode);
+        return;
+      }
+      if (!useRestrictions || type !== "restriction") return;
       const parsed = parseRestriction(tags, members);
       if (!parsed) return;
       if (parsed.unsupportedVia) {
@@ -1301,6 +2218,32 @@ export function extractRoadGraph(pbfPath, options = {}) {
   });
   const viaWayKept = restrictions.filter(restriction => restriction.viaWays != null).length;
   log(`ways: kept ${ways.length} of ${wayCount}`);
+
+  // Route relations arrive after the ways that belong to them, so the numbers
+  // they carry are stitched on here rather than read too late to use. Only
+  // the sign face changes: the geometry, the speeds and the access decisions
+  // were all correct without it.
+  let numberedByRelation = 0;
+  if (routeRefs.size) {
+    const scratch = {};
+    for (let i = 0; i < ways.length; i++) {
+      const refs = routeRefs.get(ways.id.data[i]);
+      if (!refs || !refs.length) continue;
+      const merged = signText(mergeRefs(signTable.signs[ways.signFwd.data[i] - 1]?.ref, refs));
+      if (!merged) continue;
+      for (const [column, id] of [["signFwd", ways.signFwd], ["signBwd", ways.signBwd]]) {
+        const base = id.data[i] ? signTable.signs[id.data[i] - 1] : null;
+        // A way with no sign at all still gains one: the number is the sign.
+        scratch.ref = merged;
+        scratch.exit = base?.exit || "";
+        scratch.destRef = base?.destRef || "";
+        scratch.dest = base?.dest || "";
+        id.data[i] = signTable.idFor({ ...scratch });
+      }
+      numberedByRelation++;
+    }
+  }
+  log(`route relations: ${routeRefs.size} way(s) numbered by relation, ${numberedByRelation} applied`);
   log(`restrictions: ${restrictions.length - viaWayKept} via-node + ${viaWayKept} via-way kept, ${viaWayRestrictions} oversized-via skipped`);
 
   // Junctions: any ref appearing more than once across the kept ways.
@@ -1319,6 +2262,11 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // Which approach each tagged node governs, so a stop sign facing the side
   // street is not shown to the traffic that has right of way.
   let kindFaces = new Uint8Array(usedIds.length).fill(FACES_BOTH);
+  // Nodes this profile simply cannot pass: a gate, a bollard, a stile. The
+  // way is severed at them rather than costed, because no penalty is the
+  // right price for a road that is not there.
+  let blocked = new Uint8Array(usedIds.length);
+  let blockedCount = 0;
   // Exit numbers, from the `motorway_junction` node the slip road leaves.
   // 1,326 of Québec's 1,798 such nodes carry one, which is the most reliable
   // source there is for the number on the green panel.
@@ -1333,6 +2281,10 @@ export function extractRoadGraph(pbfPath, options = {}) {
       found[index] = 1;
       if (tags) {
         penaltyDs[index] = nodePenaltyDs(profile, tags);
+        if (barrierBlocks(profile.name, tags)) {
+          blocked[index] = 1;
+          blockedCount++;
+        }
         kindCode[index] = nodeKindCode(tags);
         kindFaces[index] = signFacing(tags);
         if (tags.get("highway") === "motorway_junction") {
@@ -1343,6 +2295,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
     }
   });
   log(`exits: ${exitRefByNode.size} numbered motorway junctions`);
+  log(`barriers: ${blockedCount} nodes impassable to ${profile.name}`);
 
   // Penalties are charged per direction of travel, because a sign is charged
   // to the driver who faces it. The two runs write into separate arrays; the
@@ -1385,13 +2338,20 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // Resolve those few ids now so the large used-id and graph-node columns can
   // be released before turn expansion reaches its own memory peak.
   const nodeIndex = new Map();
-  for (const restriction of restrictions) {
-    if (restriction.viaNode == null || nodeIndex.has(restriction.viaNode)) continue;
-    const used = binarySearch(usedIds, restriction.viaNode);
-    if (used < 0) continue;
+  // Restrictions, signs and lane connections all name a junction the same
+  // way, and all three need it resolved here — this loop used to know about
+  // restrictions only, which is why a sign relation parsed cleanly and then
+  // attached to nothing at all.
+  const resolveVia = (viaNode) => {
+    if (viaNode == null || nodeIndex.has(viaNode)) return;
+    const used = binarySearch(usedIds, viaNode);
+    if (used < 0) return;
     const graphNode = graphNodeByUsed[used];
-    if (graphNode >= 0) nodeIndex.set(restriction.viaNode, graphNode);
-  }
+    if (graphNode >= 0) nodeIndex.set(viaNode, graphNode);
+  };
+  for (const restriction of restrictions) resolveVia(restriction.viaNode);
+  for (const sign of junctionSigns) resolveVia(sign.viaNode);
+  for (const link of laneConnections) resolveVia(link.viaNode);
 
   // Resolve each retained OSM node id exactly once. From here on the shared
   // spool contains used-node indexes, so both ferry costing and edge creation
@@ -1446,10 +2406,15 @@ export function extractRoadGraph(pbfPath, options = {}) {
   // What the signs say, as an index into the extract's sign table, and the
   // per-edge flag byte (bit 0: this edge is inside a roundabout).
   let edgeSign = [];
+  let edgeLimit = [];
+  let edgeCharge = [];
+  let edgeLaneSign = [];
+  let reservedLaneEdges = 0;
   let edgeFlags = [];
   const emitEdge = ({
     from, to, weightDs, distDm, nameId, wayId, classCode, junctionKind,
-    postedKmh, condRule, lanes, points, reversed, signId, flags
+    postedKmh, condRule, lanes, laneAccess, points, reversed, signId, limitId, chargeId,
+    laneSignId, flags
   }) => {
     edgeFrom.push(from);
     edgeTo.push(to);
@@ -1462,6 +2427,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeSpeed.push(postedKmh || 0);
     edgeCond.push(condRule || 0);
     edgeSign.push(signId || 0);
+    edgeLimit.push(limitId || 0);
+    edgeCharge.push(chargeId || 0);
+    edgeLaneSign.push(laneSignId || 0);
     edgeFlags.push(flags || 0);
     geomScratch.length = 0;
     // Interior polyline points only, zigzag-delta E7 from the from-node.
@@ -1479,12 +2447,22 @@ export function extractRoadGraph(pbfPath, options = {}) {
     geomBytes.ensure(geomScratch.length);
     for (const byte of geomScratch) geomBytes.data[geomBytes.length++] = byte;
     geomOffsets.push(geomBytes.length);
+    // `[count, movement × count, reason × count]`. The reasons ride in the
+    // same record as the arrows rather than in a column of their own,
+    // because they are indexed by lane rather than by edge and the two must
+    // stay aligned; a separate column is a second thing to drop, and this
+    // pipeline has dropped a column silently three times.
     const laneList = lanes || [];
-    laneBytes.ensure(laneList.length + 1);
-    laneBytes.data[laneBytes.length++] = Math.min(laneList.length, 255);
-    for (let i = 0; i < laneList.length && i < 255; i++) {
+    const laneKept = Math.min(laneList.length, 255);
+    laneBytes.ensure(laneKept * 2 + 1);
+    laneBytes.data[laneBytes.length++] = laneKept;
+    for (let i = 0; i < laneKept; i++) {
       laneBytes.data[laneBytes.length++] = laneList[i] & 0xff;
     }
+    for (let i = 0; i < laneKept; i++) {
+      laneBytes.data[laneBytes.length++] = (laneAccess?.[i] || 0) & 0xff;
+    }
+    if (laneAccess?.some(Boolean)) reservedLaneEdges++;
     laneOffsets.push(laneBytes.length);
   };
 
@@ -1524,7 +2502,15 @@ export function extractRoadGraph(pbfPath, options = {}) {
     let segKindFwdIndex = 0;
     let segKindBwd = 0;
     let segKindBwdIndex = 0;
-    const flags = way.roundabout ? EDGE_FLAG_ROUNDABOUT : 0;
+    const flags = (way.roundabout ? EDGE_FLAG_ROUNDABOUT : 0) |
+      (way.tolled ? EDGE_FLAG_TOLL : 0) |
+      // A shuttle train is boarded, waited for and paid for exactly like a
+      // boat, so "avoid ferries" means it too — a driver who will not put
+      // their van on a boat will not put it on a train through a mountain.
+      ((way.classCode === ferryClassCode || way.classCode === shuttleClassCode) ? EDGE_FLAG_FERRY : 0) |
+      (way.noHazmat ? EDGE_FLAG_NO_HAZMAT : 0) |
+      (way.noHgv ? EDGE_FLAG_NO_HGV : 0) |
+      (way.reserved || 0);
     // A boat leaves when it leaves. The wait is charged once to the crossing
     // rather than spread along it, so a longer ferry is not made to look
     // like a worse one.
@@ -1537,8 +2523,10 @@ export function extractRoadGraph(pbfPath, options = {}) {
     };
     for (let i = 0; i < way.refCount; i++) {
       const used = allRefs[way.refStart + i];
-      if (used < 0 || !found[used]) {
-        // Missing node (clipped extract): break the segment here.
+      if (used < 0 || !found[used] || blocked[used]) {
+        // Missing node (clipped extract), or one this profile cannot pass —
+        // a gate, a bollard, a stile. Either way there is no road through
+        // here, so the segment breaks and the two sides never join.
         segment.length = 0;
         fromNode = -1;
         fromUsed = -1;
@@ -1599,8 +2587,11 @@ export function extractRoadGraph(pbfPath, options = {}) {
           nameId: way.nameId, wayId: way.id, classCode: way.classCode,
           junctionKind: junction.kind + junction.index * 8,
           postedKmh: way.postedFwd, condRule: way.condRule,
-          lanes: way.lanes.forward, points: segment, reversed: false,
+          lanes: way.lanes.forward, laneAccess: way.laneAccess?.forward,
+          laneSignId: way.laneSignFwd, points: segment, reversed: false,
           signId: link ? signWithExit(way.signFwd, exitRefByNode.get(fromUsed)) : way.signFwd,
+          limitId: way.limitId,
+          chargeId: way.chargeId,
           flags
         });
       }
@@ -1615,8 +2606,11 @@ export function extractRoadGraph(pbfPath, options = {}) {
           nameId: way.nameId, wayId: way.id, classCode: way.classCode,
           junctionKind: mirrored.kind + mirrored.index * 8,
           postedKmh: way.postedBwd, condRule: way.condRule,
-          lanes: way.lanes.backward, points: segment, reversed: true,
+          lanes: way.lanes.backward, laneAccess: way.laneAccess?.backward,
+          laneSignId: way.laneSignBwd, points: segment, reversed: true,
           signId: link ? signWithExit(way.signBwd, exitRefByNode.get(used)) : way.signBwd,
+          limitId: way.limitId,
+          chargeId: way.chargeId,
           flags
         });
       }
@@ -1631,6 +2625,13 @@ export function extractRoadGraph(pbfPath, options = {}) {
     }
   }
   log(`edges: ${edgeFrom.length} directed`);
+  log(`lane panels: ${edgeLaneSign.filter(Boolean).length} approaches signed, ${laneSignTable.list.length} distinct panels`);
+  log(`lane access: ${reservedLaneEdges} approaches carry a lane that is not the driver's`);
+  log(`hazmat: ${edgeFlags.filter(f => (f & EDGE_FLAG_NO_HAZMAT) !== 0).length} edges refuse dangerous goods`);
+  log(`hgv: ${edgeFlags.filter(f => (f & EDGE_FLAG_NO_HGV) !== 0).length} edges refuse goods vehicles`);
+  log(`reserved roads: ${edgeFlags.filter(f => (f & EDGE_FLAG_PSV_ONLY) !== 0).length} edges for public service vehicles, ${edgeFlags.filter(f => (f & EDGE_FLAG_HOV_ONLY) !== 0).length} for car-pools of two, ${edgeFlags.filter(f => (f & EDGE_FLAG_HOV3_ONLY) !== 0).length} of three`);
+  log(`tolls: ${edgeFlags.filter(f => (f & EDGE_FLAG_TOLL) !== 0).length} tolled edges, ${edgeFlags.filter(f => (f & EDGE_FLAG_FERRY) !== 0).length} ferry edges, ${edgeCharge.filter(Boolean).length} priced, ${chargeTable.list.length} distinct prices`);
+  log(`limits: ${limitTable.list.length} distinct, ${edgeLimit.reduce ? edgeLimit.filter(Boolean).length : 0} directed edges posted`);
 
   // Everything below works on collapsed graph nodes and edges. Drop the raw
   // country-scale extraction columns before turn expansion allocates its
@@ -1662,7 +2663,7 @@ export function extractRoadGraph(pbfPath, options = {}) {
   linkCentreTurnLanes({
     centreTurnWays, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass,
-    edgeJunction, edgeSpeed, edgeCond, edgeSign, edgeFlags,
+    edgeJunction, edgeSpeed, edgeCond, edgeSign, edgeLimit, edgeCharge, edgeLaneSign, edgeFlags,
     geomOffsets, geomBytes, laneOffsets, laneBytes, log
   });
 
@@ -1690,6 +2691,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeSpeed,
     edgeCond,
     edgeSign,
+    edgeLimit,
+    edgeCharge,
+    edgeLaneSign,
     edgeFlags,
     geomOffsets,
     geomBytes,
@@ -1723,11 +2727,17 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeSpeed = compact("edgeSpeed", Uint8Array);
     edgeCond = compact("edgeCond", Uint8Array);
     edgeSign = compact("edgeSign", Uint32Array);
+    edgeLimit = compact("edgeLimit", Uint32Array);
+    edgeCharge = compact("edgeCharge", Uint32Array);
+    edgeLaneSign = compact("edgeLaneSign", Uint32Array);
     edgeFlags = compact("edgeFlags", Uint8Array);
     geomOffsets = compact("geomOffsets", Uint32Array);
     laneOffsets = compact("laneOffsets", Uint32Array);
 
-    const expanded = expandTurnCosts({ ...context, restrictions }, profile.turnCosts);
+    const expanded = expandTurnCosts(
+      { ...context, restrictions, junctionSigns, laneConnections, signTable },
+      profile.turnCosts
+    );
     // The expansion already returns exact typed columns. `take` remains
     // tolerant of growable/array callers used by focused tests and custom
     // integrations, but never copies the production result.
@@ -1739,6 +2749,10 @@ export function extractRoadGraph(pbfPath, options = {}) {
       classes: classTable,
       condRules: conditionalTable.rules,
       signs: signTable.signs,
+      limits: limitTable.list,
+      charges: chargeTable.list,
+      laneSigns: laneSignTable.list,
+      banRules: expanded.banRules || [],
       portals
     };
     const take = (key, Type, fallback = []) => {
@@ -1758,6 +2772,11 @@ export function extractRoadGraph(pbfPath, options = {}) {
     take("edgeSpeed", Uint8Array);
     take("edgeCond", Uint8Array);
     take("edgeSign", Uint32Array);
+    take("edgeLimit", Uint32Array);
+    take("edgeCharge", Uint32Array);
+    take("edgeLaneSign", Uint32Array);
+    take("edgeLaneMask", Uint32Array);
+    take("edgeBan", Uint32Array);
     take("edgeFlags", Uint8Array);
     take("geomOffsets", Uint32Array);
     take("geomBytes", Uint8Array);
@@ -1805,6 +2824,10 @@ export function extractRoadGraph(pbfPath, options = {}) {
     edgeSpeed: Uint8Array.from(edgeSpeed),
     edgeCond: Uint8Array.from(edgeCond),
     edgeSign: Uint32Array.from(edgeSign),
+    edgeLimit: Uint32Array.from(edgeLimit),
+    edgeCharge: Uint32Array.from(edgeCharge),
+    edgeLaneSign: Uint32Array.from(edgeLaneSign),
+    edgeLaneMask: new Uint32Array(edgeLaneSign.length),
     edgeFlags: Uint8Array.from(edgeFlags),
     laneOffsets: Uint32Array.from(laneOffsets),
     laneBytes: Uint8Array.from(laneBytes.view()),
@@ -1815,6 +2838,9 @@ export function extractRoadGraph(pbfPath, options = {}) {
     classes: classTable,
     condRules: conditionalTable.rules,
     signs: signTable.signs,
+    limits: limitTable.list,
+    charges: chargeTable.list,
+    laneSigns: laneSignTable.list,
     portals
   }, log);
 }
@@ -1873,7 +2899,7 @@ export function linkCentreTurnLanes(context) {
   const {
     centreTurnWays, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass,
-    edgeJunction, edgeSpeed, edgeCond, edgeSign, edgeFlags,
+    edgeJunction, edgeSpeed, edgeCond, edgeSign, edgeLimit, edgeCharge, edgeLaneSign, edgeFlags,
     geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
   const note = log || (() => {});
@@ -2273,7 +3299,7 @@ export function linkCentreTurnLanes(context) {
 
 export function applyTurnRestrictions(context) {
   const {
-    restrictions, nodeIndex, nodeLat, nodeLon,
+    restrictions, junctionSigns, laneConnections, signTable, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay,
     geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
@@ -2536,9 +3562,9 @@ export function applyTurnRestrictions(context) {
 // non-turn-cost mode).
 export function expandTurnCosts(context, turnCosts) {
   const {
-    restrictions, nodeIndex, nodeLat, nodeLon,
+    restrictions, junctionSigns, laneConnections, signTable, nodeIndex, nodeLat, nodeLon,
     edgeFrom, edgeTo, edgeWeightDs, edgeDistDm, edgeName, edgeWay, edgeClass, edgeJunction,
-    edgeSpeed, edgeCond, edgeSign, edgeFlags, geomOffsets, geomBytes, laneOffsets, laneBytes, log
+    edgeSpeed, edgeCond, edgeSign, edgeLimit, edgeCharge, edgeLaneSign, edgeFlags, geomOffsets, geomBytes, laneOffsets, laneBytes, log
   } = context;
   const edgeCount = edgeFrom.length;
   const nodeCount = nodeLat.length;
@@ -2613,7 +3639,47 @@ export function expandTurnCosts(context, turnCosts) {
   // of millions of short-lived strings on country graphs. Nested numeric
   // maps keep the hot loop allocation-free.
   const byVia = new Map();
+  // Signs and lane connections, indexed the same way turns are: junction,
+  // then approach way. One movement through one junction is what all three
+  // describe, so they share the lookup rather than each growing their own.
+  const signByVia = new Map();
+  const laneByVia = new Map();
+  let signViaMissing = 0;
+  for (const sign of context.junctionSigns || []) {
+    const via = nodeIndex.get(sign.viaNode);
+    if (via == null) { signViaMissing++; continue; }
+    let byWay = signByVia.get(via);
+    if (!byWay) signByVia.set(via, (byWay = new Map()));
+    byWay.set(sign.fromWay, sign);
+  }
+  for (const link of context.laneConnections || []) {
+    const via = nodeIndex.get(link.viaNode);
+    if (via == null) continue;
+    let byWay = laneByVia.get(via);
+    if (!byWay) laneByVia.set(via, (byWay = new Map()));
+    let byTo = byWay.get(link.fromWay);
+    if (!byTo) byWay.set(link.fromWay, (byTo = new Map()));
+    byTo.set(link.toWay, link.mask);
+  }
+  /** The sign a driver making this turn will be reading, or null. */
+  const signForTurn = (inEdge, outEdge) => {
+    const byWay = signByVia.get(edgeFrom[outEdge]);
+    if (!byWay) return null;
+    const sign = byWay.get(edgeWay[inEdge]);
+    if (!sign || sign.toWay !== edgeWay[outEdge]) return null;
+    return sign;
+  };
+  /** Which approach lanes actually reach this turning, or 0 for unknown. */
+  const lanesForTurn = (inEdge, outEdge) => {
+    const byWay = laneByVia.get(edgeFrom[outEdge]);
+    if (!byWay) return 0;
+    return byWay.get(edgeWay[inEdge])?.get(edgeWay[outEdge]) || 0;
+  };
+  const banTable = makeBanTable();
   let restrictedApproaches = 0;
+  let timedTurns = 0;
+  let signedTurns = 0;
+  let connectedTurns = 0;
   for (const restriction of restrictions) {
     if (restriction.viaWays != null || restriction.viaNode == null) continue;
     const via = nodeIndex.get(restriction.viaNode);
@@ -2627,19 +3693,37 @@ export function expandTurnCosts(context, turnCosts) {
     }
     (restriction.only ? group.onlys : group.nos).push(restriction);
   }
-  const allowed = (inEdge, outEdge) => {
+  /**
+   * What a restriction says about this turn.
+   *
+   * Returns 0 when nothing forbids it, -1 when it is forbidden outright, and
+   * a positive ban-rule id when it is forbidden only during a window. The
+   * three answers want three different things done: keep the turn, delete it,
+   * or keep it and record when it is shut. Reading a conditional restriction
+   * as "no restriction" — which is what discarding the relation amounted to —
+   * left the turn open at the two hours of the day it is closed.
+   */
+  const turnBan = (inEdge, outEdge) => {
     const byWay = byVia.get(edgeFrom[outEdge]);
-    if (!byWay) return true;
+    if (!byWay) return 0;
     const group = byWay.get(edgeWay[inEdge]);
-    if (!group) return true;
+    if (!group) return 0;
     const way = edgeWay[outEdge];
-    if (group.onlys.length) return group.onlys.some(only => way === only.toWay);
+    if (group.onlys.length) {
+      const permitted = group.onlys.find(only => way === only.toWay);
+      if (permitted) return 0;
+      // An `only_` restriction forbids every other turn. When it applies at
+      // all hours the turn simply goes; when it is a window, the turn stays
+      // and is shut for that window like any other conditional ban.
+      const timed = group.onlys.every(only => only.window);
+      return timed ? banTable.idFor(group.onlys[0].window) : -1;
+    }
     for (const no of group.nos) {
       if (way !== no.toWay) continue;
       if (no.toWay === no.fromWay && edgeTo[outEdge] !== edgeFrom[inEdge]) continue;
-      return false;
+      return no.window ? banTable.idFor(no.window) : -1;
     }
-    return true;
+    return 0;
   };
 
   // Incoming-edge CSR.
@@ -2678,7 +3762,7 @@ export function expandTurnCosts(context, turnCosts) {
       : 1;
     for (let slot = inStart[junction]; slot < inStart[junction + 1]; slot++) {
       const inEdge = inEdges[slot];
-      if (!allowed(inEdge, out)) {
+      if (turnBan(inEdge, out) < 0) {
         filteredTurns++;
         continue;
       }
@@ -2704,6 +3788,19 @@ export function expandTurnCosts(context, turnCosts) {
   const newSpeed = new Uint8Array(expandedEdgeCount);
   const newCond = new Uint8Array(expandedEdgeCount);
   const newSign = new Uint32Array(expandedEdgeCount);
+  // When this turn is shut, as an index into the ban table. Zero on all but a
+  // handful of turns in a city, and the reason a peak-hour ban can be obeyed
+  // at all: the turn stays in the graph and says when it is closed, instead
+  // of being deleted for every hour of the week or kept for none of them.
+  const newBan = new Uint32Array(expandedEdgeCount);
+  // Every approach copy of a road is still the same road, and the arch over
+  // it is still the same arch. Dropping this column here was invisible: the
+  // tags were read and the table was written, and afterwards not one edge in
+  // the country pointed at it.
+  const newLimit = new Uint32Array(expandedEdgeCount);
+  const newCharge = new Uint32Array(expandedEdgeCount);
+  const newLaneSign = new Uint32Array(expandedEdgeCount);
+  const newLaneMask = new Uint32Array(expandedEdgeCount);
   const newFlags = new Uint8Array(expandedEdgeCount);
   const newGeomOffsets = new Uint32Array(expandedEdgeCount + 1);
   const newGeomBytes = new Uint8Array(expandedGeomBytes);
@@ -2716,7 +3813,10 @@ export function expandTurnCosts(context, turnCosts) {
     const junction = edgeFrom[out];
     for (let slot = inStart[junction]; slot < inStart[junction + 1]; slot++) {
       const inEdge = inEdges[slot];
-      if (!allowed(inEdge, out)) continue;
+      const ban = turnBan(inEdge, out);
+      if (ban < 0) continue;
+      if (ban > 0) timedTurns++;
+      newBan[edgeCursor] = ban;
       newFrom[edgeCursor] = inEdge;
       newTo[edgeCursor] = out;
       newWeight[edgeCursor] = edgeWeightDs[out] + turnCostFor(inEdge, out);
@@ -2726,7 +3826,30 @@ export function expandTurnCosts(context, turnCosts) {
       newJunction[edgeCursor] = edgeJunction ? edgeJunction[out] : 0;
       newSpeed[edgeCursor] = edgeSpeed ? edgeSpeed[out] : 0;
       newCond[edgeCursor] = edgeCond ? edgeCond[out] : 0;
-      newSign[edgeCursor] = edgeSign ? edgeSign[out] : 0;
+      // The panel a driver making this turn will actually be reading. It
+      // outranks whatever the road itself carries, because a sign at the
+      // junction is written for this movement and the road's own tags are
+      // written for the road.
+      const turnSign = signForTurn(inEdge, out);
+      if (turnSign && signTable) {
+        newSign[edgeCursor] = signTable.idFor({
+          ref: turnSign.ref,
+          exit: "",
+          destRef: turnSign.ref,
+          dest: turnSign.text
+        });
+        signedTurns++;
+      } else {
+        newSign[edgeCursor] = edgeSign ? edgeSign[out] : 0;
+      }
+      // Which approach lanes reach this turning, when the map says outright
+      // rather than leaving it to be inferred from the arrows.
+      const laneMask = lanesForTurn(inEdge, out);
+      newLaneMask[edgeCursor] = laneMask;
+      if (laneMask) connectedTurns++;
+      newLimit[edgeCursor] = edgeLimit ? edgeLimit[out] : 0;
+      newCharge[edgeCursor] = edgeCharge ? edgeCharge[out] : 0;
+      newLaneSign[edgeCursor] = edgeLaneSign ? edgeLaneSign[out] : 0;
       newFlags[edgeCursor] = edgeFlags ? edgeFlags[out] : 0;
       const start = geomOffsets[out];
       const end = geomOffsets[out + 1];
@@ -2746,6 +3869,16 @@ export function expandTurnCosts(context, turnCosts) {
     }
   }
   log(`turn costs: ${edgeCount} junction copies, ${expandedEdgeCount} expanded edges, ${filteredTurns} restricted turns filtered, ${restrictedApproaches} restricted approaches`);
+  // Counted out loud, because a column that quietly arrives empty is exactly
+  // how the posted-limit work went wrong: the tags parsed, the table filled,
+  // and not one edge pointed at it. A zero here with rules in the table means
+  // the ban never reached an edge.
+  log(`timed turns: ${timedTurns} shut on a schedule, ${banTable.list.length} distinct windows`);
+  // Counted out loud like every other column that has to survive the trip
+  // from a tag to an edge. A zero here with relations in the extract means
+  // the sign never reached the turn it describes.
+  log(`junction signs: ${(context.junctionSigns || []).length} relation(s), ${signViaMissing} with a via node off the graph, ${signedTurns} turns carry their own panel`);
+  log(`lane connections: ${(context.laneConnections || []).length} relation(s), ${connectedTurns} turns say which lanes reach them`);
   return {
     nodeLat: newLat,
     nodeLon: newLon,
@@ -2759,6 +3892,15 @@ export function expandTurnCosts(context, turnCosts) {
     edgeSpeed: newSpeed,
     edgeCond: newCond,
     edgeSign: newSign,
+    edgeLimit: newLimit,
+    edgeCharge: newCharge,
+    edgeLaneSign: newLaneSign,
+    edgeLaneMask: newLaneMask,
+    signedTurns,
+    connectedTurns,
+    edgeBan: newBan,
+    banRules: banTable.list,
+    timedTurns,
     edgeFlags: newFlags,
     geomOffsets: newGeomOffsets,
     geomBytes: newGeomBytes,
@@ -2893,6 +4035,11 @@ export function filterLargestScc(graph, log) {
   const edgeSpeed = graph.edgeSpeed || new Uint8Array(graph.edgeFrom.length);
   const edgeCond = graph.edgeCond || new Uint8Array(graph.edgeFrom.length);
   const edgeSign = graph.edgeSign || new Uint32Array(graph.edgeFrom.length);
+  const edgeLimit = graph.edgeLimit || new Uint32Array(graph.edgeFrom.length);
+  const edgeBan = graph.edgeBan || new Uint32Array(graph.edgeFrom.length);
+  const edgeCharge = graph.edgeCharge || new Uint32Array(graph.edgeFrom.length);
+  const edgeLaneSign = graph.edgeLaneSign || new Uint32Array(graph.edgeFrom.length);
+  const edgeLaneMask = graph.edgeLaneMask || new Uint32Array(graph.edgeFrom.length);
   const edgeFlags = graph.edgeFlags || new Uint8Array(graph.edgeFrom.length);
   const laneOffsets = graph.laneOffsets || new Uint32Array(graph.edgeFrom.length + 1);
   const laneBytes = graph.laneBytes || new Uint8Array(graph.edgeFrom.length);
@@ -2913,6 +4060,11 @@ export function filterLargestScc(graph, log) {
     edgeSpeed[edgeIndex] = graph.edgeSpeed ? graph.edgeSpeed[i] : 0;
     edgeCond[edgeIndex] = graph.edgeCond ? graph.edgeCond[i] : 0;
     edgeSign[edgeIndex] = graph.edgeSign ? graph.edgeSign[i] : 0;
+    edgeLimit[edgeIndex] = graph.edgeLimit ? graph.edgeLimit[i] : 0;
+    edgeBan[edgeIndex] = graph.edgeBan ? graph.edgeBan[i] : 0;
+    edgeCharge[edgeIndex] = graph.edgeCharge ? graph.edgeCharge[i] : 0;
+    edgeLaneSign[edgeIndex] = graph.edgeLaneSign ? graph.edgeLaneSign[i] : 0;
+    edgeLaneMask[edgeIndex] = graph.edgeLaneMask ? graph.edgeLaneMask[i] : 0;
     edgeFlags[edgeIndex] = graph.edgeFlags ? graph.edgeFlags[i] : 0;
     const geomStart = graph.geomOffsets[i];
     const geomEnd = graph.geomOffsets[i + 1];
@@ -2947,6 +4099,11 @@ export function filterLargestScc(graph, log) {
     edgeSpeed: edgeSpeed.subarray(0, keptEdges),
     edgeCond: edgeCond.subarray(0, keptEdges),
     edgeSign: edgeSign.subarray(0, keptEdges),
+    edgeLimit: edgeLimit.subarray(0, keptEdges),
+    edgeBan: edgeBan.subarray(0, keptEdges),
+    edgeCharge: edgeCharge.subarray(0, keptEdges),
+    edgeLaneSign: edgeLaneSign.subarray(0, keptEdges),
+    edgeLaneMask: edgeLaneMask.subarray(0, keptEdges),
     edgeFlags: edgeFlags.subarray(0, keptEdges),
     laneOffsets: laneOffsets.subarray(0, keptEdges + 1),
     laneBytes: laneBytes.subarray(0, laneByteCount),
@@ -2957,6 +4114,10 @@ export function filterLargestScc(graph, log) {
     classes: graph.classes,
     condRules: graph.condRules || [],
     signs: graph.signs || [],
+    limits: graph.limits || [],
+    charges: graph.charges || [],
+    laneSigns: graph.laneSigns || [],
+    banRules: graph.banRules || [],
     portals: graph.portals || {}
   };
 }
@@ -2977,6 +4138,19 @@ export function writeRoadGraph(path, graph) {
     ["edgeSpeed", graph.edgeSpeed],
     ["edgeCond", graph.edgeCond],
     ["edgeSign", graph.edgeSign],
+    // What each edge physically will not admit, as an index into the header's
+    // table. Omitting this column lost every posted limit between the
+    // extractor and the index builder — the tags were read, the table was
+    // written, and not one edge pointed at it.
+    // Defaulted rather than required: a caller that never read a limit has
+    // none, and that is a graph with no posted restrictions rather than a
+    // broken one. The column being *absent mid-pipeline* is the failure that
+    // matters, and it is caught where the extractor reports its own count.
+    ["edgeLimit", graph.edgeLimit ?? new Uint32Array(graph.edgeFrom.length)],
+    ["edgeBan", graph.edgeBan ?? new Uint32Array(graph.edgeFrom.length)],
+    ["edgeCharge", graph.edgeCharge ?? new Uint32Array(graph.edgeFrom.length)],
+    ["edgeLaneSign", graph.edgeLaneSign ?? new Uint32Array(graph.edgeFrom.length)],
+    ["edgeLaneMask", graph.edgeLaneMask ?? new Uint32Array(graph.edgeFrom.length)],
     ["edgeFlags", graph.edgeFlags],
     ["laneOffsets", graph.laneOffsets],
     ["laneBytes", graph.laneBytes],
@@ -2994,6 +4168,13 @@ export function writeRoadGraph(path, graph) {
     // What the green panels say, as distinct sign faces an edge names by
     // index. A province repeats a few thousand between all its motorways.
     signs: graph.signs || [],
+    limits: graph.limits || [],
+    // When each turn is shut, for the turns that are shut on a schedule.
+    banRules: graph.banRules || [],
+    // What the tolled and ferried stretches cost, where OSM says.
+    charges: graph.charges || [],
+    // What the overhead panel says above each lane of an approach.
+    laneSigns: graph.laneSigns || [],
     nodes: graph.nodeLat.length,
     edges: graph.edgeFrom.length,
     profile: graph.profile || "car",
@@ -3087,7 +4268,11 @@ export async function readRoadGraph(path) {
       profile: header.profile || "car",
       classes: header.classes || [],
       condRules: header.condRules || [],
-      signs: header.signs || []
+      signs: header.signs || [],
+      limits: header.limits || [],
+      banRules: header.banRules || [],
+      charges: header.charges || [],
+      laneSigns: header.laneSigns || []
     };
     let offset = dataOffset;
     for (const section of header.sections) {

@@ -34,6 +34,53 @@ const HEADING_ALIGNED_DEG = 45;
 const HEADING_OPPOSED_DEG = 135;
 // Per-edge flag bits, matching the extractor's own encoding.
 const EDGE_FLAG_ROUNDABOUT = 1;
+/** This road is tolled; this edge is a boat. See the extractor's flags. */
+const EDGE_FLAG_TOLL = 2;
+const EDGE_FLAG_FERRY = 4;
+/** Dangerous goods refused; see the extractor's flags. */
+const EDGE_FLAG_NO_HAZMAT = 8;
+const EDGE_FLAG_NO_HGV = 16;
+const EDGE_FLAG_PSV_ONLY = 32;
+/** A car-pool road asking two aboard, and one asking three. */
+const EDGE_FLAG_HOV_ONLY = 64;
+const EDGE_FLAG_HOV3_ONLY = 128;
+
+/**
+ * The occupancy a car-pool lane asks for where `hov:minimum` does not say.
+ *
+ * Two is what nearly every sign reads, and what `hov=designated` means on
+ * its own. A driver who has not said how many are aboard is treated as
+ * alone, which costs them a lane rather than a fine.
+ */
+const HOV_MINIMUM_OCCUPANCY = 2;
+
+/**
+ * Above this a vehicle is a goods vehicle as far as a sign is concerned.
+ *
+ * 3.5 t is where the line sits in the EU, the UK and most of the world that
+ * signs `hgv` at all, and it is the weight the tag is written against. A
+ * driver who declares a 4 t van has declared an HGV whether or not they used
+ * the word, which matters because they will not think to.
+ */
+const HGV_WEIGHT_KG = 3500;
+
+/**
+ * How far off the route's own heading another arm may set out and still count
+ * as carrying on beside it.
+ *
+ * The prongs of a fork diverge by tens of degrees at most — that is what makes
+ * them a fork rather than a turning — while a side road at a crossroads leaves
+ * near a right angle and is no part of the decision. Fifty degrees keeps the
+ * first and drops the second.
+ */
+const FORK_SPREAD_DEG = 50;
+
+/**
+ * How far off the way you arrived another arm may lie and still be the road
+ * carrying on. Tighter than a fork's spread: a fork is two ways forward, and
+ * this is one way forward existing at all.
+ */
+const STRAIGHT_ON_DEG = 30;
 // How much further than the nearest road a snap candidate may be and still
 // be considered. Ordinary GPS error on an open road lives inside the first
 // figure; a caller reporting worse accuracy can widen it up to the second,
@@ -90,14 +137,30 @@ const JUNCTION_MERGE_METERS = 45;
  */
 const JUNCTION_MERGE_ALONG_METERS = 90;
 
+/** A painted pedestrian crossing; see JUNCTION_KINDS in the extractor. */
+const KIND_CROSSING = 5;
+
 /**
  * Whether a junction marker describes the same intersection as the last one
- * reported. Same kind, close enough to be the far side of one crossroads
- * rather than the next one along, and reached soon enough to be the same
- * crossing rather than a second visit.
+ * reported. Close enough to be the far side of one crossroads rather than the
+ * next one along, and reached soon enough to be the same crossing rather than
+ * a second visit.
+ *
+ * A crossing beside the light that governs it is the same intersection, not
+ * two things: a signalised crossroads carries a signal node and a painted
+ * crossing on each approach, and reporting both drew a traffic light with a
+ * crossing hung off it every time. So a crossing is absorbed by whatever it
+ * arrives beside — the light or the stop line is what the driver obeys, and
+ * the crossing is part of what that sign is there for. Only a crossing is:
+ * a stop line beside a light really is two facts about the road.
  */
 export function mergesWithPreviousJunction(previous, kind, latE7, lonE7, atMeters = null) {
-  if (!previous || previous.kind !== kind) return false;
+  if (!previous) return false;
+  // Same kind merges. So does a crossing arriving beside anything else, which
+  // is the one asymmetry worth having: a stop line beside a light is two
+  // facts about the road, but a painted crossing beside the light that
+  // governs it is part of what that light is for.
+  if (previous.kind !== kind && kind !== KIND_CROSSING) return false;
   if (
     atMeters != null &&
     previous.atMeters != null &&
@@ -206,6 +269,19 @@ function laneListOf(cell, edge) {
   const end = cell.laneOffsets[edge + 1];
   if (!(end > start)) return [];
   return Array.from(cell.laneMasks.subarray(start, end));
+}
+
+/**
+ * Why each of those lanes is not the driver's, in the same order; 0 where it
+ * is. Empty when the map never said, which is most roads.
+ */
+function laneAccessOf(cell, edge) {
+  if (!cell || edge < 0 || !cell.laneOffsets || !cell.laneAccess) return [];
+  const start = cell.laneOffsets[edge];
+  const end = cell.laneOffsets[edge + 1];
+  if (!(end > start) || cell.laneAccess.length < end) return [];
+  const list = Array.from(cell.laneAccess.subarray(start, end));
+  return list.some(Boolean) ? list : [];
 }
 
 export async function openRouteGraph(options) {
@@ -867,6 +943,17 @@ export async function openRouteGraph(options) {
     return candidates;
   }
 
+  /**
+   * How far down the list of nearby edges to look for one a restricted
+   * vehicle may actually use.
+   *
+   * Only consulted when every ordinary candidate is refused, which is rare
+   * and local — a depot on a street signed against lorries. Sixty-four is
+   * enough to reach the next permitted road in a dense town centre and small
+   * enough that carrying it costs nothing on the common path.
+   */
+  const SNAP_REACH_CANDIDATES = 64;
+
   async function snapUncached(point, maxCandidates, extraMeters) {
     const latE7 = Math.round(point.lat * 1e7);
     const lonE7 = Math.round((point.lon ?? point.lng) * 1e7);
@@ -891,6 +978,8 @@ export async function openRouteGraph(options) {
             classCode: cell.classes[e],
             distDm: cell.distsDm[e],
             nameId: cell.nameIds[e],
+            flags: cell.flags ? cell.flags[e] : 0,
+            limitId: cell.limits ? cell.limits[e] : 0,
             distMeters: projected.distMeters,
             ratio: projected.totalMeters > 0 ? projected.alongMeters / projected.totalMeters : 0,
             snappedLatE7: projected.latE7,
@@ -910,7 +999,15 @@ export async function openRouteGraph(options) {
     // search charges for this, so a slip road twenty metres away stops
     // beating the road the car is actually on.
     for (const match of kept) match.extraMeters = match.distMeters - best.distMeters;
-    return { latE7, lonE7, matches: kept };
+    // A wider ring of candidates, for the case where every road at the door
+    // is one this vehicle may not use. The snap cache is shared across
+    // vehicles, so it cannot filter — it can only make sure the caller has
+    // something left to choose from.
+    const reach = matches.slice(0, SNAP_REACH_CANDIDATES);
+    for (const match of reach) {
+      if (match.extraMeters == null) match.extraMeters = match.distMeters - best.distMeters;
+    }
+    return { latE7, lonE7, matches: kept, reach };
   }
 
   // --- Multilevel bidirectional Dijkstra --------------------------------
@@ -1006,7 +1103,33 @@ export async function openRouteGraph(options) {
   // the CRP region decomposition guarantees every needed edge is present in
   // at least one fetched object. Relaxing the union is therefore both
   // complete and exact, and needs no region bookkeeping.
-  function searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live) {
+  /**
+   * The edge flags this request refuses, whether by preference or by law.
+   *
+   * Shared by the search and the snap: a road a lorry may not drive is also
+   * not a road to start it on, and the two answering that question
+   * differently is how a driver gets a route that begins on a street they
+   * are signed out of.
+   */
+  function avoidMaskFor(vehicle, avoid) {
+    return (avoid?.tolls ? EDGE_FLAG_TOLL : 0) |
+      (avoid?.ferries ? EDGE_FLAG_FERRY : 0) |
+      (vehicle?.hazmat ? EDGE_FLAG_NO_HAZMAT : 0) |
+      (vehicle?.hgv ? EDGE_FLAG_NO_HGV : 0) |
+      // Reserved roads are refused unless the driver has said they are the
+      // one it is reserved for. Note this is on by default and not only when
+      // a vehicle is declared: before these ways were flagged they were
+      // deleted outright, so silence has to keep meaning "not for me" or
+      // every ordinary car would inherit the bus lanes.
+      (vehicle?.psv ? 0 : EDGE_FLAG_PSV_ONLY) |
+      // Each minimum is refused separately, so a driver with one passenger
+      // keeps the lanes that ask for two and is still turned away from the
+      // ones that ask for three.
+      (vehicle?.hov ? 0 : EDGE_FLAG_HOV_ONLY) |
+      (vehicle?.hov3 ? 0 : EDGE_FLAG_HOV3_ONLY);
+  }
+
+  function searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, bucketIndex, avoid) {
     const INF = Infinity;
     // Optional query-graph edge penalties (alternative-route computation):
     // multiplies specific (from, to) transitions without refetching.
@@ -1014,6 +1137,99 @@ export async function openRouteGraph(options) {
       ? (from, to, weight) => (penalized.has(`${from}:${to}`) ? Math.round(weight * penalized.factor) : weight)
       : (from, to, weight) => weight;
     const cellList = [...fetched.cells.values()];
+    const limitTable = root.limits || [];
+    /**
+     * Whether this vehicle physically fits down an edge.
+     *
+     * A limit is not a cost. A van 3.4 m tall does not take a 3.2 m bridge
+     * slowly — it does not take it at all — so this refuses the edge outright
+     * rather than pricing it, which is the difference between a longer route
+     * and a wedged vehicle.
+     *
+     * Equality passes: a sign reading 3.5 admits a vehicle declared 3.5. The
+     * driver's own margin is theirs to add, and inventing one here would
+     * silently refuse roads that are posted to fit.
+     */
+    const admits = vehicle
+      ? (cell, edge) => {
+        const id = cell.limits ? cell.limits[edge] : 0;
+        if (!id) return true;
+        const limit = limitTable[id - 1];
+        if (!limit) return true;
+        if (limit.heightCm && vehicle.heightCm > limit.heightCm) return false;
+        if (limit.widthCm && vehicle.widthCm > limit.widthCm) return false;
+        if (limit.lengthCm && vehicle.lengthCm > limit.lengthCm) return false;
+        if (limit.weightKg && vehicle.weightKg > limit.weightKg) return false;
+        return true;
+      }
+      : () => true;
+    /**
+     * Turns shut at this hour, by ban-rule id.
+     *
+     * Read the same way the builder wrote them: a ban applies to a bucket
+     * only when the bucket's whole window sits inside the ban's, so the two
+     * halves cannot drift apart. The overlays for this bucket were built with
+     * the ban already priced out of the metric; this is the same fact on the
+     * raw roads, so a shortcut and the street it stands for always agree
+     * about whether the turn is there at all.
+     */
+    const shutNow = (() => {
+      const rules = root.banRules || [];
+      const window = root.buckets[bucketIndex]?.rules || [];
+      const shut = new Set();
+      if (!rules.length || !window.length) return shut;
+      for (let id = 1; id <= rules.length; id++) {
+        const ban = rules[id - 1];
+        const covered = window.every(rule =>
+          (rule.dayMask & ban.days) === rule.dayMask &&
+          rule.startHour * 60 >= ban.startMinute &&
+          rule.endHour * 60 <= ban.endMinute
+        );
+        if (covered) shut.add(id);
+      }
+      return shut;
+    })();
+
+    /**
+     * What the driver would rather not use.
+     *
+     * A toll is not slow and a ferry is not slow — both are decisions, and a
+     * router that folds the money and the boat into the time has answered
+     * for the driver. So these are refusals, applied to the roads and to the
+     * shortcuts that stand for them alike: `pathFlags` carries what a
+     * shortcut's interior passes through, or "avoid ferries" would be true of
+     * every street and false of the hierarchy above them.
+     */
+    // Carrying dangerous goods is not a preference — the roads that refuse
+    // them refuse them — so it joins the mask from the vehicle rather than
+    // from what the driver would rather avoid.
+    const avoidMask = avoidMaskFor(vehicle, avoid);
+    const wantedEdge = avoidMask
+      ? (cell, edge) => ((cell.flags ? cell.flags[edge] : 0) & avoidMask) === 0
+      : () => true;
+    const wantedArc = avoidMask
+      ? (overlay, e) => ((overlay.pathFlags ? overlay.pathFlags[e] : 0) & avoidMask) === 0
+      : () => true;
+
+    /** A turn that is shut is not a slow one; it is not there. */
+    const openNow = shutNow.size
+      ? (cell, edge) => !(cell.bans && shutNow.has(cell.bans[edge]))
+      : () => true;
+
+    /** The same question of a shortcut, which stands for a whole path. */
+    const admitsArc = vehicle
+      ? (overlay, e) => {
+        const id = overlay.limits ? overlay.limits[e] : 0;
+        if (!id) return true;
+        const limit = limitTable[id - 1];
+        if (!limit) return true;
+        if (limit.heightCm && vehicle.heightCm > limit.heightCm) return false;
+        if (limit.widthCm && vehicle.widthCm > limit.widthCm) return false;
+        if (limit.lengthCm && vehicle.lengthCm > limit.lengthCm) return false;
+        if (limit.weightKg && vehicle.weightKg > limit.weightKg) return false;
+        return true;
+      }
+      : () => true;
     const overlayEntries = [...fetched.overlays.entries()].map(([key, overlay]) => {
       const [levelText, cellText] = key === "top" ? [levelCount + 1, 0] : key.split(":");
       return { overlay, level: Number(levelText), cell: Number(cellText) };
@@ -1073,6 +1289,7 @@ export async function openRouteGraph(options) {
         if (node < cell.firstNode || node >= cell.firstNode + cell.nodeCount) continue;
         const local = node - cell.firstNode;
         for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
+          if (!admits(cell, e) || !openNow(cell, e) || !wantedEdge(cell, e)) continue;
           const target = cell.targets[e];
           const next = weight + penaltyFor(node, target, liveAdjustedWeight(live, cell, e, cellEdgeWeight(cell, e, factors)));
           if (next < (distF.get(target) ?? INF)) {
@@ -1095,6 +1312,7 @@ export async function openRouteGraph(options) {
             if (overlay.isClique[e]) continue;
             if (live.byCell.has(fetched.cells.get(leafOfNode(node)))) continue;
           }
+          if (!admitsArc(overlay, e) || !wantedArc(overlay, e)) continue;
           const target = overlay.nodes[overlay.targetIndex[e]];
           const next = weight + penaltyFor(node, target, overlay.weights[e]);
           if (next < (distF.get(target) ?? INF)) {
@@ -1119,6 +1337,7 @@ export async function openRouteGraph(options) {
           const local = node - cell.firstNode;
           for (let e = reverse.rowStart[local]; e < reverse.rowStart[local + 1]; e++) {
             const edge = reverse.edgeIds[e];
+            if (!admits(cell, edge) || !openNow(cell, edge) || !wantedEdge(cell, edge)) continue;
             const source = reverse.sources[e];
             const next = weight + penaltyFor(source, node, liveAdjustedWeight(live, cell, edge, cellEdgeWeight(cell, edge, factors)));
             if (next < (distB.get(source) ?? INF)) {
@@ -1133,6 +1352,7 @@ export async function openRouteGraph(options) {
           for (let i = 0; i < external.length; i += 2) {
             const source = external[i];
             const edge = external[i + 1];
+            if (!admits(cell, edge) || !openNow(cell, edge) || !wantedEdge(cell, edge)) continue;
             const next = weight + penaltyFor(source, node, liveAdjustedWeight(live, cell, edge, cellEdgeWeight(cell, edge, factors)));
             if (next < (distB.get(source) ?? INF)) {
               distB.set(source, next);
@@ -1148,6 +1368,7 @@ export async function openRouteGraph(options) {
         const reverse = reverseOverlay(overlay);
         for (let e = reverse.rowStart[index]; e < reverse.rowStart[index + 1]; e++) {
           const edge = reverse.edgeIds[e];
+          if (!admitsArc(overlay, edge) || !wantedArc(overlay, edge)) continue;
           const source = overlay.nodes[reverse.sources[e]];
           if (live?.dirtyKeys.size) {
             const key = `${level - 1}:${cellAtLevel(leafOfNode(source), level - 1)}`;
@@ -1488,6 +1709,92 @@ export async function openRouteGraph(options) {
       }
       return 0;
     };
+
+    /** Which leaf's geometry block a cell's edges are drawn from. */
+    const leafOfCell = new Map(rawEdges.map(raw => [raw.cell, raw.leaf]));
+
+    /**
+     * How many *other* ways out of a junction set off in much the same
+     * direction as the one the route takes.
+     *
+     * A count of arms alone cannot find a fork: a crossroads driven straight
+     * through offers three ways on and needs no instruction at all, because
+     * only one of them continues the road. What makes a fork is that two ways
+     * both carry on — the driver is looking at a Y and "straight ahead" has
+     * stopped being an answer. So the other arms are measured against the one
+     * the route takes, and only those still pointing roughly the same way
+     * count. Side roads at a right angle are exactly the ones to ignore.
+     *
+     * Zero on any doubt: an unknown cell, an unreadable arm, a junction whose
+     * geometry the route never loaded. Absence of evidence, not evidence of a
+     * plain road.
+     *
+     * Counted by where the arms lead rather than by how many rows describe
+     * them. One road out of a junction can appear several times over — the
+     * graph keeps a copy per approach so a turn restriction has somewhere to
+     * live — and counting rows reports one fork as two or three.
+     */
+    const classNames = root.classes || [];
+    const isLink = (cell, edge) => {
+      const name = classNames[cell.classes ? cell.classes[edge] : 0];
+      return typeof name === "string" && name.endsWith("_link");
+    };
+
+    /**
+     * Whether anything carries on ahead from a junction.
+     *
+     * "Turn left" and "at the end of the road, turn left" are different
+     * instructions: one is a turning off a road that continues, the other is
+     * a road that stops. A driver hearing the second knows they cannot
+     * overshoot it, and the difference is not in the angle — it is whether
+     * any arm keeps going the way they arrived.
+     */
+    const continuesAhead = (node, cameFrom, approachBearing, cosLat) => {
+      if (node < 0 || approachBearing === null || !Number.isFinite(approachBearing)) return true;
+      const cell = cellForNode(node);
+      if (!cell) return true;
+      const block = geometryByLeaf.get(leafOfCell.get(cell));
+      if (!block) return true;
+      const local = node - cell.firstNode;
+      if (local < 0 || local + 1 >= cell.rowStart.length) return true;
+      for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
+        if (cell.targets[e] === cameFrom) continue;
+        const bearing = segmentBearing(edgePolyline(cell.geomRefs[e], block), 0, cosLat);
+        if (bearing === null) continue;
+        const off = Math.abs(((bearing - approachBearing + 540) % 360) - 180);
+        if (off <= STRAIGHT_ON_DEG) return true;
+      }
+      return false;
+    };
+
+    const forkArmsAtNode = (node, cameFrom, takenCell, takenEdge, takenBearing, cosLat) => {
+      if (node < 0 || takenBearing === null || !Number.isFinite(takenBearing)) return 0;
+      const cell = cellForNode(node);
+      if (!cell) return 0;
+      const block = geometryByLeaf.get(leafOfCell.get(cell));
+      if (!block) return 0;
+      const local = node - cell.firstNode;
+      if (local < 0 || local + 1 >= cell.rowStart.length) return 0;
+      const takenIsLink = isLink(takenCell, takenEdge);
+      const takenTarget = takenCell.targets[takenEdge];
+      const arms = new Set();
+      for (let e = cell.rowStart[local]; e < cell.rowStart[local + 1]; e++) {
+        // Never the way back, and never the way actually taken — the question
+        // is what *else* the driver could have carried on down.
+        if (cell.targets[e] === cameFrom) continue;
+        if (cell.targets[e] === takenTarget) continue;
+        // A slip road peeling off a motorway leaves at a shallow angle too,
+        // and every exit passed would otherwise read as a fork — turning a
+        // hundred kilometres of autoroute into an instruction per junction.
+        // A ramp beside a road is a way out of it, not a second way along it.
+        if (!takenIsLink && isLink(cell, e)) continue;
+        const bearing = segmentBearing(edgePolyline(cell.geomRefs[e], block), 0, cosLat);
+        if (bearing === null) continue;
+        const off = Math.abs(((bearing - takenBearing + 540) % 360) - 180);
+        if (off <= FORK_SPREAD_DEG) arms.add(cell.targets[e]);
+      }
+      return arms.size;
+    };
     let roundaboutExits = 0;
 
     const geometry = [];
@@ -1509,6 +1816,9 @@ export async function openRouteGraph(options) {
     // lane guidance describes the approach, not the road being joined.
     let previousCell = null;
     let previousEdge = -1;
+    // The node the previous edge set out from, which is the arm the route
+    // arrives on and therefore the one arm that is not a way onward.
+    let previousStart = -1;
     for (const raw of rawEdges) {
       const cell = raw.cell;
       const edge = raw.edge;
@@ -1521,6 +1831,34 @@ export async function openRouteGraph(options) {
       const edgeStartIndex = Math.max(0, geometry.length - 1);
       const approachCell = previousCell;
       const approachEdge = previousEdge;
+      // The junction this edge sets out from, and how many ways led on from
+      // it. Read here rather than at the step, because a step that carries on
+      // through a junction still crossed one and the count belongs to the
+      // edge that crossed it.
+      const startNode = approachCell ? approachCell.targets[approachEdge] : -1;
+      const junctionLat = geometry.length ? geometry[edgeStartIndex][0] : 0;
+      const forkArms = forkArmsAtNode(
+        startNode,
+        previousStart,
+        cell,
+        edge,
+        segmentBearing(points, 0, Math.cos(junctionLat * Math.PI / 180)),
+        Math.cos(junctionLat * Math.PI / 180)
+      );
+      // The way the driver arrived, for asking whether anything carries on
+      // that way. Taken from the edge behind rather than the one ahead: the
+      // question is about the road being left, not the one being joined.
+      const approachBearing = approachCell
+        ? segmentBearing(
+          edgePolyline(approachCell.geomRefs[approachEdge], geometryByLeaf.get(leafOfCell.get(approachCell))),
+          0,
+          Math.cos(junctionLat * Math.PI / 180)
+        )
+        : null;
+      const roadEnds = approachCell
+        ? !continuesAhead(startNode, previousStart, approachBearing, Math.cos(junctionLat * Math.PI / 180))
+        : false;
+      previousStart = startNode;
       previousCell = cell;
       previousEdge = edge;
       for (let i = 0; i < points.length; i += 2) pushPoint(points[i], points[i + 1]);
@@ -1592,7 +1930,11 @@ export async function openRouteGraph(options) {
       const last = steps[steps.length - 1];
       const continues = last && (
         roundabout ? last.roundabout : (!last.roundabout && last.name === name)
-      );
+      // A fork keeps the road's name — that is precisely what makes it
+      // invisible — so folding on the name alone swallowed the one junction
+      // where the driver had to choose. A step boundary is where an
+      // instruction can be attached, and a fork needs one.
+      ) && !forkArms;
       if (roundabout) {
         // Every arc ends at an arm of the circle. The ones that lead out are
         // the exits a driver counts, so counting them as they go past is what
@@ -1628,7 +1970,30 @@ export async function openRouteGraph(options) {
           // cycling profile that claims to prefer cycleways can only be
           // checked against the classes it actually chose.
           roadClass: cell.classes ? cell.classes[edge] : 0,
+          // How many other ways carried on from this step's junction in
+          // much the same direction as the route. Zero is "not known",
+          // never "none".
+          forkArms,
+          // Nothing carries on the way the driver arrived: this is a turning
+          // off a road that stops, not off one that continues past it.
+          endOfRoad: roadEnds,
           lanes: laneListOf(approachCell, approachEdge),
+          // Which of them are somebody else's — a reserved bus lane on the
+          // approach is the difference between "get right" and a ticket.
+          laneAccess: laneAccessOf(approachCell, approachEdge),
+          // What the panel over those lanes says, lane by lane. Belongs to
+          // the approach for the same reason the arrows do: "the left two
+          // are yours" is an instruction about the road being left, and it
+          // is read at the same glance as the arrows under it.
+          // Which of those lanes actually reach this turning, when the map
+          // says outright. Zero means it did not, and the client falls back
+          // to reading the arrows.
+          laneReach: approachCell?.laneReach ? approachCell.laneReach[approachEdge] : 0,
+          laneDestinations: (() => {
+            const id = approachCell?.laneSigns ? approachCell.laneSigns[approachEdge] : 0;
+            const panel = id ? (root.laneSigns || [])[id - 1] : "";
+            return panel ? panel.split("|") : [];
+          })(),
           // What a driver would read on a sign here, rather than what the
           // road is called in the database. Null on the ordinary street that
           // carries no numbers, which is most of them.
@@ -1702,6 +2067,41 @@ export async function openRouteGraph(options) {
       step.destination = sign?.dest || "";
       delete step.sign;
     }
+    // What the route uses that costs money, and what that costs where the map
+    // says. Charged once per continuous stretch rather than once per edge: a
+    // bridge is paid to cross, not by the hundred metres, and a tolled road
+    // arrives as dozens of ways.
+    const chargeTable = root.charges || [];
+    let tollCents = 0;
+    let tollCurrency = "";
+    let usesToll = false;
+    let usesFerry = false;
+    let previousChargeId = 0;
+    for (const raw of rawEdges) {
+      const flags = raw.cell.flags ? raw.cell.flags[raw.edge] : 0;
+      if (flags & EDGE_FLAG_TOLL) usesToll = true;
+      if (flags & EDGE_FLAG_FERRY) usesFerry = true;
+      const chargeId = raw.cell.charges ? raw.cell.charges[raw.edge] : 0;
+      if (chargeId && chargeId !== previousChargeId) {
+        const charge = chargeTable[chargeId - 1];
+        if (charge) {
+          tollCents += charge.cents;
+          tollCurrency = tollCurrency || charge.currency;
+        }
+      }
+      previousChargeId = chargeId;
+    }
+    if (usesToll || usesFerry) {
+      response.charges = {
+        toll: usesToll,
+        ferry: usesFerry,
+        // Null rather than zero when nothing is priced: "free" and "we do not
+        // know" are different answers, and only one of them is safe to show a
+        // driver deciding whether to take the bridge.
+        cents: tollCents || null,
+        currency: tollCents ? tollCurrency : ""
+      };
+    }
     response.distanceMeters = distanceMeters;
     response.geometry = geometry;
     response.steps = steps;
@@ -1745,6 +2145,57 @@ export async function openRouteGraph(options) {
     return Math.round(adjusted * 10) / 10;
   }
 
+  /**
+   * The vehicle a route is being planned for, in the units the signs use.
+   *
+   * Accepted in metres and tonnes because that is how a driver knows their
+   * van — "three-forty" is 3.4 m — and converted here to the centimetres and
+   * kilograms the index stores, so no comparison anywhere downstream is done
+   * in floating point against a number off a sign.
+   *
+   * Null when nothing was asked for, which is the ordinary car and leaves
+   * every road available and the shortcut hierarchy in use.
+   */
+  function parseVehicle(spec) {
+    if (!spec) return null;
+    const cm = (metres) => (Number.isFinite(Number(metres)) ? Math.round(Number(metres) * 100) : 0);
+    const vehicle = {
+      heightCm: cm(spec.heightM),
+      widthCm: cm(spec.widthM),
+      lengthCm: cm(spec.lengthM),
+      weightKg: Number.isFinite(Number(spec.weightT)) ? Math.round(Number(spec.weightT) * 1000) : 0,
+      hazmat: Boolean(spec.hazmat),
+      // What the vehicle *is*, which decides what it is entitled to rather
+      // than what fits through.
+      psv: Boolean(spec.psv),
+      taxi: Boolean(spec.taxi),
+      // How many are aboard, the driver included. A car-pool lane asks for a
+      // number, not a yes.
+      occupancy: Math.max(0, Math.floor(Number(spec.occupancy) || 0)),
+      hgv: false,
+      hov: false,
+      hov3: false
+    };
+    // A bus qualifies for a car-pool lane by being a bus, whatever the sign
+    // asks for; a car qualifies by carrying that many people.
+    vehicle.hov = vehicle.psv || vehicle.occupancy >= HOV_MINIMUM_OCCUPANCY;
+    vehicle.hov3 = vehicle.psv || vehicle.occupancy >= 3;
+    // Declared outright, or implied by a weight that makes it one anyway —
+    // except on a vehicle that has said what it is. A coach weighs 14 t and
+    // is not a goods vehicle, and inferring otherwise refused a school bus
+    // every street signed against lorries, including the ones that name
+    // buses as welcome.
+    vehicle.hgv = Boolean(spec.hgv) ||
+      (!vehicle.psv && !vehicle.taxi && vehicle.weightKg >= HGV_WEIGHT_KG);
+    // A vehicle that states nothing restricts nothing, and must not pay the
+    // price of losing the hierarchy for it.
+    const stated = vehicle.heightCm || vehicle.widthCm || vehicle.lengthCm ||
+      vehicle.weightKg || vehicle.hazmat || vehicle.hgv ||
+      vehicle.psv || vehicle.taxi || vehicle.hov;
+    // `hov3` implies `hov`, so it needs no clause of its own above.
+    return stated ? vehicle : null;
+  }
+
   async function route(params) {
     const bucket = bucketForParams(params);
     const factors = root.buckets[bucket].factors;
@@ -1752,6 +2203,10 @@ export async function openRouteGraph(options) {
     // Alternatives need their exact unpenalized totals, which come from the
     // unpacked path, so they imply geometry.
     const wantGeometry = params.geometry !== false || alternativeCount > 0;
+    const vehicle = parseVehicle(params.vehicle);
+    const avoid = params.avoid && (params.avoid.tolls || params.avoid.ferries)
+      ? { tolls: Boolean(params.avoid.tolls), ferries: Boolean(params.avoid.ferries) }
+      : null;
     const liveWeights = params.liveWeights || null;
     if (liveWeights?.epoch && liveWeights.epoch !== root.sourceHash) {
       throw routeError("RANGEFIND_ROUTE_STALE_LIVE", "liveWeights epoch does not match this index build.");
@@ -1789,7 +2244,44 @@ export async function openRouteGraph(options) {
     const fromOptions = accuracyMeters > SNAP_EXTRA_METERS
       ? { extraMeters: Math.min(accuracyMeters, SNAP_EXTRA_METERS_MAX) }
       : undefined;
-    const [snapFrom, snapTo] = await Promise.all([snap(params.from, fromOptions), snap(params.to)]);
+    const [rawFrom, rawTo] = await Promise.all([snap(params.from, fromOptions), snap(params.to)]);
+    /**
+     * The candidates this vehicle may actually start or finish on.
+     *
+     * Without this the first `hgv=no` street cost the job rather than the
+     * shortcut: a depot on one snapped the search onto an edge the lorry
+     * could not leave, and the driver was told there was no route in the
+     * country rather than which corner to stop at. So a refused doorstep
+     * falls back to the nearest road the vehicle may use — the last few
+     * metres on foot, which is what a courier does anyway — and only a
+     * neighbourhood with no permitted road in it at all is still a refusal.
+     */
+    const restrictSnap = (raw) => {
+      const mask = avoidMaskFor(vehicle, avoid);
+      if (!mask && !vehicle) return raw;
+      // A posted limit closes a doorstep exactly as a sign does — a 4 m van
+      // whose depot is behind a 3.2 m arch is in the same position as a
+      // lorry on a street signed against it, and was getting the same
+      // useless refusal.
+      const limits = root.limits || [];
+      const fits = (match) => {
+        if (!vehicle || !match.limitId) return true;
+        const limit = limits[match.limitId - 1];
+        if (!limit) return true;
+        if (limit.heightCm && vehicle.heightCm > limit.heightCm) return false;
+        if (limit.widthCm && vehicle.widthCm > limit.widthCm) return false;
+        if (limit.lengthCm && vehicle.lengthCm > limit.lengthCm) return false;
+        if (limit.weightKg && vehicle.weightKg > limit.weightKg) return false;
+        return true;
+      };
+      const allowed = (match) => (((match.flags || 0) & mask) === 0) && fits(match);
+      const usable = raw.matches.filter(allowed);
+      if (usable.length) return { ...raw, matches: usable };
+      const reached = (raw.reach || []).filter(allowed);
+      return reached.length ? { ...raw, matches: reached.slice(0, raw.matches.length || 1) } : raw;
+    };
+    const snapFrom = restrictSnap(rawFrom);
+    const snapTo = restrictSnap(rawTo);
     const snapLeaves = new Set();
     for (const match of snapFrom.matches) {
       snapLeaves.add(match.leaf);
@@ -1947,7 +2439,7 @@ export async function openRouteGraph(options) {
       return response;
     };
 
-    const primarySearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, null, live);
+    const primarySearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, null, live, vehicle, bucket, avoid);
     let totalWeight = primarySearch.best;
     let usedSameEdge = false;
     if (sameEdge && sameEdge.weight <= totalWeight) {
@@ -1955,6 +2447,26 @@ export async function openRouteGraph(options) {
       usedSameEdge = true;
     }
     if (totalWeight === Infinity) {
+      // A stated vehicle can genuinely have nowhere to go — every way out
+      // of a village may be posted below it — and that is a different
+      // sentence from "there is no road", because only one of them is
+      // answered by driving somewhere else.
+      if (vehicle) {
+        throw routeError(
+          "RANGEFIND_ROUTE_VEHICLE_NO_PATH",
+          "No route this vehicle fits through between the requested points."
+        );
+      }
+      // Refusing the toll or the boat can leave nowhere to go — an island has
+      // one way off it — and that is a different sentence from "there is no
+      // road". One is answered by driving somewhere else and the other by
+      // deciding to pay, so the caller is told which.
+      if (avoid) {
+        throw routeError(
+          "RANGEFIND_ROUTE_AVOID_NO_PATH",
+          "No route between the requested points that avoids what was asked."
+        );
+      }
       throw routeError("RANGEFIND_ROUTE_NO_PATH", "No route found between the requested points.");
     }
     const primary = await buildResponse(primarySearch, totalWeight, usedSameEdge);
@@ -1981,7 +2493,7 @@ export async function openRouteGraph(options) {
     const candidates = [primary];
     const searches = [primarySearch];
     for (let i = 0; i < alternativeCount; i++) {
-      const alternativeSearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live);
+      const alternativeSearch = searchQueryGraph(contexts, fetched, forwardSeeds, backwardSeeds, factors, penalized, live, vehicle, bucket, avoid);
       if (alternativeSearch.best === Infinity) break;
       // Recompute the alternative's true (unpenalized) weight from its path.
       const transitions = transitionsOf(alternativeSearch);

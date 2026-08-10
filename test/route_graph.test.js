@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { closeSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -2171,4 +2171,1207 @@ test("a ferry is a road the router can take, priced by its timetable", async () 
   assert.equal(PROFILES.foot.allowed(walkOn), true);
   // And a ferry is never one-way, whatever the default for its class.
   assert.equal(PROFILES.car.oneway(carry), 0);
+});
+
+test("a Y is a fork, and the road keeping its name is what hid it", async (t) => {
+  // A stem running north into a junction, and two prongs leaving it about
+  // twenty degrees either side. Every angle here is shallow, so the turn
+  // reported onto either prong is "carrying straight on" — the same reading a
+  // street renamed at a boundary produces. Two things differ, and neither is
+  // in the line: a second road left the junction going much the same way, and
+  // the road never changed its name, so the step would have folded and taken
+  // the junction with it.
+  const lat = [45.500, 45.505, 45.510, 45.515, 45.520, 45.515];
+  const lon = [-73.600, -73.600, -73.600, -73.6027, -73.6055, -73.5973];
+  const pairs = [[0, 1], [1, 2], [2, 3], [3, 4], [2, 5]];
+  const from = [];
+  const to = [];
+  for (const [a, b] of pairs) { from.push(a, b); to.push(b, a); }
+  const graph = {
+    nodeLat: Int32Array.from(lat, v => Math.round(v * 1e7)),
+    nodeLon: Int32Array.from(lon, v => Math.round(v * 1e7)),
+    edgeFrom: Uint32Array.from(from),
+    edgeTo: Uint32Array.from(to),
+    edgeWeightDs: Uint32Array.from(from, () => 100),
+    edgeDistDm: Uint32Array.from(from, () => 5500),
+    // One name throughout: the fork must not be an artefact of the road being
+    // called something new past the junction. This is the case that used to
+    // vanish entirely.
+    edgeName: Uint32Array.from(from, () => 1),
+    edgeClass: Uint8Array.from(from, () => 0),
+    geomOffsets: Uint32Array.from(from.map((_, i) => i).concat([from.length])),
+    geomBytes: Uint8Array.from(from, () => 0),
+    names: ["", "Rue A"],
+    profile: "car",
+    classes: ["arterial", "local"]
+  };
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-fork-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 8, fanout: 4, topMaxCells: 4 });
+  const engine = await openRouteGraphDir(dir);
+
+  const route = await engine.route({
+    from: { lat: lat[0], lon: lon[0] },
+    to: { lat: lat[4], lon: lon[4] }
+  });
+  assert.ok(route.steps.length > 1, "the Y is a step boundary, not swallowed by the name");
+  assert.ok(
+    route.steps.some(step => step.forkArms >= 1),
+    "the other prong is reported as carrying on beside the route"
+  );
+  // Nothing precedes the first step, so there is no junction to describe and
+  // the count says so rather than claiming a plain road.
+  assert.equal(route.steps[0].forkArms, 0, "unknown at the start of the route");
+});
+
+test("a square crossroads is not a fork, however many ways lead out of it", async (t) => {
+  // Every arm of a grid leaves at a right angle to its neighbours, so nothing
+  // here carries on beside the route. A client counting arms rather than
+  // measuring them would announce a keep-left at every intersection in the
+  // city — which is why the count alone was not enough to ship.
+  const graph = syntheticGraph(6, 6, 17);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-crossroads-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 12, fanout: 4, topMaxCells: 6 });
+  const engine = await openRouteGraphDir(dir);
+
+  const route = await engine.route({
+    from: { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 },
+    to: { lat: graph.nodeLat.at(-1) / 1e7, lon: graph.nodeLon.at(-1) / 1e7 }
+  });
+  assert.ok(route.steps.length, "the grid routes");
+  for (const step of route.steps) {
+    assert.equal(typeof step.forkArms, "number");
+    assert.equal(step.forkArms, 0, "a square crossroads offers no second way on");
+  }
+});
+
+test("a barrier is a road that is not there, and who it stops depends on what it is", async () => {
+  const { barrierBlocks } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  // The overwhelmingly common node: no barrier, nothing to decide.
+  assert.equal(barrierBlocks("car", tags({ highway: "traffic_signals" })), false);
+  assert.equal(barrierBlocks("car", null), false);
+
+  // Bollards at the end of an alley. A perfectly good footpath, and a road a
+  // van has never been able to enter — which is what routing one down it
+  // amounts to when nothing reads the tag.
+  assert.equal(barrierBlocks("car", tags({ barrier: "bollard" })), true);
+  assert.equal(barrierBlocks("bike", tags({ barrier: "bollard" })), false);
+  assert.equal(barrierBlocks("foot", tags({ barrier: "bollard" })), false);
+
+  // A cycle barrier is built to slow a bicycle down, not to stop one.
+  assert.equal(barrierBlocks("bike", tags({ barrier: "cycle_barrier" })), false);
+  assert.equal(barrierBlocks("car", tags({ barrier: "cycle_barrier" })), true);
+
+  // A stile is for people and stops the wheels.
+  assert.equal(barrierBlocks("foot", tags({ barrier: "stile" })), false);
+  assert.equal(barrierBlocks("bike", tags({ barrier: "stile" })), true);
+  assert.equal(barrierBlocks("car", tags({ barrier: "stile" })), true);
+
+  // A wall is a wall.
+  for (const profile of ["car", "bike", "foot"]) {
+    assert.equal(barrierBlocks(profile, tags({ barrier: "wall" })), true);
+  }
+
+  // A gate ordinarily stands open — most of them do, and refusing every one
+  // would cut up farm tracks and car parks everywhere. Locked or refused by
+  // its own access tag, it is a wall with hinges.
+  assert.equal(barrierBlocks("car", tags({ barrier: "gate" })), false);
+  assert.equal(barrierBlocks("car", tags({ barrier: "gate", locked: "yes" })), true);
+  assert.equal(barrierBlocks("car", tags({ barrier: "gate", access: "private" })), true);
+
+  // The node's own access tag outranks the table in both directions.
+  assert.equal(barrierBlocks("car", tags({ barrier: "bollard", motor_vehicle: "yes" })), false);
+  assert.equal(barrierBlocks("foot", tags({ barrier: "gate", foot: "no" })), true);
+  // Reaching a place is not passing through it; the way-level rules already
+  // price a car park, so the barrier itself does not refuse a customer.
+  assert.equal(barrierBlocks("car", tags({ barrier: "gate", access: "customers" })), false);
+});
+
+test("a posted limit is read the way the sign is written, in either system", async () => {
+  const { parseLengthCm, parseWeightKg, wayLimits } = await import("../scripts/osm_road_graph.mjs");
+
+  // Metres, which is what most of the world posts and most mappers copy.
+  assert.equal(parseLengthCm("3.5"), 350);
+  assert.equal(parseLengthCm("3.5 m"), 350);
+  assert.equal(parseLengthCm("3,5"), 350);
+  // Feet and inches, which is what North America posts. An unparsed limit
+  // reads as no limit, so failing here sends a van under every low bridge on
+  // the continent — the exact failure this exists to prevent.
+  assert.equal(parseLengthCm("12'6\""), 381);
+  assert.equal(parseLengthCm("12'"), 366);
+  assert.equal(parseLengthCm("12 ft"), 366);
+  // Values that measure nothing must not be mistaken for a limit of zero,
+  // which would refuse the road to everything including a bicycle.
+  for (const nothing of ["none", "default", "unsigned", "", null, "below_default"]) {
+    assert.equal(parseLengthCm(nothing), 0);
+  }
+
+  assert.equal(parseWeightKg("7.5"), 7500);
+  assert.equal(parseWeightKg("7.5 t"), 7500);
+  assert.equal(parseWeightKg("3500 kg"), 3500);
+  assert.equal(parseWeightKg("none"), 0);
+
+  const tags = (entries) => new Map(Object.entries(entries));
+  assert.equal(wayLimits(tags({ highway: "residential" })), null);
+  // The physical arch outranks the legal posting where both exist: one is
+  // what you are allowed to do and the other is what will happen.
+  assert.equal(wayLimits(tags({ maxheight: "4.0", "maxheight:physical": "3.2" })).heightCm, 320);
+  assert.equal(wayLimits(tags({ maxweight: "7.5" })).weightKg, 7500);
+});
+
+test("a van is turned away by a bridge a car drives under", async (t) => {
+  // A straight road north with a 3.2 m arch across the middle of it, and a
+  // longer way round that has none. A car takes the arch. A van 3.4 m tall
+  // cannot, and sending it under is not a slower route — it is a wedged
+  // vehicle under a bridge and a road closed behind it.
+  const lat = [45.500, 45.505, 45.510, 45.515, 45.520, 45.512, 45.518];
+  const lon = [-73.600, -73.600, -73.600, -73.600, -73.600, -73.5920, -73.5920];
+  const pairs = [[0, 1], [1, 2], [2, 3], [3, 4], [2, 5], [5, 6], [6, 4]];
+  const from = [];
+  const to = [];
+  const weight = [];
+  const limitId = [];
+  for (const [a, b] of pairs) {
+    from.push(a, b);
+    to.push(b, a);
+    const isArch = a === 2 && b === 3;
+    // The detour is deliberately dearer, so a van found on it can only be
+    // there because the arch refused it rather than because it was quicker.
+    const detour = (a === 2 && b === 5) || (a === 5 && b === 6) || (a === 6 && b === 4);
+    const w = detour ? 600 : 100;
+    weight.push(w, w);
+    limitId.push(isArch ? 1 : 0, isArch ? 1 : 0);
+  }
+  const graph = {
+    nodeLat: Int32Array.from(lat, v => Math.round(v * 1e7)),
+    nodeLon: Int32Array.from(lon, v => Math.round(v * 1e7)),
+    edgeFrom: Uint32Array.from(from),
+    edgeTo: Uint32Array.from(to),
+    edgeWeightDs: Uint32Array.from(weight),
+    edgeDistDm: Uint32Array.from(from, () => 5000),
+    edgeName: Uint32Array.from(from, () => 1),
+    edgeClass: Uint8Array.from(from, () => 0),
+    edgeLimit: Uint32Array.from(limitId),
+    geomOffsets: Uint32Array.from(from.map((_, i) => i).concat([from.length])),
+    geomBytes: Uint8Array.from(from, () => 0),
+    names: ["", "Rue A"],
+    profile: "car",
+    classes: ["arterial", "local"],
+    limits: [{ heightCm: 320, weightKg: 0, widthCm: 0, lengthCm: 0 }]
+  };
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-maxheight-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 8, fanout: 4, topMaxCells: 4 });
+  const engine = await openRouteGraphDir(dir);
+
+  const ends = { from: { lat: lat[0], lon: lon[0] }, to: { lat: lat[4], lon: lon[4] } };
+  const car = await engine.route(ends);
+  const van = await engine.route({ ...ends, vehicle: { heightM: 3.4 } });
+
+  assert.ok(car.distanceMeters > 0, "the car routes");
+  assert.ok(
+    van.distanceMeters > car.distanceMeters,
+    "the van is sent the long way round rather than under the arch"
+  );
+  // A vehicle that fits is not punished for having said so, and equality
+  // passes: a sign reading 3.2 admits a vehicle declared 3.2. Inventing a
+  // safety margin here would silently refuse roads that are posted to fit.
+  const fits = await engine.route({ ...ends, vehicle: { heightM: 3.0 } });
+  assert.equal(fits.distanceMeters, car.distanceMeters, "a vehicle that fits keeps the short way");
+  const exact = await engine.route({ ...ends, vehicle: { heightM: 3.2 } });
+  assert.equal(exact.distanceMeters, car.distanceMeters, "a posted 3.2 admits a vehicle of 3.2");
+  // A limit the vehicle says nothing about restricts nothing: a weight-only
+  // van must not be refused by a height it never claimed.
+  const weightOnly = await engine.route({ ...ends, vehicle: { weightT: 3.5 } });
+  assert.equal(weightOnly.distanceMeters, car.distanceMeters, "an unrelated limit does not refuse");
+  const unstated = await engine.route({ ...ends, vehicle: {} });
+  assert.equal(unstated.distanceMeters, car.distanceMeters, "an unstated vehicle is an ordinary car");
+});
+
+test("a posted limit survives every stage between the tag and the edge", async (t) => {
+  // The bug this guards was silent in the worst way: the tags parsed, the
+  // limit table was written with 82 entries, the index built, the query
+  // filtered — and not one edge in the country pointed at a limit, because
+  // the column was dropped three separate times on the way through. Nothing
+  // failed. Every route was simply the car's route.
+  //
+  // So this asserts the join rather than the parts: a limit reaches an edge,
+  // survives the shortcut that replaces it, and still refuses a vehicle on
+  // the far side of the whole pipeline.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  const root = engine.root ?? engine._root;
+  assert.ok(root, "the fixture opens");
+  assert.ok(
+    (root.limits || []).length > 0,
+    "the index carries the distinct limit sets its edges point at"
+  );
+
+  // Across a spread of the country, a vehicle too big for the posted limits
+  // must be routed differently somewhere — and always the long way round
+  // rather than through, since a refusal can only ever add distance.
+  const points = [
+    [49.6116, 6.1319], [49.5000, 6.1000], [49.7500, 6.1000],
+    [49.6000, 5.9500], [49.8500, 6.1000], [49.6300, 6.1700]
+  ];
+  let routed = 0;
+  let differed = 0;
+  let faster = 0;
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      const ends = {
+        from: { lat: points[i][0], lon: points[i][1] },
+        to: { lat: points[j][0], lon: points[j][1] }
+      };
+      let car;
+      try { car = await engine.route(ends); } catch { continue; }
+      routed++;
+      const oversize = await engine.route({ ...ends, vehicle: { heightM: 6, weightT: 60 } });
+      if (Math.round(oversize.seconds) !== Math.round(car.seconds)) {
+        differed++;
+        if (oversize.seconds < car.seconds) faster++;
+      }
+    }
+  }
+  assert.ok(routed > 0, "the fixture routes at all");
+  assert.ok(differed > 0, "an oversize vehicle is turned off at least one posted road");
+  assert.equal(faster, 0, "a refusal can only ever cost time, never save it");
+});
+
+test("an unmarked crossing is a routing connector, not a feature of the road", async () => {
+  // Most `highway=crossing` nodes in OSM exist to join a sidewalk to the
+  // roadway so pedestrian routing works at all. Nothing is painted there and
+  // a driver would not know one had been passed — but the map drew a marker
+  // for each, every few metres, all the way down the street.
+  const { nodeKindCode, JUNCTION_KINDS } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  assert.equal(nodeKindCode(tags({ highway: "crossing", crossing: "unmarked" })), 0);
+  assert.equal(nodeKindCode(tags({ highway: "crossing" })), 0, "no marking stated is not a marking");
+  assert.equal(nodeKindCode(tags({ highway: "crossing", "crossing:markings": "no" })), 0);
+
+  // Painted ones are real, and a driver reads them off the road surface.
+  assert.equal(nodeKindCode(tags({ highway: "crossing", crossing: "marked" })), JUNCTION_KINDS.crossing);
+  assert.equal(nodeKindCode(tags({ highway: "crossing", crossing: "zebra" })), JUNCTION_KINDS.crossing);
+  // The North American spelling of "marked but not signalised".
+  assert.equal(nodeKindCode(tags({ highway: "crossing", crossing: "uncontrolled" })), JUNCTION_KINDS.crossing);
+  assert.equal(
+    nodeKindCode(tags({ highway: "crossing", "crossing:markings": "zebra" })),
+    JUNCTION_KINDS.crossing
+  );
+  // A signal-controlled crossing is a signal, whatever else it says.
+  assert.equal(
+    nodeKindCode(tags({ highway: "crossing", crossing: "traffic_signals" })),
+    JUNCTION_KINDS.traffic_signals
+  );
+  // And the things that were never crossings are untouched.
+  assert.equal(nodeKindCode(tags({ highway: "traffic_signals" })), JUNCTION_KINDS.traffic_signals);
+  assert.equal(nodeKindCode(tags({ highway: "stop" })), JUNCTION_KINDS.stop);
+});
+
+test("a crossing beside the light that governs it is not drawn twice", async () => {
+  const { mergesWithPreviousJunction } = await import("../src/route_graph_query.js");
+  const at = (lat, lon, kind) => ({ lat, lon, kind });
+  const SIGNAL = 1, STOP = 2, CROSSING = 5;
+
+  // A signalised crossroads carries a signal node and a painted crossing on
+  // each approach. The driver obeys one thing there, and was shown two.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), CROSSING, 455000200, -736000000), true);
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, STOP), CROSSING, 455000200, -736000000), true);
+  // Only the crossing gives way. A stop line beside a light is two facts.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), STOP, 455000200, -736000000), false);
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, CROSSING), SIGNAL, 455000200, -736000000), false);
+  // And a crossing far enough away is its own crossing.
+  assert.equal(mergesWithPreviousJunction(at(45.5, -73.6, SIGNAL), CROSSING, 455008000, -736000000), false);
+});
+
+test("a mini-roundabout is a junction the driver can see, not a nameless crossroads", async () => {
+  // A painted circle on an ordinary crossroads: no arcs to collapse, no exits
+  // to count, and nothing in the geometry that says it is there. The turn
+  // through it is the real instruction and stays one — this only makes sure
+  // the thing the driver is turning at is on the map and costs what it costs.
+  const { nodeKindCode, JUNCTION_KINDS, PROFILES } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  assert.equal(nodeKindCode(tags({ highway: "mini_roundabout" })), JUNCTION_KINDS.mini_roundabout);
+  assert.equal(JUNCTION_KINDS.mini_roundabout, 6, "a new kind, appended so old readers keep their meanings");
+  // Yielding costs more than a give-way triangle and far less than a signal.
+  const car = PROFILES.car.nodePenalties;
+  assert.ok(car.mini_roundabout > car.give_way);
+  assert.ok(car.mini_roundabout < car.traffic_signals);
+});
+
+test("a turn banned at rush hour is shut then and open the rest of the day", async (t) => {
+  // A straight run north with a left at the top, and a longer way round that
+  // needs no left. The left is signed "no left turn, Mo-Fr 07:00-09:00" —
+  // one sign with two meanings, and the router used to read it as none: the
+  // whole relation was thrown away and the turn stood open at eight in the
+  // morning along with every other hour.
+  //
+  // The bucket here carries no speed factors at all, so nothing but the ban
+  // can move the route: if base and peak differ, it is the sign doing it.
+  const lat = [45.500, 45.505, 45.510, 45.515, 45.520, 45.512, 45.518];
+  const lon = [-73.600, -73.600, -73.600, -73.594, -73.588, -73.610, -73.606];
+  const pairs = [[0, 1], [1, 2], [2, 3], [3, 4], [2, 5], [5, 6], [6, 4]];
+  const from = [];
+  const to = [];
+  const weight = [];
+  const ban = [];
+  for (const [a, b] of pairs) {
+    from.push(a, b);
+    to.push(b, a);
+    const isBannedTurn = a === 2 && b === 3;
+    const detour = (a === 2 && b === 5) || (a === 5 && b === 6) || (a === 6 && b === 4);
+    const w = detour ? 400 : 100;
+    weight.push(w, w);
+    // Only the forward direction is banned; the sign faces one way.
+    ban.push(isBannedTurn ? 1 : 0, 0);
+  }
+  const graph = {
+    nodeLat: Int32Array.from(lat, v => Math.round(v * 1e7)),
+    nodeLon: Int32Array.from(lon, v => Math.round(v * 1e7)),
+    edgeFrom: Uint32Array.from(from),
+    edgeTo: Uint32Array.from(to),
+    edgeWeightDs: Uint32Array.from(weight),
+    edgeDistDm: Uint32Array.from(from, () => 5000),
+    edgeName: Uint32Array.from(from, () => 1),
+    edgeClass: Uint8Array.from(from, () => 0),
+    edgeBan: Uint32Array.from(ban),
+    geomOffsets: Uint32Array.from(from.map((_, i) => i).concat([from.length])),
+    geomBytes: Uint8Array.from(from, () => 0),
+    names: ["", "Rue A"],
+    profile: "car",
+    classes: ["arterial", "local"],
+    banRules: [{ days: 0b0111110, startMinute: 420, endMinute: 540, monthStart: 1, monthEnd: 12 }]
+  };
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-timed-turn-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, {
+    leafNodes: 8,
+    fanout: 4,
+    topMaxCells: 4,
+    // Exactly the window on the sign, and no speed factors: the only thing
+    // this bucket changes is whether that turn exists.
+    timeBuckets: [{ name: "peak", rules: [{ dayMask: 0b0111110, startHour: 7, endHour: 9 }], classFactors: {} }]
+  });
+  const engine = await openRouteGraphDir(dir);
+
+  const ends = { from: { lat: lat[0], lon: lon[0] }, to: { lat: lat[4], lon: lon[4] } };
+  const offPeak = await engine.route({ ...ends, bucket: "base" });
+  const rushHour = await engine.route({ ...ends, bucket: "peak" });
+
+  assert.ok(offPeak.distanceMeters > 0, "the road routes at all");
+  assert.ok(
+    rushHour.distanceMeters > offPeak.distanceMeters,
+    "at rush hour the banned left is refused and the route goes the long way"
+  );
+  // And the ban is not a tax: the rest of the day the turn is simply there.
+  const midnight = await engine.route({ ...ends, departureTime: "2026-08-10T02:30:00" });
+  assert.equal(
+    Math.round(midnight.distanceMeters),
+    Math.round(offPeak.distanceMeters),
+    "outside the window the sign says nothing and the short way is taken"
+  );
+  // A departure inside the window picks the same answer as the bucket does,
+  // which is what makes the clock and the metric agree.
+  const eightAm = await engine.route({ ...ends, departureTime: "2026-08-10T08:00:00" });
+  assert.equal(
+    Math.round(eightAm.distanceMeters),
+    Math.round(rushHour.distanceMeters),
+    "a departure at eight is routed the way rush hour is"
+  );
+});
+
+test("a toll and a ferry are refusable, and the refusal survives a shortcut", async (t) => {
+  // A short way across a tolled bridge and a long way round. A toll is not
+  // slow — it is a decision, and one driver pays it daily while another will
+  // drive twenty minutes to save two dollars. So it is refused rather than
+  // priced into the time, and the refusal has to hold on the shortcut that
+  // replaces the bridge as well as on the bridge itself.
+  const { EDGE_FLAG_TOLL, EDGE_FLAG_FERRY } = await import("../scripts/osm_road_graph.mjs");
+  const lat = [45.500, 45.505, 45.510, 45.515, 45.520, 45.512, 45.518];
+  const lon = [-73.600, -73.600, -73.600, -73.600, -73.600, -73.5920, -73.5920];
+  const pairs = [[0, 1], [1, 2], [2, 3], [3, 4], [2, 5], [5, 6], [6, 4]];
+
+  const build = (flagOn) => {
+    const from = [];
+    const to = [];
+    const weight = [];
+    const flags = [];
+    for (const [a, b] of pairs) {
+      from.push(a, b);
+      to.push(b, a);
+      const crossing = a === 2 && b === 3;
+      const detour = (a === 2 && b === 5) || (a === 5 && b === 6) || (a === 6 && b === 4);
+      const w = detour ? 600 : 100;
+      weight.push(w, w);
+      flags.push(crossing ? flagOn : 0, crossing ? flagOn : 0);
+    }
+    return {
+      nodeLat: Int32Array.from(lat, v => Math.round(v * 1e7)),
+      nodeLon: Int32Array.from(lon, v => Math.round(v * 1e7)),
+      edgeFrom: Uint32Array.from(from),
+      edgeTo: Uint32Array.from(to),
+      edgeWeightDs: Uint32Array.from(weight),
+      edgeDistDm: Uint32Array.from(from, () => 5000),
+      edgeName: Uint32Array.from(from, () => 1),
+      edgeClass: Uint8Array.from(from, () => 0),
+      edgeFlags: Uint8Array.from(flags),
+      edgeCharge: Uint32Array.from(from, (_, i) => (flags[i] ? 1 : 0)),
+      geomOffsets: Uint32Array.from(from.map((_, i) => i).concat([from.length])),
+      geomBytes: Uint8Array.from(from, () => 0),
+      names: ["", "Rue A"],
+      profile: "car",
+      classes: ["arterial", "local"],
+      charges: [{ cents: 250, currency: "CAD" }]
+    };
+  };
+
+  for (const [what, flag, avoid] of [
+    ["toll", EDGE_FLAG_TOLL, { tolls: true }],
+    ["ferry", EDGE_FLAG_FERRY, { ferries: true }]
+  ]) {
+    const dir = mkdtempSync(join(tmpdir(), `rangefind-${what}-`));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    buildRouteGraph(build(flag), dir, { leafNodes: 8, fanout: 4, topMaxCells: 4 });
+    const engine = await openRouteGraphDir(dir);
+    const ends = { from: { lat: lat[0], lon: lon[0] }, to: { lat: lat[4], lon: lon[4] } };
+
+    const straight = await engine.route(ends);
+    const avoided = await engine.route({ ...ends, avoid });
+    assert.ok(
+      avoided.distanceMeters > straight.distanceMeters,
+      `avoiding the ${what} takes the long way round`
+    );
+    // Asking to avoid the other thing must not move the route: a preference
+    // that refuses more than it was asked to is worse than none.
+    const other = what === "toll" ? { ferries: true } : { tolls: true };
+    const unrelated = await engine.route({ ...ends, avoid: other });
+    assert.equal(
+      Math.round(unrelated.distanceMeters),
+      Math.round(straight.distanceMeters),
+      "an unrelated preference leaves the route alone"
+    );
+    // And the route says what it used, and what that cost.
+    assert.equal(straight.charges?.[what], true, `the route reports the ${what}`);
+    assert.equal(straight.charges?.cents, 250);
+    assert.equal(straight.charges?.currency, "CAD");
+    assert.equal(avoided.charges, undefined, "the avoided route costs nothing to report");
+  }
+});
+
+test("the panel over each lane says where that lane goes", async () => {
+  const { laneDestinations } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  // The arrows say which movements a lane allows. Only this says where any of
+  // them goes, and on a five-lane approach that is the entire decision.
+  assert.equal(
+    laneDestinations(tags({ "destination:lanes": "Montréal|Montréal|Laval" }), 1).forward,
+    "Montréal|Montréal|Laval"
+  );
+  // The number outranks the name, the way the panel is painted: "40 Ouest" is
+  // above the lane and "Autoroute Félix-Leclerc" is nowhere a driver can see.
+  assert.equal(
+    laneDestinations(tags({
+      "destination:lanes": "Autoroute Félix-Leclerc|Local",
+      "destination:ref:lanes": "40 Ouest|"
+    }), 1).forward,
+    "40 Ouest|Local"
+  );
+  // A lane listing three places is read for the first; a chip has room for one.
+  assert.equal(
+    laneDestinations(tags({ "destination:lanes": "Montréal;Québec;Trois-Rivières|Local" }), 1).forward,
+    "Montréal|Local"
+  );
+  // Nothing tagged is nothing to draw, and a two-way street does not hand the
+  // forward panel to traffic coming the other way.
+  assert.equal(laneDestinations(tags({ highway: "primary" }), 1).forward, "");
+  assert.equal(laneDestinations(tags({ "destination:lanes:forward": "Laval|Laval" }), 1).backward, "");
+});
+
+test("a car-carrying train is a road, and one a driver may refuse", async () => {
+  const { wayClass, SHUTTLE_CLASS, isBoarded, FERRY_CLASS } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  // The Chunnel and the Alpine tunnels: you drive on, you wait, you drive off.
+  // Unroutable without this, which cuts a country in half wherever one is the
+  // only way through a mountain.
+  assert.equal(wayClass(tags({ route: "shuttle_train" })), SHUTTLE_CLASS);
+  assert.equal(wayClass(tags({ route: "shuttle" })), SHUTTLE_CLASS);
+  assert.equal(isBoarded(SHUTTLE_CLASS), true);
+  assert.equal(isBoarded(FERRY_CLASS), true);
+  assert.equal(isBoarded("motorway"), false);
+});
+
+test("a ford, a winter road and a bus lane are not a courier's road", async () => {
+  const { drivableSurface, reservedFor, EDGE_FLAG_PSV_ONLY, EDGE_FLAG_HOV_ONLY } =
+    await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  // A stream running over the road: passable in a pickup in July and not in a
+  // van in April, and the map cannot tell you which day it is.
+  assert.equal(drivableSurface(tags({ ford: "yes" })), false);
+  assert.equal(drivableSurface(tags({ ford: "no" })), true);
+  // The same claim about the calendar.
+  assert.equal(drivableSurface(tags({ seasonal: "winter" })), false);
+  assert.equal(drivableSurface(tags({ winter_road: "yes" })), false);
+  // A perfectly good road that this driver is not allowed on. Being sent
+  // down one is a fine rather than a detour — but it is somebody's road, so
+  // it is flagged for them rather than deleted for everyone. Dropping it at
+  // extract time made the decision unrecoverable: no option at query time
+  // can reach a way that was never written, which is why a bus could not be
+  // routed down its own route.
+  assert.equal(drivableSurface(tags({ access: "psv" })), true);
+  assert.equal(reservedFor(tags({ access: "psv" })), EDGE_FLAG_PSV_ONLY);
+  assert.equal(reservedFor(tags({ access: "bus" })), EDGE_FLAG_PSV_ONLY);
+  assert.equal(reservedFor(tags({ motor_vehicle: "psv" })), EDGE_FLAG_PSV_ONLY);
+  assert.equal(drivableSurface(tags({ hov: "designated" })), true);
+  assert.equal(reservedFor(tags({ hov: "designated" })), EDGE_FLAG_HOV_ONLY);
+  assert.equal(reservedFor(tags({ access: "hov" })), EDGE_FLAG_HOV_ONLY);
+  // Where cars are spelled out, that is the more specific claim and the
+  // road belongs to everyone again.
+  assert.equal(reservedFor(tags({ hov: "designated", motorcar: "yes" })), 0);
+  assert.equal(reservedFor(tags({ highway: "residential" })), 0);
+  // And an ordinary street is left alone.
+  assert.equal(drivableSurface(tags({ highway: "residential" })), true);
+});
+
+test("a guide sign at a junction is read for the turn it points at", async () => {
+  const { parseDestinationSign } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+  const members = (extra = []) => [
+    { role: "from", type: "way", ref: 100 },
+    { role: "to", type: "way", ref: 200 },
+    ...extra
+  ];
+
+  // The panel itself: which approach faces it, which turning it points at,
+  // and what is written on it. Without this an ordinary junction announces a
+  // turn by a street name the driver will not find on any sign.
+  const sign = parseDestinationSign(
+    tags({ destination: "Montréal", "destination:ref": "40 Ouest" }),
+    members([{ role: "intersection", type: "node", ref: 7 }])
+  );
+  assert.deepEqual(sign, { fromWay: 100, toWay: 200, viaNode: 7, ref: "40 Ouest", text: "Montréal" });
+
+  // Mappers who know the restriction shape write `via`, and mean the same node.
+  assert.equal(
+    parseDestinationSign(tags({ destination: "Laval" }), members([{ role: "via", type: "node", ref: 9 }]))?.viaNode,
+    9
+  );
+  // A relation with nothing written on it describes no sign.
+  assert.equal(parseDestinationSign(tags({}), members([{ role: "intersection", type: "node", ref: 7 }])), null);
+  // And one with no junction cannot be attached to a turn.
+  assert.equal(parseDestinationSign(tags({ destination: "Laval" }), members()), null);
+});
+
+test("connectivity says which lanes reach a turning, where arrows only imply it", async () => {
+  const { parseConnectivity } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (spec) => new Map(Object.entries({ connectivity: spec }));
+  const members = [
+    { role: "from", type: "way", ref: 100 },
+    { role: "to", type: "way", ref: 200 },
+    { role: "via", type: "node", ref: 7 }
+  ];
+
+  // "lane 1 to lane 1, lane 2 to lanes 2 and 3, lane 3 to nothing" — the
+  // third lane is exactly the one a driver must not be in, and no arrow
+  // painted on the road says so.
+  assert.equal(parseConnectivity(tags("1:1|2:2,3|3:"), members).mask, 0b011);
+  assert.equal(parseConnectivity(tags("1:1|2:2|3:3"), members).mask, 0b111);
+  assert.equal(parseConnectivity(tags("1:none|2:2"), members).mask, 0b010);
+  // Nothing usable is not a claim worth carrying.
+  assert.equal(parseConnectivity(tags("1:none|2:none"), members), null);
+  assert.equal(parseConnectivity(new Map(), members), null);
+});
+
+test("a road number carried by a route relation reaches the sign", async () => {
+  const { mergeRefs, waySigns } = await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  // The way's own number leads and the relation's follows, which is the
+  // order the gantry stacks them.
+  assert.equal(mergeRefs("A 4", ["E 50"]), "A 4;E 50");
+  // A number the way already carries is not said twice because a relation
+  // repeats it.
+  assert.equal(mergeRefs("A 4", ["E 50", "A 4"]), "A 4;E 50");
+  // The case this exists for: the way carries no number at all, and every
+  // number the driver can see is on the relation.
+  assert.equal(mergeRefs("", ["E 25"]), "E 25");
+  assert.equal(mergeRefs(" ", []), "");
+  // Semicolon lists on either side are one list, deduplicated across both.
+  assert.equal(mergeRefs("N 5;N 5", ["E 411"]), "N 5;E 411");
+
+  assert.equal(waySigns(tags({ ref: "A 4" }), ["E 50"]).forward.ref, "A 4;E 50");
+  // Absent relations change nothing, which is every way in North America.
+  assert.equal(waySigns(tags({ ref: "A 40" })).forward.ref, "A 40");
+});
+
+test("E-road numbers reach the index from the relations that carry them", async (t) => {
+  // Luxembourg is the case North America cannot exercise: its motorways are
+  // signed `A 4` on the way and `E 44` only on a `type=route` relation, so a
+  // router reading ways alone announces half of what is on the gantry — and
+  // in Europe the half it drops is often the one being followed.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  const root = engine.root ?? engine._root;
+  const refs = (root.signs || []).map(sign => sign?.ref || "").filter(Boolean);
+  assert.ok(refs.length > 0, "the index carries road numbers at all");
+  // An E-number can only have come from a relation: no Luxembourg way is
+  // tagged with one.
+  const eRoads = refs.filter(ref => /(^|;)\s*E\s?\d+/.test(ref));
+  assert.ok(eRoads.length > 0, `no E-road number survived to the index (${refs.length} refs)`);
+  // And it arrived alongside the national number rather than replacing it.
+  assert.ok(
+    eRoads.some(ref => ref.includes(";")),
+    `E-numbers replaced the national number instead of joining it: ${eRoads.slice(0, 5).join(" | ")}`
+  );
+});
+
+test("a lorry is refused a street signed against it", async (t) => {
+  // `hgv=no` is the most-mapped restriction this router could not read, and
+  // it is aimed at exactly the vehicle a delivery app carries.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  const root = engine.root ?? engine._root;
+  assert.ok(root, "the fixture opens");
+
+  // Ordinary points across the country rather than points planted on a ban:
+  // what matters is how the country routes, not how a contrived pair does.
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0x100000000);
+  const bounds = { minLat: 49.45, maxLat: 50.15, minLon: 5.75, maxLon: 6.50 };
+  const point = () => ({
+    lat: bounds.minLat + rnd() * (bounds.maxLat - bounds.minLat),
+    lon: bounds.minLon + rnd() * (bounds.maxLon - bounds.minLon)
+  });
+  const go = async (params) => {
+    try {
+      return await engine.route(params);
+    } catch (err) {
+      return err.code;
+    }
+  };
+
+  let compared = 0;
+  let diverted = 0;
+  for (let attempt = 0; attempt < 220 && compared < 60; attempt++) {
+    const from = point();
+    const to = point();
+    const car = await go({ from, to });
+    if (typeof car === "string") continue;
+    const lorry = await go({ from, to, vehicle: { hgv: true } });
+    if (typeof lorry === "string") continue;
+
+    // A 2.4 t van is not a goods vehicle and must not be made to pay for
+    // having declared its weight.
+    const van = await go({ from, to, vehicle: { weightT: 2.4 } });
+    assert.ok(typeof van !== "string", "a 2.4 t van failed to route at all");
+    assert.equal(van.seconds, car.seconds, "a 2.4 t van was treated as a goods vehicle");
+
+    // Weight alone makes a vehicle one, because a driver declaring 7.5 t
+    // will not also think to say "hgv" — and the sign applies to them anyway.
+    const heavy = await go({ from, to, vehicle: { weightT: 7.5 } });
+    assert.ok(typeof heavy !== "string", "a 7.5 t vehicle failed to route at all");
+    // At least as restricted, not identically so: 7.5 t also meets every
+    // posted weight limit on the way, which a bare `hgv` declaration does
+    // not. What is being asserted is the implication — that the weight alone
+    // was enough to make it a goods vehicle — and a vehicle that were not
+    // one would come back with the car's route, well under the lorry's.
+    assert.ok(
+      heavy.seconds >= lorry.seconds - 1,
+      "a 7.5 t vehicle was let down roads a goods vehicle may not use"
+    );
+
+    // A refusal is never a shortcut — but only where the two are answering
+    // the same question. A lorry refused the road at the door is snapped to
+    // the nearest one it may use and finishes the last few metres on foot,
+    // and that route is legitimately shorter than the car's because it stops
+    // short of the same doorstep. Compare only the pairs that ran door to
+    // identical door.
+    const sameEnds =
+      car.from.snapDistanceMeters === lorry.from.snapDistanceMeters &&
+      car.to.snapDistanceMeters === lorry.to.snapDistanceMeters;
+    if (!sameEnds) continue;
+    compared++;
+    assert.ok(
+      lorry.seconds >= car.seconds - 1,
+      "a refused road produced a quicker route, which means the refusal was a bug"
+    );
+    if (lorry.seconds > car.seconds + 1) diverted++;
+  }
+
+  assert.ok(compared > 20, `too few comparable pairs to conclude anything (${compared})`);
+  assert.ok(
+    diverted > 0,
+    "no lorry anywhere in the country was diverted by an hgv sign, which is what a dropped column looks like"
+  );
+});
+
+test("a doorstep a lorry may not use is a corner to stop at, not a refusal", async (t) => {
+  // The regression this guards is one the feature itself introduced: reading
+  // `hgv=no` at all means a depot on such a street snaps the search onto an
+  // edge the lorry cannot leave, and the honest-looking answer — "no route
+  // this vehicle fits through" — is the one answer a courier cannot act on.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  let seed = 99; 
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0x100000000);
+  const point = () => ({ lat: 49.45 + rnd() * 0.70, lon: 5.75 + rnd() * 0.75 });
+  const go = async (params) => {
+    try {
+      return await engine.route(params);
+    } catch (err) {
+      return err.code;
+    }
+  };
+
+  let routed = 0;
+  let refused = 0;
+  for (let attempt = 0; attempt < 200 && routed + refused < 80; attempt++) {
+    const from = point();
+    const to = point();
+    const car = await go({ from, to });
+    if (typeof car === "string") continue;
+    const lorry = await go({ from, to, vehicle: { hgv: true } });
+    if (lorry === "RANGEFIND_ROUTE_VEHICLE_NO_PATH") refused++;
+    else if (typeof lorry !== "string") routed++;
+  }
+
+  assert.ok(routed > 0, "no lorry route succeeded anywhere");
+  // Some neighbourhoods genuinely have no road a lorry may use, and saying so
+  // is right. Most do, and a country where a lorry is refused more often than
+  // not is a snap that gave up rather than a country that is closed.
+  assert.ok(
+    refused * 4 < routed,
+    `a lorry was refused ${refused} of ${routed + refused} ordinary journeys, which is a snapping failure rather than a road network`
+  );
+});
+
+test("a lane reserved for buses is read as theirs, and a lane buses may use is not", async () => {
+  const { wayLanes, wayLaneAccess, LANE_BUS, LANE_HOV, LANE_HOV3, LANE_NO_MOTOR, LANE_BICYCLE } =
+    await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+  const access = (entries) => {
+    const map = tags(entries);
+    return wayLaneAccess(map, wayLanes(map, entries.oneway === "yes" ? 1 : 0));
+  };
+
+  // The Tunnel Albert Bousser, which is why this distinction exists. Buses
+  // are *permitted* in lane 1 and the lane is *for* them in lane 2, and the
+  // first cut read both as reserved — leaving a car with no lane at all on a
+  // road it was being routed down.
+  assert.deepEqual(
+    access({
+      highway: "trunk",
+      lanes: "3",
+      "lanes:backward": "2",
+      "lanes:forward": "1",
+      "access:lanes:backward": "yes|no",
+      "bus:lanes:backward": "yes|designated"
+    }).backward,
+    [0, LANE_BUS | LANE_NO_MOTOR]
+  );
+
+  // A lane every bus may use is nobody's lane in particular, and claiming it
+  // is reserved would grey out most of the road network.
+  assert.equal(access({ highway: "primary", lanes: "2", "bus:lanes": "yes|yes" }).forward, null);
+  // And a road with no lane access tags at all says nothing, which is almost
+  // all of them.
+  assert.equal(access({ highway: "primary", lanes: "2" }).forward, null);
+
+  // The reason is kept, not just the fact: "bus lane" and "HOV lane" are
+  // different instructions to a driver.
+  // One-way, so `lanes=2` really is two lanes forward: on a two-way street
+  // the same tag means one lane each way, and the reasons follow the lanes.
+  assert.deepEqual(
+    access({ highway: "primary", oneway: "yes", lanes: "2", "hov:lanes": "designated|no" }).forward,
+    [LANE_HOV, 0]
+  );
+  // Not every car-pool lane asks the same carful: Québec signs 22 ways at
+  // three. A lane that wants three is a different claim from one that wants
+  // two, so it is a different value rather than the same one with a note.
+  assert.deepEqual(
+    access({
+      highway: "primary",
+      oneway: "yes",
+      lanes: "2",
+      "hov:lanes": "designated|no",
+      "hov:minimum": "3"
+    }).forward,
+    [LANE_HOV3, 0]
+  );
+  // An unreadable or absent minimum is two, which is what the sign reads
+  // where nobody has written a number down.
+  assert.deepEqual(
+    access({
+      highway: "primary",
+      oneway: "yes",
+      lanes: "2",
+      "hov:lanes": "designated|no",
+      "hov:minimum": "boom"
+    }).forward,
+    [LANE_HOV, 0]
+  );
+  assert.deepEqual(
+    access({ highway: "primary", oneway: "yes", lanes: "2", "bicycle:lanes": "designated|no" }).forward,
+    [LANE_BICYCLE, 0]
+  );
+
+  // Alignment is the point: the reasons index the same lanes the arrows do,
+  // so a short access tag pads rather than shifting everything left.
+  const wide = tags({
+    highway: "primary",
+    "turn:lanes": "left|through|through;right",
+    "bus:lanes": "no|no|designated"
+  });
+  const lanes = wayLanes(wide, 0);
+  const reasons = wayLaneAccess(wide, lanes).forward;
+  assert.equal(reasons.length, lanes.forward.length, "a reason per lane, or the labels slide");
+  assert.deepEqual(reasons, [0, 0, LANE_BUS]);
+
+  // An unsuffixed tag is not applied backwards. Lane order reverses with
+  // direction, so borrowing it would put the bus lane on the wrong side —
+  // a missing label is recoverable, a mirrored one is not.
+  assert.equal(access({ highway: "primary", lanes: "2", "bus:lanes": "designated|no" }).backward, null);
+});
+
+test("a reserved lane survives every stage between the tag and the step", async (t) => {
+  // The join, not the parts. This pipeline has silently dropped a column
+  // three times, and each time the tags parsed, the table filled, the index
+  // built and every route came back looking perfectly reasonable.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const { LANE_BUS, LANE_NO_MOTOR } = await import("../scripts/osm_road_graph.mjs");
+  const engine = await openRouteGraphDir(fixture);
+
+  // Journeys that actually cross Luxembourg City's reserved lanes, read off
+  // the built index rather than guessed: the first two run the bus lane on
+  // the northbound approach, the last a marked cycle lane on a three-lane
+  // one.
+  const seen = [];
+  const spread = [
+    [{ lat: 49.58353, lon: 6.13060 }, { lat: 49.59987, lon: 6.13612 }],
+    [{ lat: 49.62717, lon: 6.09669 }, { lat: 49.62652, lon: 6.10736 }],
+    [{ lat: 49.62761, lon: 6.10258 }, { lat: 49.62531, lon: 6.10489 }],
+    [{ lat: 49.60705, lon: 6.10867 }, { lat: 49.60596, lon: 6.10495 }]
+  ];
+  for (const [from, to] of spread) {
+    let route;
+    try {
+      route = await engine.route({ from, to });
+    } catch {
+      continue;
+    }
+    for (const step of route.steps || []) {
+      if (!Array.isArray(step.laneAccess) || !step.laneAccess.some(Boolean)) continue;
+      seen.push(step);
+      // A reason per lane and no more: a list that has drifted out of step
+      // with the arrows labels the wrong lane, which is worse than silence.
+      assert.equal(
+        step.laneAccess.length,
+        step.lanes.length,
+        "the reasons and the arrows disagree about how many lanes there are"
+      );
+    }
+  }
+
+  assert.ok(
+    seen.length > 0,
+    "no step anywhere carried a reserved lane, which is what a dropped column looks like"
+  );
+  // And the reason survived intact rather than arriving as a bare 1.
+  assert.ok(
+    seen.some(step => step.laneAccess.some(reason => (reason & LANE_BUS) !== 0)),
+    "a reserved lane reached the step with no reason attached"
+  );
+  assert.ok(
+    seen.some(step => step.laneAccess.some(reason => (reason & LANE_NO_MOTOR) !== 0)),
+    "the closed-to-motor-traffic bit did not survive"
+  );
+});
+
+test("a bus is routed down the road its job is on", async (t) => {
+  // Reserved roads used to be deleted at extract time, so no option at query
+  // time could reach them: a bus or taxi driver could not be routed down the
+  // very roads their work is on. They are flagged now instead, which means
+  // the ordinary car has to still be refused them — silence must keep
+  // meaning "not for me", or every car inherits the bus lanes.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  const root = engine.root ?? engine._root;
+  assert.ok(root, "the fixture opens");
+
+  const go = async (params) => {
+    try {
+      return await engine.route(params);
+    } catch (err) {
+      return err.code;
+    }
+  };
+  // A stretch of Boulevard Franklin D. Roosevelt reserved for public service
+  // vehicles, entered from each end.
+  const from = { lat: 49.6073113, lon: 6.1331524 };
+  const to = { lat: 49.6066773, lon: 6.1336198 };
+  const car = await go({ from, to });
+  const bus = await go({ from, to, vehicle: { psv: true } });
+  assert.ok(typeof car !== "string", `an ordinary car could not route at all: ${car}`);
+  assert.ok(typeof bus !== "string", `a bus could not route at all: ${bus}`);
+  assert.ok(
+    bus.seconds < car.seconds,
+    "a bus was given the same route as a car past a road reserved for buses"
+  );
+  // And the car really is going round rather than merely being charged for it.
+  assert.ok(
+    car.distanceMeters > bus.distanceMeters,
+    "the car was sent down a road reserved for public service vehicles"
+  );
+});
+
+test("a coach's weight is not read as freight", async (t) => {
+  // The defect the vehicle class fixes. `weight >= 3.5 t` implies a goods
+  // vehicle, which is right for the van it was written for and wrong for a
+  // coach: a driver entering their real weight was refused every street
+  // signed against lorries, including the ones that name buses as welcome,
+  // and the routes just came back longer with nothing said.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  let seed = 4242;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0x100000000);
+  const point = () => ({ lat: 49.45 + rnd() * 0.70, lon: 5.75 + rnd() * 0.75 });
+  const go = async (params) => {
+    try {
+      return await engine.route(params);
+    } catch (err) {
+      return err.code;
+    }
+  };
+
+  let compared = 0;
+  let lorryDiverted = 0;
+  let coachDiverted = 0;
+  for (let attempt = 0; attempt < 260 && compared < 60; attempt++) {
+    const from = point();
+    const to = point();
+    const car = await go({ from, to });
+    if (typeof car === "string") continue;
+    // Same fourteen tonnes both times; only the licence differs.
+    const lorry = await go({ from, to, vehicle: { weightT: 14 } });
+    const coach = await go({ from, to, vehicle: { weightT: 14, psv: true } });
+    if (typeof lorry === "string" || typeof coach === "string") continue;
+    compared++;
+    if (lorry.seconds > car.seconds + 1) lorryDiverted++;
+    if (coach.seconds > car.seconds + 1) coachDiverted++;
+    // A coach is still stopped by a posted weight limit — it really does
+    // weigh fourteen tonnes — so with the same ends it is never worse off
+    // than the lorry, only less constrained by the signs aimed at freight.
+    //
+    // Only with the same ends: a coach may use a reserved road, so its
+    // doorstep can snap somewhere the lorry's could not, and two routes
+    // between different points are not comparable in either direction.
+    const sameEnds =
+      lorry.from.snapDistanceMeters === coach.from.snapDistanceMeters &&
+      lorry.to.snapDistanceMeters === coach.to.snapDistanceMeters;
+    if (sameEnds) {
+      assert.ok(
+        coach.seconds <= lorry.seconds + 1,
+        "a coach was refused something the same weight of lorry was allowed"
+      );
+    }
+  }
+
+  assert.ok(compared > 20, `too few comparable pairs to conclude anything (${compared})`);
+  assert.ok(lorryDiverted > 0, "no lorry was diverted at all, so this proves nothing");
+  assert.ok(
+    coachDiverted < lorryDiverted,
+    `the coach was diverted as often as the lorry (${coachDiverted} vs ${lorryDiverted}): ` +
+    "its weight is still being read as freight"
+  );
+});
+
+test("a car-pool road asking three aboard turns away a car carrying two", async () => {
+  const { reservedFor, hovMinimum, EDGE_FLAG_HOV_ONLY, EDGE_FLAG_HOV3_ONLY, EDGE_FLAG_PSV_ONLY } =
+    await import("../scripts/osm_road_graph.mjs");
+  const tags = (entries) => new Map(Object.entries(entries));
+
+  // Two where nobody wrote a number down, which is what the sign reads.
+  assert.equal(hovMinimum(tags({})), 2);
+  assert.equal(hovMinimum(tags({ "hov:minimum": "3" })), 3);
+  // A minimum below two is not a car-pool lane at all, and an unreadable one
+  // is not a licence to invent a number.
+  assert.equal(hovMinimum(tags({ "hov:minimum": "1" })), 2);
+  assert.equal(hovMinimum(tags({ "hov:minimum": "" })), 2);
+  assert.equal(hovMinimum(tags({ "hov:minimum": "three" })), 2);
+
+  assert.equal(reservedFor(tags({ access: "hov" })), EDGE_FLAG_HOV_ONLY);
+  assert.equal(reservedFor(tags({ access: "hov", "hov:minimum": "3" })), EDGE_FLAG_HOV3_ONLY);
+  assert.equal(
+    reservedFor(tags({ hov: "designated", "hov:minimum": "3" })),
+    EDGE_FLAG_HOV3_ONLY
+  );
+  // The two are alternatives, never both: a road asks for one number.
+  assert.equal(
+    reservedFor(tags({ access: "hov", "hov:minimum": "3" })) & EDGE_FLAG_HOV_ONLY,
+    0
+  );
+  // A minimum on a road reserved for buses says nothing about the buses.
+  assert.equal(reservedFor(tags({ access: "psv", "hov:minimum": "3" })), EDGE_FLAG_PSV_ONLY);
+});
+
+test("occupancy decides which car-pool road a driver is given", async (t) => {
+  // Built by hand rather than read off an extract: Luxembourg tags no
+  // `hov:minimum` at all, and a rule about thresholds has to be provable on
+  // a graph where every threshold is present.
+  //
+  // A straight road north whose middle segment is a car-pool road asking
+  // three aboard, and a dearer way round that asks nothing. A driver alone
+  // or with one passenger takes the long way; a third passenger opens the
+  // short one.
+  const lat = [45.500, 45.505, 45.510, 45.515, 45.520, 45.512, 45.518];
+  const lon = [-73.600, -73.600, -73.600, -73.600, -73.600, -73.5920, -73.5920];
+  const pairs = [[0, 1], [1, 2], [2, 3], [3, 4], [2, 5], [5, 6], [6, 4]];
+  const from = [];
+  const to = [];
+  const weight = [];
+  const flags = [];
+  const EDGE_FLAG_HOV3_ONLY = 128;
+  for (const [a, b] of pairs) {
+    from.push(a, b);
+    to.push(b, a);
+    const reserved = a === 2 && b === 3;
+    // The detour is deliberately dearer, so a car found on it can only be
+    // there because the short way refused it rather than because it was quicker.
+    const detour = (a === 2 && b === 5) || (a === 5 && b === 6) || (a === 6 && b === 4);
+    const w = detour ? 600 : 100;
+    weight.push(w, w);
+    flags.push(reserved ? EDGE_FLAG_HOV3_ONLY : 0, reserved ? EDGE_FLAG_HOV3_ONLY : 0);
+  }
+  const graph = {
+    nodeLat: Int32Array.from(lat, v => Math.round(v * 1e7)),
+    nodeLon: Int32Array.from(lon, v => Math.round(v * 1e7)),
+    edgeFrom: Uint32Array.from(from),
+    edgeTo: Uint32Array.from(to),
+    edgeWeightDs: Uint32Array.from(weight),
+    edgeDistDm: Uint32Array.from(from, () => 5000),
+    edgeName: Uint32Array.from(from, () => 1),
+    edgeClass: Uint8Array.from(from, () => 0),
+    edgeFlags: Uint8Array.from(flags),
+    geomOffsets: Uint32Array.from(from.map((_, i) => i).concat([from.length])),
+    geomBytes: Uint8Array.from(from, () => 0),
+    names: ["", "Rue A"],
+    profile: "car",
+    classes: ["arterial", "local"]
+  };
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-hov3-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 8, fanout: 4, topMaxCells: 4 });
+  const engine = await openRouteGraphDir(dir);
+  const ends = { from: { lat: lat[0], lon: lon[0] }, to: { lat: lat[4], lon: lon[4] } };
+  const meters = async (vehicle) =>
+    (await engine.route(vehicle ? { ...ends, vehicle } : ends)).distanceMeters;
+
+  const round = await meters(null);
+  const through = await meters({ occupancy: 3 });
+  assert.ok(round > through, "the reserved road is not the short way, so this proves nothing");
+
+  // Short of the number on the sign, the road is not theirs.
+  assert.equal(await meters({ occupancy: 1 }), round, "a driver alone was let into a 3+ lane");
+  assert.equal(await meters({ occupancy: 2 }), round, "two aboard was let into a 3+ lane");
+  // At it and past it, it is.
+  assert.equal(await meters({ occupancy: 3 }), through, "three aboard was refused a 3+ lane");
+  assert.equal(await meters({ occupancy: 4 }), through, "four aboard was refused a 3+ lane");
+  // A bus is entitled by being a bus, whatever number the sign asks for.
+  assert.equal(await meters({ psv: true }), through, "a bus was refused a car-pool road");
+  // And a vehicle that says nothing at all is a driver alone.
+  assert.equal(await meters({}), round, "an unstated vehicle was given a reserved road");
+});
+
+test("Montréal's three-aboard reserved lane reaches the step, and gates on occupancy", async (t) => {
+  // Luxembourg tags no `hov:minimum` anywhere, so the only real-data proof
+  // of the two-versus-three distinction is Québec's. Skipped where that
+  // index has not been built, which is why the synthetic graph above carries
+  // the routing rule and this carries the tagging.
+  const fixture = "bench/route/quebec-index";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`quebec index missing at ${fixture}`);
+    return;
+  }
+  const { LANE_BUS, LANE_HOV, LANE_HOV3 } = await import("../scripts/osm_road_graph.mjs");
+  const engine = await openRouteGraphDir(fixture);
+
+  // The Autoroute du Souvenir corridor through Dorval, swept deterministically.
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0x100000000);
+  const reasons = new Set();
+  for (let attempt = 0; attempt < 400; attempt++) {
+    const from = { lat: 45.42 + rnd() * 0.06, lon: -73.80 + rnd() * 0.12 };
+    const to = { lat: 45.42 + rnd() * 0.06, lon: -73.80 + rnd() * 0.12 };
+    let route;
+    try {
+      route = await engine.route({ from, to });
+    } catch {
+      continue;
+    }
+    for (const step of route.steps || []) {
+      for (const reason of step.laneAccess || []) if (reason) reasons.add(reason);
+    }
+  }
+
+  const threePlus = [...reasons].filter(reason => (reason & LANE_HOV3) !== 0);
+  assert.ok(
+    threePlus.length > 0,
+    `no three-aboard lane reached a step; reasons seen: ${[...reasons].join(", ")}`
+  );
+  // Montréal signs that lane for buses and for car-pools of three together,
+  // which is why the reason is a set rather than a single class.
+  assert.ok(
+    threePlus.some(reason => (reason & LANE_BUS) !== 0),
+    "the three-aboard lane arrived without the bus it is also signed for"
+  );
+  // Two and three are alternatives on any one lane, never both at once.
+  assert.ok(
+    threePlus.every(reason => (reason & LANE_HOV) === 0),
+    "a lane claimed to ask for two and three aboard at the same time"
+  );
+  // And the ordinary two-aboard lane is still out there, or this would be
+  // proving that everything got relabelled rather than that the split works.
+  assert.ok(
+    [...reasons].some(reason => (reason & LANE_HOV) !== 0),
+    "no two-aboard lane survived at all"
+  );
 });

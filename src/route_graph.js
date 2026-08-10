@@ -24,14 +24,14 @@ export const ROUTE_ROOT_MAGIC = [0x52, 0x46, 0x52, 0x54]; // RFRT
 export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
-const ROOT_VERSION = 5;
-const CELL_VERSION = 8;
+const ROOT_VERSION = 10;
+const CELL_VERSION = 14;
 // v5 cells carry no lane column. A published index is a large download that
 // A reader requires the version it was built for. Carrying older shapes means
 // a branch per field per version, and every one of those is a place to read a
 // byte that is really the next field. Rebuild and republish instead — the
 // index is derived data, and reproducing it is a command.
-const OVERLAY_VERSION = 1;
+const OVERLAY_VERSION = 3;
 const GEOMETRY_VERSION = 1;
 
 // Integer time-of-day metric: factors are time multipliers scaled by 1000,
@@ -153,6 +153,30 @@ export function encodeRouteCell(cell) {
       // road leads to. A motorway's *name* is the one thing never written on
       // a sign, so guidance that has only the name has nothing to say.
       pushVarint(out, cell.signs ? cell.signs[e] : 0);
+      // What this edge physically will not admit — height, weight, width,
+      // length — as a 1-based index into the root's table. Zero is "no posted
+      // limit", which is nearly every edge in the world and costs one byte.
+      //
+      // Kept off the weight deliberately. A limit is not a cost: a van that
+      // is 3.4 m tall does not take a 3.2 m bridge slowly, it does not take
+      // it at all, and pricing the two the same is how a router sends a
+      // courier under a bridge their vehicle will not clear.
+      pushVarint(out, cell.limits ? cell.limits[e] : 0);
+      // When this turn is shut, as a 1-based index into the root's ban table.
+      // The overlays above it are already built per bucket with the ban
+      // priced in; this is the same fact on the roads themselves, so the
+      // shortcut and the street it stands for cannot disagree.
+      pushVarint(out, cell.bans ? cell.bans[e] : 0);
+      // What passing here costs, as a 1-based index into the root's table.
+      pushVarint(out, cell.charges ? cell.charges[e] : 0);
+      // What the overhead panel says above each lane of this approach, as a
+      // 1-based index into the root's table. The arrows say which movements
+      // a lane allows; only this says where any of them goes.
+      pushVarint(out, cell.laneSigns ? cell.laneSigns[e] : 0);
+      // Which approach lanes actually reach this turning, bit 0 leftmost.
+      // Zero is "the map did not say", and guidance falls back to inferring
+      // it from the arrows — a good guess, and still a guess.
+      pushVarint(out, cell.laneReach ? cell.laneReach[e] : 0);
       // Flag byte. Bit 0: this edge runs inside a roundabout, which is a
       // maneuver rather than a road and cannot be inferred from geometry.
       pushVarint(out, cell.flags ? cell.flags[e] : 0);
@@ -162,6 +186,12 @@ export function encodeRouteCell(cell) {
       const laneCount = lanes ? Math.min(lanes.length, 255) : 0;
       pushVarint(out, laneCount);
       for (let i = 0; i < laneCount; i++) pushVarint(out, lanes[i] & 0xff);
+      // Why each of those lanes is not the driver's — bus, HOV, taxi, cycle,
+      // closed — or 0 where it is theirs. Written beside the arrows rather
+      // than in a column of its own because it is indexed by lane, and the
+      // one thing that must never drift is which lane a label describes.
+      const laneAccess = cell.laneAccess ? cell.laneAccess[e] : null;
+      for (let i = 0; i < laneCount; i++) pushVarint(out, laneAccess?.[i] || 0);
       const external = cell.targets[e] < cell.firstNode || cell.targets[e] >= cell.firstNode + cell.nodeCount;
       if (external) {
         // Cross-cell edges carry their far endpoint so snapping and
@@ -208,9 +238,15 @@ export function decodeRouteCell(bytes) {
   const speeds = new Uint8Array(edgeCount);
   const condRules = new Uint8Array(edgeCount);
   const signs = new Uint32Array(edgeCount);
+  const limits = new Uint32Array(edgeCount);
+  const bans = new Uint32Array(edgeCount);
+  const charges = new Uint32Array(edgeCount);
+  const laneSigns = new Uint32Array(edgeCount);
+  const laneReach = new Uint32Array(edgeCount);
   const flags = new Uint8Array(edgeCount);
   const laneOffsets = new Uint32Array(edgeCount + 1);
   const laneMasks = [];
+  const laneAccess = [];
   const extLat = new Int32Array(edgeCount);
   const extLon = new Int32Array(edgeCount);
   const geomRefs = new Uint32Array(edgeCount);
@@ -229,10 +265,16 @@ export function decodeRouteCell(bytes) {
       speeds[cursor] = readVarint(bytes, state);
       condRules[cursor] = readVarint(bytes, state);
       signs[cursor] = readVarint(bytes, state);
+      limits[cursor] = readVarint(bytes, state);
+      bans[cursor] = readVarint(bytes, state);
+      charges[cursor] = readVarint(bytes, state);
+      laneSigns[cursor] = readVarint(bytes, state);
+      laneReach[cursor] = readVarint(bytes, state);
       flags[cursor] = readVarint(bytes, state);
       if (hasLanes) {
         const laneCount = readVarint(bytes, state);
         for (let i = 0; i < laneCount; i++) laneMasks.push(readVarint(bytes, state));
+        for (let i = 0; i < laneCount; i++) laneAccess.push(readVarint(bytes, state));
       }
       laneOffsets[cursor + 1] = laneMasks.length;
       const external = targets[cursor] < firstNode || targets[cursor] >= firstNode + nodeCount;
@@ -247,8 +289,8 @@ export function decodeRouteCell(bytes) {
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route cell block.");
   return {
     cellId, firstNode, nodeCount, latE7, lonE7, rowStart, targets, weights, distsDm,
-    nameIds, classes, junctions, speeds, condRules, signs, flags,
-    laneOffsets, laneMasks: Uint8Array.from(laneMasks),
+    nameIds, classes, junctions, speeds, condRules, signs, limits, bans, charges, laneSigns, laneReach, flags,
+    laneOffsets, laneMasks: Uint8Array.from(laneMasks), laneAccess: Uint8Array.from(laneAccess),
     extLat, extLon, geomRefs
   };
 }
@@ -349,6 +391,16 @@ export function encodeRouteOverlay(overlay) {
     for (let e = start; e < end; e++) {
       pushZigzag(out, overlay.targetIndex[e] - node);
       pushVarint(out, overlay.weights[e] * 2 + (overlay.isClique[e] ? 1 : 0));
+      // The tightest thing standing over the path this arc replaces, as a
+      // 1-based index into the root's table. A shortcut is a whole path
+      // collapsed to one number and the low bridge is somewhere inside it;
+      // without this the hierarchy is a hole every restriction falls through.
+      // Zero on all but a handful of arcs, and one byte when it is.
+      pushVarint(out, overlay.limits ? overlay.limits[e] : 0);
+      // What the path behind this arc passes through — a toll booth, a boat.
+      // A preference to avoid either has to survive the collapse, or the
+      // hierarchy is a hole it falls straight through.
+      pushVarint(out, overlay.pathFlags ? overlay.pathFlags[e] : 0);
     }
   }
   return Uint8Array.from(out);
@@ -372,6 +424,8 @@ export function decodeRouteOverlay(bytes) {
   const rowStart = new Uint32Array(nodeCount + 1);
   const targetIndex = new Uint32Array(edgeCount);
   const weights = new Uint32Array(edgeCount);
+  const limits = new Uint32Array(edgeCount);
+  const pathFlags = new Uint8Array(edgeCount);
   const isClique = new Uint8Array(edgeCount);
   let cursor = 0;
   for (let node = 0; node < nodeCount; node++) {
@@ -382,11 +436,13 @@ export function decodeRouteOverlay(bytes) {
       const packed = readVarint(bytes, state);
       weights[cursor] = Math.floor(packed / 2);
       isClique[cursor] = packed % 2;
+      limits[cursor] = readVarint(bytes, state);
+      pathFlags[cursor] = readVarint(bytes, state);
       cursor++;
     }
   }
   if (state.pos !== bytes.length) throw new Error("Trailing bytes in Rangefind route overlay block.");
-  return { level, cellId, nodes, rowStart, targetIndex, weights, isClique };
+  return { level, cellId, nodes, rowStart, targetIndex, weights, limits, pathFlags, isClique };
 }
 
 // --- Root ---------------------------------------------------------------
@@ -495,6 +551,45 @@ export function encodeRouteRoot(root) {
     pushUtf8(out, sign.destRef || "");
     pushUtf8(out, sign.dest || "");
   }
+  // The distinct sets of physical limits edges point at. A whole province
+  // repeats a few hundred between them — 3.5 t, 4.0 m, 2.6 m are posted over
+  // and over — so they are written once and referenced by index.
+  //
+  // Centimetres and kilograms, as integers. A limit is a number off a sign
+  // and signs are not written to the millimetre; storing it as a float would
+  // invite comparing 3.5 against 3.4999998 at the one moment it matters.
+  const limits = root.limits || [];
+  pushVarint(out, limits.length);
+  for (const limit of limits) {
+    pushVarint(out, limit.heightCm || 0);
+    pushVarint(out, limit.weightKg || 0);
+    pushVarint(out, limit.widthCm || 0);
+    pushVarint(out, limit.lengthCm || 0);
+  }
+  // The windows timed turn bans are in force during. Same shape as the
+  // conditional speed windows and for the same reason: a city posts the same
+  // handful of peak hours over and over.
+  // What the tolled and ferried stretches cost, where the map says at all.
+  const charges = root.charges || [];
+  pushVarint(out, charges.length);
+  for (const charge of charges) {
+    pushVarint(out, charge.cents);
+    pushUtf8(out, charge.currency || "");
+  }
+  // The distinct lane panels, written once: a motorway repeats the same one
+  // across every way of its run up to the interchange.
+  const laneSignTable = root.laneSigns || [];
+  pushVarint(out, laneSignTable.length);
+  for (const panel of laneSignTable) pushUtf8(out, panel);
+  const banRules = root.banRules || [];
+  pushVarint(out, banRules.length);
+  for (const rule of banRules) {
+    pushVarint(out, rule.days);
+    pushVarint(out, rule.startMinute);
+    pushVarint(out, rule.endMinute);
+    pushVarint(out, rule.monthStart);
+    pushVarint(out, rule.monthEnd);
+  }
   const buckets = root.buckets || [{ name: "base", rules: [], factors: [] }];
   pushVarint(out, buckets.length);
   for (const bucket of buckets) {
@@ -580,6 +675,35 @@ export function decodeRouteRoot(bytes) {
       dest: readUtf8(bytes, state)
     });
   }
+  const limitCount = readVarint(bytes, state);
+  const limits = [];
+  for (let i = 0; i < limitCount; i++) {
+    limits.push({
+      heightCm: readVarint(bytes, state),
+      weightKg: readVarint(bytes, state),
+      widthCm: readVarint(bytes, state),
+      lengthCm: readVarint(bytes, state)
+    });
+  }
+  const chargeCount = readVarint(bytes, state);
+  const charges = [];
+  for (let i = 0; i < chargeCount; i++) {
+    charges.push({ cents: readVarint(bytes, state), currency: readUtf8(bytes, state) });
+  }
+  const laneSignCount = readVarint(bytes, state);
+  const laneSigns = [];
+  for (let i = 0; i < laneSignCount; i++) laneSigns.push(readUtf8(bytes, state));
+  const banRuleCount = readVarint(bytes, state);
+  const banRules = [];
+  for (let i = 0; i < banRuleCount; i++) {
+    banRules.push({
+      days: readVarint(bytes, state),
+      startMinute: readVarint(bytes, state),
+      endMinute: readVarint(bytes, state),
+      monthStart: readVarint(bytes, state),
+      monthEnd: readVarint(bytes, state)
+    });
+  }
   const bucketCount = readVarint(bytes, state);
   const buckets = [];
   for (let i = 0; i < bucketCount; i++) {
@@ -648,6 +772,10 @@ export function decodeRouteRoot(bytes) {
     classes,
     condRules,
     signs,
+    limits,
+    banRules,
+    charges,
+    laneSigns,
     buckets,
     shards,
     leaves,
