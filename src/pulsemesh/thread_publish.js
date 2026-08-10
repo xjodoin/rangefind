@@ -258,7 +258,7 @@ export async function createThreadPublisher({
     return best;
   }
 
-  /** Seals one already-encoded body into a PMT1 and hands it to the transport. */
+  /** Seals one already-encoded body into a nonce-safe PMT1 and hands it to the transport. */
   async function emitPlaintext(plaintext, nowMillis, extra) {
     const window = threadWindow(nowMillis);
     const tag = await threadTag(keys, epoch32, window);

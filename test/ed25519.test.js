@@ -23,7 +23,7 @@ import {
   publicKeyFromSeed,
   setThreadCryptoImplementation
 } from "../src/pulsemesh/thread_crypto.js";
-import { THREAD_MODE } from "../src/pulsemesh/thread_codec.js";
+import { THREAD_MODE, threadRecordAad } from "../src/pulsemesh/thread_codec.js";
 import { encodeThreadPlan, issueTicket, verifyThreadTicket } from "../src/pulsemesh/thread_ticket.js";
 
 const PKCS8_PREFIX = fromHex("302e020100300506032b657004220420");
@@ -263,8 +263,9 @@ test("thread_crypto falls back on its own, after one probe", async () => {
     // The rest of the key schedule never left WebCrypto.
     const keys = await crypto7.deriveThreadKeys(publicKey);
     assert.equal(keys.contentKey.length, 32);
-    const sealed = await crypto7.sealThreadBody(keys, 1, new Uint8Array([1, 2]), message);
-    assert.deepEqual(await crypto7.openThreadBody(keys, 1, new Uint8Array([1, 2]), sealed), message);
+    const aad = threadRecordAad(new Uint8Array(8), new Uint8Array(8), 1);
+    const sealed = await crypto7.sealThreadBody(keys, 1, aad, message);
+    assert.deepEqual(await crypto7.openThreadBody(keys, 1, aad, sealed), message);
   } finally {
     subtleProto.importKey = realImportKey;
   }

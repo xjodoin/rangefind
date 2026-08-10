@@ -415,11 +415,10 @@ export class MeshNode {
    *                  keeps an attacker from scoring down honest peers by
    *                  replaying their own traffic back at them.
    *   GOSSIP_ACCEPT  checked in full, stored, safe to vouch for.
-   *   null           not this node's channel to judge (the reserved
-   *                  thread namespace, or a topic that is not ours at
-   *                  all). The caller falls back to its previous
-   *                  behaviour; nothing is consumed and no side effect
-   *                  has happened here.
+   *   null           no registered channel can judge this topic. The
+   *                  bundled thread channel installs `onOtherGossip`,
+   *                  so reserved thread topics take the same
+   *                  validate-before-forward path as traffic.
    *
    * A message carrying several records is forwarded only if *every* one
    * of them was accepted and fully judged: the message is the unit the
@@ -427,7 +426,10 @@ export class MeshNode {
    */
   judgeGossip(topicName, payload, fromPeer, nowMillis = this.clock()) {
     const topic = parseTopic(topicName);
-    if (!topic || topic.reserved) return null;
+    if (!topic) return null;
+    if (topic.reserved) {
+      return this.onOtherGossip?.(topicName, payload, fromPeer, nowMillis) ?? null;
+    }
     return this.#ingestGossip(topic, payload, fromPeer, nowMillis);
   }
 

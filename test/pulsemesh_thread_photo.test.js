@@ -26,6 +26,7 @@ import {
   STOP_OUTCOME,
   THREAD_MAX_PHOTO_LIST,
   THREAD_MAX_RECORD_BYTES,
+  THREAD_RECORD_OVERHEAD,
   THREAD_MODE,
   decodePhotoListRequest,
   decodePhotoListResponse,
@@ -525,7 +526,7 @@ test("three proofs marked in a dead zone are recovered and verified by a holder 
     "the proof for the stop that failed in the dead zone, opened by the dispatcher");
 
   // The three sit inside a 256-byte record like everything else.
-  assert.ok(follow.latest().preimage.length + 64 + 43 <= THREAD_MAX_RECORD_BYTES);
+  assert.ok(follow.latest().preimage.length + 64 + THREAD_RECORD_OVERHEAD <= THREAD_MAX_RECORD_BYTES);
 
   follow.stop();
   driverThreads.close();

@@ -142,13 +142,14 @@ const REASON_CODE_MASK = 0x7f;
 /**
  * What a PMT1 record spends on framing around the sealed body: magic 4,
  * epochPrefix8 8, tag 8, `seq` varint ≤ 5, `ctLen` varint 2 (a body is
- * never under 128 nor over 16383 bytes), AEAD tag 16.
+ * never under 128 nor over 16383 bytes), random GCM nonce 12, AEAD tag
+ * 16.
  *
  * Subtracting it gives the budget the *plaintext* body has, which is the
  * only number an encoder can check: the body is sealed before it is
  * framed, so a record that overflows 256 has already been signed.
  */
-export const THREAD_RECORD_OVERHEAD = 43;
+export const THREAD_RECORD_OVERHEAD = 55;
 export const THREAD_MAX_BODY_BYTES = THREAD_MAX_RECORD_BYTES - THREAD_RECORD_OVERHEAD;
 
 /**
@@ -779,6 +780,9 @@ export function threadRecordAad(epochPrefix8, tag, seq) {
 export function encodeThreadRecord({ epochPrefix8, tag, seq, ciphertext }) {
   if (epochPrefix8.length !== 8) throw new Error("epochPrefix8 must be 8 bytes.");
   if (tag.length !== 8) throw new Error("Thread tag must be 8 bytes.");
+  if (ciphertext.length < 28) {
+    throw new Error("PMT1 sealed body must include its 12-byte nonce and 16-byte authentication tag.");
+  }
   const aad = threadRecordAad(epochPrefix8, tag, seq);
   const out = [...aad];
   pushVarint(out, ciphertext.length);
@@ -795,6 +799,7 @@ export function readThreadRecord(bytes, state) {
   const seq = readVarint(bytes, state);
   const aadEnd = state.pos;
   const ctLen = readVarint(bytes, state);
+  if (ctLen < 28) throw new Error("PMT1 sealed body is too short.");
   const ciphertext = readBytes(bytes, state, ctLen);
   return {
     magic: THREAD_MAGIC.PMT1,

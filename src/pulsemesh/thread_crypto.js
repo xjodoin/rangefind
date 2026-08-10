@@ -32,7 +32,6 @@ import { x25519, x25519Base } from "./x25519.js";
 export const THREAD_TOPIC_PREFIX = "/rangefind/pulsemesh/1/t";
 const TAG_INFO = "pulsemesh/thread/topic/1";
 const CONTENT_INFO = "pulsemesh/thread/content/1";
-const NONCE_INFO = "pulsemesh/thread/nonce/1";
 const TAG_DOMAIN = "pulsemesh/thread/1";
 const PHOTO_INFO = "pulsemesh/photo/1";
 
@@ -104,12 +103,11 @@ async function hkdf(publicKey, info, lengthBytes) {
  */
 export async function deriveThreadKeys(publicKey) {
   if (publicKey.length !== 32) throw new Error("A thread capability is a 32-byte Ed25519 public key.");
-  const [topicKey, contentKey, noncePrefix] = await Promise.all([
+  const [topicKey, contentKey] = await Promise.all([
     hkdf(publicKey, TAG_INFO, 32),
-    hkdf(publicKey, CONTENT_INFO, 32),
-    hkdf(publicKey, NONCE_INFO, 4)
+    hkdf(publicKey, CONTENT_INFO, 32)
   ]);
-  return { publicKey, topicKey, contentKey, noncePrefix };
+  return { publicKey, topicKey, contentKey };
 }
 
 // --- §4.2 finding the thread ----------------------------------------------
@@ -150,34 +148,49 @@ export async function threadTagsForWindows(keys, epoch32, windows) {
 
 // --- §5.1 sealing ---------------------------------------------------------
 
-export function threadNonce(noncePrefix, seq) {
-  return new Uint8Array([...noncePrefix, ...uint64be(seq)]);
-}
+/** The NIST-recommended size for a randomly generated AES-GCM nonce. */
+export const THREAD_NONCE_BYTES = 12;
 
 /**
- * AES-256-GCM with the tag appended. The nonce is never transmitted —
- * it is `noncePrefix ‖ uint64be(seq)`, unique by construction — and the
- * AAD binds the ciphertext to its epoch, tag, and sequence number, so a
- * record cannot be replayed into another thread or another window.
+ * AES-256-GCM with a fresh 96-bit nonce prepended and the tag appended.
+ * The nonce travels inside PMT1's sealed-body field. This is deliberately
+ * random per record: route links keep one content key across service days,
+ * and a publisher can restart without a peer from which to recover `seq`.
+ * Neither event can therefore repeat an IV.
  */
-export async function sealThreadBody(keys, seq, aad, plaintext) {
+export async function sealThreadBody(keys, _seq, aad, plaintext, { nonce = null } = {}) {
   const key = await subtle().importKey("raw", keys.contentKey, "AES-GCM", false, ["encrypt"]);
+  const iv = nonce || globalThis.crypto.getRandomValues(new Uint8Array(THREAD_NONCE_BYTES));
+  if (iv.length !== THREAD_NONCE_BYTES) throw new Error("A thread record nonce is 12 bytes.");
   const sealed = await subtle().encrypt(
-    { name: "AES-GCM", iv: threadNonce(keys.noncePrefix, seq), additionalData: aad, tagLength: 128 },
+    { name: "AES-GCM", iv, additionalData: aad, tagLength: 128 },
     key,
     plaintext
   );
-  return bytes(sealed);
+  const ciphertext = bytes(sealed);
+  const out = new Uint8Array(iv.length + ciphertext.length);
+  out.set(iv, 0);
+  out.set(ciphertext, iv.length);
+  return out;
 }
 
 /** Returns null on any AEAD failure — a wrong key, a tampered record. */
-export async function openThreadBody(keys, seq, aad, ciphertext) {
+export async function openThreadBody(keys, _seq, aad, ciphertext) {
   try {
+    const encodedSeq = [];
+    pushVarint(encodedSeq, _seq);
+    if (
+      aad.length !== 20 + encodedSeq.length
+      || encodedSeq.some((value, index) => aad[20 + index] !== value)
+    ) return null;
+    if (ciphertext.length < THREAD_NONCE_BYTES + 16) return null;
+    const iv = ciphertext.subarray(0, THREAD_NONCE_BYTES);
+    const sealed = ciphertext.subarray(THREAD_NONCE_BYTES);
     const key = await subtle().importKey("raw", keys.contentKey, "AES-GCM", false, ["decrypt"]);
     const opened = await subtle().decrypt(
-      { name: "AES-GCM", iv: threadNonce(keys.noncePrefix, seq), additionalData: aad, tagLength: 128 },
+      { name: "AES-GCM", iv, additionalData: aad, tagLength: 128 },
       key,
-      ciphertext
+      sealed
     );
     return bytes(opened);
   } catch {
@@ -225,10 +238,9 @@ export async function photoKeyFor(privateSeed, planRef, stopIndex) {
 /**
  * AES-256-GCM with a fresh CSPRNG IV **prepended** to the ciphertext.
  *
- * Deliberately not the §5.1 convention, where the nonce is derived from
- * `seq` and never transmitted: a photo has no sequence number, is not
- * addressed by one, and is fetched out of band by content hash — so
- * there is nothing to derive a nonce from and the IV has to travel.
+ * The same §5.1 convention as a PMT1 record: a fresh random nonce travels
+ * with the ciphertext. A photo has no sequence number, is not addressed
+ * by one, and is fetched out of band by content hash.
  * There is no AAD for the same reason: the binding a record needs comes
  * from the signed accumulator over the commitment (§5.2 field 21), not
  * from the blob's own framing.

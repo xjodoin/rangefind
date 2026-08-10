@@ -247,10 +247,12 @@
     "@chainsafe/libp2p-yamux": "^7.0.4",
     "@libp2p/circuit-relay-v2": "^3.2.24",
     "@libp2p/identify": "^3.0.39",
-    "@libp2p/kad-dht": "^14.2.15",
+    "@libp2p/kad-dht": "^15.1.11",
+    "@libp2p/ping": "^2.0.37",
     "@libp2p/tcp": "^10.1.19",
     "@libp2p/webrtc": "^5.2.24",
     "@libp2p/websockets": "^9.2.19",
+    "datastore-core": "^10.0.4",
     "esbuild": "^0.25.12",
     "libp2p": "^2.10.0",
     "multiformats": "^13.4.2",
@@ -258,14 +260,20 @@
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": "*",
-    "jpeg-js": "^0.4.4",
-    "playwright": "*",
     "@chainsafe/libp2p-gossipsub": "^14.1.2",
     "@chainsafe/libp2p-noise": "^16.1.5",
     "@chainsafe/libp2p-yamux": "^7.0.4",
+    "@libp2p/circuit-relay-v2": "^3.2.24",
     "@libp2p/identify": "^3.0.39",
+    "@libp2p/kad-dht": "^15.1.11",
+    "@libp2p/ping": "^2.0.37",
     "@libp2p/tcp": "^10.1.19",
-    "libp2p": "^2.10.0"
+    "@libp2p/webrtc": "^5.2.24",
+    "@libp2p/websockets": "^9.2.19",
+    "datastore-core": "^10.0.4",
+    "jpeg-js": "^0.4.4",
+    "libp2p": "^2.10.0",
+    "playwright": "*"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {
@@ -286,7 +294,25 @@
     "@libp2p/identify": {
       "optional": true
     },
+    "@libp2p/circuit-relay-v2": {
+      "optional": true
+    },
+    "@libp2p/kad-dht": {
+      "optional": true
+    },
+    "@libp2p/ping": {
+      "optional": true
+    },
     "@libp2p/tcp": {
+      "optional": true
+    },
+    "@libp2p/webrtc": {
+      "optional": true
+    },
+    "@libp2p/websockets": {
+      "optional": true
+    },
+    "datastore-core": {
       "optional": true
     },
     "libp2p": {

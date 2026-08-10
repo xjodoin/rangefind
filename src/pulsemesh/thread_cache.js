@@ -25,6 +25,9 @@ import {
 } from "./thread_codec.js";
 import { toHex } from "./sha256.js";
 
+const SOURCE_BUDGET_MAX = 1024;
+const OPENABLE_BURST = 4;
+
 function randomBytes(length) {
   const out = new Uint8Array(length);
   globalThis.crypto.getRandomValues(out);
@@ -36,8 +39,10 @@ function randomBytes(length) {
  * and per-source admission limits.
  *
  * `openable` marks tags this peer actually subscribes to; those are kept
- * regardless of the relay budget, because dropping your own thread to
- * make room for someone else's is never right.
+ * regardless of the relay eviction budget, because dropping your own
+ * thread to make room for someone else's is never right. Remote records
+ * remain rate-limited even when openable: possession of a follow link is
+ * not permission to make every subscriber decrypt an unlimited flood.
  */
 export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.now, rng = Math.random } = {}) {
   const tags = new Map();       // tagHex -> { records: [], lastUsed, openable }
@@ -70,13 +75,12 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
   }
 
   /**
-   * Admits a sealed record. `openable` records (our own threads) bypass
-   * the relay rate limits; anything else is bounded by
-   * THREAD_CACHE_RATE per tag and THREAD_TAG_BUDGET new tags per source
-   * peer per window, because caching what you cannot verify is
-   * best-effort by definition and shedding under load is correct.
+   * Admits a sealed record. Locally produced records have no `fromPeer`
+   * and bypass network quotas. Remote openable records get a small burst
+   * for certificate+position startup, then the ordinary per-tag refill;
+   * relay-only traffic gets no burst and also pays the new-tag budget.
    */
-  function admit(record, { fromPeer = null, openable = false, nowMillis = clock() } = {}) {
+  function admit(record, { fromPeer = null, openable = false, retain = true, nowMillis = clock() } = {}) {
     const decoded = record instanceof Uint8Array ? decodeThreadRecord(record) : record;
     if (decoded.bytes.length > constants.THREAD_MAX_RECORD_BYTES) {
       stats.rejected++;
@@ -85,25 +89,43 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
     const tagHex = toHex(decoded.tag);
     const known = tags.get(tagHex);
 
-    if (!openable && fromPeer != null) {
+    if (fromPeer != null) {
       const window = Math.floor(nowMillis / 1000 / 300);
       let budget = sourceBudget.get(fromPeer);
       if (!budget || budget.window !== window) {
+        for (const [peer, held] of sourceBudget) {
+          if (held.window !== window) sourceBudget.delete(peer);
+        }
+        while (sourceBudget.size >= SOURCE_BUDGET_MAX) {
+          sourceBudget.delete(sourceBudget.keys().next().value);
+        }
         budget = { window, newTags: 0, admitted: new Map() };
         sourceBudget.set(fromPeer, budget);
       }
-      if (!known && budget.newTags >= constants.THREAD_TAG_BUDGET) {
+      if (!openable && !known && budget.newTags >= constants.THREAD_TAG_BUDGET) {
         stats.rejected++;
         return { admitted: false, reason: "tag-budget" };
       }
-      const last = budget.admitted.get(tagHex);
-      if (last != null && nowMillis - last < constants.THREAD_CACHE_RATE * 1000) {
+      const burst = openable ? OPENABLE_BURST : 1;
+      const refillMillis = constants.THREAD_CACHE_RATE * 1000;
+      const previous = budget.admitted.get(tagHex);
+      const elapsed = previous ? Math.max(0, nowMillis - previous.lastMillis) : 0;
+      const available = previous
+        ? Math.min(burst, previous.tokens + elapsed / refillMillis)
+        : burst;
+      if (available < 1) {
         stats.rejected++;
         return { admitted: false, reason: "rate" };
       }
-      if (!known) budget.newTags++;
-      budget.admitted.set(tagHex, nowMillis);
+      if (!openable && !known) budget.newTags++;
+      budget.admitted.set(tagHex, { tokens: available - 1, lastMillis: nowMillis });
     }
+
+    // Validation-only mode for a channel configured not to relay. The
+    // framing and source quota above still apply before forwarding, but
+    // bytes this host neither follows nor republishes do not occupy its
+    // catch-up cache.
+    if (!retain) return { admitted: true, retained: false };
 
     const entry = entryFor(tagHex, { openable, nowMillis });
     if (entry.records.some(held => held.seq === decoded.seq)) {
@@ -114,7 +136,7 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
     if (entry.records.length > constants.THREAD_CACHE_RING) entry.records.shift();
     stats.admitted++;
     evictIfNeeded();
-    return { admitted: true };
+    return { admitted: true, retained: true };
   }
 
   /** Drops records past THREAD_CACHE_TTL, and tags left empty. */

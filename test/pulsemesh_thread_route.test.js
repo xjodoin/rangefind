@@ -25,6 +25,7 @@ import {
   THREAD_MODE,
   decodeDayCertificate,
   decodeThreadLink,
+  decodeThreadRecord,
   encodeDayCertificate,
   encodeDayCertificatePreimage,
   encodeThreadBody,
@@ -207,6 +208,32 @@ test("the same 45-byte link works on day 1 and on day 40", async () => {
   const publisherTags = day40.publisher.keys;
   assert.equal(toHex(publisherTags.topicKey), toHex(subscriber.keys.topicKey));
   assert.equal(tagsDay40.length, 3);
+});
+
+test("recurring days and restarts never reuse a GCM nonce", async () => {
+  const root = await generateThreadKeypair(sha256Utf8("route-nonce-root"));
+
+  async function firstSealedRecord(atMillis) {
+    const emitted = [];
+    const { publisher } = await driverFor(root.privateSeed, atMillis, {
+      publish: record => { emitted.push(record); }
+    });
+    await publisher.handleFix({ lat: 45.521, lon: -73.591, speedMps: 8, nowMillis: atMillis });
+    const record = decodeThreadRecord(emitted[0].bytes);
+    assert.equal(record.seq, 1, "each isolated publisher starts at the same sequence");
+    return { publisher, nonce: record.ciphertext.subarray(0, 12) };
+  }
+
+  const first = await firstSealedRecord(DAY_ONE);
+  const restarted = await firstSealedRecord(DAY_ONE);
+  const tomorrow = await firstSealedRecord(DAY_ONE + DAY);
+
+  assert.equal(toHex(first.publisher.keys.contentKey), toHex(restarted.publisher.keys.contentKey));
+  assert.equal(toHex(first.publisher.keys.contentKey), toHex(tomorrow.publisher.keys.contentKey),
+    "the stable route link intentionally keeps one content key");
+  assert.notEqual(toHex(first.nonce), toHex(restarted.nonce), "a same-day restart gets a fresh nonce");
+  assert.notEqual(toHex(first.nonce), toHex(tomorrow.nonce), "the next service day gets a fresh nonce");
+  assert.notEqual(toHex(restarted.nonce), toHex(tomorrow.nonce));
 });
 
 test("a day seed is deterministic and does not invert to the root", async () => {

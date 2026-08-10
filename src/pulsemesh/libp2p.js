@@ -46,6 +46,16 @@ const REQUEST_TIMEOUT_MS = 10_000;
 // free.
 const SERVE_TIMEOUT_MS = 15_000;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+// A length prefix is protocol framing, not permission to allocate the
+// sync protocol's full allowance on every smaller endpoint.
+const MAX_BOND_FRAME_BYTES = 1024;
+const MAX_THREAD_FRAME_BYTES = 2 * 1024 * 1024;
+const MAX_PHOTO_FRAME_BYTES = 192 * 1024;
+const MAX_PRESENTED_PEERS = 1024;
+const PRESENTED_PEER_TTL_MS = 24 * 60 * 60 * 1000;
+const DHT_DATASTORE_PREFIX = "/pulsemesh-dht";
+const MAX_DHT_VALUE_RECORDS = 2048;
+const MAX_DHT_VALUE_RECORD_BYTES = 16 * 1024;
 /**
  * Opt in to running over a relayed circuit, which libp2p classifies as a
  * "limited" connection and otherwise refuses protocols on. Applied to
@@ -216,8 +226,14 @@ export async function createPulseMeshHost({
   } else if (relay && browser) {
     throw new Error("A browser cannot be a Circuit Relay server; only a node host can relay.");
   }
+  let datastore = null;
   if (dht) {
-    const { kadDHT, passthroughMapper, removePrivateAddressesMapper } = await import("@libp2p/kad-dht");
+    const [dhtModule, { MemoryDatastore }, { ping }] = await Promise.all([
+      import("@libp2p/kad-dht"),
+      import("datastore-core/memory"),
+      import("@libp2p/ping")
+    ]);
+    const { kadDHT, passthroughMapper, removePrivateAddressesMapper, Record: Libp2pRecord } = dhtModule;
     const options = typeof dht === "object" ? dht : {};
     // The default mapper strips private addresses, which is right for a
     // public DHT and fatal on loopback or a LAN: peers connect happily
@@ -226,6 +242,12 @@ export async function createPulseMeshHost({
     // the mapper explicitly rather than leaving it to a default that
     // silently does nothing on the network you are testing on.
     const scope = options.scope ?? "public";
+    datastore = hardenDhtDatastore(new MemoryDatastore(), {
+      decodeRecord: value => Libp2pRecord.deserialize(value),
+      prefix: DHT_DATASTORE_PREFIX
+    });
+    const { datastorePrefix: _unsafePrefix, ...kadOptions } = options.kadOptions || {};
+    services.ping = ping();
     services.dht = kadDHT({
       // `clientMode` in the browser: a tab answers no routing queries but
       // can still publish and resolve provider records.
@@ -233,7 +255,11 @@ export async function createPulseMeshHost({
       protocol: options.protocol ?? "/rangefind/pulsemesh/kad/1",
       peerInfoMapper: options.peerInfoMapper
         ?? (scope === "public" ? removePrivateAddressesMapper : passthroughMapper),
-      ...(options.kadOptions || {})
+      ...kadOptions,
+      // Fixed because the datastore guard above keys its policy to this
+      // namespace. Allowing a caller to move it would silently bypass the
+      // security boundary.
+      datastorePrefix: DHT_DATASTORE_PREFIX
     });
   }
 
@@ -245,6 +271,7 @@ export async function createPulseMeshHost({
       ...(announce.length ? { announce } : {})
     },
     ...(privateKey ? { privateKey } : {}),
+    ...(datastore ? { datastore } : {}),
     transports,
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
@@ -278,53 +305,183 @@ function toBytes(chunk) {
 }
 
 /**
- * Reads a length prefix, distinguishing "not all here yet" from a real
- * value. `readVarint` in src/binary.js cannot: given the first byte of a
- * two-byte prefix it returns the low 7 bits as if the number were
- * complete, so 300 (`ac 02`) arriving one byte at a time reads as 44,
- * and a prefix beginning `80` reads as 0 — which frames an empty
- * message and consumes the byte, silently eating the message that
- * followed. A TCP stream may split anywhere, so this has to be exact.
- */
-function tryReadLength(buffer) {
-  let value = 0;
-  let multiplier = 1;
-  for (let pos = 0; pos < buffer.length; pos++) {
-    const byte = buffer[pos];
-    value += (byte & 0x7f) * multiplier;
-    if ((byte & 0x80) === 0) return { length: value, headerBytes: pos + 1 };
-    multiplier *= 0x80;
-    if (multiplier > 2 ** 35) return { malformed: true };
-  }
-  return null; // every byte so far had the continuation bit set
-}
-
-/**
  * Collects framed messages from a byte stream that ignores boundaries.
  * Exported so the fragmentation behaviour can be tested directly: a live
  * socket rarely reproduces the one-byte-at-a-time split that breaks a
- * naive reader, and "rarely" is the worst kind of bug.
+ * naive reader, and "rarely" is the worst kind of bug. The state machine
+ * allocates exactly once per declared frame and copies each payload byte
+ * once; appending fragments by reallocating the accumulated prefix would
+ * turn a one-byte dribble into quadratic work.
  */
-export function frameAssembler(onFrame) {
-  let buffer = new Uint8Array(0);
-  return chunk => {
+export function frameAssembler(onFrame, { maxFrameBytes = MAX_FRAME_BYTES } = {}) {
+  if (!Number.isInteger(maxFrameBytes) || maxFrameBytes < 0 || maxFrameBytes > MAX_FRAME_BYTES) {
+    throw new Error(`PulseMesh frame limit must be between 0 and ${MAX_FRAME_BYTES} bytes.`);
+  }
+  let headerValue = 0;
+  let headerMultiplier = 1;
+  let headerBytes = 0;
+  let frame = null;
+  let frameOffset = 0;
+  const stats = { allocations: 0, copiedBytes: 0 };
+
+  const assemble = chunk => {
     const incoming = toBytes(chunk);
-    const merged = new Uint8Array(buffer.length + incoming.length);
-    merged.set(buffer, 0);
-    merged.set(incoming, buffer.length);
-    buffer = merged;
-    for (;;) {
-      if (!buffer.length) return;
-      const header = tryReadLength(buffer);
-      if (!header) return;            // length prefix still incomplete
-      if (header.malformed) throw new Error("PulseMesh sync frame length is malformed.");
-      if (header.length > MAX_FRAME_BYTES) throw new Error("PulseMesh sync frame too large.");
-      const end = header.headerBytes + header.length;
-      if (end > buffer.length) return; // payload still incomplete
-      onFrame(buffer.subarray(header.headerBytes, end));
-      buffer = buffer.slice(end);
+    let offset = 0;
+    while (offset < incoming.length) {
+      if (frame === null) {
+        const byte = incoming[offset++];
+        headerValue += (byte & 0x7f) * headerMultiplier;
+        headerBytes++;
+        if (headerValue > maxFrameBytes) throw new Error("PulseMesh frame too large.");
+        if ((byte & 0x80) !== 0) {
+          headerMultiplier *= 0x80;
+          if (headerMultiplier > 2 ** 35 || headerBytes >= 6) {
+            throw new Error("PulseMesh frame length is malformed.");
+          }
+          continue;
+        }
+        frame = new Uint8Array(headerValue);
+        stats.allocations++;
+        frameOffset = 0;
+        headerValue = 0;
+        headerMultiplier = 1;
+        headerBytes = 0;
+        if (frame.length === 0) {
+          onFrame(frame);
+          frame = null;
+        }
+        continue;
+      }
+
+      const available = incoming.length - offset;
+      const wanted = frame.length - frameOffset;
+      const take = Math.min(available, wanted);
+      frame.set(incoming.subarray(offset, offset + take), frameOffset);
+      stats.copiedBytes += take;
+      offset += take;
+      frameOffset += take;
+      if (frameOffset === frame.length) {
+        const complete = frame;
+        frame = null;
+        frameOffset = 0;
+        onFrame(complete);
+      }
     }
   };
+  assemble.stats = stats;
+  return assemble;
+}
+
+/**
+ * Bounded memory of peers that have already received our current bond.
+ * A public keeper sees attacker-chosen peer identities, so this cannot be
+ * an unbounded Set. Disconnect removes the common case immediately; TTL
+ * and LRU eviction cover missed events and sustained identity churn.
+ */
+export function createPeerPresentationLedger({
+  maxPeers = MAX_PRESENTED_PEERS,
+  ttlMillis = PRESENTED_PEER_TTL_MS,
+  clock = Date.now
+} = {}) {
+  if (!Number.isInteger(maxPeers) || maxPeers < 1) throw new Error("Peer presentation limit must be positive.");
+  if (!Number.isFinite(ttlMillis) || ttlMillis <= 0) throw new Error("Peer presentation TTL must be positive.");
+  const peers = new Map();
+
+  const prune = (nowMillis = clock()) => {
+    for (const [peer, seenAt] of peers) {
+      if (nowMillis - seenAt < ttlMillis) break;
+      peers.delete(peer);
+    }
+  };
+
+  return {
+    has(peer) {
+      prune();
+      return peers.has(peer);
+    },
+    add(peer) {
+      const nowMillis = clock();
+      prune(nowMillis);
+      peers.delete(peer);
+      peers.set(peer, nowMillis);
+      while (peers.size > maxPeers) peers.delete(peers.keys().next().value);
+    },
+    delete(peer) {
+      return peers.delete(peer);
+    },
+    clear() {
+      peers.clear();
+    },
+    get size() {
+      prune();
+      return peers.size;
+    }
+  };
+}
+
+/**
+ * Guards the vulnerable libp2p-v2 DHT value-record store at its final
+ * write boundary. GHSA-32mq-hpph-xfvr relies on old kad-dht accepting a
+ * record key with no namespace, skipping validators, and storing it. A
+ * current patched kad-dht requires libp2p v3, for which no compatible
+ * GossipSub exists yet; this guard applies the upstream namespace rule
+ * while also bounding valid record size/count.
+ */
+export function hardenDhtDatastore(datastore, {
+  decodeRecord,
+  prefix = DHT_DATASTORE_PREFIX,
+  maxRecords = MAX_DHT_VALUE_RECORDS,
+  maxRecordBytes = MAX_DHT_VALUE_RECORD_BYTES
+} = {}) {
+  if (!datastore || typeof datastore.put !== "function") throw new Error("A DHT datastore is required.");
+  if (typeof decodeRecord !== "function") throw new Error("A DHT record decoder is required.");
+  const recordPath = `${prefix}/record/`;
+  const held = new Map(); // datastore key string -> datastore Key, insertion/LRU order
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+
+  const guardedPut = (key, value, options) => {
+    const path = key.toString();
+    if (path.startsWith(recordPath)) {
+      if (value.byteLength > maxRecordBytes) throw new Error("PulseMesh DHT value record is too large.");
+      const record = decodeRecord(value);
+      let recordKey;
+      try {
+        recordKey = decoder.decode(record.key);
+      } catch {
+        throw new Error("PulseMesh DHT value record key is not UTF-8.");
+      }
+      // PulseMesh installs no custom value namespaces. `/pk/` is the one
+      // built-in namespace and its validator subsequently checks that the
+      // value hashes to the key. Anything else must never reach storage.
+      if (!recordKey.startsWith("/pk/") || recordKey.length <= 4) {
+        throw new Error("PulseMesh DHT value record has no supported namespace.");
+      }
+      held.delete(path);
+      held.set(path, key);
+      while (held.size > maxRecords) {
+        const oldest = held.keys().next().value;
+        const oldKey = held.get(oldest);
+        held.delete(oldest);
+        datastore.delete(oldKey);
+      }
+    }
+    return datastore.put(key, value, options);
+  };
+
+  const guardedDelete = (key, options) => {
+    held.delete(key.toString());
+    return datastore.delete(key, options);
+  };
+
+  return new Proxy(datastore, {
+    get(target, property) {
+      if (property === "put") return guardedPut;
+      if (property === "delete") return guardedDelete;
+      if (property === "pulseMeshDhtRecordCount") return held.size;
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
 }
 
 function framed(payload) {
@@ -427,10 +584,10 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
       // A validator that throws must not turn into a forward.
       return GOSSIP_IGNORE;
     }
-    // Null: another channel's topic (the reserved thread namespace).
-    // Nothing was consumed, so the delivery listener handles it as it
-    // always did — the thread channel is authenticated end to end by its
-    // own key and no bond of ours vouches for it.
+    // Null: no channel registered a validator for this topic. Preserve
+    // compatibility for hosts wiring their own protocol, but the bundled
+    // thread channel installs `onOtherGossip` and therefore never takes
+    // this unjudged path.
     if (action == null) return GOSSIP_ACCEPT;
     stats.gossipJudged++;
     stats.gossipIn += message.data.length;
@@ -458,7 +615,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
   // to every peer we are connected to now or connect to later. Presenting
   // is idempotent per peer — the receiver's registry just extends expiry.
   let ownBondBytes = null;
-  const presentedTo = new Set();
+  const presentedTo = createPeerPresentationLedger();
 
   const presentBond = async peerIdStr => {
     if (!ownBondBytes || presentedTo.has(peerIdStr)) return;
@@ -484,6 +641,10 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
     const peerIdStr = event.detail?.toString?.();
     if (peerIdStr) presentBond(peerIdStr);
   };
+  const onPeerDisconnect = event => {
+    const peerIdStr = event.detail?.toString?.();
+    if (peerIdStr) presentedTo.delete(peerIdStr);
+  };
 
   // One framed PMA1 per stream, no response. The peerId comes from the
   // connection — the single input a sender cannot forge — and is the
@@ -500,7 +661,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
       handled = true;
       stats.bondsReceived++;
       meshNode.registerBond(payload, fromPeer, meshNode.clock());
-    });
+    }, { maxFrameBytes: MAX_BOND_FRAME_BYTES });
     (async () => {
       try {
         for await (const chunk of stream.source) {
@@ -554,7 +715,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
       stats.served++;
       const response = meshNode.onStream(payload, fromPeer, meshNode.clock());
       if (response) responses.push(framed(response));
-    });
+    }, { maxFrameBytes: MAX_FRAME_BYTES });
     stream.sink((async function* () {
       try {
         for await (const chunk of stream.source) {
@@ -579,7 +740,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
    * shape and neither consults a bond — the sync stream's contract is
    * the one that differs, which is why it stays written out above.
    */
-  const streamResponder = (label, seam, count) => ({ stream, connection }) => {
+  const streamResponder = (label, seam, count, maxFrameBytes) => ({ stream, connection }) => {
     const fromPeer = connection.remotePeer.toString();
     const responses = [];
     let answered = false;
@@ -595,7 +756,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
       count();
       const response = meshNode[seam](payload, fromPeer, meshNode.clock());
       if (response) responses.push(framed(response));
-    });
+    }, { maxFrameBytes });
     stream.sink((async function* () {
       try {
         for await (const chunk of stream.source) {
@@ -619,13 +780,17 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
   // bytes it may not be able to open and never consults a bond, and any
   // subscriber answers, which is what makes availability scale with the
   // audience instead of against it.
-  const onThreadStream = streamResponder("thread", "onOtherStream", () => { stats.threadsServed++; });
+  const onThreadStream = streamResponder(
+    "thread", "onOtherStream", () => { stats.threadsServed++; }, MAX_THREAD_FRAME_BYTES
+  );
 
   // Threads §20.7: PMTF in, PMTB out. Sealed proof-of-delivery bytes, on
   // demand, and only from a peer publishing the run — relays never cache
   // these, so this seam answers for one device's own photos or answers
   // "not held".
-  const onPhotoStream = streamResponder("photo", "onPhotoStream", () => { stats.photosServed++; });
+  const onPhotoStream = streamResponder(
+    "photo", "onPhotoStream", () => { stats.photosServed++; }, MAX_PHOTO_FRAME_BYTES
+  );
 
   /**
    * One framed request, one framed response, on whichever protocol the
@@ -655,7 +820,10 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
           if (value) stats.responses++;
           resolve(value);
         };
-        const assemble = frameAssembler(response => finish(response.slice()));
+        const maxFrameBytes = protocol === PHOTO_PROTOCOL
+          ? MAX_PHOTO_FRAME_BYTES
+          : (protocol === THREAD_PROTOCOL ? MAX_THREAD_FRAME_BYTES : MAX_FRAME_BYTES);
+        const assemble = frameAssembler(response => finish(response.slice()), { maxFrameBytes });
         stream.sink((async function* () {
           yield framed(payload);
         })()).catch(() => finish(null));
@@ -675,6 +843,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
 
   host.services.pubsub.addEventListener("gossipsub:message", onGossip);
   host.addEventListener("peer:connect", onPeerConnect);
+  host.addEventListener("peer:disconnect", onPeerDisconnect);
   // Registration is async. Callers that announce readiness (a keeper
   // printing "listening") must await `ready` first, or a peer that dials
   // immediately has its first stream rejected. The rejection is caught
@@ -821,6 +990,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
     async close() {
       host.services.pubsub.removeEventListener("gossipsub:message", onGossip);
       host.removeEventListener("peer:connect", onPeerConnect);
+      host.removeEventListener("peer:disconnect", onPeerDisconnect);
       for (const timer of scheduled) clearTimeout(timer);
       scheduled.clear();
       for (const topic of subscriptions) {
@@ -833,6 +1003,7 @@ export function createLibp2pNetwork(host, { validate = null } = {}) {
       }
       subscriptions.clear();
       verdicts.clear();
+      presentedTo.clear();
       await ready;
       await host.unhandle(SYNC_PROTOCOL).catch(() => {});
       await host.unhandle(BOND_PROTOCOL).catch(() => {});

@@ -140,7 +140,7 @@ test("one link shares a drive, and the follower computes its own arrival", async
   // you read a thread, never write one.
   const forged = new Uint8Array(64);
   await viewerThreads.deliver([...follow.topics][0], forged, now);
-  assert.ok(follow.stats.dropped > 0);
+  assert.ok(viewerThreads.stats.dropped > 0, "malformed framing is dropped before subscriber crypto");
 
   follow.stop();
   driverThreads.close();

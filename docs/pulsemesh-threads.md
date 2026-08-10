@@ -125,7 +125,6 @@ Everything derives from `P` by HKDF-SHA256 (empty salt, label as
 | --- | --- | --- | --- |
 | `K_topic` | `pulsemesh/thread/topic/1` | 32 | topic tag derivation (§4.2) |
 | `K_content` | `pulsemesh/thread/content/1` | 32 | AES-256-GCM content key |
-| `noncePrefix` | `pulsemesh/thread/nonce/1` | 4 | nonce prefix (§5.1) |
 
 So the split is:
 
@@ -240,12 +239,13 @@ The only thread record that touches the network.
 | 3 | tag | bytes(8) | §4.2, current window |
 | 4 | seq | varint | strictly increasing per thread |
 | 5 | ctLen | varint | |
-| 6 | ciphertext | bytes(ctLen) | AES-256-GCM, tag appended |
+| 6 | sealed body | bytes(ctLen) | random nonce, AES-256-GCM ciphertext, tag |
 
-AEAD parameters: key `K_content`; nonce =
-`noncePrefix(4) ‖ uint64be(seq)` (12 bytes — unique by construction, no
-nonce is ever transmitted); AAD = fields 1–4 exactly as encoded, which
-binds the ciphertext to its epoch, tag and sequence number.
+AEAD parameters: key `K_content`; the sealed body is a fresh random
+96-bit nonce followed by the ciphertext and 16-byte authentication tag.
+AAD = fields 1–4 exactly as encoded, which binds the ciphertext to its
+epoch, tag and sequence number. A publisher restart or a new recurring
+service day therefore cannot reuse a nonce even when `seq` starts over.
 
 AES-256-GCM rather than XChaCha20-Poly1305 because it is in WebCrypto
 on every target host, and this project does not take crypto
@@ -551,18 +551,18 @@ signed. The encoder therefore refuses at encode time, with the number of
 stops that would have fitted this particular body.
 
 Subtracting the PMT1 framing — magic 4, epochPrefix8 8, tag 8, `seq`
-varint ≤ 5, `ctLen` varint 2, AEAD tag 16 — leaves **213 bytes** for the
-plaintext body, signature included. Against the widest position varints
+varint ≤ 5, `ctLen` varint 2, random nonce 12, AEAD tag 16 — leaves
+**201 bytes** for the plaintext body, signature included. Against the widest position varints
 a planet-scale leaf index can produce:
 
 | Note | Max plan stops | …on a run that has taken a photo (§20.7.1) |
 | --- | --- | --- |
-| none | 428 | 300 |
-| 32 bytes | 300 | 172 |
-| 64 bytes (the maximum) | 172 | 48 |
+| none | 380 | 252 |
+| 32 bytes | 252 | 127 |
+| 64 bytes (the maximum) | 127 | 0 |
 
-A 200-stop day — the size this feature is scaled for — fits with **57
-bytes** of note left over, or **25** once the run has taken a photo.
+A 200-stop day — the size this feature is scaled for — fits with **45
+bytes** of note left over, or **13** once the run has taken a photo.
 **A full 64-byte note and a 200-stop plan do not both fit**, with or
 without photos, and the encoder says so rather than truncating either.
 That is the honest ceiling of a 256-byte record, and raising it would
@@ -727,8 +727,8 @@ is a ~100 KB transfer.
 | `THREAD_UPDATE_FINE` | 5 s | yes | publish cadence, fine mode |
 | `THREAD_UPDATE_COARSE` | on stop events + 60 s heartbeat | yes | coarse mode |
 | `THREAD_MAX_RECORD_BYTES` | 256 | no | max encoded PMT1 |
-| `THREAD_RECORD_OVERHEAD` | 43 | no | PMT1 framing around the sealed body |
-| `THREAD_MAX_BODY_BYTES` | 213 | no | derived: what a PMTP body may spend, signature included (§5.2.2) |
+| `THREAD_RECORD_OVERHEAD` | 55 | no | PMT1 framing, nonce, and tag around the sealed body |
+| `THREAD_MAX_BODY_BYTES` | 201 | no | derived: what a PMTP body may spend, signature included (§5.2.2) |
 | `THREAD_MAX_AGE` | 120 s | yes | oldest update a subscriber accepts |
 | `THREAD_MAX_FUTURE_SKEW` | 15 s | yes | |
 | `THREAD_STALE` | 90 s | yes | UI must stop claiming "live" past this |
@@ -761,7 +761,8 @@ A subscriber applies these in order, dropping on first failure.
 3. `tag` equals a tag the subscriber derived for the current or an
    adjacent window. (Unknown tags are dropped silently and cheaply —
    this is the entire cost of a hostile flood on the gossip path.)
-4. AEAD opens with `K_content` under nonce `noncePrefix ‖ seq`.
+4. The sealed body's 12-byte nonce is present and AEAD opens with
+   `K_content`.
 5. Inner magic well-formed, no trailing bytes. `"PMTP"` is a run update
    and continues below; `"PMTC"` is a §21 day certificate and takes
    §21.5's path instead. A v1 link refuses a `"PMTC"` outright.
@@ -1222,7 +1223,6 @@ K_topic      = HKDF(P, "pulsemesh/thread/topic/1",   32)
              = 0a3e8b5df4d51e0ce7306d79a309b78c35c21f460ca07cdd5f6cfd7f30453c4b
 K_content    = HKDF(P, "pulsemesh/thread/content/1", 32)
              = 39413c192f15a7068ac77abdf8a96eb9a769db3d226ed9731c7a201e88b8b3d7
-noncePrefix4 = HKDF(P, "pulsemesh/thread/nonce/1",    4) = 576cd8f8
 ```
 
 ### 16.2 Topic tag and rendezvous
@@ -1419,8 +1419,8 @@ behaviour, not where the code merely looks right.
       is the embedding application's obligation — the library never
       writes it anywhere, and a test asserts `P` does not appear in a
       record's bytes.)*
-- [x] Never transmits `K_content` or a nonce; derives every nonce from
-      `noncePrefix ‖ seq`.
+- [x] Never transmits `K_content`; generates and transmits a fresh 96-bit
+      nonce for every sealed record.
 - [x] Carries the capability in a URL fragment, never a query string or
       path.
 - [x] Rejects: bad AEAD tag, missing or invalid signature, non-increasing
@@ -2187,10 +2187,9 @@ prefix regardless, and the largest list a plan can produce is ~7 KB
 against the ~100 KB blob it is the prelude to.
 
 **Sealing.** AES-256-GCM under a per-stop key, with a fresh CSPRNG
-12-byte IV **prepended** to the ciphertext. This deliberately breaks the
-§5.1 convention where the nonce is derived from `seq` and never
-transmitted, and it has to: a photo has no sequence number and is
-addressed by content hash, so there is nothing to derive a nonce from.
+12-byte IV **prepended** to the ciphertext, matching §5.1's record
+convention. A photo has no sequence number and is addressed by content
+hash, so its random nonce is independently generated in the same way.
 There is no AAD for the same reason — the binding a record needs comes
 from the signed accumulator over the commitment, not from the blob's
 framing.

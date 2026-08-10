@@ -82,7 +82,6 @@ test("§16.1 the whole key schedule derives from the capability alone", async ()
   const keys = await deriveThreadKeys(publicKey);
   assert.equal(toHex(keys.topicKey), "0a3e8b5df4d51e0ce7306d79a309b78c35c21f460ca07cdd5f6cfd7f30453c4b");
   assert.equal(toHex(keys.contentKey), "39413c192f15a7068ac77abdf8a96eb9a769db3d226ed9731c7a201e88b8b3d7");
-  assert.equal(toHex(keys.noncePrefix), "576cd8f8");
   await assert.rejects(() => deriveThreadKeys(new Uint8Array(31)), /32-byte/);
 });
 
@@ -157,16 +156,17 @@ test("§16.4 signed preimage and sealed record are byte-identical", async () => 
 
   const aad = threadRecordAad(EPOCH_PREFIX8, tag, 42);
   assert.equal(toHex(aad), "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a");
-  const ciphertext = await sealThreadBody(keys, 42, aad, body);
+  const nonce = fromHex("00112233445566778899aabb");
+  const ciphertext = await sealThreadBody(keys, 42, aad, body, { nonce });
   const record = encodeThreadRecord({ epochPrefix8: EPOCH_PREFIX8, tag, seq: 42, ciphertext });
-  assert.equal(record.bytes.length, 133);
+  assert.equal(record.bytes.length, 145);
   assert.equal(
     toHex(record.bytes),
-    "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a6f7a8da4d85d9063cc5eb7" +
-    "1712716a95268c73bc86a24089e44a7a7d62c928a32cbe9fd21d6a288405cb8f" +
-    "ea6ddf8df6554e6a47f074ca1de7227eae05ceeeeb8fc01365a1e9bab637909e" +
-    "3842d6f1f0e84ea37c031daf6067fc919866eadfaf2e888b8ce54447d1e2bdf7" +
-    "5792b13843"
+    "504d5431f44796c8cc1f3fa7cbfa3ae2fdc2cf0f2a7b00112233445566778899" +
+    "aabbf520c4a6951422138f86b7970c64fe8c6a457dacbccc71caf0c23cb046ec3" +
+    "489a02527129dd036e1fd3272003ede23fabb6ea5fca90adfb83284a19321b7c8" +
+    "032da6a258f21ceaf886694ff479187c981a970f7e92ac8707e916aecaed7d8d" +
+    "96164d83dcba97b7a2f8ab00dcdbfeec"
   );
 
   // Round trip: open, decode, verify.
@@ -206,7 +206,7 @@ test("a tampered record fails to open, and a tampered AAD fails with it", async 
   assert.equal(await openThreadBody(keys, 42, otherSeqAad, ciphertext), null, "AAD seq mismatch fails");
   const otherTagAad = threadRecordAad(EPOCH_PREFIX8, new Uint8Array(8), 42);
   assert.equal(await openThreadBody(keys, 42, otherTagAad, ciphertext), null, "AAD tag mismatch fails");
-  assert.equal(await openThreadBody(keys, 43, aad, ciphertext), null, "a different nonce fails");
+  assert.equal(await openThreadBody(keys, 43, aad, ciphertext), null, "a sequence/AAD mismatch fails");
 
   // A different capability derives different keys and opens nothing.
   const stranger = await deriveThreadKeys((await generateThreadKeypair()).publicKey);
@@ -471,36 +471,36 @@ test("a plan too large to encode is refused, with the number that fits", () => {
   };
   const noted = { ...worst, note: new Uint8Array(64) };
 
-  assert.ok(encodeThreadBodyPreimage({ ...noted, outcomes: new Array(172).fill(1) }).length + 64
-    <= THREAD_MAX_BODY_BYTES, "172 stops fit alongside a full 64-byte note");
+  assert.ok(encodeThreadBodyPreimage({ ...noted, outcomes: new Array(127).fill(1) }).length + 64
+    <= THREAD_MAX_BODY_BYTES, "127 stops fit alongside a full 64-byte note");
   assert.throws(
     () => encodeThreadBodyPreimage({ ...noted, outcomes: new Array(600).fill(1) }),
-    /600 plan stops cost 150 bytes of outcome map and this note costs 64.*at most 172 stops/su
+    /600 plan stops cost 150 bytes of outcome map and this note costs 64.*at most 127 stops/su
   );
 
   // Without a note the same body carries a far longer day.
-  assert.ok(encodeThreadBodyPreimage({ ...worst, outcomes: new Array(428).fill(1) }).length + 64
+  assert.ok(encodeThreadBodyPreimage({ ...worst, outcomes: new Array(380).fill(1) }).length + 64
     <= THREAD_MAX_BODY_BYTES);
   assert.throws(
     () => encodeThreadBodyPreimage({ ...worst, outcomes: new Array(600).fill(1) }),
-    /at most 428 stops/su
+    /at most 380 stops/su
   );
 
   // The realistic case the feature is sized for: a 200-stop day still
-  // leaves 57 bytes of note even at the worst position width.
+  // leaves 45 bytes of note even at the worst position width.
   assert.ok(encodeThreadBodyPreimage({
-    ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(57)
+    ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(45)
   }).length + 64 <= THREAD_MAX_BODY_BYTES);
   assert.throws(
     () => encodeThreadBodyPreimage({
-      ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(58)
+      ...worst, outcomes: new Array(200).fill(1), note: new Uint8Array(46)
     }),
-    /allows 213/su
+    /allows 201/su
   );
 
   // §20.7.1: the photo accumulator is 32 of those bytes, and it comes out
   // of the same budget the single commitment used to. The same 200-stop
-  // day with photos leaves 25 — the number field 19 left, for a field
+  // day with photos leaves 13 — the number field 19 left, for a field
   // that binds every commitment rather than the newest.
   const withPhoto = {
     ...worst,
@@ -508,15 +508,15 @@ test("a plan too large to encode is refused, with the number that fits", () => {
     photoChain: "d3".repeat(32),
     outcomes: new Array(200).fill(1)
   };
-  assert.ok(encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(25) }).length + 64
+  assert.ok(encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(13) }).length + 64
     <= THREAD_MAX_BODY_BYTES);
   assert.throws(
-    () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(26) }),
-    /allows 213/su
+    () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(14) }),
+    /allows 201/su
   );
   assert.throws(
     () => encodeThreadBodyPreimage({ ...withPhoto, note: new Uint8Array(64), outcomes: new Array(600).fill(1) }),
-    /at most 48 stops/su,
+    /at most 0 stops/su,
     "a full note and a photo together leave very little day"
   );
 });

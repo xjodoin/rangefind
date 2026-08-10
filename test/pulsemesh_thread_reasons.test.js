@@ -24,6 +24,7 @@ import {
   THREAD_MARK_FLAG,
   THREAD_MAX_BODY_BYTES,
   THREAD_MAX_RECORD_BYTES,
+  THREAD_RECORD_OVERHEAD,
   THREAD_MAX_REASONS,
   THREAD_MODE,
   decodeThreadBody,
@@ -273,7 +274,7 @@ test("a normal day costs exactly what it costs today", async () => {
 
 test("the cap keeps the newest reasons and the record keeps fitting", async () => {
   // A pathological day: every stop fails. The list is bounded twice —
-  // by THREAD_MAX_REASONS and by whatever is left of the 213-byte body —
+  // by THREAD_MAX_REASONS and by whatever is left of the 201-byte body —
   // and it is *bounded* rather than refused, because refusing to encode
   // mid-day would take the outcome map and the position down with the
   // reason it was protecting.
@@ -315,7 +316,7 @@ test("the cap keeps the newest reasons and the record keeps fitting", async () =
     photoCount: 3,
     note: new Uint8Array(0)
   };
-  assert.equal(fitStopReasons(tight).length, THREAD_MAX_REASONS, "16 fit a 200-stop day with no note");
+  assert.equal(fitStopReasons(tight).length, 14, "14 fit a worst-case 200-stop day with no note");
   const noted = { ...tight, note: new Uint8Array(40) };
   const kept = fitStopReasons(noted);
   assert.ok(kept.length < THREAD_MAX_REASONS && kept.length > 0, `a 40-byte note squeezes it to ${kept.length}`);
@@ -323,7 +324,7 @@ test("the cap keeps the newest reasons and the record keeps fitting", async () =
   assert.ok(encodeThreadBodyPreimage({ ...noted, stopReasons: kept }).length + 64 <= THREAD_MAX_BODY_BYTES);
   // The note wins that fight, and it can, because the list is cumulative:
   // the next record — an ordinary fix with no note — carries them again.
-  assert.equal(fitStopReasons({ ...noted, note: new Uint8Array(0) }).length, THREAD_MAX_REASONS);
+  assert.equal(fitStopReasons({ ...noted, note: new Uint8Array(0) }).length, 14);
 });
 
 test("carried reasons are signed, ordered, and refused when malformed", async () => {
@@ -450,45 +451,46 @@ test("what the outage costs on the wire, in bytes the encoder produces", async (
     return best;
   };
 
-  // Unchanged: a day that carries no reasons pays nothing for them.
-  assert.equal(noteRoom(worst), 57, "the published 200-stop headroom is where it was");
+  // A day that carries no reasons pays nothing for them beyond PMT1's
+  // transmitted nonce.
+  assert.equal(noteRoom(worst), 45, "the published 200-stop headroom includes the nonce");
 
   // §20.7.1: the accumulator costs exactly what the single commitment it
-  // replaced cost. Same 32 bytes, same 25 bytes of headroom left — and
+  // replaced cost. Same 32 bytes, 13 bytes of headroom left — and
   // every commitment of the run bound instead of the newest one.
   const withPhoto = {
     ...worst,
     lastOutcome: { ...worst.lastOutcome, hasPhoto: true },
     photoChain: "d3".repeat(32)
   };
-  assert.equal(noteRoom(withPhoto), 25);
+  assert.equal(noteRoom(withPhoto), 13);
 
   // Each reason is a stop-index varint and one byte, plus one for the
   // count: three failed stops on a 200-stop day cost seven bytes.
   const reasons = n => Array.from({ length: n }, (_, i) => ({ stopIndex: 7 + i, reasonCode: 1 }));
-  assert.equal(noteRoom({ ...worst, stopReasons: reasons(3) }), 57 - 7);
-  assert.equal(noteRoom({ ...worst, stopReasons: reasons(16) }), 57 - 33);
-  assert.equal(noteRoom({ ...withPhoto, stopReasons: reasons(3) }), 57 - 7 - 32);
+  assert.equal(noteRoom({ ...worst, stopReasons: reasons(3) }), 45 - 7);
+  assert.equal(noteRoom({ ...worst, stopReasons: reasons(16) }), 45 - 33);
+  assert.equal(noteRoom({ ...withPhoto, stopReasons: reasons(3) }), 45 - 7 - 32);
   // A 200-stop day with a full 16-entry list at the widest stop indices.
   const wide = Array.from({ length: 16 }, (_, i) => ({ stopIndex: 150 + i, reasonCode: 1 }));
-  assert.equal(noteRoom({ ...worst, stopReasons: wide }), 57 - 49);
+  assert.equal(noteRoom({ ...worst, stopReasons: wide }), -1);
 
   // The chain and a full reason list do **not** both fit a 200-stop day,
-  // and that is the one number this pass moved: 49 + 32 is 81 against 57
+  // and that is the one number this pass moved: 49 + 32 is 81 against 45
   // bytes of headroom. `fitStopReasons` is what makes it a trim rather
-  // than a refusal — it keeps the newest 8 instead of all 16.
+  // than a refusal — it keeps the newest 4 instead of all 16.
   assert.equal(noteRoom({ ...withPhoto, stopReasons: wide }), -1);
-  assert.equal(fitStopReasons({ ...withPhoto, stopReasons: wide }).length, 8);
+  assert.equal(fitStopReasons({ ...withPhoto, stopReasons: wide }).length, 4);
   assert.deepEqual(
     fitStopReasons({ ...withPhoto, stopReasons: wide }).map(entry => entry.stopIndex),
-    wide.slice(8).map(entry => entry.stopIndex),
+    wide.slice(12).map(entry => entry.stopIndex),
     "the newest survive; the oldest were already delivered when they were new"
   );
 
   // And the whole thing still frames into one PMT1.
   const trimmed = { ...withPhoto, stopReasons: fitStopReasons({ ...withPhoto, stopReasons: wide }) };
   assert.ok(
-    encodeThreadBodyPreimage(trimmed).length + 64 + 43 <= THREAD_MAX_RECORD_BYTES,
-    "body plus signature plus the 43 bytes of PMT1 framing"
+    encodeThreadBodyPreimage(trimmed).length + 64 + THREAD_RECORD_OVERHEAD <= THREAD_MAX_RECORD_BYTES,
+    `body plus signature plus the ${THREAD_RECORD_OVERHEAD} bytes of PMT1 framing`
   );
 });

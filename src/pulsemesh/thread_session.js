@@ -35,7 +35,7 @@
 import { fromHex, toHex } from "./sha256.js";
 import { THREAD_MODE, decodeThreadLink, encodeThreadLink, threadLinkUrl } from "./thread_codec.js";
 import { THREAD_CONSTANTS, createThreadPublisher } from "./thread_publish.js";
-import { createThreadSubscriber } from "./thread_consume.js";
+import { THREAD_DROP, createThreadSubscriber } from "./thread_consume.js";
 import { estimateArrival, scheduledArrival } from "./thread_eta.js";
 import {
   applyThreadResponse,
@@ -71,6 +71,7 @@ import {
   publicKeyFromSeed,
   threadTopic
 } from "./thread_crypto.js";
+import { GOSSIP_ACCEPT, GOSSIP_IGNORE, GOSSIP_REJECT } from "./validate.js";
 
 // How many peers a joiner asks for the gap. Measured (benchmarks §9c):
 // 3 peers recover 95% of a two-minute hole, 8 recover 100% — the bound
@@ -190,33 +191,63 @@ export function createThreadChannel({
     return listening;
   }
 
-  async function deliver(topicName, payload, nowMillis = clock()) {
+  async function deliver(topicName, payload, nowMillis = clock(), fromPeer = null) {
     stats.delivered++;
     const listening = followsOn(topicName);
+    let record;
+    try {
+      record = payload instanceof Uint8Array ? decodeThreadRecord(payload) : payload;
+    } catch {
+      stats.dropped++;
+      return GOSSIP_IGNORE;
+    }
+    // A valid record on the wrong reserved topic is still not ours to
+    // vouch for. Bind the envelope to the topic before any AEAD work.
+    const parts = String(topicName).split("/");
+    if (
+      parts.length !== 7
+      || parts[1] !== "rangefind"
+      || parts[2] !== "pulsemesh"
+      || parts[3] !== "1"
+      || parts[4] !== "t"
+      || parts[5] !== toHex(record.epochPrefix8)
+      || parts[6] !== toHex(record.tag)
+    ) {
+      stats.dropped++;
+      return GOSSIP_IGNORE;
+    }
     // Cache before validating: a relay holds bytes it cannot open, and
     // whether *we* can read a record has nothing to do with whether the
     // next joiner needs it. Records for our own threads are `openable`
     // and exempt from the relay budget — dropping your own thread to
     // make room for someone else's is never right.
-    if (relay || listening.length) {
-      try {
-        const admitted = cache.admit(payload, {
-          fromPeer: listening.length ? null : id,
-          openable: listening.length > 0,
-          nowMillis
-        });
-        if (admitted.admitted) stats.cached++;
-      } catch {
-        // Garbage addressed to an invented tag. The caps exist for
-        // exactly this, and a decode failure is one of them working.
+    try {
+      const admitted = cache.admit(record, {
+        fromPeer,
+        openable: listening.length > 0,
+        // A follower can authenticate before retaining. A blind relay
+        // cannot, so its bounded cache is necessarily best-effort.
+        retain: relay && listening.length === 0,
+        nowMillis
+      });
+      if (!admitted.admitted) {
+        stats.dropped++;
+        return GOSSIP_IGNORE;
       }
+      if (admitted.retained) stats.cached++;
+    } catch {
+      // Garbage addressed to an invented tag. The caps exist for
+      // exactly this, and a decode failure is one of them working.
+      stats.dropped++;
+      return GOSSIP_IGNORE;
     }
     // A record is offered to every follow listening on that topic. Tags
     // are key-derived, so at most one can decrypt it; the rest reject at
     // step 3 for the cost of a byte comparison, which is the whole cost
     // of a flood from someone without the capability.
+    let action = GOSSIP_ACCEPT;
     for (const follow of listening) {
-      const verdict = await follow.subscriber.accept(payload, { nowMillis });
+      const verdict = await follow.subscriber.accept(record, { nowMillis });
       if (verdict.ok) {
         stats.accepted++;
         // A §21 certificate carries no update of its own, but accepting
@@ -227,8 +258,20 @@ export function createThreadChannel({
         for (const released of verdict.released || []) follow.onUpdate?.(released);
       } else {
         stats.dropped++;
+        if (verdict.code === THREAD_DROP.BAD_SIGNATURE) action = GOSSIP_REJECT;
+        else if (verdict.code !== THREAD_DROP.AWAITING_CERTIFICATE && action !== GOSSIP_REJECT) {
+          action = GOSSIP_IGNORE;
+        }
       }
     }
+    if (action === GOSSIP_ACCEPT && listening.length) {
+      // Store only after AEAD/shape/signature validation (or the explicit
+      // awaiting-certificate state) so a link holder cannot evict useful
+      // catch-up history with authenticated-address garbage.
+      const retained = cache.admit(record, { openable: true, nowMillis });
+      if (retained.retained) stats.cached++;
+    }
+    return action;
   }
 
   /**
@@ -439,11 +482,17 @@ export function createThreadChannel({
     const previous = node.onOtherTopic;
     node.onOtherTopic = (topicName, payload, fromPeer, nowMillis) => {
       previous?.(topicName, payload, fromPeer, nowMillis);
-      deliver(topicName, payload, nowMillis).catch(() => {
+      deliver(topicName, payload, nowMillis, fromPeer).catch(() => {
         // A record that throws on the way in is a dropped record, never
         // a dead channel.
       });
     };
+    // libp2p calls this from its GossipSub topic validator. Delivery and
+    // cryptographic verification happen here, before forwarding; the
+    // transport's validate-once cache then suppresses the ordinary
+    // delivery callback for the same bytes.
+    node.onOtherGossip = (topicName, payload, fromPeer, nowMillis) =>
+      deliver(topicName, payload, nowMillis, fromPeer);
   }
 
   /**
@@ -1025,6 +1074,7 @@ export function createThreadChannel({
     runs.clear();
     if (node) {
       node.onOtherTopic = null;
+      node.onOtherGossip = null;
       node.onOtherStream = null;
       node.onPhotoStream = null;
     }

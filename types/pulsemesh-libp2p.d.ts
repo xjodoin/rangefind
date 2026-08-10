@@ -21,6 +21,38 @@ export declare function createPulseMeshHost(options?: {
   dht?: boolean | Record<string, unknown>;
 }): Promise<Libp2pLike>;
 
+/** Incrementally assembles length-prefixed frames with one allocation per frame. */
+export declare function frameAssembler(
+  onFrame: (payload: Uint8Array) => void,
+  options?: { maxFrameBytes?: number }
+): ((chunk: Uint8Array | { subarray(): Uint8Array }) => void) & {
+  stats: { allocations: number; copiedBytes: number };
+};
+
+/** Bounded memory of peers that received the current admission bond. */
+export declare function createPeerPresentationLedger(options?: {
+  maxPeers?: number;
+  ttlMillis?: number;
+  clock?: () => number;
+}): {
+  has(peer: string): boolean;
+  add(peer: string): void;
+  delete(peer: string): boolean;
+  clear(): void;
+  readonly size: number;
+};
+
+/** Applies PulseMesh's namespace, size, and count policy to DHT value writes. */
+export declare function hardenDhtDatastore<T extends object>(
+  datastore: T,
+  options: {
+    decodeRecord(value: Uint8Array): { key: Uint8Array };
+    prefix?: string;
+    maxRecords?: number;
+    maxRecordBytes?: number;
+  }
+): T & { readonly pulseMeshDhtRecordCount: number };
+
 /**
  * Wraps a libp2p host as a MeshNetwork for exactly one MeshNode:
  * GossipSub topics for gossip, one framed request/response per stream on

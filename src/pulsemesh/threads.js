@@ -98,7 +98,6 @@ export {
   sealThreadBody,
   setThreadCryptoImplementation,
   signThread,
-  threadNonce,
   threadRendezvous,
   threadTag,
   threadTagsForWindows,

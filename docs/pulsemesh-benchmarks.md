@@ -517,7 +517,7 @@ WebCrypto path, so the same numbers apply in a browser.
 
 | Operation | Result |
 | --- | --- |
-| PMT1 record (fine mode, no run plan) | **133 bytes** |
+| PMT1 record (fine mode, no run plan) | **145 bytes** |
 | PMTP body | 95 bytes (31-byte preimage + 64-byte signature) |
 | Cumulative outcome map, per record | +16 B at 50 stops, +55 B at 200 |
 | The link — the entire capability | **45 bytes** |
