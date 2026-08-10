@@ -5,8 +5,13 @@
 // considered. No routing server or whole-continent graph is required.
 
 import { openRouteGraphUrl } from "./route_graph_query.js";
+import {
+  ROUTE_PORTAL_FORMAT,
+  decodeRoutePortalIds,
+  decodeRoutePortalRecords
+} from "./route_portals.js";
 
-const PORTAL_FORMAT = "rfrouteportals-v1";
+const LEGACY_PORTAL_FORMAT = "rfrouteportals-v1";
 const CATALOG_FORMAT = "rangefind-route-catalog-v1";
 const EARTH_METERS = 6371008.8;
 
@@ -55,20 +60,39 @@ function portalTriples(values) {
   return portals;
 }
 
-function intersectPortals(left, right) {
-  const a = portalTriples(left);
-  const b = portalTriples(right);
-  const small = a.length <= b.length ? a : b;
-  const large = a.length <= b.length ? b : a;
-  const byId = new Map(small.map(portal => [portal.id, portal]));
+function resolveIndexBase(catalogUrl, base) {
+  const value = String(base || "./");
+  const catalogBase = new URL(".", catalogUrl);
+  // Production catalogs are stored at routes/catalog.json but their entries
+  // are dataset-root-relative (routes/car/quebec/). Preserve that contract
+  // without breaking catalogs whose entries are catalog-relative
+  // (car/quebec/) or absolute.
+  if (value.startsWith("routes/") && /\/routes\/$/u.test(catalogBase.pathname)) {
+    return new URL(value, new URL("../", catalogBase)).href;
+  }
+  return new URL(value, catalogBase).href;
+}
+
+function intersectPortalRecords(records, ids) {
   const shared = [];
-  for (const portal of large) {
-    const peer = byId.get(portal.id);
-    if (!peer) continue;
-    // Shared ids should have byte-identical coordinates. Keep a small guard
-    // for sources independently rounded to E7, but reject corrupted matches.
-    if (haversine(peer, portal) > 3) continue;
-    shared.push({ id: portal.id, lat: (portal.lat + peer.lat) / 2, lon: (portal.lon + peer.lon) / 2 });
+  let left = 0;
+  let right = 0;
+  while (left < records.ids.length && right < ids.length) {
+    const recordId = records.ids[left];
+    const candidateId = ids[right];
+    if (recordId < candidateId) {
+      left++;
+    } else if (candidateId < recordId) {
+      right++;
+    } else {
+      shared.push({
+        id: recordId,
+        lat: records.latE7[left] / 1e7,
+        lon: records.lonE7[left] / 1e7
+      });
+      left++;
+      right++;
+    }
   }
   return shared;
 }
@@ -140,7 +164,16 @@ function mergeLegs(legs, regionPath, transitions) {
   let seconds = 0;
   let distanceMeters = 0;
   let settledNodes = 0;
-  const stats = { objectFetches: 0, bytesFetched: 0, cellFetches: 0, overlayFetches: 0, unpackCellFetches: 0, httpRequests: 0 };
+  const stats = {
+    objectFetches: 0,
+    bytesFetched: 0,
+    rangeBytesFetched: 0,
+    rangeOverfetchBytes: 0,
+    cellFetches: 0,
+    overlayFetches: 0,
+    unpackCellFetches: 0,
+    httpRequests: 0
+  };
   for (let index = 0; index < legs.length; index++) {
     const leg = legs[index];
     const region = regionPath[index];
@@ -189,47 +222,113 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
   const catalog = await response.json();
   if (catalog.format !== CATALOG_FORMAT) throw new Error(`Unsupported route catalog format: ${catalog.format}.`);
   const profile = options.profile || "car";
-  const catalogBase = new URL(".", catalogUrl).href;
   const indexes = new Map(catalog.indexes.filter(index => index.profile === profile).map(index => [index.region, index]));
   if (!indexes.size) throw routeError("RANGEFIND_ROUTE_NO_PROFILE", `Route catalog has no ${profile} indexes.`);
   const graphCache = new Map();
-  const portalCache = new Map();
+  const legacyPortalCache = new Map();
+  const portalBlockCache = new Map();
+  const portalStats = { requests: 0, bytes: 0 };
   const inflate = options.inflate || (async bytes => {
     if (typeof DecompressionStream === "undefined") throw new Error("Gzip route portals require DecompressionStream or options.inflate.");
     const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
     return new Uint8Array(await new Response(stream).arrayBuffer());
   });
-  const openGraph = options.openGraph || ((index, base) => openRouteGraphUrl(base, options.graphOptions || {}));
+  const graphOptions = { ...(options.graphOptions || {}) };
+  if (!graphOptions.fetch) graphOptions.fetch = fetcher;
+  const openGraph = options.openGraph || ((index, base) => openRouteGraphUrl(base, graphOptions));
+  const portalMeta = region => {
+    const index = indexes.get(region);
+    return index?.portals || index?.manifest?.portals || null;
+  };
+  const portalBase = region => resolveIndexBase(catalogUrl, indexes.get(region)?.base);
   const graphFor = region => {
     let promise = graphCache.get(region);
     if (!promise) {
       const index = indexes.get(region);
-      const base = new URL(index.base, catalogBase).href;
+      const base = resolveIndexBase(catalogUrl, index.base);
       promise = Promise.resolve(openGraph(index, base));
       graphCache.set(region, promise);
       promise.catch(() => graphCache.delete(region));
     }
     return promise;
   };
-  const portalsFor = region => {
-    let promise = portalCache.get(region);
+  const legacyPortalsFor = region => {
+    let promise = legacyPortalCache.get(region);
     if (!promise) {
-      const index = indexes.get(region);
-      const file = index.portals || index.manifest?.portals;
-      if (!file) return Promise.resolve({ format: PORTAL_FORMAT, neighbors: {} });
-      const url = new URL(file, new URL(index.base, catalogBase)).href;
+      const file = portalMeta(region);
+      if (!file || typeof file !== "string") return Promise.resolve({ format: LEGACY_PORTAL_FORMAT, neighbors: {} });
+      const url = new URL(file, portalBase(region)).href;
       promise = fetcher(url, { cache: "force-cache" }).then(async result => {
         if (!result.ok) throw new Error(`Route portals HTTP ${result.status}: ${url}`);
-        const sidecar = url.endsWith(".gz")
-          ? JSON.parse(new TextDecoder().decode(await inflate(new Uint8Array(await result.arrayBuffer()))))
-          : await result.json();
-        if (sidecar.format !== PORTAL_FORMAT) throw new Error(`Unsupported route portal format: ${sidecar.format}.`);
+        portalStats.requests++;
+        let sidecar;
+        if (url.endsWith(".gz")) {
+          const downloaded = new Uint8Array(await result.arrayBuffer());
+          portalStats.bytes += downloaded.length;
+          sidecar = JSON.parse(new TextDecoder().decode(await inflate(downloaded)));
+        } else {
+          sidecar = await result.json();
+        }
+        if (sidecar.format !== LEGACY_PORTAL_FORMAT) throw new Error(`Unsupported route portal format: ${sidecar.format}.`);
         return sidecar;
       });
-      portalCache.set(region, promise);
-      promise.catch(() => portalCache.delete(region));
+      legacyPortalCache.set(region, promise);
+      promise.catch(() => legacyPortalCache.delete(region));
     }
     return promise;
+  };
+  const verifyPortalBlock = async (bytes, checksum, label) => {
+    if (!checksum || options.verifyPortalChecksums === false || !globalThis.crypto?.subtle) return;
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    const actual = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    if (actual !== checksum) throw new Error(`Route portal checksum mismatch for ${label}.`);
+  };
+  const loadPortalBlock = (region, neighbor, kind) => {
+    const descriptor = portalMeta(region);
+    const pointer = descriptor?.neighbors?.[neighbor]?.[kind];
+    if (descriptor?.format !== ROUTE_PORTAL_FORMAT || !pointer) return Promise.resolve(null);
+    const url = new URL(descriptor.file, portalBase(region)).href;
+    const key = `${url}:${pointer.offset}:${pointer.length}`;
+    let promise = portalBlockCache.get(key);
+    if (!promise) {
+      promise = fetcher(url, {
+        cache: "force-cache",
+        headers: { Range: `bytes=${pointer.offset}-${pointer.offset + pointer.length - 1}` }
+      }).then(async result => {
+        if (result.status !== 200 && result.status !== 206) {
+          throw new Error(`Route portals HTTP ${result.status}: ${url}`);
+        }
+        const downloaded = new Uint8Array(await result.arrayBuffer());
+        portalStats.requests++;
+        portalStats.bytes += downloaded.length;
+        const compressed = result.status === 206
+          ? downloaded
+          : downloaded.subarray(pointer.offset, pointer.offset + pointer.length);
+        if (compressed.length !== pointer.length) {
+          throw new Error(`Route portal range returned ${compressed.length} of ${pointer.length} bytes.`);
+        }
+        await verifyPortalBlock(compressed, pointer.checksum, `${region}/${neighbor}/${kind}`);
+        const decoded = await inflate(compressed);
+        return kind === "ids" ? decodeRoutePortalIds(decoded) : decodeRoutePortalRecords(decoded);
+      });
+      portalBlockCache.set(key, promise);
+      promise.catch(() => portalBlockCache.delete(key));
+    }
+    return promise;
+  };
+  const portalObjects = async (region, neighbor) => {
+    const descriptor = portalMeta(region);
+    if (descriptor?.format === ROUTE_PORTAL_FORMAT) {
+      const records = await loadPortalBlock(region, neighbor, "records");
+      if (!records) return [];
+      return Array.from(records.ids, (id, index) => ({
+        id,
+        lat: records.latE7[index] / 1e7,
+        lon: records.lonE7[index] / 1e7
+      }));
+    }
+    const legacy = await legacyPortalsFor(region);
+    return portalTriples(legacy.neighbors?.[neighbor]);
   };
   const candidateRegions = point => {
     const candidates = [...indexes.values()].filter(index => contains(index.bbox, point));
@@ -256,8 +355,30 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
     return Number.isFinite(measured[0].meters) ? measured[0].region : candidates[0];
   };
   const sharedPortals = async (left, right, from, to) => {
-    const [a, b] = await Promise.all([portalsFor(left), portalsFor(right)]);
-    const shared = intersectPortals(a.neighbors?.[right], b.neighbors?.[left]);
+    const leftMeta = portalMeta(left);
+    const rightMeta = portalMeta(right);
+    let shared;
+    if (leftMeta?.format === ROUTE_PORTAL_FORMAT && rightMeta?.format === ROUTE_PORTAL_FORMAT) {
+      const leftEntry = leftMeta.neighbors?.[right];
+      const rightEntry = rightMeta.neighbors?.[left];
+      if (!leftEntry || !rightEntry) return [];
+      const recordsOnLeft = leftEntry.count <= rightEntry.count;
+      const [records, ids] = await Promise.all([
+        loadPortalBlock(recordsOnLeft ? left : right, recordsOnLeft ? right : left, "records"),
+        loadPortalBlock(recordsOnLeft ? right : left, recordsOnLeft ? left : right, "ids")
+      ]);
+      shared = records && ids ? intersectPortalRecords(records, ids) : [];
+    } else {
+      const [a, b] = await Promise.all([portalObjects(left, right), portalObjects(right, left)]);
+      const small = a.length <= b.length ? a : b;
+      const large = a.length <= b.length ? b : a;
+      const byId = new Map(small.map(portal => [portal.id, portal]));
+      shared = [];
+      for (const portal of large) {
+        const peer = byId.get(portal.id);
+        if (peer && haversine(peer, portal) <= 3) shared.push(peer);
+      }
+    }
     return selectPortals(shared, from, to, Math.max(1, Math.floor(options.maxPortalsPerBorder ?? 8)));
   };
   const safeRoute = async (region, from, to, params, geometry) => {
@@ -324,6 +445,7 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
   }
 
   async function route(params) {
+    const portalBefore = { requests: portalStats.requests, bytes: portalStats.bytes };
     const from = coordinates(params.from);
     const to = coordinates(params.to);
     // Prefer one graph whenever it genuinely covers and can snap both ends.
@@ -374,6 +496,10 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
       fromRegion: winner.regionPath[index],
       toRegion: winner.regionPath[index + 1]
     })));
+    merged.stats.portalRequests = portalStats.requests - portalBefore.requests;
+    merged.stats.portalBytesFetched = portalStats.bytes - portalBefore.bytes;
+    merged.stats.httpRequests += merged.stats.portalRequests;
+    merged.stats.bytesFetched += merged.stats.portalBytesFetched;
     if (params.geometry === false) {
       delete merged.geometry;
       delete merged.steps;
@@ -389,7 +515,20 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
     const seconds = Array.from({ length: points.length }, () => new Float64Array(points.length).fill(Infinity));
     for (let index = 0; index < points.length; index++) seconds[index][index] = 0;
     const pairs = [];
-    const stats = { objectFetches: 0, bytesFetched: 0, cellFetches: 0, overlayFetches: 0, unpackCellFetches: 0, httpRequests: 0, shardsTouched: [], regionsTouched: [] };
+    const stats = {
+      objectFetches: 0,
+      bytesFetched: 0,
+      rangeBytesFetched: 0,
+      rangeOverfetchBytes: 0,
+      cellFetches: 0,
+      overlayFetches: 0,
+      unpackCellFetches: 0,
+      httpRequests: 0,
+      portalRequests: 0,
+      portalBytesFetched: 0,
+      shardsTouched: [],
+      regionsTouched: []
+    };
     const shards = new Set();
     const regions = new Set();
     for (let from = 0; from < points.length; from++) for (let to = 0; to < points.length; to++) {
@@ -398,7 +537,11 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
     await mapLimit(pairs, options.portalConcurrency || 8, async pair => {
       const result = await route({ ...params, from: points[pair.from], to: points[pair.to], geometry: false });
       seconds[pair.from][pair.to] = result.seconds;
-      for (const key of ["objectFetches", "bytesFetched", "cellFetches", "overlayFetches", "unpackCellFetches", "httpRequests"]) {
+      for (const key of [
+        "objectFetches", "bytesFetched", "rangeBytesFetched", "rangeOverfetchBytes",
+        "cellFetches", "overlayFetches", "unpackCellFetches", "httpRequests",
+        "portalRequests", "portalBytesFetched"
+      ]) {
         stats[key] += Number(result.stats?.[key] || 0);
       }
       for (const shard of result.stats?.shardsTouched || []) shards.add(shard);
@@ -417,7 +560,8 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
     regionFor: point => regionFor(coordinates(point)),
     clearCaches() {
       graphCache.clear();
-      portalCache.clear();
+      legacyPortalCache.clear();
+      portalBlockCache.clear();
     }
   };
 }

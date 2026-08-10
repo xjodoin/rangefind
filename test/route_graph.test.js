@@ -14,6 +14,7 @@ import {
 } from "../src/route_graph.js";
 import { IntegerRadixHeap, buildRouteGraph } from "../src/route_graph_build.js";
 import { openRouteGraphDir } from "../src/route_graph_node.js";
+import { decodeRoutePortalIds, decodeRoutePortalRecords } from "../src/route_portals.js";
 
 // Deterministic LCG so the synthetic graph is stable across runs.
 function lcg(seed) {
@@ -227,11 +228,19 @@ test("route builds publish immutable compact federation portal sidecars", (t) =>
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   buildRouteGraph(graph, dir, { leafNodes: 16, fanout: 4, topMaxCells: 4 });
   const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
-  assert.match(manifest.portals, /^portals\.[a-f0-9]{24}\.json\.gz$/u);
+  assert.equal(manifest.portals.format, "rfrouteportals-v2");
+  assert.match(manifest.portals.file, /^portals\.[a-f0-9]{24}\.bin$/u);
   assert.equal(manifest.portalCandidates, 1);
-  const portals = JSON.parse(gunzipSync(readFileSync(join(dir, manifest.portals))).toString("utf8"));
-  assert.equal(portals.format, "rfrouteportals-v1");
-  assert.deepEqual(portals.neighbors, graph.portals);
+  const pack = readFileSync(join(dir, manifest.portals.file));
+  const entry = manifest.portals.neighbors.neighbor;
+  const ids = decodeRoutePortalIds(gunzipSync(pack.subarray(entry.ids.offset, entry.ids.offset + entry.ids.length)));
+  const records = decodeRoutePortalRecords(gunzipSync(pack.subarray(entry.records.offset, entry.records.offset + entry.records.length)));
+  assert.deepEqual([...ids], [123]);
+  assert.deepEqual([...records.ids], [123]);
+  assert.deepEqual([...records.latE7], [graph.nodeLat[0]]);
+  assert.deepEqual([...records.lonE7], [graph.nodeLon[0]]);
+  assert.equal(entry.ids.checksum.length, 64);
+  assert.equal(entry.records.checksum.length, 64);
 });
 
 test("federation portal extraction keeps only valid neighboring OSM junction ids", async () => {
@@ -987,6 +996,55 @@ test("http adapter routes identically over Range requests", async (t) => {
     assert.deepEqual(remoteResult.geometry, localResult.geometry, `pair ${i} geometry http vs file`);
   }
   assert.ok(remote.io.counters.requests > 0, "http adapter actually fetched");
+});
+
+test("dedicated geometry packs and adaptive ranges collapse long-route fetches", async (t) => {
+  const { openRouteGraph } = await import("../src/route_graph_query.js");
+  const graph = syntheticGraph(64, 40, 91);
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-route-range-plan-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 16, fanout: 4, topMaxCells: 4, packBytes: 4 * 1024 * 1024 });
+  const makeIo = () => {
+    const counters = { requests: 0, bytes: 0 };
+    return {
+      counters,
+      async readFile(path) { return new Uint8Array(readFileSync(join(dir, path))); },
+      async readRange(path, offset, length) {
+        counters.requests++;
+        counters.bytes += length;
+        return new Uint8Array(readFileSync(join(dir, path)).subarray(offset, offset + length));
+      }
+    };
+  };
+  const exactIo = makeIo();
+  const batchedIo = makeIo();
+  const [exact, batched] = await Promise.all([
+    openRouteGraph({
+      io: exactIo,
+      rangeMergeGapBytes: 0,
+      rangeMaxMergedBytes: 1,
+      rangeMaxOverfetchBytes: 0,
+      rangeMaxOverfetchRatio: 1
+    }),
+    openRouteGraph({ io: batchedIo })
+  ]);
+  const from = { lat: graph.nodeLat[0] / 1e7, lon: graph.nodeLon[0] / 1e7 };
+  const last = graph.nodeLat.length - 1;
+  const to = { lat: graph.nodeLat[last] / 1e7, lon: graph.nodeLon[last] / 1e7 };
+  const [exactResult, batchedResult] = await Promise.all([
+    exact.route({ from, to }),
+    batched.route({ from, to })
+  ]);
+  assert.equal(batchedResult.seconds, exactResult.seconds);
+  assert.deepEqual(batchedResult.geometry, exactResult.geometry);
+  assert.ok(
+    batchedIo.counters.requests <= exactIo.counters.requests * 0.5,
+    `expected at least 2x fewer ranges (${exactIo.counters.requests} -> ${batchedIo.counters.requests})`
+  );
+  assert.ok(
+    batchedIo.counters.bytes <= exactIo.counters.bytes * 2.5,
+    `adaptive overfetch stayed bounded (${exactIo.counters.bytes} -> ${batchedIo.counters.bytes})`
+  );
 });
 
 test("one-to-many matrix equals pairwise routes", async (t) => {

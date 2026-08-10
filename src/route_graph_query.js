@@ -225,6 +225,8 @@ export async function openRouteGraph(options) {
   const stats = {
     objectFetches: 0,
     bytesFetched: 0,
+    rangeBytesFetched: 0,
+    rangeOverfetchBytes: 0,
     cellFetches: 0,
     overlayFetches: 0,
     unpackCellFetches: 0,
@@ -233,11 +235,16 @@ export async function openRouteGraph(options) {
   };
 
   // Same-file reads issued within one microtask window coalesce into merged
-  // Range requests when the gap between them is small — snap topology +
-  // geometry pairs are byte-adjacent by construction, and each fetch wave
-  // issues all its reads synchronously, so this collapses request counts
-  // without changing any call site.
-  const COALESCE_GAP_BYTES = 16 * 1024;
+  // Merge nearby reads from the same immutable pack. Topology and geometry
+  // live in separate spatially ordered packs, and each fetch wave issues its
+  // reads synchronously, so this collapses request counts without changing
+  // any call site or downloading an unbounded gap.
+  const rangePlan = {
+    mergeGapBytes: Math.max(0, Number(options.rangeMergeGapBytes ?? 256 * 1024)),
+    maxMergedBytes: Math.max(1, Number(options.rangeMaxMergedBytes ?? 4 * 1024 * 1024)),
+    maxOverfetchBytes: Math.max(0, Number(options.rangeMaxOverfetchBytes ?? 1024 * 1024)),
+    maxOverfetchRatio: Math.max(1, Number(options.rangeMaxOverfetchRatio ?? 2.5))
+  };
   const pendingReads = new Map();
   let flushScheduled = false;
   function coalescedRead(path, offset, length) {
@@ -260,16 +267,29 @@ export async function openRouteGraph(options) {
       let group = null;
       const groups = [];
       for (const item of items) {
-        if (group && item.offset <= group.end + COALESCE_GAP_BYTES) {
-          group.end = Math.max(group.end, item.offset + item.length);
+        const nextEnd = Math.max(group?.end || 0, item.offset + item.length);
+        const nextExactBytes = (group?.exactBytes || 0) + item.length;
+        const nextMergedBytes = group ? nextEnd - group.start : item.length;
+        const nextOverfetchBytes = nextMergedBytes - nextExactBytes;
+        if (
+          group
+          && item.offset <= group.end + rangePlan.mergeGapBytes
+          && nextMergedBytes <= rangePlan.maxMergedBytes
+          && nextOverfetchBytes <= rangePlan.maxOverfetchBytes
+          && nextMergedBytes <= nextExactBytes * rangePlan.maxOverfetchRatio
+        ) {
+          group.end = nextEnd;
+          group.exactBytes = nextExactBytes;
           group.items.push(item);
         } else {
-          group = { start: item.offset, end: item.offset + item.length, items: [item] };
+          group = { start: item.offset, end: item.offset + item.length, exactBytes: item.length, items: [item] };
           groups.push(group);
         }
       }
       for (const merged of groups) {
         stats.httpRequests++;
+        stats.rangeBytesFetched += merged.end - merged.start;
+        stats.rangeOverfetchBytes += merged.end - merged.start - merged.exactBytes;
         io.readRange(path, merged.start, merged.end - merged.start).then(bytes => {
           for (const item of merged.items) {
             item.resolve(bytes.subarray(item.offset - merged.start, item.offset - merged.start + item.length));
@@ -2308,6 +2328,8 @@ export async function openRouteGraph(options) {
     return {
       objectFetches: stats.objectFetches,
       bytesFetched: stats.bytesFetched,
+      rangeBytesFetched: stats.rangeBytesFetched,
+      rangeOverfetchBytes: stats.rangeOverfetchBytes,
       cellFetches: stats.cellFetches,
       overlayFetches: stats.overlayFetches,
       unpackCellFetches: stats.unpackCellFetches,
@@ -2319,10 +2341,14 @@ export async function openRouteGraph(options) {
   function resetStats() {
     stats.objectFetches = 0;
     stats.bytesFetched = 0;
+    stats.rangeBytesFetched = 0;
+    stats.rangeOverfetchBytes = 0;
     stats.cellFetches = 0;
     stats.overlayFetches = 0;
     stats.unpackCellFetches = 0;
+    stats.httpRequests = 0;
     stats.shardsTouched.clear();
+    io.resetCounters?.();
   }
 
   function clearCaches() {

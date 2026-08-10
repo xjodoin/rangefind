@@ -136,11 +136,14 @@ const route = await roads.route({
 ```
 
 Every regional build publishes an immutable, content-addressed
-`rfrouteportals-v1` gzip sidecar. It contains only junctions inside candidate
-neighbor coverage. A transition is legal only when both independently built
-sidecars contain the same original OSM node id at the same coordinate; nearby
-roads are never joined by proximity. Coverage bboxes find candidates, not
-connections. This uses Geofabrik's documented extract invariant that Osmium
+`rfrouteportals-v2` binary range pack. Its manifest has independent compressed
+`ids` and `records` byte ranges for each candidate neighbor. A query fetches
+the smaller side's coordinate-bearing records plus the larger side's compact
+id-only membership block; unrelated borders are never downloaded. A
+transition is legal only when both independently built ranges contain the same
+original OSM node id at the same coordinate; nearby roads are never joined by
+proximity. Coverage bboxes find candidates, not connections. This uses
+Geofabrik's documented extract invariant that Osmium
 keeps ways crossing an extract border complete
 ([technical details](https://download.geofabrik.de/technical.html)).
 
@@ -148,13 +151,14 @@ For a cross-region query the client:
 
 1. resolves endpoint regions (ambiguous overlapping bboxes are verified by a
    real road snap);
-2. enumerates a bounded number of catalog paths and intersects only the portal
-   sidecars on those paths;
+2. enumerates a bounded number of catalog paths and intersects only the two
+   per-neighbor portal ranges needed by each path edge;
 3. keeps a spatially diverse portal set per boundary (eight by default);
 4. evaluates portal combinations with the actual regional road metric, not
    straight-line distance;
 5. opens regional roots lazily, reuses their object caches, and unpacks geometry
-   only for the winning legs;
+   only for the winning legs; geometry has its own spatially ordered packs so
+   adjacent cells merge into bounded Range requests;
 6. merges geometry, steps, junctions, statistics, and region-qualified segment
    ids into one normal route result.
 

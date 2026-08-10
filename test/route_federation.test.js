@@ -1,12 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { openRouteCatalogUrl } from "../src/route_federation.js";
+import { encodeRoutePortalIds, encodeRoutePortalRecords } from "../src/route_portals.js";
 
 const catalogUrl = "https://routes.test/routes/catalog.json";
 const point = (lat, lon) => ({ lat, lon });
 
 function jsonResponse(value) {
   return { ok: true, status: 200, async json() { return value; } };
+}
+
+function rangeResponse(bytes) {
+  return {
+    ok: true,
+    status: 206,
+    async arrayBuffer() { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength); }
+  };
+}
+
+function portalPack(values) {
+  const ids = encodeRoutePortalIds(values);
+  const records = encodeRoutePortalRecords(values);
+  const pack = new Uint8Array(ids.length + records.length);
+  pack.set(ids);
+  pack.set(records, ids.length);
+  return {
+    pack,
+    entry: {
+      count: values.length / 3,
+      ids: { offset: 0, length: ids.length },
+      records: { offset: ids.length, length: records.length }
+    }
+  };
 }
 
 function fixture({ disconnect = false } = {}) {
@@ -77,6 +102,71 @@ test("same-region routing opens only its regional graph", async () => {
   const result = await engine.route({ from: point(5, 1), to: point(6, 2) });
   assert.equal(result.federated, undefined);
   assert.deepEqual(source.opened, ["west"]);
+});
+
+test("dataset-root route bases resolve beside routes/catalog.json without duplicating routes", async () => {
+  const source = fixture();
+  const catalog = await source.fetch(catalogUrl).then(response => response.json());
+  for (const index of catalog.indexes) index.base = `routes/${index.base}`;
+  const opened = [];
+  const engine = await openRouteCatalogUrl(catalogUrl, {
+    ...source,
+    fetch: async (url, options) => {
+      if (url === catalogUrl) return jsonResponse(catalog);
+      assert.ok(!String(url).includes("/routes/routes/"));
+      return source.fetch(url, options);
+    },
+    openGraph(index, base) {
+      opened.push(base);
+      return source.openGraph(index);
+    }
+  });
+  await engine.route({ from: point(5, 1), to: point(5, 19), geometry: false });
+  assert.deepEqual(opened.sort(), [
+    "https://routes.test/routes/car/east/",
+    "https://routes.test/routes/car/west/"
+  ]);
+});
+
+test("v2 federation reads only one record range and the peer id range", async () => {
+  const west = portalPack([101, 5e7, 10e7, 102, 6e7, 10e7]);
+  const east = portalPack([101, 5e7, 10e7, 102, 6e7, 10e7, 999, 7e7, 10e7]);
+  const catalog = {
+    format: "rangefind-route-catalog-v1",
+    indexes: [
+      {
+        region: "west", profile: "car", base: "routes/car/west/", bbox: [0, 0, 10, 10], neighbors: ["east"],
+        portals: { format: "rfrouteportals-v2", file: "portals.west.bin", neighbors: { east: west.entry } }
+      },
+      {
+        region: "east", profile: "car", base: "routes/car/east/", bbox: [0, 10, 10, 20], neighbors: ["west"],
+        portals: { format: "rfrouteportals-v2", file: "portals.east.bin", neighbors: { west: east.entry } }
+      }
+    ]
+  };
+  const packs = { "portals.west.bin": west.pack, "portals.east.bin": east.pack };
+  const ranges = [];
+  const source = fixture();
+  const engine = await openRouteCatalogUrl(catalogUrl, {
+    inflate: async bytes => bytes,
+    fetch: async (url, options = {}) => {
+      if (url === catalogUrl) return jsonResponse(catalog);
+      const name = new URL(url).pathname.split("/").at(-1);
+      const match = options.headers?.Range?.match(/^bytes=(\d+)-(\d+)$/u);
+      assert.ok(match, "portal packs use Range requests");
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      ranges.push({ name, start, end });
+      return rangeResponse(packs[name].subarray(start, end + 1));
+    },
+    openGraph: source.openGraph
+  });
+  const result = await engine.route({ from: point(5, 1), to: point(5, 19), geometry: false });
+  assert.equal(result.federated, true);
+  assert.equal(ranges.length, 2);
+  assert.deepEqual(ranges.map(range => range.name).sort(), ["portals.east.bin", "portals.west.bin"]);
+  assert.equal(ranges.find(range => range.name === "portals.west.bin").start, west.entry.records.offset);
+  assert.equal(ranges.find(range => range.name === "portals.east.bin").start, east.entry.ids.offset);
 });
 
 test("nearby regional roads are never stitched without a shared OSM id", async () => {

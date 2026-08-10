@@ -21,16 +21,32 @@ export interface OpenRouteGraphOptions {
   verifyChecksums?: boolean;
   /** Reject snaps whose nearest road is farther than this; default 250. */
   maxSnapMeters?: number;
+  /** Largest byte gap merged into one route-pack Range request; default 256 KiB. */
+  rangeMergeGapBytes?: number;
+  /** Hard cap for one merged route-pack Range request; default 4 MiB. */
+  rangeMaxMergedBytes?: number;
+  /** Hard cap for bytes fetched between requested objects; default 1 MiB. */
+  rangeMaxOverfetchBytes?: number;
+  /** Hard cap for merged bytes / exact object bytes; default 2.5. */
+  rangeMaxOverfetchRatio?: number;
 }
 
 export interface RouteFetchStats {
   objectFetches: number;
   bytesFetched: number;
+  /** Bytes transferred by merged pack ranges, including bounded gaps. */
+  rangeBytesFetched: number;
+  /** Portion of rangeBytesFetched intentionally fetched between objects. */
+  rangeOverfetchBytes: number;
   cellFetches: number;
   overlayFetches: number;
   unpackCellFetches: number;
   /** Actual merged Range requests after same-file coalescing. */
   httpRequests: number;
+  /** Per-neighbor portal range requests for a federated route. */
+  portalRequests?: number;
+  /** Actual compressed portal bytes transferred for a federated route. */
+  portalBytesFetched?: number;
   shardsTouched: string[];
   /** Regional graph ids touched by a federated route. */
   regionsTouched?: string[];
@@ -312,9 +328,25 @@ export interface RouteCatalogIndex {
   profile: string;
   base: string;
   bbox: [number, number, number, number];
-  portals?: string;
+  portals?: string | RoutePortalDirectory;
   neighbors?: string[];
-  manifest?: { portals?: string; [key: string]: unknown };
+  manifest?: { portals?: string | RoutePortalDirectory; [key: string]: unknown };
+}
+
+export interface RoutePortalPointer {
+  offset: number;
+  length: number;
+  checksum?: string;
+}
+
+export interface RoutePortalDirectory {
+  format: "rfrouteportals-v2";
+  file: string;
+  neighbors: Record<string, {
+    count: number;
+    ids: RoutePortalPointer;
+    records: RoutePortalPointer;
+  }>;
 }
 
 export interface FederatedRouteEngine {
@@ -332,6 +364,8 @@ export declare function openRouteCatalogUrl(catalogUrl: string, options?: {
   /** Gzip inflate override for immutable portal sidecars. */
   inflate?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   graphOptions?: Partial<OpenRouteGraphOptions>;
+  /** SHA-256 verification of portal range blocks; defaults to on when available. */
+  verifyPortalChecksums?: boolean;
   maxPortalsPerBorder?: number;
   maxRegionPaths?: number;
   maxRegionHops?: number;

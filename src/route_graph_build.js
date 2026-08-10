@@ -21,9 +21,14 @@ import {
   encodeRouteOverlay,
   encodeRouteRoot
 } from "./route_graph.js";
+import {
+  ROUTE_PORTAL_FORMAT,
+  encodeRoutePortalIds,
+  encodeRoutePortalRecords
+} from "./route_portals.js";
 
 const OBJECT_NAME_HASH_LENGTH = 24;
-export const ROUTE_PORTAL_FORMAT = "rfrouteportals-v1";
+export { ROUTE_PORTAL_FORMAT } from "./route_portals.js";
 
 function kdPartition(latE7, lonE7, leafNodes) {
   const nodeCount = latE7.length;
@@ -629,10 +634,13 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   mkdirSync(outDir, { recursive: true });
   const shardDirs = [];
   const writers = [];
+  const geometryWriters = [];
   for (let s = 0; s < shardCount; s++) {
     const dir = shardCount === 1 ? "objects" : `shards/${String(s).padStart(2, "0")}`;
+    const packIndexes = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
     shardDirs.push(dir);
-    writers.push(createPackWriter(join(outDir, dir), packBytes, { dedupe: false }));
+    writers.push(createPackWriter(join(outDir, dir), packBytes, { dedupe: false, indexCounter: packIndexes }));
+    geometryWriters.push(createPackWriter(join(outDir, dir), packBytes, { dedupe: false, indexCounter: packIndexes }));
   }
   const rootWriter = createPackWriter(join(outDir, "top"), packBytes, { dedupe: false });
 
@@ -760,7 +768,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     const written = writeShard(writers[shardIndex], `cell-${leaf}`, compressed, encoded.length);
     const encodedGeometry = encodeRouteGeometry({ cellId: leaf, polylines: uniquePolylines });
     const compressedGeometry = gzipSync(Buffer.from(encodedGeometry), { level: 6 });
-    const writtenGeometry = writeShard(writers[shardIndex], `geom-${leaf}`, compressedGeometry, encodedGeometry.length);
+    const writtenGeometry = writeShard(geometryWriters[shardIndex], `geom-${leaf}`, compressedGeometry, encodedGeometry.length);
     let minLat = Infinity;
     let maxLat = -Infinity;
     let minLon = Infinity;
@@ -848,6 +856,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const topOverlayGraph = { nodes: { length: topEntries[0].nodes } };
 
   for (const writer of writers) finalizePackWriter(writer);
+  for (const writer of geometryWriters) finalizePackWriter(writer);
   finalizePackWriter(rootWriter);
 
   // Build-only debug artifact: source-graph id per index node. Never
@@ -862,33 +871,70 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   const namesFile = `names.${namesHash}.bin.gz`;
   writeFileSync(join(outDir, namesFile), namesGz);
 
-  // Build-time federation metadata stays outside the range packs: clients
-  // fetch it only when an endpoint lies in a different regional graph. Each
-  // neighbor list contains flat [osmNodeId, latE7, lonE7] triples. The peer
-  // sidecar must contain the same OSM id before it is accepted as a portal.
+  // Build-time federation metadata stays outside the graph packs: clients
+  // fetch it only when endpoints lie in different regional graphs. Each
+  // neighbor has independently compressed id-only and coordinate-bearing
+  // blocks in one content-addressed range file. A query reads the smaller
+  // side's records plus the larger side's ids, never unrelated neighbors.
   const portalNeighbors = Object.fromEntries(
     Object.entries(graph.portals || {}).filter(([, values]) => Array.isArray(values) && values.length >= 3)
   );
-  const portalsJson = Buffer.from(JSON.stringify({
+  const portalChunks = [];
+  const portalDirectory = {};
+  let portalOffset = 0;
+  for (const [neighbor, values] of Object.entries(portalNeighbors).sort(([left], [right]) => left.localeCompare(right))) {
+    const ids = gzipSync(Buffer.from(encodeRoutePortalIds(values)), { level: 6 });
+    const records = gzipSync(Buffer.from(encodeRoutePortalRecords(values)), { level: 6 });
+    const pointer = bytes => ({
+      offset: portalOffset,
+      length: bytes.length,
+      checksum: createHash("sha256").update(bytes).digest("hex")
+    });
+    const idsPointer = pointer(ids);
+    portalChunks.push(ids);
+    portalOffset += ids.length;
+    const recordsPointer = pointer(records);
+    portalChunks.push(records);
+    portalOffset += records.length;
+    portalDirectory[neighbor] = {
+      count: values.length / 3,
+      ids: idsPointer,
+      records: recordsPointer
+    };
+  }
+  const portalsBin = Buffer.concat(portalChunks);
+  const portalsHash = createHash("sha256").update(portalsBin).digest("hex").slice(0, OBJECT_NAME_HASH_LENGTH);
+  const portalsFile = `portals.${portalsHash}.bin`;
+  writeFileSync(join(outDir, portalsFile), portalsBin);
+  const portals = {
     format: ROUTE_PORTAL_FORMAT,
-    profile: graph.profile || "car",
-    neighbors: portalNeighbors
-  }), "utf8");
-  const portalsGz = gzipSync(portalsJson, { level: 6 });
-  const portalsHash = createHash("sha256").update(portalsGz).digest("hex").slice(0, OBJECT_NAME_HASH_LENGTH);
-  const portalsFile = `portals.${portalsHash}.json.gz`;
-  writeFileSync(join(outDir, portalsFile), portalsGz);
+    file: portalsFile,
+    neighbors: portalDirectory
+  };
 
+  const shardPackTables = writers.map((writer, s) => (
+    [...writer.packs, ...geometryWriters[s].packs]
+      .sort((left, right) => left.index - right.index)
+      .map(pack => pack.file)
+  ));
   const shards = writers.map((writer, s) => ({
     id: shardCount === 1 ? "all" : `shard-${String(s).padStart(2, "0")}`,
     dir: shardDirs[s],
-    packs: writer.packs.map(pack => pack.file)
+    packs: shardPackTables[s]
   }));
   shards.push({ id: "__top", dir: "top", packs: rootWriter.packs.map(pack => pack.file) });
   const topShardIndex = shards.length - 1;
 
+  const packTableOf = writer => {
+    const dataShard = writers.indexOf(writer);
+    if (dataShard >= 0) return shardPackTables[dataShard];
+    const geometryShard = geometryWriters.indexOf(writer);
+    if (geometryShard >= 0) return shardPackTables[geometryShard];
+    if (writer === rootWriter) return rootWriter.packs.map(pack => pack.file);
+    return [];
+  };
   const packIndexOf = (writer, entry) => {
-    const index = writer.packs.findIndex(pack => pack.file === entry.pack);
+    const index = packTableOf(writer).indexOf(entry.pack);
     if (index < 0) throw new Error("Route graph pack entry does not resolve to a finalized pack.");
     return index;
   };
@@ -920,7 +966,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
       bbox: leaf.bbox,
       shardIndex: leaf.shardIndex,
       pointer: pointerOf(writers[leaf.shardIndex], leaf.entry),
-      geometryPointer: pointerOf(writers[leaf.shardIndex], leaf.geometryEntry)
+      geometryPointer: pointerOf(geometryWriters[leaf.shardIndex], leaf.geometryEntry)
     })),
     levels: levelEntries.map(level => level.map(cell => ({
       firstLeaf: cell.firstLeaf,
@@ -947,7 +993,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     levels: levelFanouts,
     buckets: buckets.map(bucket => bucket.name),
     shards: shards.length - 1,
-    portals: portalsFile,
+    portals,
     portalCandidates: Object.values(portalNeighbors).reduce((sum, values) => sum + values.length / 3, 0)
   }, null, 2));
 
