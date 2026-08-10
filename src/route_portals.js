@@ -62,13 +62,51 @@ function assertMagic(bytes, magic) {
   }
 }
 
+/** Normalize both extractor-time flat triples and disk-backed columnar rows. */
+export function routePortalColumns(values) {
+  if (Array.isArray(values) || ArrayBuffer.isView(values)) {
+    if (values.length % 3 !== 0) throw new Error("Route portals must be flat id/latE7/lonE7 triples.");
+    return {
+      count: values.length / 3,
+      ids: values,
+      latE7: values,
+      lonE7: values,
+      stride: 3,
+      latOffset: 1,
+      lonOffset: 2
+    };
+  }
+  if (values?.ids && values?.latE7 && values?.lonE7
+      && ArrayBuffer.isView(values.ids)
+      && ArrayBuffer.isView(values.latE7)
+      && ArrayBuffer.isView(values.lonE7)
+      && values.ids.length === values.latE7.length
+      && values.ids.length === values.lonE7.length) {
+    return {
+      count: values.ids.length,
+      ids: values.ids,
+      latE7: values.latE7,
+      lonE7: values.lonE7,
+      stride: 1,
+      latOffset: 0,
+      lonOffset: 0
+    };
+  }
+  throw new Error("Route portals must be flat triples or equal-length id/latE7/lonE7 columns.");
+}
+
+export function routePortalCount(values) {
+  return routePortalColumns(values).count;
+}
+
 function portalRows(values) {
-  if (!values || values.length % 3 !== 0) throw new Error("Route portals must be flat id/latE7/lonE7 triples.");
+  const columns = routePortalColumns(values);
   let previousId = -1;
-  for (let offset = 0; offset < values.length; offset += 3) {
-    const id = Number(values[offset]);
-    const latE7 = Number(values[offset + 1]);
-    const lonE7 = Number(values[offset + 2]);
+  for (let row = 0; row < columns.count; row++) {
+    const offset = row * columns.stride;
+    const id = Number(columns.ids[offset]);
+    const latE7 = Number(columns.latE7[offset + columns.latOffset]);
+    const lonE7 = Number(columns.lonE7[offset + columns.lonOffset]);
     if (!Number.isSafeInteger(id) || id < 0 || id <= previousId) {
       throw new Error("Route portal OSM ids must be unique safe integers in ascending order.");
     }
@@ -77,15 +115,16 @@ function portalRows(values) {
     }
     previousId = id;
   }
-  return values.length / 3;
+  return columns;
 }
 
 export function encodeRoutePortalIds(values) {
-  const count = portalRows(values);
+  const columns = portalRows(values);
+  const { count } = columns;
   let length = IDS_MAGIC.length + varintLength(count);
   let previousId = 0;
-  for (let offset = 0; offset < values.length; offset += 3) {
-    const id = values[offset];
+  for (let row = 0; row < count; row++) {
+    const id = columns.ids[row * columns.stride];
     length += varintLength(id - previousId);
     previousId = id;
   }
@@ -93,8 +132,8 @@ export function encodeRoutePortalIds(values) {
   bytes.set(IDS_MAGIC);
   let cursor = writeVarint(bytes, IDS_MAGIC.length, count);
   previousId = 0;
-  for (let offset = 0; offset < values.length; offset += 3) {
-    const id = values[offset];
+  for (let row = 0; row < count; row++) {
+    const id = columns.ids[row * columns.stride];
     cursor = writeVarint(bytes, cursor, id - previousId);
     previousId = id;
   }
@@ -102,15 +141,17 @@ export function encodeRoutePortalIds(values) {
 }
 
 export function encodeRoutePortalRecords(values) {
-  const count = portalRows(values);
+  const columns = portalRows(values);
+  const { count } = columns;
   let length = RECORDS_MAGIC.length + varintLength(count);
   let previousId = 0;
   let previousLat = 0;
   let previousLon = 0;
-  for (let offset = 0; offset < values.length; offset += 3) {
-    const id = values[offset];
-    const lat = values[offset + 1];
-    const lon = values[offset + 2];
+  for (let row = 0; row < count; row++) {
+    const offset = row * columns.stride;
+    const id = columns.ids[offset];
+    const lat = columns.latE7[offset + columns.latOffset];
+    const lon = columns.lonE7[offset + columns.lonOffset];
     length += varintLength(id - previousId)
       + varintLength(zigZag(lat - previousLat))
       + varintLength(zigZag(lon - previousLon));
@@ -124,10 +165,11 @@ export function encodeRoutePortalRecords(values) {
   previousId = 0;
   previousLat = 0;
   previousLon = 0;
-  for (let offset = 0; offset < values.length; offset += 3) {
-    const id = values[offset];
-    const lat = values[offset + 1];
-    const lon = values[offset + 2];
+  for (let row = 0; row < count; row++) {
+    const offset = row * columns.stride;
+    const id = columns.ids[offset];
+    const lat = columns.latE7[offset + columns.latOffset];
+    const lon = columns.lonE7[offset + columns.lonOffset];
     cursor = writeVarint(bytes, cursor, id - previousId);
     cursor = writeVarint(bytes, cursor, zigZag(lat - previousLat));
     cursor = writeVarint(bytes, cursor, zigZag(lon - previousLon));

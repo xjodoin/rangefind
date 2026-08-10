@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Country-scale inter-region road extraction no longer serializes every
+  federation portal into one giant JSON string. Source graphs persist portal
+  ids and coordinates as bounded-memory binary columns (16 bytes per
+  candidate), avoiding V8's string-length ceiling and the corresponding
+  reader-side JSON memory spike while retaining earlier `rfroutesrc-v8`
+  compatibility.
+
 ### Added
 
 - Suggestions resolve directly to their document. Per-shard authority

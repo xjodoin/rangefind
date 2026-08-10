@@ -211,7 +211,12 @@ test("road graph writer replaces atomically without concatenating sections", asy
   const decoded = await readRoadGraph(path);
   assert.equal(decoded.profile, graph.profile);
   assert.deepEqual(decoded.names, graph.names);
-  assert.deepEqual(decoded.portals, graph.portals);
+  assert.deepEqual([...decoded.portals.neighbor.ids], [123]);
+  assert.deepEqual([...decoded.portals.neighbor.latE7], [455000000]);
+  assert.deepEqual([...decoded.portals.neighbor.lonE7], [-736000000]);
+  const header = JSON.parse(readFileSync(path, "utf8").split("\n", 1)[0]);
+  assert.equal(header.portalColumns[0].count, 1);
+  assert.equal(header.sections.some(section => section.name === "portalsBytes"), false);
   for (const key of [
     "nodeLat", "nodeLon", "edgeFrom", "edgeTo", "edgeWeightDs", "edgeDistDm",
     "edgeName", "edgeClass", "edgeJunction", "edgeSpeed", "edgeCond", "edgeSign",
@@ -219,6 +224,22 @@ test("road graph writer replaces atomically without concatenating sections", asy
   ]) {
     assert.deepEqual(decoded[key], graph[key], `${key} round trips`);
   }
+});
+
+test("road graph reader keeps legacy v8 JSON portal sections readable", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-road-legacy-portals-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "graph.bin");
+  const portals = Buffer.from(JSON.stringify({ neighbor: [123, 455000000, -736000000] }));
+  const header = Buffer.from(`${JSON.stringify({
+    format: "rfroutesrc-v8",
+    profile: "car",
+    sections: [{ name: "portalsBytes", bytes: portals.length, type: "Uint8Array" }]
+  })}\n`);
+  writeFileSync(path, Buffer.concat([header, portals]));
+  const { readRoadGraph } = await import("../scripts/osm_road_graph.mjs");
+  const decoded = await readRoadGraph(path);
+  assert.deepEqual(decoded.portals, { neighbor: [123, 455000000, -736000000] });
 });
 
 test("route builds publish immutable compact federation portal sidecars", (t) => {

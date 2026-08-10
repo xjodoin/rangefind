@@ -24,7 +24,8 @@ import {
 import {
   ROUTE_PORTAL_FORMAT,
   encodeRoutePortalIds,
-  encodeRoutePortalRecords
+  encodeRoutePortalRecords,
+  routePortalCount
 } from "./route_portals.js";
 
 const OBJECT_NAME_HASH_LENGTH = 24;
@@ -1109,7 +1110,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
   // blocks in one content-addressed range file. A query reads the smaller
   // side's records plus the larger side's ids, never unrelated neighbors.
   const portalNeighbors = Object.fromEntries(
-    Object.entries(graph.portals || {}).filter(([, values]) => Array.isArray(values) && values.length >= 3)
+    Object.entries(graph.portals || {}).filter(([, values]) => routePortalCount(values) > 0)
   );
   const portalChunks = [];
   const portalDirectory = {};
@@ -1129,7 +1130,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     portalChunks.push(records);
     portalOffset += records.length;
     portalDirectory[neighbor] = {
-      count: values.length / 3,
+      count: routePortalCount(values),
       ids: idsPointer,
       records: recordsPointer
     };
@@ -1230,7 +1231,7 @@ export function buildRouteGraph(graph, outDir, options = {}) {
     buckets: buckets.map(bucket => bucket.name),
     shards: shards.length - 1,
     portals,
-    portalCandidates: Object.values(portalNeighbors).reduce((sum, values) => sum + values.length / 3, 0)
+    portalCandidates: Object.values(portalNeighbors).reduce((sum, values) => sum + routePortalCount(values), 0)
   }, null, 2));
 
   let overlayNodes = 0;
