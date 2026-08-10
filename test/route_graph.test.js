@@ -9,10 +9,12 @@ import {
   bucketWeight,
   decodeRouteCell,
   decodeRouteOverlay,
+  decodeRouteTopSlice,
   encodeRouteCell,
-  encodeRouteOverlay
+  encodeRouteOverlay,
+  encodeRouteTopSlice
 } from "../src/route_graph.js";
-import { IntegerRadixHeap, buildRouteGraph } from "../src/route_graph_build.js";
+import { IntegerRadixHeap, adaptiveTopMaxCells, buildRouteGraph } from "../src/route_graph_build.js";
 import { openRouteGraphDir } from "../src/route_graph_node.js";
 import { decodeRoutePortalIds, decodeRoutePortalRecords } from "../src/route_portals.js";
 
@@ -47,6 +49,12 @@ test("integer radix heap orders duplicate and 53-bit monotone distances", () => 
   assert.equal(heap.peekWeight(), 20);
   heap.pop();
   assert.throws(() => heap.push(19, "past"), /monotone safe-integer/);
+});
+
+test("country hierarchy widens only when cell working sets would exceed the mobile target", () => {
+  assert.equal(adaptiveTopMaxCells({ nodeCount: 672, leafCount: 14, fanout: 4, configured: 6 }), 6);
+  assert.equal(adaptiveTopMaxCells({ nodeCount: 30_642_545, leafCount: 32_768, fanout: 8, configured: 8 }), 512);
+  assert.equal(adaptiveTopMaxCells({ nodeCount: 30_642_545, leafCount: 32_768, fanout: 8, configured: 1024 }), 1024);
 });
 
 // Grid road network around Montreal-ish coordinates. Every neighbor pair is
@@ -752,11 +760,48 @@ test("route cell, geometry, and overlay codecs round-trip", async () => {
     weights: Uint32Array.from([500, 1200, 70]),
     isClique: Uint8Array.from([1, 0, 1])
   };
-  const decodedOverlay = decodeRouteOverlay(encodeRouteOverlay(overlay));
+  const encodedOverlay = encodeRouteOverlay(overlay);
+  const legacyBytes = [0x52, 0x46, 0x52, 0x4f];
+  const pushVarint = value => {
+    let number = Math.max(0, Math.floor(value));
+    while (number >= 0x80) {
+      legacyBytes.push((number % 0x80) | 0x80);
+      number = Math.floor(number / 0x80);
+    }
+    legacyBytes.push(number);
+  };
+  const pushZigzag = value => pushVarint(value < 0 ? -value * 2 - 1 : value * 2);
+  pushVarint(1);
+  pushVarint(overlay.level);
+  pushVarint(overlay.cellId);
+  pushVarint(overlay.nodes.length);
+  let previousNode = 0;
+  for (const node of overlay.nodes) {
+    pushVarint(node - previousNode);
+    previousNode = node;
+  }
+  pushVarint(overlay.targetIndex.length);
+  for (let node = 0; node < overlay.nodes.length; node++) {
+    pushVarint(overlay.rowStart[node + 1] - overlay.rowStart[node]);
+    for (let edge = overlay.rowStart[node]; edge < overlay.rowStart[node + 1]; edge++) {
+      pushZigzag(overlay.targetIndex[edge] - node);
+      pushVarint(overlay.weights[edge] * 2 + overlay.isClique[edge]);
+    }
+  }
+  assert.deepEqual([...encodedOverlay], legacyBytes, "pre-sized encoder must retain the published RFRO bytes");
+  const decodedOverlay = decodeRouteOverlay(encodedOverlay);
   assert.equal(decodedOverlay.level, 2);
   assert.deepEqual([...decodedOverlay.nodes], [10, 55, 300]);
   assert.deepEqual([...decodedOverlay.weights], [500, 1200, 70]);
   assert.deepEqual([...decodedOverlay.isClique], [1, 0, 1]);
+
+  const topSlice = decodeRouteTopSlice(encodeRouteTopSlice(overlay, 0, overlay.nodes.length, 9));
+  assert.equal(topSlice.level, 2);
+  assert.equal(topSlice.cellId, 9);
+  assert.deepEqual([...topSlice.nodes], [10, 300]);
+  assert.deepEqual([...topSlice.targets], [55, 300, 10]);
+  assert.deepEqual([...topSlice.weights], [500, 1200, 70]);
+  assert.deepEqual([...topSlice.isClique], [1, 0, 1]);
 });
 
 test("multilevel routes match reference Dijkstra on a synthetic city", async (t) => {

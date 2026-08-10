@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- Country-scale route overlays no longer grow one multi-gigabyte JavaScript
+  byte array or force every phone to download and inflate it. The builder
+  widens large hierarchies to a bounded per-cell working set, writes exact-size
+  binary columns, and publishes the root graph as independently checksummed
+  range slices. Route, matrix, and itinerary searches reuse the ordinary pack
+  reader and fetch/decode a slice only when their frontier reaches its cell;
+  existing v5 route roots remain readable.
+
 - Country-scale inter-region road extraction no longer serializes every
   federation portal into one giant JSON string. Source graphs persist portal
   ids and coordinates as bounded-memory binary columns (16 bytes per

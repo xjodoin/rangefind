@@ -73,9 +73,11 @@ adapted to range-addressed static objects:
    graph is ~2.3× larger and everything downstream just works.
 2. **Partition** (`rangefind/route/build`): nodes are KD-partitioned into
    contiguous leaf cells (default ≤1280 nodes) over a locality-preserving
-   order, then grouped by fanout into nested parent cells until the top
-   level is small. Node ids are the KD order, so every cell at every level
-   is one contiguous id range.
+   order, then grouped by fanout into nested parent cells. Small graphs keep
+   the configured top width; country graphs widen it automatically so a top
+   cell stays near 128K nodes rather than creating one enormous boundary
+   clique. Node ids are the KD order, so every cell at every level is one
+   contiguous id range.
 3. **Cliques, bottom-up**: each cell's boundary nodes (endpoints of edges
    that leave the cell) get an exact all-pairs shortest-path clique computed
    within the cell — leaves over raw edges, parents over their children's
@@ -86,18 +88,22 @@ adapted to range-addressed static objects:
      distances, street-name ids, and polyline geometry;
    - `overlay` blocks (RFRO): a parent cell's overlay graph — child cliques
      plus original edges crossing between children;
-   - the top overlay: the same structure over the top-level cells, published
-     as its own object (`top/`) so sharded deployments share one boundary
-     artifact;
+   - top slices (RFTS): source rows of the top overlay partitioned by top-level
+     cell, published as independent compressed objects under `top/`. Targets
+     remain global node ids, so following an edge never requires decoding an
+     unrelated slice;
    - a root (RFRT): leaf bboxes and node ranges, per-level cell tables,
      shard/pack tables, and object pointers. Quebec's root is 33 KB.
 5. **Query** (`rangefind/route`): snapping reads 1–4 leaf cells near each
    endpoint (bbox candidates from the root, exact polyline projection,
    one-way handled by seeding directed edges). The query then fetches a
-   fixed object set computable from the endpoints alone — the snap leaves,
-   one overlay per ancestor level per endpoint, and the top overlay — in a
-   single parallel wave, and runs a bidirectional multilevel Dijkstra
-   client-side. Because every clique edge's weight equals an exact
+   bounded object set — the snap leaves and one overlay per ancestor level
+   per endpoint — in a single parallel wave. The endpoint top slices join
+   that wave; additional immutable top slices load only as the forward
+   frontier reaches their hierarchy cells. Legacy v5 roots retain the
+   bidirectional single-top path. The same lazy slice
+   cache serves `route()`, `matrix()`, alternatives, and itineraries. Because
+   every clique edge's weight equals an exact
    shortest-path length, the union of all fetched objects is both complete
    and exact: results equal a flat Dijkstra over the full graph, verified
    edge-for-edge in tests and benchmarks.
@@ -109,8 +115,9 @@ adapted to range-addressed static objects:
 
 Sharding is the same picture at a different granularity: a shard is a
 contiguous group of top-level cells with its own pack files, and the top
-overlay is the cross-shard boundary artifact. A query touches the source
-shard, the target shard, and `top/` — never the rest of the planet. Sharded
+slices are the cross-shard boundary artifacts. A query touches the source
+shard, the target shard, and only the `top/` ranges its frontier needs — never
+the rest of the planet. Sharded
 and monolithic builds return identical results by construction.
 
 ## Inter-region routing
@@ -175,7 +182,7 @@ and `toRegion` can pin endpoint coverage when an application already resolved
 administrative membership. `matrix()` uses the same federated route planner.
 
 This is different from an internal shard crossing. Internal shards share one
-top overlay and are exact by construction. Regional graphs have independent
+range-addressed top-slice directory and are exact by construction. Regional graphs have independent
 overlays and are connected only at verified OSM portals; a missing shared id
 returns `RANGEFIND_ROUTE_REGIONS_DISCONNECTED` rather than inventing a bridge.
 
