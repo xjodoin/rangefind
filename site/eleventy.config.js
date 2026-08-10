@@ -92,6 +92,9 @@ export default function (eleventyConfig) {
       .replace(/\]\(\.\.\/src\/([^)]+)\)/gu, `](${repoBlob}src/$1)`)
       .replace(/\]\(\.\.\/examples\/([^)]+)\)/gu, `](${repoBlob}examples/$1)`)
       .replace(/\]\(sharded-osm\.md\)/gu, "](/docs/sharded-indexes/)")
+      .replace(/\]\(route-graph\.md\)/gu, "](/docs/routing/)")
+      .replace(/\]\(pulsemesh\.md\)/gu, "](/docs/pulsemesh/)")
+      .replace(/\]\(pulsemesh-threads\.md\)/gu, "](/docs/pulsemesh-threads/)")
       .replace(/\]\(osm-maps-benchmark\.md\)/gu, `](${repoBlob}docs/osm-maps-benchmark.md)`);
     return md.render(source);
   });

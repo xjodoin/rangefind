@@ -13,8 +13,10 @@ permalink: /google-maps-api-alternative/
       <p class="hero__lede">
         Replace Google Places search, autocomplete, forward and reverse
         geocoding, nearby search, and place details with a
-        <strong>client-only OpenStreetMap index</strong>. No API key, search
-        server, session token, or per-request bill.
+        <strong>client-only OpenStreetMap index</strong> — and now
+        <strong>routes, travel-time matrices, and multi-stop itineraries</strong>
+        from the same static files. No API key, search server, session token,
+        or per-request bill.
       </p>
       <div class="hero__actions">
         <a class="button button--marker" href="{{ '/map/' | url }}">Try the live map</a>
@@ -112,8 +114,20 @@ const engine = await createSearch({
         <p>Use exact radius, nearest-first, bounding-box, open-now, accessibility, service, and payment constraints.</p>
       </div>
       <div class="feature">
+        <h3>Routes and turn-by-turn steps</h3>
+        <p>Car, bike, and foot routes with exact turn restrictions and steps that carry what the signs say — road number, exit number, roundabout exit, posted limit.</p>
+      </div>
+      <div class="feature">
+        <h3>Matrices and multi-stop itineraries</h3>
+        <p>All-pairs travel times from one shared search, and stop ordering that is exact to 10 interior stops — Compute Route Matrix and Route Optimization, run locally.</p>
+      </div>
+      <div class="feature">
         <h3>Search along a route</h3>
-        <p>Find places inside a route corridor and return trip progress, direction, off-route distance, and the closest rejoin point.</p>
+        <p>Find places inside a route corridor and return trip progress, direction, off-route distance, and the closest rejoin point — over a route you computed or one you already had.</p>
+      </div>
+      <div class="feature">
+        <h3>Live traffic, from a feed you choose</h3>
+        <p>A pluggable provider contract: a municipal feed, your own telemetry, or the PulseMesh peer-to-peer channel. When it is absent the router degrades to the static metric and still answers.</p>
       </div>
       <div class="feature">
         <h3>Inline place details</h3>
@@ -130,9 +144,9 @@ const engine = await createSearch({
     <span class="eyebrow">HONEST COMPATIBILITY</span>
     <h2>Google Maps Platform versus Rangefind OSM</h2>
     <p>
-      Use Rangefind for the static OSM-backed search surface. Keep a routing
-      or specialist data provider only for capabilities that require live or
-      proprietary data.
+      Use Rangefind for the OSM-backed search, geocoding, and routing surface.
+      Keep a specialist provider only for capabilities that require licensed
+      or proprietary data.
     </p>
     <div class="maps-table-wrap">
       <table class="maps-table">
@@ -146,7 +160,10 @@ const engine = await createSearch({
           <tr><td>Forward/reverse geocoding</td><td><strong>Yes</strong> — including OSM address interpolation</td><td>Address completeness varies by region</td></tr>
           <tr><td>Place details and geometry</td><td><strong>Yes</strong> — configured OSM fields returned inline</td><td>No Google reviews, ratings, or photos</td></tr>
           <tr><td>Map rendering</td><td>Use MapLibre, Leaflet, OpenLayers, or another renderer</td><td>Rangefind does not supply basemap tiles</td></tr>
-          <tr><td>Directions, traffic, and ETA</td><td>Keep your routing engine</td><td>Rangefind can search an existing route but does not calculate it</td></tr>
+          <tr><td>Directions and ETA</td><td><strong>Yes</strong> — car, bike, and foot routes with sign-accurate steps</td><td>No tolls or proprietary road data</td></tr>
+          <tr><td>Distance matrix and stop ordering</td><td><strong>Yes</strong> — <code>matrix()</code> and <code>itinerary()</code></td><td>One vehicle; no capacities, time windows, or fleet assignment</td></tr>
+          <tr><td>Live traffic</td><td><strong>Yes</strong> — through a pluggable provider contract</td><td>You supply the feed or run the mesh; absent data degrades to the static metric</td></tr>
+          <tr><td>Journey and shipment tracking</td><td><strong>Yes</strong> — PulseMesh threads</td><td>The tracking channel, not a dispatch backend or operator console</td></tr>
         </tbody>
       </table>
     </div>
@@ -185,8 +202,9 @@ const engine = await createSearch({
       <h2>Replace Google Places and Geocoding APIs step by step</h2>
       <p class="docs-lede">
         The guide below maps common Google request shapes to Rangefind,
-        includes production code for six map-search journeys, and documents
-        deployment, attribution, benchmarking, and parity limits.
+        includes production code for nine map journeys — six for search and
+        geocoding, three for routing, itineraries, and live traffic — and
+        documents deployment, attribution, benchmarking, and parity limits.
       </p>
       {{ googleMapsMigrationHtml | safe }}
     </article>
@@ -206,7 +224,7 @@ const engine = await createSearch({
       </div>
       <div class="feature">
         <h3>Does it provide map tiles or directions?</h3>
-        <p>No. Use a map renderer and tile source for display, and a routing engine for routes, traffic, ETA, and turn-by-turn instructions.</p>
+        <p>Directions yes — routes, ETAs, matrices, and itineraries come from a static route graph read the same way. Tiles no: use a map renderer and tile source for display.</p>
       </div>
       <div class="feature">
         <h3>Does “free” mean zero infrastructure cost?</h3>

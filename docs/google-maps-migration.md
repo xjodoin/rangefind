@@ -1,6 +1,6 @@
 # Replace Google Maps search APIs with Rangefind OSM
 
-Rangefind can replace the static-search and geocoding portion of many Google
+Rangefind can replace the search, geocoding, and routing portion of many Google
 Maps Platform integrations with a browser-only OpenStreetMap index: no API key,
 query server, database, session token, per-request billing, or query data sent
 to a third-party search provider.
@@ -8,7 +8,16 @@ to a third-party search provider.
 This is a practical migration guide. It maps current Google Places and
 Geocoding concepts to Rangefind, supplies a compatibility adapter, and shows
 complete map-search journeys. It also identifies the boundaries honestly:
-Rangefind does not calculate routes, traffic, driving times, reviews, or photos.
+Rangefind has no reviews, photos, ratings, live occupancy, proprietary
+popularity, or basemap tiles, and its traffic is whatever feed you supply
+rather than a licensed dataset.
+
+Routing used to sit on that list. It no longer does — the
+[route graph](route-graph.md) computes routes, travel-time matrices, and
+multi-stop itineraries from the same static substrate, and
+[PulseMesh](pulsemesh.md) carries live traffic over it without a traffic
+server. Sections that were written when Rangefind could only *consume* a
+route now point at the ones that compute it.
 
 The Google surface names below follow the current official documentation for
 [Places API (New)](https://developers.google.com/maps/documentation/places/web-service/op-overview),
@@ -16,7 +25,9 @@ The Google surface names below follow the current official documentation for
 [Text Search (New)](https://developers.google.com/maps/documentation/places/web-service/text-search),
 [Nearby Search (New)](https://developers.google.com/maps/documentation/places/web-service/nearby-search),
 [Place Details (New)](https://developers.google.com/maps/documentation/places/web-service/place-details),
-and the [Geocoding API](https://developers.google.com/maps/documentation/geocoding/overview).
+the [Geocoding API](https://developers.google.com/maps/documentation/geocoding/overview),
+the [Routes API](https://developers.google.com/maps/documentation/routes),
+and the [Route Optimization API](https://developers.google.com/maps/documentation/route-optimization).
 
 ## What you can replace
 
@@ -30,11 +41,18 @@ and the [Geocoding API](https://developers.google.com/maps/documentation/geocodi
 | Reverse Geocoding | `reverseGeocodeOsm()` | Address-first bounded lookup, accuracy/result filters, and locality fallback. |
 | “Search this area” | `geo.box` or map-aware `searchOsmQuery()` | Exact viewport restriction with multi-resolution category cells. |
 | Open now and place constraints | `constraints`, `evaluateOpeningHours()` | Client-side evaluation of indexed schedules plus typed OSM facets. |
-| Search along an existing route | `searchAlongRouteOsm()` | Exact route corridor, progress, direction, viewport bias, and rejoin point. |
+| Search along a route | `searchAlongRouteOsm()` | Exact route corridor, progress, direction, viewport bias, and rejoin point. The route can now be one Rangefind computed. |
 | Place/building/park geometry | Result `geometry` | Compact simplified line/polygon rendering for selected results. |
-| Maps JavaScript rendering | MapLibre, Leaflet, OpenLayers, or your renderer | Rangefind supplies search data, not a basemap renderer. |
-| Routes API | Keep a routing engine | Rangefind consumes a route but does not compute one. |
-| Photos, reviews, ratings, traffic, live occupancy | No static OSM equivalent | Keep another provider or remove the feature. |
+| Maps JavaScript rendering | MapLibre, Leaflet, OpenLayers, or your renderer | Rangefind supplies search and routing data, not a basemap renderer. |
+| Routes API — Compute Routes | `route()` from `rangefind/route` | Car, bike, and foot routes with exact turn restrictions, sign-accurate steps, speed limits, and alternatives. No tolls, no proprietary road data. |
+| Routes API — Compute Route Matrix | `matrix()` | All-pairs travel times from one shared-context search, not k² requests. |
+| Route Optimization API | `itinerary()` | Single-vehicle stop ordering, exact to 10 interior stops. No capacities, time windows, shifts, or multi-vehicle assignment. |
+| Roads API — snap to roads | `snap()` / `locate()` | Map-matching to a physical segment id, and its exact inverse. |
+| Roads API — speed limits | `route().speedLimits` | OSM `maxspeed` as a step function over distance, with conditional windows resolved on device time. Untagged ways report 0, never a guess. |
+| Traffic layer and traffic-aware ETAs | `route({ live })`, [PulseMesh](pulsemesh.md) | A pluggable provider contract, not a licensed dataset — you run the mesh or supply the feed. Absent data degrades to the static metric. |
+| Fleet Engine journey/shipment sharing | [PulseMesh threads](pulsemesh-threads.md) | One publisher, a bounded audience, a link that is a key. No dispatch console, proof-of-delivery workflow UI, or fleet backend. |
+| Navigation SDK turn-by-turn | Steps, speed limits, and heading-aware rerouting | Rangefind supplies the instruction data; the navigation UI, voice, and lane rendering are yours. |
+| Photos, reviews, ratings, live occupancy, proprietary popularity | No static OSM equivalent | Keep another provider or remove the feature. |
 
 Google's current Nearby Search requires a circular location restriction and can
 rank by distance or popularity. Rangefind supports the same hard-circle and
@@ -392,10 +410,11 @@ Use a location **bias** while typing and a location **restriction** after the
 user presses “Search this area.” Bias improves ranking without excluding a
 relevant place just outside the current map; restriction is a hard boundary.
 
-## Use case 5: search along an existing route
+## Use case 5: search along a route
 
-Rangefind consumes route geometry produced by your routing engine, a stored
-GPX/GeoJSON trip, or the user's recorded path:
+Rangefind consumes route geometry from [its own router](route-graph.md) (use
+case 7), your existing routing engine, a stored GPX/GeoJSON trip, or the
+user's recorded path:
 
 ```js
 const response = await maps.searchAlongRoute({
@@ -426,11 +445,9 @@ into one large diagonal bounding box. Final points are checked against exact
 segments and ranked by cross-track distance, route progress, forward/behind
 direction, and viewport proximity.
 
-This is not a replacement for Google's
-[Compute Routes](https://developers.google.com/maps/documentation/routes/compute-route-over):
-Rangefind does not calculate the route, ETA, traffic, tolls, turn instructions,
-or the driving detour after adding a stop. A client can search a route entirely
-offline once it already has the geometry.
+A client can search a route entirely offline once it already has the geometry.
+Use case 7 is where that geometry comes from when you would rather not keep a
+routing provider for it; tolls remain out of scope either way.
 
 ## Use case 6: render the actual result geometry
 
@@ -464,6 +481,104 @@ map.getSource("selected-place").setData({
 Result geometry is intentionally not a vector-tile system or a polygon spatial
 relation index. It makes selection/highlight rendering better while point,
 viewport, radius, and corridor lookup stay fast.
+
+## Use case 7: compute the route, then search along it
+
+The [route graph](route-graph.md) is a separate index from the place index,
+opened separately and queried natively — there is no Google-shaped adapter for
+it, because a `Route` response and a `Place` response have nothing in common:
+
+```js
+import { openRouteGraphUrl } from "rangefind/route";
+
+const roads = await openRouteGraphUrl("https://example.com/route-graph/car/");
+
+const trip = await roads.route({
+  from: { lat: 45.5088, lon: -73.554 },
+  to:   { lat: 46.8131, lon: -71.2075 },
+  alternatives: 2,
+  departureTime: "2026-08-04T08:15"   // selects a time-of-day bucket
+});
+
+console.log({
+  seconds: trip.seconds,
+  meters: trip.distanceMeters,
+  bucket: trip.bucket,
+  first: trip.steps[0]      // { name, ref, exitRef, destination, meters, seconds, … }
+});
+```
+
+`trip.geometry` is what use case 5 wants. **Convert it explicitly** — a bare
+array is read as GeoJSON `[lon, lat]`, while `geometry` is `[lat, lon]`, and
+in most of the populated world both orders are valid coordinates, so a swap
+produces a corridor somewhere else rather than an error:
+
+```js
+const alongTheWay = await maps.searchAlongRoute({
+  route: trip.geometry.map(([lat, lon]) => ({ lat, lon })),
+  query: "Tim Hortons",
+  corridorMeters: 1500,
+  routePositionMeters: 12_400
+});
+```
+
+Compared with Compute Routes: turn restrictions, junction penalties, ferries,
+and turn costs are exact — routes are verified edge-for-edge against a
+full-graph Dijkstra — and steps carry what road signs actually say (`ref`,
+`exitRef`, `destinationRef`, roundabout exit numbers) rather than only a road
+name. Not covered: tolls and toll pricing, lane-level guidance beyond OSM's
+own lane tags, and any road attribute OSM does not carry. Profiles are
+separate builds, so `car`, `bike`, and `foot` are three index directories.
+
+## Use case 8: order a multi-stop round
+
+Google splits this across Compute Route Matrix and the Route Optimization API.
+Both are one local call here, and the matrix underneath fetches a single
+shared context rather than k² routes:
+
+```js
+const { seconds } = await roads.matrix({ points: stops });  // seconds[i][j]
+
+const round = await roads.itinerary({ stops, openEnd: true });
+// round.order, round.legs, round.totalSeconds, round.totalMeters
+```
+
+`openEnd` pins only the start and lets the optimizer choose where the run
+finishes, which is usually what a delivery round wants; the default treats the
+last stop as a fixed end, and `roundTrip: true` returns to stop 0. Ordering is
+exact (Held-Karp) to 10 interior stops and 2-opt beyond.
+
+The honest boundary against Route Optimization: this orders **one vehicle's**
+stops by travel time. There are no capacities, time windows, driver shifts,
+skills, pickup/delivery pairing, or multi-vehicle assignment — if your problem
+is fleet-wide assignment rather than one driver's sequence, this is not that
+product.
+
+## Use case 9: live traffic and journey sharing
+
+Traffic reaches the router through a provider contract, so a municipal feed, a
+CDN-published delta sidecar, your own fleet telemetry, and
+[PulseMesh](pulsemesh.md) are interchangeable:
+
+```js
+const withTraffic = await roads.route({ from, to, live: provider });
+// withTraffic.adjustedSeconds — the ETA under the live metric
+// withTraffic.live — { provider, states, applied, error }
+```
+
+This is not a licensed traffic dataset, and the guide should not be read as
+claiming one. What it is: a contract with a defined failure mode. An empty
+mesh, a stale graph epoch, or a provider that throws all degrade to the static
+metric and still return a route.
+
+For the Fleet Engine journey- and shipment-sharing surface — "where is my
+delivery", "where is the school bus" — [PulseMesh threads](pulsemesh-threads.md)
+covers the tracking half: one authoritative publisher, a bounded audience, and
+a capability that is a 45-byte key rather than a URL pointing at a tracking
+server. The arrival estimate is computed on the recipient's own device from
+the broadcast position, so nothing server-side learns which stop a given
+subscriber is waiting at. It is not a dispatch backend: driver assignment,
+proof-of-delivery workflow, and the operator console remain yours.
 
 ## Type migration
 
@@ -615,6 +730,8 @@ tiles, or another renderer/source whose terms match your traffic.
 | Concern | Google-hosted request API | Rangefind OSM |
 | --- | --- | --- |
 | Query processing | Provider service | User's browser/device |
+| Route computation | Provider service, billed per route/element | Browser/device, from range reads over static objects |
+| Origin and destination exposure | Both sent to the provider on every route | Never leave the device; live-traffic lookups are cell-scoped and padded |
 | API key | Required | None for a public static index |
 | Per-query billing/quota | Provider-dependent | None; pay storage/CDN egress |
 | Query data exposure | Sent to provider | Stays client-side, apart from static object access logs |
@@ -710,6 +827,11 @@ keep separately licensed datasets separate.
 | Autocomplete probes every shard | Root suggest routing was not published/rebuilt | Rebuild suggest-set sidecars and root suggest routing. |
 | Text query probes every shard | Root text routing is absent/stale | Rebuild term-set sidecars and root text routing. |
 | Search result differs from Google | Different source data/ranking/type taxonomy | Decide whether OSM is sufficient, add a licensed source, or keep that Google surface. |
+| `RANGEFIND_ROUTE_SNAP_TOO_FAR` | Endpoint is farther than `maxSnapMeters` (250 m) from any routable road | Raise the limit per call, or snap the pin to a place result first. |
+| Route starts by driving back the way the car came | Reroute seeded the opposing direction of the same road | Pass `fromHeading` (direction of travel, not bearing to the destination). |
+| `RANGEFIND_ROUTE_REGIONS_DISCONNECTED` | Two regional graphs share no verified OSM portal node | Check the catalog's coverage/neighbors; regions are joined by proven shared ids, never by proximity. |
+| Corridor search finds nothing along a computed route | `route.geometry` passed as a bare array and read as `[lon, lat]` | Map it to `{ lat, lon }` objects (use case 7). |
+| Live states fetched but no edge adjusted | Graph epoch mismatch, or contributions carry no length | Compare the provider's `epoch` with `root.sourceHash`; `states: n, applied: 0` is the signature. |
 
 ## When Rangefind is the right replacement
 
@@ -720,12 +842,17 @@ Rangefind OSM is especially strong for:
 - public/community services that cannot sustain per-query fees;
 - map search over a known set of countries or regions;
 - self-hosted products that want deterministic data/version control;
-- category, address, reverse, viewport, and along-route discovery; and
+- category, address, reverse, viewport, and along-route discovery;
+- routes, travel-time matrices, and single-vehicle stop ordering on the same
+  substrate as the search;
+- delivery and school-transport tracking that should not accumulate a
+  position history in a vendor database; and
 - products willing to expose OSM completeness honestly.
 
-Keep a hosted maps provider when the product depends on live traffic, exact
-driving detours/ETAs, turn-by-turn navigation, reviews, photos, real-time
-business changes, proprietary popularity, or guaranteed global commercial
-coverage. A hybrid migration is valid: Rangefind can own static search and
-geocoding while a routing or dynamic-place provider handles only the smaller
-surface that genuinely requires a service.
+Keep a hosted maps provider when the product depends on reviews, photos,
+ratings, real-time business changes, proprietary popularity, live occupancy,
+tolls, a licensed traffic dataset in regions where you cannot source one, or
+guaranteed global commercial coverage — and use a tile provider for the
+basemap either way. A hybrid migration is valid, and the line has moved: it
+used to fall between search and routing, and now it falls between open data
+you can host and proprietary data you cannot.
