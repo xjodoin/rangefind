@@ -903,7 +903,7 @@ const arrivalMs = u.unixSeconds * 1000 + eta * 1000;
 ```
 
 **Use `matrix()`, not `itinerary()`.** `itinerary()` *reorders* stops
-(exact Held-Karp up to 12, 2-opt beyond) — it solves a travelling
+(exact Held-Karp up to 10 interior stops, 2-opt beyond) — it solves a travelling
 salesman problem, which is exactly wrong for a bus run whose sequence
 is fixed by the plan. `matrix()` gives all-pairs times from one
 shared-context search; summing the consecutive pairs evaluates the

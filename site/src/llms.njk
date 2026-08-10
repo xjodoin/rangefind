@@ -8,6 +8,8 @@ eleventyExcludeFromCollections: true
 
 Key facts: MIT licensed; zero runtime dependencies in the core npm package (`rangefind`); indexes proven at 7.2M-page (English Wikipedia) and 33M-place (OpenStreetMap) scale; geographic sharding federates planet-scale corpora with rankings identical to a monolithic build; every claim on this site is backed by committed, rerunnable benchmarks.
 
+The same substrate also carries roads: a static route graph answers driving routes, travel-time matrices, and optimized multi-stop itineraries from bounded range requests with results identical to a full-graph Dijkstra, and live traffic arrives through a pluggable provider contract whose peer-to-peer implementation (PulseMesh) needs no traffic server.
+
 Install: `npm install rangefind`. Index a built site: `npx rangefind build ./dist`. Query from a browser via `createSearch({ baseUrl })`, from Node via `rangefind/node`, from a shell via `rangefind search`, or from an agent via the `rangefind-mcp` MCP server.
 
 ## Documentation

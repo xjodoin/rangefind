@@ -337,6 +337,45 @@ export interface SnapResult {
   matches: SnapMatch[];
 }
 
+/** A point on a physical segment, in travel order along it. */
+export interface SegmentPoint {
+  lat: number;
+  lon: number;
+  segment: string;
+  /** The clamped position along the segment the answer was taken at. */
+  ratio: number;
+}
+
+export interface SegmentGeometry {
+  segment: string;
+  /** The canonical polyline, in travel order, as [lat, lon] pairs. */
+  points: Array<[number, number]>;
+  meters: number;
+}
+
+export interface RoadsInResult {
+  /** One entry per physical polyline — a one-way pair is drawn once. */
+  roads: Array<{ points: Array<[number, number]>; roadClass: string }>;
+  /** Leaves actually read, capped by `maxLeaves`. */
+  leaves: number;
+  /** True when the bbox covered more leaves than the cap allowed. */
+  truncated: boolean;
+}
+
+/**
+ * The static facts about one leaf's edges, keyed by the `geomRef` that
+ * identifies a physical segment on the wire. Accessors are synchronous
+ * because PulseMesh's validator is; they return null for a ref this leaf
+ * does not carry.
+ */
+export interface CellFacts {
+  leaf: number;
+  polylineCount: number;
+  classOf(geomRef: number): string | null;
+  metersOf(geomRef: number): number | null;
+  freeflowKmhOf(geomRef: number): number | null;
+}
+
 export interface RouteGraphEngine {
   root: unknown;
   io?: RouteGraphIo;
@@ -368,6 +407,31 @@ export interface RouteGraphEngine {
     extraMeters?: number;
     maxSnapMeters?: number;
   }): Promise<SnapResult>;
+  /**
+   * The inverse of `snap()`: decode a physical segment's canonical
+   * polyline and interpolate along it by arc length. Required by the
+   * thread channel, whose records carry position as (segment, ratio)
+   * rather than coordinates. `ratio` is clamped to [0, 1].
+   */
+  locate(segment: string, ratio?: number): Promise<SegmentPoint>;
+  /**
+   * A whole physical segment as a drawable polyline. `locate()` answers
+   * "where along this segment", which draws a straight chord across every
+   * bend if used to rebuild the line itself.
+   */
+  geometryOf(segment: string): Promise<SegmentGeometry>;
+  /** Every road in a bounding box, as drawable polylines. `maxLeaves` defaults to 24. */
+  roadsIn(
+    bbox: { minLat: number; maxLat: number; minLon: number; maxLon: number },
+    options?: { maxLeaves?: number }
+  ): Promise<RoadsInResult>;
+  /**
+   * Static facts about one leaf, for hosts that must answer PulseMesh
+   * validation rules 10–12. Resolves null when `leaf` is not in this
+   * graph; a cold leaf is a legal "no context" answer, and inventing one
+   * is worse than skipping the rules.
+   */
+  cellFacts(leaf: number): Promise<CellFacts | null>;
   stats(): RouteFetchStats;
   resetStats(): void;
   clearCaches(): void;

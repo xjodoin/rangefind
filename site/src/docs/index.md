@@ -116,3 +116,4 @@ For production hosting, caching headers, and CDN guidance, read
 - [How it works](how-it-works/) — what's actually in those files.
 - [Search component](search-component/) — every attribute and CSS hook.
 - [Query API](query-api/) — filters, facets, sorting, geo, vectors.
+- [Routing & itineraries](routing/) — the same substrate applied to roads.

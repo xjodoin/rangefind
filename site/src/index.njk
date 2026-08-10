@@ -163,6 +163,44 @@ await rf.search({ q: "byte ranges" });</code></pre>
     </p>
   </section>
 
+  <section class="section">
+    <span class="eyebrow">route-graph/ · pulsemesh/</span>
+    <h2>It routes, too — and it still isn't a server</h2>
+    <p>
+      The same trick works on roads. A route graph packed into
+      content-addressed objects answers driving routes, travel-time
+      matrices, and optimized multi-stop itineraries from a bounded set of
+      range requests — results proven <strong>edge-for-edge identical</strong>
+      to a full-graph Dijkstra. Live traffic arrives through a provider
+      contract, and PulseMesh implements it peer-to-peer, so nothing about
+      where anyone drove reaches a database.
+    </p>
+    <div class="features">
+      <div class="feature">
+        <span class="eyebrow">itinerary()</span>
+        <h3>Routing &amp; itineraries</h3>
+        <p>Exact Held-Karp stop ordering up to 10 interior stops, 2-opt beyond. A 5-stop, 525 km round plans in ~410 ms cold — matrix, ordering, and four unpacked legs.</p>
+        <p><a href="{{ '/docs/routing/' | url }}">Plan a route →</a></p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">live: provider</span>
+        <h3>PulseMesh live traffic</h3>
+        <p>Anonymous corroborated speed observations, ~42 bytes each, aggregated identically by every peer. No traffic server, no accounts, and a 90-second TTL as the entire retention policy.</p>
+        <p><a href="{{ '/docs/pulsemesh/' | url }}">How the mesh works →</a></p>
+      </div>
+      <div class="feature">
+        <span class="eyebrow">45 bytes</span>
+        <h3>PulseMesh threads</h3>
+        <p>Follow one school bus or one courier from a link that is a key, not a URL to a server. The arrival time is routed on your own device, so the publisher never learns which stop you care about.</p>
+        <p><a href="{{ '/docs/pulsemesh-threads/' | url }}">Follow a thread →</a></p>
+      </div>
+    </div>
+    <p style="margin-top:1.6rem">
+      <a class="button button--marker" href="{{ '/docs/routing/' | url }}">Read the routing docs</a>
+      <a class="button button--ghost" href="{{ '/docs/pulsemesh/' | url }}">Live traffic without a server</a>
+    </p>
+  </section>
+
   <div class="band">
     <div class="band__inner">
       <span class="eyebrow">debug/build-telemetry.json</span>

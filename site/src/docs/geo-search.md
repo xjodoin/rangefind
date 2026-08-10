@@ -77,3 +77,7 @@ OSM adapter, including the capabilities that still require another provider.
 
 Planet-scale OSM — every country, updated nightly — is the sharded setup:
 see [Sharded indexes](../sharded-indexes/).
+
+Corridor search needs a corridor. Rangefind computes one itself from the
+same static substrate — see [Routing & itineraries](../routing/), whose
+output geometry feeds `prepareRoute` directly.

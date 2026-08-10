@@ -50,6 +50,14 @@ export default {
         { title: "Sharded indexes", url: "/docs/sharded-indexes/" },
         { title: "Benchmarks", url: "/docs/benchmarks/" }
       ]
+    },
+    {
+      section: "Routing & live data",
+      items: [
+        { title: "Routing & itineraries", url: "/docs/routing/" },
+        { title: "PulseMesh live traffic", url: "/docs/pulsemesh/" },
+        { title: "PulseMesh threads", url: "/docs/pulsemesh-threads/" }
+      ]
     }
   ]
 };
