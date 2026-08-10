@@ -98,7 +98,21 @@ export async function createPulseMeshHost({
   // people's traffic, and that is a decision an operator makes. A keeper
   // turns it on (scripts/pulsemesh_keeper.mjs), because a keeper nobody
   // can be reached through is a keeper that carries nothing.
-  relay = false
+  relay = false,
+  // This host's stable identity. Absent, libp2p mints a fresh Ed25519
+  // key at startup and the peer id changes on every restart — which is
+  // fine for a tab and fatal for a seed: a fleet seed's address travels
+  // inside sealed tickets (threads §20.10), and `/p2p/<peerId>` is part
+  // of that address. A seed that reboots with a new identity invalidates
+  // every ticket already handed to a driver, silently, and the failure
+  // shows up as phones that simply never connect. Long-lived hosts pass
+  // a key they persisted; the library still stores nothing itself.
+  privateKey = null,
+  // Addresses to tell other peers about, when they differ from what this
+  // process bound. A seed behind a TLS terminator listens on a local
+  // `/ws` and is reached at `/dns4/<host>/tcp/443/tls/ws` — libp2p can
+  // only observe the former, so the latter has to be stated.
+  announce = []
 } = {}) {
   const browser = profile === "browser";
   const [{ createLibp2p }, { noise }, { yamux }, { identify }, { gossipsub }] = await Promise.all([
@@ -226,7 +240,11 @@ export async function createPulseMeshHost({
   const host = await createLibp2p({
     // A browser cannot listen on a socket; it dials out and accepts
     // relayed circuits.
-    addresses: { listen: listen ?? (browser ? ["/p2p-circuit", "/webrtc"] : ["/ip4/127.0.0.1/tcp/0"]) },
+    addresses: {
+      listen: listen ?? (browser ? ["/p2p-circuit", "/webrtc"] : ["/ip4/127.0.0.1/tcp/0"]),
+      ...(announce.length ? { announce } : {})
+    },
+    ...(privateKey ? { privateKey } : {}),
     transports,
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],

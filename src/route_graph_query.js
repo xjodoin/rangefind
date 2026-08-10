@@ -2065,6 +2065,8 @@ export async function openRouteGraph(options) {
       step.exitRef = sign?.exit || "";
       step.destinationRef = sign?.destRef || "";
       step.destination = sign?.dest || "";
+      // The scheme the number is posted under, for whatever draws the shield.
+      step.network = sign?.network || "";
       delete step.sign;
     }
     // What the route uses that costs money, and what that costs where the map

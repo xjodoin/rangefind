@@ -24,7 +24,7 @@ export const ROUTE_ROOT_MAGIC = [0x52, 0x46, 0x52, 0x54]; // RFRT
 export const ROUTE_CELL_MAGIC = [0x52, 0x46, 0x52, 0x43]; // RFRC
 export const ROUTE_OVERLAY_MAGIC = [0x52, 0x46, 0x52, 0x4f]; // RFRO
 export const ROUTE_GEOMETRY_MAGIC = [0x52, 0x46, 0x52, 0x50]; // RFRP
-const ROOT_VERSION = 10;
+const ROOT_VERSION = 11;
 const CELL_VERSION = 14;
 // v5 cells carry no lane column. A published index is a large download that
 // A reader requires the version it was built for. Carrying older shapes means
@@ -550,6 +550,10 @@ export function encodeRouteRoot(root) {
     pushUtf8(out, sign.exit || "");
     pushUtf8(out, sign.destRef || "");
     pushUtf8(out, sign.dest || "");
+    // Which numbering scheme posts this number — "CA:QC:A", "US:I", "e-road".
+    // A bare number is drawn on a different shield in every country, and this
+    // is the only thing in the data that says which.
+    pushUtf8(out, sign.network || "");
   }
   // The distinct sets of physical limits edges point at. A whole province
   // repeats a few hundred between them — 3.5 t, 4.0 m, 2.6 m are posted over
@@ -672,7 +676,8 @@ export function decodeRouteRoot(bytes) {
       ref: readUtf8(bytes, state),
       exit: readUtf8(bytes, state),
       destRef: readUtf8(bytes, state),
-      dest: readUtf8(bytes, state)
+      dest: readUtf8(bytes, state),
+      network: readUtf8(bytes, state)
     });
   }
   const limitCount = readVarint(bytes, state);
