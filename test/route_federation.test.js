@@ -179,6 +179,36 @@ test("nearby regional roads are never stitched without a shared OSM id", async (
   assert.deepEqual(source.opened, [], "regional packs are not opened when portal proof fails");
 });
 
+test("an adjacent endpoint region is proved before unrelated neighbor expansion", async () => {
+  const catalog = {
+    format: "rangefind-route-catalog-v1",
+    indexes: [
+      { region: "west", profile: "car", base: "west/", bbox: [0, 0, 10, 7], portals: "p.json", neighbors: ["middle", "east"] },
+      { region: "middle", profile: "car", base: "middle/", bbox: [0, 6, 10, 14], portals: "p.json", neighbors: ["west", "east"] },
+      { region: "east", profile: "car", base: "east/", bbox: [0, 13, 10, 20], portals: "p.json", neighbors: ["middle", "west"] }
+    ]
+  };
+  const sidecars = {
+    west: { format: "rfrouteportals-v1", neighbors: { middle: [2, 5e7, 65e6], east: [1, 5e7, 7e7] } },
+    middle: { format: "rfrouteportals-v1", neighbors: { west: [2, 5e7, 65e6], east: [3, 5e7, 135e6] } },
+    east: { format: "rfrouteportals-v1", neighbors: { middle: [3, 5e7, 135e6], west: [1, 5e7, 7e7] } }
+  };
+  const sidecarReads = [];
+  const source = fixture();
+  const engine = await openRouteCatalogUrl(catalogUrl, {
+    fetch: async url => {
+      if (url === catalogUrl) return jsonResponse(catalog);
+      const region = new URL(url).pathname.split("/").at(-2);
+      sidecarReads.push(region);
+      return jsonResponse(sidecars[region]);
+    },
+    openGraph: source.openGraph
+  });
+  const result = await engine.route({ from: point(5, 1), to: point(5, 19), geometry: false });
+  assert.deepEqual(result.regions, ["west", "east"]);
+  assert.deepEqual(new Set(sidecarReads), new Set(["west", "east"]));
+});
+
 test("portal-aware catalog search bypasses a false direct bbox edge", async () => {
   const catalog = {
     format: "rangefind-route-catalog-v1",

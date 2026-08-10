@@ -368,6 +368,8 @@ export declare function openRouteCatalogUrl(catalogUrl: string, options?: {
   verifyPortalChecksums?: boolean;
   maxPortalsPerBorder?: number;
   maxRegionPaths?: number;
+  /** Prefer a proven direct handoff over exploring multi-region detours. Defaults to true. */
+  preferDirectRegionPath?: boolean;
   maxRegionHops?: number;
   /** Maximum portal-proven regional nodes expanded while finding catalog paths. */
   maxRegionExpansions?: number;

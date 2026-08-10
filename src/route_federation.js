@@ -468,15 +468,24 @@ export async function openRouteCatalogUrl(catalogUrl, options = {}) {
       throw routeError("RANGEFIND_ROUTE_NO_REGION", `Unknown ${profile} route region ${fromRegion} or ${toRegion}.`);
     }
     if (fromRegion === toRegion) return (await graphFor(fromRegion)).route(params);
-    const paths = await connectedRegionPaths(
-      fromRegion,
-      toRegion,
-      indexes,
-      Math.max(1, Math.floor(options.maxRegionPaths ?? 3)),
-      Math.max(1, Math.floor(options.maxRegionHops ?? 12)),
-      Math.max(1, Math.floor(options.maxRegionExpansions ?? 512)),
-      async (left, right) => (await sharedPortals(left, right, from, to)).length > 0
-    );
+    // Adjacent extracts are the overwhelmingly common inter-region case.
+    // Prove that edge first and avoid expanding every bbox neighbor merely to
+    // rediscover a longer regional detour. Callers that explicitly want to
+    // compare cross-border/detour region paths can disable this fast path.
+    const directCandidate = indexes.get(fromRegion)?.neighbors?.includes(toRegion);
+    const directConnected = directCandidate
+      && (await sharedPortals(fromRegion, toRegion, from, to)).length > 0;
+    const paths = directConnected && options.preferDirectRegionPath !== false
+      ? [[fromRegion, toRegion]]
+      : await connectedRegionPaths(
+        fromRegion,
+        toRegion,
+        indexes,
+        Math.max(1, Math.floor(options.maxRegionPaths ?? 3)),
+        Math.max(1, Math.floor(options.maxRegionHops ?? 12)),
+        Math.max(1, Math.floor(options.maxRegionExpansions ?? 512)),
+        async (left, right) => (await sharedPortals(left, right, from, to)).length > 0
+      );
     let winner = null;
     for (const regionPath of paths) {
       const candidate = await evaluatePath(regionPath, from, to, params);

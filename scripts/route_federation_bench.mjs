@@ -57,7 +57,7 @@ async function measured(label, engine, geometry) {
     portals: result.transitions.map(transition => transition.osmNodeId),
     requests: network.requests,
     fetchedMiB: Math.round((network.bytes / 1024 / 1024) * 100) / 100,
-    cache: network.cache,
+    cache: { ...network.cache },
     routeRangeRequestsCumulative: result.stats?.httpRequests || 0,
     routeRangeOverfetchMiBCumulative: Math.round(((result.stats?.rangeOverfetchBytes || 0) / 1024 / 1024) * 100) / 100
   };

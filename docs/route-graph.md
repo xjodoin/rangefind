@@ -162,6 +162,10 @@ For a cross-region query the client:
 6. merges geometry, steps, junctions, statistics, and region-qualified segment
    ids into one normal route result.
 
+Adjacent endpoint regions use their proven direct handoff before expanding
+multi-region detours. Set `preferDirectRegionPath: false` when an application
+needs to compare those detours as well.
+
 `maxPortalsPerBorder`, `maxRegionPaths`, `maxRegionHops`,
 `maxRegionExpansions`, and `portalConcurrency` bound CPU and transfer for
 unusual topology. Catalog BFS expands only portal-proven edges, so overlapping
