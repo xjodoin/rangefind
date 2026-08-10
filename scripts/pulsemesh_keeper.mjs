@@ -51,6 +51,8 @@ import { ADMIT_CONNECTED, BRIDGE_POLICIES, createFleetBridge } from "../src/puls
 import { THREAD_MAX_BOOTSTRAP_ADDRESSES, THREAD_MAX_BOOTSTRAP_BYTES } from "../src/pulsemesh/thread_codec.js";
 import { encodeSeedCard, isDialableAddress, seedCardUrl } from "../src/pulsemesh/thread_seed.js";
 import { encodeQr, qrTerminal } from "../src/qr.js";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).map(arg => {
   const [key, value] = arg.replace(/^--/, "").split("=");
@@ -71,10 +73,26 @@ Required
   --graph=<dir>           the static route graph this keeper validates against
   --test-world            harness substitute for --graph: a synthetic 64-leaf world
 
+Identity
+  --identity=<file>       persist this keeper's Ed25519 key here, creating it on
+                          first run. A seed's /p2p/<peerId> is signed into every
+                          sealed ticket that carries its address, so WITHOUT this
+                          a restart mints a new identity and silently strands
+                          every device already holding a ticket. Long-lived
+                          deployments should always pass it.
+
 Mesh
-  --listen=<multiaddr>    where THIS host listens (default /ip4/127.0.0.1/tcp/0).
+  --listen=<ma>,...       where THIS host listens (default /ip4/127.0.0.1/tcp/0).
+                          Takes a list: keeper↔keeper is TCP while a customer's
+                          tab can only arrive over WebSocket, and those are two
+                          addresses on one peer id.
                           With --bridge on, this is MY ISLAND: the address a
                           fleet's own devices dial, and what --seed-card prints.
+  --announce=<ma>,...     addresses to advertise instead of what was bound, for
+                          when they differ — a seed behind a TLS terminator
+                          listens on a local /ws and is reached at
+                          /dns4/<host>/tcp/443/tls/ws. The seed card carries
+                          these.
   --bootstrap=<ma>,...    peers to dial. With --bridge on, this is THE WIDER
                           NETWORK, dialled by a second, listen-less host — never
                           by the island side. With --bridge=off it is the plain
@@ -222,7 +240,22 @@ if (!bridging && admit && bootstrap.length) {
 // the thread's topic is derived from a capability this host never holds.
 const relay = String(args.relay ?? "on").toLowerCase() !== "off";
 
-const listenAddress = String(args.listen || "/ip4/127.0.0.1/tcp/0");
+// One host can face more than one transport, and a product seed has to:
+// keeper↔keeper is TCP, while a customer's tab can only ever arrive over
+// WebSocket. Those are two listen addresses on one peer id, not two
+// peers — so --listen takes a list.
+const listenAddresses = String(args.listen || "/ip4/127.0.0.1/tcp/0")
+  .split(",").map(part => part.trim()).filter(Boolean);
+if (!listenAddresses.length) fail("--listen listed no addresses");
+
+// What this process bound is not always what another peer can reach. A
+// seed behind a TLS terminator listens on a local /ws and is dialled at
+// /dns4/<host>/tcp/443/tls/ws; libp2p can only observe the first, so the
+// second is stated here and is what the seed card carries.
+const announce = args.announce
+  ? String(args.announce).split(",").map(part => part.trim()).filter(Boolean)
+  : [];
+
 // A relay that nobody can be *found* through is only half a keeper.
 // Threads are discovered by content routing (threads §4.2): a publisher
 // advertises the rendezvous key derived from its rotating tag, a holder
@@ -231,12 +264,25 @@ const listenAddress = String(args.listen || "/ip4/127.0.0.1/tcp/0");
 // that is always up. Its scope follows its own listen address for the
 // reason in the library: the public mapper strips private addresses, so a
 // depot LAN with the default would form connections and no routing table.
-const dhtScope = /\/ip4\/(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/u.test(listenAddress)
+// With several addresses, one reachable from outside is enough to make
+// this a public node — a seed that also binds loopback is still public.
+const isPrivateAddress = address =>
+  /\/ip4\/(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/u.test(address);
+const dhtScope = (announce.length ? announce : listenAddresses).every(isPrivateAddress)
   ? "lan"
   : "public";
 
+// A seed's identity is part of its address. `/p2p/<peerId>` is signed
+// into every sealed ticket that carries this seed (threads §20.10), so a
+// keeper that mints a fresh key on each start hands out addresses that
+// stop working the first time it restarts — and does it silently, since
+// the drivers' phones just fail to connect. Persist it when asked.
+const privateKey = args.identity ? await loadOrCreateIdentity(String(args.identity)) : null;
+
 const host = await createPulseMeshHost({
-  listen: [listenAddress],
+  listen: listenAddresses,
+  announce,
+  privateKey,
   // With bridging on, --bootstrap belongs to the upstream host below:
   // this one faces the island and dials nobody.
   bootstrapPeers: bridging ? [] : bootstrap,
@@ -354,6 +400,36 @@ console.log(JSON.stringify({
   upstreamPeerId: upstreamHost ? upstreamHost.peerId.toString() : null,
   upstreamReadOnly: bridgePolicy === "in"
 }));
+
+// --- Identity --------------------------------------------------------------
+
+/**
+ * Reads this keeper's Ed25519 identity from `path`, creating it on first
+ * run. The file is the protobuf encoding libp2p already speaks, written
+ * 0600, and it is the seed's whole identity: whoever holds it can be
+ * this seed. Back it up with the same care as a signing key, and do not
+ * copy it to a second machine — two hosts answering as one peer id is a
+ * mesh that disagrees with itself about where a peer is.
+ */
+async function loadOrCreateIdentity(path) {
+  const { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } =
+    await import("@libp2p/crypto/keys");
+  try {
+    return privateKeyFromProtobuf(await readFile(path));
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      fail(`--identity=${path} could not be read: ${error?.message ?? error}`);
+    }
+  }
+  const key = await generateKeyPair("Ed25519");
+  await mkdir(dirname(path), { recursive: true });
+  // `mode` on write only applies when the file is created, which is
+  // exactly the case here — and it must be created already-private
+  // rather than chmod'ed a moment later.
+  await writeFile(path, privateKeyToProtobuf(key), { mode: 0o600, flag: "wx" });
+  console.error(`pulsemesh-keeper: minted a new identity at ${path} — back it up.`);
+  return key;
+}
 
 // --- Fleet-seed mode (threads §20.10) -------------------------------------
 
