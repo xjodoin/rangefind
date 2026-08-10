@@ -11,6 +11,7 @@
 // fragments would otherwise poison random-pair benchmarks.
 
 import { closeSync, fstatSync, fsyncSync, openSync, readSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { routePortalColumns } from "../src/route_portals.js";
 import { scanPbf } from "./osm_pbf.mjs";
 
 export const ROAD_SOURCE_FORMAT = "rfroutesrc-v8";
@@ -2963,7 +2964,6 @@ export function filterLargestScc(graph, log) {
 
 export function writeRoadGraph(path, graph) {
   const namesBytes = new TextEncoder().encode(JSON.stringify(graph.names));
-  const portalsBytes = new TextEncoder().encode(JSON.stringify(graph.portals || {}));
   const sections = [
     ["nodeLat", graph.nodeLat],
     ["nodeLon", graph.nodeLon],
@@ -2982,9 +2982,42 @@ export function writeRoadGraph(path, graph) {
     ["laneBytes", graph.laneBytes],
     ["geomOffsets", graph.geomOffsets],
     ["geomBytes", graph.geomBytes],
-    ["namesBytes", namesBytes],
-    ["portalsBytes", portalsBytes]
-  ];
+    ["namesBytes", namesBytes]
+  ].map(([name, array]) => ({
+    name,
+    bytes: array.byteLength,
+    type: array.constructor.name,
+    array
+  }));
+  // India has tens of millions of federation candidates, enough to exceed
+  // V8's maximum string length. Persist them as 16-byte binary rows instead
+  // of materializing one country-sized JSON string. Each column is emitted
+  // through a small reusable buffer, so peak memory stays bounded.
+  const portalColumns = [];
+  for (const [id, values] of Object.entries(graph.portals || {})) {
+    const columns = routePortalColumns(values);
+    const index = portalColumns.length;
+    const descriptor = {
+      id,
+      count: columns.count,
+      ids: `portalIds.${index}`,
+      latE7: `portalLatE7.${index}`,
+      lonE7: `portalLonE7.${index}`
+    };
+    portalColumns.push(descriptor);
+    for (const [key, Type, source, sourceOffset] of [
+      ["ids", Float64Array, columns.ids, 0],
+      ["latE7", Int32Array, columns.latE7, columns.latOffset],
+      ["lonE7", Int32Array, columns.lonE7, columns.lonOffset]
+    ]) {
+      sections.push({
+        name: descriptor[key],
+        bytes: columns.count * Type.BYTES_PER_ELEMENT,
+        type: Type.name,
+        portal: { Type, source, sourceOffset, stride: columns.stride, key, count: columns.count }
+      });
+    }
+  }
   const header = {
     format: ROAD_SOURCE_FORMAT,
     // The distinct conditional windows an edge's condRule indexes into. A
@@ -2998,11 +3031,8 @@ export function writeRoadGraph(path, graph) {
     edges: graph.edgeFrom.length,
     profile: graph.profile || "car",
     classes: graph.classes || [],
-    sections: sections.map(([name, array]) => ({
-      name,
-      bytes: array.byteLength,
-      type: array.constructor.name
-    }))
+    portalColumns,
+    sections: sections.map(({ name, bytes, type }) => ({ name, bytes, type }))
   };
   const headerBytes = new TextEncoder().encode(JSON.stringify(header) + "\n");
 
@@ -3020,11 +3050,31 @@ export function writeRoadGraph(path, graph) {
       offset += writeSync(fd, bytes, offset, bytes.byteLength - offset);
     }
   };
+  const writePortalColumn = ({ Type, source, sourceOffset, stride, key, count }) => {
+    const chunk = new Type(Math.min(count, 64 * 1024));
+    for (let start = 0; start < count; start += chunk.length) {
+      const length = Math.min(chunk.length, count - start);
+      for (let index = 0; index < length; index++) {
+        const value = Number(source[(start + index) * stride + sourceOffset]);
+        if (key === "ids"
+          ? (!Number.isSafeInteger(value) || value < 0)
+          : (!Number.isInteger(value) || value < -0x80000000 || value > 0x7fffffff)) {
+          throw new Error(`Invalid route portal ${key} value at row ${start + index}.`);
+        }
+        chunk[index] = value;
+      }
+      writeAll(new Uint8Array(chunk.buffer, 0, length * Type.BYTES_PER_ELEMENT));
+    }
+  };
   try {
     fd = openSync(temporary, "wx");
     writeAll(headerBytes);
-    for (const [, array] of sections) {
-      writeAll(new Uint8Array(array.buffer, array.byteOffset, array.byteLength));
+    for (const section of sections) {
+      if (section.array) {
+        writeAll(new Uint8Array(section.array.buffer, section.array.byteOffset, section.array.byteLength));
+      } else {
+        writePortalColumn(section.portal);
+      }
     }
     fsyncSync(fd);
     closeSync(fd);
@@ -3039,7 +3089,7 @@ export function writeRoadGraph(path, graph) {
   }
 }
 
-const TYPED_ARRAYS = { Int32Array, Uint32Array, Uint8Array };
+const TYPED_ARRAYS = { Float64Array, Int32Array, Uint32Array, Uint8Array };
 const ROAD_GRAPH_READ_CHUNK_BYTES = 64 * 1024 * 1024;
 const ROAD_GRAPH_MAX_HEADER_BYTES = 64 * 1024 * 1024;
 
@@ -3089,6 +3139,23 @@ export async function readRoadGraph(path) {
       condRules: header.condRules || [],
       signs: header.signs || []
     };
+    const portalColumns = Array.isArray(header.portalColumns) ? header.portalColumns : [];
+    const portals = Object.fromEntries(portalColumns.map(portal => [portal.id, {}]));
+    if (Object.keys(portals).length !== portalColumns.length) {
+      throw new Error("Duplicate road graph portal region metadata.");
+    }
+    const portalSection = new Map();
+    for (const portal of portalColumns) {
+      if (typeof portal.id !== "string" || !Number.isSafeInteger(portal.count) || portal.count < 0) {
+        throw new Error("Invalid road graph portal column metadata.");
+      }
+      for (const [key, type] of [["ids", "Float64Array"], ["latE7", "Int32Array"], ["lonE7", "Int32Array"]]) {
+        if (typeof portal[key] !== "string" || portalSection.has(portal[key])) {
+          throw new Error("Invalid or duplicate road graph portal section metadata.");
+        }
+        portalSection.set(portal[key], { portal: portals[portal.id], key, type, count: portal.count });
+      }
+    }
     let offset = dataOffset;
     for (const section of header.sections) {
       if (!Number.isSafeInteger(section.bytes) || section.bytes < 0 || offset + section.bytes > fileBytes) {
@@ -3108,7 +3175,27 @@ export async function readRoadGraph(path) {
       if (!Type || section.bytes % Type.BYTES_PER_ELEMENT !== 0) {
         throw new Error(`Invalid road graph section type: ${section.name} (${section.type}).`);
       }
-      graph[section.name] = new Type(bytes.buffer);
+      const array = new Type(bytes.buffer);
+      const target = portalSection.get(section.name);
+      if (target) {
+        if (section.type !== target.type || array.length !== target.count) {
+          throw new Error(`Invalid road graph portal section: ${section.name}.`);
+        }
+        target.portal[target.key] = array;
+      } else {
+        graph[section.name] = array;
+      }
+    }
+    if (portalColumns.length) {
+      for (const portal of portalColumns) {
+        const values = portals[portal.id];
+        if (!values.ids || !values.latE7 || !values.lonE7) {
+          throw new Error(`Missing road graph portal columns for ${portal.id}.`);
+        }
+      }
+      graph.portals = portals;
+    } else {
+      graph.portals ||= {};
     }
     return graph;
   } finally {

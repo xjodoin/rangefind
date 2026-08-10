@@ -264,6 +264,14 @@ place to read a byte that is really the next field. An index is derived data
 and reproducing it is two commands, so a format change is a rebuild, not an
 archaeology problem. Clients holding an older copy are told to refresh it.
 
+The v8 source container writes inter-region portal candidates as three binary
+columns (`Float64` OSM ids plus `Int32` latitude/longitude). This keeps the
+temporary graph at 16 bytes per candidate and avoids materializing a
+country-sized JSON string during either extraction or build. The section
+directory describes the columns, so an interrupted build can resume from the
+same source file with bounded memory. Readers also accept the earlier v8
+`portalsBytes` section produced before the columnar optimization.
+
 ## Quebec benchmark
 
 `scripts/route_bench.mjs bench` verifies exact equality against a reference
