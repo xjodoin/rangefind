@@ -56,6 +56,15 @@ const EDGE_FLAG_HOV3_ONLY = 128;
 const HOV_MINIMUM_OCCUPANCY = 2;
 
 /**
+ * Below this the final leg into the destination is not its own instruction.
+ *
+ * Doors sit a few metres past a junction as often as not, and "turn into Rue
+ * Armstrong, then arrive" is one instruction rather than two when the street
+ * is four metres long.
+ */
+const ARRIVAL_STEP_METERS = 10;
+
+/**
  * Above this a vehicle is a goods vehicle as far as a sign is concerned.
  *
  * 3.5 t is where the line sits in the EU, the UK and most of the world that
@@ -2197,7 +2206,58 @@ export async function openRouteGraph(options) {
       }
       if (!roundabout) roundaboutExits = 0;
     }
-    if (chain.endMatch) pushPoint(chain.endMatch.snappedLatE7, chain.endMatch.snappedLonE7);
+    if (chain.endMatch) {
+      // Where this last leg begins, captured before the destination point is
+      // appended: `at` indexes the point a step *starts* at, and a client
+      // reads the turn onto the step from the bearings either side of it. An
+      // `at` pointing at the final point has nothing after it to turn into,
+      // so the turn measured zero and the last instruction of the drive —
+      // "turn left into Rue Armstrong" — was drawn as a straight-on arrival.
+      const tailAt = Math.max(0, geometry.length - 1);
+      pushPoint(chain.endMatch.snappedLatE7, chain.endMatch.snappedLonE7);
+      // The last thing a driver does is turn into the street the address is
+      // on and drive part of it. That leg is the seed the search finished on
+      // rather than an edge it traversed, so it reached the geometry and
+      // never the step list — and the arrival was announced on whichever
+      // road the driver had turned *off*. Routing to a door on Rue Armstrong
+      // ended "arrive on Rue Frenette", 73 m short, with those 73 m missing
+      // from the distance as well. The time was always right: the seed is in
+      // the recompute below.
+      const tail = chain.endMatch;
+      const tailMeters = (tail.distDm / 10) * tail.ratio;
+      const tailName = names ? names[tail.nameId] || "" : "";
+      const previous = steps[steps.length - 1];
+      if (tailMeters > 0) {
+        distanceMeters += tailMeters;
+        const tailSeconds =
+          bucketWeight(tail.weight, tail.classCode, factors) * tail.ratio / 10;
+        // A sliver, or the same road carrying on: extend rather than invent
+        // an instruction out of the last few metres of a street the driver
+        // is already on.
+        if (!previous || (tailName && tailName !== previous.name && tailMeters >= ARRIVAL_STEP_METERS)) {
+          steps.push({
+            name: tailName,
+            meters: tailMeters,
+            seconds: tailSeconds,
+            at: tailAt,
+            roadClass: tail.classCode,
+            forkArms: 0,
+            endOfRoad: false,
+            lanes: [],
+            laneAccess: [],
+            laneDestinations: [],
+            laneReach: 0,
+            sign: null,
+            roundabout: false,
+            roundaboutExit: 0,
+            limitMeters: new Map()
+          });
+        } else {
+          previous.meters += tailMeters;
+          previous.seconds += tailSeconds;
+        }
+      }
+    }
     // Where the posted limit changes along the route, as a step function over
     // distance travelled.
     //

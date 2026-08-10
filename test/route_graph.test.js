@@ -3475,3 +3475,74 @@ test("Montréal's three-aboard reserved lane reaches the step, and gates on occu
     "no two-aboard lane survived at all"
   );
 });
+
+test("the last step is the street the address is on", async (t) => {
+  // A destination almost never sits on a junction: the last thing a driver
+  // does is turn into the street the address is on and drive part of it.
+  //
+  // That leg is the seed the search finishes on rather than an edge it
+  // traverses, and it was reaching the geometry without ever reaching the
+  // step list. Routing to a door on Rue Armstrong ended "arrive on Rue
+  // Frenette" — the road turned *off* — 73 m short, with those 73 m missing
+  // from the distance too. The clue was the asymmetry: the same coordinate
+  // was "Rue Armstrong" when used as an origin, because a forward seed
+  // enters at the far node and really does traverse its edge.
+  const fixture = "examples/osm-geo/public/route-graph";
+  if (!existsSync(join(fixture, "manifest.json"))) {
+    t.skip(`route graph fixture missing at ${fixture}`);
+    return;
+  }
+  const engine = await openRouteGraphDir(fixture);
+  const R = 6371000;
+  const rad = (x) => (x * Math.PI) / 180;
+  const between = (a, b) => {
+    const dLat = rad(b[0] - a[0]);
+    const dLon = rad(b[1] - a[1]);
+    return Math.hypot(dLat, dLon * Math.cos(rad((a[0] + b[0]) / 2))) * R;
+  };
+
+  let seed = 20260810;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 0x100000000);
+  const point = () => ({ lat: 49.45 + rnd() * 0.70, lon: 5.75 + rnd() * 0.75 });
+
+  let checked = 0;
+  for (let attempt = 0; attempt < 200 && checked < 40; attempt++) {
+    let route;
+    try {
+      route = await engine.route({ from: point(), to: point() });
+    } catch {
+      continue;
+    }
+    if (!route.steps?.length || !route.geometry?.length) continue;
+    checked++;
+
+    // Every metre of the drive belongs to some step. The tail going missing
+    // showed up here first: the route was 73 m shorter than the line it drew.
+    const summed = route.steps.reduce((total, step) => total + step.meters, 0);
+    assert.ok(
+      Math.abs(summed - route.distanceMeters) < 1,
+      `steps sum to ${summed.toFixed(1)} m but the route claims ${route.distanceMeters.toFixed(1)} m`
+    );
+
+    // And the last step covers the geometry to the destination rather than
+    // stopping at the junction before it.
+    const last = route.steps[route.steps.length - 1];
+    let drawn = 0;
+    for (let i = last.at + 1; i < route.geometry.length; i++) {
+      drawn += between(
+        [route.geometry[i - 1].lat ?? route.geometry[i - 1][0], route.geometry[i - 1].lon ?? route.geometry[i - 1][1]],
+        [route.geometry[i].lat ?? route.geometry[i][0], route.geometry[i].lon ?? route.geometry[i][1]]
+      );
+    }
+    // Loose: the polyline is simplified and road distances come from the
+    // index, so a few percent of drift is ordinary. A whole unnamed street
+    // is not.
+    assert.ok(
+      drawn - last.meters < Math.max(15, last.meters * 0.25),
+      `the last step reports ${last.meters.toFixed(1)} m but its geometry runs ` +
+      `${drawn.toFixed(1)} m — the leg into the destination has no step of its own`
+    );
+  }
+
+  assert.ok(checked > 20, `too few routes to conclude anything (${checked})`);
+});
