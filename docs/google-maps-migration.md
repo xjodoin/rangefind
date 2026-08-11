@@ -252,7 +252,15 @@ cache and intentionally fails if the application discarded the selected place.
 This catches an unnecessary Google-style second request during migration.
 
 Autocomplete predictions carry `rangefindSelection` instead of inventing a
-Google place id before a document has been selected:
+Google place id before a document has been selected. Where Google requires a
+second billed Place Details request after a prediction is picked, a Rangefind
+suggestion already names its document: `suggestOsmQuery` stamps
+`selection.doc`, and `resolveOsmSuggestion()` turns it into the full place in
+two small range reads (~0.5 KB) with no search. `suggestOsmQuery({ hydrate:
+true })` — or `hydrateOsmSuggestions(engine, [prediction])` for one row —
+resolves predictions into places *before* selection, which is how you build
+previews (map pins, distances) without a per-prediction details call. See the
+[autocomplete guide](autocomplete.md).
 
 ```js
 const response = await maps.autocomplete({

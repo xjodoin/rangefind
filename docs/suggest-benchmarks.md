@@ -10,6 +10,48 @@ npm run bench:suggest
 node scripts/suggest_bench.mjs --root=examples/osm-geo
 ```
 
+For how to *use* these lanes well, see the
+[autocomplete guide](autocomplete.md).
+
+## Cost of each autocomplete pattern
+
+Recorded 2026-08-11, each scenario in a cold process against an HTTP
+range server. "Typing" is seven keystrokes (`p` → `philhar`); the lexicon
+caches, so most keystrokes after the first transfer nothing.
+
+| Pattern | OSM Luxembourg (339,445 docs) | wiki (200 docs) |
+| --- | ---: | ---: |
+| Completions only, typing | 6 req / 46.9 KB | 5 req / 4.5 KB |
+| Completions + `hydrate: true`, typing | 46 req / 786 KB | 7 req / 90 KB |
+| `suggestOsmQuery`, typing | 10 req / 55.8 KB | — |
+| `suggestOsmQuery` + `hydrate: true`, typing | 32 req / 4,259 KB | — |
+| `suggestOsmQuery` + focused previews, typing | 22 req / 509 KB | — |
+| Selection via `hydrateRows` | 2 req / 0.5 KB | — |
+| Selection via re-running the query as a search | 14 req / 215 KB | — |
+
+Two conclusions drive the guide's recommendations. Selecting a suggestion by
+hydrating its document is ~430× cheaper than searching for its own text, on
+every index. Hydrating *previews*, on the other hand, scales with doc page
+payload: negligible on the wiki corpus, but on OSM each doc page carries ~1 MB,
+so previewing every row of every keystroke costs megabytes while previewing
+only the focused row costs ~0.4 KB per row.
+
+Lane choice matters when hydrating several suggestion documents by hand.
+Suggestion documents are scattered corpus-wide, so the packed lane's
+per-document pointer reads merge into ranges covering most of the dense
+pointer file:
+
+| Documents hydrated | Packed lane | Doc pages (`preferDocPages: "force"`) |
+| ---: | ---: | ---: |
+| 1 | **0.4 KB** | 1.8 KB |
+| 2 | 13,592 KB | **428 KB** |
+| 8 | 13,614 KB | **510 KB** |
+| 16 | 13,643 KB | **567 KB** |
+
+The built-in hydration paths apply this rule via
+`suggestionHydrationContext(count)`: packed for one document, doc pages for
+more.
+
 ## Unified authority result
 
 Recorded 2026-07-09 on the 175,276-document Luxembourg place corpus. The
@@ -66,8 +108,11 @@ HTTP deployments benefit more directly from the reduced byte totals.
   only after crossing 256 candidates; the bounded 18,252-prefix keyspace keeps
   aggregation independent of corpus size, while adaptive publication avoids
   inflating the root for rare prefixes.
-- `rfauth-v2` autocomplete entries store only normalized/display text, maximum
-  weight, and count—no unnecessary document row list or payload hydration.
+- `rfauth-v2` autocomplete entries store normalized/display text, maximum
+  weight, count, and the best `[doc, score]` rows (`suggestMaxDocRows`,
+  default 3) — the documents a suggestion hydrates on selection or previews
+  via `suggest({ hydrate: true })`. Payload hydration itself stays out of the
+  suggest path unless asked for.
 
 The former `suggest/` directory, page/branch codecs, pack table, manifest
 branch, scan aggregation map, and runtime page lane have been removed.

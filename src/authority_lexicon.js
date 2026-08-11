@@ -75,6 +75,11 @@ export function autocompleteRank(item, weighted = false) {
     : (full ? UNWEIGHTED_SURFACE_BONUS : 0) + Math.min(UNWEIGHTED_SURFACE_BONUS - 1, weight);
 }
 
+// How many best [doc, score] rows an autocomplete surface keeps by default:
+// enough to preview a handful of documents behind an ambiguous suggestion
+// while staying a few varints per surface.
+export const DEFAULT_AUTOCOMPLETE_DOC_ROWS = 3;
+
 export function autocompleteEntrySummary(key, rows, options = {}) {
   const parsed = parseAutocompleteKey(key);
   if (!parsed) return null;
@@ -88,16 +93,25 @@ export function autocompleteEntrySummary(key, rows, options = {}) {
     if (topDoc === null || weight > maxWeight || (weight === maxWeight && doc < topDoc)) topDoc = doc;
     maxWeight = Math.max(maxWeight, weight);
   }
+  // Only when the caller vouches rows are [doc, weight] — root routing
+  // artifacts pass [shard ordinal, weight] rows, which must never be
+  // mistaken for document ids.
+  let docs = null;
+  if (options.docRows && rows?.length) {
+    const maxDocs = Math.max(1, Math.floor(Number(options.maxDocs ?? DEFAULT_AUTOCOMPLETE_DOC_ROWS)));
+    docs = rows
+      .slice()
+      .sort((left, right) => right[1] - left[1] || left[0] - right[0])
+      .slice(0, maxDocs)
+      .map(row => ({ doc: Number(row[0]), score: Number(row[1]) || 0 }));
+  }
   const item = {
     key,
     ...parsed,
     weight: maxWeight || rows.length,
     count: rows.length,
     full: suggestKey(parsed.display) === parsed.normalized,
-    // Only when the caller vouches rows are [doc, weight] — root routing
-    // artifacts pass [shard ordinal, weight] rows, which must never be
-    // mistaken for document ids.
-    ...(options.docRows && rows?.length ? { doc: topDoc } : {})
+    ...(docs ? { doc: topDoc, docs } : {})
   };
   item.rank = autocompleteRank(item, options.weighted);
   return item;
@@ -319,19 +333,32 @@ export function parseAuthorityLexiconSegment(buffer, options = {}) {
 
 // Version 2 hot lists append each entry's best doc ordinal (offset by one,
 // zero meaning "none") so hot-lane suggestions resolve to documents exactly
-// like lexicon-lane ones. Root routing hot lists carry no doc by design.
+// like lexicon-lane ones.
 const AUTHORITY_HOT_DOC_VERSION = 2;
+// Version 3 hot lists carry each entry's best [doc, score] rows instead of a
+// single doc, plus an optional federation shard ordinal per row (offset by
+// one, zero meaning "local") so root routing hot lists resolve documents to
+// their owning shard exactly like the paged lexicon lane.
+const AUTHORITY_HOT_DOC_ROWS_VERSION = 3;
 
 export function encodeAuthorityHotList(entries) {
   const out = [...AUTHORITY_HOT_MAGIC];
-  pushVarint(out, AUTHORITY_HOT_DOC_VERSION);
+  pushVarint(out, AUTHORITY_HOT_DOC_ROWS_VERSION);
   pushVarint(out, entries.length);
   for (const entry of entries) {
     pushUtf8(out, entry.normalized);
     pushUtf8(out, entry.display);
     pushVarint(out, entry.weight);
     pushVarint(out, entry.count);
-    pushVarint(out, entry.doc == null ? 0 : entry.doc + 1);
+    const docs = Array.isArray(entry.docs) && entry.docs.length
+      ? entry.docs
+      : entry.doc != null ? [{ doc: entry.doc, score: entry.weight }] : [];
+    pushVarint(out, docs.length);
+    for (const row of docs) {
+      pushVarint(out, row.doc);
+      pushVarint(out, Math.max(0, Math.floor(Number(row.score) || 0)));
+      pushVarint(out, row.ordinal == null ? 0 : row.ordinal + 1);
+    }
   }
   return Buffer.from(Uint8Array.from(out));
 }
@@ -341,7 +368,8 @@ export function parseAuthorityHotList(buffer) {
   assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
   const state = { pos: AUTHORITY_HOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION) {
+  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION
+    && version !== AUTHORITY_HOT_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
   }
   const count = readVarint(bytes, state);
@@ -353,9 +381,22 @@ export function parseAuthorityHotList(buffer) {
       weight: readVarint(bytes, state),
       count: readVarint(bytes, state)
     };
-    if (version >= AUTHORITY_HOT_DOC_VERSION) {
+    if (version === AUTHORITY_HOT_DOC_VERSION) {
       const doc = readVarint(bytes, state);
       if (doc > 0) entry.doc = doc - 1;
+    } else if (version >= AUTHORITY_HOT_DOC_ROWS_VERSION) {
+      const rowCount = readVarint(bytes, state);
+      if (rowCount > 0) {
+        const docs = new Array(rowCount);
+        for (let row = 0; row < rowCount; row++) {
+          const doc = readVarint(bytes, state);
+          const score = readVarint(bytes, state);
+          const ordinal = readVarint(bytes, state);
+          docs[row] = { doc, score, ...(ordinal > 0 ? { ordinal: ordinal - 1 } : {}) };
+        }
+        entry.doc = docs[0].doc;
+        entry.docs = docs;
+      }
     }
     entries[index] = entry;
   }

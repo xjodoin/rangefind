@@ -227,11 +227,15 @@ export function createRangefindMcpServer(options = {}) {
     {
       title: "Autocomplete",
       description:
-        "Search-as-you-type autocomplete: prefix and mid-token suggestions ranked by weight. Useful to complete a partial place or entity name before a full search.",
+        "Search-as-you-type autocomplete: prefix and mid-token suggestions ranked by weight. Useful to complete a partial place or entity name before a full search. With hydrate, suggestions that resolve to documents include the hydrated hit (same fields as rangefind_search results) — often no follow-up search is needed.",
       inputSchema: {
         index: INDEX_ARG,
         q: z.string().min(1).describe("The typed prefix."),
         size: z.number().int().min(1).max(50).default(8),
+        hydrate: z
+          .boolean()
+          .default(false)
+          .describe("Resolve each suggestion's documents into real hits (adds `result`/`results`)."),
         shards: SHARDS_ARG
       },
       annotations: { readOnlyHint: true, openWorldHint: false }
@@ -240,6 +244,7 @@ export function createRangefindMcpServer(options = {}) {
       const { suggestions } = await (await engineFor(args.index)).suggest({
         q: args.q,
         size: args.size,
+        hydrate: args.hydrate,
         shards: args.shards
       });
       return { suggestions };

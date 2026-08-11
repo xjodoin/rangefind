@@ -21,6 +21,8 @@ export const PART_HOOKS = {
   status: "rf-search__status",
   suggest: "rf-search__suggest",
   suggestItem: "rf-search__suggest-item",
+  suggestText: "rf-search__suggest-text",
+  suggestCount: "rf-search__suggest-count",
   mark: "rf-search__mark"
 };
 
@@ -39,6 +41,8 @@ export const PART_CLASS_ATTRS = {
   status: "status-class",
   suggest: "suggest-class",
   suggestItem: "suggest-item-class",
+  suggestText: "suggest-text-class",
+  suggestCount: "suggest-count-class",
   mark: "mark-class"
 };
 

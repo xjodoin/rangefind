@@ -41,7 +41,7 @@ Claude Desktop (`claude_desktop_config.json`):
 | Tool | Purpose |
 | --- | --- |
 | `rangefind_search` | BM25F full-text search with typo correction, facets, filters, sorting, geo (radius / bounding box / nearest-first / distance boost), shard scoping, pagination |
-| `rangefind_suggest` | search-as-you-type autocomplete |
+| `rangefind_suggest` | search-as-you-type autocomplete; `hydrate: true` also returns each suggestion's resolved document, so a completion often answers the question without a follow-up `rangefind_search` |
 | `rangefind_count` | exact match counts without fetching results |
 | `rangefind_info` | index metadata: totals, build time, provenance/license, features, shard list with groups and coverage bboxes |
 | `rangefind_list_indexes` | the configured index names (configured mode only) |

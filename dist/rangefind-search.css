@@ -76,6 +76,10 @@
 }
 
 .rf-search__suggest-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
   padding: 0.4rem 0.6rem;
   border-radius: calc(var(--rf-radius) - 2px);
   color: var(--rf-muted);
@@ -86,6 +90,20 @@
 .rf-search__suggest-item:hover {
   background: var(--rf-option-hover);
   color: var(--rf-fg);
+}
+
+.rf-search__suggest-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Result-set size of a completion ("boulangerie · 1,240"). */
+.rf-search__suggest-count {
+  flex: none;
+  font-size: 0.78em;
+  font-variant-numeric: tabular-nums;
+  color: var(--rf-muted);
 }
 
 .rf-search__option {

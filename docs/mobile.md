@@ -67,6 +67,15 @@ const { results } = await engine.search({ q: "sparse inverted index" });
 const suggestions = await engine.suggest({ q: "spar" });
 ```
 
+Autocomplete is the cheapest thing a mobile client can do — completions are a
+couple of small range reads per keystroke, and selecting a suggestion by
+hydrating its `doc` avoids re-running the query entirely (measured 0.5 KB
+versus 215 KB). Be deliberate about *previews*, though: `hydrate: true`
+resolves every suggestion into a full document, which on an index with rich
+display payloads means fetching a doc page per suggestion. On metered or slow
+connections hydrate only the row the user focuses. See the
+[autocomplete guide](autocomplete.md#choosing-a-pattern).
+
 For a remote index, point `source` at the deployed URL instead. React
 Native's `fetch` passes Range headers through, but provides none of the
 browser's HTTP caching, so the transport adds it back: content-addressed

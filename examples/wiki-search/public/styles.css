@@ -125,6 +125,10 @@ main {
 }
 
 .suggest-list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
   padding: 9px 16px;
   font-size: 1rem;
   color: var(--ink);
@@ -133,6 +137,19 @@ main {
 
 .suggest-list li:hover {
   background: #eef4ef;
+}
+
+.suggest-list .suggest-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suggest-list .suggest-count {
+  flex: none;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  color: #6b7a70;
 }
 
 .query-row input {

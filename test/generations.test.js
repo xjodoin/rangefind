@@ -154,6 +154,21 @@ test("pure-addition generational build matches the full rebuild", async () => {
       fullSuggest.suggestions.map(item => item.text).sort()
     );
 
+    // Suggestion docs survive the merge with their owning generation, and
+    // hydrate: true resolves them through that generation into real hits.
+    const genSuggest = await deltaEngine.suggest({ q: "entry 205 about", size: 3, hydrate: true });
+    const entry205 = genSuggest.suggestions.find(item => item.text.startsWith("Entry 205 "));
+    assert.equal(typeof entry205.doc, "number");
+    assert.equal(entry205.generation, 1);
+    assert.equal(entry205.result.title, entry205.text);
+    assert.equal(entry205.result.generation, 1);
+    const baseSuggest = await deltaEngine.suggest({ q: "entry 7 about", size: 3 });
+    const entry7 = baseSuggest.suggestions.find(item => item.text.startsWith("Entry 7 "));
+    assert.equal(entry7.generation, 0);
+    const [hydrated7] = await deltaEngine.hydrateRows([[entry7.doc, 0]], { generation: 0 });
+    assert.equal(hydrated7.title, entry7.text);
+    assert.equal(hydrated7.generation, 0);
+
     // count() sums exactly with no tombstones.
     const fullCount = await fullEngine.count({ q: "glacier" });
     const deltaCount = await deltaEngine.count({ q: "glacier" });
@@ -433,6 +448,18 @@ test("replaced documents tombstone their old version", async () => {
     const replaced = glacier.results.find(item => item.id === "doc-0");
     assert.ok(replaced, "replaced doc should still match");
     assert.ok(replaced.title.endsWith("revised"));
+
+    // A tombstoned document must never travel as a suggestion's doc: the
+    // stale surface keeps its text but loses doc provenance (and hydrates
+    // nothing), while the revised surface resolves to the new version.
+    const suggest = await engine.suggest({ q: "entry 0 about", size: 5, hydrate: true });
+    const stale = suggest.suggestions.find(item => item.text === "Entry 0 about glacier");
+    assert.ok(stale, "stale surface still suggests as text");
+    assert.equal(stale.doc, undefined);
+    assert.equal(stale.result, undefined);
+    const revised = suggest.suggestions.find(item => item.text === "Entry 0 about glacier revised");
+    assert.equal(revised.generation, 1);
+    assert.equal(revised.result.title, "Entry 0 about glacier revised");
   } finally {
     await server.close();
   }

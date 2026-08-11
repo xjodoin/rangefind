@@ -113,8 +113,9 @@ Recognized element attributes (from the underlying Web Component): `placeholder`
 plus the per-part class hooks `root-class`, `input-class`, `panel-class`,
 `list-class`, `option-class`, `option-title-class`, `option-snippet-class`,
 `option-url-class`, `empty-class`, `status-class`, `suggest-class`,
-`suggest-item-class`, `mark-class`. Unrecognized names are dropped with a
-warning rather than rendered.
+`suggest-item-class`, `suggest-text-class`, `suggest-count-class`,
+`mark-class`. Unrecognized names are dropped with a warning rather than
+rendered.
 
 Boolean arguments follow the component's semantics: `router: true` renders a
 bare `router` attribute; `highlight: false` renders `highlight="false"` to turn

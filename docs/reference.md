@@ -471,8 +471,9 @@ these optional structures the same query falls back to the geo tree.
 
 ### `suggest`
 
-Search-as-you-type configuration for the unified authority lexicon. See
-[`suggest-benchmarks.md`](suggest-benchmarks.md).
+Search-as-you-type configuration for the unified authority lexicon. See the
+[autocomplete guide](autocomplete.md) for usage patterns and measured costs,
+and [`suggest-benchmarks.md`](suggest-benchmarks.md) for retrieval benchmarks.
 
 ```json
 { "path": "name", "weightPath": "population", "tokenPrefixes": true }
@@ -485,9 +486,11 @@ Search-as-you-type configuration for the unified authority lexicon. See
 - `tokenPrefixes` — default `true`; emit mid-label token keys so "eiffel"
   completes "Tour Eiffel".
 
-Tuning: `suggestMaxTokenKeys` (`4`), `suggestHotListSize` (`64`), and
-`suggestMinKeyLength` (`1`). Authority pack, shard, directory, and run-buffer
-settings control the shared physical layout.
+Tuning: `suggestMaxTokenKeys` (`4`), `suggestHotListSize` (`64`),
+`suggestMinKeyLength` (`1`), and `suggestMaxDocRows` (`3` — best `[doc, score]`
+rows kept per surface, the documents a suggestion can hydrate or preview
+without a search). Authority pack, shard, directory, and run-buffer settings
+control the shared physical layout.
 
 ### `vectors`
 
@@ -738,15 +741,24 @@ early-stopped totals and sampled facet counts.
 
 - **`engine.count({ q })`** — exact match count for a text-only query (no
   filters/sort/geo/vector). Returns `{ total, totalExact, approximate, stats }`.
-- **`engine.suggest({ q, size = 8 })`** — autocomplete. Returns
-  `{ q, prefix, suggestions: [{ text, weight, count, doc? }], stats }`. `size`
-  clamped to 50. Sources are fixed at build time: the `suggest` config when
-  present, otherwise a single `title` authority field when available. `doc` is
-  the ordinal of the best document behind the surface, present when its owner
-  is unambiguous (always on single-index engines; on sharded fan-out only when
-  one shard owns the winning rank; never from the root routing artifact or on
-  generational engines) — hydrate it with `engine.hydrateRows` instead of
-  re-running the selection as a search.
+- **`engine.suggest({ q, size = 8, hydrate = false })`** — autocomplete.
+  Returns `{ q, prefix, suggestions: [{ text, weight, count, doc?, docs?,
+  docShard?, generation?, result?, results? }], stats }`. `size` clamped to
+  50. Sources are fixed at build time: the `suggest` config when present,
+  otherwise a single `title` authority field when available. `doc` is the
+  ordinal of the best document behind the surface and `docs` every kept row
+  (`suggestMaxDocRows`, default 3), present when the rank's owner is
+  unambiguous: always on single-index engines; on federated engines when one
+  shard/generation owns the winning rank, with `docShard` / `generation`
+  naming the owner (sharded roots serve this from the fan-out merge *and* from
+  `rfsuggestroute-v2` root artifacts). `hydrate: true` resolves those doc rows
+  into real search hits in one batched doc-page pass — `result` is the best
+  document and `results` all kept rows, shaped exactly like `search()`
+  results, so a dropdown renders the same cards the results list will.
+  Hydration is advisory: failures leave the text suggestions intact. Hydration
+  cost scales with your doc page size, not document count — see the
+  [autocomplete guide](autocomplete.md#choosing-a-pattern) for when to prefer
+  hydrating only the focused row.
 - **`engine.vectorSearch({ vector, field?, k = 10, nprobe = 8, refineFactor = 8,
   refine = true, includeResults })`** — pure vector top-k with real cosine
   scores. `k` clamped to 200, `nprobe` to the cluster count, `refineFactor` to
@@ -769,8 +781,20 @@ early-stopped totals and sampled facet counts.
   display results without running a query (also used internally by the
   generational layer). On sharded roots pass `context.shard` (the owning shard
   id, e.g. from suggestion provenance) since doc ordinals are shard-local;
-  results come back shard-stamped. This is the direct-selection path for
-  suggestions carrying `doc`. Generational engines do not expose it.
+  results come back shard-stamped. On generational engines pass
+  `context.generation` (doc ordinals are generation-local); results come back
+  generation-stamped. This is the direct-selection path for suggestions
+  carrying `doc`.
+
+  **Lane note.** Hydrating *one* document is two small range reads and needs
+  no options. Hydrating *several suggestion* documents does: they are
+  scattered corpus-wide, so the default packed lane's per-document pointer
+  reads merge into ranges covering most of the dense pointer file (measured
+  13.6 MB for two documents on a 339k-document index, versus 0.43 MB through
+  doc pages). Pass `{ preferDocPages: "force" }` — or use the exported
+  `suggestionHydrationContext(count)`, which applies exactly this rule and is
+  what the built-in hydration paths use. Search results cluster and are
+  unaffected.
 - **`engine.loadBuildTelemetry()`**, **`loadIndexOptimizer()`**, and
   **`loadSegmentManifest()`** — lazily load optional diagnostics. These are
   available on a single/generational engine when the corresponding artifacts
@@ -782,15 +806,22 @@ early-stopped totals and sampled facet counts.
 Notable fields:
 
 - Text: `plannerLane` (`tailProof` | `fullFallback` | `blockBudget`),
-  `exact`, `blocksDecoded`, `postingsDecoded`, `skippedBlocks`.
+  `exact`, `blocksDecoded`, `postingsDecoded`, `skippedBlocks`. Geo-filtered
+  text queries add `geoFilterDeferred` with
+  `geoFilterDeferredCandidates`/`geoFilterDeferredAccepted` when the geo
+  membership check ran as one batched pass over the collected candidates
+  instead of per posting (`plannerFallbackReason:
+  "filter_deferred_shortfall"` marks the rare exhaustive re-answer).
 - Geo: `geoLane` (`browse` | `nearest` | `nearestText` | `nearestTextDocValues` |
   `nearestTextEmpty` | `textDocSet` |
   `textDocValues` | route/cell variants), `geoCandidateLeaves`,
   `geoLeavesVisited`, `geoPointsScanned`, `geoPointsAccepted`, plus route-cell
   and route-ranking counters when applicable.
 - Suggest: `suggestLane` (`authority-hot` | `authority-lexicon` |
-  `authority-title` for old indexes), `suggestShardsVisited`, and
-  `suggestEntriesScanned`.
+  `address-authority` | `authority-title` for old indexes),
+  `suggestShardsVisited`, `suggestEntriesScanned`, `suggestRouting`
+  (`root-authority` on sharded roots), and `suggestDocsHydrated` with
+  `hydrate: true`.
 - Facet counts: `facetCountLane` (`dictionary` | `text-match-set` |
   `chunk-scan` | `global-fallback`).
 - Vector/hybrid: `vectorClustersProbed`, `vectorCandidatesScanned`,
@@ -812,6 +843,15 @@ Notable fields:
 Build it with `npm run build:element`, which emits `dist/rangefind-search.js`
 (self-contained ESM, bundles the runtime, zero dependencies) and
 `dist/rangefind-search.css` (the optional theme).
+
+**Dropdown behavior.** The element requests hydrated suggestions, so a
+completion that resolves to exactly one document renders as the *same* result
+card the results list uses and activating it navigates straight there — no
+follow-up search. Ambiguous completions render as text plus their result count
+(`×N`). It also warms the search for the top completion in the background
+(16-entry LRU keyed by query), so accepting a suggestion renders from cache.
+Indexes without an autocomplete lexicon degrade to results only. See the
+[autocomplete guide](autocomplete.md).
 
 **Light DOM + headless.** The element renders into its own light DOM — no
 shadow root — and injects no styling of its own. That is deliberate: the host
@@ -852,7 +892,9 @@ own CSS or the theme:
 | `rf-search__input` | The `role="combobox"` input. |
 | `rf-search__panel` | Popup container (has `hidden` when closed). |
 | `rf-search__suggest` | Suggestions `role="listbox"`. |
-| `rf-search__suggest-item` | A suggestion `role="option"`. |
+| `rf-search__suggest-item` | A text suggestion `role="option"`. |
+| `rf-search__suggest-text` | The completion text inside a suggestion. |
+| `rf-search__suggest-count` | Its result count (`×N`), when the surface is shared. |
 | `rf-search__list` | Results `role="listbox"`. |
 | `rf-search__option` | A result option (an `<a>` to `result.url`). |
 | `rf-search__option-title` | Result title (highlighted). |
@@ -869,8 +911,9 @@ Two equivalent mechanisms:
 
 - **`*-class` attributes** — one per part, ideal for Tailwind:
   `input-class`, `panel-class`, `suggest-class`, `suggest-item-class`,
-  `list-class`, `option-class`, `option-title-class`, `option-snippet-class`,
-  `option-url-class`, `mark-class`, `empty-class`, `status-class`, `root-class`.
+  `suggest-text-class`, `suggest-count-class`, `list-class`, `option-class`,
+  `option-title-class`, `option-snippet-class`, `option-url-class`,
+  `mark-class`, `empty-class`, `status-class`, `root-class`.
 
   ```html
   <rangefind-search src="/rangefind/"
@@ -879,9 +922,9 @@ Two equivalent mechanisms:
   ```
 
 - **`.classNames` JS property** — an object keyed by the camelCase part name
-  (`input`, `panel`, `suggest`, `suggestItem`, `list`, `option`, `optionTitle`,
-  `optionSnippet`, `optionUrl`, `mark`, `empty`, `status`, `root`) for
-  framework/programmatic use:
+  (`input`, `panel`, `suggest`, `suggestItem`, `suggestText`, `suggestCount`,
+  `list`, `option`, `optionTitle`, `optionSnippet`, `optionUrl`, `mark`,
+  `empty`, `status`, `root`) for framework/programmatic use:
 
   ```js
   document.querySelector("rangefind-search").classNames = {
@@ -1086,6 +1129,14 @@ shared surface), `selection.doc = { index, shard? }` is present and
 response (`plannerLane: "osmSuggestEntity"`) in a couple of range reads — no
 search. It throws when `selection.doc` is absent; fall back to
 `searchOsmQuery` with `selection.query`/`selection.shards` there.
+
+`suggestOsmQuery` also accepts `hydrate: true`: after collapsing and slicing,
+each remaining suggestion's best document is resolved into a real hit on
+`result` (at most one doc per dropdown row — the engine's overfetched inner
+suggest is never hydrated), so a map UI can show distance-annotated place
+previews or drop preview pins per keystroke. Composed suggestions
+(category-locality, collapsed streets) carry no document by design. Advisory
+and fail-open like every hydration path.
 
 For existing Google Places/Geocoding clients, `rangefind/osm` also exports
 `createRangefindMapsAdapter(engine, options)`. It provides promise-based

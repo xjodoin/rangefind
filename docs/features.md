@@ -251,24 +251,44 @@ const { suggestions } = await engine.suggest({ q: "eiff", size: 8 });
 const exact = await engine.authorityLookup("Tour Eiffel", { size: 4 });
 ```
 
-Each suggestion also names the best document behind its surface (`doc`, a doc
-ordinal) when that is unambiguous — single-index engines always, sharded
-fan-out when exactly one shard owns the winning rank. Selecting such a
+Each suggestion also names the best documents behind its surface: `doc` (the
+winning doc ordinal) plus `docs` (all kept rows, `suggestMaxDocRows` per
+surface, default 3) when the rank has one unambiguous owner — single-index
+engines always, federated engines when exactly one shard/generation owns the
+winning rank (`docShard` / `generation` name the owner). Selecting such a
 suggestion should hydrate the document directly instead of re-running the
 query as a search:
 
 ```js
 const picked = suggestions[0];
 if (picked.doc != null) {
-  const [place] = await engine.hydrateRows([[picked.doc, 0]]); // 1-2 small reads
+  const [place] = await engine.hydrateRows(
+    [[picked.doc, 0]],
+    picked.docShard ? { shard: picked.docShard } : {}
+  ); // 1-2 small reads
 }
 ```
 
+The [autocomplete guide](autocomplete.md) covers which pattern to use where,
+with measured per-keystroke costs.
+
+Or let the engine do it: `suggest({ q, hydrate: true })` resolves every
+suggestion's doc rows into real search hits in one batched doc-page pass —
+each suggestion gains `result` (best document) and `results` (all kept rows),
+shaped exactly like `search()` results, so an autocomplete dropdown can render
+the same cards the results list shows. Hydration is advisory: on failure the
+text suggestions survive unchanged. The `<rangefind-search>` element uses this
+to render doc-resolving suggestions as result cards (with per-completion
+result counts) and speculatively warms the search for the top completion, so
+accepting a suggestion renders instantly.
+
 The OSM integration wraps the same contract as `selection.doc` plus
 `resolveOsmSuggestion(engine, suggestion)`, which returns a one-result search
-response (`plannerLane: "osmSuggestEntity"`). Root-routed suggestions on
-sharded planets carry no `doc` (the root artifact stores shard ordinals);
-selection falls back to the shard-scoped search there.
+response (`plannerLane: "osmSuggestEntity"`). Since `rfsuggestroute-v2`,
+root-routed suggestions on sharded planets carry the same `doc` + `docShard`
+provenance (the artifact stamps the winning row's shard ordinal and doc), so
+selection hydrates from the owning shard there too; v1 artifacts fall back to
+the shard-scoped search.
 
 `authorityLookup()` returns every canonical display whose normalized surface is
 equal to the input. On sharded roots, root-level suggest routing supplies shard
@@ -607,7 +627,12 @@ WebView/hybrid and native/Flutter recipes are documented in [Mobile](mobile.md).
 `<rangefind-search>` is an unstyled, light-DOM, framework-agnostic WAI-ARIA
 combobox with keyboard navigation, autocomplete, instant results, snippets,
 events, CSS hooks, and an optional light/dark theme. It can be used directly or
-inside React, Vue, Svelte, Angular, and static-site generators.
+inside React, Vue, Svelte, Angular, and static-site generators. Its dropdown
+uses hydrated suggestions: completions show their result counts, suggestions
+that resolve to a single document render as the same result cards the results
+list uses (activating one navigates directly), and the search for the top
+completion is speculatively warmed so accepting a suggestion renders from
+cache.
 
 ### Static-site generator integrations
 
@@ -723,6 +748,8 @@ schema.
 
 ## Documentation map
 
+- [Autocomplete guide](autocomplete.md) — search-as-you-type patterns, measured
+  costs per keystroke, previews, instant selection, and anti-patterns.
 - [Reference](reference.md) — configuration, APIs, runtime tuning, UI component,
   incremental publishing, and deployment.
 - [Architecture](architecture.md) — file formats and retrieval design.

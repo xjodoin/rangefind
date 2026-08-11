@@ -10,7 +10,8 @@ import {
   encodeAuthorityHotList,
   encodeAuthorityLexiconRoot,
   isAutocompleteKey,
-  AUTHORITY_LEXICON_FORMAT
+  AUTHORITY_LEXICON_FORMAT,
+  DEFAULT_AUTOCOMPLETE_DOC_ROWS
 } from "./authority_lexicon.js";
 import { writeDirectoryFiles } from "./directory_writer.js";
 import { createPackWriter, finalizePackWriter, writePackedShard } from "./packs.js";
@@ -215,6 +216,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
   let autocompleteRowCount = 0;
   const autocompleteShards = [];
   const autocompleteWeighted = autocompleteFields(config).some(field => field.weightPath);
+  const suggestMaxDocRows = Math.max(1, Math.floor(Number(config.suggestMaxDocRows || DEFAULT_AUTOCOMPLETE_DOC_ROWS)));
   const hotLimit = Math.max(8, Math.floor(Number(config.suggestHotListSize || 64)));
   const hot = new Map();
   const hotSeen = new Map();
@@ -262,7 +264,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
       onPartition: (partition) => {
         const autocomplete = partition.entries
           .filter(([key]) => isAutocompleteKey(key))
-          .map(([key, rows]) => autocompleteEntrySummary(key, rows, { weighted: autocompleteWeighted, docRows: true }));
+          .map(([key, rows]) => autocompleteEntrySummary(key, rows, { weighted: autocompleteWeighted, docRows: true, maxDocs: suggestMaxDocRows }));
         if (autocomplete.length) {
           let maxRank = 0;
           let rows = 0;
@@ -279,10 +281,14 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
           autocompleteKeyCount += autocomplete.length;
           autocompleteRowCount += rows;
         }
-        // docRows keeps each autocomplete surface's best [doc, score] row so
-        // an unambiguous suggestion can hydrate its document on selection
-        // instead of re-running the query as a search.
-        const buffer = buildAuthorityShard(partition.entries, { maxRows: config.authorityMaxRowsPerKey, docRows: true });
+        // docRows keeps each autocomplete surface's best [doc, score] rows so
+        // a suggestion can hydrate its top documents on selection (or preview
+        // them in a dropdown) instead of re-running the query as a search.
+        const buffer = buildAuthorityShard(partition.entries, {
+          maxRows: config.authorityMaxRowsPerKey,
+          docRows: true,
+          maxAutocompleteRows: suggestMaxDocRows
+        });
         const entry = writePackedShard(packWriter, partition.name, gzipSync(buffer, { level: 6 }), {
           kind: "authority-shard",
           codec: AUTHORITY_FORMAT,
@@ -331,6 +337,7 @@ export async function reduceAuthorityRuns(config, dirs, baseShards) {
     autocomplete = {
       format: AUTHORITY_LEXICON_FORMAT,
       fields: autocompleteFields(config),
+      max_doc_rows: suggestMaxDocRows,
       keys: autocompleteKeyCount,
       rows: autocompleteRowCount,
       shards: autocompleteShards.length,

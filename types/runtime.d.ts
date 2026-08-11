@@ -112,16 +112,54 @@ export interface SearchResponse {
   stats?: Record<string, unknown>;
 }
 
+/**
+ * Doc-payload lane for hydrating autocomplete documents, which are scattered
+ * corpus-wide unlike a text query's clustered hits. One document is cheapest
+ * on the packed lane; two or more must use doc pages, or their per-document
+ * pointer reads merge into ranges covering most of the dense pointer file.
+ * Pass the result as `hydrateRows`' `context` when hydrating suggestions
+ * yourself; the built-in hydration paths already apply it.
+ */
+export function suggestionHydrationContext(count: number): {
+  hasTextTerms: false;
+  preferDocPages: "force" | false;
+};
+
 export interface Suggestion {
   text: string;
   count: number;
   weight: number;
   /**
    * Best document ordinal behind this surface (rfauth v4 doc rows). Present
-   * on single-index and single-shard-provenance suggestions; resolve it with
-   * `engine.hydrateRows([[doc, 0]])` instead of re-running a search.
+   * on single-index suggestions and on federated ones whose rank has one
+   * unambiguous owner; resolve it with `engine.hydrateRows([[doc, 0]])`
+   * (passing `{ shard: docShard }` / `{ generation }` on federated engines)
+   * instead of re-running a search.
    */
   doc?: number;
+  /**
+   * All kept doc ordinals behind this surface, rank order (first === `doc`).
+   * Present when the surface keeps more than one doc row
+   * (`suggestMaxDocRows`, default 3).
+   */
+  docs?: number[];
+  /**
+   * Sharded roots: the federation shard that owns `doc` — stamped by both
+   * the fan-out merge and rfsuggestroute-v2 root routing. Pass it as
+   * `context.shard` to `hydrateRows`.
+   */
+  docShard?: string;
+  /** Generational indexes: the generation that owns `doc`. */
+  generation?: number;
+  /**
+   * `suggest({ hydrate: true })`: the suggestion's documents resolved into
+   * real search hits (same shape and display fields as `search()` results).
+   * `result` is the best document, `results` every kept doc row. Absent when
+   * the surface has no unambiguous documents or hydration failed (hydration
+   * is advisory — text suggestions always survive).
+   */
+  result?: SearchResult;
+  results?: SearchResult[];
   /** OSM integration: structured prediction fields. */
   description?: string;
   mainText?: string;
@@ -171,7 +209,7 @@ export interface RangefindManifest {
 export interface SearchEngine {
   manifest: RangefindManifest;
   search(params?: SearchParams): Promise<SearchResponse>;
-  suggest(params?: { q?: string; size?: number; shards?: string | string[]; [key: string]: unknown }): Promise<SuggestResponse>;
+  suggest(params?: { q?: string; size?: number; shards?: string | string[]; hydrate?: boolean; [key: string]: unknown }): Promise<SuggestResponse>;
   count(params?: { q?: string; shards?: string | string[]; [key: string]: unknown }): Promise<CountResponse>;
   /**
    * Exact-surface lookup against the authority autocomplete lexicon: every

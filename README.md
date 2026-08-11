@@ -189,6 +189,7 @@ Start with the guide that matches the job:
 | **[Feature guide](docs/features.md)** | Complete capability catalog, examples, supported combinations, compatibility, and boundaries. |
 | **[Reference](docs/reference.md)** | Configuration properties, builder/runtime APIs, tuning knobs, UI component, and deployment requirements. |
 | **[Architecture](docs/architecture.md)** | Static file layout, range directories, posting retrieval, geo, authority, and vector internals. |
+| **[Autocomplete guide](docs/autocomplete.md)** | Search-as-you-type patterns, measured per-keystroke costs, hydrated previews, instant selection, and the anti-patterns. |
 | **[OSM example](examples/osm-geo/README.md)** | Map search, autocomplete, geocoding, constraints, route corridors, geometry, extraction, and RQA. |
 | **[Replace Google Maps APIs](https://rangefind.dev/google-maps-api-alternative/)** | Free public OSM index, migration adapter, API mapping, complete use cases, production checklist, attribution, and parity boundaries. |
 | **[Node](docs/node-runtime.md) / [mobile](docs/mobile.md)** | Local, remote, cached, embedded, and offline runtimes. |
@@ -507,8 +508,9 @@ lexicon:
 ```
 
 ```js
-const { suggestions } = await engine.suggest({ q: "boul", size: 8 });
-// [{ text: "Boulangerie Fischer", weight: 12, count: 12 }, ...]
+const { suggestions } = await engine.suggest({ q: "boul", size: 8, hydrate: true });
+// [{ text: "Boulangerie Fischer", weight: 12, count: 12, doc: 41,
+//    result: { title: "Boulangerie Fischer", url: "…", … } }, ...]
 ```
 
 Matching is prefix-based over diacritic-folded keys ("montre" finds
@@ -517,6 +519,15 @@ Ranking uses an optional `weightPath` (for example population or importance)
 and falls back to direct-prefix priority plus popularity — how many documents
 share the surface. Each keystroke costs at most a few small range requests;
 repeat keystrokes in a session are usually served entirely from cache.
+
+Suggestions also carry the best documents behind each surface (`doc`/`docs`),
+and `hydrate: true` resolves them into real search hits — the same display
+payloads `search()` returns — so a dropdown can show result cards and a
+selected suggestion renders instantly instead of re-running the query as a
+search (measured 0.5 KB and 4 ms, versus 215 KB and 32 ms re-searching its
+text). The **[autocomplete guide](docs/autocomplete.md)** covers the patterns,
+what each costs per keystroke, and when to prefer focused previews over
+hydrating every row.
 
 For title-prefix completion on an older index, a single
 `authority: [{ "name": "title", "path": "title" }]` field is also sufficient.

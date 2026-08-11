@@ -383,6 +383,21 @@ Very high-cardinality facets are omitted from posting-block summaries by
 default; exact per-document filtering still uses doc-value chunks, while block
 filters keep only compact summaries that are worth shipping on every term block.
 
+Per-document filtering is ordered by price. Term-hit accumulation runs on
+in-memory postings, so the exhaustive lanes test minShouldMatch *first* and
+verify filters only for the eligible conjunction — filter ∧ conjunction
+commutes, and verifying the raw posting union used to fetch a lat/lon
+doc-value chunk for nearly every doc a common term touches. The streamed
+block-max lanes split the plan the same way: bitmap-covered facets/booleans
+and non-geo numbers verify inline (block summaries still prune with the full
+plan, including lat/lon ranges), while the geo membership check without a
+resolved doc set — the one network-priced component — is deferred and applied
+to the collected candidates in one batched pass. If deferred verification
+thins a proven top-k window below the requested page, the query re-answers
+through the exhaustive lane (`plannerFallbackReason:
+"filter_deferred_shortfall"`), which is cheap now that it is
+conjunction-first.
+
 For no-query metadata views, the runtime now uses doc-value pruning instead of
 materializing every candidate chunk. Sort requests use the sorted doc-value tree
 for the sort field and evaluate filters with page summaries before touching
