@@ -117,7 +117,6 @@ if (args.listen || args.bootstrap) {
   network = createLibp2pNetwork(host);
   await network.ready;
   if (network.registrationError) fail(`could not register the sync protocol: ${network.registrationError.message}`);
-  if (buying && !(await network.mintBond())) fail("could not mint the publishing bond");
 } else {
   network = createLoopbackNetwork({});
 }
@@ -129,6 +128,18 @@ const session = await createMeshSession({
   transport: host ? "wire" : "loopback",
   ...(datasetId ? { epochHex: await datasetEpoch(datasetId) } : {})
 });
+
+// The bond is minted AFTER the session exists, not before.
+//
+// `mintBond()` needs the mesh node, and the node is what
+// `createMeshSession` registers with the network — so minting first
+// throws "register(node) before mintBond()" and the run dies before it
+// has probed anything. It only ever showed up on a real mesh: the
+// loopback path mints nothing, which is the path this script is usually
+// developed against.
+if (host && buying && !(await network.mintBond())) {
+  fail("could not mint the publishing bond");
+}
 
 // --- Route, assess, maybe buy ---------------------------------------------
 
