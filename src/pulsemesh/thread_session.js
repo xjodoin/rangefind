@@ -1071,6 +1071,19 @@ export function createThreadChannel({
    */
   async function tick(nowMillis = clock()) {
     cache.sweep(nowMillis);
+    // Publishing keeps advertising. Discovery has its own interval
+    // timer, but that is a *browser* timer, and the platform this
+    // matters most on — a driver's phone, screen off, half a day into a
+    // run — throttles a backgrounded WebView's timers to nothing while
+    // the host keeps ticking on its own clock. Without this line the
+    // run keeps publishing, the windows rotate, the provider records
+    // lapse, and a customer opening their link mid-afternoon finds
+    // nobody — while everyone already connected keeps hearing records,
+    // so nothing on the phone looks wrong. `provide` rate-limits itself
+    // per window, so ticking it is idempotent, not chatty.
+    for (const run of [...runs]) {
+      if (run.discovery) await run.discovery.provide({ nowMillis }).catch(() => 0);
+    }
     for (const entry of [...follows]) {
       if (entry.subscriber.expired(nowMillis)) {
         entry.stop();
