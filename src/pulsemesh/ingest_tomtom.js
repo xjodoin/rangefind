@@ -235,7 +235,21 @@ export function createRouteBackfill({
   maxFreeflowMismatch = 0.5,
   maxSnapMeters = 40,
   shouldProbe = null,
-  clock = Date.now
+  clock = Date.now,
+  /**
+   * Probe timestamps already spent, and where to record new ones.
+   *
+   * Without this the daily cap is per-PROCESS, which is invisible while
+   * the backfill is a thing a person runs by hand and dangerous the
+   * moment anything schedules it: every invocation starts with a full
+   * budget, so an hourly job spends the daily ceiling every hour. The
+   * cap has to outlive the process that enforces it.
+   *
+   * `load()` returns millis of probes already issued (the module drops
+   * any older than 24 h itself); `record(millis)` is called once per
+   * probe actually issued.
+   */
+  spendLog = null
 } = {}) {
   if (!engine?.route) throw new Error("Backfill needs an open route graph.");
   if (!session) throw new Error("Backfill needs a mesh session.");
@@ -245,7 +259,18 @@ export function createRouteBackfill({
   const pending = [];                 // observations awaiting the publisher's drain
   const cache = new Map();            // segKey -> { atMillis, ttlSeconds, reading }
 
-  const spendTimes = [];              // millis of each probe actually issued
+  // Seeded from whatever the host persisted, so the rolling window spans
+  // runs rather than restarting with each one.
+  const spendTimes = (() => {
+    try {
+      return (spendLog?.load?.() ?? []).filter(Number.isFinite).sort((a, b) => a - b);
+    } catch {
+      // A budget file that cannot be read must not be treated as "nothing
+      // spent" silently — but it must also not stop a run. Start full and
+      // let the host's own logging surface the read failure.
+      return [];
+    }
+  })();
   let lastProbeMillis = 0;
 
   const stats = {
@@ -445,6 +470,12 @@ export function createRouteBackfill({
 
       const issuedAt = clock();
       spendTimes.push(issuedAt);
+      try {
+        spendLog?.record?.(issuedAt);
+      } catch {
+        // Recording is best-effort: a failed append must not lose a probe
+        // that was already paid for and published.
+      }
       lastProbeMillis = issuedAt;
       stats.probesIssued++;
       let reading;
