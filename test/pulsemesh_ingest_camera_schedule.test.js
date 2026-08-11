@@ -95,3 +95,29 @@ test("requests to one host are spaced, not bursted by the worker pool", async ()
   const spread = times[times.length - 1] - times[0];
   assert.ok(spread >= 150, `four requests spread over ${spread}ms, expected >=150ms`);
 });
+
+test("a first unusable frame is not demoted — a differencing analyzer always produces one", async () => {
+  // The pixel analyzer's first frame of any camera is unusable by
+  // construction: that frame IS the background it will difference
+  // against. Backing off there means the second frame never arrives and
+  // a perfectly good camera looks dead forever.
+  let attempts = 0;
+  const source = createCameraTrafficSource({
+    cameras: cameras.slice(0, 1), maxCameras: 1, concurrency: 1,
+    hostMinIntervalMillis: 0, minRevisitSeconds: 100, quietRevisitMultiplier: 3,
+    fetchImage: async () => ({ base64: `frame-${++attempts}`, mediaType: "image/jpeg" }),
+    // Unusable first, then a real reading — exactly the differencing shape.
+    analyze: async () => (attempts === 1
+      ? { congestion: "unusable", confidence: 0.9 }
+      : { congestion: "slow", confidence: 0.9 })
+  });
+  let now = 1_000_000;
+  await source.fetch({ nowMillis: now });
+  assert.equal(attempts, 1);
+  // One unusable frame earns the ORDINARY gap (100s), not 300s.
+  await source.fetch({ nowMillis: now + 101_000 });
+  assert.equal(attempts, 2, "the second frame must arrive, or the camera can never start");
+  const observed = await source.fetch({ nowMillis: now + 202_000 });
+  assert.ok(source.stats.observations >= 1, "and it produces a reading once it has a background");
+  assert.ok(observed !== undefined);
+});

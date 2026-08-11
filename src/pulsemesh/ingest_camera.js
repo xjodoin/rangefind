@@ -329,7 +329,7 @@ export function createCameraTrafficSource({
     const key = camera?.id ?? "camera";
     let state = schedule.get(key);
     if (!state) {
-      state = { nextEligibleMillis: 0, failures: 0, lastCongestedMillis: 0, lastVisitedMillis: 0 };
+      state = { nextEligibleMillis: 0, failures: 0, lastCongestedMillis: 0, lastVisitedMillis: 0, unusableStreak: 0 };
       schedule.set(key, state);
     }
     return state;
@@ -350,7 +350,18 @@ export function createCameraTrafficSource({
     // costs a request every time and can never produce an observation,
     // so it earns the longest ordinary gap.
     if (outcome === "frozen") return minRevisitSeconds * frozenRevisitMultiplier;
-    if (outcome === "unusable") return minRevisitSeconds * quietRevisitMultiplier;
+    // One unusable frame is not evidence of a useless camera, and
+    // demoting on the first is actively wrong for a differencing
+    // analyzer: its FIRST frame of any camera is unusable by
+    // construction, because that frame is what establishes the
+    // background to difference against. Backing off there means the
+    // second frame never arrives and the camera can never start working
+    // — it would look like a dead feed while being a perfectly good one.
+    // Two in a row is a camera that is genuinely dark, fogged or aimed
+    // at a car park.
+    if (outcome === "unusable") {
+      return state.unusableStreak > 1 ? minRevisitSeconds * quietRevisitMultiplier : minRevisitSeconds;
+    }
     return minRevisitSeconds;
   }
 
@@ -398,6 +409,7 @@ export function createCameraTrafficSource({
         await claimHostSlot(hostOf(camera), Date.now());
         const result = await pollCamera(camera, nowMillis);
         state.lastVisitedMillis = nowMillis;
+        state.unusableStreak = result.outcome === "unusable" ? state.unusableStreak + 1 : 0;
         if (result.outcome === "refused") {
           state.failures++;
           stats.refused++;
