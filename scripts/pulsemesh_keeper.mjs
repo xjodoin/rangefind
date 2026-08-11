@@ -69,7 +69,15 @@ const USAGE = `pulsemesh-keeper — a headless PulseMesh peer (§12), optionally
   node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<dir|https://…> [options]
 
 Required
-  --epoch=<64 hex>        the route graph's sourceHash; must match --graph
+  --epoch=<64 hex>        the route graph's sourceHash; must match --graph. Pins
+                          one exact build — right when you serve a graph you
+                          will not change under a running job.
+  --dataset=<region/prof> name the epoch by dataset instead — "quebec/car".
+                          Hashed to the same 64-hex shape, stable across
+                          rebuilds, and what a graph tracking a published index
+                          needs: a sourceHash changes when one driveway does,
+                          and renaming the topic strands every issued ticket.
+                          Must be the same string the apps use.
   --graph=<dir|url>       the static route graph this keeper validates against.
                           A directory, or an http(s) base URL of a published
                           graph — a keeper reads only the root, so serving it
@@ -141,8 +149,50 @@ if (args.help || args.h) {
   process.exit(0);
 }
 
-const epochHex = String(args.epoch || "");
-if (!/^[0-9a-f]{64}$/.test(epochHex)) fail("--epoch must be the route graph's 64-hex sourceHash");
+// The epoch is the topic namespace (§4.2), so it is what decides whether
+// this keeper and a fleet's phones are on the same mesh at all. Two ways
+// to name it, and they answer different questions:
+//
+//   --epoch    the graph's own sourceHash: "is this the same map", down
+//              to the driveway. Right for an operator serving a build
+//              they pinned and will not change under a running job.
+//
+//   --dataset  a region and profile — `quebec/car` — hashed into the same
+//              64-hex shape. Right for a graph tracking a public index,
+//              because a sourceHash is a hash over node coordinates, edge
+//              topology and weights: one new driveway changes it, and a
+//              weekly Geofabrik rebuild would rename every running job's
+//              channel and strand every ticket already issued.
+//
+// A dataset epoch is a promise rather than a proof — nothing here can
+// check that a given graph really is a build of `quebec/car`, only that
+// it opens. That is the same promise every other party on the run makes,
+// and the alternative is a topic namespace that changes when a road does.
+//
+// The namespace prefix below must stay byte-identical to the one the apps
+// derive from, or the two sides hash the same dataset to different
+// epochs and simply never meet. Its other definition is DATASET_NAMESPACE
+// in wayfind's packages/core/src/graphs.ts.
+const DATASET_NAMESPACE = "wayfind-dataset-v1:";
+
+async function datasetEpoch(datasetId) {
+  const name = String(datasetId ?? "").trim().toLowerCase();
+  if (!name) fail("--dataset cannot be empty");
+  const bytes = new TextEncoder().encode(DATASET_NAMESPACE + name);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+if (args.epoch && args.dataset) {
+  fail("--epoch and --dataset both name the epoch; pass one. --dataset is the stable "
+    + "one and the right choice for a graph tracking a published index.");
+}
+
+const datasetId = args.dataset ? String(args.dataset).trim().toLowerCase() : null;
+const epochHex = datasetId ? await datasetEpoch(datasetId) : String(args.epoch || "");
+if (!/^[0-9a-f]{64}$/.test(epochHex)) {
+  fail("name the epoch with --epoch=<64 hex sourceHash> or --dataset=<region/profile>");
+}
 
 // --- Static world: leaf -> z15 cell -------------------------------------
 
@@ -199,8 +249,17 @@ if (args["test-world"]) {
       "  were built by different releases — republish the graph, or pin the engine."
     ].join("\n"));
   }
-  if (engine.root.sourceHash !== epochHex) {
+  // Only --epoch asserts "this exact build". A dataset epoch deliberately
+  // matches every build of its region, which is the whole reason to use
+  // one, so there is nothing to compare here — the graph still has to
+  // open, and that is what was actually checked above.
+  if (!datasetId && engine.root.sourceHash !== epochHex) {
     fail(`graph epoch ${engine.root.sourceHash.slice(0, 16)}… does not match --epoch ${epochHex.slice(0, 16)}… (${graphSource})`);
+  }
+  if (datasetId) {
+    console.error(`pulsemesh-keeper: epoch ${epochHex.slice(0, 16)}… from dataset ${datasetId}`
+      + ` (this graph's own sourceHash is ${engine.root.sourceHash.slice(0, 16)}…, which is`
+      + " expected to differ and will change on every rebuild).");
   }
   cellOf = record => {
     const bbox = engine.root.leaves[record.leafCell]?.bbox;
