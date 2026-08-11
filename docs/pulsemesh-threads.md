@@ -257,7 +257,9 @@ the former ticket shape.
 A plaintext ticket is both a publishing capability and customer data. It MUST
 NOT leave the issuing process. PME1 seals arbitrary ticket bytes once under a
 random content key and wraps that key to one or more enrolled X25519 device
-public keys. Opening the envelope does not replace ticket signature
+public keys. How a device key becomes *enrolled* is outside this section:
+either the PMV1 card moves over a side channel (paste, read aloud), or the
+mesh itself carries it — §16. Opening the envelope does not replace ticket signature
 verification.
 
 Route-day tickets require the exact random authority seed returned with PMTC.
@@ -359,6 +361,10 @@ correlation otherwise reconstructs the route.
 | `SUBSCRIPTION_BYTES` | 154 |
 | `JOB_CLAIM_BYTES` | 121 |
 | `ASSIGNMENT_MAX_OFFER_BYTES` | 2048 |
+| `PAIR_MAX_SECONDS` | 900 s |
+| `PAIR_MAX_REPLY_BYTES` | 512 |
+| `PAIR_MAX_CANDIDATES` | 16 (= `SEAL_MAX_RECIPIENTS`) |
+| `PAIR_POP_SKEW` | 120 s |
 
 Hosts may tighten operational limits. They must not loosen fixed wire sizes,
 certificate lifetime, cryptographic field lengths, or parser strictness.
@@ -385,3 +391,131 @@ Implementations must cover at least:
 
 The repository's `test/pulsemesh*.test.js` suite is the executable
 conformance surface for this implementation.
+
+## 16. Mesh pairing (PMP1)
+
+Enrolment today moves the device card from the phone to the console over
+whatever channel is at hand — pasted text, a URL read aloud, a messaging app
+that now holds a copy. The card is public material, so nothing leaks; what it
+costs is the channel itself, and the channel is the wrong way round: the
+console has a screen and the phone has a camera. Pairing flips the scan. The
+console displays a short-lived offer, the phone scans it and answers **over
+the mesh**, and the only thing that still crosses the room by hand is the
+same eight-character fingerprint two people already read to each other in a
+doorway. The mesh replaces the clipboard, not the judgement.
+
+### 16.1 Offer
+
+`PMP1` ‖ version ‖ kind=1 ‖ pairingId(16, random) ‖ pairingPub(32, X25519) ‖
+epochPrefix8 ‖ varint notAfter ‖ varint labelLen ‖ label(≤32) ‖
+varint addrCount(≤3) ‖ addrs(each ≤96, multiaddr).
+
+Displayed as `wayfind://pair#<base64url>` — a QR on the console's screen.
+The offer is **unsigned**, deliberately: the operator has no long-lived
+identity key to sign with and must not be given one for this, and the
+offer's authenticity is physical — it is on the dispatcher's own screen in
+the dispatcher's own room. An offer is a location plus a public key and
+grants nothing; scanning it lets a device *propose* a card, which §16.4
+filters.
+
+The pairing keypair MUST be freshly generated per offer and discarded with
+it, and MUST NOT be the issuer key or any key that outlives the session.
+Reuse would turn the QR into a stable identifier of the operator, and would
+let yesterday's photograph open tomorrow's channel. `notAfter` is at most
+`PAIR_MAX_SECONDS` from mint. The bootstrap hints carry the operator's own
+seed under exactly the caps a sealed ticket's hints carry — ≤3 entries, ≤96
+bytes each — and the same travel rule: your own seed's address, never one a
+stranger handed you, because the offer is shown on your screen and whatever
+it names is where your drivers will dial.
+
+### 16.2 Rendezvous
+
+tag = HKDF(pairingId ‖ pairingPub, `"wayfind-pair-v1/tag"`, 8 bytes), and the
+topic is the ordinary thread-topic namespace over `epochPrefix8` — pairing
+traffic is indistinguishable from thread traffic to everything that carries
+it. Both parties subscribe on their own behalf: the console when it mints
+the offer, the phone when it scans. Delivery is live gossip only. Pairing
+messages are not PMT1 records, are not admitted to catch-up caches, and have
+no catch-up: both parties are present by definition — this is a doorway
+ceremony — so nothing about it needs to persist anywhere, and nothing does.
+
+### 16.3 Reply
+
+`PMP1` ‖ version ‖ kind=2 ‖ pairingId ‖ PME1( PMV1 card ‖ varint timestamp ‖
+pop(32) ), sealed to pairingPub. The plaintext pairingId lets the console
+drop foreign replies without trial decryption.
+
+pop = HMAC‑SHA256 over (`"wayfind-pair-v1/pop"` ‖ pairingId ‖ pairingPub ‖
+devicePub ‖ timestamp), keyed by HKDF(X25519(devicePriv, pairingPub),
+`"wayfind-pair-v1/key"`) — the same construction PMQ1 already uses for claim
+binding. The console MUST verify the MAC, that devicePub matches the card,
+and that timestamp is within `PAIR_POP_SKEW` of its clock.
+
+This is one honest upgrade over the pasted card, and only one: a reply
+proves the sender **holds the private half** of the key it is offering,
+which paste never proved. It does not prove the sender is the phone in
+front of you. That proof does not exist in bytes; it is §16.4.
+
+### 16.4 Confirmation stays human
+
+The console lists every valid reply with its `fingerprint()` and MUST NOT
+enrol any of them on its own. The phone shows its own fingerprint, the two
+are read aloud, and the dispatcher confirms exactly one — the ceremony §10
+enrolment has always ended with, unchanged. Multiple replies are the
+expected consequence of a photographable offer, not an attack signal: the
+mismatched ones are somebody else's phones, and refusing them is the whole
+point of the ceremony. Four bytes of SHA‑256 is not a cryptographic binding
+and is still not claimed to be one.
+
+### 16.5 Ack
+
+`PMP1` ‖ version ‖ kind=3 ‖ pairingId ‖ PME1( varint labelLen ‖ label ‖
+varint enrolledAt ‖ chosenFingerprint(4) ), sealed to the enrolled devicePub,
+published on the same topic, only **after** the dispatcher confirms. The
+phone that finds its own fingerprint inside shows "paired"; every other
+phone learns only that it was not chosen. The ack is a courtesy, not a
+record — the authoritative roster lives where it always has, in the issuing
+console.
+
+### 16.6 Hygiene
+
+A reply is at most `PAIR_MAX_REPLY_BYTES`; one reply per (pairingId,
+devicePub) — later duplicates are dropped; a console shows at most
+`PAIR_MAX_CANDIDATES` distinct candidates and past that MUST stop showing
+new ones and tell the operator to mint a fresh offer, because a flooded
+pairing is a photographed offer. At `notAfter` or on confirmation, both
+sides unsubscribe and the pairing key is destroyed. Replays after expiry
+have nothing to open them.
+
+### 16.7 What this deliberately does not do
+
+It does not bind a device card to a libp2p peerId — the standing rule, for
+the standing reason: that binding would let an operator join anonymous
+traffic records to a named driver, and enrolment is the tempting place to
+build it by accident. The reply is a proposal, not an enrolment; no roster
+exists on the mesh. And it does not replace the pasteable card: §10's side
+channel remains for depots with no mesh and for anything headless.
+
+### 16.8 Honest costs
+
+- A passive observer sees one sealed blob on a random topic and learns that
+  a pairing happened near that time — not who, not where, not which device.
+  The seed relays it and learns the same nothing.
+- Anyone who photographs the offer can propose a key until it expires. The
+  ceremony filters them; the expiry bounds them; neither makes the
+  photograph harmless, which is why `PAIR_MAX_SECONDS` is fifteen minutes
+  and not a shift.
+- A 2³² grind against a 4-byte fingerprint is feasible offline. An attacker
+  who already knows a target device's fingerprint could mint a colliding key
+  and race the reply. That exposure is exactly today's — the pasted card has
+  the same fingerprint and the same ceremony — unworsened and unrepaired.
+  The defences behind it are unchanged: possession at claim time, and the
+  award ceremony a wrong device still cannot win.
+
+### 16.9 Required security tests
+
+In addition to §15: offer expiry and post-expiry replay; reply dedupe;
+pop tampering (wrong pairing id, wrong device key, stale timestamp, foreign
+HKDF label); envelope sealed to the wrong recipient; oversized label, name,
+and reply; unknown kind, version, and trailing bytes; the candidate cap; and
+that no host path enrols a card without an explicit confirmation step.
