@@ -4,7 +4,7 @@
 // add availability, never authority: their records carry the same proofs
 // and get the same trust treatment as anyone's.
 //
-//   node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<route-graph dir>
+//   node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<dir|https://…>
 //        [--listen=/ip4/0.0.0.0/tcp/4001] [--zones=x/y,x/y] [--store-cap=1048576]
 //        [--bootstrap=<multiaddr>,...] [--stats-seconds=30]
 //        [--seed-card] [--seed-label="Depot seed"]
@@ -66,11 +66,17 @@ function fail(message) {
 
 const USAGE = `pulsemesh-keeper — a headless PulseMesh peer (§12), optionally a fleet's own seed (§12.1)
 
-  node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<route-graph dir> [options]
+  node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<dir|https://…> [options]
 
 Required
   --epoch=<64 hex>        the route graph's sourceHash; must match --graph
-  --graph=<dir>           the static route graph this keeper validates against
+  --graph=<dir|url>       the static route graph this keeper validates against.
+                          A directory, or an http(s) base URL of a published
+                          graph — a keeper reads only the root, so serving it
+                          over byte ranges costs two requests at startup and
+                          saves mirroring a region. A URL makes the graph a
+                          startup dependency; keep a directory if that is not
+                          acceptable.
   --test-world            harness substitute for --graph: a synthetic 64-leaf world
 
 Identity
@@ -151,10 +157,50 @@ if (args["test-world"]) {
     : null);
   defaultZones = [zoneOfDetailCell(BASE)];
 } else if (args.graph) {
-  const { openRouteGraphDir } = await import("../src/route_graph_node.js");
-  const engine = await openRouteGraphDir(String(args.graph));
+  // A directory or a URL. The engine is byte ranges over static files, so
+  // a published graph is already reachable the way the apps read it —
+  // requiring a local copy would mean mirroring a region's worth of
+  // immutable objects to run the one thing that never queries them.
+  //
+  // A keeper reads `root` and stops: leaf bounding boxes, to place a
+  // record in a cell and to derive the zone set it pins. That is two
+  // requests at startup against an immutable, cacheable path, which is
+  // why serving it over HTTP costs nothing here even though it would be
+  // the wrong choice for a router answering live queries.
+  //
+  // The cost this does carry, stated plainly: the graph becomes a startup
+  // network dependency. A keeper restarting while its host is unreachable
+  // will not come up, where one with a local copy would. `Restart=always`
+  // turns that into a retry rather than an outage, and the seed is a
+  // single point of failure for joining only — but a fleet that cannot
+  // tolerate even that should keep a local directory.
+  const graphSource = String(args.graph);
+  const remote = /^https?:\/\//iu.test(graphSource);
+  let engine;
+  try {
+    engine = remote
+      ? await (await import("../src/route_graph_query.js")).openRouteGraphUrl(graphSource)
+      : await (await import("../src/route_graph_node.js")).openRouteGraphDir(graphSource);
+  } catch (error) {
+    // A mistyped region and an unreachable host both arrive here, and a
+    // stack trace from inside the codec names neither. This is the first
+    // thing an operator sees when a keeper will not start, so it should
+    // say which of the two it was.
+    const reason = error?.message ?? String(error);
+    fail([
+      `cannot open the route graph at ${graphSource}: ${reason}`,
+      remote
+        ? "  A 404 usually means the region or profile is not published under that path;"
+        : "  Check the path exists and contains a manifest.json;",
+      remote
+        ? "  browse the catalog at <origin>/routes/catalog.json to see what is."
+        : "  a graph is build output, published rather than committed.",
+      "  An unsupported root version instead means the graph and this rangefind",
+      "  were built by different releases — republish the graph, or pin the engine."
+    ].join("\n"));
+  }
   if (engine.root.sourceHash !== epochHex) {
-    fail(`graph epoch ${engine.root.sourceHash.slice(0, 16)}… does not match --epoch ${epochHex.slice(0, 16)}…`);
+    fail(`graph epoch ${engine.root.sourceHash.slice(0, 16)}… does not match --epoch ${epochHex.slice(0, 16)}… (${graphSource})`);
   }
   cellOf = record => {
     const bbox = engine.root.leaves[record.leafCell]?.bbox;
