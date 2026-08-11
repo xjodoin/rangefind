@@ -121,3 +121,48 @@ test("a first unusable frame is not demoted — a differencing analyzer always p
   assert.ok(source.stats.observations >= 1, "and it produces a reading once it has a background");
   assert.ok(observed !== undefined);
 });
+
+test("a focus box spends the budget where somebody is actually asking", async () => {
+  // 20 cameras spread north; three sit inside the corridor being asked
+  // about. A budget of two must land inside that box, not on whichever
+  // happened to be stalest three regions away — and the budget still
+  // caps the work, so demand raises priority without raising spend.
+  const seen = [];
+  const source = createCameraTrafficSource({
+    cameras, analyze: async () => ({ congestion: "free", confidence: 0.9 }),
+    maxCameras: 2, concurrency: 1, hostMinIntervalMillis: 0, minRevisitSeconds: 900,
+    focus: () => [{ minLat: 45.515, minLon: -73.57, maxLat: 45.517, maxLon: -73.55 }],
+    fetchImage: async camera => { seen.push(camera.id); return { base64: `f-${camera.id}`, mediaType: "image/jpeg" }; }
+  });
+  await source.fetch({ nowMillis: 1_000_000 });
+  assert.equal(seen.length, 2, "the budget still caps the work");
+  assert.ok(seen.every(id => ["cam-15", "cam-16", "cam-17"].includes(id)),
+    `every request went inside the box, got ${seen.join(",")}`);
+  assert.equal(source.stats.focusBoxes, 1);
+  assert.equal(source.stats.inFocus, 3, "three were in the box; two fit the budget");
+});
+
+test("no demand signal falls back to plain rotation rather than stalling", async () => {
+  const seen = [];
+  const source = createCameraTrafficSource({
+    cameras, analyze: async () => ({ congestion: "free", confidence: 0.9 }),
+    maxCameras: 3, concurrency: 1, hostMinIntervalMillis: 0, minRevisitSeconds: 900,
+    focus: () => [],   // nobody asking
+    fetchImage: async camera => { seen.push(camera.id); return { base64: `f-${camera.id}`, mediaType: "image/jpeg" }; }
+  });
+  await source.fetch({ nowMillis: 1_000_000 });
+  assert.equal(seen.length, 3, "a quiet mesh still surveys the map");
+  assert.equal(source.stats.inFocus, 0);
+});
+
+test("a focus that throws does not take the survey down with it", async () => {
+  const seen = [];
+  const source = createCameraTrafficSource({
+    cameras, analyze: async () => ({ congestion: "free", confidence: 0.9 }),
+    maxCameras: 2, concurrency: 1, hostMinIntervalMillis: 0,
+    focus: () => { throw new Error("demand signal unavailable"); },
+    fetchImage: async camera => { seen.push(camera.id); return { base64: `f-${camera.id}`, mediaType: "image/jpeg" }; }
+  });
+  await source.fetch({ nowMillis: 1_000_000 });
+  assert.equal(seen.length, 2);
+});

@@ -156,7 +156,25 @@ export function createCameraTrafficSource({
   // per-pool, so without this the workers arrive as a burst.
   hostMinIntervalMillis = 1500,
   // How long a camera stays "interesting" after showing a queue.
-  congestedBoostSeconds = 1800
+  congestedBoostSeconds = 1800,
+  /**
+   * Where the demand is, as `[{ minLat, minLon, maxLat, maxLon }, …]` —
+   * a function, because it changes between ticks.
+   *
+   * This is what makes the source answer a question instead of surveying
+   * a province. A region has hundreds of cameras and a budget of a
+   * handful; without a focus the budget is spread evenly over roads
+   * nobody asked about, and the one corridor somebody is actually
+   * driving gets a camera every few hours. Hand it the corridors being
+   * asked for and the same budget lands where an answer can still change
+   * a route.
+   *
+   * Cameras inside a focus box are taken first; the rest of the budget
+   * falls through to ordinary rotation, so a quiet mesh still covers the
+   * map and a busy one concentrates. Returning nothing means "no demand
+   * signal", which is exactly the fallback.
+   */
+  focus = null
 } = {}) {
   if (typeof analyze !== "function") throw new Error("A camera source needs an analyze() function.");
   if (!cameras) throw new Error("A camera source needs cameras.");
@@ -167,7 +185,7 @@ export function createCameraTrafficSource({
     // Scheduler visibility. `blocked` is the one to watch: it counts 429
     // and 403 specifically, so a feed that has started refusing us is
     // legible in the stats line instead of hiding inside fetchFailed.
-    eligible: 0, skippedCooling: 0, refused: 0, blocked: 0
+    eligible: 0, skippedCooling: 0, refused: 0, blocked: 0, focusBoxes: 0, inFocus: 0
   };
   const lastFrameHash = new Map(); // camera id -> sha256 hex of last frame
   // camera id -> { nextEligibleMillis, failures, lastCongestedMillis, lastVisitedMillis }
@@ -378,17 +396,37 @@ export function createCameraTrafficSource({
     // and eight image URLs fetched on a metronome from one address —
     // which is precisely the shape a rate limiter blocks, and it had no
     // way to notice it had been blocked.
+    // Where the demand is this tick, if anything is asking.
+    let boxes = [];
+    if (typeof focus === "function") {
+      try {
+        boxes = (await focus()) || [];
+      } catch {
+        // A focus that throws must not take the survey down with it.
+        boxes = [];
+      }
+    }
+    const inFocus = camera => boxes.some(b =>
+      camera.lat >= b.minLat && camera.lat <= b.maxLat
+      && camera.lon >= b.minLon && camera.lon <= b.maxLon);
+
     const eligible = [];
     for (const camera of list) {
       const state = stateOf(camera);
       if (state.nextEligibleMillis > nowMillis) continue;
-      eligible.push({ camera, state });
+      eligible.push({ camera, state, focused: boxes.length > 0 && inFocus(camera) });
     }
+    stats.focusBoxes = boxes.length;
+    stats.inFocus = eligible.filter(e => e.focused).length;
 
     // Oldest first, but a camera that recently showed a queue jumps the
     // line: congestion is the only thing here worth spending a request
     // on, and it moves on a scale of minutes.
     eligible.sort((a, b) => {
+      // Asked-about first. A camera on a corridor somebody is driving can
+      // change a route now; one on an empty road three regions away
+      // cannot, however long it has been since anyone looked.
+      if (a.focused !== b.focused) return a.focused ? -1 : 1;
       const recentA = nowMillis - a.state.lastCongestedMillis < congestedBoostSeconds * 1000 ? 1 : 0;
       const recentB = nowMillis - b.state.lastCongestedMillis < congestedBoostSeconds * 1000 ? 1 : 0;
       if (recentA !== recentB) return recentB - recentA;
