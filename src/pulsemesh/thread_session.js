@@ -64,6 +64,18 @@ import {
   verifyThreadTicket
 } from "./thread_ticket.js";
 import { isSealedTicket, openSealedTicket } from "./thread_seal.js";
+import {
+  PAIR_KIND,
+  PAIR_MAX_CANDIDATES,
+  createPairingAck,
+  createPairingOffer,
+  createPairingReply,
+  openPairingAck,
+  openPairingReply,
+  pairingKindOf,
+  pairingTag,
+  pairingTopic
+} from "./thread_pair.js";
 import { THREAD_PROTOCOL } from "./topics.js";
 import {
   base64UrlToBytes,
@@ -153,6 +165,13 @@ export function createThreadChannel({
 
   const follows = new Set();
   const runs = new Set();
+  // Active pairings (§16). Keyed by pairingId hex. A console entry holds
+  // the offer key and the candidate replies it has seen; a phone entry
+  // holds its own device key and waits for an ack. Both are ephemeral —
+  // they subscribe on mint/scan and tear down on expiry or confirmation,
+  // touch no cache, and have no catch-up, because a doorway ceremony has
+  // both parties present by definition.
+  const pairings = new Map();
   // topic -> how many follows want it. Subscriptions rotate every five
   // minutes and two follows can share a window, so this is refcounted
   // rather than owned by whichever follow subscribed last.
@@ -482,6 +501,10 @@ export function createThreadChannel({
     const previous = node.onOtherTopic;
     node.onOtherTopic = (topicName, payload, fromPeer, nowMillis) => {
       previous?.(topicName, payload, fromPeer, nowMillis);
+      // Pairing messages ride the thread-topic namespace but are not PMT1
+      // records — route them out before deliver(), which would only drop
+      // them. §16.
+      if (deliverPairing(topicName, payload, nowMillis)) return;
       deliver(topicName, payload, nowMillis, fromPeer).catch(() => {
         // A record that throws on the way in is a dropped record, never
         // a dead channel.
@@ -491,8 +514,10 @@ export function createThreadChannel({
     // cryptographic verification happen here, before forwarding; the
     // transport's validate-once cache then suppresses the ordinary
     // delivery callback for the same bytes.
-    node.onOtherGossip = (topicName, payload, fromPeer, nowMillis) =>
-      deliver(topicName, payload, nowMillis, fromPeer);
+    node.onOtherGossip = (topicName, payload, fromPeer, nowMillis) => {
+      if (deliverPairing(topicName, payload, nowMillis)) return GOSSIP_IGNORE;
+      return deliver(topicName, payload, nowMillis, fromPeer);
+    };
   }
 
   /**
@@ -1133,12 +1158,19 @@ export function createThreadChannel({
       const due = nowMillis - entry.lastCatchUpMillis >= constants.THREAD_POLL_INTERVAL * 1000;
       if (!status.live && due) await catchUp(entry, { nowMillis }).catch(() => 0);
     }
+    // Pairings end at their offer's expiry — a photographed offer opens
+    // nothing past it, so nothing needs to keep listening. Confirmation
+    // leaves the entry in place until then so a lost ack can be re-sent.
+    for (const [idHex, entry] of [...pairings]) {
+      if (nowMillis >= entry.notAfter * 1000) stopPairing(idHex);
+    }
   }
 
   function close() {
     for (const entry of [...follows]) entry.stop();
     for (const run of runs) run.discovery?.stop();
     runs.clear();
+    for (const idHex of [...pairings.keys()]) stopPairing(idHex);
     if (node) {
       node.onOtherTopic = null;
       node.onOtherGossip = null;
@@ -1147,11 +1179,169 @@ export function createThreadChannel({
     }
   }
 
+  // --- Mesh pairing (§16) -------------------------------------------------
+
+  async function topicForPairing({ pairingId, pairingPub }) {
+    const tag = await pairingTag({ pairingId, pairingPub });
+    return pairingTopic(epochPrefix16hex, tag);
+  }
+
+  /**
+   * Console side: mint an offer, subscribe to its topic, and start
+   * collecting replies. Returns the QR bytes and a live handle. Enrols
+   * nothing — the handle lists candidates for a human to confirm.
+   */
+  async function startPairing({ label = "", addresses = [], nowMillis = clock() } = {}) {
+    const nowSeconds = Math.floor(nowMillis / 1000);
+    const offer = await createPairingOffer({ epochPrefix8, label, addresses, nowSeconds });
+    const topic = await topicForPairing({ pairingId: offer.pairingId, pairingPub: offer.publicKey });
+    subscribe(topic);
+    const idHex = toHex(offer.pairingId);
+    const entry = {
+      role: "offer",
+      pairingId: offer.pairingId,
+      privateKey: offer.privateKey,
+      publicKey: offer.publicKey,
+      notAfter: offer.notAfter,
+      topic,
+      candidates: new Map(),   // publicKeyHex -> candidate
+      label
+    };
+    pairings.set(idHex, entry);
+    return {
+      offerBytes: offer.bytes,
+      pairingId: offer.pairingId,
+      notAfter: offer.notAfter,
+      get candidates() { return [...entry.candidates.values()]; },
+      /** Confirm one candidate: seal an ack to it and publish (§16.5). */
+      confirm: (publicKeyHex, { name = label } = {}) =>
+        confirmPairing(idHex, publicKeyHex, name),
+      stop: () => stopPairing(idHex)
+    };
+  }
+
+  /**
+   * Phone side: scan an offer, subscribe to its topic, publish a reply,
+   * and wait for an ack. Returns a handle that resolves when this device
+   * is confirmed — or when the offer expires.
+   */
+  async function replyToPairing({ offer, devicePublicKey, devicePrivateKey, name = "", nowMillis = clock() }) {
+    const nowSeconds = Math.floor(nowMillis / 1000);
+    const topic = await topicForPairing({ pairingId: offer.pairingId, pairingPub: offer.pairingPub });
+    subscribe(topic);
+    const idHex = toHex(offer.pairingId);
+    const entry = {
+      role: "reply",
+      pairingId: offer.pairingId,
+      devicePrivateKey,
+      devicePublicKey,
+      notAfter: offer.notAfter,
+      topic,
+      acked: null
+    };
+    pairings.set(idHex, entry);
+    const reply = await createPairingReply({
+      offer, devicePublicKey, devicePrivateKey, name, nowSeconds
+    });
+    network?.publish(topic, reply, id);
+    return {
+      pairingId: offer.pairingId,
+      /** The ack for this device, once it arrives; null until then. */
+      get ack() { return entry.acked; },
+      stop: () => stopPairing(idHex)
+    };
+  }
+
+  async function confirmPairing(idHex, publicKeyHex, name) {
+    const entry = pairings.get(idHex);
+    if (!entry || entry.role !== "offer") return null;
+    const candidate = entry.candidates.get(publicKeyHex);
+    if (!candidate) return null;
+    const ack = await createPairingAck({
+      pairingId: entry.pairingId,
+      devicePublicKey: candidate.publicKey,
+      label: name || entry.label,
+      chosenFingerprint: candidate.fingerprint,
+      enrolledAt: Math.floor(clock() / 1000)
+    });
+    network?.publish(entry.topic, ack, id);
+    // The roster lives in the console, not here; this session's job ends
+    // at "told the winner". Keep the pairing briefly so a lost ack can be
+    // re-sent, then let tick() expire it.
+    entry.confirmed = candidate;
+    return candidate;
+  }
+
+  function stopPairing(idHex) {
+    const entry = pairings.get(idHex);
+    if (!entry) return;
+    unsubscribe(entry.topic);
+    pairings.delete(idHex);
+  }
+
+  /**
+   * Routes a PMP1 message to the pairing it belongs to. Returns true when
+   * it handled the payload (so the caller does not treat it as a record).
+   */
+  function deliverPairing(topicName, payload, nowMillis) {
+    const bytes = payload instanceof Uint8Array ? payload : null;
+    if (!bytes) return false;
+    const kind = pairingKindOf(bytes);
+    if (kind == null) return false;
+    // Find the pairing this topic belongs to. Pairings are few, so a scan
+    // is cheaper than deriving a reverse index.
+    for (const entry of pairings.values()) {
+      if (entry.topic !== topicName) continue;
+      if (entry.role === "offer" && kind === PAIR_KIND.REPLY) {
+        void ingestReply(entry, bytes, nowMillis);
+      } else if (entry.role === "reply" && kind === PAIR_KIND.ACK) {
+        void ingestAck(entry, bytes);
+      }
+      return true;
+    }
+    // A PMP1 for a pairing we are not part of. Still ours to recognise so
+    // it is not mistaken for a malformed record; a relay carries it on.
+    return true;
+  }
+
+  async function ingestReply(entry, bytes, nowMillis) {
+    const opened = await openPairingReply({
+      bytes,
+      pairingId: entry.pairingId,
+      pairingPrivateKey: entry.privateKey,
+      pairingPublicKey: entry.publicKey,
+      nowSeconds: Math.floor(nowMillis / 1000)
+    }).catch(() => null);
+    if (!opened) return;
+    // One reply per device; later duplicates are dropped (§16.6). The cap
+    // is a photographed-offer signal, not an attack — stop showing new
+    // ones and let the operator mint a fresh offer.
+    if (!entry.candidates.has(opened.publicKeyHex)
+        && entry.candidates.size >= PAIR_MAX_CANDIDATES) {
+      entry.flooded = true;
+      return;
+    }
+    if (!entry.candidates.has(opened.publicKeyHex)) {
+      entry.candidates.set(opened.publicKeyHex, opened);
+    }
+  }
+
+  async function ingestAck(entry, bytes) {
+    const ack = await openPairingAck({
+      bytes,
+      pairingId: entry.pairingId,
+      devicePrivateKey: entry.devicePrivateKey
+    }).catch(() => null);
+    if (ack) entry.acked = ack;
+  }
+
   return {
     publish,
     publishRouteDay,
     publishTicket,
     follow,
+    startPairing,
+    replyToPairing,
     tick,
     close,
     stats,

@@ -323,3 +323,97 @@ test("a coarse run never claims a live position, because it withheld one", async
   busThreads.close();
   parentThreads.close();
 });
+
+test("pairing carries a device card console<->phone over the mesh, and enrols only on confirm", async t => {
+  const found = await fixture(t);
+  if (!found) return;
+  const { engine } = found;
+  let now = Math.floor(Date.now() / 1000) * 1000;
+  const clock = () => now;
+  const network = createLoopbackNetwork({ clock });
+
+  const consoleNode = await createMeshSession({
+    engine, network, id: "console", transport: "loopback", constants: DEFAULT_CONSTANTS, clock
+  });
+  const phoneNode = await createMeshSession({
+    engine, network, id: "phone", transport: "loopback", constants: DEFAULT_CONSTANTS, clock
+  });
+  const consoleThreads = createThreadChannel({ node: consoleNode.node, network, engine, id: "console", clock });
+  const phoneThreads = createThreadChannel({ node: phoneNode.node, network, engine, id: "phone", clock });
+
+  const { generateDeviceKeypair } = await import("../src/pulsemesh/thread_seal.js");
+  const { decodePairingOffer } = await import("../src/pulsemesh/thread_pair.js");
+
+  // Console mints an offer (this is what becomes a QR on its screen).
+  const pairing = await consoleThreads.startPairing({
+    label: "Dispatch", addresses: ["/dns4/mesh.example/tcp/443/tls/ws/p2p/12D3KooWabc"],
+    nowMillis: now
+  });
+
+  // Phone scans it and replies over the mesh.
+  const device = await generateDeviceKeypair();
+  const offer = decodePairingOffer(pairing.offerBytes);
+  const phoneHandle = await phoneThreads.replyToPairing({
+    offer, devicePublicKey: device.publicKey, devicePrivateKey: device.privateKey,
+    name: "Marco — Pixel", nowMillis: now
+  });
+
+  // The console sees exactly one candidate, and has enrolled nobody.
+  await until(() => pairing.candidates.length === 1);
+  assert.equal(pairing.candidates.length, 1, "the reply arrived as a candidate");
+  const candidate = pairing.candidates[0];
+  assert.equal(candidate.name, "Marco — Pixel");
+  assert.equal(candidate.fingerprint.length, 8, "a fingerprint to read aloud");
+
+  // A human confirms it (the read-aloud match). Only now is an ack sent.
+  const chosen = await pairing.confirm(candidate.publicKeyHex, { name: "Marco — Pixel" });
+  assert.ok(chosen, "confirm sealed an ack to the chosen device");
+
+  // The phone learns it was chosen, and with which fingerprint.
+  await until(() => phoneHandle.ack != null);
+  assert.ok(phoneHandle.ack, "the phone received its ack");
+  assert.equal(phoneHandle.ack.fingerprint, candidate.fingerprint);
+  assert.equal(phoneHandle.ack.label, "Marco — Pixel");
+
+  pairing.stop();
+  phoneHandle.stop();
+  consoleThreads.close();
+  phoneThreads.close();
+});
+
+test("a second phone answering the same offer is a separate candidate, not an enrolment", async t => {
+  const found = await fixture(t);
+  if (!found) return;
+  const { engine } = found;
+  let now = Math.floor(Date.now() / 1000) * 1000;
+  const clock = () => now;
+  const network = createLoopbackNetwork({ clock });
+
+  const consoleNode = await createMeshSession({ engine, network, id: "c", transport: "loopback", constants: DEFAULT_CONSTANTS, clock });
+  const p1 = await createMeshSession({ engine, network, id: "p1", transport: "loopback", constants: DEFAULT_CONSTANTS, clock });
+  const p2 = await createMeshSession({ engine, network, id: "p2", transport: "loopback", constants: DEFAULT_CONSTANTS, clock });
+  const consoleThreads = createThreadChannel({ node: consoleNode.node, network, engine, id: "c", clock });
+  const t1 = createThreadChannel({ node: p1.node, network, engine, id: "p1", clock });
+  const t2 = createThreadChannel({ node: p2.node, network, engine, id: "p2", clock });
+
+  const { generateDeviceKeypair } = await import("../src/pulsemesh/thread_seal.js");
+  const { decodePairingOffer } = await import("../src/pulsemesh/thread_pair.js");
+
+  const pairing = await consoleThreads.startPairing({ label: "Dispatch", nowMillis: now });
+  const offer = decodePairingOffer(pairing.offerBytes);
+
+  const d1 = await generateDeviceKeypair();
+  const d2 = await generateDeviceKeypair();
+  await t1.replyToPairing({ offer, devicePublicKey: d1.publicKey, devicePrivateKey: d1.privateKey, name: "Phone one", nowMillis: now });
+  await t2.replyToPairing({ offer, devicePublicKey: d2.publicKey, devicePrivateKey: d2.privateKey, name: "Phone two", nowMillis: now });
+
+  await until(() => pairing.candidates.length === 2);
+  assert.equal(pairing.candidates.length, 2, "both phones show as distinct candidates for a human to choose between");
+  const names = pairing.candidates.map(c => c.name).sort();
+  assert.deepEqual(names, ["Phone one", "Phone two"]);
+
+  pairing.stop();
+  consoleThreads.close();
+  t1.close();
+  t2.close();
+});

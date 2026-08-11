@@ -135,6 +135,27 @@ export {
 } from "./thread_seal.js";
 
 export {
+  PAIR_KIND,
+  PAIR_MAGIC,
+  PAIR_MAX_CANDIDATES,
+  PAIR_MAX_REPLY_BYTES,
+  PAIR_MAX_SECONDS,
+  PAIR_POP_SKEW,
+  PAIR_VERSION,
+  createPairingAck,
+  createPairingOffer,
+  createPairingReply,
+  decodePairingOffer,
+  openPairingAck,
+  openPairingReply,
+  pairingKindOf,
+  pairingOfferUrl,
+  pairingTag,
+  pairingTopic,
+  parsePairingOfferUrl
+} from "./thread_pair.js";
+
+export {
   SUBSCRIPTION_BYTES,
   SUBSCRIPTION_FLAG_DELEGATED,
   SUBSCRIPTION_MAGIC,
