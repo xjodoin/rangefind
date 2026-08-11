@@ -233,8 +233,17 @@ export function createThreadDiscovery({
       try {
         const { multiaddr } = await import("@multiformats/multiaddr");
         for (const address of peer.multiaddrs.slice(0, MAX_PROVIDER_ADDRESSES)) {
+          // A provider record stores the peer's addresses and its id as
+          // separate fields, so a relayed address arrives ending at
+          // `/p2p-circuit` — no destination. Dialled as-is, libp2p answers
+          // "no valid addresses" and the follower never reaches a
+          // publisher it has already found. Re-attach the id; on a direct
+          // address the suffix additionally pins who must answer it.
+          const target = address.endsWith(`/p2p/${peer.id}`)
+            ? address
+            : `${address}/p2p/${peer.id}`;
           try {
-            await host.dial(multiaddr(address), { signal: deadline(findTimeoutMs) });
+            await host.dial(multiaddr(target), { signal: deadline(findTimeoutMs) });
             connected.push(peer.id);
             break;
           } catch {
