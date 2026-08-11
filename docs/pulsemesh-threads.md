@@ -439,6 +439,17 @@ messages are not PMT1 records, are not admitted to catch-up caches, and have
 no catch-up: both parties are present by definition — this is a doorway
 ceremony — so nothing about it needs to persist anywhere, and nothing does.
 
+Gossip is only live between peers that are connected, and on a fleet mesh
+both ends are typically connected to nothing but the seed, which never joins
+thread topics. So both ends run the §4.2 rendezvous over the pairing topic:
+provide `threadRendezvous(topic)` on the DHT, look the same key up, dial
+whoever answers. Both advertise and both look up, because either end may be
+the one without an address of its own. A phone that has not been answered
+re-publishes its reply while it keeps looking; the console drops duplicates
+by devicePub under §16.6, so repeating costs a candidate nothing. The key is
+derived from a topic that lives fifteen minutes, so the DHT learns what it
+learns from any thread: that some peer holds something by an opaque name.
+
 ### 16.3 Reply
 
 `PMP1` ‖ version ‖ kind=2 ‖ pairingId ‖ PME1( PMV1 card ‖ varint timestamp ‖

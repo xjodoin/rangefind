@@ -87,6 +87,18 @@ export function createThreadDiscovery({
   constants = THREAD_CONSTANTS,
   clock = Date.now,
   advertise = false,
+  /**
+   * Where this discovery is addressed, as `[{ window, topic, rendezvous,
+   * cid }]`. Threads derive it from their keys and their rotating window,
+   * which is the default; a **pairing** (§16.2) has one fixed topic that
+   * lives fifteen minutes and no keys at all, so it passes its own.
+   *
+   * The mechanism underneath is identical either way — provide an opaque
+   * hash, look the same hash up, dial who answers — and so is what the
+   * DHT learns from it, which is nothing but that some peer holds
+   * something by that name.
+   */
+  addressesFor = null,
   provideTimeoutMs = 10_000,
   findTimeoutMs = 10_000
 } = {}) {
@@ -111,6 +123,7 @@ export function createThreadDiscovery({
     : undefined);
 
   async function addresses(nowMillis = clock()) {
+    if (addressesFor) return addressesFor(nowMillis);
     return threadAddresses({ keys, epoch32, epochPrefix16hex, nowMillis });
   }
 

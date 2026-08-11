@@ -56,7 +56,7 @@ import {
   encodePhotoResponse
 } from "./thread_codec.js";
 import { routeFollowLink } from "./thread_route.js";
-import { photoCommitment, photoHashHex, verifyPhotoChain } from "./thread_crypto.js";
+import { photoCommitment, photoHashHex, threadRendezvous, verifyPhotoChain } from "./thread_crypto.js";
 import {
   decodeThreadTicket,
   jobIdHexOf,
@@ -165,6 +165,13 @@ export function createThreadChannel({
 
   const follows = new Set();
   const runs = new Set();
+  // How often a phone that has not been answered re-offers its reply,
+  // and how long it keeps doing so. Both are well inside the fifteen
+  // minutes an offer lives: a doorway ceremony that has not worked in
+  // two minutes has not worked, and the operator mints a fresh code.
+  const PAIR_REPLY_RETRY_MS = 4_000;
+  const PAIR_REPLY_RETRY_WINDOW_MS = 120_000;
+
   // Active pairings (§16). Keyed by pairingId hex. A console entry holds
   // the offer key and the candidate replies it has seen; a phone entry
   // holds its own device key and waits for an ack. Both are ephemeral —
@@ -1162,7 +1169,22 @@ export function createThreadChannel({
     // nothing past it, so nothing needs to keep listening. Confirmation
     // leaves the entry in place until then so a lost ack can be re-sent.
     for (const [idHex, entry] of [...pairings]) {
-      if (nowMillis >= entry.notAfter * 1000) stopPairing(idHex);
+      if (nowMillis >= entry.notAfter * 1000) {
+        stopPairing(idHex);
+        continue;
+      }
+      // A reply published into an empty topic is lost, and that is the
+      // normal first attempt: the phone publishes the instant it scans,
+      // while the dial to the console is still being found. So a phone
+      // that has not been answered keeps looking and keeps re-offering,
+      // for a bounded while. The console drops duplicates by devicePub
+      // (§16.6), so repeating costs a candidate nothing.
+      if (entry.role !== "reply" || entry.acked) continue;
+      if (nowMillis - entry.lastReplyMillis < PAIR_REPLY_RETRY_MS) continue;
+      if (nowMillis - entry.startedMillis > PAIR_REPLY_RETRY_WINDOW_MS) continue;
+      entry.lastReplyMillis = nowMillis;
+      void entry.discovery?.connect({ nowMillis }).catch(() => []);
+      network?.publish(entry.topic, await mintReply(entry, Math.floor(nowMillis / 1000)), id);
     }
   }
 
@@ -1187,6 +1209,61 @@ export function createThreadChannel({
   }
 
   /**
+   * How the two ends of a pairing find each other.
+   *
+   * §16.2 says delivery is live gossip only, and it is — but gossip is
+   * only live between peers that are *connected*, and on a fleet mesh
+   * both ends are typically connected to nothing but the keeper, which
+   * never joins thread topics. So the console and the phone would sit on
+   * the same topic, one hop apart, and never hear each other.
+   *
+   * The answer is the one §4.2 already gives a thread: provide the
+   * topic's rendezvous on the DHT, look the same key up, dial who
+   * answers. Both ends do both here, because either may be the one with
+   * a relay address — a browser tab and a phone are equally likely to
+   * have none of their own. The key is derived from the pairing topic,
+   * so it is as opaque and as short-lived as the offer itself.
+   */
+  async function startPairingDiscovery(topic) {
+    if (!host?.contentRouting) return null;
+    const { createThreadDiscovery, rendezvousCid } = await import("./thread_discovery.js");
+    const rendezvous = threadRendezvous(topic);
+    const cid = await rendezvousCid(rendezvous);
+    const addresses = [{ window: 0, topic, rendezvous, cid }];
+    const discovery = createThreadDiscovery({
+      host, epoch32, epochPrefix16hex, constants, clock, advertise: true,
+      addressesFor: () => addresses
+    });
+    discovery.start();
+    // One lookup now, so a phone scanning an offer that has been on
+    // screen for a minute does not wait for the next interval; the
+    // periodic ones follow from tick().
+    void discovery.connect().catch(() => []);
+    return discovery;
+  }
+
+  /**
+   * One reply, minted fresh every time it is offered.
+   *
+   * Not a cached blob re-sent: gossip deduplicates by message id, so
+   * repeating byte-identical bytes is repeating nothing — every attempt
+   * after the first would be dropped by the sender's own seen-cache and
+   * the retry would be a no-op that looks like a network problem. A new
+   * reply also carries a current pop timestamp, which is what the console
+   * checks against `PAIR_POP_SKEW`: a reply minted two minutes ago and
+   * delivered now is a reply the console is right to refuse.
+   */
+  async function mintReply(entry, nowSeconds) {
+    return createPairingReply({
+      offer: entry.offer,
+      devicePublicKey: entry.devicePublicKey,
+      devicePrivateKey: entry.devicePrivateKey,
+      name: entry.name,
+      nowSeconds
+    });
+  }
+
+  /**
    * Console side: mint an offer, subscribe to its topic, and start
    * collecting replies. Returns the QR bytes and a live handle. Enrols
    * nothing — the handle lists candidates for a human to confirm.
@@ -1199,6 +1276,7 @@ export function createThreadChannel({
     const idHex = toHex(offer.pairingId);
     const entry = {
       role: "offer",
+      discovery: await startPairingDiscovery(topic),
       pairingId: offer.pairingId,
       privateKey: offer.privateKey,
       publicKey: offer.publicKey,
@@ -1237,13 +1315,15 @@ export function createThreadChannel({
       devicePublicKey,
       notAfter: offer.notAfter,
       topic,
-      acked: null
+      discovery: await startPairingDiscovery(topic),
+      acked: null,
+      offer,
+      name,
+      startedMillis: nowMillis,
+      lastReplyMillis: nowMillis
     };
     pairings.set(idHex, entry);
-    const reply = await createPairingReply({
-      offer, devicePublicKey, devicePrivateKey, name, nowSeconds
-    });
-    network?.publish(topic, reply, id);
+    network?.publish(topic, await mintReply(entry, nowSeconds), id);
     return {
       pairingId: offer.pairingId,
       /** The ack for this device, once it arrives; null until then. */
@@ -1275,6 +1355,7 @@ export function createThreadChannel({
   function stopPairing(idHex) {
     const entry = pairings.get(idHex);
     if (!entry) return;
+    entry.discovery?.stop();
     unsubscribe(entry.topic);
     pairings.delete(idHex);
   }
