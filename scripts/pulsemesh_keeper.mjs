@@ -51,6 +51,7 @@ import { ADMIT_CONNECTED, BRIDGE_POLICIES, createFleetBridge } from "../src/puls
 import { THREAD_MAX_BOOTSTRAP_ADDRESSES, THREAD_MAX_BOOTSTRAP_BYTES } from "../src/pulsemesh/thread_codec.js";
 import { encodeSeedCard, isDialableAddress, seedCardUrl } from "../src/pulsemesh/thread_seed.js";
 import { encodeQr, qrTerminal } from "../src/qr.js";
+import { datasetEpoch } from "../src/pulsemesh/dataset_epoch.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -169,20 +170,8 @@ if (args.help || args.h) {
 // it opens. That is the same promise every other party on the run makes,
 // and the alternative is a topic namespace that changes when a road does.
 //
-// The namespace prefix below must stay byte-identical to the one the apps
-// derive from, or the two sides hash the same dataset to different
-// epochs and simply never meet. Its other definition is DATASET_NAMESPACE
-// in wayfind's packages/core/src/graphs.ts.
-const DATASET_NAMESPACE = "wayfind-dataset-v1:";
-
-async function datasetEpoch(datasetId) {
-  const name = String(datasetId ?? "").trim().toLowerCase();
-  if (!name) fail("--dataset cannot be empty");
-  const bytes = new TextEncoder().encode(DATASET_NAMESPACE + name);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-}
-
+// Derivation shared with the ingest node — see src/pulsemesh/dataset_epoch.js
+// for why the namespace must match the product's byte for byte.
 if (args.epoch && args.dataset) {
   fail("--epoch and --dataset both name the epoch; pass one. --dataset is the stable "
     + "one and the right choice for a graph tracking a published index.");
