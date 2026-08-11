@@ -570,7 +570,16 @@ export function createThreadChannel({
         // every record by construction. Cached as `openable` so the
         // relay budget never evicts a run this device is publishing.
         try {
-          if (cache.admit(emitted.bytes, { openable: true, nowMillis: clock() }).admitted) stats.cached++;
+          // Retained until the LINK expires, not for the relay window.
+          // A customer opens their link when the parcel arrives, which is
+          // routinely after the run ended; ten minutes of catch-up would
+          // miss exactly the moment it exists for.
+          const admitted = cache.admit(emitted.bytes, {
+            openable: true,
+            nowMillis: clock(),
+            retainUntilMillis: notAfter ? notAfter * 1000 : null
+          }).admitted;
+          if (admitted) stats.cached++;
         } catch {
           // Its own record failing to decode would be a bug elsewhere.
         }
@@ -635,16 +644,29 @@ export function createThreadChannel({
       photoChainEntries: () => publisher.photoChainEntries(),
       async finish(options) {
         const emitted = await publisher.finish(options);
-        // The final record still needs to reach anyone catching up, so
-        // the run leaves the set but its bytes stay in the cache until
-        // THREAD_CACHE_TTL sweeps them.
-        discovery?.stop();
-        // Let the topics go. A device that finishes a round and keeps
-        // the subscription is relaying somebody else's thread traffic
-        // for nothing, and on a phone that is battery.
+        // Let the TOPICS go, but stay findable.
+        //
+        // These are two different costs and only one of them is the
+        // battery argument. A subscription means carrying other people's
+        // thread traffic on this radio, which a finished round should
+        // not do. Being discoverable and answering catch-up means a DHT
+        // provider record and the occasional request for bytes already
+        // in this cache — and it is the whole reason the publisher
+        // caches its own records as `openable`: it is the best catch-up
+        // source there is, because it holds every record by
+        // construction.
+        //
+        // Dropping both at `finish` retired that source at exactly the
+        // moment it becomes most likely to be asked: a customer opens
+        // their link when the parcel arrives, not while the van is
+        // moving. The keeper cannot cover for it — a thread's topic
+        // derives from a capability a keeper must never hold, so it
+        // never joins one and forwards none of this.
         for (const topic of publishedTopics) unsubscribe(topic);
         publishedTopics.clear();
-        runs.delete(run);
+        // Stays in `runs` so tick() keeps re-providing the rendezvous
+        // key; retired there once the link it belongs to has expired.
+        run.finishedAtMillis = clock();
         return emitted;
       },
       get stats() { return publisher.stats; },
@@ -1082,6 +1104,19 @@ export function createThreadChannel({
     // so nothing on the phone looks wrong. `provide` rate-limits itself
     // per window, so ticking it is idempotent, not chatty.
     for (const run of [...runs]) {
+      // A finished run keeps advertising until its link expires — that
+      // is the window in which somebody may still open it — and is
+      // retired the moment it cannot serve anyone. Advertising past
+      // expiry would keep announcing that this device once carried a
+      // run, for a capability that no longer opens anything.
+      if (run.finishedAtMillis != null) {
+        const expired = !run.notAfter || nowMillis >= run.notAfter * 1000;
+        if (expired) {
+          run.discovery?.stop();
+          runs.delete(run);
+          continue;
+        }
+      }
       if (run.discovery) await run.discovery.provide({ nowMillis }).catch(() => 0);
     }
     for (const entry of [...follows]) {

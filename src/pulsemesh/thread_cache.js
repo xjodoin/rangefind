@@ -81,7 +81,7 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
    * for certificate+position startup, then the ordinary per-tag refill;
    * relay-only traffic gets no burst and also pays the new-tag budget.
    */
-  function admit(record, { fromPeer = null, openable = false, retain = true, nowMillis = clock() } = {}) {
+  function admit(record, { fromPeer = null, openable = false, retain = true, nowMillis = clock(), retainUntilMillis = null } = {}) {
     const decoded = record instanceof Uint8Array ? decodeThreadRecord(record) : record;
     if (decoded.bytes.length > constants.THREAD_MAX_RECORD_BYTES) {
       stats.rejected++;
@@ -154,7 +154,12 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
       generation: decoded.generation,
       seq: decoded.seq,
       bytes: decoded.bytes,
-      receivedAt: nowMillis
+      receivedAt: nowMillis,
+      // An explicit deadline, for records this device published itself.
+      // Everything else here is somebody else's traffic held on a relay
+      // budget, and ten minutes is right for that. A run of one's own is
+      // the thing a customer comes back and asks for.
+      retainUntilMillis: Number.isFinite(retainUntilMillis) ? retainUntilMillis : null
     });
     entry.records.sort((a, b) => a.generation - b.generation || a.seq - b.seq);
     if (entry.records.length > constants.THREAD_CACHE_RING) entry.records.shift();
@@ -167,7 +172,15 @@ export function createThreadCache({ constants = THREAD_CONSTANTS, clock = Date.n
   function sweep(nowMillis = clock()) {
     const cutoff = nowMillis - constants.THREAD_CACHE_TTL * 1000;
     for (const [tagHex, entry] of [...tags]) {
-      entry.records = entry.records.filter(record => record.receivedAt > cutoff);
+      // A record carrying its own deadline outlives the relay window: it
+      // is this device's own run, kept so a follower arriving after the
+      // last stop still has somebody to ask. Everything else ages out on
+      // THREAD_CACHE_TTL exactly as before.
+      entry.records = entry.records.filter(record => (
+        record.retainUntilMillis != null
+          ? nowMillis < record.retainUntilMillis
+          : record.receivedAt > cutoff
+      ));
       if (!entry.records.length && !entry.openable) tags.delete(tagHex);
     }
   }
