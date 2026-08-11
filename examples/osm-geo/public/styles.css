@@ -902,6 +902,38 @@ a { color: inherit; }
   border-radius: inherit;
   background: linear-gradient(90deg, var(--pine), #88e0d2);
 }
+.query-receipt__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 11px;
+}
+.query-receipt__action {
+  padding: 5px 9px;
+  border: 1px solid rgba(250, 249, 242, .14);
+  border-radius: 6px;
+  background: rgba(250, 249, 242, .03);
+  color: #9ea6a9;
+  cursor: pointer;
+  font: 500 .5rem/1 var(--mono);
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  transition: color .16s ease, border-color .16s ease, background .16s ease;
+}
+.query-receipt__action:hover:not(:disabled) {
+  border-color: rgba(53, 194, 172, .4);
+  background: rgba(53, 194, 172, .08);
+  color: var(--pine);
+}
+.query-receipt__action:disabled { opacity: .45; cursor: default; }
+.query-receipt__feedback {
+  color: var(--pine);
+  font: 500 .5rem/1 var(--mono);
+  text-transform: uppercase;
+}
+.query-receipt__feedback[data-state="error"] { color: var(--danger); }
+
 .query-receipt__proof {
   margin: 11px 0 0;
   padding-top: 9px;
@@ -1036,6 +1068,27 @@ a { color: inherit; }
 }
 .result-card__arrow { padding-top: 7px; color: #5d6571; font: 500 .8rem/1 var(--mono); transition: color .16s ease, transform .16s ease; }
 .result-card:hover .result-card__arrow { color: var(--marker); transform: translateX(2px); }
+
+/* Hydrated-suggestion preview dots: where each dropdown row lives, shown
+   while the suggestion list is open, without moving the map. */
+.suggestion-preview-marker {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #c19726;
+  border: 2px solid #fffdf5;
+  box-shadow: 0 1px 4px rgba(30, 25, 10, 0.35);
+  opacity: 0.85;
+  pointer-events: none;
+  transition: transform 120ms ease, background 120ms ease, opacity 120ms ease;
+}
+
+.suggestion-preview-marker.active {
+  background: #9b3d2e;
+  transform: scale(1.4);
+  opacity: 1;
+}
 
 .result-marker {
   display: grid;

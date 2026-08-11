@@ -23,6 +23,7 @@ import { DEFAULT_CONSTANTS } from "../src/pulsemesh/bins.js";
 import { createMeshSession } from "../src/pulsemesh/session.js";
 import { createIngestPublisher } from "../src/pulsemesh/ingest.js";
 import { createLibp2pNetwork, createPulseMeshHost } from "../src/pulsemesh/libp2p.js";
+import { datasetEpoch } from "../src/pulsemesh/dataset_epoch.js";
 
 const args = Object.fromEntries(process.argv.slice(2).map(arg => {
   const [key, value] = arg.replace(/^--/, "").split("=");
@@ -40,7 +41,11 @@ const USAGE = `pulsemesh-ingest — publish traffic from external sources into t
 
 Required
   --epoch=<64 hex>        the route graph's sourceHash; must match --graph
-  --graph=<dir>           the static route graph observations are matched against
+  --dataset=<region/prof> name the epoch by dataset instead — "quebec/car".
+                          Stable across rebuilds. Must match the keeper this
+                          feeds, or these records land on a topic nobody is on.
+  --graph=<dir|url>       the static route graph observations are matched against;
+                          a directory or an http(s) base URL
   --config=<file.mjs>     module exporting { sources: [...] }; each source is
                           { id, intervalSeconds, fetch({nowMillis}) -> observations }
                           or { id, intervalSeconds, url, headers?, map(json) -> observations }.
@@ -79,9 +84,23 @@ if (args.help || args.h) {
   process.exit(0);
 }
 
-const epochHex = String(args.epoch || "");
-if (!/^[0-9a-f]{64}$/.test(epochHex)) fail("--epoch must be the route graph's 64-hex sourceHash");
-if (!args.graph) fail("--graph=<route-graph dir> is required");
+// Same two ways to name the epoch as the keeper, and for the same reason:
+// the epoch is the topic namespace, so an ingest node that derives it
+// differently from the mesh it feeds publishes into a void — validly
+// signed records on a topic nobody is listening to, with nothing
+// anywhere reporting a problem. An operator running both must pass the
+// same flag to both.
+if (args.epoch && args.dataset) {
+  fail("--epoch and --dataset both name the epoch; pass one. Use whichever the "
+    + "keeper this feeds was given.");
+}
+
+const datasetId = args.dataset ? String(args.dataset).trim().toLowerCase() : null;
+const epochHex = datasetId ? await datasetEpoch(datasetId) : String(args.epoch || "");
+if (!/^[0-9a-f]{64}$/.test(epochHex)) {
+  fail("name the epoch with --epoch=<64 hex sourceHash> or --dataset=<region/profile>");
+}
+if (!args.graph) fail("--graph=<dir|https://…> is required");
 if (!args.config) fail("--config=<sources.mjs> is required");
 
 // --- Sources ---------------------------------------------------------------
@@ -135,9 +154,23 @@ try {
 
 // --- Engine + mesh ---------------------------------------------------------
 
-const { openRouteGraphDir } = await import("../src/route_graph_node.js");
-const engine = await openRouteGraphDir(String(args.graph));
-if (engine.root.sourceHash !== epochHex) {
+// A directory or a published URL, like the keeper. An ingest node matches
+// observations to the graph continuously rather than reading the root
+// once, so this one does pay for byte ranges as it runs — which is the
+// right trade against mirroring a region, and the wrong one if the feed
+// interval is seconds. It is stated rather than assumed.
+const graphSource = String(args.graph);
+let engine;
+try {
+  engine = /^https?:\/\//iu.test(graphSource)
+    ? await (await import("../src/route_graph_query.js")).openRouteGraphUrl(graphSource)
+    : await (await import("../src/route_graph_node.js")).openRouteGraphDir(graphSource);
+} catch (error) {
+  fail(`cannot open the route graph at ${graphSource}: ${error?.message ?? error}`);
+}
+// Only --epoch pins one exact build; a dataset epoch matches every build
+// of its region on purpose.
+if (!datasetId && engine.root.sourceHash !== epochHex) {
   fail(`graph epoch ${engine.root.sourceHash.slice(0, 16)}… does not match --epoch ${epochHex.slice(0, 16)}…`);
 }
 
@@ -153,7 +186,15 @@ const session = await createMeshSession({
   engine,
   network,
   id: host.peerId.toString(),
-  transport: "wire"
+  transport: "wire",
+  // Explicitly, because the session's default is the graph's sourceHash.
+  // That was the same value back when --epoch had to equal it; with
+  // --dataset they differ on purpose, and leaving this out publishes
+  // every record onto the content-hash topic while the whole mesh — and
+  // this script's own `epoch` field — is on the dataset one. Nothing
+  // errors: the feeds are read, the records are signed, and no listener
+  // exists.
+  epochHex
 });
 await network.ready;
 if (network.registrationError) {

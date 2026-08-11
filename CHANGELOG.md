@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Suggestions became previews of search instead of bare strings. Autocomplete
+  entries keep their best `[doc, score]` rows (`suggestMaxDocRows`, default 3
+  — was a single row kept only when unambiguous), suggestions expose them as
+  `doc`/`docs`, and `suggest({ hydrate: true })` resolves them into real
+  search hits (`result`/`results`, the exact display payloads `search()`
+  returns) in one batched doc-page pass on every lane — lexicon, hot list
+  (hot codec v3 carries the rows), legacy title authority, and the address
+  lane, which attaches the hit it already computed. Hydration is advisory:
+  a failure leaves the text suggestions intact.
+- Doc provenance now survives federation. Generational merges keep the
+  winning generation's docs (tombstone-filtered, cleared on cross-generation
+  ties) and stamp `generation`; generational engines expose
+  `hydrateRows(rows, { generation })`. Sharded fan-out merges stamp
+  `docShard` alongside the winning shard's docs, and `rfsuggestroute-v2`
+  root artifacts (authority codec v5) record the winning row's
+  `[shard ordinal, doc]` — so planet-scale root-routed suggestions resolve
+  to a document and its owning shard without opening a single shard, and
+  `suggest({ hydrate: true })` on a sharded root hydrates through the owning
+  shards. Suggest-set sidecars (`rfsuggestset-v2`) carry the doc column so
+  reclaimed-shard pipelines keep provenance; v1 sidecars and v1 routing
+  artifacts still load (docless).
+- The OSM `structuredSuggestion` selection contract consumes `docShard`, so
+  entity suggestions from a v2 root artifact hydrate directly
+  (`resolveOsmSuggestion`) instead of falling back to a shard-scoped search.
+  `suggestOsmQuery({ hydrate: true })` post-hydrates the final dropdown rows
+  (≤ size doc reads — never the overfetched inner suggest) into `result`
+  hits; composed category-locality suggestions no longer leak the locality's
+  doc provenance. The map demo uses it for distance-annotated suggestion rows
+  and live preview pins while the dropdown is open.
+- `<rangefind-search>` renders a unified dropdown from hydrated suggestions:
+  completions show their result counts (`rf-search__suggest-text`/`-count`
+  hooks), suggestions resolving to one document render as regular result
+  cards that navigate directly, and the element speculatively warms the
+  search for the top completion (LRU-memoized per query), so accepting a
+  suggestion paints from cache. The wiki demo does the same and paints a
+  picked article's hydrated card immediately while the full search fills in.
+- `rangefind-mcp`'s `rangefind_suggest` accepts `hydrate` and returns the
+  hydrated hits.
+- The map demo's Query X-Ray can export the trace it is showing — copy to
+  clipboard or download `rangefind-trace-<query>-<timestamp>.json`. The bundle
+  carries the query and its resolved params (anchor, area box, shard scope),
+  the index, the response summary, the runtime's full `stats` including the
+  `trace` spans, a per-request waterfall from resource timings, and the client
+  environment, so a slow query is reproducible from a bug report instead of a
+  screenshot.
+- A new [autocomplete guide](docs/autocomplete.md) documents the patterns and
+  what each costs, measured per keystroke on a 200-document and a
+  339,445-document index: completions are ~47 KB for a whole typed word,
+  selecting by hydrating a suggestion's document is ~430× cheaper than
+  re-running its text as a search (0.5 KB / 4 ms versus 215 KB / 32 ms), and
+  previews scale with doc page payload — negligible on small corpora, worth
+  restricting to the focused row on large ones.
+
+### Fixed
+
+- Geo-filtered text queries no longer verify the raw posting union against
+  lat/lon doc-value chunks. "parc loraine" near Lorraine, QC on the planet
+  demo took 13.2 s / 431 reads / 11.5 MB: with the 50 km near-filter active,
+  every doc the common term "parc" touched was filter-verified through
+  scattered doc-value chunks before minShouldMatch could reject it — 409
+  chunk requests across 116 serial waves for a 16-document match set,
+  multiplied by the typo-fallback legs. The exhaustive lanes now test the
+  (in-memory) conjunction first and verify filters only for eligible docs;
+  the streamed block-max lanes defer the geo membership check to the
+  collected candidates in one batched pass (block pruning keeps the full
+  plan; a thinned proven window re-answers through the exhaustive lane,
+  `plannerFallbackReason: "filter_deferred_shortfall"`). Measured live
+  against the planet index: 822 → 177 requests, doc-value packs 677 requests
+  / 16.5 MB → 32 / 0.5 MB, identical results; a five-term variant on the
+  Luxembourg index went from 217 doc-value requests / 3.9 MB to 5 / 49 KB.
+- Hydrating several suggestion documents no longer reads most of the dense
+  per-document pointer file. Autocomplete documents are scattered corpus-wide,
+  so the packed lane merged their pointer reads into ranges spanning that
+  file — 13.6 MB to hydrate two documents on a 339k-document index, versus
+  0.43 MB through doc pages. Hydration now picks the lane by document count
+  (`suggestionHydrationContext`, exported for callers doing their own
+  `hydrateRows`): packed for a single document, which is genuinely cheapest at
+  0.4 KB, and doc pages beyond that. This also speeds up the legacy
+  `authority-title` suggest lane on large indexes.
+
 ## 0.5.0 — 2026-08-10
 
 ### Breaking

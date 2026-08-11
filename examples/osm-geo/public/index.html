@@ -272,7 +272,12 @@
           <div class="query-receipt__body">
             <p id="queryReceiptRoute" class="query-receipt__route"></p>
             <div id="queryReceiptBars" class="query-receipt__bars" aria-label="Static index reads by data structure"></div>
-            <p class="query-receipt__proof"><b>Zero-server proof.</b> These are immutable HTTP range reads performed by this browser—no search API or query database was contacted.</p>
+            <div class="query-receipt__actions">
+              <button id="queryTraceCopy" type="button" class="query-receipt__action">Copy trace JSON</button>
+              <button id="queryTraceDownload" type="button" class="query-receipt__action">Download</button>
+              <span id="queryTraceFeedback" class="query-receipt__feedback" role="status" aria-live="polite"></span>
+            </div>
+            <p class="query-receipt__proof"><b>Zero-server proof.</b> These are immutable HTTP range reads performed by this browser—no search API or query database was contacted. The export carries this query, its planner lanes, every traced range read, and your map anchor—handy for a bug report.</p>
           </div>
         </details>
         <details id="routeReceipt" class="query-receipt query-receipt--route" hidden>

@@ -2624,12 +2624,13 @@ function parseAuthorityLexiconSegment(buffer, options = {}) {
   };
 }
 var AUTHORITY_HOT_DOC_VERSION = 2;
+var AUTHORITY_HOT_DOC_ROWS_VERSION = 3;
 function parseAuthorityHotList(buffer) {
   const bytes = new Uint8Array(buffer);
   assertMagic(bytes, AUTHORITY_HOT_MAGIC, "Unsupported Rangefind authority hot list");
   const state = { pos: AUTHORITY_HOT_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION) {
+  if (version !== AUTHORITY_LEXICON_VERSION && version !== AUTHORITY_HOT_DOC_VERSION && version !== AUTHORITY_HOT_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority hot-list version ${version}`);
   }
   const count = readVarint(bytes, state);
@@ -2641,9 +2642,22 @@ function parseAuthorityHotList(buffer) {
       weight: readVarint(bytes, state),
       count: readVarint(bytes, state)
     };
-    if (version >= AUTHORITY_HOT_DOC_VERSION) {
+    if (version === AUTHORITY_HOT_DOC_VERSION) {
       const doc = readVarint(bytes, state);
       if (doc > 0) entry.doc = doc - 1;
+    } else if (version >= AUTHORITY_HOT_DOC_ROWS_VERSION) {
+      const rowCount = readVarint(bytes, state);
+      if (rowCount > 0) {
+        const docs = new Array(rowCount);
+        for (let row = 0; row < rowCount; row++) {
+          const doc = readVarint(bytes, state);
+          const score = readVarint(bytes, state);
+          const ordinal2 = readVarint(bytes, state);
+          docs[row] = { doc, score, ...ordinal2 > 0 ? { ordinal: ordinal2 - 1 } : {} };
+        }
+        entry.doc = docs[0].doc;
+        entry.docs = docs;
+      }
     }
     entries[index] = entry;
   }
@@ -2885,11 +2899,12 @@ function interpolateAddressRangePoint(encodedGeometry, start, end, houseNumber) 
 
 // src/authority_codec.js
 var AUTHORITY_FORMAT = "rfauth-v2";
-var SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v1";
+var SUGGEST_ROUTING_COMPAT_FORMATS = ["rfsuggestroute-v1", "rfsuggestroute-v2"];
 var AUTHORITY_VERSION = 2;
 var AUTHORITY_LEGACY_VERSION = 1;
 var AUTHORITY_ORDINAL_ROWS_VERSION = 3;
 var AUTHORITY_DOC_ROWS_VERSION = 4;
+var AUTHORITY_ORDINAL_DOC_ROWS_VERSION = 5;
 var SURFACE_PREFIX = "r|";
 var EXACT_PREFIX = "x|";
 var TOKEN_PREFIX = "t|";
@@ -2953,10 +2968,11 @@ function parseAuthorityShard(buffer) {
   assertMagic(bytes, AUTHORITY_SHARD_MAGIC, "Unsupported Rangefind authority shard");
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
-  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION) {
+  if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION && version !== AUTHORITY_ORDINAL_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
-  const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
+  const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION || version === AUTHORITY_ORDINAL_DOC_ROWS_VERSION;
+  const docProvenance = version === AUTHORITY_ORDINAL_DOC_ROWS_VERSION;
   const docRows = version === AUTHORITY_DOC_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = /* @__PURE__ */ new Map();
@@ -2974,13 +2990,19 @@ function parseAuthorityShard(buffer) {
         rows2 = new Array(rowCount2);
         for (let j = 0; j < rowCount2; j++) rows2[j] = [readVarint(bytes, state), readVarint(bytes, state)];
       }
+      let provenance = null;
+      if (docProvenance) {
+        const ordinalPlusOne = readVarint(bytes, state);
+        if (ordinalPlusOne > 0) provenance = { docOrdinal: ordinalPlusOne - 1, doc: readVarint(bytes, state) };
+      }
       entries.set(key, {
         total,
         complete: true,
         rows: rows2,
         autocompleteWeight,
         ...ordinalRows ? { ordinalRows: true } : {},
-        ...docRows ? { docRows: true } : {}
+        ...docRows ? { docRows: true } : {},
+        ...provenance ?? {}
       });
       previous = key;
       continue;
@@ -5035,6 +5057,9 @@ function finalizeRuntimeTrace(trace) {
     totalBytes: spans.reduce((sum, span) => sum + Number(span.bytes || 0), 0),
     spans
   };
+}
+function suggestionHydrationContext(count) {
+  return { hasTextTerms: false, preferDocPages: count > 1 ? "force" : false };
 }
 var inflateImpl = null;
 function viewToArrayBuffer(bytes) {
@@ -7626,6 +7651,43 @@ async function createSearch(options = {}) {
     if (filterPlan.geo && !geoDocMatches(filterPlan.geo, codeData, doc, known)) return false;
     return true;
   }
+  function splitDeferredGeoFilterPlan(docFilterPlan) {
+    const geo = docFilterPlan?.geo;
+    if (!geo || geo.docSet) return { inline: docFilterPlan, deferred: null };
+    const inlineNumbers = docFilterPlan.numbers.filter(([field]) => field !== geo.latField && field !== geo.lonField);
+    const deferredNumbers = docFilterPlan.numbers.filter(([field]) => field === geo.latField || field === geo.lonField);
+    return {
+      inline: {
+        facets: docFilterPlan.facets,
+        numbers: inlineNumbers,
+        booleans: docFilterPlan.booleans,
+        geo: null,
+        active: docFilterPlan.facets.length > 0 || inlineNumbers.length > 0 || docFilterPlan.booleans.length > 0
+      },
+      deferred: {
+        facets: [],
+        numbers: deferredNumbers,
+        booleans: [],
+        geo,
+        active: true
+      }
+    };
+  }
+  async function applyDeferredGeoFilter(ranked, deferredFilterPlan, { exhausted, k }) {
+    if (!deferredFilterPlan || !ranked.length) return { ranked, shortfall: false, stats: null };
+    const store = await valueStoreForFilterPlan(deferredFilterPlan, ranked.map(([doc]) => doc));
+    const before = ranked.length;
+    const filtered = ranked.filter(([doc]) => passesFilterPlan(doc, store, deferredFilterPlan));
+    return {
+      ranked: filtered,
+      shortfall: !exhausted && filtered.length < Math.min(k, before),
+      stats: {
+        geoFilterDeferred: true,
+        geoFilterDeferredCandidates: before,
+        geoFilterDeferredAccepted: filtered.length
+      }
+    };
+  }
   function blockFacetMatches(summary, selected) {
     if (!selected?.size) return true;
     const words = summary?.words || [];
@@ -10191,6 +10253,7 @@ async function createSearch(options = {}) {
     hasFilters,
     blockFilterPlan,
     docFilterPlan,
+    deferredFilterPlan = null,
     rerank,
     candidateK,
     minShouldMatch,
@@ -10381,6 +10444,9 @@ async function createSearch(options = {}) {
     }
     exhausted = !stable && maxDocRangeOutsidePotential(rangeStates).potential <= 0;
     let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || topEligibleScores(scores, hits, minShouldMatch, candidateK).top;
+    const deferred = await applyDeferredGeoFilter(ranked, deferredFilterPlan, { exhausted, k: offset + size });
+    if (deferred.shortfall) return null;
+    ranked = deferred.ranked;
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
@@ -10445,6 +10511,7 @@ async function createSearch(options = {}) {
         docRangeFetchGroups: fetchGroups,
         docRangeWantedBlocks: wantedBlocks,
         filterSummaryProofBlocks,
+        ...deferred.stats || {},
         plannerFallbackReason: exhausted ? "range_exhausted" : "",
         ...topKProofStatsObject(proofStats, exhausted ? "range_exhausted" : ""),
         docPayloadLane: resultContext.docPayloadLane,
@@ -10478,8 +10545,9 @@ async function createSearch(options = {}) {
     if (bundleResponse) return bundleResponse;
     await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
-    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const filterFields = filterPlanFields(docFilterPlan);
+    const fullDocFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const { inline: docFilterPlan, deferred: deferredFilterPlan } = fullDocFilterPlan ? splitDeferredGeoFilterPlan(fullDocFilterPlan) : { inline: null, deferred: null };
+    const hasInlineFilters = Boolean(docFilterPlan?.active);
     const entries = await termEntries(terms);
     const baseSet = new Set(baseTerms);
     const minShouldMatch = minShouldMatchFor(baseTerms);
@@ -10499,9 +10567,10 @@ async function createSearch(options = {}) {
       baseTerms,
       terms,
       entries,
-      hasFilters,
+      hasFilters: hasInlineFilters,
       blockFilterPlan,
       docFilterPlan,
+      deferredFilterPlan,
       rerank,
       candidateK,
       minShouldMatch,
@@ -10583,7 +10652,7 @@ async function createSearch(options = {}) {
         conjunctionTailBlocks += wanted.length;
         for (const { rows: rows2 } of await lookupEntryBlocks(cursor.shard, cursor.entry, wanted, candidateDocs)) {
           if (!rows2.length) continue;
-          const codeData = hasFilters ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
+          const codeData = hasInlineFilters ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
           blocksDecoded++;
           postingsDecoded += rows2.length / 2;
           postingsAccepted += applyBlockRows(cursor, rows2, codeData, docFilterPlan, scores, hits, masks);
@@ -10619,9 +10688,9 @@ async function createSearch(options = {}) {
       const batchBlocks = decoded.blocks.map(({ cursor, rows: rows2 }) => ({
         cursor,
         rows: rows2,
-        filterSummaryProvesBlock: hasFilters && blockDefinitelyPassesDocFilter(cursor.entry.blocks[cursor.blockIndex], docFilterPlan)
+        filterSummaryProvesBlock: hasInlineFilters && blockDefinitelyPassesDocFilter(cursor.entry.blocks[cursor.blockIndex], docFilterPlan)
       }));
-      if (hasFilters) {
+      if (hasInlineFilters) {
         await prefetchFilterPlanDocValues(
           docFilterPlan,
           batchBlocks.filter((item) => !item.filterSummaryProvesBlock).map((item) => postingDocs(item.rows))
@@ -10631,7 +10700,7 @@ async function createSearch(options = {}) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && !filterSummaryProvesBlock ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
+        const codeData = hasInlineFilters && !filterSummaryProvesBlock ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows2)) : null;
         blocksDecoded++;
         postingsDecoded += rows2.length / 2;
         postingsAccepted += applyBlockRows(cursor, rows2, codeData, filterSummaryProvesBlock ? null : docFilterPlan, scores, hits, masks);
@@ -10649,6 +10718,11 @@ async function createSearch(options = {}) {
       if (stable || budgetExhausted) break;
     }
     let ranked = exhausted ? collectEligibleScores(scores, hits, minShouldMatch) : stable || topEligibleScores(scores, hits, minShouldMatch, k).top;
+    const deferred = await applyDeferredGeoFilter(ranked, deferredFilterPlan, { exhausted, k });
+    if (deferred.shortfall) {
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, includeResults, plannerFallbackReason: "filter_deferred_shortfall" });
+    }
+    ranked = deferred.ranked;
     const reranked = rerank === false ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateK);
     ranked = reranked.ranked;
     const rows = ranked.slice(offset, offset + size);
@@ -10667,6 +10741,7 @@ async function createSearch(options = {}) {
       stats: {
         exact: exhausted && !budgetExhausted,
         plannerLane: budgetExhausted ? "blockBudget" : exhausted ? "fullFallback" : "tailProof",
+        ...deferred.stats || {},
         topKProven: !budgetExhausted && Boolean(stable || exhausted),
         totalExact: exhausted && !budgetExhausted,
         tailExhausted: exhausted,
@@ -10726,18 +10801,15 @@ async function createSearch(options = {}) {
       });
     }
     const decoded = [];
-    const candidateDocs = /* @__PURE__ */ new Set();
     let postingsDecoded = 0;
     for (const item of entries) {
       const rows2 = await decodeSegmentEntryPostings(item, segmentSearch.dfs.get(item.term));
       decoded.push({ ...item, rows: rows2 });
       postingsDecoded += rows2.length / 2;
-      for (let i = 0; i < rows2.length; i += 2) candidateDocs.add(rows2[i]);
     }
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     let postingsAccepted = 0;
@@ -10745,13 +10817,17 @@ async function createSearch(options = {}) {
       const isBase = baseSet.has(term);
       for (let i = 0; i < rows2.length; i += 2) {
         const doc = rows2[i];
-        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         scores.set(doc, (scores.get(doc) || 0) + rows2[i + 1]);
         if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
         postingsAccepted++;
       }
     }
     let ranked = collectEligibleScores(scores, hits, minShouldMatch);
+    if (hasFilters) {
+      const filterStore = await valueStoreForFilterPlan(docFilterPlan, ranked.map(([doc]) => doc));
+      ranked = ranked.filter(([doc]) => passesFilterPlan(doc, filterStore, docFilterPlan));
+      if (!codeData) codeData = filterStore;
+    }
     const reranked = rerank === false || sortPlan ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
     if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
@@ -10817,28 +10893,24 @@ async function createSearch(options = {}) {
     const scores = /* @__PURE__ */ new Map();
     const hits = /* @__PURE__ */ new Map();
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const filterFields = filterPlanFields(docFilterPlan);
     const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters) {
-      const docs = /* @__PURE__ */ new Set();
-      for (const { shard, entry } of entries) {
-        const postings = await decodeEntryPostings(shard, entry);
-        for (let i = 0; i < postings.length; i += 2) docs.add(postings[i]);
-      }
-      codeData = await valueStoreForFilterPlan(docFilterPlan, [...docs]);
-    }
     for (const { term, shard, entry } of entries) {
       const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
       for (let i = 0; i < postings.length; i += 2) {
         const doc = postings[i];
-        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         scores.set(doc, (scores.get(doc) || 0) + postings[i + 1]);
         if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
       }
     }
     let ranked = collectEligibleScores(scores, hits, minShouldMatchFor(baseTerms));
+    if (hasFilters) {
+      const eligibleDocs = ranked.map(([doc]) => doc);
+      const filterStore = await valueStoreForFilterPlan(docFilterPlan, eligibleDocs);
+      ranked = ranked.filter(([doc]) => passesFilterPlan(doc, filterStore, docFilterPlan));
+      if (!codeData) codeData = filterStore;
+    }
     const reranked = rerank === false || sortPlan ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } } : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
     if (sortPlan && docValues) codeData = await valueStoreForDocs([sortPlan.field], reranked.ranked.map(([doc]) => doc));
     ranked = sortRanked(reranked.ranked, codeData, sortPlan);
@@ -11885,7 +11957,7 @@ async function createSearch(options = {}) {
     const field = fields[0];
     return field.path === "title" ? field : null;
   }
-  async function executeLegacyAuthoritySuggest(params, q, prefix, size) {
+  async function executeLegacyAuthoritySuggest(params, q, prefix, size, hydrate = false) {
     const field = authoritySuggestField();
     if (!authorityDirectory || options.authority === false || !field) return null;
     const keyPrefix = `x|${prefix}`;
@@ -11912,12 +11984,14 @@ async function createSearch(options = {}) {
       }
       if (candidates.length >= size) break;
     }
-    const resultContext = { hasTextTerms: false, preferDocPages: false };
+    const resultContext = suggestionHydrationContext(candidates.length);
     const docs = candidates.length ? await rowsToResults(candidates.map((item) => [item.doc, item.weight]), resultContext) : [];
     const suggestions = docs.map((doc, index) => ({
       text: String(doc.title || ""),
       weight: candidates[index].weight,
-      count: candidates[index].count
+      count: candidates[index].count,
+      doc: candidates[index].doc,
+      ...hydrate ? { result: doc, results: [doc] } : {}
     })).filter((item) => item.text).slice(0, size);
     const exact = candidates.length >= size || !range.truncated;
     return {
@@ -11955,7 +12029,14 @@ async function createSearch(options = {}) {
       }
       suggestion.ordinals = ordinals;
     }
-    if (candidate.docRows?.length) suggestion.doc = candidate.docRows[0][0];
+    if (candidate.docRows?.length) {
+      suggestion.doc = candidate.docRows[0][0];
+      if (candidate.docRows.length > 1) suggestion.docs = candidate.docRows.map((row) => row[0]);
+    }
+    if (candidate.rootDoc) {
+      suggestion.doc = candidate.rootDoc.doc;
+      suggestion.docOrdinal = candidate.rootDoc.ordinal;
+    }
     return suggestion;
   }
   function autocompleteCandidatesForShard(shard, weighted) {
@@ -11972,10 +12053,12 @@ async function createSearch(options = {}) {
         full: suggestKey(parsed.display) === parsed.normalized,
         // Root suggest-routing artifacts store [shard ordinal, weight] rows
         // on autocomplete entries; provenance travels with the candidate.
-        // Per-shard doc-row artifacts store the best [doc, weight] row so an
-        // unambiguous suggestion resolves straight to its document.
+        // Per-shard doc-row artifacts store the best [doc, weight] rows so a
+        // suggestion resolves straight to its top documents. v5 root entries
+        // additionally name the winning row's document and owning ordinal.
         ...entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {},
-        ...entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {}
+        ...entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {},
+        ...entry.ordinalRows && entry.doc != null && entry.docOrdinal != null ? { rootDoc: { doc: entry.doc, ordinal: entry.docOrdinal } } : {}
       };
       candidate.rank = autocompleteRank(candidate, weighted);
       list.push(candidate);
@@ -12003,7 +12086,16 @@ async function createSearch(options = {}) {
         return {
           q,
           prefix,
-          suggestions: hot.slice(0, size).map(({ display, weight, count: count2, doc }) => ({ text: display, weight, count: count2, ...doc != null ? { doc } : {} })),
+          suggestions: hot.slice(0, size).map(({ display, weight, count: count2, doc, docs }) => ({
+            text: display,
+            weight,
+            count: count2,
+            ...doc != null ? { doc } : {},
+            // v3 hot rows: multiple docs, plus an optional federation shard
+            // ordinal per row (root routing artifacts).
+            ...docs?.length > 1 && docs.every((row) => row.ordinal == null) ? { docs: docs.map((row) => row.doc) } : {},
+            ...docs?.[0]?.ordinal != null ? { docOrdinal: docs[0].ordinal } : {}
+          })),
           stats: {
             exact: true,
             suggestLane: "authority-hot",
@@ -12094,7 +12186,7 @@ async function createSearch(options = {}) {
     const tail = String(value || "").trim().replace(/^\d+[\p{L}]?(?:\s*[\u2013-]\s*\d+[\p{L}]?)?\s+/u, "");
     return tail ? `${houseNumber} ${tail}` : "";
   }
-  async function executeAddressSuggest(q, prefix, size, root) {
+  async function executeAddressSuggest(q, prefix, size, root, hydrate = false) {
     if (!addressInterpolationEnabled || !root) return null;
     const parts = addressSuggestionParts(q);
     if (!parts?.tail) return null;
@@ -12138,7 +12230,10 @@ async function createSearch(options = {}) {
         text,
         weight: Math.max(1, Number(candidate.weight || 0)),
         count: 1,
-        interpolated: Boolean(result.interpolated)
+        interpolated: Boolean(result.interpolated),
+        // The address probe already produced the hydrated hit — attach it for
+        // free instead of asking callers to re-search the selected address.
+        ...hydrate ? { result, results: [result] } : {}
       });
       if (suggestions.length >= size) break;
     }
@@ -12162,20 +12257,58 @@ async function createSearch(options = {}) {
       }
     };
   }
+  async function hydrateSuggestionDocs(response) {
+    const suggestions = response?.suggestions || [];
+    const ordered = [];
+    const slots = /* @__PURE__ */ new Map();
+    for (const item of suggestions) {
+      if (item.docOrdinal != null) continue;
+      for (const ordinal2 of item.docs || (item.doc != null ? [item.doc] : [])) {
+        if (!slots.has(ordinal2)) {
+          slots.set(ordinal2, ordered.length);
+          ordered.push(ordinal2);
+        }
+      }
+    }
+    if (!ordered.length) return response;
+    const resultContext = suggestionHydrationContext(ordered.length);
+    try {
+      const hydrated = await rowsToResults(ordered.map((ordinal2) => [ordinal2, 0]), resultContext);
+      for (const item of suggestions) {
+        if (item.docOrdinal != null) continue;
+        const results = (item.docs || (item.doc != null ? [item.doc] : [])).map((ordinal2) => hydrated[slots.get(ordinal2)]).filter(Boolean);
+        if (results.length) {
+          item.results = results;
+          item.result = results[0];
+        }
+      }
+      response.stats = {
+        ...response.stats || {},
+        suggestDocsHydrated: ordered.length,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages
+      };
+    } catch {
+      response.stats = { ...response.stats || {}, suggestDocsHydrated: 0 };
+    }
+    return response;
+  }
   async function executeSuggest(params = {}) {
     const q = String(params.q || "");
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const hydrate = params.hydrate === true;
     const prefix = suggestKey(q);
     if (!prefix) {
       return { q, prefix, suggestions: [], stats: { exact: true, suggestShardsVisited: 0, suggestEntriesScanned: 0 } };
     }
     const root = await loadAuthorityLexiconRoot();
     if (root) {
-      const address = await executeAddressSuggest(q, prefix, size, root);
+      const address = await executeAddressSuggest(q, prefix, size, root, hydrate);
       if (address) return address;
-      return executeLexiconSuggest(q, prefix, size, root);
+      const response = await executeLexiconSuggest(q, prefix, size, root);
+      return hydrate ? hydrateSuggestionDocs(response) : response;
     }
-    const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
+    const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size, hydrate);
     if (legacy) return legacy;
     throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");
   }
@@ -12932,27 +13065,82 @@ async function createGenerationalSearch(root, options, baseUrl) {
       }
     };
   }
+  function setSuggestionGenerationDocs(entry, docs, genIndex) {
+    delete entry.doc;
+    delete entry.docs;
+    delete entry.generation;
+    if (!docs.length) return;
+    entry.doc = docs[0];
+    if (docs.length > 1) entry.docs = docs;
+    entry.generation = genIndex;
+  }
+  async function hydrateGenerationalSuggestions(suggestions) {
+    const byGeneration = /* @__PURE__ */ new Map();
+    for (const item of suggestions) {
+      if (item.generation == null) continue;
+      const ordinals = item.docs || (item.doc != null ? [item.doc] : []);
+      if (!ordinals.length) continue;
+      if (!byGeneration.has(item.generation)) byGeneration.set(item.generation, /* @__PURE__ */ new Map());
+      const slots = byGeneration.get(item.generation);
+      for (const ordinal2 of ordinals) {
+        if (!slots.has(ordinal2)) slots.set(ordinal2, null);
+      }
+    }
+    if (!byGeneration.size) return;
+    await Promise.all([...byGeneration.entries()].map(async ([genIndex, slots]) => {
+      const engine = engines[genIndex];
+      if (typeof engine.hydrateRows !== "function") return;
+      const ordinals = [...slots.keys()];
+      try {
+        const results = await engine.hydrateRows(
+          ordinals.map((ordinal2) => [ordinal2, 0]),
+          suggestionHydrationContext(ordinals.length)
+        );
+        ordinals.forEach((ordinal2, index) => {
+          if (results[index]) slots.set(ordinal2, { ...results[index], generation: genIndex });
+        });
+      } catch {
+      }
+    }));
+    for (const item of suggestions) {
+      if (item.generation == null) continue;
+      const slots = byGeneration.get(item.generation);
+      const results = (item.docs || (item.doc != null ? [item.doc] : [])).map((ordinal2) => slots?.get(ordinal2)).filter(Boolean);
+      if (results.length) {
+        item.results = results;
+        item.result = results[0];
+      }
+    }
+  }
   async function suggest(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const responses = await Promise.all(engines.map((engine) => engine.suggest(activeParams)));
+    const { hydrate, ...forwarded } = activeParams;
+    const responses = await Promise.all(engines.map((engine) => engine.suggest(forwarded)));
     const merged = /* @__PURE__ */ new Map();
-    for (const response of responses) {
-      for (const item of response.suggestions) {
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const item of responses[genIndex].suggestions) {
+        const docs = (item.docs || (item.doc != null ? [item.doc] : [])).filter((doc) => !tombstones[genIndex].has(doc));
         const existing = merged.get(item.text);
         if (existing) {
           existing.count += item.count;
-          existing.weight = Math.max(existing.weight, item.weight);
-          delete existing.doc;
+          if (item.weight > existing.weight) {
+            existing.weight = item.weight;
+            setSuggestionGenerationDocs(existing, docs, genIndex);
+          } else if (item.weight === existing.weight) {
+            setSuggestionGenerationDocs(existing, [], genIndex);
+          }
         } else {
-          const { doc, ...rest } = item;
+          const { doc, docs: ignoredDocs, ...rest } = item;
+          setSuggestionGenerationDocs(rest, docs, genIndex);
           merged.set(item.text, rest);
         }
       }
     }
     const suggestions = [...merged.values()].sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1)).slice(0, size);
+    if (hydrate === true) await hydrateGenerationalSuggestions(suggestions);
     return {
       q: surfaceQuery,
       suggestions,
@@ -12962,6 +13150,19 @@ async function createGenerationalSearch(root, options, baseUrl) {
         ...normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {}
       }
     };
+  }
+  async function hydrateRows(rows, context = {}) {
+    const genIndex = Math.floor(Number(context.generation));
+    if (!Number.isInteger(genIndex) || genIndex < 0 || genIndex >= engines.length) {
+      throw new Error("Rangefind: hydrateRows on a generational index requires context.generation naming one generation.");
+    }
+    const engine = engines[genIndex];
+    if (typeof engine.hydrateRows !== "function") {
+      throw new Error(`Rangefind: generation ${genIndex} does not support hydrateRows.`);
+    }
+    const { generation, ...rest } = context;
+    const docs = await engine.hydrateRows(rows, rest);
+    return docs.map((doc) => ({ ...doc, generation: genIndex }));
   }
   async function count(params = {}) {
     const surfaceQuery = String(params.q || "");
@@ -12987,6 +13188,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     suggest,
     count,
     vectorSearch,
+    hydrateRows,
     loadFacetValues: (field) => engines[0].loadFacetValues(field)
   };
 }
@@ -13086,7 +13288,7 @@ async function createShardedSearch(root, options, baseUrl) {
   const textRouting = root.text_routing?.format === TEXT_ROUTING_FORMAT && root.text_routing.directory?.root ? createTextRoutingState(root.text_routing) : null;
   const suggestRoutingAuthority = root.suggest_routing?.authority;
   const suggestRoutingDirectory = suggestRoutingAuthority?.autocomplete?.format === AUTHORITY_LEXICON_PAGED_FORMAT ? suggestRoutingAuthority.autocomplete.segments?.directory : suggestRoutingAuthority?.directory;
-  const suggestRouting = root.suggest_routing?.format === SUGGEST_ROUTING_FORMAT && suggestRoutingDirectory?.root ? root.suggest_routing : null;
+  const suggestRouting = SUGGEST_ROUTING_COMPAT_FORMATS.includes(root.suggest_routing?.format) && suggestRoutingDirectory?.root ? root.suggest_routing : null;
   let rootAuthorityEnginePromise = null;
   function rootAuthorityEngine() {
     if (!rootAuthorityEnginePromise) {
@@ -13123,9 +13325,54 @@ async function createShardedSearch(root, options, baseUrl) {
     return ids.length ? ids.sort() : null;
   }
   function remapSuggestRoutingItem(item) {
-    const { ordinals, ...rest } = item;
+    const { ordinals, docOrdinal, ...rest } = item;
     const ids = suggestRoutingShards(ordinals);
+    if (rest.doc != null) {
+      const docShard = docOrdinal != null ? suggestRoutingShardIds[docOrdinal] : void 0;
+      if (docShard !== void 0 && shardIdIndex.has(docShard)) rest.docShard = docShard;
+      else delete rest.doc;
+    }
     return ids ? { ...rest, shards: ids } : rest;
+  }
+  async function hydrateShardedSuggestions(suggestions) {
+    const groups = /* @__PURE__ */ new Map();
+    for (const item of suggestions) {
+      if (item.doc == null || !item.docShard) continue;
+      const key = `${item.docShard}\0${item.generation ?? ""}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          context: { shard: item.docShard, ...item.generation != null ? { generation: item.generation } : {} },
+          slots: /* @__PURE__ */ new Map()
+        });
+      }
+      const { slots } = groups.get(key);
+      for (const ordinal2 of item.docs || [item.doc]) {
+        if (!slots.has(ordinal2)) slots.set(ordinal2, null);
+      }
+    }
+    if (!groups.size) return;
+    await Promise.all([...groups.values()].map(async ({ context, slots }) => {
+      const ordinals = [...slots.keys()];
+      try {
+        const results = await hydrateRows(
+          ordinals.map((ordinal2) => [ordinal2, 0]),
+          { ...suggestionHydrationContext(ordinals.length), ...context }
+        );
+        ordinals.forEach((ordinal2, index) => {
+          if (results[index]) slots.set(ordinal2, results[index]);
+        });
+      } catch {
+      }
+    }));
+    for (const item of suggestions) {
+      if (item.doc == null || !item.docShard) continue;
+      const { slots } = groups.get(`${item.docShard}\0${item.generation ?? ""}`);
+      const results = (item.docs || [item.doc]).map((ordinal2) => slots.get(ordinal2)).filter(Boolean);
+      if (results.length) {
+        item.results = results;
+        item.result = results[0];
+      }
+    }
   }
   function createTextRoutingState(block) {
     const routedIds = new Set((block.shard_ids || []).map(String));
@@ -13637,18 +13884,32 @@ async function createShardedSearch(root, options, baseUrl) {
       }
     };
   }
+  function setSuggestionShardDocs(entry, item, shardId) {
+    delete entry.doc;
+    delete entry.docs;
+    delete entry.docShard;
+    delete entry.generation;
+    if (item.doc == null) return;
+    entry.doc = item.doc;
+    if (item.docs?.length > 1) entry.docs = item.docs;
+    entry.docShard = shardId;
+    if (item.generation != null) entry.generation = item.generation;
+  }
   async function suggest(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const { hydrate, ...forwarded } = activeParams;
     if (suggestRouting && params.shards == null) {
       try {
         const rootEngine = await rootAuthorityEngine();
-        const response = await rootEngine.suggest({ ...activeParams, size });
+        const response = await rootEngine.suggest({ ...forwarded, size });
+        const suggestions2 = (response.suggestions || []).map(remapSuggestRoutingItem);
+        if (hydrate === true) await hydrateShardedSuggestions(suggestions2);
         return {
           q: surfaceQuery,
-          suggestions: (response.suggestions || []).map(remapSuggestRoutingItem),
+          suggestions: suggestions2,
           ...normalizedQuery !== surfaceQuery ? { normalizedQuery } : {},
           stats: {
             ...response.stats || {},
@@ -13661,10 +13922,10 @@ async function createShardedSearch(root, options, baseUrl) {
       } catch {
       }
     }
-    const routed = await withSuggestRoute(activeParams, normalizedQuery.trim());
+    const routed = await withSuggestRoute(forwarded, normalizedQuery.trim());
     const responses = await Promise.all(routed.shards.map(async (shard) => {
       const engine = await engineAt(shard.index);
-      return { shard, response: await engine.suggest({ ...activeParams, shards: void 0 }) };
+      return { shard, response: await engine.suggest({ ...forwarded, shards: void 0 }) };
     }));
     const merged = /* @__PURE__ */ new Map();
     for (const { shard, response } of responses) {
@@ -13675,18 +13936,21 @@ async function createShardedSearch(root, options, baseUrl) {
           if (item.weight > existing.weight) {
             existing.weight = item.weight;
             existing.shards = [shard.id];
-            if (item.doc != null) existing.doc = item.doc;
-            else delete existing.doc;
+            setSuggestionShardDocs(existing, item, shard.id);
           } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
             existing.shards.push(shard.id);
-            delete existing.doc;
+            setSuggestionShardDocs(existing, {}, shard.id);
           }
         } else {
-          merged.set(item.text, { ...item, shards: [shard.id] });
+          const { doc, docs, generation, ...rest } = item;
+          const entry = { ...rest, shards: [shard.id] };
+          setSuggestionShardDocs(entry, item, shard.id);
+          merged.set(item.text, entry);
         }
       }
     }
     const suggestions = [...merged.values()].sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1)).slice(0, size);
+    if (hydrate === true) await hydrateShardedSuggestions(suggestions);
     return {
       q: surfaceQuery,
       suggestions,
@@ -13808,6 +14072,8 @@ var PART_HOOKS = {
   status: "rf-search__status",
   suggest: "rf-search__suggest",
   suggestItem: "rf-search__suggest-item",
+  suggestText: "rf-search__suggest-text",
+  suggestCount: "rf-search__suggest-count",
   mark: "rf-search__mark"
 };
 var PART_CLASS_ATTRS = {
@@ -13823,6 +14089,8 @@ var PART_CLASS_ATTRS = {
   status: "status-class",
   suggest: "suggest-class",
   suggestItem: "suggest-item-class",
+  suggestText: "suggest-text-class",
+  suggestCount: "suggest-count-class",
   mark: "mark-class"
 };
 var SNIPPET_FIELDS = ["excerpt", "summary", "description", "body", "content", "text", "snippet"];
@@ -14019,6 +14287,7 @@ var RangefindSearchElement = class extends HTMLElement {
     this._debounceTimer = 0;
     this._built = false;
     this._destroyed = false;
+    this._searchCache = /* @__PURE__ */ new Map();
     this._onInput = this._onInput.bind(this);
     this._onKeydown = this._onKeydown.bind(this);
     this._onFocus = this._onFocus.bind(this);
@@ -14039,6 +14308,7 @@ var RangefindSearchElement = class extends HTMLElement {
   }
   set searchOptions(value) {
     this._searchOptions = value && typeof value === "object" ? value : {};
+    this._searchCache.clear();
   }
   // --- Lifecycle ------------------------------------------------------------
   connectedCallback() {
@@ -14128,6 +14398,7 @@ var RangefindSearchElement = class extends HTMLElement {
     this._input.placeholder = this._config.placeholder;
     this._input.setAttribute("aria-label", this._config.label);
     this._list.setAttribute("aria-label", this._config.label);
+    this._searchCache.clear();
   }
   _applyClasses() {
     const ctx = { attrs: this._attrMap(), classNames: this._classNames };
@@ -14203,11 +14474,18 @@ var RangefindSearchElement = class extends HTMLElement {
     this._runSearch(query, token);
     this._runSuggest(query, token);
   }
-  async _runSearch(query, token) {
-    const engine = await this._ensureEngine();
-    if (token !== this._token) return;
-    if (!engine) return;
-    try {
+  // Search response for `query`, memoized. The promise (not the response) is
+  // cached so concurrent callers — the live keystroke and a speculative
+  // prefetch — coalesce into one request; failed fetches evict themselves so
+  // a later retry is real.
+  _searchResponse(query, engine) {
+    const cached = this._searchCache.get(query);
+    if (cached) {
+      this._searchCache.delete(query);
+      this._searchCache.set(query, cached);
+      return cached;
+    }
+    const promise = (async () => {
       let params = {
         q: query,
         page: 1,
@@ -14217,9 +14495,22 @@ var RangefindSearchElement = class extends HTMLElement {
       };
       if (typeof this._searchOptions.transform === "function") {
         params = await this._searchOptions.transform(params) || params;
-        if (token !== this._token) return;
       }
-      const response = await engine.search(params);
+      return engine.search(params);
+    })();
+    promise.catch(() => {
+      if (this._searchCache.get(query) === promise) this._searchCache.delete(query);
+    });
+    this._searchCache.set(query, promise);
+    while (this._searchCache.size > 16) this._searchCache.delete(this._searchCache.keys().next().value);
+    return promise;
+  }
+  async _runSearch(query, token) {
+    const engine = await this._ensureEngine();
+    if (token !== this._token) return;
+    if (!engine) return;
+    try {
+      const response = await this._searchResponse(query, engine);
       if (token !== this._token) return;
       this._renderResults(query, response);
       this._emit("rangefind:search", { query, response });
@@ -14237,9 +14528,13 @@ var RangefindSearchElement = class extends HTMLElement {
     const engine = await this._ensureEngine();
     if (token !== this._token || !engine || typeof engine.suggest !== "function") return;
     try {
-      const response = await engine.suggest({ q: query, size: 6 });
+      const response = await engine.suggest({ q: query, size: 6, hydrate: true });
       if (token !== this._token) return;
-      this._renderSuggestions(response?.suggestions || []);
+      const suggestions = response?.suggestions || [];
+      this._renderSuggestions(suggestions);
+      const top = suggestions.find((item) => typeof item?.text === "string" && item.text.trim() && item.text.trim() !== query);
+      if (top) this._searchResponse(top.text.trim(), engine).catch(() => {
+      });
     } catch {
       this._renderSuggestions([]);
     }
@@ -14313,13 +14608,28 @@ var RangefindSearchElement = class extends HTMLElement {
     for (const item of items) {
       const text = String(item?.text ?? "");
       if (!text) continue;
+      const result = item?.result;
+      if (result && Number(item.count) === 1 && safeHref(result.url)) {
+        this._suggest.append(this._buildResultOption(result, ctx));
+        continue;
+      }
       const li = document.createElement("li");
       li.className = partClass("suggestItem", ctx);
       li.setAttribute("role", "option");
       li.setAttribute("aria-selected", "false");
       li.dataset.rfKind = "suggest";
       li.dataset.rfText = text;
-      li.textContent = text;
+      const textEl = document.createElement("span");
+      textEl.className = partClass("suggestText", ctx);
+      textEl.textContent = text;
+      li.append(textEl);
+      const count = Number(item?.count);
+      if (Number.isFinite(count) && count > 1) {
+        const countEl = document.createElement("span");
+        countEl.className = partClass("suggestCount", ctx);
+        countEl.textContent = count.toLocaleString();
+        li.append(countEl);
+      }
       li.addEventListener("mousedown", (event) => {
         event.preventDefault();
         this._acceptSuggestion(text);

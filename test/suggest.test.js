@@ -51,6 +51,29 @@ test("authority lexicon shard summaries and hot lists round trip", () => {
   assert.deepEqual(decoded.shards, shards);
   assert.deepEqual(decoded.hot.get("a"), hot.get("a"));
   assert.deepEqual(parseAuthorityHotList(encodeAuthorityHotList(hotItems)), hotItems);
+
+  // v3 hot rows: best [doc, score] rows per entry, plus an optional
+  // federation shard ordinal per row (root routing artifacts). Legacy
+  // single-doc entries re-encode as one row.
+  const docItems = [
+    {
+      normalized: "alpha",
+      display: "Alpha",
+      weight: 9,
+      count: 3,
+      doc: 12,
+      docs: [{ doc: 12, score: 9 }, { doc: 4, score: 7 }]
+    },
+    { normalized: "azure", display: "Azure", weight: 5, count: 1, doc: 30, docs: [{ doc: 30, score: 5, ordinal: 2 }] }
+  ];
+  const decodedDocs = parseAuthorityHotList(encodeAuthorityHotList(docItems));
+  assert.deepEqual(decodedDocs, docItems);
+  const legacySingle = parseAuthorityHotList(encodeAuthorityHotList([
+    { normalized: "beta", display: "Beta", weight: 4, count: 1, doc: 9 }
+  ]));
+  assert.deepEqual(legacySingle, [
+    { normalized: "beta", display: "Beta", weight: 4, count: 1, doc: 9, docs: [{ doc: 9, score: 4 }] }
+  ]);
 });
 
 test("streamed authority lexicon root matches the in-memory codec", async () => {
@@ -231,17 +254,20 @@ function oracleSuggest(docs, q, size) {
     const docWeight = Number(doc.population) || 0;
     for (const key of keys) {
       const mapKey = `${key}\0${display}`;
-      const previous = rows.get(mapKey) || { key, display, weight: 0, count: 0, full: key === normalized, doc: null };
+      const previous = rows.get(mapKey) || { key, display, weight: 0, count: 0, full: key === normalized, rows: [] };
       previous.count++;
-      // The suggestion's doc is the row owning the surface's rank: highest
-      // weight, first (lowest) ordinal on ties — mirroring compareRows.
-      if (previous.doc === null || docWeight > previous.weight) previous.doc = ordinal;
+      previous.rows.push([ordinal, docWeight]);
       previous.weight = Math.max(previous.weight, docWeight);
       rows.set(mapKey, previous);
     }
   }
   const entries = [...rows.values()];
   for (const entry of entries) {
+    // The codec keeps the best doc rows (weight desc, doc asc), capped at the
+    // suggestMaxDocRows default of 3; the first names the suggestion's `doc`.
+    entry.rows.sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    entry.doc = entry.rows[0][0];
+    entry.docs = entry.rows.slice(0, 3).map(row => row[0]);
     if (!entry.weight) entry.weight = entry.count;
     entry.rank = entry.weight * 2 + (entry.full ? 1 : 0);
   }
@@ -263,7 +289,13 @@ function oracleSuggest(docs, q, size) {
       || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
       || (a.display < b.display ? -1 : a.display > b.display ? 1 : 0))
     .slice(0, size)
-    .map(entry => ({ text: entry.display, weight: entry.weight, count: entry.count, doc: entry.doc }));
+    .map(entry => ({
+      text: entry.display,
+      weight: entry.weight,
+      count: entry.count,
+      doc: entry.doc,
+      ...(entry.docs.length > 1 ? { docs: entry.docs } : {})
+    }));
 }
 
 async function runSuggestOracleSuite(configOverrides, assertManifest) {
@@ -322,6 +354,21 @@ async function runSuggestOracleSuite(configOverrides, assertManifest) {
     assert.ok(chains.suggestions.some(item => item.text === "Tim Hortons"));
     const tim = await engine.suggest({ q: "tim", size: 2 });
     assert.equal(tim.suggestions[0].count, 30);
+
+    // hydrate: true turns suggestions into real hits — the same display
+    // payloads a search would return — in one batched doc-page pass.
+    const hydratedMont = await engine.suggest({ q: "mont", size: 3, hydrate: true });
+    assert.equal(hydratedMont.suggestions[0].result.title, "Montréal");
+    assert.ok(hydratedMont.stats.suggestDocsHydrated > 0);
+    const hydratedTim = await engine.suggest({ q: "tim", size: 2, hydrate: true });
+    // An ambiguous suggestion (30 duplicate chain locations) previews its
+    // best kept doc rows, capped by the codec's suggestMaxDocRows default.
+    assert.equal(hydratedTim.suggestions[0].results.length, 3);
+    assert.ok(hydratedTim.suggestions[0].results.every(item => item.title === "Tim Hortons"));
+    // The hot lane hydrates too (v3 hot rows carry the doc provenance).
+    const hydratedHot = await engine.suggest({ q: "mo", size: 3, hydrate: true });
+    assert.equal(hydratedHot.stats.suggestLane, "authority-hot");
+    assert.equal(hydratedHot.suggestions[0].result.title, hydratedHot.suggestions[0].text);
 
     // Diacritic-insensitive both ways.
     const folded = await engine.suggest({ q: "cafe dep", size: 2 });
@@ -390,6 +437,12 @@ test("legacy title authority provides bounded autocomplete without explicit sugg
 
     const folded = await engine.suggest({ q: "cafe", size: 2 });
     assert.deepEqual(folded.suggestions.map(item => item.text), ["Café Alpha", "Cafe Beta"]);
+
+    // The legacy lane pays for hydrated payloads anyway (titles come from
+    // them), so suggestions carry their doc — and, with hydrate, the hit.
+    assert.equal(typeof folded.suggestions[0].doc, "number");
+    const hydrated = await engine.suggest({ q: "cafe", size: 2, hydrate: true });
+    assert.equal(hydrated.suggestions[0].result.title, "Café Alpha");
   } finally {
     await server.close();
   }

@@ -303,7 +303,10 @@ async function showSuggestions() {
     return;
   }
   try {
-    const response = await engine.suggest({ q, size: 8 });
+    // hydrate: true resolves each suggestion's doc rows into real hits, so
+    // the dropdown shows the same article the results list would — and a
+    // picked article renders instantly instead of re-querying the index.
+    const response = await engine.suggest({ q, size: 8, hydrate: true });
     if (token !== suggestToken) return;
     if (!response.suggestions.length) {
       hideSuggestions();
@@ -311,11 +314,28 @@ async function showSuggestions() {
     }
     suggestList.replaceChildren(...response.suggestions.map(item => {
       const li = document.createElement("li");
-      li.textContent = item.text;
+      const text = document.createElement("span");
+      text.className = "suggest-text";
+      text.textContent = item.text;
+      li.append(text);
+      if (Number(item.count) > 1) {
+        const count = document.createElement("span");
+        count.className = "suggest-count";
+        count.textContent = formatNumber(item.count);
+        li.append(count);
+      }
       li.addEventListener("mousedown", event => {
         event.preventDefault();
         queryInput.value = item.text;
         hideSuggestions();
+        // A doc-resolving suggestion paints its hydrated article immediately
+        // (stale-while-revalidate); the full search then fills totals, facets,
+        // and stats without a visible gap.
+        if (item.result && Number(item.count) === 1) {
+          resultSummary.textContent = "1 result";
+          correctionSummary.textContent = "";
+          renderResults([item.result]);
+        }
         runSearch();
       });
       return li;

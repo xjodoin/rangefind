@@ -332,18 +332,18 @@ function fold(value) {
 function typeQueryText(type) {
   return String(type || "").replaceAll(/[_;]+/gu, " ").trim();
 }
-function labelize(folded) {
-  return folded.replaceAll(/\b\p{L}/gu, (letter) => letter.toLocaleUpperCase("en-US"));
+function labelize(folded2) {
+  return folded2.replaceAll(/\b\p{L}/gu, (letter) => letter.toLocaleUpperCase("en-US"));
 }
 function addEntry(lexicon, key, type) {
-  const folded = fold(key);
-  if (!folded || lexicon.has(folded)) return;
-  lexicon.set(folded, { type, query: typeQueryText(type) });
+  const folded2 = fold(key);
+  if (!folded2 || lexicon.has(folded2)) return;
+  lexicon.set(folded2, { type, query: typeQueryText(type) });
 }
 function gateableType(type) {
   if (CATEGORY_EXCLUDED_TYPES.has(type)) return false;
-  const folded = fold(typeQueryText(type));
-  return Boolean(folded) && folded.length <= 32 && folded.split(" ").length <= 3 && /\p{L}/u.test(folded);
+  const folded2 = fold(typeQueryText(type));
+  return Boolean(folded2) && folded2.length <= 32 && folded2.split(" ").length <= 3 && /\p{L}/u.test(folded2);
 }
 function buildCategoryLexicon(typeValues = null) {
   const lexicon = /* @__PURE__ */ new Map();
@@ -376,8 +376,8 @@ function buildCategoryLexiconArtifact(typeValues, { minCount = 250 } = {}) {
   for (const [type, list] of Object.entries(OSM_TYPE_ALIASES)) {
     if (!present.has(type)) continue;
     for (const alias of list) {
-      const folded = fold(alias);
-      if (folded && !(folded in aliases)) aliases[folded] = type;
+      const folded2 = fold(alias);
+      if (folded2 && !(folded2 in aliases)) aliases[folded2] = type;
     }
   }
   return {
@@ -387,19 +387,19 @@ function buildCategoryLexiconArtifact(typeValues, { minCount = 250 } = {}) {
     aliases
   };
 }
-function lookupKeys(folded) {
-  const keys = [folded];
-  if (folded.endsWith("aux")) keys.push(`${folded.slice(0, -3)}al`);
-  if (folded.endsWith("es")) keys.push(folded.slice(0, -2));
-  if (folded.endsWith("s") || folded.endsWith("x")) keys.push(folded.slice(0, -1));
+function lookupKeys(folded2) {
+  const keys = [folded2];
+  if (folded2.endsWith("aux")) keys.push(`${folded2.slice(0, -3)}al`);
+  if (folded2.endsWith("es")) keys.push(folded2.slice(0, -2));
+  if (folded2.endsWith("s") || folded2.endsWith("x")) keys.push(folded2.slice(0, -1));
   return keys;
 }
 function lookupCategory(lexicon, surface) {
-  const folded = fold(surface);
-  if (!folded) return null;
-  for (const key of lookupKeys(folded)) {
+  const folded2 = fold(surface);
+  if (!folded2) return null;
+  for (const key of lookupKeys(folded2)) {
     const entry = lexicon.get(key);
-    if (entry) return { type: entry.type, query: entry.query, label: labelize(folded) };
+    if (entry) return { type: entry.type, query: entry.query, label: labelize(folded2) };
   }
   return null;
 }
@@ -432,22 +432,22 @@ function withinOneEdit(left, right) {
   return true;
 }
 function lookupCategoryFuzzy(lexicon, surface) {
-  const folded = fold(surface);
-  if (folded.length < 4 || folded.includes(" ")) return null;
+  const folded2 = fold(surface);
+  if (folded2.length < 4 || folded2.includes(" ")) return null;
   const matches = [];
   for (const [key, entry] of lexicon) {
-    if (key.includes(" ") || Math.abs(key.length - folded.length) > 1) continue;
-    if (withinOneEdit(folded, key)) matches.push({ key, entry });
+    if (key.includes(" ") || Math.abs(key.length - folded2.length) > 1) continue;
+    if (withinOneEdit(folded2, key)) matches.push({ key, entry });
   }
   const types = new Set(matches.map((match2) => match2.entry.type));
   if (types.size !== 1) return null;
-  const match = matches.sort((left, right) => Math.abs(left.key.length - folded.length) - Math.abs(right.key.length - folded.length) || left.key.localeCompare(right.key))[0];
+  const match = matches.sort((left, right) => Math.abs(left.key.length - folded2.length) - Math.abs(right.key.length - folded2.length) || left.key.localeCompare(right.key))[0];
   if (!match) return null;
   return {
     type: match.entry.type,
     query: match.entry.query,
-    label: labelize(folded),
-    correctedFrom: folded,
+    label: labelize(folded2),
+    correctedFrom: folded2,
     correctedTo: match.key
   };
 }
@@ -1896,6 +1896,1830 @@ function interpolationRangeDocs(osmId, refs, points, wayTags) {
   return docs;
 }
 
+// src/terms.js
+function expandedTermsFromBaseTerms(terms) {
+  const expanded = [...terms];
+  for (const n of [2, 3]) {
+    for (let i = 0; i <= terms.length - n; i++) {
+      expanded.push(terms.slice(i, i + n).join("_"));
+    }
+  }
+  return [...new Set(expanded)];
+}
+
+// src/analysis_data.js
+var RAW_STOPWORDS = {
+  en: [
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "not",
+    "of",
+    "on",
+    "or",
+    "she",
+    "than",
+    "that",
+    "the",
+    "their",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "under",
+    "was",
+    "we",
+    "were",
+    "which",
+    "will",
+    "with",
+    "within",
+    "would",
+    "you",
+    "your"
+  ],
+  fr: [
+    "au",
+    "aux",
+    "avec",
+    "ce",
+    "ces",
+    "cette",
+    "dans",
+    "de",
+    "des",
+    "du",
+    "elle",
+    "en",
+    "et",
+    "eux",
+    "il",
+    "ils",
+    "je",
+    "la",
+    "le",
+    "les",
+    "leur",
+    "leurs",
+    "lui",
+    "ma",
+    "mais",
+    "me",
+    "mes",
+    "moi",
+    "mon",
+    "ne",
+    "nos",
+    "notre",
+    "nous",
+    "on",
+    "ou",
+    "o\xF9",
+    "par",
+    "pas",
+    "pour",
+    "qu",
+    "que",
+    "qui",
+    "sa",
+    "se",
+    "ses",
+    "son",
+    "sur",
+    "ta",
+    "te",
+    "tes",
+    "toi",
+    "ton",
+    "tu",
+    "un",
+    "une",
+    "vos",
+    "votre",
+    "vous",
+    "y"
+  ],
+  de: [
+    "aber",
+    "als",
+    "am",
+    "an",
+    "auch",
+    "auf",
+    "aus",
+    "bei",
+    "bin",
+    "bis",
+    "das",
+    "dass",
+    "dem",
+    "den",
+    "der",
+    "des",
+    "die",
+    "durch",
+    "ein",
+    "eine",
+    "einem",
+    "einen",
+    "einer",
+    "eines",
+    "er",
+    "es",
+    "f\xFCr",
+    "hat",
+    "hatte",
+    "ich",
+    "ihr",
+    "im",
+    "in",
+    "ist",
+    "mit",
+    "nach",
+    "nicht",
+    "noch",
+    "nur",
+    "oder",
+    "sein",
+    "sich",
+    "sie",
+    "sind",
+    "so",
+    "\xFCber",
+    "um",
+    "und",
+    "vom",
+    "von",
+    "vor",
+    "war",
+    "was",
+    "wie",
+    "wird",
+    "zu",
+    "zum",
+    "zur"
+  ],
+  es: [
+    "a",
+    "al",
+    "algo",
+    "como",
+    "con",
+    "de",
+    "del",
+    "el",
+    "ella",
+    "ellas",
+    "ellos",
+    "en",
+    "entre",
+    "era",
+    "es",
+    "esta",
+    "este",
+    "esto",
+    "fue",
+    "ha",
+    "han",
+    "hay",
+    "la",
+    "las",
+    "le",
+    "les",
+    "lo",
+    "los",
+    "m\xE1s",
+    "me",
+    "mi",
+    "muy",
+    "no",
+    "nos",
+    "o",
+    "para",
+    "pero",
+    "por",
+    "que",
+    "se",
+    "ser",
+    "si",
+    "sin",
+    "sobre",
+    "son",
+    "su",
+    "sus",
+    "tambi\xE9n",
+    "te",
+    "tiene",
+    "un",
+    "una",
+    "uno",
+    "y",
+    "ya",
+    "yo"
+  ],
+  it: [
+    "a",
+    "ad",
+    "ai",
+    "al",
+    "alla",
+    "alle",
+    "anche",
+    "che",
+    "chi",
+    "ci",
+    "come",
+    "con",
+    "da",
+    "dai",
+    "dal",
+    "dalla",
+    "degli",
+    "dei",
+    "del",
+    "della",
+    "delle",
+    "dello",
+    "di",
+    "e",
+    "ed",
+    "era",
+    "gli",
+    "ha",
+    "hanno",
+    "i",
+    "il",
+    "in",
+    "la",
+    "le",
+    "lo",
+    "loro",
+    "ma",
+    "mi",
+    "ne",
+    "nel",
+    "nella",
+    "non",
+    "o",
+    "per",
+    "pi\xF9",
+    "quella",
+    "quello",
+    "questa",
+    "questo",
+    "se",
+    "si",
+    "sono",
+    "su",
+    "sua",
+    "sul",
+    "sulla",
+    "suo",
+    "un",
+    "una",
+    "uno",
+    "\xE8"
+  ],
+  pt: [
+    "a",
+    "ao",
+    "aos",
+    "as",
+    "\xE0s",
+    "com",
+    "como",
+    "da",
+    "das",
+    "de",
+    "dela",
+    "dele",
+    "do",
+    "dos",
+    "e",
+    "\xE9",
+    "ela",
+    "ele",
+    "em",
+    "entre",
+    "era",
+    "foi",
+    "for",
+    "isso",
+    "isto",
+    "j\xE1",
+    "mais",
+    "mas",
+    "me",
+    "mesmo",
+    "na",
+    "n\xE3o",
+    "nas",
+    "no",
+    "nos",
+    "o",
+    "os",
+    "ou",
+    "para",
+    "pela",
+    "pelo",
+    "por",
+    "que",
+    "se",
+    "sem",
+    "ser",
+    "seu",
+    "sua",
+    "s\xE3o",
+    "tamb\xE9m",
+    "tem",
+    "um",
+    "uma",
+    "voc\xEA"
+  ],
+  nl: [
+    "aan",
+    "als",
+    "bij",
+    "dan",
+    "dat",
+    "de",
+    "der",
+    "des",
+    "deze",
+    "die",
+    "dit",
+    "door",
+    "een",
+    "en",
+    "er",
+    "haar",
+    "heeft",
+    "het",
+    "hij",
+    "hun",
+    "ik",
+    "in",
+    "is",
+    "je",
+    "kan",
+    "maar",
+    "met",
+    "naar",
+    "niet",
+    "nog",
+    "of",
+    "om",
+    "onder",
+    "ook",
+    "op",
+    "over",
+    "te",
+    "tot",
+    "uit",
+    "van",
+    "voor",
+    "was",
+    "wat",
+    "wordt",
+    "zijn",
+    "zo"
+  ],
+  sv: [
+    "att",
+    "av",
+    "den",
+    "det",
+    "de",
+    "dem",
+    "der",
+    "du",
+    "efter",
+    "ej",
+    "eller",
+    "en",
+    "ett",
+    "f\xF6r",
+    "fr\xE5n",
+    "han",
+    "hans",
+    "har",
+    "hon",
+    "i",
+    "inte",
+    "jag",
+    "kan",
+    "man",
+    "med",
+    "men",
+    "mot",
+    "n\xE4r",
+    "och",
+    "om",
+    "p\xE5",
+    "samma",
+    "sig",
+    "sin",
+    "sitt",
+    "som",
+    "till",
+    "under",
+    "upp",
+    "var",
+    "vad",
+    "vid",
+    "vi",
+    "\xE4n",
+    "\xE4r",
+    "\xF6ver"
+  ],
+  no: [
+    "at",
+    "av",
+    "da",
+    "de",
+    "den",
+    "der",
+    "det",
+    "din",
+    "du",
+    "eller",
+    "en",
+    "er",
+    "et",
+    "etter",
+    "for",
+    "fra",
+    "ha",
+    "han",
+    "hans",
+    "har",
+    "hun",
+    "hva",
+    "hvor",
+    "i",
+    "ikke",
+    "jeg",
+    "kan",
+    "man",
+    "med",
+    "men",
+    "mot",
+    "n\xE5r",
+    "og",
+    "om",
+    "opp",
+    "over",
+    "p\xE5",
+    "seg",
+    "sin",
+    "sitt",
+    "skal",
+    "som",
+    "til",
+    "under",
+    "var",
+    "ved",
+    "vi",
+    "vil",
+    "v\xE6re",
+    "\xE5"
+  ],
+  da: [
+    "af",
+    "alle",
+    "at",
+    "da",
+    "de",
+    "den",
+    "der",
+    "det",
+    "dette",
+    "dig",
+    "din",
+    "du",
+    "efter",
+    "eller",
+    "en",
+    "er",
+    "et",
+    "for",
+    "fra",
+    "han",
+    "hans",
+    "har",
+    "havde",
+    "hun",
+    "hvad",
+    "hvor",
+    "i",
+    "ikke",
+    "jeg",
+    "kan",
+    "man",
+    "med",
+    "men",
+    "mod",
+    "n\xE5r",
+    "og",
+    "om",
+    "op",
+    "over",
+    "p\xE5",
+    "sig",
+    "sin",
+    "skal",
+    "som",
+    "til",
+    "under",
+    "var",
+    "ved",
+    "vi",
+    "vil",
+    "v\xE6re",
+    "\xE5r"
+  ],
+  fi: [
+    "ett\xE4",
+    "ei",
+    "he",
+    "h\xE4n",
+    "ja",
+    "jo",
+    "jos",
+    "kanssa",
+    "kuin",
+    "kun",
+    "me",
+    "mik\xE4",
+    "mit\xE4",
+    "mutta",
+    "my\xF6s",
+    "ne",
+    "niin",
+    "nyt",
+    "olen",
+    "oli",
+    "olla",
+    "on",
+    "ovat",
+    "se",
+    "sen",
+    "siit\xE4",
+    "sin\xE4",
+    "tai",
+    "t\xE4m\xE4",
+    "te",
+    "vain",
+    "voi",
+    "viel\xE4"
+  ],
+  ru: [
+    "\u0430",
+    "\u0431\u044B",
+    "\u0431\u044B\u043B",
+    "\u0432",
+    "\u0432\u044B",
+    "\u0434\u0430",
+    "\u0434\u043B\u044F",
+    "\u0434\u043E",
+    "\u0435\u0433\u043E",
+    "\u0435\u0435",
+    "\u0435\u0441\u043B\u0438",
+    "\u0435\u0441\u0442\u044C",
+    "\u0436\u0435",
+    "\u0437\u0430",
+    "\u0438",
+    "\u0438\u0437",
+    "\u0438\u043B\u0438",
+    "\u0438\u0445",
+    "\u043A",
+    "\u043A\u0430\u043A",
+    "\u043A\u043E",
+    "\u043A\u043E\u0433\u0434\u0430",
+    "\u043A\u0442\u043E",
+    "\u043C\u044B",
+    "\u043D\u0430",
+    "\u043D\u0435",
+    "\u043D\u0435\u0433\u043E",
+    "\u043D\u0435\u0435",
+    "\u043D\u0438",
+    "\u043D\u043E",
+    "\u043E",
+    "\u043E\u0431",
+    "\u043E\u043D",
+    "\u043E\u043D\u0430",
+    "\u043E\u043D\u0438",
+    "\u043E\u043D\u043E",
+    "\u043E\u0442",
+    "\u043F\u043E",
+    "\u043F\u043E\u0434",
+    "\u043F\u0440\u0438",
+    "\u0441",
+    "\u0441\u043E",
+    "\u0442\u0430\u043A",
+    "\u0442\u0430\u043A\u0436\u0435",
+    "\u0442\u043E",
+    "\u0442\u043E\u0433\u043E",
+    "\u0442\u043E\u043B\u044C\u043A\u043E",
+    "\u0442\u043E\u043C",
+    "\u0442\u044B",
+    "\u0443",
+    "\u0443\u0436\u0435",
+    "\u0447\u0442\u043E",
+    "\u0447\u0442\u043E\u0431\u044B",
+    "\u044D\u0442\u0430",
+    "\u044D\u0442\u0438",
+    "\u044D\u0442\u043E",
+    "\u044D\u0442\u043E\u0442",
+    "\u044F"
+  ],
+  el: [
+    "\u03B1\u03BB\u03BB\u03AC",
+    "\u03B1\u03C0\u03CC",
+    "\u03B3\u03B9\u03B1",
+    "\u03B4\u03B5\u03BD",
+    "\u03B5\u03AF\u03BD\u03B1\u03B9",
+    "\u03B5\u03BD",
+    "\u03AD\u03BD\u03B1",
+    "\u03AD\u03BD\u03B1\u03BD",
+    "\u03B5\u03BD\u03CC\u03C2",
+    "\u03B5\u03C0\u03AF",
+    "\u03B7",
+    "\u03AE",
+    "\u03B8\u03B1",
+    "\u03BA\u03B1\u03B9",
+    "\u03BA\u03B1\u03C4\u03AC",
+    "\u03BC\u03B5",
+    "\u03BC\u03B9\u03B1",
+    "\u03BD\u03B1",
+    "\u03BF",
+    "\u03BF\u03B9",
+    "\u03CC\u03C0\u03C9\u03C2",
+    "\u03CC\u03C4\u03B9",
+    "\u03BF\u03C5",
+    "\u03C0\u03B1\u03C1\u03AC",
+    "\u03C0\u03BF\u03C5",
+    "\u03C0\u03C1\u03BF\u03C2",
+    "\u03C0\u03C9\u03C2",
+    "\u03C3\u03B5",
+    "\u03C3\u03C4\u03B7",
+    "\u03C3\u03C4\u03B7\u03BD",
+    "\u03C3\u03C4\u03BF",
+    "\u03C3\u03C4\u03BF\u03BD",
+    "\u03C4\u03B1",
+    "\u03C4\u03B7\u03BD",
+    "\u03C4\u03B7\u03C2",
+    "\u03C4\u03B9",
+    "\u03C4\u03B9\u03C2",
+    "\u03C4\u03BF",
+    "\u03C4\u03BF\u03BD",
+    "\u03C4\u03BF\u03C5",
+    "\u03C4\u03C9\u03BD",
+    "\u03C9\u03C2"
+  ],
+  ar: [
+    "\u0627\u0644",
+    "\u0625\u0644\u0649",
+    "\u0627\u0644\u0649",
+    "\u0623\u0646",
+    "\u0627\u0646",
+    "\u0623\u0648",
+    "\u0627\u0648",
+    "\u0625\u0646",
+    "\u0627\u0644\u062A\u064A",
+    "\u0627\u0644\u0630\u064A",
+    "\u0628\u0639\u062F",
+    "\u0628\u064A\u0646",
+    "\u062B\u0645",
+    "\u062D\u062A\u0649",
+    "\u0639\u0644\u0649",
+    "\u0639\u0646",
+    "\u0639\u0646\u062F",
+    "\u063A\u064A\u0631",
+    "\u0641\u064A",
+    "\u0642\u0628\u0644",
+    "\u0642\u062F",
+    "\u0643\u0627\u0646",
+    "\u0643\u0627\u0646\u062A",
+    "\u0643\u0644",
+    "\u0643\u0645\u0627",
+    "\u0644\u0627",
+    "\u0644\u0645",
+    "\u0644\u0646",
+    "\u0644\u0647",
+    "\u0644\u0647\u0627",
+    "\u0645\u0627",
+    "\u0645\u0639",
+    "\u0645\u0646",
+    "\u0645\u0646\u0630",
+    "\u0647\u0630\u0627",
+    "\u0647\u0630\u0647",
+    "\u0647\u0648",
+    "\u0647\u064A",
+    "\u0648",
+    "\u0648\u0644\u0627",
+    "\u0648\u0645\u0627",
+    "\u0648\u0645\u0646",
+    "\u064A\u0643\u0648\u0646"
+  ],
+  hi: [
+    "\u0905\u0917\u0930",
+    "\u0914\u0930",
+    "\u0907\u0928",
+    "\u0907\u0938",
+    "\u0909\u0928",
+    "\u0909\u0938",
+    "\u090F\u0915",
+    "\u090F\u0935\u0902",
+    "\u0915\u0930",
+    "\u0915\u0930\u0928\u093E",
+    "\u0915\u093E",
+    "\u0915\u093F",
+    "\u0915\u093F\u092F\u093E",
+    "\u0915\u0940",
+    "\u0915\u0947",
+    "\u0915\u094B",
+    "\u0917\u092F\u093E",
+    "\u091C\u092C",
+    "\u091C\u094B",
+    "\u0924\u0915",
+    "\u0924\u0925\u093E",
+    "\u0924\u094B",
+    "\u0925\u093E",
+    "\u0925\u0940",
+    "\u0925\u0947",
+    "\u0928\u0939\u0940\u0902",
+    "\u0928\u0947",
+    "\u092A\u0930",
+    "\u092B\u093F\u0930",
+    "\u092C\u093E\u0926",
+    "\u092D\u0940",
+    "\u092E\u0948\u0902",
+    "\u092E\u0947\u0902",
+    "\u092F\u0939",
+    "\u092F\u093E",
+    "\u092F\u0947",
+    "\u0935\u0939",
+    "\u0935\u0947",
+    "\u0938\u0947",
+    "\u0939\u0940",
+    "\u0939\u0948",
+    "\u0939\u0948\u0902",
+    "\u0939\u094B",
+    "\u0939\u094B\u0924\u093E"
+  ],
+  tr: [
+    "acaba",
+    "ama",
+    "ancak",
+    "bir",
+    "bu",
+    "da",
+    "daha",
+    "de",
+    "de\u011Fil",
+    "gibi",
+    "hem",
+    "hep",
+    "her",
+    "ile",
+    "ise",
+    "i\xE7in",
+    "kadar",
+    "ki",
+    "mi",
+    "m\u0131",
+    "mu",
+    "m\xFC",
+    "ne",
+    "o",
+    "olan",
+    "olarak",
+    "sonra",
+    "\u015Fu",
+    "ve",
+    "veya",
+    "ya",
+    "yani"
+  ],
+  pl: [
+    "aby",
+    "ale",
+    "by\u0142",
+    "by\u0142a",
+    "by\u0142o",
+    "by\u0107",
+    "co",
+    "czy",
+    "dla",
+    "do",
+    "go",
+    "i",
+    "ich",
+    "jak",
+    "jako",
+    "je",
+    "jego",
+    "jej",
+    "jest",
+    "ju\u017C",
+    "lub",
+    "ma",
+    "na",
+    "nie",
+    "o",
+    "od",
+    "oraz",
+    "po",
+    "pod",
+    "przez",
+    "si\u0119",
+    "s\u0105",
+    "ta",
+    "tak",
+    "tak\u017Ce",
+    "te",
+    "tego",
+    "tej",
+    "ten",
+    "to",
+    "tym",
+    "w",
+    "we",
+    "z",
+    "za",
+    "ze",
+    "\u017Ce"
+  ],
+  cs: [
+    "a",
+    "aby",
+    "ale",
+    "ani",
+    "bude",
+    "byl",
+    "byla",
+    "bylo",
+    "b\xFDt",
+    "co",
+    "co\u017E",
+    "do",
+    "i",
+    "jak",
+    "jako",
+    "je",
+    "jeho",
+    "jej\xED",
+    "jen",
+    "je\u0161t\u011B",
+    "jsem",
+    "jsou",
+    "k",
+    "kde",
+    "kdy\u017E",
+    "kter\xE1",
+    "kter\xE9",
+    "kter\xFD",
+    "ma",
+    "mezi",
+    "na",
+    "nebo",
+    "nen\xED",
+    "o",
+    "od",
+    "po",
+    "pod",
+    "pro",
+    "p\u0159ed",
+    "s",
+    "se",
+    "si",
+    "tak",
+    "tak\xE9",
+    "tato",
+    "ten",
+    "to",
+    "tohoto",
+    "toto",
+    "u",
+    "v",
+    "ve",
+    "v\u0161ak",
+    "z",
+    "za",
+    "\u017Ee"
+  ],
+  id: [
+    "ada",
+    "adalah",
+    "akan",
+    "atau",
+    "bahwa",
+    "dan",
+    "dari",
+    "dengan",
+    "di",
+    "dia",
+    "ia",
+    "ini",
+    "itu",
+    "juga",
+    "kami",
+    "karena",
+    "ke",
+    "kita",
+    "lebih",
+    "oleh",
+    "pada",
+    "para",
+    "saya",
+    "sebagai",
+    "sudah",
+    "telah",
+    "tidak",
+    "untuk",
+    "yang"
+  ],
+  hu: [
+    "a",
+    "az",
+    "azt",
+    "be",
+    "csak",
+    "de",
+    "egy",
+    "el",
+    "ez",
+    "ezt",
+    "fel",
+    "hogy",
+    "is",
+    "ki",
+    "le",
+    "lesz",
+    "meg",
+    "mint",
+    "mit",
+    "nem",
+    "pedig",
+    "s",
+    "\xE9s",
+    "vagy",
+    "van",
+    "volt"
+  ],
+  ro: [
+    "a",
+    "acest",
+    "aceast\u0103",
+    "al",
+    "ale",
+    "care",
+    "ce",
+    "cu",
+    "de",
+    "din",
+    "dup\u0103",
+    "el",
+    "ea",
+    "este",
+    "fi",
+    "fost",
+    "\xEEn",
+    "\xEEntre",
+    "la",
+    "le",
+    "lor",
+    "lui",
+    "mai",
+    "nu",
+    "o",
+    "pe",
+    "pentru",
+    "prin",
+    "sa",
+    "sau",
+    "se",
+    "\u0219i",
+    "sunt",
+    "un",
+    "una",
+    "unei",
+    "unui"
+  ]
+};
+function rawStopwordLists() {
+  return RAW_STOPWORDS;
+}
+var STOPWORD_LANGUAGES = Object.freeze(Object.keys(RAW_STOPWORDS));
+
+// src/analysis_stemmers.js
+var VOWELS = new Set("aeiouy");
+function hasVowel(token) {
+  for (const ch of token) if (VOWELS.has(ch)) return true;
+  return false;
+}
+function undouble(token) {
+  const n = token.length;
+  if (n < 4) return token;
+  const last = token[n - 1];
+  if (token[n - 2] !== last || VOWELS.has(last) || "lsz".includes(last)) return token;
+  return token.slice(0, -1);
+}
+function folded(suffixes) {
+  return suffixes.map((suffix) => foldMulti(suffix));
+}
+function stripOne(token, suffixes, minStem) {
+  for (const suffix of suffixes) {
+    if (token.length - suffix.length >= minStem && token.endsWith(suffix)) {
+      return token.slice(0, token.length - suffix.length);
+    }
+  }
+  return token;
+}
+function stemEnglish(token) {
+  let t = token;
+  if (t.length > 4 && t.endsWith("ies") && !t.endsWith("eies") && !t.endsWith("aies")) {
+    t = `${t.slice(0, -3)}y`;
+  } else if (t.length > 3 && t.endsWith("es") && !t.endsWith("aes") && !t.endsWith("ees") && !t.endsWith("oes")) {
+    t = t.slice(0, -1);
+  } else if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss") && !t.endsWith("us") && !t.endsWith("is")) {
+    t = t.slice(0, -1);
+  }
+  if (t.length > 5 && t.endsWith("ing") && hasVowel(t.slice(0, -3))) {
+    t = undouble(t.slice(0, -3));
+  } else if (t.length > 4 && t.endsWith("ed") && hasVowel(t.slice(0, -2))) {
+    t = undouble(t.slice(0, -2));
+  }
+  return t;
+}
+var FRENCH_SUFFIXES = folded([
+  "issement",
+  "atrice",
+  "ateur",
+  "ation",
+  "ement",
+  "euse",
+  "ante",
+  "ence",
+  "it\xE9",
+  "eur",
+  "ive",
+  "ant",
+  "ent",
+  "\xE9e",
+  "if",
+  "er",
+  "ez",
+  "e"
+]);
+function stemFrench(token) {
+  let t = token;
+  if (t.length > 5 && t.endsWith("eaux")) return t.slice(0, -1);
+  if (t.length > 4 && t.endsWith("aux")) return `${t.slice(0, -2)}l`;
+  if (t.length > 3 && (t.endsWith("x") || t.endsWith("s") || t.endsWith("z"))) t = t.slice(0, -1);
+  t = stripOne(t, FRENCH_SUFFIXES, 3);
+  return undouble(t);
+}
+var GERMAN_SUFFIXES = folded([
+  "heiten",
+  "ungen",
+  "heit",
+  "ung",
+  "isch",
+  "ern",
+  "en",
+  "er",
+  "es",
+  "em",
+  "e"
+]);
+function stemGerman(token) {
+  let t = stripOne(token, GERMAN_SUFFIXES, 3);
+  if (t.length > 3 && t.endsWith("s") && "bdfghklmnt".includes(t[t.length - 2])) {
+    t = t.slice(0, -1);
+  }
+  return t;
+}
+function stemSpanish(token) {
+  let t = token;
+  if (t.length > 4 && t.endsWith("ces")) return `${t.slice(0, -3)}z`;
+  if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) t = t.slice(0, -1);
+  if (t.length > 3 && (t.endsWith("o") || t.endsWith("a") || t.endsWith("e"))) t = t.slice(0, -1);
+  return t;
+}
+function stemItalian(token) {
+  let t = token;
+  if (t.length > 3 && "aeio".includes(t[t.length - 1])) t = t.slice(0, -1);
+  return undouble(t);
+}
+function stemPortuguese(token) {
+  let t = token;
+  if (t.length > 5 && t.endsWith("oes")) return `${t.slice(0, -3)}ao`;
+  if (t.length > 4 && t.endsWith("aes")) return `${t.slice(0, -3)}ao`;
+  if (t.length > 4 && t.endsWith("ais")) return `${t.slice(0, -2)}l`;
+  if (t.length > 4 && t.endsWith("eis")) return `${t.slice(0, -2)}l`;
+  if (t.length > 4 && t.endsWith("ois")) return `${t.slice(0, -2)}l`;
+  if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) t = t.slice(0, -1);
+  if (t.length > 3 && (t.endsWith("a") || t.endsWith("e") || t.endsWith("o"))) t = t.slice(0, -1);
+  return t;
+}
+function stemDutch(token) {
+  let t = token;
+  if (t.length > 5 && t.endsWith("jes")) return t.slice(0, -3);
+  if (t.length > 4 && t.endsWith("je")) return t.slice(0, -2);
+  if (t.length > 4 && t.endsWith("en")) return undouble(t.slice(0, -2));
+  if (t.length > 3 && t.endsWith("s") && !t.endsWith("ss")) return t.slice(0, -1);
+  if (t.length > 4 && t.endsWith("e")) return t.slice(0, -1);
+  return t;
+}
+var SWEDISH_SUFFIXES = folded([
+  "arnas",
+  "ernas",
+  "ornas",
+  "arna",
+  "erna",
+  "orna",
+  "ande",
+  "aste",
+  "aren",
+  "are",
+  "ast",
+  "ens",
+  "ans",
+  "or",
+  "ar",
+  "er",
+  "en",
+  "et",
+  "as",
+  "es",
+  "at",
+  "a",
+  "e",
+  "s"
+]);
+function stemSwedish(token) {
+  return stripOne(token, SWEDISH_SUFFIXES, 3);
+}
+var NORWEGIAN_SUFFIXES = folded([
+  "endes",
+  "enes",
+  "erne",
+  "eren",
+  "ede",
+  "ene",
+  "ens",
+  "ers",
+  "ets",
+  "en",
+  "er",
+  "es",
+  "et",
+  "a",
+  "e",
+  "s"
+]);
+function stemNorwegian(token) {
+  return stripOne(token, NORWEGIAN_SUFFIXES, 3);
+}
+var DANISH_SUFFIXES = folded([
+  "erendes",
+  "erende",
+  "endes",
+  "erne",
+  "ende",
+  "ene",
+  "ens",
+  "ers",
+  "ets",
+  "en",
+  "er",
+  "es",
+  "et",
+  "e",
+  "s"
+]);
+function stemDanish(token) {
+  return stripOne(token, DANISH_SUFFIXES, 3);
+}
+var FINNISH_ENCLITICS = folded(["kaan", "k\xE4\xE4n", "kin", "han", "h\xE4n", "pa", "p\xE4", "ko", "k\xF6"]);
+var FINNISH_SUFFIXES = folded([
+  "issa",
+  "iss\xE4",
+  "ista",
+  "ist\xE4",
+  "illa",
+  "ill\xE4",
+  "ilta",
+  "ilt\xE4",
+  "ille",
+  "ssa",
+  "ss\xE4",
+  "sta",
+  "st\xE4",
+  "lla",
+  "ll\xE4",
+  "lta",
+  "lt\xE4",
+  "lle",
+  "ksi",
+  "tta",
+  "tt\xE4",
+  "nsa",
+  "ns\xE4",
+  "aan",
+  "een",
+  "iin",
+  "in",
+  "en",
+  "an",
+  "\xE4n"
+]);
+function stemFinnish(token) {
+  let t = stripOne(token, FINNISH_ENCLITICS, 4);
+  t = stripOne(t, FINNISH_SUFFIXES, 3);
+  return t;
+}
+var RUSSIAN_SUFFIXES = folded([
+  "\u0438\u044F\u043C\u0438",
+  "\u044F\u043C\u0438",
+  "\u0430\u043C\u0438",
+  "\u0438\u044F\u0445",
+  "\u0438\u044F\u043C",
+  "\u0438\u0435\u043C",
+  "\u0435\u0433\u043E",
+  "\u043E\u0433\u043E",
+  "\u0435\u043C\u0443",
+  "\u043E\u043C\u0443",
+  "\u0438\u043C\u0438",
+  "\u044B\u043C\u0438",
+  "\u0430\u0445",
+  "\u044F\u0445",
+  "\u0430\u043C",
+  "\u044F\u043C",
+  "\u043E\u043C",
+  "\u0435\u043C",
+  "\u0438\u043C",
+  "\u044B\u043C",
+  "\u043E\u0432",
+  "\u0435\u0432",
+  "\u0435\u0439",
+  "\u0438\u0439",
+  "\u044B\u0439",
+  "\u043E\u0439",
+  "\u0430\u044F",
+  "\u044F\u044F",
+  "\u0443\u044E",
+  "\u044E\u044E",
+  "\u043E\u0435",
+  "\u0435\u0435",
+  "\u044B\u0435",
+  "\u0438\u0435",
+  "\u044C\u044F",
+  "\u044C\u0435",
+  "\u044C\u044E",
+  "\u0438\u044F",
+  "\u0438\u044E",
+  "\u0430",
+  "\u044F",
+  "\u043E",
+  "\u0435",
+  "\u0438",
+  "\u044B",
+  "\u0443",
+  "\u044E",
+  "\u044C"
+]);
+function stemRussian(token) {
+  return stripOne(token, RUSSIAN_SUFFIXES, 3);
+}
+var GREEK_SUFFIXES = folded([
+  "\u03BC\u03B1\u03C4\u03C9\u03BD",
+  "\u03BC\u03B1\u03C4\u03B1",
+  "\u03BF\u03C5\u03C3",
+  "\u03B5\u03C9\u03BD",
+  "\u03B5\u03B9\u03C3",
+  "\u03BF\u03C2",
+  "\u03B5\u03C2",
+  "\u03B1\u03C2",
+  "\u03B7\u03C2",
+  "\u03C9\u03BD",
+  "\u03BF\u03B9",
+  "\u03B1\u03B9",
+  "\u03BF",
+  "\u03B7",
+  "\u03B1",
+  "\u03B9"
+]);
+function stemGreek(token) {
+  return stripOne(token, GREEK_SUFFIXES, 3);
+}
+var ARABIC_PREFIXES = ["\u0648\u0627\u0644", "\u0628\u0627\u0644", "\u0643\u0627\u0644", "\u0641\u0627\u0644", "\u0627\u0644", "\u0644\u0644"];
+var ARABIC_SUFFIXES = ["\u0647\u0627", "\u0627\u0646", "\u0627\u062A", "\u0648\u0646", "\u064A\u0646", "\u064A\u0647", "\u064A\u0629", "\u0647", "\u0629", "\u064A"];
+function stemArabic(token) {
+  let t = token;
+  if (t.length > 3 && t.startsWith("\u0648")) t = t.slice(1);
+  for (const prefix of ARABIC_PREFIXES) {
+    if (t.length - prefix.length >= 2 && t.startsWith(prefix)) {
+      t = t.slice(prefix.length);
+      break;
+    }
+  }
+  for (const suffix of ARABIC_SUFFIXES) {
+    if (t.length - suffix.length >= 2 && t.endsWith(suffix)) {
+      t = t.slice(0, t.length - suffix.length);
+    }
+  }
+  return t;
+}
+var HINDI_SUFFIXES_LONG = ["\u093E\u090F\u0917\u0940", "\u093E\u090F\u0917\u093E", "\u093E\u0913\u0917\u0940", "\u093E\u0913\u0917\u0947", "\u090F\u0902\u0917\u0940", "\u090F\u0902\u0917\u0947", "\u0942\u0902\u0917\u0940", "\u0942\u0902\u0917\u093E", "\u093E\u0924\u0940\u0902", "\u0928\u093E\u0913\u0902", "\u0928\u093E\u090F\u0902", "\u0924\u093E\u0913\u0902", "\u0924\u093E\u090F\u0902", "\u093F\u092F\u093E\u0901", "\u093F\u092F\u094B\u0902", "\u093F\u092F\u093E\u0902"];
+var HINDI_SUFFIXES_MID = ["\u093E\u0915\u0930", "\u093E\u0907\u090F", "\u093E\u0908\u0902", "\u093E\u092F\u093E", "\u0947\u0917\u0940", "\u0947\u0917\u093E", "\u094B\u0917\u0940", "\u094B\u0917\u0947", "\u093E\u0928\u0947", "\u093E\u0928\u093E", "\u093E\u0924\u0947", "\u093E\u0924\u0940", "\u093E\u0924\u093E", "\u0924\u0940\u0902", "\u093E\u0913\u0902", "\u093E\u090F\u0902", "\u0941\u0913\u0902", "\u0941\u090F\u0902", "\u0941\u0906\u0902"];
+var HINDI_SUFFIXES_SHORT = ["\u0915\u0930", "\u093E\u0913", "\u093F\u090F", "\u093E\u0908", "\u093E\u090F", "\u0928\u0947", "\u0928\u0940", "\u0928\u093E", "\u0924\u0947", "\u0940\u0902", "\u0924\u0940", "\u0924\u093E", "\u093E\u0901", "\u093E\u0902", "\u094B\u0902", "\u0947\u0902"];
+var HINDI_SUFFIXES_MIN = ["\u094B", "\u0947", "\u0942", "\u0941", "\u0940", "\u093F", "\u093E"];
+function stemHindi(token) {
+  if (token.length > 5) {
+    const t = stripOne(token, HINDI_SUFFIXES_LONG, token.length - 4);
+    if (t !== token) return t;
+  }
+  if (token.length > 4) {
+    const t = stripOne(token, HINDI_SUFFIXES_MID, token.length - 3);
+    if (t !== token) return t;
+  }
+  if (token.length > 3) {
+    const t = stripOne(token, HINDI_SUFFIXES_SHORT, token.length - 2);
+    if (t !== token) return t;
+  }
+  if (token.length > 2) {
+    return stripOne(token, HINDI_SUFFIXES_MIN, token.length - 1);
+  }
+  return token;
+}
+var STEMMERS = {
+  en: stemEnglish,
+  fr: stemFrench,
+  de: stemGerman,
+  es: stemSpanish,
+  it: stemItalian,
+  pt: stemPortuguese,
+  nl: stemDutch,
+  sv: stemSwedish,
+  no: stemNorwegian,
+  da: stemDanish,
+  fi: stemFinnish,
+  ru: stemRussian,
+  el: stemGreek,
+  ar: stemArabic,
+  hi: stemHindi
+};
+var STEMMER_LANGUAGES = Object.freeze(Object.keys(STEMMERS));
+function stemmerFor(language) {
+  return STEMMERS[language] || null;
+}
+
+// src/analysis.js
+var ANALYSIS_PROFILE_MULTI = "multi-v1";
+var QUERY_TERM_BUDGET = 30;
+var WORD_RE = /[\p{L}\p{M}\p{N}ー々]+/gu;
+var BIGRAM_CHAR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}ー々]/u;
+var SCRIPT_RES = {
+  latin: /\p{Script=Latin}/u,
+  cyrillic: /\p{Script=Cyrillic}/u,
+  greek: /\p{Script=Greek}/u,
+  arabic: /\p{Script=Arabic}/u,
+  hebrew: /\p{Script=Hebrew}/u,
+  devanagari: /\p{Script=Devanagari}/u,
+  han: /\p{Script=Han}/u,
+  kana: /[\p{Script=Hiragana}\p{Script=Katakana}]/u,
+  hangul: /\p{Script=Hangul}/u,
+  thai: /\p{Script=Thai}/u
+};
+var LANG_SCRIPT = {
+  ru: "cyrillic",
+  uk: "cyrillic",
+  bg: "cyrillic",
+  sr: "cyrillic",
+  be: "cyrillic",
+  mk: "cyrillic",
+  el: "greek",
+  ar: "arabic",
+  fa: "arabic",
+  ur: "arabic",
+  he: "hebrew",
+  yi: "hebrew",
+  hi: "devanagari",
+  mr: "devanagari",
+  ne: "devanagari",
+  th: "thai",
+  zh: "han",
+  ja: "kana",
+  ko: "hangul"
+};
+function scriptForLanguage(language) {
+  return LANG_SCRIPT[language] || "latin";
+}
+function isSingleDigit(value) {
+  if (value.length !== 1) return false;
+  const code = value.charCodeAt(0);
+  return code >= 48 && code <= 57;
+}
+function pathValue(object, path) {
+  if (!path) return "";
+  let value = object;
+  for (const part of String(path).split(".")) {
+    if (value == null) return "";
+    value = value[part];
+  }
+  if (Array.isArray(value)) return value.join(" ");
+  return value == null ? "" : String(value);
+}
+var LANGUAGE_CODE_RE = /^[a-z]{2,3}$/;
+function normalizeLanguageCode(value) {
+  const code = String(value || "").trim().toLowerCase().split(/[-_]/)[0];
+  return LANGUAGE_CODE_RE.test(code) ? code : "";
+}
+var DEFAULT_ANALYSIS_LANGUAGES = ["en", "fr"];
+function normalizeAnalysisConfig(raw) {
+  if (raw == null || raw === false) return normalizeAnalysisConfig({ languages: DEFAULT_ANALYSIS_LANGUAGES });
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Rangefind analysis config must be an object.");
+  }
+  const languages = [];
+  for (const value of Array.isArray(raw.languages) ? raw.languages : []) {
+    const code = normalizeLanguageCode(value);
+    if (!code) throw new Error(`Rangefind analysis language "${value}" is not a valid ISO 639 code.`);
+    if (!languages.includes(code)) languages.push(code);
+  }
+  if (!languages.length) languages.push("en");
+  const primary = normalizeLanguageCode(raw.primary);
+  const stemming = String(raw.stemming || "light").toLowerCase();
+  if (!["light", "off"].includes(stemming)) {
+    throw new Error(`Rangefind analysis stemming "${raw.stemming}" must be "light" or "off".`);
+  }
+  const stopwords = String(raw.stopwords || "default").toLowerCase();
+  if (!["default", "off"].includes(stopwords)) {
+    throw new Error(`Rangefind analysis stopwords "${raw.stopwords}" must be "default" or "off".`);
+  }
+  const minLength = Math.max(1, Math.min(4, Math.floor(Number(raw.minLength ?? 2)) || 2));
+  return {
+    profile: ANALYSIS_PROFILE_MULTI,
+    languages,
+    primary: primary && languages.includes(primary) ? primary : languages[0],
+    languageField: String(raw.languageField || ""),
+    detect: raw.detect !== false,
+    stemming,
+    stopwords,
+    foldDiacritics: raw.foldDiacritics !== false,
+    minLength
+  };
+}
+function splitScriptRuns(word) {
+  const runs = [];
+  let current = "";
+  let currentBigram = false;
+  for (const ch of word) {
+    const bigram = BIGRAM_CHAR_RE.test(ch);
+    if (current && bigram === currentBigram) {
+      current += ch;
+    } else {
+      if (current) runs.push({ text: current, bigram: currentBigram });
+      current = ch;
+      currentBigram = bigram;
+    }
+  }
+  if (current) runs.push({ text: current, bigram: currentBigram });
+  return runs;
+}
+function bigramTokens(run, out) {
+  const chars = [...run];
+  if (chars.length === 1) {
+    out.push(chars[0]);
+    return;
+  }
+  for (let i = 0; i < chars.length - 1; i++) {
+    out.push(chars[i] + chars[i + 1]);
+  }
+}
+function createMultiAnalyzer(profile) {
+  const foldOptions = { foldDiacritics: profile.foldDiacritics };
+  const fold2 = (text) => foldMulti(text, foldOptions);
+  const stopwordSets = /* @__PURE__ */ new Map();
+  const rawLists = rawStopwordLists();
+  function stopwordsFor(language) {
+    if (profile.stopwords === "off") return EMPTY_SET;
+    let set = stopwordSets.get(language);
+    if (!set) {
+      set = new Set((rawLists[language] || []).map((word) => fold2(word)).filter(Boolean));
+      stopwordSets.set(language, set);
+    }
+    return set;
+  }
+  function stemFor(language) {
+    return profile.stemming === "light" ? stemmerFor(language) : null;
+  }
+  function normalizeAlphaToken(raw, language, stopwords, stemmer) {
+    if (raw.length < profile.minLength && !isSingleDigit(raw)) return "";
+    if (stopwords.has(raw)) return "";
+    const term = stemmer ? stemmer(raw) : raw;
+    if (term.length < profile.minLength && !isSingleDigit(term)) return "";
+    if (stopwords.has(term)) return "";
+    return term;
+  }
+  function emitTokens(text, language, callback) {
+    const lang = profile.languages.includes(language) ? language : profile.primary;
+    const stopwords = stopwordsFor(lang);
+    const stemmer = stemFor(lang);
+    const folded2 = fold2(text);
+    WORD_RE.lastIndex = 0;
+    let match;
+    const bigrams = [];
+    while (match = WORD_RE.exec(folded2)) {
+      for (const run of splitScriptRuns(match[0])) {
+        if (run.bigram) {
+          bigrams.length = 0;
+          bigramTokens(run.text, bigrams);
+          for (const token of bigrams) callback(token, token);
+        } else {
+          const term = normalizeAlphaToken(run.text, lang, stopwords, stemmer);
+          if (term) callback(run.text, term);
+        }
+      }
+    }
+  }
+  function tokenize(text, options = {}) {
+    const unique = options.unique !== false;
+    const out = [];
+    const seen = unique ? /* @__PURE__ */ new Set() : null;
+    emitTokens(text, options.lang || "", (raw, term) => {
+      if (seen) {
+        if (seen.has(term)) return;
+        seen.add(term);
+      }
+      out.push(term);
+    });
+    return out;
+  }
+  function termCounts(text, options = {}) {
+    const counts = /* @__PURE__ */ new Map();
+    emitTokens(text, options.lang || "", (raw, term) => {
+      counts.set(term, (counts.get(term) || 0) + 1);
+    });
+    return counts;
+  }
+  function analyzeTerms(text, options = {}) {
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    emitTokens(text, options.lang || "", (raw, term) => {
+      if (seen.has(term)) return;
+      seen.add(term);
+      out.push({ raw, term });
+    });
+    return out;
+  }
+  function scriptCounts(text) {
+    const sample = String(text || "").slice(0, 1600);
+    const counts = {};
+    for (const ch of sample) {
+      for (const [script, re] of Object.entries(SCRIPT_RES)) {
+        if (re.test(ch)) {
+          counts[script] = (counts[script] || 0) + 1;
+          break;
+        }
+      }
+    }
+    return counts;
+  }
+  function stopwordVote(text, candidates) {
+    if (candidates.length === 1) return candidates[0];
+    const folded2 = fold2(String(text || "").slice(0, 1600));
+    const words = folded2.match(WORD_RE) || [];
+    let best = "";
+    let bestHits = 0;
+    let secondHits = 0;
+    for (const language of candidates) {
+      const set = profile.stopwords === "off" ? new Set((rawLists[language] || []).map((word) => fold2(word))) : stopwordsFor(language);
+      let hits = 0;
+      for (const word of words) if (set.has(word)) hits++;
+      if (hits > bestHits) {
+        secondHits = bestHits;
+        bestHits = hits;
+        best = language;
+      } else if (hits > secondHits) {
+        secondHits = hits;
+      }
+    }
+    return bestHits >= 2 && bestHits > secondHits ? best : "";
+  }
+  function detectLanguage(text) {
+    const counts = scriptCounts(text);
+    const kana = counts.kana || 0;
+    const han = counts.han || 0;
+    const hangul = counts.hangul || 0;
+    if (kana > 0 && profile.languages.includes("ja")) return "ja";
+    if (hangul > 0 && profile.languages.includes("ko")) return "ko";
+    if (han > 0) {
+      if (profile.languages.includes("zh")) return "zh";
+      if (profile.languages.includes("ja")) return "ja";
+    }
+    let dominant = "";
+    let dominantCount = 0;
+    for (const [script, count] of Object.entries(counts)) {
+      if (script === "han" || script === "kana" || script === "hangul") continue;
+      if (count > dominantCount) {
+        dominant = script;
+        dominantCount = count;
+      }
+    }
+    if (!dominant) return "";
+    const candidates = profile.languages.filter((language) => scriptForLanguage(language) === dominant);
+    if (candidates.length === 1) return candidates[0];
+    if (!candidates.length) return "";
+    return stopwordVote(text, candidates) || "";
+  }
+  function docLanguage(doc, config) {
+    if (profile.languageField) {
+      const explicit = normalizeLanguageCode(pathValue(doc, profile.languageField));
+      if (explicit && profile.languages.includes(explicit)) return explicit;
+    }
+    if (profile.detect) {
+      const parts = [];
+      let length = 0;
+      for (const field of config?.fields || []) {
+        const value = pathValue(doc, field.path);
+        if (!value) continue;
+        parts.push(value.slice(0, 800));
+        length += Math.min(value.length, 800);
+        if (length >= 1600) break;
+      }
+      const detected = detectLanguage(parts.join(" "));
+      if (detected) return detected;
+    }
+    return profile.primary;
+  }
+  function queryPlan(text) {
+    const language = detectLanguage(text) || profile.primary;
+    const analyzedTerms = analyzeTerms(text, { lang: language });
+    const baseTerms = analyzedTerms.map((item) => item.term);
+    const terms = new Set(expandedTermsFromBaseTerms(baseTerms));
+    const altPlans = [];
+    const seenPlans = /* @__PURE__ */ new Set([baseTerms.join("\0")]);
+    for (const alt of profile.languages) {
+      if (alt === language) continue;
+      const altAnalyzed = analyzeTerms(text, { lang: alt });
+      if (!altAnalyzed.length) continue;
+      const altBase = altAnalyzed.map((item) => item.term);
+      const key = altBase.join("\0");
+      if (seenPlans.has(key)) continue;
+      seenPlans.add(key);
+      altPlans.push({ language: alt, analyzedTerms: altAnalyzed, baseTerms: altBase });
+    }
+    for (const alt of altPlans) {
+      for (const term of alt.baseTerms) {
+        if (terms.size >= QUERY_TERM_BUDGET) break;
+        terms.add(term);
+      }
+    }
+    for (const alt of altPlans) {
+      for (const term of expandedTermsFromBaseTerms(alt.baseTerms)) {
+        if (terms.size >= QUERY_TERM_BUDGET) break;
+        terms.add(term);
+      }
+    }
+    return { language, analyzedTerms, baseTerms, terms: [...terms], altPlans };
+  }
+  function queryTerms(text) {
+    return queryPlan(text).terms;
+  }
+  function highlightTerms(query, correctedQuery = "") {
+    const terms = /* @__PURE__ */ new Set();
+    for (const language of profile.languages) {
+      for (const item of analyzeTerms(String(query || ""), { lang: language })) terms.add(item.term);
+      if (correctedQuery) {
+        for (const item of analyzeTerms(String(correctedQuery || ""), { lang: language })) terms.add(item.term);
+      }
+    }
+    return terms;
+  }
+  function wordMatchRanges(word, termSet) {
+    const ranges = [];
+    let offset = 0;
+    for (const run of splitScriptRuns(word)) {
+      if (run.bigram) {
+        const chars = [...run.text];
+        if (chars.length === 1) {
+          if (termSet.has(chars[0])) ranges.push([offset, offset + chars[0].length]);
+        } else {
+          let charOffset = offset;
+          for (let i = 0; i < chars.length - 1; i++) {
+            const bigram = chars[i] + chars[i + 1];
+            if (termSet.has(bigram)) {
+              const start = charOffset;
+              const end = charOffset + chars[i].length + chars[i + 1].length;
+              const previous = ranges[ranges.length - 1];
+              if (previous && previous[1] >= start) previous[1] = end;
+              else ranges.push([start, end]);
+            }
+            charOffset += chars[i].length;
+          }
+        }
+        offset += run.text.length;
+      } else {
+        const folded2 = fold2(run.text);
+        let matched = termSet.has(folded2);
+        if (!matched && profile.stemming === "light") {
+          for (const language of profile.languages) {
+            const stemmer = stemmerFor(language);
+            if (stemmer && termSet.has(stemmer(folded2))) {
+              matched = true;
+              break;
+            }
+          }
+        }
+        if (matched) ranges.push([offset, offset + run.text.length]);
+        offset += run.text.length;
+      }
+    }
+    return ranges;
+  }
+  function canonicalTerm(word) {
+    const foldedWord = fold2(word);
+    const stemmer = stemFor(profile.primary);
+    return stemmer ? stemmer(foldedWord) : foldedWord;
+  }
+  return {
+    profile,
+    languages: profile.languages,
+    fold: fold2,
+    tokenize,
+    termCounts,
+    analyzeTerms,
+    detectLanguage,
+    docLanguage,
+    queryPlan,
+    queryTerms,
+    highlightTerms,
+    wordMatchRanges,
+    canonicalTerm
+  };
+}
+var EMPTY_SET = /* @__PURE__ */ new Set();
+var DEFAULT_ANALYSIS_PROFILE = normalizeAnalysisConfig(null);
+var DEFAULT_ANALYZER = createMultiAnalyzer(DEFAULT_ANALYSIS_PROFILE);
+
+// src/authority_lexicon.js
+var UNWEIGHTED_SURFACE_BONUS = 2 ** 32;
+
+// src/directory.js
+var DEFAULT_DIRECTORY_PAGE_BYTES = 64 * 1024;
+var textEncoder3 = new TextEncoder();
+
+// src/segment_codec.js
+var SEGMENT_TERMS_MAGIC = Uint8Array.from([82, 70, 83, 71, 84, 69, 82, 49]);
+var textDecoder3 = new TextDecoder();
+
+// src/shards.js
+var RANGE_MERGE_GAP_BYTES = 8 * 1024;
+
+// src/http_ranges.js
+var latin1Decoder = new TextDecoder("iso-8859-1");
+
+// src/runtime.js
+var GEO_TEXT_NEAREST_MIN_TRAVERSAL_BYTES = 1 << 20;
+var textDecoder4 = new TextDecoder();
+function suggestionHydrationContext(count) {
+  return { hasTextTerms: false, preferDocPages: count > 1 ? "force" : false };
+}
+
 // src/integrations/osm/query.js
 var LOCALITY_CONNECTORS = /* @__PURE__ */ new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
 var LOCALITY_CACHE = /* @__PURE__ */ new WeakMap();
@@ -3047,8 +4871,8 @@ function foldedTextWithOffsets(value) {
   const ends = [];
   let offset = 0;
   for (const character of String(value || "")) {
-    const folded = fold(character);
-    for (const unit of folded) {
+    const folded2 = fold(character);
+    for (const unit of folded2) {
       text += unit;
       starts.push(offset);
       ends.push(offset + character.length);
@@ -3074,7 +4898,8 @@ function structuredSuggestion(item, input) {
   const mainText = item.type === "category-locality" ? String(item.category || text).replaceAll("_", " ") : comma > 0 ? text.slice(0, comma).trim() : text;
   const secondaryText = item.type === "category-locality" ? String(item.locality || "") : comma > 0 ? text.slice(comma + 1).trim() : "";
   const kind = item.type || "place";
-  const entityDoc = kind === "place" && item.doc != null && Number(item.count) === 1 && (item.shards == null || item.shards.length === 1) ? { index: item.doc, ...item.shards?.length === 1 ? { shard: item.shards[0] } : {} } : null;
+  const entityShard = item.docShard || (item.shards?.length === 1 ? item.shards[0] : null);
+  const entityDoc = kind === "place" && item.doc != null && Number(item.count) === 1 && (item.docShard || item.shards == null || item.shards.length === 1) ? { index: item.doc, ...entityShard ? { shard: entityShard } : {} } : null;
   return {
     ...item,
     description: text,
@@ -3123,6 +4948,44 @@ function structuredSuggestions(response, input) {
     suggestions: (response.suggestions || []).map((item) => structuredSuggestion(item, input))
   };
 }
+async function hydrateOsmSuggestions(engine, suggestions) {
+  if (typeof engine?.hydrateRows !== "function") return;
+  const groupKey = (item) => JSON.stringify([item.docShard ?? null, item.generation ?? null]);
+  const groups = /* @__PURE__ */ new Map();
+  for (const item of suggestions || []) {
+    if (item.doc == null) continue;
+    const key = groupKey(item);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        context: {
+          ...item.docShard ? { shard: item.docShard } : {},
+          ...item.generation != null ? { generation: item.generation } : {}
+        },
+        slots: /* @__PURE__ */ new Map()
+      });
+    }
+    groups.get(key).slots.set(item.doc, null);
+  }
+  if (!groups.size) return;
+  await Promise.all([...groups.values()].map(async ({ context, slots }) => {
+    const ordinals = [...slots.keys()];
+    try {
+      const results = await engine.hydrateRows(
+        ordinals.map((ordinal2) => [ordinal2, 0]),
+        { ...suggestionHydrationContext(ordinals.length), ...context }
+      );
+      ordinals.forEach((ordinal2, index) => {
+        if (results[index]) slots.set(ordinal2, results[index]);
+      });
+    } catch {
+    }
+  }));
+  for (const item of suggestions || []) {
+    if (item.doc == null) continue;
+    const hit = groups.get(groupKey(item)).slots.get(item.doc);
+    if (hit) item.result = hit;
+  }
+}
 async function suggestOsmQuery(engine, rawParams = {}) {
   const { inputOffset: rawInputOffset, ...rawEngineParams } = rawParams;
   const originalQ = String(rawParams.q || "");
@@ -3130,6 +4993,8 @@ async function suggestOsmQuery(engine, rawParams = {}) {
   const inputOffset = Number.isFinite(parsedOffset) ? Math.max(0, Math.min(originalQ.length, Math.floor(parsedOffset))) : originalQ.length;
   const input = originalQ.slice(0, inputOffset);
   const params = { ...engineParams(rawEngineParams), q: input };
+  const hydrateRequested = params.hydrate === true;
+  delete params.hydrate;
   const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
   const anchor = nearAnchor(rawParams) || viewportAnchor(rawParams.geo?.box);
   const coverage = anchor && params.shards == null ? anchorCoverageShards(engine, anchor) : [];
@@ -3143,7 +5008,7 @@ async function suggestOsmQuery(engine, rawParams = {}) {
       ...coverage.length ? { shards: coverage } : {},
       size: Math.max(32, requestedSize)
     });
-    const suggestions = (localityResponse.suggestions || []).map((item) => ({
+    const suggestions = (localityResponse.suggestions || []).map(({ doc, docs, docShard, generation, result, results, ...item }) => ({
       ...item,
       text: intent.order === "locality-category" ? `${item.text} ${intent.category.label}` : `${intent.category.label} ${item.text}`,
       type: "category-locality",
@@ -3169,7 +5034,7 @@ async function suggestOsmQuery(engine, rawParams = {}) {
     size: hasHouseNumber(params.q) ? requestedSize : Math.max(32, requestedSize)
   });
   const collapsed = collapseStreetSuggestions(response, { ...params, size: requestedSize });
-  return structuredSuggestions(coverage.length ? {
+  const structured = structuredSuggestions(coverage.length ? {
     ...collapsed,
     q: originalQ,
     inputOffset,
@@ -3178,6 +5043,8 @@ async function suggestOsmQuery(engine, rawParams = {}) {
       osmSuggestCoverageShards: coverage
     }
   } : { ...collapsed, q: originalQ, inputOffset }, input);
+  if (hydrateRequested) await hydrateOsmSuggestions(engine, structured.suggestions);
+  return structured;
 }
 function collapseCivicDuplicates(response) {
   const results = response.results || [];
@@ -4774,6 +6641,7 @@ export {
   evaluateOsmConstraints,
   fold,
   geometryForWay,
+  hydrateOsmSuggestions,
   interpolationRangeDocs,
   lookupCategory,
   lookupCategoryFuzzy,

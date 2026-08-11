@@ -95,6 +95,24 @@ supports click-to-reverse-geocode through **Pick map**, distinguishes exact,
 interpolated, and approximate locations, and progressively displays the compact
 OSM `details` fields as rebuilt shards publish them.
 
+### Exporting a query trace
+
+The **Query X-Ray** panel can export what it is showing: *Copy trace JSON*
+puts it on the clipboard, *Download* writes
+`rangefind-trace-<query>-<timestamp>.json`. The bundle is self-contained —
+the query text and its resolved params (map anchor, area box, shard scope),
+the index it ran against, the response summary, the runtime's full `stats`
+(planner and geo lanes, shard routing, and the `trace` spans the bars are
+drawn from), a per-request waterfall from the browser's resource timings, and
+the client's user agent and viewport. That makes a slow or wrong query
+reproducible from a bug report alone, without a screenshot.
+
+Cross-origin resource timings only expose sizes and status when the host
+sends `Timing-Allow-Origin`; when it does not, those fields are null and the
+export says so — `stats.trace` still carries the runtime's own byte
+accounting. The anchor is your map center (or device location when you
+granted it), so review a trace before attaching it to a public issue.
+
 ## Directions (static routing)
 
 The map client includes a Directions mode backed by the rfroutegraph-v1

@@ -8,7 +8,10 @@ import { normalizeAddressAuthorityKey } from "./address.js";
 export const AUTHORITY_FORMAT = "rfauth-v2";
 // Root-level suggest routing artifact for sharded indexes (the block lives
 // in the sharded root manifest as `suggest_routing`; see suggest_routing.js).
-export const SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v1";
+// v2 artifacts add per-suggestion doc provenance ([shard ordinal, doc] of the
+// winning row) on top of the v1 shard-ordinal rows; readers accept both.
+export const SUGGEST_ROUTING_FORMAT = "rfsuggestroute-v2";
+export const SUGGEST_ROUTING_COMPAT_FORMATS = ["rfsuggestroute-v1", "rfsuggestroute-v2"];
 const AUTHORITY_VERSION = 2;
 const AUTHORITY_LEGACY_VERSION = 1;
 // Version 3 is written only by root-level suggest routing artifacts
@@ -20,6 +23,15 @@ const AUTHORITY_ORDINAL_ROWS_VERSION = 3;
 // keep their best [doc, score] rows so a selected suggestion can hydrate its
 // document directly instead of re-running the query as a search.
 const AUTHORITY_DOC_ROWS_VERSION = 4;
+// Version 5 is version 3 plus doc provenance: after the ordinal rows each
+// autocomplete entry may name the winning row's [shard ordinal, doc index],
+// so a root-routed suggestion can hydrate its document from the owning shard
+// without re-running the query as a search.
+const AUTHORITY_ORDINAL_DOC_ROWS_VERSION = 5;
+// Default cap for per-shard doc rows kept on an autocomplete entry: enough to
+// preview the top documents behind an ambiguous suggestion, still a few
+// varints per surface.
+const DEFAULT_AUTOCOMPLETE_DOC_ROWS = 3;
 const SURFACE_PREFIX = "r|";
 const EXACT_PREFIX = "x|";
 const TOKEN_PREFIX = "t|";
@@ -141,16 +153,22 @@ function compareRows(left, right) {
 export function buildAuthorityShard(entries, options = {}) {
   const maxRows = Math.max(1, Math.floor(Number(options.maxRows || 16)));
   const ordinalRows = options.ordinalRows === true;
+  // Ordinal-row artifacts optionally stamp doc provenance (version 5): each
+  // autocomplete entry names the winning row's [shard ordinal, doc index],
+  // taken from the entry's meta ({ doc, docOrdinal }).
+  const docProvenance = ordinalRows && options.docProvenance === true;
   const docRows = !ordinalRows && options.docRows === true;
-  // A suggestion only resolves directly to a document when it is unambiguous,
-  // so autocomplete entries keep just their best row(s) — the byte cost stays
-  // a few varints per surface.
+  // Autocomplete entries keep just their best row(s) — enough to hydrate the
+  // top documents behind a suggestion while the byte cost stays a few varints
+  // per surface.
   const maxAutocompleteRows = docRows
-    ? Math.max(1, Math.floor(Number(options.maxAutocompleteRows || 1)))
+    ? Math.max(1, Math.floor(Number(options.maxAutocompleteRows || DEFAULT_AUTOCOMPLETE_DOC_ROWS)))
     : maxRows;
   const out = new AuthorityByteWriter();
   for (const byte of AUTHORITY_SHARD_MAGIC) out.push(byte);
-  pushVarint(out, ordinalRows ? AUTHORITY_ORDINAL_ROWS_VERSION : docRows ? AUTHORITY_DOC_ROWS_VERSION : AUTHORITY_VERSION);
+  pushVarint(out, ordinalRows
+    ? (docProvenance ? AUTHORITY_ORDINAL_DOC_ROWS_VERSION : AUTHORITY_ORDINAL_ROWS_VERSION)
+    : docRows ? AUTHORITY_DOC_ROWS_VERSION : AUTHORITY_VERSION);
   pushVarint(out, entries.length);
   let previous = "";
   for (const [key, rows, meta] of entries) {
@@ -177,6 +195,14 @@ export function buildAuthorityShard(entries, options = {}) {
           pushVarint(out, score);
         }
       }
+      if (docProvenance) {
+        // [shard ordinal + 1, doc] of the winning row; zero means "no
+        // unambiguous owner" (cross-shard rank tie or a shard without doc
+        // rows), matching the query-time fan-out merge semantics.
+        const hasDoc = meta?.doc != null && meta?.docOrdinal != null;
+        pushVarint(out, hasDoc ? Math.floor(Number(meta.docOrdinal)) + 1 : 0);
+        if (hasDoc) pushVarint(out, Math.floor(Number(meta.doc)));
+      }
       previous = key;
       continue;
     }
@@ -196,10 +222,12 @@ export function parseAuthorityShard(buffer) {
   const state = { pos: AUTHORITY_SHARD_MAGIC.length };
   const version = readVarint(bytes, state);
   if (version !== AUTHORITY_VERSION && version !== AUTHORITY_LEGACY_VERSION
-    && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION) {
+    && version !== AUTHORITY_ORDINAL_ROWS_VERSION && version !== AUTHORITY_DOC_ROWS_VERSION
+    && version !== AUTHORITY_ORDINAL_DOC_ROWS_VERSION) {
     throw new Error(`Unsupported Rangefind authority shard version ${version}`);
   }
-  const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION;
+  const ordinalRows = version === AUTHORITY_ORDINAL_ROWS_VERSION || version === AUTHORITY_ORDINAL_DOC_ROWS_VERSION;
+  const docProvenance = version === AUTHORITY_ORDINAL_DOC_ROWS_VERSION;
   const docRows = version === AUTHORITY_DOC_ROWS_VERSION;
   const count = readVarint(bytes, state);
   const entries = new Map();
@@ -217,13 +245,19 @@ export function parseAuthorityShard(buffer) {
         rows = new Array(rowCount);
         for (let j = 0; j < rowCount; j++) rows[j] = [readVarint(bytes, state), readVarint(bytes, state)];
       }
+      let provenance = null;
+      if (docProvenance) {
+        const ordinalPlusOne = readVarint(bytes, state);
+        if (ordinalPlusOne > 0) provenance = { docOrdinal: ordinalPlusOne - 1, doc: readVarint(bytes, state) };
+      }
       entries.set(key, {
         total,
         complete: true,
         rows,
         autocompleteWeight,
         ...(ordinalRows ? { ordinalRows: true } : {}),
-        ...(docRows ? { docRows: true } : {})
+        ...(docRows ? { docRows: true } : {}),
+        ...(provenance ?? {})
       });
       previous = key;
       continue;

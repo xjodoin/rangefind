@@ -12,6 +12,7 @@ import {
   evaluateOsmConstraints,
   parseOsmConstraints
 } from "./constraints.js";
+import { suggestionHydrationContext } from "../../runtime.js";
 export { decodePolyline } from "../../geo_route.js";
 
 const LOCALITY_CONNECTORS = new Set(["a", "around", "dans", "de", "du", "in", "near", "pres"]);
@@ -1466,14 +1467,17 @@ function structuredSuggestion(item, input) {
     : comma > 0 ? text.slice(comma + 1).trim() : "";
   const kind = item.type || "place";
   // An entity suggestion — one specific place, unambiguously backed by a
-  // single document in a single shard — carries a direct doc reference so
-  // selection can hydrate the place instead of re-running a search. Streets,
-  // category compositions, and shared surfaces (count > 1) stay query-only.
+  // single document — carries a direct doc reference so selection can
+  // hydrate the place instead of re-running a search. The owning shard comes
+  // from `docShard` (root suggest-routing v2 and fan-out merges both stamp
+  // it) or from a single-shard provenance list. Streets, category
+  // compositions, and shared surfaces (count > 1) stay query-only.
+  const entityShard = item.docShard || (item.shards?.length === 1 ? item.shards[0] : null);
   const entityDoc = kind === "place"
     && item.doc != null
     && Number(item.count) === 1
-    && (item.shards == null || item.shards.length === 1)
-    ? { index: item.doc, ...(item.shards?.length === 1 ? { shard: item.shards[0] } : {}) }
+    && (item.docShard || item.shards == null || item.shards.length === 1)
+    ? { index: item.doc, ...(entityShard ? { shard: entityShard } : {}) }
     : null;
   return {
     ...item,
@@ -1532,6 +1536,61 @@ function structuredSuggestions(response, input) {
   };
 }
 
+/**
+ * Resolve suggestions' best documents into real hits (`result`) — at most one
+ * document per suggestion, so an 8-row dropdown costs at most 8 hydrations
+ * even though `suggestOsmQuery` overfetched 32 candidates (which is why
+ * `hydrate` never flows into the inner `engine.suggest` calls). Batched per
+ * owning (shard, generation); advisory and fail-open.
+ *
+ * Exported so callers can hydrate a *subset* on demand. That is the cheaper
+ * pattern on large indexes with rich display payloads: hydrating one document
+ * is two small range reads (~0.4 KB measured on a 339k-document OSM index),
+ * while hydrating eight scattered ones must touch eight distinct doc pages
+ * (~4 MB there, since each page carries ~1 MB of payload). Previewing only
+ * the focused row keeps per-keystroke cost flat; `suggestOsmQuery({ hydrate:
+ * true })` bulk-hydrates everything and suits small to medium indexes.
+ */
+export async function hydrateOsmSuggestions(engine, suggestions) {
+  if (typeof engine?.hydrateRows !== "function") return;
+  const groupKey = item => JSON.stringify([item.docShard ?? null, item.generation ?? null]);
+  const groups = new Map();
+  for (const item of suggestions || []) {
+    if (item.doc == null) continue;
+    const key = groupKey(item);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        context: {
+          ...(item.docShard ? { shard: item.docShard } : {}),
+          ...(item.generation != null ? { generation: item.generation } : {})
+        },
+        slots: new Map()
+      });
+    }
+    groups.get(key).slots.set(item.doc, null);
+  }
+  if (!groups.size) return;
+  await Promise.all([...groups.values()].map(async ({ context, slots }) => {
+    const ordinals = [...slots.keys()];
+    try {
+      const results = await engine.hydrateRows(
+        ordinals.map(ordinal => [ordinal, 0]),
+        { ...suggestionHydrationContext(ordinals.length), ...context }
+      );
+      ordinals.forEach((ordinal, index) => {
+        if (results[index]) slots.set(ordinal, results[index]);
+      });
+    } catch {
+      // A failed group keeps its text suggestions.
+    }
+  }));
+  for (const item of suggestions || []) {
+    if (item.doc == null) continue;
+    const hit = groups.get(groupKey(item)).slots.get(item.doc);
+    if (hit) item.result = hit;
+  }
+}
+
 export async function suggestOsmQuery(engine, rawParams = {}) {
   const { inputOffset: rawInputOffset, ...rawEngineParams } = rawParams;
   const originalQ = String(rawParams.q || "");
@@ -1541,6 +1600,10 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
     : originalQ.length;
   const input = originalQ.slice(0, inputOffset);
   const params = { ...engineParams(rawEngineParams), q: input };
+  // Hydration happens after collapsing and slicing (hydrateOsmSuggestions),
+  // never inside the engine's overfetched suggest.
+  const hydrateRequested = params.hydrate === true;
+  delete params.hydrate;
   const requestedSize = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
   const anchor = nearAnchor(rawParams) || viewportAnchor(rawParams.geo?.box);
   const coverage = anchor && params.shards == null ? anchorCoverageShards(engine, anchor) : [];
@@ -1555,7 +1618,11 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
       size: Math.max(32, requestedSize)
     });
     const suggestions = (localityResponse.suggestions || [])
-      .map(item => ({
+      // The locality's doc provenance (doc/docs/docShard/generation and any
+      // hydrated result) describes the locality document, not the composed
+      // "category in locality" query — it must not travel onto the relabeled
+      // suggestion.
+      .map(({ doc, docs, docShard, generation, result, results, ...item }) => ({
         ...item,
         text: intent.order === "locality-category"
           ? `${item.text} ${intent.category.label}`
@@ -1584,7 +1651,7 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
     size: hasHouseNumber(params.q) ? requestedSize : Math.max(32, requestedSize)
   });
   const collapsed = collapseStreetSuggestions(response, { ...params, size: requestedSize });
-  return structuredSuggestions(coverage.length ? {
+  const structured = structuredSuggestions(coverage.length ? {
     ...collapsed,
     q: originalQ,
     inputOffset,
@@ -1593,6 +1660,8 @@ export async function suggestOsmQuery(engine, rawParams = {}) {
       osmSuggestCoverageShards: coverage
     }
   } : { ...collapsed, q: originalQ, inputOffset }, input);
+  if (hydrateRequested) await hydrateOsmSuggestions(engine, structured.suggestions);
+  return structured;
 }
 
 function collapseCivicDuplicates(response) {

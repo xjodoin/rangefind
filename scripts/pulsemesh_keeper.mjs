@@ -4,7 +4,7 @@
 // add availability, never authority: their records carry the same proofs
 // and get the same trust treatment as anyone's.
 //
-//   node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<route-graph dir>
+//   node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<dir|https://…>
 //        [--listen=/ip4/0.0.0.0/tcp/4001] [--zones=x/y,x/y] [--store-cap=1048576]
 //        [--bootstrap=<multiaddr>,...] [--stats-seconds=30]
 //        [--seed-card] [--seed-label="Depot seed"]
@@ -51,6 +51,7 @@ import { ADMIT_CONNECTED, BRIDGE_POLICIES, createFleetBridge } from "../src/puls
 import { THREAD_MAX_BOOTSTRAP_ADDRESSES, THREAD_MAX_BOOTSTRAP_BYTES } from "../src/pulsemesh/thread_codec.js";
 import { encodeSeedCard, isDialableAddress, seedCardUrl } from "../src/pulsemesh/thread_seed.js";
 import { encodeQr, qrTerminal } from "../src/qr.js";
+import { datasetEpoch } from "../src/pulsemesh/dataset_epoch.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -66,11 +67,25 @@ function fail(message) {
 
 const USAGE = `pulsemesh-keeper — a headless PulseMesh peer (§12), optionally a fleet's own seed (§12.1)
 
-  node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<route-graph dir> [options]
+  node scripts/pulsemesh_keeper.mjs --epoch=<64 hex> --graph=<dir|https://…> [options]
 
 Required
-  --epoch=<64 hex>        the route graph's sourceHash; must match --graph
-  --graph=<dir>           the static route graph this keeper validates against
+  --epoch=<64 hex>        the route graph's sourceHash; must match --graph. Pins
+                          one exact build — right when you serve a graph you
+                          will not change under a running job.
+  --dataset=<region/prof> name the epoch by dataset instead — "quebec/car".
+                          Hashed to the same 64-hex shape, stable across
+                          rebuilds, and what a graph tracking a published index
+                          needs: a sourceHash changes when one driveway does,
+                          and renaming the topic strands every issued ticket.
+                          Must be the same string the apps use.
+  --graph=<dir|url>       the static route graph this keeper validates against.
+                          A directory, or an http(s) base URL of a published
+                          graph — a keeper reads only the root, so serving it
+                          over byte ranges costs two requests at startup and
+                          saves mirroring a region. A URL makes the graph a
+                          startup dependency; keep a directory if that is not
+                          acceptable.
   --test-world            harness substitute for --graph: a synthetic 64-leaf world
 
 Identity
@@ -135,8 +150,38 @@ if (args.help || args.h) {
   process.exit(0);
 }
 
-const epochHex = String(args.epoch || "");
-if (!/^[0-9a-f]{64}$/.test(epochHex)) fail("--epoch must be the route graph's 64-hex sourceHash");
+// The epoch is the topic namespace (§4.2), so it is what decides whether
+// this keeper and a fleet's phones are on the same mesh at all. Two ways
+// to name it, and they answer different questions:
+//
+//   --epoch    the graph's own sourceHash: "is this the same map", down
+//              to the driveway. Right for an operator serving a build
+//              they pinned and will not change under a running job.
+//
+//   --dataset  a region and profile — `quebec/car` — hashed into the same
+//              64-hex shape. Right for a graph tracking a public index,
+//              because a sourceHash is a hash over node coordinates, edge
+//              topology and weights: one new driveway changes it, and a
+//              weekly Geofabrik rebuild would rename every running job's
+//              channel and strand every ticket already issued.
+//
+// A dataset epoch is a promise rather than a proof — nothing here can
+// check that a given graph really is a build of `quebec/car`, only that
+// it opens. That is the same promise every other party on the run makes,
+// and the alternative is a topic namespace that changes when a road does.
+//
+// Derivation shared with the ingest node — see src/pulsemesh/dataset_epoch.js
+// for why the namespace must match the product's byte for byte.
+if (args.epoch && args.dataset) {
+  fail("--epoch and --dataset both name the epoch; pass one. --dataset is the stable "
+    + "one and the right choice for a graph tracking a published index.");
+}
+
+const datasetId = args.dataset ? String(args.dataset).trim().toLowerCase() : null;
+const epochHex = datasetId ? await datasetEpoch(datasetId) : String(args.epoch || "");
+if (!/^[0-9a-f]{64}$/.test(epochHex)) {
+  fail("name the epoch with --epoch=<64 hex sourceHash> or --dataset=<region/profile>");
+}
 
 // --- Static world: leaf -> z15 cell -------------------------------------
 
@@ -151,10 +196,59 @@ if (args["test-world"]) {
     : null);
   defaultZones = [zoneOfDetailCell(BASE)];
 } else if (args.graph) {
-  const { openRouteGraphDir } = await import("../src/route_graph_node.js");
-  const engine = await openRouteGraphDir(String(args.graph));
-  if (engine.root.sourceHash !== epochHex) {
-    fail(`graph epoch ${engine.root.sourceHash.slice(0, 16)}… does not match --epoch ${epochHex.slice(0, 16)}…`);
+  // A directory or a URL. The engine is byte ranges over static files, so
+  // a published graph is already reachable the way the apps read it —
+  // requiring a local copy would mean mirroring a region's worth of
+  // immutable objects to run the one thing that never queries them.
+  //
+  // A keeper reads `root` and stops: leaf bounding boxes, to place a
+  // record in a cell and to derive the zone set it pins. That is two
+  // requests at startup against an immutable, cacheable path, which is
+  // why serving it over HTTP costs nothing here even though it would be
+  // the wrong choice for a router answering live queries.
+  //
+  // The cost this does carry, stated plainly: the graph becomes a startup
+  // network dependency. A keeper restarting while its host is unreachable
+  // will not come up, where one with a local copy would. `Restart=always`
+  // turns that into a retry rather than an outage, and the seed is a
+  // single point of failure for joining only — but a fleet that cannot
+  // tolerate even that should keep a local directory.
+  const graphSource = String(args.graph);
+  const remote = /^https?:\/\//iu.test(graphSource);
+  let engine;
+  try {
+    engine = remote
+      ? await (await import("../src/route_graph_query.js")).openRouteGraphUrl(graphSource)
+      : await (await import("../src/route_graph_node.js")).openRouteGraphDir(graphSource);
+  } catch (error) {
+    // A mistyped region and an unreachable host both arrive here, and a
+    // stack trace from inside the codec names neither. This is the first
+    // thing an operator sees when a keeper will not start, so it should
+    // say which of the two it was.
+    const reason = error?.message ?? String(error);
+    fail([
+      `cannot open the route graph at ${graphSource}: ${reason}`,
+      remote
+        ? "  A 404 usually means the region or profile is not published under that path;"
+        : "  Check the path exists and contains a manifest.json;",
+      remote
+        ? "  browse the catalog at <origin>/routes/catalog.json to see what is."
+        : "  a graph is build output, published rather than committed.",
+      "  An unsupported root version instead means the graph and this rangefind",
+      "  were built by different releases — republish the graph, or pin the engine."
+    ].join("\n"));
+  }
+  // Only --epoch asserts "this exact build". A dataset epoch deliberately
+  // matches every build of its region, which is the whole reason to use
+  // one, so there is nothing to compare here — the graph still has to
+  // open, and that is what was actually checked above.
+  if (!datasetId && engine.root.sourceHash !== epochHex) {
+    fail(`graph epoch ${engine.root.sourceHash.slice(0, 16)}… does not match --epoch ${epochHex.slice(0, 16)}… (${graphSource})`);
+  }
+  if (datasetId) {
+    console.error(`pulsemesh-keeper: epoch ${epochHex.slice(0, 16)}… from dataset ${datasetId}`
+      + ` (this graph's own sourceHash is ${engine.root.sourceHash.slice(0, 16)}…, which is`
+      + " expected to differ and will change on every rebuild).");
   }
   cellOf = record => {
     const bbox = engine.root.leaves[record.leafCell]?.bbox;

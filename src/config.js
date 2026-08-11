@@ -41,6 +41,9 @@ export const DEFAULTS = {
   suggestMaxTokenKeys: 4,
   suggestMinKeyLength: 1,
   suggestHotListSize: 64,
+  // Best [doc, score] rows kept per autocomplete surface — the documents a
+  // suggestion can hydrate/preview without re-running the query as a search.
+  suggestMaxDocRows: 3,
   vectorPackBytes: 4 * 1024 * 1024,
   vectorTrainSample: 20000,
   vectorKmeansIterations: 6,

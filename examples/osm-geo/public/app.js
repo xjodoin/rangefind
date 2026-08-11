@@ -1,6 +1,7 @@
 import { createSearch } from "./runtime.browser.js";
 import {
   decodePolyline,
+  hydrateOsmSuggestions,
   matchPointToRoute,
   prepareRoute,
   resolveOsmSuggestion,
@@ -45,6 +46,9 @@ const queryReceipt = document.querySelector("#queryReceipt");
 const queryReceiptSummary = document.querySelector("#queryReceiptSummary");
 const queryReceiptRoute = document.querySelector("#queryReceiptRoute");
 const queryReceiptBars = document.querySelector("#queryReceiptBars");
+const queryTraceCopy = document.querySelector("#queryTraceCopy");
+const queryTraceDownload = document.querySelector("#queryTraceDownload");
+const queryTraceFeedback = document.querySelector("#queryTraceFeedback");
 const placeLens = document.querySelector("#placeLens");
 const placeLensEyebrow = document.querySelector("#placeLensEyebrow");
 const placeLensTitle = document.querySelector("#placeLensTitle");
@@ -426,6 +430,11 @@ function setStatus(text, state = "ready") {
   searchButton.dataset.state = state;
 }
 
+// The exportable trace of the query currently shown in the X-Ray. Captured on
+// render so the export buttons never have to re-run anything.
+let lastQueryTrace = null;
+let queryTraceStartedAt = 0;
+
 function beginQueryReceipt() {
   queryReceipt.hidden = false;
   queryReceipt.open = false;
@@ -433,14 +442,164 @@ function beginQueryReceipt() {
   queryReceiptSummary.textContent = "Tracing byte ranges…";
   queryReceiptRoute.textContent = "Following the request from this browser into the static index.";
   queryReceiptBars.replaceChildren();
+  // Resource timings are sliced from here, so the export's waterfall covers
+  // this query rather than the whole session.
+  queryTraceStartedAt = performance.now();
+  setQueryTrace(null);
 }
 
-function renderQueryReceipt(response, shown) {
+function setQueryTrace(payload) {
+  lastQueryTrace = payload;
+  const disabled = !payload;
+  queryTraceCopy.disabled = disabled;
+  queryTraceDownload.disabled = disabled;
+  queryTraceFeedback.textContent = "";
+  queryTraceFeedback.removeAttribute("data-state");
+}
+
+// Per-request waterfall for the export. Cross-origin entries only expose
+// sizes and status when the host sends Timing-Allow-Origin, so the fields are
+// reported as-is and a note explains zeros rather than inventing numbers.
+function queryTraceNetwork(indexBase) {
+  if (typeof performance?.getEntriesByType !== "function") return null;
+  const limit = 600;
+  const entries = performance.getEntriesByType("resource")
+    .filter(entry => entry.startTime >= queryTraceStartedAt && String(entry.name).startsWith(indexBase))
+    .map(entry => ({
+      path: String(entry.name).slice(indexBase.length),
+      startMs: Math.round(entry.startTime - queryTraceStartedAt),
+      durationMs: Math.round(entry.duration),
+      transferBytes: entry.transferSize ?? null,
+      encodedBytes: entry.encodedBodySize ?? null,
+      status: entry.responseStatus ?? null,
+      protocol: entry.nextHopProtocol || null
+    }));
+  const timingVisible = entries.some(entry => entry.transferBytes > 0 || entry.status != null);
+  return {
+    requests: entries.length,
+    truncated: entries.length > limit,
+    ...(timingVisible ? {} : {
+      note: "Sizes/status are 0 or null because the index host does not send Timing-Allow-Origin to this page; stats.trace carries the runtime's own byte accounting."
+    }),
+    entries: entries.slice(0, limit)
+  };
+}
+
+// A self-contained diagnostic bundle: everything needed to reproduce and
+// explain the query without the reporter's screen.
+function buildQueryTracePayload(response, shown, context = {}) {
+  const anchor = context.anchor || null;
+  const center = map.getCenter();
+  return {
+    tool: "rangefind-osm-demo",
+    exportedAt: new Date().toISOString(),
+    query: {
+      text: context.query ?? queryInput.value.trim(),
+      kind: context.kind || "search",
+      near: anchor ? { lat: anchor.lat, lon: anchor.lon, source: anchor.source } : null,
+      limitToMapArea: Boolean(context.areaBox),
+      geoBox: context.areaBox || null,
+      scopedShards: context.shards || null,
+      params: context.params || null
+    },
+    mapView: {
+      center: { lat: Number(center.lat.toFixed(5)), lon: Number(center.lng.toFixed(5)) },
+      zoom: Number(map.getZoom().toFixed(2))
+    },
+    index: {
+      baseUrl: OSM_INDEX_BASE_URL,
+      total: engine?.manifest?.total ?? null,
+      shards: engine?.shards?.length ?? engine?.manifest?.shards?.length ?? null,
+      builtAt: engine?.manifest?.built_at ?? null,
+      engineVersion: engine?.manifest?.version ?? null
+    },
+    response: {
+      total: response.total ?? null,
+      shown,
+      approximate: response.approximate ?? null,
+      resolvedQuery: response.resolvedQuery ?? null,
+      correctedQuery: response.correctedQuery ?? null,
+      elapsedMs: context.elapsedMs ?? null,
+      firstResult: response.results?.[0]
+        ? { name: response.results[0].name || response.results[0].title || null, type: response.results[0].type || null }
+        : null
+    },
+    // The runtime's own accounting: planner/geo lanes, shard routing, and the
+    // per-bucket fetch spans the X-Ray bars are drawn from.
+    stats: response.stats || null,
+    network: queryTraceNetwork(OSM_INDEX_BASE_URL),
+    client: {
+      userAgent: navigator.userAgent,
+      hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+      viewport: { width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1 }
+    }
+  };
+}
+
+function queryTraceFilename(payload) {
+  const slug = String(payload.query.text || "viewport")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-|-$/gu, "")
+    .slice(0, 40) || "query";
+  return `rangefind-trace-${slug}-${payload.exportedAt.replace(/[:.]/gu, "-")}.json`;
+}
+
+function flashQueryTraceFeedback(message, state = "") {
+  queryTraceFeedback.textContent = message;
+  if (state) queryTraceFeedback.dataset.state = state;
+  else queryTraceFeedback.removeAttribute("data-state");
+  clearTimeout(flashQueryTraceFeedback.timer);
+  flashQueryTraceFeedback.timer = setTimeout(() => {
+    queryTraceFeedback.textContent = "";
+    queryTraceFeedback.removeAttribute("data-state");
+  }, 2600);
+}
+
+queryTraceCopy.addEventListener("click", async () => {
+  if (!lastQueryTrace) return;
+  const json = JSON.stringify(lastQueryTrace, null, 2);
+  try {
+    await navigator.clipboard.writeText(json);
+    flashQueryTraceFeedback("Copied");
+  } catch {
+    // Clipboard access needs a secure context and permission; fall back to a
+    // selection-based copy before telling the user it failed.
+    const area = document.createElement("textarea");
+    area.value = json;
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position:fixed;top:0;left:0;opacity:0;";
+    document.body.append(area);
+    area.select();
+    const copied = document.execCommand?.("copy");
+    area.remove();
+    if (copied) flashQueryTraceFeedback("Copied");
+    else flashQueryTraceFeedback("Copy blocked — use Download", "error");
+  }
+});
+
+queryTraceDownload.addEventListener("click", () => {
+  if (!lastQueryTrace) return;
+  const blob = new Blob([JSON.stringify(lastQueryTrace, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = queryTraceFilename(lastQueryTrace);
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  flashQueryTraceFeedback("Downloaded");
+});
+
+function renderQueryReceipt(response, shown, context = {}) {
   const trace = response.stats?.trace;
   if (!trace) {
     queryReceipt.hidden = true;
+    setQueryTrace(null);
     return;
   }
+  setQueryTrace(buildQueryTracePayload(response, shown, context));
   const fetchSpans = (trace?.spans || []).filter(span => span.name.endsWith(".fetch") && span.count > 0);
   const queried = Number(response.stats?.shardsQueried || 1);
   const available = Number(response.stats?.shards || engine.shards?.length || 1);
@@ -488,6 +647,7 @@ function interruptQueryReceipt() {
   if (queryReceipt.hidden) return;
   queryReceipt.dataset.state = "error";
   queryReceiptSummary.textContent = "Trace interrupted";
+  setQueryTrace(null);
 }
 
 function showEmpty(title, copy) {
@@ -904,7 +1064,15 @@ async function runSearch({ fit = false } = {}) {
     setStatus(response.total
       ? `Showing ${formatNumber(shown)} of ${formatNumber(response.total)}${response.approximate ? "+" : ""} matches · ${timing}${directText}${nearText}${modeText}${plannerText}`
       : `No matches · ${timing}${directText}${nearText}${modeText}${plannerText}`);
-    renderQueryReceipt(response, shown);
+    renderQueryReceipt(response, shown, {
+      query: q,
+      kind: "search",
+      anchor,
+      areaBox,
+      shards: hintedShards?.length ? hintedShards : null,
+      params,
+      elapsedMs: ms
+    });
     const scopeText = useArea
       ? "this map area"
       : anchoredQueryActive
@@ -934,6 +1102,7 @@ function hideSuggestions() {
   suggestList.replaceChildren();
   visibleSuggestions = [];
   activeSuggestion = -1;
+  clearSuggestionPreviews();
   queryInput.setAttribute("aria-expanded", "false");
   queryInput.removeAttribute("aria-activedescendant");
 }
@@ -951,6 +1120,78 @@ function setActiveSuggestion(index) {
       option.scrollIntoView({ block: "nearest" });
     }
   }
+  setActiveSuggestionPreview(activeSuggestion);
+}
+
+let suggestionPreviewMarkers = new Map();
+let suggestionPreviewToken = 0;
+
+function clearSuggestionPreviews() {
+  suggestionPreviewToken++;
+  for (const marker of suggestionPreviewMarkers.values()) marker.remove();
+  suggestionPreviewMarkers.clear();
+}
+
+function setActiveSuggestionPreview(index) {
+  for (const [markerIndex, marker] of suggestionPreviewMarkers) {
+    marker.getElement().classList.toggle("active", markerIndex === index);
+  }
+  previewSuggestion(index);
+}
+
+// Hydrating a suggestion's document is two small range reads, so the dropdown
+// previews the row the user is actually considering — a pin where it is, plus
+// the distance from the search anchor — instead of paying for every row's
+// document on every keystroke. Pins accumulate as the user arrows through and
+// clear with the dropdown.
+async function previewSuggestion(index) {
+  const item = visibleSuggestions[index];
+  if (!item || item.doc == null || suggestionPreviewMarkers.has(index)) return;
+  const token = suggestionPreviewToken;
+  if (!item.result) {
+    try {
+      await hydrateOsmSuggestions(engine, [item]);
+    } catch {
+      return; // Advisory: a preview that cannot load simply does not appear.
+    }
+  }
+  if (token !== suggestionPreviewToken) return;
+  const place = item.result;
+  if (!place || !Number.isFinite(place.lat) || !Number.isFinite(place.lon)) return;
+  const element = document.createElement("span");
+  element.className = "suggestion-preview-marker active";
+  element.dataset.kind = item.kind || "place";
+  element.setAttribute("aria-hidden", "true");
+  suggestionPreviewMarkers.set(index, new maplibregl.Marker({ element, anchor: "center" })
+    .setLngLat([place.lon, place.lat])
+    .addTo(map));
+  setActiveSuggestionPreview(index);
+  annotateSuggestionDistance(index, item);
+}
+
+// A hydrated preview knows where it is: annotate its row with the distance
+// from the search anchor once the document arrives.
+function annotateSuggestionDistance(index, item) {
+  const option = suggestList.querySelector(`#suggestion-${index}`);
+  const count = option?.querySelector(".count");
+  const anchor = searchAnchor();
+  const place = item.result;
+  if (!count || !anchor || !place || !Number.isFinite(place.lat) || !Number.isFinite(place.lon)) return;
+  const distance = formatDistance(haversineMeters(anchor, { lat: place.lat, lon: place.lon }));
+  if (!distance) return;
+  const base = count.dataset.baseLabel || count.textContent;
+  count.dataset.baseLabel = base;
+  count.textContent = base === "place" ? distance : `${base} · ${distance}`;
+  option.setAttribute("aria-label", `${item.description || item.text}, ${count.textContent}`);
+}
+
+function haversineMeters(a, b) {
+  const rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad;
+  const dLon = (b.lon - a.lon) * rad;
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.sqrt(Math.min(1, h)));
 }
 
 function chooseSuggestion(suggestion) {
@@ -998,7 +1239,13 @@ async function runEntitySelection(item, query) {
     renderResults(response.results, { fit: true, query });
     const ms = Math.round(performance.now() - started);
     setStatus(`Showing 1 of 1 matches · ${(ms / 1000).toFixed(1)}s · ${PLANNER_LABELS.get("osmSuggestEntity")}`);
-    renderQueryReceipt(response, 1);
+    renderQueryReceipt(response, 1, {
+      query,
+      kind: "suggestion-entity",
+      anchor: searchAnchor(),
+      params: { selection: item.selection || null },
+      elapsedMs: ms
+    });
     openPlaceLens(place);
     mapHudText.textContent = `${place.name || query} · direct from the suggestion`;
   } catch {
@@ -1059,6 +1306,10 @@ async function showSuggestions() {
       q,
       inputOffset: cursor,
       size: 8,
+      // Previews hydrate per focused row (see previewSuggestion), not in bulk:
+      // on a planet-scale index with rich payloads, eight scattered documents
+      // live on eight ~1 MB doc pages, while one document is two ~0.4 KB
+      // reads. Bulk `hydrate: true` is the right call on smaller indexes.
       ...(anchor ? { near: { lat: anchor.lat, lon: anchor.lon } } : {})
     });
     if (token !== suggestToken || suggestionsSuppressed) return;
@@ -1112,6 +1363,7 @@ function renderSuggestions(response) {
   // A peek-height sheet would clip the list; give it room to be tapped.
   if (searchPanel.dataset.snap === "peek") snapSheet("half");
   visibleSuggestions = suggestions;
+  clearSuggestionPreviews();
   suggestList.replaceChildren(...suggestions.map((item, index) => {
     const option = document.createElement("li");
     option.id = `suggestion-${index}`;
@@ -1158,10 +1410,13 @@ function renderSuggestions(response) {
       event.preventDefault();
       chooseSuggestion(item);
     });
+    option.addEventListener("pointerenter", () => setActiveSuggestionPreview(index));
     return option;
   }));
   suggestList.hidden = false;
   queryInput.setAttribute("aria-expanded", "true");
+  // Preview the top row immediately; the rest hydrate as the user moves.
+  previewSuggestion(0);
 }
 
 async function loadIndexStatus() {

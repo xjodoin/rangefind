@@ -168,11 +168,20 @@ federated engine. Nothing changes for callers.
   shard's authority autocomplete lexicon merged into one standard authority
   sidecar at `<root>/authority/` — hot lists make early keystrokes one small
   fetch, longer prefixes cost a directory page plus a partition read, all
-  edge-cacheable. Entry rows store federation shard ordinals (authority
-  codec v3), so `suggestions[].shards` still reports the region(s) whose
-  weight won — the same provenance the fan-out produced — and a selected
-  suggestion can scope its follow-up search. `stats.suggestRouting:
-  "root-authority"` marks the lane; hot-list answers carry no provenance.
+  edge-cacheable. Entry rows store federation shard ordinals plus the
+  winning row's `[shard ordinal, doc]` provenance (authority codec v5,
+  `rfsuggestroute-v2`), so `suggestions[].shards` still reports the
+  region(s) whose weight won — the same provenance the fan-out produced —
+  and an unambiguous suggestion additionally carries `doc` + `docShard`,
+  letting selection hydrate the document straight from the owning shard
+  (`hydrateRows` or `suggest({ hydrate: true })`) instead of re-searching.
+  `stats.suggestRouting: "root-authority"` marks the lane; hot lists carry
+  the same doc provenance (hot codec v3). Selecting a suggestion therefore
+  costs two small range reads against one shard instead of a scoped search.
+  Note that *previewing* suggestions (`hydrate: true`) is a different
+  trade-off at this scale: each preview needs its document's page, which on a
+  rich-payload planet index is ~1 MB, so preview the focused row rather than
+  every row — see the [autocomplete guide](autocomplete.md#choosing-a-pattern).
   The root artifact also powers `engine.authorityLookup(surface)`: an
   exact-surface lexicon lookup that returns each matching display with its
   weight and home shards. The OSM integration resolves locality names

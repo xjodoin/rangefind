@@ -56,6 +56,11 @@ export class RangefindSearchElement extends HTMLElement {
     this._debounceTimer = 0;
     this._built = false;
     this._destroyed = false;
+    // Memoized search responses keyed by query text. Serves two jobs: a
+    // suggestion accepted from the dropdown re-renders instantly (its search
+    // was already speculatively fetched when the suggestion appeared), and
+    // retyping a recent query costs nothing.
+    this._searchCache = new Map();
     // Bound handlers so add/removeEventListener pair up in disconnectedCallback.
     this._onInput = this._onInput.bind(this);
     this._onKeydown = this._onKeydown.bind(this);
@@ -82,6 +87,8 @@ export class RangefindSearchElement extends HTMLElement {
 
   set searchOptions(value) {
     this._searchOptions = value && typeof value === "object" ? value : {};
+    // Cached responses were computed with the previous params.
+    this._searchCache.clear();
   }
 
   // --- Lifecycle ------------------------------------------------------------
@@ -197,6 +204,8 @@ export class RangefindSearchElement extends HTMLElement {
     this._input.placeholder = this._config.placeholder;
     this._input.setAttribute("aria-label", this._config.label);
     this._list.setAttribute("aria-label", this._config.label);
+    // Config (page size, highlighting, source) shapes search params.
+    this._searchCache.clear();
   }
 
   _applyClasses() {
@@ -290,11 +299,19 @@ export class RangefindSearchElement extends HTMLElement {
     this._runSuggest(query, token);
   }
 
-  async _runSearch(query, token) {
-    const engine = await this._ensureEngine();
-    if (token !== this._token) return;
-    if (!engine) return; // error state already shown by _ensureEngine
-    try {
+  // Search response for `query`, memoized. The promise (not the response) is
+  // cached so concurrent callers — the live keystroke and a speculative
+  // prefetch — coalesce into one request; failed fetches evict themselves so
+  // a later retry is real.
+  _searchResponse(query, engine) {
+    const cached = this._searchCache.get(query);
+    if (cached) {
+      // Refresh recency (Map preserves insertion order).
+      this._searchCache.delete(query);
+      this._searchCache.set(query, cached);
+      return cached;
+    }
+    const promise = (async () => {
       let params = {
         q: query,
         page: 1,
@@ -306,9 +323,23 @@ export class RangefindSearchElement extends HTMLElement {
       // embed it for hybrid semantic search and set `params.vector`.
       if (typeof this._searchOptions.transform === "function") {
         params = (await this._searchOptions.transform(params)) || params;
-        if (token !== this._token) return; // superseded while transforming
       }
-      const response = await engine.search(params);
+      return engine.search(params);
+    })();
+    promise.catch(() => {
+      if (this._searchCache.get(query) === promise) this._searchCache.delete(query);
+    });
+    this._searchCache.set(query, promise);
+    while (this._searchCache.size > 16) this._searchCache.delete(this._searchCache.keys().next().value);
+    return promise;
+  }
+
+  async _runSearch(query, token) {
+    const engine = await this._ensureEngine();
+    if (token !== this._token) return;
+    if (!engine) return; // error state already shown by _ensureEngine
+    try {
+      const response = await this._searchResponse(query, engine);
       if (token !== this._token) return;
       this._renderResults(query, response);
       this._emit("rangefind:search", { query, response });
@@ -327,9 +358,18 @@ export class RangefindSearchElement extends HTMLElement {
     const engine = await this._ensureEngine();
     if (token !== this._token || !engine || typeof engine.suggest !== "function") return;
     try {
-      const response = await engine.suggest({ q: query, size: 6 });
+      // hydrate: true resolves each suggestion's documents into real search
+      // hits (older runtimes/indexes simply ignore it), so the dropdown can
+      // show the same titles/urls the results list will.
+      const response = await engine.suggest({ q: query, size: 6, hydrate: true });
       if (token !== this._token) return;
-      this._renderSuggestions(response?.suggestions || []);
+      const suggestions = response?.suggestions || [];
+      this._renderSuggestions(suggestions);
+      // Speculatively warm the search for the top completion: accepting it
+      // (Enter/click) then renders from cache instead of paying the full
+      // query on the critical path.
+      const top = suggestions.find(item => typeof item?.text === "string" && item.text.trim() && item.text.trim() !== query);
+      if (top) this._searchResponse(top.text.trim(), engine).catch(() => {});
     } catch {
       // The index may lack a sidecar even when asked; fail quietly.
       this._renderSuggestions([]);
@@ -416,13 +456,33 @@ export class RangefindSearchElement extends HTMLElement {
     for (const item of items) {
       const text = String(item?.text ?? "");
       if (!text) continue;
+      // A suggestion that unambiguously resolves to one document renders as
+      // that document — the same card the results list shows — and activating
+      // it navigates straight to the page, no follow-up search.
+      const result = item?.result;
+      if (result && Number(item.count) === 1 && safeHref(result.url)) {
+        this._suggest.append(this._buildResultOption(result, ctx));
+        continue;
+      }
       const li = document.createElement("li");
       li.className = partClass("suggestItem", ctx);
       li.setAttribute("role", "option");
       li.setAttribute("aria-selected", "false");
       li.dataset.rfKind = "suggest";
       li.dataset.rfText = text;
-      li.textContent = text;
+      const textEl = document.createElement("span");
+      textEl.className = partClass("suggestText", ctx);
+      textEl.textContent = text;
+      li.append(textEl);
+      // The suggestion's result-set size, so a completion visibly *is* a
+      // query with a known outcome instead of a bare string.
+      const count = Number(item?.count);
+      if (Number.isFinite(count) && count > 1) {
+        const countEl = document.createElement("span");
+        countEl.className = partClass("suggestCount", ctx);
+        countEl.textContent = count.toLocaleString();
+        li.append(countEl);
+      }
       // mousedown (not click) so the input never loses focus first.
       li.addEventListener("mousedown", event => {
         event.preventDefault();

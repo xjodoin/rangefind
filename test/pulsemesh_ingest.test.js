@@ -372,6 +372,13 @@ test("a frozen camera feed is refused, not analyzed into an empty road", async (
     id: "frozen",
     intervalSeconds: 60,
     cameras: [{ id: "cam", lat: 0, lon: 0, bearingDeg: 0 }],
+    // Opt out of the revisit scheduler. This test is about what happens
+    // to a repeated frame, not about when the next request falls due:
+    // under the default 900 s gap the second and third polls would never
+    // be made, and it would pass or fail on pacing rather than on the
+    // thing it is named for. Pacing has its own tests.
+    minRevisitSeconds: 0,
+    hostMinIntervalMillis: 0,
     fetchImage: async () => ({ base64: "c3RhbGUtZnJhbWU=", mediaType: "image/jpeg" }),
     analyze: async () => {
       analyzed++;

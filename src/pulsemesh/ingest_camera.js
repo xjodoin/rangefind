@@ -51,11 +51,30 @@ export const CONGESTION_RATIO = Object.freeze({
   stopped: 0.08
 });
 
+/**
+ * A fetch that failed with a status the scheduler should react to.
+ *
+ * Carrying the code matters: "this host is pushing me away" (429, 403,
+ * 5xx) and "that one image is gone" (404) call for opposite responses,
+ * and a bare Error makes them look the same. The first should widen the
+ * gap between requests to the whole host; the second should retire one
+ * camera and leave the rest alone.
+ */
+export class CameraFetchError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "CameraFetchError";
+    this.status = status;
+  }
+}
+
 async function defaultFetchImage(camera) {
   const response = await fetch(camera.imageUrl, {
     signal: AbortSignal.timeout(camera.timeoutMillis ?? 15000)
   });
-  if (!response.ok) throw new Error(`${camera.imageUrl}: HTTP ${response.status}`);
+  if (!response.ok) {
+    throw new CameraFetchError(`${camera.imageUrl}: HTTP ${response.status}`, response.status);
+  }
   const mediaType = (response.headers.get("content-type") || "image/jpeg").split(";")[0].trim();
   const bytes = new Uint8Array(await response.arrayBuffer());
   let binary = "";
@@ -119,16 +138,58 @@ export function createCameraTrafficSource({
   maxCameras = 12,
   concurrency = 3,
   minConfidence = 0.5,
-  onResult = null
+  onResult = null,
+  // How long before a camera already looked at is worth another request.
+  // This, not `intervalSeconds`, is what sets the load a feed sees: the
+  // tick decides how often the budget is spent, this decides how widely.
+  minRevisitSeconds = 900,
+  // A frozen feed can never produce an observation, so it earns the
+  // longest ordinary gap rather than the same one as a working camera.
+  frozenRevisitMultiplier = 6,
+  // Dark, fogged, pointed at a car park: not broken, just not answering
+  // today.
+  quietRevisitMultiplier = 3,
+  // The ceiling on backoff after refusals. An hour is long enough to
+  // stop looking like a scraper and short enough to recover the same day.
+  maxBackoffSeconds = 3600,
+  // Minimum gap between two requests to the same host. Concurrency is
+  // per-pool, so without this the workers arrive as a burst.
+  hostMinIntervalMillis = 1500,
+  // How long a camera stays "interesting" after showing a queue.
+  congestedBoostSeconds = 1800,
+  /**
+   * Where the demand is, as `[{ minLat, minLon, maxLat, maxLon }, …]` —
+   * a function, because it changes between ticks.
+   *
+   * This is what makes the source answer a question instead of surveying
+   * a province. A region has hundreds of cameras and a budget of a
+   * handful; without a focus the budget is spread evenly over roads
+   * nobody asked about, and the one corridor somebody is actually
+   * driving gets a camera every few hours. Hand it the corridors being
+   * asked for and the same budget lands where an answer can still change
+   * a route.
+   *
+   * Cameras inside a focus box are taken first; the rest of the budget
+   * falls through to ordinary rotation, so a quiet mesh still covers the
+   * map and a busy one concentrates. Returning nothing means "no demand
+   * signal", which is exactly the fallback.
+   */
+  focus = null
 } = {}) {
   if (typeof analyze !== "function") throw new Error("A camera source needs an analyze() function.");
   if (!cameras) throw new Error("A camera source needs cameras.");
 
   const stats = {
     frames: 0, fetchFailed: 0, analyzeFailed: 0,
-    unusable: 0, lowConfidence: 0, frozen: 0, undirected: 0, observations: 0
+    unusable: 0, lowConfidence: 0, frozen: 0, undirected: 0, observations: 0,
+    // Scheduler visibility. `blocked` is the one to watch: it counts 429
+    // and 403 specifically, so a feed that has started refusing us is
+    // legible in the stats line instead of hiding inside fetchFailed.
+    eligible: 0, skippedCooling: 0, refused: 0, blocked: 0, focusBoxes: 0, inFocus: 0
   };
   const lastFrameHash = new Map(); // camera id -> sha256 hex of last frame
+  // camera id -> { nextEligibleMillis, failures, lastCongestedMillis, lastVisitedMillis }
+  const schedule = new Map();
 
   /** True once a view says which way it is looking (see `cameras` above). */
   function stated(view) {
@@ -156,25 +217,30 @@ export function createCameraTrafficSource({
     }));
   }
 
+  // Returns `{ observations, outcome, status }` rather than a bare list.
+  // The scheduler decides when to come back on the strength of WHY a poll
+  // produced nothing, and "frozen", "refused" and "unusable" call for
+  // three different answers — collapsing them into an empty array is what
+  // made every camera look identical and get re-fetched at the same rate.
   async function pollCamera(camera, nowMillis) {
     const views = viewsOf(camera).filter(view => {
       if (stated(view)) return true;
       stats.undirected++;
       return false;
     });
-    if (!views.length) return [];
+    if (!views.length) return { observations: [], outcome: "undirected" };
 
     stats.frames++;
     let image;
     try {
       image = await fetchImage(camera);
-    } catch {
+    } catch (error) {
       stats.fetchFailed++;
-      return [];
+      return { observations: [], outcome: "refused", status: error?.status };
     }
     if (!image?.base64) {
       stats.fetchFailed++;
-      return [];
+      return { observations: [], outcome: "refused" };
     }
     // A byte-identical frame across polls is a FROZEN feed — an offline
     // camera serving its cached last picture (found in the wild: the
@@ -186,7 +252,7 @@ export function createCameraTrafficSource({
     const key = camera?.id ?? "camera";
     if (lastFrameHash.get(key) === hash) {
       stats.frozen++;
-      return [];
+      return { observations: [], outcome: "frozen" };
     }
     lastFrameHash.set(key, hash);
 
@@ -196,7 +262,14 @@ export function createCameraTrafficSource({
       const observation = await analyzeView(view, image, nowMillis);
       if (observation) observations.push(observation);
     }
-    return observations;
+    return {
+      observations,
+      outcome: observations.length ? "observed" : "unusable",
+      // Congestion is the whole reason to look at a camera. One that just
+      // reported a queue is worth returning to sooner than one that has
+      // reported an empty road for hours.
+      congested: observations.some(o => Number(o.congestionRatio) <= CONGESTION_RATIO.slow)
+    };
   }
 
   async function analyzeView(view, image, nowMillis) {
@@ -244,17 +317,148 @@ export function createCameraTrafficSource({
     };
   }
 
+  /** Per-host pacing, so a whole feed is never asked faster than this. */
+  const hostNextFreeMillis = new Map();
+
+  function hostOf(camera) {
+    try {
+      return new URL(camera.imageUrl).host;
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Waits out this host's minimum gap and claims the next slot.
+   *
+   * Concurrency is per-pool, not per-host, so without this three workers
+   * hitting one image server arrive together — which is what a rate
+   * limiter sees as a burst regardless of how modest the average is.
+   */
+  async function claimHostSlot(host, nowMillis) {
+    if (!host || hostMinIntervalMillis <= 0) return;
+    const readyAt = Math.max(nowMillis, hostNextFreeMillis.get(host) ?? 0);
+    hostNextFreeMillis.set(host, readyAt + hostMinIntervalMillis);
+    const wait = readyAt - nowMillis;
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+  }
+
+  function stateOf(camera) {
+    const key = camera?.id ?? "camera";
+    let state = schedule.get(key);
+    if (!state) {
+      state = { nextEligibleMillis: 0, failures: 0, lastCongestedMillis: 0, lastVisitedMillis: 0, unusableStreak: 0 };
+      schedule.set(key, state);
+    }
+    return state;
+  }
+
+  /** Seconds to wait before this camera is worth another request. */
+  function revisitSeconds(outcome, status, state) {
+    if (outcome === "refused") {
+      // Back off hardest on the codes that mean "stop asking": 429 and
+      // 403 are a decision about us, not an accident. Doubling per
+      // consecutive failure turns a block into a retreat instead of a
+      // tighter loop, which is how a polite client stays unblocked.
+      const rejected = status === 429 || status === 403 || (status >= 500 && status < 600);
+      const base = minRevisitSeconds * (rejected ? 4 : 1);
+      return Math.min(maxBackoffSeconds, base * 2 ** Math.min(state.failures, 6));
+    }
+    // A frozen feed is an offline camera serving yesterday's picture. It
+    // costs a request every time and can never produce an observation,
+    // so it earns the longest ordinary gap.
+    if (outcome === "frozen") return minRevisitSeconds * frozenRevisitMultiplier;
+    // One unusable frame is not evidence of a useless camera, and
+    // demoting on the first is actively wrong for a differencing
+    // analyzer: its FIRST frame of any camera is unusable by
+    // construction, because that frame is what establishes the
+    // background to difference against. Backing off there means the
+    // second frame never arrives and the camera can never start working
+    // — it would look like a dead feed while being a perfectly good one.
+    // Two in a row is a camera that is genuinely dark, fogged or aimed
+    // at a car park.
+    if (outcome === "unusable") {
+      return state.unusableStreak > 1 ? minRevisitSeconds * quietRevisitMultiplier : minRevisitSeconds;
+    }
+    return minRevisitSeconds;
+  }
+
   async function fetch_({ nowMillis }) {
     const list = (typeof cameras === "function" ? await cameras() : cameras) || [];
-    const wanted = list.slice(0, maxCameras);
+
+    // Lazy in the sense the TomTom backfill is lazy: the budget is spent
+    // where it can still change something, rather than on the first N
+    // entries of a list.
+    //
+    // The old selection was `list.slice(0, maxCameras)`, which asked the
+    // same handful every tick for as long as the process lived. On a
+    // 675-camera feed that is the worst of both: 667 cameras never seen,
+    // and eight image URLs fetched on a metronome from one address —
+    // which is precisely the shape a rate limiter blocks, and it had no
+    // way to notice it had been blocked.
+    // Where the demand is this tick, if anything is asking.
+    let boxes = [];
+    if (typeof focus === "function") {
+      try {
+        boxes = (await focus()) || [];
+      } catch {
+        // A focus that throws must not take the survey down with it.
+        boxes = [];
+      }
+    }
+    const inFocus = camera => boxes.some(b =>
+      camera.lat >= b.minLat && camera.lat <= b.maxLat
+      && camera.lon >= b.minLon && camera.lon <= b.maxLon);
+
+    const eligible = [];
+    for (const camera of list) {
+      const state = stateOf(camera);
+      if (state.nextEligibleMillis > nowMillis) continue;
+      eligible.push({ camera, state, focused: boxes.length > 0 && inFocus(camera) });
+    }
+    stats.focusBoxes = boxes.length;
+    stats.inFocus = eligible.filter(e => e.focused).length;
+
+    // Oldest first, but a camera that recently showed a queue jumps the
+    // line: congestion is the only thing here worth spending a request
+    // on, and it moves on a scale of minutes.
+    eligible.sort((a, b) => {
+      // Asked-about first. A camera on a corridor somebody is driving can
+      // change a route now; one on an empty road three regions away
+      // cannot, however long it has been since anyone looked.
+      if (a.focused !== b.focused) return a.focused ? -1 : 1;
+      const recentA = nowMillis - a.state.lastCongestedMillis < congestedBoostSeconds * 1000 ? 1 : 0;
+      const recentB = nowMillis - b.state.lastCongestedMillis < congestedBoostSeconds * 1000 ? 1 : 0;
+      if (recentA !== recentB) return recentB - recentA;
+      return a.state.lastVisitedMillis - b.state.lastVisitedMillis;
+    });
+
+    const wanted = eligible.slice(0, maxCameras);
+    stats.eligible = eligible.length;
+    stats.skippedCooling = list.length - eligible.length;
+
     const observations = [];
     // A bounded worker pool: one stuck frame must not serialize the rest,
     // and an analyzer billed per call must not be hit with a thundering herd.
     let next = 0;
     const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
       while (next < wanted.length) {
-        const camera = wanted[next++];
-        observations.push(...await pollCamera(camera, nowMillis));
+        const { camera, state } = wanted[next++];
+        await claimHostSlot(hostOf(camera), Date.now());
+        const result = await pollCamera(camera, nowMillis);
+        state.lastVisitedMillis = nowMillis;
+        state.unusableStreak = result.outcome === "unusable" ? state.unusableStreak + 1 : 0;
+        if (result.outcome === "refused") {
+          state.failures++;
+          stats.refused++;
+          if (result.status === 429 || result.status === 403) stats.blocked++;
+        } else {
+          state.failures = 0;
+        }
+        if (result.congested) state.lastCongestedMillis = nowMillis;
+        state.nextEligibleMillis =
+          nowMillis + revisitSeconds(result.outcome, result.status, state) * 1000;
+        observations.push(...result.observations);
       }
     });
     await Promise.all(workers);

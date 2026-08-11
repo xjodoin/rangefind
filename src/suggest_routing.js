@@ -43,8 +43,12 @@ import { partitionEntries, shardKey } from "./shards.js";
 // direct physical-authority pointers, avoiding any corpus-sized routing root.
 
 export { SUGGEST_ROUTING_FORMAT } from "./authority_codec.js";
-const SUGGEST_ROUTING_VERSION = 1;
-const SUGGEST_SET_FORMAT = "rfsuggestset-v1";
+const SUGGEST_ROUTING_VERSION = 2;
+// v2 suggest sets append the entry's best doc ordinal (offset by one, zero
+// meaning "none") so root routing can stamp doc provenance; v1 sets are still
+// readable and simply contribute no docs.
+const SUGGEST_SET_FORMAT = "rfsuggestset-v2";
+const SUGGEST_SET_COMPAT_FORMATS = new Set(["rfsuggestset-v1", SUGGEST_SET_FORMAT]);
 const DEFAULT_PACK_TARGET_BYTES = 8 * 1024 * 1024;
 const DEFAULT_SUGGEST_SET_CHUNK_BYTES = 8 * 1024 * 1024;
 // Root partitions group at depth 4 ("s|" plus two characters) instead of the
@@ -79,10 +83,11 @@ function autocompleteWeightedOf(manifest) {
   return (manifest.authority?.autocomplete?.fields || []).some(field => field.weightPath);
 }
 
-// Yields `{ key, weight, count }` for every autocomplete lexicon entry of one
-// built generation, in code-unit key order. Authority directory pages and the
-// partitions inside them are written key sorted, so sequential iteration is a
-// globally sorted stream.
+// Yields `{ key, weight, count, doc }` for every autocomplete lexicon entry
+// of one built generation, in code-unit key order (`doc` is the best doc row
+// of a v4 shard, or null). Authority directory pages and the partitions
+// inside them are written key sorted, so sequential iteration is a globally
+// sorted stream.
 function* generationSuggestEntries(genDir, genManifest) {
   const directory = genManifest.authority?.directory;
   if (!directory?.root) return;
@@ -109,7 +114,12 @@ function* generationSuggestEntries(genDir, genManifest) {
         const parsed = parseAuthorityShard(gunzipSync(compressed));
         for (const [key, data] of parsed.entries) {
           if (!isAutocompleteKey(key)) continue;
-          yield { key, weight: data.autocompleteWeight || data.total || 0, count: data.total || 1 };
+          yield {
+            key,
+            weight: data.autocompleteWeight || data.total || 0,
+            count: data.total || 1,
+            doc: data.docRows && data.rows?.length ? data.rows[0][0] : null
+          };
         }
       }
     }
@@ -121,6 +131,9 @@ function* generationSuggestEntries(genDir, genManifest) {
 // Sorted autocomplete entries of a built shard directory (single or
 // generational). Generations can repeat a key; duplicates merge with the
 // same semantics as the federated fan-out (max weight, summed count).
+// Multi-generational shards contribute no doc: a doc ordinal is only
+// meaningful inside its own generation, and the root artifact has no
+// generation column — selection falls back to shard-scoped search there.
 function* indexSuggestEntries(dir) {
   const manifest = manifestAt(dir, "manifest.min.json");
   const generations = generationsOf(dir, manifest);
@@ -155,14 +168,15 @@ function* indexSuggestEntries(dir) {
         advance(head);
       }
     }
-    yield { key: min, weight, count };
+    yield { key: min, weight, count, doc: null };
   }
 }
 
-// Suggest-set sidecar ("rfsuggestset-v1"): one shard's sorted autocomplete
-// lexicon as a gzipped JSONL stream — header line, then [key, weight, count]
-// rows. Pipelines that reclaim shard artifacts after upload keep this small
-// file so the routing merge never needs the full shard on disk.
+// Suggest-set sidecar ("rfsuggestset-v2"): one shard's sorted autocomplete
+// lexicon as a gzipped JSONL stream — header line, then
+// [key, weight, count, doc + 1] rows (0 meaning "no doc"). Pipelines that
+// reclaim shard artifacts after upload keep this small file so the routing
+// merge never needs the full shard on disk.
 export function writeShardSuggestSet({ dir, outFile, chunkTargetBytes = DEFAULT_SUGGEST_SET_CHUNK_BYTES }) {
   const manifest = manifestAt(resolve(dir), "manifest.min.json");
   const generations = generationsOf(resolve(dir), manifest);
@@ -195,7 +209,7 @@ export function writeShardSuggestSet({ dir, outFile, chunkTargetBytes = DEFAULT_
     fd = openSync(temporary, "wx");
     appendLine(JSON.stringify({ format: SUGGEST_SET_FORMAT, weighted }));
     for (const item of indexSuggestEntries(resolve(dir))) {
-      appendLine(JSON.stringify([item.key, item.weight, item.count]));
+      appendLine(JSON.stringify([item.key, item.weight, item.count, item.doc == null ? 0 : item.doc + 1]));
       keys++;
     }
     flush();
@@ -490,7 +504,7 @@ async function writeGzipContentAddressed({
 function parseSuggestSetHeader(line, file) {
   if (line === undefined) throw new Error(`Invalid empty Rangefind suggest set ${file}.`);
   const header = JSON.parse(line);
-  if (header.format !== SUGGEST_SET_FORMAT) throw new Error(`Unsupported Rangefind suggest set ${file} (${header.format}).`);
+  if (!SUGGEST_SET_COMPAT_FORMATS.has(header.format)) throw new Error(`Unsupported Rangefind suggest set ${file} (${header.format}).`);
   return { weighted: header.weighted === true };
 }
 
@@ -513,16 +527,24 @@ async function* suggestSetEntries(file) {
       continue;
     }
     if (line === "") continue;
-    const [key, weight, count] = JSON.parse(line);
-    yield { key: String(key), weight: Number(weight) || 0, count: Number(count) || 1 };
+    const [key, weight, count, docPlusOne] = JSON.parse(line);
+    yield {
+      key: String(key),
+      weight: Number(weight) || 0,
+      count: Number(count) || 1,
+      doc: Number(docPlusOne) > 0 ? Number(docPlusOne) - 1 : null
+    };
   }
   if (first) parseSuggestSetHeader(undefined, file);
 }
 
-// K-way heap merge over per-shard sorted `{ key, weight, count }` streams.
-// Emits each unique key once with the merged rows `[ordinal, weight]`,
-// summed count, and max weight — the same aggregation the federated
-// suggest fan-out applies at query time.
+// K-way heap merge over per-shard sorted `{ key, weight, count, doc }`
+// streams. Emits each unique key once with the merged rows
+// `[ordinal, weight]`, summed count, and max weight — the same aggregation
+// the federated suggest fan-out applies at query time. Doc provenance follows
+// the fan-out's selection rule too: the winning-weight shard's doc travels as
+// `{ doc, docOrdinal }`, and a cross-shard rank tie clears it (ambiguous
+// owner).
 async function* mergeShardSuggestStreams(streams) {
   const heads = streams.map((stream, index) => ({
     stream: stream[Symbol.asyncIterator]?.() || stream[Symbol.iterator]?.(),
@@ -591,15 +613,33 @@ async function* mergeShardSuggestStreams(streams) {
       while (heap.length && heap[0].item.key === key) matched.push(pop());
       const rows = [];
       let count = 0;
+      let maxWeight = -1;
+      let winnerDoc = null;
+      let winnerOrdinal = null;
+      let tied = false;
       for (const head of matched) {
-        rows.push([head.index, Math.max(0, Math.floor(Number(head.item.weight) || 0))]);
+        const weight = Math.max(0, Math.floor(Number(head.item.weight) || 0));
+        rows.push([head.index, weight]);
         count += head.item.count;
+        if (weight > maxWeight) {
+          maxWeight = weight;
+          winnerDoc = head.item.doc ?? null;
+          winnerOrdinal = head.index;
+          tied = false;
+        } else if (weight === maxWeight) {
+          tied = true;
+        }
         await advance(head);
       }
       for (const head of matched) {
         if (!head.done) push(head);
       }
-      yield { key, rows, count };
+      yield {
+        key,
+        rows,
+        count,
+        ...(tied || winnerDoc == null ? {} : { doc: winnerDoc, docOrdinal: winnerOrdinal })
+      };
     }
   } finally {
     await Promise.allSettled(heads.map(head => head.done ? undefined : head.stream.return?.()));
@@ -690,7 +730,7 @@ export async function writeSuggestRoutingIndex({
   function flushGroup(group) {
     if (!group.length) return;
     for (const partition of partitionEntries(group, shardConfig)) {
-      const buffer = buildAuthorityShard(partition.entries, { maxRows: maxRowsPerKey, ordinalRows: true });
+      const buffer = buildAuthorityShard(partition.entries, { maxRows: maxRowsPerKey, ordinalRows: true, docProvenance: true });
       const entry = writePackedShard(packWriter, partition.name, gzipSync(buffer, { level: 9 }), {
         kind: "authority-shard",
         codec: AUTHORITY_FORMAT,
@@ -725,7 +765,12 @@ export async function writeSuggestRoutingIndex({
       const base = shardKey(merged.key, baseShardDepth);
       if (groupKey !== null && base !== groupKey) flushGroup(group);
       groupKey = base;
-      const entry = [merged.key, merged.rows, { total: merged.count }];
+      const entry = [merged.key, merged.rows, {
+        total: merged.count,
+        // Doc provenance of the winning row (v5 shard layout): lets a
+        // root-routed suggestion hydrate its document from the owning shard.
+        ...(merged.doc != null ? { doc: merged.doc, docOrdinal: merged.docOrdinal } : {})
+      }];
       // partitionEntries and the hot merge both want the summary item; rank it
       // once here with the artifact-wide weighting mode.
       let weight = 0;
@@ -736,7 +781,10 @@ export async function writeSuggestRoutingIndex({
         display: parsed.display,
         weight: weight || merged.rows.length,
         count: merged.count,
-        full: suggestKey(parsed.display) === parsed.normalized
+        full: suggestKey(parsed.display) === parsed.normalized,
+        ...(merged.doc != null
+          ? { doc: merged.doc, docs: [{ doc: merged.doc, score: weight, ordinal: merged.docOrdinal }] }
+          : {})
       };
       item.rank = autocompleteRank(item, weighted);
       entry.rank = item.rank;

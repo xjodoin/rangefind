@@ -1,6 +1,6 @@
 import { expandedTermsFromBaseTerms, proximityTerm, queryBundleKeysFromBaseTerms } from "./terms.js";
 import { analyzerFromManifest } from "./analysis.js";
-import { authorityAddressRangeKey, authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard, SUGGEST_ROUTING_FORMAT } from "./authority_codec.js";
+import { authorityAddressRangeKey, authorityKeysForQuery, authorityNormalizeSurface, parseAuthorityShard, SUGGEST_ROUTING_COMPAT_FORMATS } from "./authority_codec.js";
 import { decodePostingBlock, decodePostingBytes, decodePostings, lookupDecodedPostingRows, lookupPostingBlock, lookupPostingBytes, parseCodes, parseDocValueChunk, parseFacetDictionary, parsePostingSegment } from "./codec.js";
 import { findDirectoryPage, parseDirectoryPage, parseDirectoryRoot } from "./directory.js";
 import { floorDirectoryPageIndex, floorSortedKeyIndex, parseTextRoutingSegment, TEXT_ROUTING_FORMAT } from "./text_routing_codec.js";
@@ -293,6 +293,19 @@ function finalizeRuntimeTrace(trace) {
     totalBytes: spans.reduce((sum, span) => sum + Number(span.bytes || 0), 0),
     spans
   };
+}
+
+// Doc-payload lane for autocomplete documents, which are scattered across the
+// corpus by construction — a prefix matches names everywhere, unlike the
+// clustered hits a text query returns. On the packed lane each document costs
+// a record read from the dense per-document pointer file, and two distant
+// records already merge into ranges spanning most of that file: measured on a
+// 339k-document index, hydrating 2 suggestion documents cost 13.6 MB packed
+// versus 0.43 MB through doc pages, and 16 documents 13.6 MB versus 0.57 MB.
+// A single document has no span to blow up and is cheapest packed (0.4 KB
+// versus 1.8 KB), so the lane is chosen by count.
+export function suggestionHydrationContext(count) {
+  return { hasTextTerms: false, preferDocPages: count > 1 ? "force" : false };
 }
 
 // Injectable gzip inflation: browsers and Node use DecompressionStream, while
@@ -3293,6 +3306,57 @@ export async function createSearch(options = {}) {
     return true;
   }
 
+  // Splits a doc filter plan into the parts safe to verify inline during
+  // streamed scoring (bitmap-covered facets/booleans, non-geo numbers) and
+  // the network-priced geo membership check (disc/box plus its lat/lon range
+  // rewrites), which verifies through scattered doc-value chunks and is
+  // therefore deferred to the collected candidates. With a resolved geo doc
+  // set membership is a free Set lookup, so nothing defers.
+  function splitDeferredGeoFilterPlan(docFilterPlan) {
+    const geo = docFilterPlan?.geo;
+    if (!geo || geo.docSet) return { inline: docFilterPlan, deferred: null };
+    const inlineNumbers = docFilterPlan.numbers.filter(([field]) => field !== geo.latField && field !== geo.lonField);
+    const deferredNumbers = docFilterPlan.numbers.filter(([field]) => field === geo.latField || field === geo.lonField);
+    return {
+      inline: {
+        facets: docFilterPlan.facets,
+        numbers: inlineNumbers,
+        booleans: docFilterPlan.booleans,
+        geo: null,
+        active: docFilterPlan.facets.length > 0 || inlineNumbers.length > 0 || docFilterPlan.booleans.length > 0
+      },
+      deferred: {
+        facets: [],
+        numbers: deferredNumbers,
+        booleans: [],
+        geo,
+        active: true
+      }
+    };
+  }
+
+  // Deferred geo verification for the streamed top-k lanes: candidates were
+  // ranked without the geo membership check, so verify the survivors in one
+  // batched doc-value pass. `shortfall` means verification thinned the
+  // ranked set below the requested window while unseen candidates may still
+  // qualify — the caller must fall back to an exhaustive lane (which, being
+  // conjunction-first, verifies only eligible docs and stays cheap).
+  async function applyDeferredGeoFilter(ranked, deferredFilterPlan, { exhausted, k }) {
+    if (!deferredFilterPlan || !ranked.length) return { ranked, shortfall: false, stats: null };
+    const store = await valueStoreForFilterPlan(deferredFilterPlan, ranked.map(([doc]) => doc));
+    const before = ranked.length;
+    const filtered = ranked.filter(([doc]) => passesFilterPlan(doc, store, deferredFilterPlan));
+    return {
+      ranked: filtered,
+      shortfall: !exhausted && filtered.length < Math.min(k, before),
+      stats: {
+        geoFilterDeferred: true,
+        geoFilterDeferredCandidates: before,
+        geoFilterDeferredAccepted: filtered.length
+      }
+    };
+  }
+
   function blockFacetMatches(summary, selected) {
     if (!selected?.size) return true;
     const words = summary?.words || [];
@@ -6154,6 +6218,7 @@ export async function createSearch(options = {}) {
     hasFilters,
     blockFilterPlan,
     docFilterPlan,
+    deferredFilterPlan = null,
     rerank,
     candidateK,
     minShouldMatch,
@@ -6360,6 +6425,12 @@ export async function createSearch(options = {}) {
     let ranked = exhausted
       ? collectEligibleScores(scores, hits, minShouldMatch)
       : stable || topEligibleScores(scores, hits, minShouldMatch, candidateK).top;
+    const deferred = await applyDeferredGeoFilter(ranked, deferredFilterPlan, { exhausted, k: offset + size });
+    // Verification thinned the proven window below the requested page while
+    // unseen candidates may still qualify: let the caller's exhaustive lanes
+    // answer instead of guessing.
+    if (deferred.shortfall) return null;
+    ranked = deferred.ranked;
     const reranked = rerank === false
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, candidateK);
@@ -6426,6 +6497,7 @@ export async function createSearch(options = {}) {
         docRangeFetchGroups: fetchGroups,
         docRangeWantedBlocks: wantedBlocks,
         filterSummaryProofBlocks,
+        ...(deferred.stats || {}),
         plannerFallbackReason: exhausted ? "range_exhausted" : "",
         ...topKProofStatsObject(proofStats, exhausted ? "range_exhausted" : ""),
         docPayloadLane: resultContext.docPayloadLane,
@@ -6467,8 +6539,18 @@ export async function createSearch(options = {}) {
 
     await ensureFacetDictionaries(filters);
     const blockFilterPlan = hasFilters ? makeBlockFilterPlan(filters) : null;
-    const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const filterFields = filterPlanFields(docFilterPlan);
+    // Block pruning keeps the FULL plan (lat/lon range summaries skip whole
+    // blocks for free), but per-doc verification splits: geo membership
+    // without a resolved doc set reads scattered lat/lon doc-value chunks,
+    // so it is deferred to the collected candidates instead of running on
+    // every posting a common term touches before minShouldMatch can reject
+    // it ("parc lorraine" near Lorraine used to verify the whole "parc"
+    // union — 409 chunk requests for a 16-doc match set).
+    const fullDocFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
+    const { inline: docFilterPlan, deferred: deferredFilterPlan } = fullDocFilterPlan
+      ? splitDeferredGeoFilterPlan(fullDocFilterPlan)
+      : { inline: null, deferred: null };
+    const hasInlineFilters = Boolean(docFilterPlan?.active);
     // Doc values load lazily through valueStoreForFilterPlan: only shards
     // whose blocks actually surface candidates pay the (large) doc-values
     // manifest; bitmap-covered plans never load it at all. On a wide
@@ -6494,9 +6576,10 @@ export async function createSearch(options = {}) {
       baseTerms,
       terms,
       entries,
-      hasFilters,
+      hasFilters: hasInlineFilters,
       blockFilterPlan,
       docFilterPlan,
+      deferredFilterPlan,
       rerank,
       candidateK,
       minShouldMatch,
@@ -6589,7 +6672,7 @@ export async function createSearch(options = {}) {
         conjunctionTailBlocks += wanted.length;
         for (const { rows } of await lookupEntryBlocks(cursor.shard, cursor.entry, wanted, candidateDocs)) {
           if (!rows.length) continue;
-          const codeData = hasFilters
+          const codeData = hasInlineFilters
             ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
             : null;
           blocksDecoded++;
@@ -6637,10 +6720,10 @@ export async function createSearch(options = {}) {
       const batchBlocks = decoded.blocks.map(({ cursor, rows }) => ({
         cursor,
         rows,
-        filterSummaryProvesBlock: hasFilters
+        filterSummaryProvesBlock: hasInlineFilters
           && blockDefinitelyPassesDocFilter(cursor.entry.blocks[cursor.blockIndex], docFilterPlan)
       }));
-      if (hasFilters) {
+      if (hasInlineFilters) {
         await prefetchFilterPlanDocValues(
           docFilterPlan,
           batchBlocks.filter(item => !item.filterSummaryProvesBlock).map(item => postingDocs(item.rows))
@@ -6650,7 +6733,7 @@ export async function createSearch(options = {}) {
         if (filterSummaryProvesBlock) filterSummaryProofBlocks++;
         markSuperblockDecoded(cursor);
         cursor.blockIndex++;
-        const codeData = hasFilters && !filterSummaryProvesBlock
+        const codeData = hasInlineFilters && !filterSummaryProvesBlock
           ? await valueStoreForFilterPlan(docFilterPlan, postingDocs(rows))
           : null;
         blocksDecoded++;
@@ -6673,6 +6756,15 @@ export async function createSearch(options = {}) {
     let ranked = exhausted
       ? collectEligibleScores(scores, hits, minShouldMatch)
       : stable || topEligibleScores(scores, hits, minShouldMatch, k).top;
+    const deferred = await applyDeferredGeoFilter(ranked, deferredFilterPlan, { exhausted, k });
+    if (deferred.shortfall) {
+      // The stability proof covered the unverified candidate set; deferred
+      // verification thinned it below the requested page. The exhaustive
+      // lane verifies only conjunction-eligible docs, so re-answering there
+      // stays cheap and exact.
+      return runFullSearch({ q, page, size, filters, sort, baseTerms, terms, rerank, includeResults, plannerFallbackReason: "filter_deferred_shortfall" });
+    }
+    ranked = deferred.ranked;
     const reranked = rerank === false
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, candidateK);
@@ -6693,6 +6785,7 @@ export async function createSearch(options = {}) {
       stats: {
         exact: exhausted && !budgetExhausted,
         plannerLane: budgetExhausted ? "blockBudget" : exhausted ? "fullFallback" : "tailProof",
+        ...(deferred.stats || {}),
         topKProven: !budgetExhausted && Boolean(stable || exhausted),
         totalExact: exhausted && !budgetExhausted,
         tailExhausted: exhausted,
@@ -6754,20 +6847,20 @@ export async function createSearch(options = {}) {
     }
 
     const decoded = [];
-    const candidateDocs = new Set();
     let postingsDecoded = 0;
     for (const item of entries) {
       const rows = await decodeSegmentEntryPostings(item, segmentSearch.dfs.get(item.term));
       decoded.push({ ...item, rows });
       postingsDecoded += rows.length / 2;
-      for (let i = 0; i < rows.length; i += 2) candidateDocs.add(rows[i]);
     }
 
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
     const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
-    if (hasFilters) codeData = await valueStoreForFilterPlan(docFilterPlan, [...candidateDocs]);
 
+    // Conjunction before filter, exactly as in runFullSearch: term hits are
+    // in-memory, the filter is network-priced doc-value chunks, and the two
+    // predicates commute — so only docs reaching minShouldMatch are verified.
     const scores = new Map();
     const hits = new Map();
     let postingsAccepted = 0;
@@ -6775,7 +6868,6 @@ export async function createSearch(options = {}) {
       const isBase = baseSet.has(term);
       for (let i = 0; i < rows.length; i += 2) {
         const doc = rows[i];
-        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         scores.set(doc, (scores.get(doc) || 0) + rows[i + 1]);
         if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
         postingsAccepted++;
@@ -6783,6 +6875,11 @@ export async function createSearch(options = {}) {
     }
 
     let ranked = collectEligibleScores(scores, hits, minShouldMatch);
+    if (hasFilters) {
+      const filterStore = await valueStoreForFilterPlan(docFilterPlan, ranked.map(([doc]) => doc));
+      ranked = ranked.filter(([doc]) => passesFilterPlan(doc, filterStore, docFilterPlan));
+      if (!codeData) codeData = filterStore;
+    }
     const reranked = rerank === false || sortPlan
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
@@ -6851,31 +6948,33 @@ export async function createSearch(options = {}) {
     const scores = new Map();
     const hits = new Map();
     const docFilterPlan = hasFilters ? makeDocFilterPlan(filters) : null;
-    const filterFields = filterPlanFields(docFilterPlan);
     const fallbackCodeData = sortPlan && !docValues ? await loadCodes() : null;
     let codeData = fallbackCodeData;
 
-    if (hasFilters) {
-      const docs = new Set();
-      for (const { shard, entry } of entries) {
-        const postings = await decodeEntryPostings(shard, entry);
-        for (let i = 0; i < postings.length; i += 2) docs.add(postings[i]);
-      }
-      codeData = await valueStoreForFilterPlan(docFilterPlan, [...docs]);
-    }
-
+    // Term-hit accumulation runs on in-memory postings; the filter runs on
+    // doc-value chunks fetched over the network. Filter ∧ conjunction
+    // commutes, so test the free predicate first: only docs that reach
+    // minShouldMatch are worth a filter verification. Filtering the raw
+    // posting union instead used to fetch a lat/lon chunk for nearly every
+    // doc a common term touches — 11.9 MB / 409 requests for a two-term
+    // near-filtered query whose real match set held 16 documents.
     for (const { term, shard, entry } of entries) {
       const postings = await decodeEntryPostings(shard, entry);
       const isBase = baseSet.has(term);
       for (let i = 0; i < postings.length; i += 2) {
         const doc = postings[i];
-        if (codeData && !passesFilterPlan(doc, codeData, docFilterPlan)) continue;
         scores.set(doc, (scores.get(doc) || 0) + postings[i + 1]);
         if (isBase) hits.set(doc, (hits.get(doc) || 0) + 1);
       }
     }
 
     let ranked = collectEligibleScores(scores, hits, minShouldMatchFor(baseTerms));
+    if (hasFilters) {
+      const eligibleDocs = ranked.map(([doc]) => doc);
+      const filterStore = await valueStoreForFilterPlan(docFilterPlan, eligibleDocs);
+      ranked = ranked.filter(([doc]) => passesFilterPlan(doc, filterStore, docFilterPlan));
+      if (!codeData) codeData = filterStore;
+    }
     const reranked = rerank === false || sortPlan
       ? { ranked, stats: { rerankCandidates: 0, dependencyFeatures: 0, dependencyTermsMatched: 0, dependencyPostingsScanned: 0, dependencyCandidateMatches: 0 } }
       : await rerankWithDependencies(ranked, baseTerms, candidateLimitFor(baseTerms, offset + size, rerank));
@@ -8049,7 +8148,7 @@ export async function createSearch(options = {}) {
     return field.path === "title" ? field : null;
   }
 
-  async function executeLegacyAuthoritySuggest(params, q, prefix, size) {
+  async function executeLegacyAuthoritySuggest(params, q, prefix, size, hydrate = false) {
     const field = authoritySuggestField();
     if (!authorityDirectory || options.authority === false || !field) return null;
     const keyPrefix = `x|${prefix}`;
@@ -8079,14 +8178,18 @@ export async function createSearch(options = {}) {
       if (candidates.length >= size) break;
     }
 
-    const resultContext = { hasTextTerms: false, preferDocPages: false };
+    const resultContext = suggestionHydrationContext(candidates.length);
     const docs = candidates.length
       ? await rowsToResults(candidates.map(item => [item.doc, item.weight]), resultContext)
       : [];
+    // This lane already paid for the hydrated payloads (titles come from
+    // them), so doc references — and, when asked, the full results — are free.
     const suggestions = docs.map((doc, index) => ({
       text: String(doc.title || ""),
       weight: candidates[index].weight,
-      count: candidates[index].count
+      count: candidates[index].count,
+      doc: candidates[index].doc,
+      ...(hydrate ? { result: doc, results: [doc] } : {})
     })).filter(item => item.text).slice(0, size);
     const exact = candidates.length >= size || !range.truncated;
     return {
@@ -8120,8 +8223,10 @@ export async function createSearch(options = {}) {
   // weight-descending, so the leading rows that tie the winning weight name
   // the federation shard(s) responsible for the suggestion's rank — the same
   // provenance the fan-out merge derives from per-shard responses. Doc rows
-  // (per-shard rfauth v4) instead name the best document behind the surface,
-  // so a selected suggestion can hydrate directly via hydrateRows.
+  // (per-shard rfauth v4) instead name the best documents behind the surface,
+  // so a selected suggestion can hydrate directly via hydrateRows. Root
+  // routing artifacts (rfauth v5) carry both: ordinal rows plus the winning
+  // row's { doc, docOrdinal }, remapped to a shard id by the sharded layer.
   function lexiconSuggestion(candidate) {
     const suggestion = { text: candidate.display, weight: candidate.weight, count: candidate.count };
     if (candidate.rows?.length) {
@@ -8133,7 +8238,14 @@ export async function createSearch(options = {}) {
       }
       suggestion.ordinals = ordinals;
     }
-    if (candidate.docRows?.length) suggestion.doc = candidate.docRows[0][0];
+    if (candidate.docRows?.length) {
+      suggestion.doc = candidate.docRows[0][0];
+      if (candidate.docRows.length > 1) suggestion.docs = candidate.docRows.map(row => row[0]);
+    }
+    if (candidate.rootDoc) {
+      suggestion.doc = candidate.rootDoc.doc;
+      suggestion.docOrdinal = candidate.rootDoc.ordinal;
+    }
     return suggestion;
   }
 
@@ -8155,10 +8267,14 @@ export async function createSearch(options = {}) {
         full: suggestKey(parsed.display) === parsed.normalized,
         // Root suggest-routing artifacts store [shard ordinal, weight] rows
         // on autocomplete entries; provenance travels with the candidate.
-        // Per-shard doc-row artifacts store the best [doc, weight] row so an
-        // unambiguous suggestion resolves straight to its document.
+        // Per-shard doc-row artifacts store the best [doc, weight] rows so a
+        // suggestion resolves straight to its top documents. v5 root entries
+        // additionally name the winning row's document and owning ordinal.
         ...(entry.ordinalRows && entry.rows?.length ? { rows: entry.rows } : {}),
-        ...(entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {})
+        ...(entry.docRows && entry.rows?.length ? { docRows: entry.rows } : {}),
+        ...(entry.ordinalRows && entry.doc != null && entry.docOrdinal != null
+          ? { rootDoc: { doc: entry.doc, ordinal: entry.docOrdinal } }
+          : {})
       };
       candidate.rank = autocompleteRank(candidate, weighted);
       list.push(candidate);
@@ -8188,7 +8304,16 @@ export async function createSearch(options = {}) {
         return {
           q,
           prefix,
-          suggestions: hot.slice(0, size).map(({ display, weight, count, doc }) => ({ text: display, weight, count, ...(doc != null ? { doc } : {}) })),
+          suggestions: hot.slice(0, size).map(({ display, weight, count, doc, docs }) => ({
+            text: display,
+            weight,
+            count,
+            ...(doc != null ? { doc } : {}),
+            // v3 hot rows: multiple docs, plus an optional federation shard
+            // ordinal per row (root routing artifacts).
+            ...(docs?.length > 1 && docs.every(row => row.ordinal == null) ? { docs: docs.map(row => row.doc) } : {}),
+            ...(docs?.[0]?.ordinal != null ? { docOrdinal: docs[0].ordinal } : {})
+          })),
           stats: {
             exact: true,
             suggestLane: "authority-hot",
@@ -8295,7 +8420,7 @@ export async function createSearch(options = {}) {
     return tail ? `${houseNumber} ${tail}` : "";
   }
 
-  async function executeAddressSuggest(q, prefix, size, root) {
+  async function executeAddressSuggest(q, prefix, size, root, hydrate = false) {
     if (!addressInterpolationEnabled || !root) return null;
     const parts = addressSuggestionParts(q);
     if (!parts?.tail) return null;
@@ -8341,7 +8466,10 @@ export async function createSearch(options = {}) {
         text,
         weight: Math.max(1, Number(candidate.weight || 0)),
         count: 1,
-        interpolated: Boolean(result.interpolated)
+        interpolated: Boolean(result.interpolated),
+        // The address probe already produced the hydrated hit — attach it for
+        // free instead of asking callers to re-search the selected address.
+        ...(hydrate ? { result, results: [result] } : {})
       });
       if (suggestions.length >= size) break;
     }
@@ -8366,20 +8494,69 @@ export async function createSearch(options = {}) {
     };
   }
 
+  // Hydrates each suggestion's doc rows into real search hits — the same
+  // payloads a search response would return, fetched straight from the doc
+  // pages (no postings, no query execution). Suggestions gain `result` (best
+  // document) and `results` (all kept doc rows). Federation-owned docs
+  // (`docOrdinal` — root routing artifacts) are skipped: their ordinals name
+  // documents in other shards, and the sharded layer hydrates them instead.
+  // Advisory by contract: hydration failures leave text suggestions intact.
+  async function hydrateSuggestionDocs(response) {
+    const suggestions = response?.suggestions || [];
+    const ordered = [];
+    const slots = new Map();
+    for (const item of suggestions) {
+      if (item.docOrdinal != null) continue;
+      for (const ordinal of item.docs || (item.doc != null ? [item.doc] : [])) {
+        if (!slots.has(ordinal)) {
+          slots.set(ordinal, ordered.length);
+          ordered.push(ordinal);
+        }
+      }
+    }
+    if (!ordered.length) return response;
+    const resultContext = suggestionHydrationContext(ordered.length);
+    try {
+      const hydrated = await rowsToResults(ordered.map(ordinal => [ordinal, 0]), resultContext);
+      for (const item of suggestions) {
+        if (item.docOrdinal != null) continue;
+        const results = (item.docs || (item.doc != null ? [item.doc] : []))
+          .map(ordinal => hydrated[slots.get(ordinal)])
+          .filter(Boolean);
+        if (results.length) {
+          item.results = results;
+          item.result = results[0];
+        }
+      }
+      response.stats = {
+        ...(response.stats || {}),
+        suggestDocsHydrated: ordered.length,
+        docPayloadLane: resultContext.docPayloadLane,
+        docPayloadPages: resultContext.docPayloadPages
+      };
+    } catch {
+      // Text suggestions must never break because payload hydration did.
+      response.stats = { ...(response.stats || {}), suggestDocsHydrated: 0 };
+    }
+    return response;
+  }
+
   async function executeSuggest(params = {}) {
     const q = String(params.q || "");
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    const hydrate = params.hydrate === true;
     const prefix = suggestKey(q);
     if (!prefix) {
       return { q, prefix, suggestions: [], stats: { exact: true, suggestShardsVisited: 0, suggestEntriesScanned: 0 } };
     }
     const root = await loadAuthorityLexiconRoot();
     if (root) {
-      const address = await executeAddressSuggest(q, prefix, size, root);
+      const address = await executeAddressSuggest(q, prefix, size, root, hydrate);
       if (address) return address;
-      return executeLexiconSuggest(q, prefix, size, root);
+      const response = await executeLexiconSuggest(q, prefix, size, root);
+      return hydrate ? hydrateSuggestionDocs(response) : response;
     }
-    const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size);
+    const legacy = await executeLegacyAuthoritySuggest(params, q, prefix, size, hydrate);
     if (legacy) return legacy;
     throw new Error("Rangefind: this index has no authority autocomplete lexicon (configure `suggest` fields at build time).");
   }
@@ -9330,24 +9507,92 @@ async function createGenerationalSearch(root, options, baseUrl) {
     };
   }
 
+  // A doc ordinal is only meaningful inside its own generation, so merged
+  // suggestions carry `generation` provenance alongside `doc`/`docs` — the
+  // winning generation's documents, cleared on a cross-generation rank tie
+  // (ambiguous owner), with tombstoned documents filtered out.
+  function setSuggestionGenerationDocs(entry, docs, genIndex) {
+    delete entry.doc;
+    delete entry.docs;
+    delete entry.generation;
+    if (!docs.length) return;
+    entry.doc = docs[0];
+    if (docs.length > 1) entry.docs = docs;
+    entry.generation = genIndex;
+  }
+
+  // Hydrates merged suggestions' docs through their owning generation —
+  // advisory, like the single-index path: failures leave text suggestions
+  // intact.
+  async function hydrateGenerationalSuggestions(suggestions) {
+    const byGeneration = new Map();
+    for (const item of suggestions) {
+      if (item.generation == null) continue;
+      const ordinals = item.docs || (item.doc != null ? [item.doc] : []);
+      if (!ordinals.length) continue;
+      if (!byGeneration.has(item.generation)) byGeneration.set(item.generation, new Map());
+      const slots = byGeneration.get(item.generation);
+      for (const ordinal of ordinals) {
+        if (!slots.has(ordinal)) slots.set(ordinal, null);
+      }
+    }
+    if (!byGeneration.size) return;
+    await Promise.all([...byGeneration.entries()].map(async ([genIndex, slots]) => {
+      const engine = engines[genIndex];
+      if (typeof engine.hydrateRows !== "function") return;
+      const ordinals = [...slots.keys()];
+      try {
+        const results = await engine.hydrateRows(
+          ordinals.map(ordinal => [ordinal, 0]),
+          suggestionHydrationContext(ordinals.length)
+        );
+        ordinals.forEach((ordinal, index) => {
+          if (results[index]) slots.set(ordinal, { ...results[index], generation: genIndex });
+        });
+      } catch {
+        // Advisory: an unhydratable generation keeps its text suggestions.
+      }
+    }));
+    for (const item of suggestions) {
+      if (item.generation == null) continue;
+      const slots = byGeneration.get(item.generation);
+      const results = (item.docs || (item.doc != null ? [item.doc] : []))
+        .map(ordinal => slots?.get(ordinal))
+        .filter(Boolean);
+      if (results.length) {
+        item.results = results;
+        item.result = results[0];
+      }
+    }
+  }
+
   async function suggest(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
-    const responses = await Promise.all(engines.map(engine => engine.suggest(activeParams)));
+    // Hydration happens once, after the merge, through each winner's owning
+    // generation — per-generation hydration would pay for losers.
+    const { hydrate, ...forwarded } = activeParams;
+    const responses = await Promise.all(engines.map(engine => engine.suggest(forwarded)));
     const merged = new Map();
-    for (const response of responses) {
-      for (const item of response.suggestions) {
+    for (let genIndex = 0; genIndex < responses.length; genIndex++) {
+      for (const item of responses[genIndex].suggestions) {
+        const docs = (item.docs || (item.doc != null ? [item.doc] : []))
+          .filter(doc => !tombstones[genIndex].has(doc));
         const existing = merged.get(item.text);
         if (existing) {
           existing.count += item.count;
-          existing.weight = Math.max(existing.weight, item.weight);
-          // A doc ordinal is only meaningful inside its own generation, and
-          // merged suggestions carry no generation provenance — drop it.
-          delete existing.doc;
+          if (item.weight > existing.weight) {
+            existing.weight = item.weight;
+            setSuggestionGenerationDocs(existing, docs, genIndex);
+          } else if (item.weight === existing.weight) {
+            // Cross-generation rank tie makes the doc's owner ambiguous.
+            setSuggestionGenerationDocs(existing, [], genIndex);
+          }
         } else {
-          const { doc, ...rest } = item;
+          const { doc, docs: ignoredDocs, ...rest } = item;
+          setSuggestionGenerationDocs(rest, docs, genIndex);
           merged.set(item.text, rest);
         }
       }
@@ -9355,6 +9600,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     const suggestions = [...merged.values()]
       .sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1))
       .slice(0, size);
+    if (hydrate === true) await hydrateGenerationalSuggestions(suggestions);
     return {
       q: surfaceQuery,
       suggestions,
@@ -9364,6 +9610,23 @@ async function createGenerationalSearch(root, options, baseUrl) {
         ...(normalizedQuery !== surfaceQuery ? { postalCodeNormalized: true } : {})
       }
     };
+  }
+
+  // Doc ordinals are generation-local, so hydrating on a generational index
+  // requires the owning generation: `context.generation` names it (as carried
+  // by suggestion provenance). Results are generation-stamped.
+  async function hydrateRows(rows, context = {}) {
+    const genIndex = Math.floor(Number(context.generation));
+    if (!Number.isInteger(genIndex) || genIndex < 0 || genIndex >= engines.length) {
+      throw new Error("Rangefind: hydrateRows on a generational index requires context.generation naming one generation.");
+    }
+    const engine = engines[genIndex];
+    if (typeof engine.hydrateRows !== "function") {
+      throw new Error(`Rangefind: generation ${genIndex} does not support hydrateRows.`);
+    }
+    const { generation, ...rest } = context;
+    const docs = await engine.hydrateRows(rows, rest);
+    return docs.map(doc => ({ ...doc, generation: genIndex }));
   }
 
   async function count(params = {}) {
@@ -9391,6 +9654,7 @@ async function createGenerationalSearch(root, options, baseUrl) {
     suggest,
     count,
     vectorSearch,
+    hydrateRows,
     loadFacetValues: field => engines[0].loadFacetValues(field)
   };
 }
@@ -9544,7 +9808,7 @@ async function createShardedSearch(root, options, baseUrl) {
   const suggestRoutingDirectory = suggestRoutingAuthority?.autocomplete?.format === AUTHORITY_LEXICON_PAGED_FORMAT
     ? suggestRoutingAuthority.autocomplete.segments?.directory
     : suggestRoutingAuthority?.directory;
-  const suggestRouting = root.suggest_routing?.format === SUGGEST_ROUTING_FORMAT
+  const suggestRouting = SUGGEST_ROUTING_COMPAT_FORMATS.includes(root.suggest_routing?.format)
     && suggestRoutingDirectory?.root
     ? root.suggest_routing
     : null;
@@ -9584,9 +9848,63 @@ async function createShardedSearch(root, options, baseUrl) {
     return ids.length ? ids.sort() : null;
   }
   function remapSuggestRoutingItem(item) {
-    const { ordinals, ...rest } = item;
+    const { ordinals, docOrdinal, ...rest } = item;
     const ids = suggestRoutingShards(ordinals);
+    // v2 routing artifacts stamp the winning row's [shard ordinal, doc]; the
+    // ordinal resolves to a federation shard id here so selection (and
+    // hydration) can go straight to the owning shard. A doc whose owner is
+    // unknown cannot be hydrated on a sharded root — drop it.
+    if (rest.doc != null) {
+      const docShard = docOrdinal != null ? suggestRoutingShardIds[docOrdinal] : undefined;
+      if (docShard !== undefined && shardIdIndex.has(docShard)) rest.docShard = docShard;
+      else delete rest.doc;
+    }
     return ids ? { ...rest, shards: ids } : rest;
+  }
+
+  // Hydrates suggestions whose doc provenance names an owning shard —
+  // batched per (shard, generation), advisory like every hydration path:
+  // failures leave the text suggestions intact.
+  async function hydrateShardedSuggestions(suggestions) {
+    const groups = new Map();
+    for (const item of suggestions) {
+      if (item.doc == null || !item.docShard) continue;
+      const key = `${item.docShard}\u0000${item.generation ?? ""}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          context: { shard: item.docShard, ...(item.generation != null ? { generation: item.generation } : {}) },
+          slots: new Map()
+        });
+      }
+      const { slots } = groups.get(key);
+      for (const ordinal of item.docs || [item.doc]) {
+        if (!slots.has(ordinal)) slots.set(ordinal, null);
+      }
+    }
+    if (!groups.size) return;
+    await Promise.all([...groups.values()].map(async ({ context, slots }) => {
+      const ordinals = [...slots.keys()];
+      try {
+        const results = await hydrateRows(
+          ordinals.map(ordinal => [ordinal, 0]),
+          { ...suggestionHydrationContext(ordinals.length), ...context }
+        );
+        ordinals.forEach((ordinal, index) => {
+          if (results[index]) slots.set(ordinal, results[index]);
+        });
+      } catch {
+        // Advisory: an unhydratable shard keeps its text suggestions.
+      }
+    }));
+    for (const item of suggestions) {
+      if (item.doc == null || !item.docShard) continue;
+      const { slots } = groups.get(`${item.docShard}\u0000${item.generation ?? ""}`);
+      const results = (item.docs || [item.doc]).map(ordinal => slots.get(ordinal)).filter(Boolean);
+      if (results.length) {
+        item.results = results;
+        item.result = results[0];
+      }
+    }
   }
 
   function createTextRoutingState(block) {
@@ -10201,18 +10519,40 @@ async function createShardedSearch(root, options, baseUrl) {
     };
   }
 
+  // The doc ordinal is shard-local: it must travel with the shard that owns
+  // the winning rank or not at all. `docShard` names that owner explicitly
+  // (and `generation` survives for generational shards) so selection and
+  // hydration never guess.
+  function setSuggestionShardDocs(entry, item, shardId) {
+    delete entry.doc;
+    delete entry.docs;
+    delete entry.docShard;
+    delete entry.generation;
+    if (item.doc == null) return;
+    entry.doc = item.doc;
+    if (item.docs?.length > 1) entry.docs = item.docs;
+    entry.docShard = shardId;
+    if (item.generation != null) entry.generation = item.generation;
+  }
+
   async function suggest(params = {}) {
     const surfaceQuery = String(params.q || "");
     const normalizedQuery = normalizePostalCodePrefixSpacing(surfaceQuery);
     const activeParams = normalizedQuery === surfaceQuery ? params : { ...params, q: normalizedQuery };
     const size = Math.max(1, Math.min(50, Math.floor(Number(params.size || 8))));
+    // Hydration happens here at the root, through each suggestion's owning
+    // shard: the root routing engine has no doc payloads, and per-shard
+    // hydration would pay for suggestions the merge discards.
+    const { hydrate, ...forwarded } = activeParams;
     if (suggestRouting && params.shards == null) {
       try {
         const rootEngine = await rootAuthorityEngine();
-        const response = await rootEngine.suggest({ ...activeParams, size });
+        const response = await rootEngine.suggest({ ...forwarded, size });
+        const suggestions = (response.suggestions || []).map(remapSuggestRoutingItem);
+        if (hydrate === true) await hydrateShardedSuggestions(suggestions);
         return {
           q: surfaceQuery,
-          suggestions: (response.suggestions || []).map(remapSuggestRoutingItem),
+          suggestions,
           ...(normalizedQuery !== surfaceQuery ? { normalizedQuery } : {}),
           stats: {
             ...(response.stats || {}),
@@ -10227,10 +10567,10 @@ async function createShardedSearch(root, options, baseUrl) {
         // the per-shard fan-out.
       }
     }
-    const routed = await withSuggestRoute(activeParams, normalizedQuery.trim());
+    const routed = await withSuggestRoute(forwarded, normalizedQuery.trim());
     const responses = await Promise.all(routed.shards.map(async shard => {
       const engine = await engineAt(shard.index);
-      return { shard, response: await engine.suggest({ ...activeParams, shards: undefined }) };
+      return { shard, response: await engine.suggest({ ...forwarded, shards: undefined }) };
     }));
     const merged = new Map();
     for (const { shard, response } of responses) {
@@ -10241,30 +10581,31 @@ async function createShardedSearch(root, options, baseUrl) {
           if (item.weight > existing.weight) {
             existing.weight = item.weight;
             existing.shards = [shard.id];
-            // The doc ordinal is shard-local: it must travel with the shard
-            // that owns the winning rank or not at all.
-            if (item.doc != null) existing.doc = item.doc;
-            else delete existing.doc;
+            setSuggestionShardDocs(existing, item, shard.id);
           } else if (item.weight === existing.weight && !existing.shards.includes(shard.id)) {
             // Route a selected suggestion only to the shard(s) responsible
             // for its winning rank. Weak same-text rows elsewhere contribute
             // to `count` but should not reopen those regions on selection.
             existing.shards.push(shard.id);
             // A cross-shard rank tie makes the doc's owner ambiguous.
-            delete existing.doc;
+            setSuggestionShardDocs(existing, {}, shard.id);
           }
         } else {
           // Preserve the top-level shard provenance so a selected suggestion
           // can hand the following search directly to the region(s) that
           // produced it. This is additive metadata; callers that ignore it
           // retain the existing autocomplete contract.
-          merged.set(item.text, { ...item, shards: [shard.id] });
+          const { doc, docs, generation, ...rest } = item;
+          const entry = { ...rest, shards: [shard.id] };
+          setSuggestionShardDocs(entry, item, shard.id);
+          merged.set(item.text, entry);
         }
       }
     }
     const suggestions = [...merged.values()]
       .sort((a, b) => b.weight - a.weight || (a.text < b.text ? -1 : 1))
       .slice(0, size);
+    if (hydrate === true) await hydrateShardedSuggestions(suggestions);
     return {
       q: surfaceQuery,
       suggestions,

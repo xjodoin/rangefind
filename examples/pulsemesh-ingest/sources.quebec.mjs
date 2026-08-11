@@ -242,7 +242,13 @@ export function createQuebecCameraSource({
   calibration = CAMERA_CALIBRATION,
   headless = false,
   chromium = null,
-  decode = undefined
+  decode = undefined,
+  // Where to look, when something is asking. See `focus` in
+  // ingest_camera.js: 675 cameras against a budget of eight is a survey,
+  // and a survey answers nobody in particular. Given the corridors peers
+  // are actually requesting, the same eight land where a reading can
+  // still change a route.
+  focus = null
 } = {}) {
   const gallery = createGalleryImageFetcher({
     origin: QUEBEC511,
@@ -259,6 +265,7 @@ export function createQuebecCameraSource({
     intervalSeconds,
     maxCameras,
     cameras: () => quebecCameras({ calibration }),
+    focus,
     fetchImage: gallery.fetchImage,
     analyze: createPixelCameraAnalyzer(decode ? { decode } : {})
   });
@@ -271,9 +278,53 @@ export function createQuebecCameraSource({
 // watch — start small:
 //
 //   RANGEFIND_QUEBEC_CAMERAS=8 node scripts/pulsemesh_ingest.mjs …
+// Where something is currently reported to be happening.
+//
+// This is the demand signal the camera budget follows. Québec publishes
+// no speed feed, so a camera is the only way to learn whether a reported
+// closure has actually backed traffic up — and "near a live event" is a
+// far better use of eight requests than "next in a list of 675".
+//
+// Filled by the events source below as a side effect of a fetch it was
+// making anyway, so the signal costs no extra request. A box is a rough
+// square around the point; cameras inside it are taken first.
+const EVENT_FOCUS_DEGREES = 0.05;   // ~5 km
+const eventFocus = { boxes: [], atMillis: 0 };
+
+function noteEventFocus(points) {
+  eventFocus.boxes = points.map(p => ({
+    minLat: p.lat - EVENT_FOCUS_DEGREES, maxLat: p.lat + EVENT_FOCUS_DEGREES,
+    minLon: p.lon - EVENT_FOCUS_DEGREES, maxLon: p.lon + EVENT_FOCUS_DEGREES
+  }));
+  eventFocus.atMillis = Date.now();
+}
+
+/**
+ * Records where the events are and returns them untouched.
+ *
+ * A tap rather than a second fetch: the events source is already
+ * pulling this collection every two minutes, and asking the WFS again
+ * just to aim a camera would be paying twice for one answer.
+ */
+function tapEventFocus(observations) {
+  noteEventFocus(observations.map(o => ({ lat: o.lat, lon: o.lon })));
+  return observations;
+}
+
+// Stale demand is worse than none: it would pin the budget to a crash
+// cleared an hour ago while a new one goes unwatched.
+export function currentEventFocus() {
+  if (!eventFocus.boxes.length) return [];
+  return Date.now() - eventFocus.atMillis > 30 * 60 * 1000 ? [] : eventFocus.boxes;
+}
+
 const cameraBudget = Number(process.env.RANGEFIND_QUEBEC_CAMERAS || 0);
 const cameraSources = cameraBudget > 0
-  ? [createQuebecCameraSource({ maxCameras: cameraBudget, intervalSeconds: 300 })]
+  ? [createQuebecCameraSource({
+      maxCameras: cameraBudget,
+      intervalSeconds: 300,
+      focus: () => currentEventFocus()
+    })]
   : [];
 
 export default {
@@ -290,7 +341,7 @@ export default {
       id: "quebec511-evenements",
       intervalSeconds: 120,
       url: wfsUrl("ms:evenements"),
-      map: collection => (collection.features || [])
+      map: collection => tapEventFocus((collection.features || [])
         .map(feature => {
           const type = eventTypeOf(feature.properties || {});
           const point = midpointOf(feature.geometry);
@@ -308,7 +359,7 @@ export default {
             ...directionOf(feature.properties?.direction, feature.geometry)
           };
         })
-        .filter(Boolean)
+        .filter(Boolean))
     },
 
     // --- Works registry: closures and major hindrances only -----------
