@@ -129,9 +129,7 @@ export async function createPairingOffer({
 }
 
 function randomId() {
-  const out = new Uint8Array(PAIR_ID_BYTES);
-  (globalThis.crypto || require("node:crypto").webcrypto).getRandomValues(out);
-  return out;
+  return globalThis.crypto.getRandomValues(new Uint8Array(PAIR_ID_BYTES));
 }
 
 export function encodePairingOffer({
@@ -231,7 +229,8 @@ function popPreimage({ pairingId, pairingPub, devicePub, timestamp }) {
 }
 
 async function computePop(keyBytes, preimage) {
-  const subtle = (globalThis.crypto || require("node:crypto").webcrypto).subtle;
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("PulseMesh pairing requires WebCrypto (globalThis.crypto.subtle).");
   const key = await subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const msg = new Uint8Array([...encoder.encode(POP_DOMAIN), ...preimage]);
   return new Uint8Array(await subtle.sign("HMAC", key, msg));

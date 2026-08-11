@@ -95,6 +95,7 @@ import {
   sealedTicketUrl
 } from "./thread_seal.js";
 import { SEED_MAGIC, decodeSeedCard } from "./thread_seed.js";
+import { PAIR_MAGIC, decodePairingOffer } from "./thread_pair.js";
 
 // `PMJ1` is the **j**ob offer (§20.4). `O` for "offer" was the obvious
 // letter and is the one to avoid: `PMO1` and `PM01` differ by a single
@@ -1592,6 +1593,21 @@ export function classifyThreadArtifact(fragmentOrBytes) {
       return { ...nothing, kind: "offer" };
     } catch {
       return { ...nothing, kind: "offer", reason: UNREADABLE_OFFER };
+    }
+  }
+  // A pairing offer (§16) is a location plus an ephemeral public key, and
+  // like a seed card it grants nothing at all. It gets its own kind for
+  // the same reason: a host that routed it to the device-card arm would
+  // show a confirmation sheet for a key nobody offered, and one that
+  // ignored it would drop the artifact that starts enrolment.
+  if (hasMagic(bytes, PAIR_MAGIC)) {
+    try {
+      decodePairingOffer(bytes);
+      return { ...nothing, kind: "pair" };
+    } catch {
+      // A reply or an ack read off a screen is a PMP1 that is not an
+      // offer — still pairing, still not something to act on here.
+      return { ...nothing, kind: "pair", reason: "That is part of a pairing already in progress." };
     }
   }
   // A seed card is the one artifact here that is a **location** rather
