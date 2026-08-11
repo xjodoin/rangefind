@@ -216,7 +216,7 @@ async function patrolRoutes(count) {
     });
     if (!b) continue;
     try {
-      routes.push(await engine.route({ from: a, to: b, live: session.provider() }));
+      routes.push({ route: await engine.route({ from: a, to: b, live: session.provider() }), from: a, to: b });
     } catch {
       // Will not snap, or the two do not connect. There are thousands of
       // leaves; the patrol only needs `count` corridors.
@@ -225,9 +225,13 @@ async function patrolRoutes(count) {
   return routes;
 }
 
+// Each entry carries its own endpoints. A route RESULT reports `from`
+// as { snapped, snapDistanceMeters } rather than a point, so re-pricing
+// a patrol corridor from `corridor.from` fails on a bad point — after
+// the probes have already been paid for.
 const routes = patrolCount
   ? await patrolRoutes(patrolCount)
-  : [await engine.route({ from, to, live: session.provider() })];
+  : [{ route: await engine.route({ from, to, live: session.provider() }), from, to }];
 if (!routes.length) fail("patrol found no routable corridor in this graph");
 const km = metres => (metres / 1000).toFixed(1);
 
@@ -277,7 +281,7 @@ const backfill = createRouteBackfill({
 // stats are shared across them, so the ceiling counts the whole run and a
 // corridor overlapping the last one is answered from cache rather than
 // bought twice.
-for (const [index, corridor] of routes.entries()) {
+for (const [index, { route: corridor, from: corridorFrom, to: corridorTo }] of routes.entries()) {
   if (patrolCount) {
     console.log(JSON.stringify({ event: "patrol", corridor: index + 1, of: routes.length }));
   }
@@ -322,7 +326,7 @@ for (const [index, corridor] of routes.entries()) {
     // for and can use now.
     const repriced = report.states.length
       ? await engine.route({
-        from: corridor.from ?? from, to: corridor.to ?? to,
+        from: corridorFrom, to: corridorTo,
         live: createStaticLiveProvider(report.states)
       })
       : null;
