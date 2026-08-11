@@ -1,6 +1,69 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-08-10
+
+### Breaking
+
+- PulseMesh thread links and the PMT1, PMTC, PMK1, and PMR1 records use new
+  sole wire formats: bearer capabilities are separated from signing
+  identities, and records bind to authority generations, admission MACs, and
+  predecessor hashes. Legacy artifacts are not decoded — a thread published
+  by an older peer cannot be read by this release, and vice versa.
+- PMT1 sealed bodies carry a random 12-byte nonce. Records written in the
+  previous deterministic-nonce format are rejected.
+
+### Added
+
+- Routing reads who a road and a lane are *for*, not only what physically
+  fits. `hgv=no` becomes an edge flag a declared goods vehicle refuses
+  (16,589 Québec edges, the index's largest restriction), while
+  `hgv=destination` stays open — a centre signed against through freight is
+  signed for the lorry delivering into it. Per-lane access reaches guidance,
+  carrying the reason ("bus lane", "car-pool lane") rather than a bare
+  closed bit, so "get right" is never drawn into a lane the driver would be
+  ticketed for using (5,988 Québec approaches). Reserved roads are flagged
+  instead of dropped at extract time, so a bus can be routed into a bus
+  terminal; car-pool minimums are a value, not a modifier. Snapping learned
+  the same facts — a depot on a refused street no longer answers "no route
+  in the country" instead of naming the corner to stop at, which also fixes
+  the equivalent refusal for a van behind a low arch. ROOT_VERSION and
+  CELL_VERSION bump: a stale index has these bits clear on every edge and
+  would answer wrongly rather than fail.
+- Road numbers carry the numbering scheme they are posted under
+  (`CA:QC:A`, `US:I`, `e-road`, `Bundesstrassen`), read from the
+  `type=route` relations that collect them, so a shield can be drawn
+  without guessing whether "15" is an autoroute, an Interstate, or a route
+  départementale. Refs deduplicate on the number rather than its spelling
+  (`A 1` on the way, `A1` on the relation, no longer both on one sign), and
+  a scheme attaches only where the letters agree — a missing shield is
+  recoverable, a wrong one is a confident lie. ROOT_VERSION bump.
+- PulseMesh threads gained managed subscription rotation and private
+  multi-recipient offers with authenticated claims and atomic single-winner
+  awards (`src/pulsemesh/thread_assignment.js`,
+  `src/pulsemesh/thread_subscription.js`).
+- A PulseMesh seed keeps its identity across restarts and states where it
+  can actually be reached. `--identity=<file>` persists the Ed25519 key
+  (created 0600 on first run), so a rebooted keeper no longer strands every
+  device holding a sealed ticket that names its old peer id. `--listen`
+  takes a list, because keeper-to-keeper is TCP while a browser tab can
+  only arrive over WebSocket, and `--announce` states externally reachable
+  addresses for a seed behind a TLS terminator. DHT scope follows the
+  announced addresses and treats a host as public if any one address is.
+
+### Fixed
+
+- The last step of a drive is the street the address is on. The final leg is
+  the seed the search finishes on rather than an edge it traverses, so it
+  reached the geometry and never the step list: routing to a door on Rue
+  Armstrong ended "arrive on Rue Frenette", 73 m short, with those metres
+  missing from the distance. `at` now points at the junction a leg starts
+  from, so the closing turn is measured against something rather than drawn
+  as a straight-on arrival. The regression test asserts the invariants —
+  every metre belongs to a step, the last step's geometry matches its
+  reported length — and catches a 400 m unnamed final leg in Luxembourg.
+- PulseMesh thread and transport boundaries are hardened: gossip is
+  validated before forwarding, and DHT records, fragmented frames, peer
+  memory, and per-source quotas are bounded.
 
 ### Fixed
 
