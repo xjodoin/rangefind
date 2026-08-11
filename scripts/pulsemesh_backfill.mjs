@@ -23,6 +23,7 @@ import { createIngestPublisher } from "../src/pulsemesh/ingest.js";
 import { createRouteBackfill, createTomTomProbe } from "../src/pulsemesh/ingest_tomtom.js";
 import { createLoopbackNetwork } from "../src/pulsemesh/node.js";
 import { createStaticLiveProvider } from "../src/route_graph_query.js";
+import { datasetEpoch } from "../src/pulsemesh/dataset_epoch.js";
 
 const args = Object.fromEntries(process.argv.slice(2).map(arg => {
   const [key, value] = arg.replace(/^--/, "").split("=");
@@ -39,7 +40,12 @@ const USAGE = `pulsemesh-backfill — buy traffic only where the mesh cannot ans
   node scripts/pulsemesh_backfill.mjs --graph=<dir> --from=<lat,lon> --to=<lat,lon> [options]
 
 Required
-  --graph=<dir>           the static route graph the itinerary is computed on
+  --graph=<dir|url>       the static route graph the itinerary is computed on;
+                          a directory or an http(s) base URL
+  --dataset=<region/prof> rendezvous on a dataset epoch — "quebec/car" — the
+                          same one the mesh being bought for uses. Without it
+                          the epoch is the graph's content hash, and the
+                          answers are published where nobody is listening.
   --from=<lat,lon>        origin
   --to=<lat,lon>          destination
 
@@ -67,7 +73,12 @@ if (args.help || args.h) {
   process.exit(0);
 }
 
-if (!args.graph) fail("--graph=<route-graph dir> is required");
+if (!args.graph) fail("--graph=<dir|https://…> is required");
+// The epoch is the topic namespace, so a backfill that derives it
+// differently from the mesh it is buying for publishes its answers where
+// nobody is listening — having paid for them. Same flag the keeper and
+// the ingest node take.
+const datasetId = args.dataset ? String(args.dataset).trim().toLowerCase() : null;
 const point = (value, name) => {
   const parts = String(value || "").split(",").map(Number);
   if (parts.length !== 2 || !parts.every(Number.isFinite)) fail(`--${name}=<lat,lon> is required`);
@@ -82,8 +93,16 @@ if (buying && !key) fail("--buy needs --key=<TomTom key> or TOMTOM_KEY in the en
 
 // --- Engine + mesh ---------------------------------------------------------
 
-const { openRouteGraphDir } = await import("../src/route_graph_node.js");
-const engine = await openRouteGraphDir(String(args.graph));
+// A directory or a published URL, like the keeper's --graph.
+const graphSource = String(args.graph);
+let engine;
+try {
+  engine = /^https?:\/\//iu.test(graphSource)
+    ? await (await import("../src/route_graph_query.js")).openRouteGraphUrl(graphSource)
+    : await (await import("../src/route_graph_node.js")).openRouteGraphDir(graphSource);
+} catch (error) {
+  fail(`cannot open the route graph at ${graphSource}: ${error?.message ?? error}`);
+}
 
 let network;
 let host = null;
@@ -107,7 +126,8 @@ const session = await createMeshSession({
   engine,
   network,
   id: host ? host.peerId.toString() : "backfill",
-  transport: host ? "wire" : "loopback"
+  transport: host ? "wire" : "loopback",
+  ...(datasetId ? { epochHex: await datasetEpoch(datasetId) } : {})
 });
 
 // --- Route, assess, maybe buy ---------------------------------------------
