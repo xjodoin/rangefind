@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  addressAuthorityQueryKeys,
   addressRangeContains,
   addressRangeLookupValues,
   addressRangeQueryCandidates,
@@ -52,6 +53,100 @@ test("address keys normalize directions, suffixes, punctuation, and ordinal word
   assert.equal(normalizePostalCodeSpacing("h4r 1p8"), "h4r 1p8");
   assert.equal(normalizePostalCodePrefixSpacing("J7A1V"), "J7A 1V");
   assert.equal(normalizePostalCodePrefixSpacing("pharmacy J7A1"), "pharmacy J7A 1");
+});
+
+test("French-Canadian abbreviated queries probe the published address keys", () => {
+  // "Bd"/"Boul" are deterministic spellings of boulevard, shared with the
+  // builder so both sides land on the canonical token.
+  assert.equal(normalizeAddressKey("311 Bd Cartier Ouest"), normalizeAddressKey("311 Boulevard Cartier Ouest"));
+  assert.equal(normalizeAddressKey("311 Boul Cartier Ouest"), normalizeAddressKey("311 Boulevard Cartier Ouest"));
+
+  const keys = addressAuthorityQueryKeys("311 A Bd Cartier O, Laval, QC H7N 2J3");
+  // Canonical reading first — single-key callers keep their behavior.
+  assert.equal(keys[0], normalizeAddressAuthorityKey("311 A Bd Cartier O, Laval, QC H7N 2J3"));
+  // The indexed full-formatted key (unit letter dropped, O expanded to
+  // Ouest, postal code shed) and the base+city key must both be probed.
+  assert.ok(keys.includes(normalizeAddressAuthorityKey("311 Boulevard Cartier Ouest, Laval, QC")));
+  assert.ok(keys.includes(normalizeAddressAuthorityKey("311 Boulevard Cartier Ouest, Laval")));
+
+  // Attached unit letters split off; detached ones also merge in.
+  assert.ok(addressAuthorityQueryKeys("311A Bd Cartier O, Laval")
+    .includes(normalizeAddressAuthorityKey("311 Boulevard Cartier Ouest, Laval")));
+  assert.ok(addressAuthorityQueryKeys("311 A Bd Cartier O, Laval")
+    .includes(normalizeAddressAuthorityKey("311A Boulevard Cartier Ouest, Laval")));
+
+  // US-shaped tails shed the ZIP and the state abbreviation the same way.
+  assert.ok(addressAuthorityQueryKeys("350 Fifth Avenue, New York, NY 10118")
+    .includes(normalizeAddressAuthorityKey("350 5th Avenue, New York")));
+
+  // Street suffixes are never shed as if they were region abbreviations.
+  assert.ok(!addressAuthorityQueryKeys("100 Main St")
+    .includes(normalizeAddressAuthorityKey("100 Main")));
+
+  // Interpolation candidates carry the same readings: an abbreviated French
+  // query must produce the tail the builder derived from the full spelling.
+  const values = addressRangeLookupValues(202, 218, 2, ["Boulevard Cartier Ouest Laval"]);
+  assert.ok(addressRangeQueryCandidates("214 Bd Cartier O, Laval")
+    .some(candidate => values.includes(candidate.lookupValue) && candidate.houseNumber === 214));
+});
+
+test("abbreviated queries reach spelled-out keys across the libpostal en/fr matrix", () => {
+  // Adapted from libpostal's expansion tests (test_expand.c) to this
+  // matcher's contract: some probed key must equal the key the builder
+  // derives from the spelled-out indexed form.
+  const cases = [
+    // en street types, directionals, ordinals, units
+    ["123 Main St #2F, Brooklyn", "123 Main Street, Brooklyn"],
+    ["120 E 96th St, New York", "120 East 96th Street, New York"],
+    ["100 S St NW, Washington", "100 S Street Northwest, Washington"],
+    ["1600 Pennsylvania Ave NW, Washington, DC 20500", "1600 Pennsylvania Avenue Northwest, Washington"],
+    ["501 Apt 3 Elm Trl, Austin, TX 78701", "501 Elm Trail, Austin, TX"],
+    ["501 Elm Trl Apt 3, Austin, TX 78701", "501 Elm Trail, Unit 3, Austin"],
+    // state names spell out and contract
+    ["4998 Vanderbilt Dr, Columbus, OH 43213", "4998 Vanderbilt Drive, Columbus, OH"],
+    ["4998 Vanderbilt Dr, Columbus, Ohio 43213", "4998 Vanderbilt Drive, Columbus, OH"],
+    // Saint/Street both ways
+    ["1500 St Clair Ave W, Toronto", "1500 Saint Clair Avenue West, Toronto"],
+    ["1500 Saint Clair Ave W, Toronto", "1500 St Clair Avenue West, Toronto"],
+    // fr street types, saints, directionals
+    ["92 Ave des Champs-Élysées, Paris", "92 Avenue des Champs-Élysées, Paris"],
+    ["15 Ch de la Côte-Sainte-Catherine, Montréal", "15 Chemin de la Côte-Sainte-Catherine, Montréal"],
+    ["1 Rue Ste-Catherine E, Montréal", "1 Rue Sainte-Catherine Est, Montréal"],
+    ["300 Rte 117, Mont-Tremblant", "300 Route 117, Mont-Tremblant"],
+    ["22 Hwy 7 E, Markham, ON", "22 Highway 7 East, Markham"],
+    // de/nl/sv concatenated street suffixes: spaced, abbreviated-spaced, and
+    // abbreviated-concatenated forms all reach the concatenated indexed key
+    ["Markt Strasse 5, Berlin", "Marktstraße 5, Berlin"],
+    ["Markt Str 5, Berlin", "Marktstraße 5, Berlin"],
+    ["Marktstr 5, Berlin", "Marktstraße 5, Berlin"],
+    ["Kerkstr 12, Amsterdam", "Kerkstraat 12, Amsterdam"],
+    ["Kerk Straat 12, Amsterdam", "Kerkstraat 12, Amsterdam"],
+    ["Stor Gatan 5, Stockholm", "Storgatan 5, Stockholm"],
+    // es/ca/it/pl street types
+    ["Av del Libertador 100, Madrid", "Avenida del Libertador 100, Madrid"],
+    ["Avda Diagonal 200, Barcelona", "Avinguda Diagonal 200, Barcelona"],
+    ["Vle Monza 100, Milano", "Viale Monza 100, Milano"],
+    ["Ul Marszałkowska 1, Warszawa", "Ulica Marszałkowska 1, Warszawa"]
+  ];
+  for (const [query, indexed] of cases) {
+    assert.ok(
+      addressAuthorityQueryKeys(query).includes(normalizeAddressAuthorityKey(indexed)),
+      `${query} should reach the key of "${indexed}"`
+    );
+  }
+
+  // Probe budget: queries without ambiguous tokens must stay at one key,
+  // spelled-out addresses stay at a handful ("ave"/"blvd" carry multilingual
+  // readings), and even the most abbreviation-dense envelope form stays
+  // within the variant cap.
+  assert.equal(addressAuthorityQueryKeys("300 Rte 117, Mont-Tremblant").length, 1);
+  assert.ok(addressAuthorityQueryKeys("10 Boulevard des Châteaux J7B1Z5").length <= 4);
+  assert.ok(addressAuthorityQueryKeys("350 Fifth Avenue New York").length <= 4);
+  assert.ok(addressAuthorityQueryKeys("311 A Bd Cartier O, Laval, QC H7N 2J3").length <= 40);
+
+  // A lettered token is only shed as a unit when a pure house number
+  // remains — "311a" alone must keep its own key.
+  assert.equal(addressAuthorityQueryKeys("311a Boulevard Cartier")[0], normalizeAddressAuthorityKey("311a Boulevard Cartier"));
 });
 
 test("OSM area geometry is compact and supplies a real polygon centroid", () => {
@@ -363,6 +458,44 @@ test("exact, reordered, and component address forms bypass postings", async () =
       category: "boundary",
       type: "postal_code"
     },
+    {
+      id: "cartier-ouest",
+      name: "311 Boulevard Cartier Ouest, Laval, QC",
+      address: "311 Boulevard Cartier Ouest, Laval, QC",
+      address_search: "311 Boulevard Cartier Ouest, Laval, QC",
+      house_number: "311",
+      street: "Boulevard Cartier Ouest",
+      city: "Laval",
+      state: "QC",
+      postcode: "H7N 2J3",
+      category: "address",
+      type: "address"
+    },
+    {
+      id: "vanderbilt",
+      name: "4998 Vanderbilt Drive, Columbus, OH",
+      address: "4998 Vanderbilt Drive, Columbus, OH",
+      address_search: "4998 Vanderbilt Drive, Columbus, OH",
+      house_number: "4998",
+      street: "Vanderbilt Drive",
+      city: "Columbus",
+      state: "OH",
+      postcode: "43213",
+      category: "address",
+      type: "address"
+    },
+    {
+      id: "st-clair",
+      name: "1500 St Clair Avenue West, Toronto, ON",
+      address: "1500 St Clair Avenue West, Toronto, ON",
+      address_search: "1500 St Clair Avenue West, Toronto, ON",
+      house_number: "1500",
+      street: "St Clair Avenue West",
+      city: "Toronto",
+      state: "ON",
+      category: "address",
+      type: "address"
+    },
     ...interpolation
   ];
   await writeFile(join(root, "docs.jsonl"), docs.map(JSON.stringify).join("\n"));
@@ -497,6 +630,27 @@ test("exact, reordered, and component address forms bypass postings", async () =
     assert.equal(compactFullAddress.stats.plannerLane, "addressAuthorityExact");
     assert.equal(compactFullAddress.stats.postingsDecoded, 0);
     assert.equal(compactFullAddress.results[0].id, "jean-coutu");
+
+    // A pasted French-Canadian envelope form: detached unit letter,
+    // abbreviated street type and directional, trailing province + postal
+    // code. Every reading resolves in the authority lane, not postings.
+    const frenchAbbreviated = await engine.search({ q: "311 A Bd Cartier O, Laval, QC H7N 2J3", size: 5 });
+    assert.equal(frenchAbbreviated.stats.plannerLane, "addressAuthorityExact");
+    assert.equal(frenchAbbreviated.stats.postingsDecoded, 0);
+    assert.equal(frenchAbbreviated.results[0].id, "cartier-ouest");
+
+    // Abbreviated English envelope forms: street type, state spelled out
+    // against an abbreviated tag, and ZIP shed the same way.
+    const englishAbbreviated = await engine.search({ q: "4998 Vanderbilt Dr, Columbus, Ohio 43213", size: 5 });
+    assert.equal(englishAbbreviated.stats.plannerLane, "addressAuthorityExact");
+    assert.equal(englishAbbreviated.stats.postingsDecoded, 0);
+    assert.equal(englishAbbreviated.results[0].id, "vanderbilt");
+
+    // "Saint" spelled out against an indexed "St" name (and the street-type
+    // "St" in the same query staying a street).
+    const saintSpelled = await engine.search({ q: "1500 Saint Clair Ave W, Toronto", size: 5 });
+    assert.equal(saintSpelled.stats.plannerLane, "addressAuthorityExact");
+    assert.equal(saintSpelled.results[0].id, "st-clair");
   } finally {
     await engine.close();
   }

@@ -1,4 +1,9 @@
 import { foldMulti } from "./analysis_fold.js";
+import {
+  ADDRESS_TOKEN_READINGS,
+  CONCATENATED_STREET_SUFFIXES,
+  CONCATENATED_SUFFIX_READINGS
+} from "./address_abbreviations.js";
 
 const DIRECTION_PHRASES = [
   [/\bnorth[\s-]*east\b/gu, "ne"],
@@ -7,7 +12,7 @@ const DIRECTION_PHRASES = [
   [/\bsouth[\s-]*west\b/gu, "sw"]
 ];
 
-const TOKEN_ALIASES = new Map(Object.entries({
+export const TOKEN_ALIASES = new Map(Object.entries({
   north: "n",
   south: "s",
   east: "e",
@@ -21,6 +26,11 @@ const TOKEN_ALIASES = new Map(Object.entries({
   avenue: "ave",
   av: "ave",
   boulevard: "blvd",
+  // French-Canadian civic addresses abbreviate "boulevard" as "boul" or "bd"
+  // ("311 Bd Cartier O"). OSM/RQA data spells the word out, so both spellings
+  // must land on the same canonical token as "boulevard" itself.
+  boul: "blvd",
+  bd: "blvd",
   road: "rd",
   drive: "dr",
   lane: "ln",
@@ -142,6 +152,262 @@ export function normalizeAddressAuthorityKey(value) {
   return key ? key.split(" ").sort().join(" ") : "";
 }
 
+// Ambiguous abbreviations expanded only on the query side: "St" means Saint
+// or Street, a bare "O" in "311 Bd Cartier O" means Ouest but is also an
+// initial ("Rue O'Brien" tokenizes to "o brien"), so these readings cannot be
+// part of the deterministic key shared with the builder. Queries probe every
+// reading instead. The table is generated from libpostal's en/fr address
+// dictionaries plus curated saints, units, and state/province names.
+
+const CANADIAN_POSTAL_FSA = /^[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]$/u;
+const CANADIAN_POSTAL_LDU = /^\d[abceghj-nprstvwxyz]\d$/u;
+// Canonical street-suffix and directional tokens that legitimately end an
+// address ("100 Main St"); a trailing region abbreviation ("QC", "NY") is
+// droppable, these are not.
+const TRAILING_KEEP_TOKENS = new Set([...new Set(TOKEN_ALIASES.values()), "o"]);
+
+function isNumberToken(token) {
+  return /^\d+$/u.test(token);
+}
+
+function withoutIndex(tokens, index) {
+  return tokens.filter((_, tokenIndex) => tokenIndex !== index);
+}
+
+// Detached or attached unit letters: "311 A Bd Cartier" and "311A Bd Cartier"
+// both describe house 311 (unit A) or housenumber "311A" depending on the
+// data, so the query probes the merged, split, and dropped readings.
+function unitLetterVariants(tokens) {
+  const variants = [{ tokens, cost: 0 }];
+  const numberIndex = tokens.findIndex(isNumberToken);
+  if (numberIndex >= 0 && /^[a-z]$/u.test(tokens[numberIndex + 1] || "")) {
+    variants.push({ tokens: withoutIndex(tokens, numberIndex + 1), cost: 1 });
+    variants.push({
+      tokens: tokens.map((token, index) => index === numberIndex ? `${token}${tokens[numberIndex + 1]}` : token)
+        .filter((_, index) => index !== numberIndex + 1),
+      cost: 1
+    });
+  }
+  const compactIndex = tokens.findIndex(token => /^\d+[a-z]$/u.test(token));
+  if (compactIndex >= 0) {
+    variants.push({
+      tokens: tokens.map((token, index) => index === compactIndex ? token.slice(0, -1) : token),
+      cost: 1
+    });
+  }
+  return variants;
+}
+
+// Alternative readings of ambiguous abbreviations, breadth-first by how many
+// tokens are substituted: most queries abbreviate one thing, so all single
+// substitutions come before any stacked pair. Multi-token readings ("no" ->
+// "nord ouest") splice in place; substitution positions are bounded so a
+// pathological query cannot explode the frontier.
+// Readings for one token: the shared table, plus concatenated Germanic
+// abbreviations rewritten in place ("hauptstr" -> "hauptstrasse",
+// "kerkstr" -> "kerkstraat") — the stem stays, only the suffix expands.
+function tokenReadings(token) {
+  const readings = ADDRESS_TOKEN_READINGS.get(token);
+  for (const [abbrev, expansions] of CONCATENATED_SUFFIX_READINGS) {
+    if (token.length <= abbrev.length + 2 || !token.endsWith(abbrev)) continue;
+    const stem = token.slice(0, -abbrev.length);
+    return [
+      ...(readings || []),
+      ...expansions.map(expansion => [`${stem}${expansion}`])
+    ];
+  }
+  return readings;
+}
+
+function readingsVariants(baseTokens, maxVariants = 12) {
+  const positions = [];
+  for (let index = 0; index < baseTokens.length && positions.length < 5; index++) {
+    const readings = tokenReadings(baseTokens[index]);
+    if (readings?.length) positions.push({ index, readings });
+  }
+  const variants = [{ tokens: baseTokens, cost: 0 }];
+  if (!positions.length) return variants;
+  const substitute = (tokens, entries) => {
+    let out = tokens;
+    // Apply from the highest index down so earlier positions stay valid when
+    // a reading changes the token count.
+    for (const { index, reading } of [...entries].sort((a, b) => b.index - a.index)) {
+      out = [...out.slice(0, index), ...reading, ...out.slice(index + 1)];
+    }
+    return out;
+  };
+  for (const { index, readings } of positions) {
+    // A lone letter carries almost no meaning of its own, so reading it as
+    // its directional word ("O" -> Ouest, "E" -> Est) is the likeliest
+    // interpretation and ranks ahead of rewriting a full abbreviation.
+    const cost = baseTokens[index].length === 1 ? 0.5 : 1;
+    for (const reading of readings) {
+      variants.push({ tokens: substitute(baseTokens, [{ index, reading }]), cost });
+      if (variants.length >= maxVariants) return variants;
+    }
+  }
+  for (let left = 0; left < positions.length; left++) {
+    for (let right = left + 1; right < positions.length; right++) {
+      for (const leftReading of positions[left].readings) {
+        for (const rightReading of positions[right].readings) {
+          // Two independent abbreviations in one query are genuinely rarer
+          // than one, so stacked substitutions rank behind every single
+          // substitution combined with cheap tail shedding.
+          variants.push({
+            tokens: substitute(baseTokens, [
+              { index: positions[left].index, reading: leftReading },
+              { index: positions[right].index, reading: rightReading }
+            ]),
+            cost: 3
+          });
+          if (variants.length >= maxVariants) return variants;
+        }
+      }
+    }
+  }
+  return variants;
+}
+
+const UNIT_MARKER_TOKENS = new Set(["unit", "apt", "ste", "app"]);
+
+// Germanic and Scandinavian street names concatenate their type suffix, so a
+// spaced query ("Markt Straße 5") also probes the merged form the index
+// derived from "Marktstraße". Runs after readings so "Markt Str" reaches
+// "marktstrasse" through the strasse reading.
+function concatenationVariants(tokens) {
+  const variants = [{ tokens, cost: 0 }];
+  for (let index = 1; index < tokens.length && variants.length <= 2; index++) {
+    if (!CONCATENATED_STREET_SUFFIXES.has(tokens[index])) continue;
+    const stem = tokens[index - 1];
+    if (!/^[a-z]{3,}$/u.test(stem)) continue;
+    variants.push({
+      tokens: [
+        ...tokens.slice(0, index - 1),
+        `${stem}${tokens[index]}`,
+        ...tokens.slice(index + 1)
+      ],
+      cost: 1
+    });
+  }
+  return variants;
+}
+
+// Unit designations ("Apt 5", "#2F") are never part of an indexed component
+// key, so they shed independently of the locality tail. A marker + number
+// pair sheds together; a bare lettered number sheds only when another pure
+// number remains to serve as the house number.
+function unitShedVariants(tokens) {
+  const markerIndex = tokens.findIndex((token, index) => (
+    UNIT_MARKER_TOKENS.has(token) && /^\d+[a-z]?$/u.test(tokens[index + 1] || "")
+  ));
+  if (markerIndex >= 0) {
+    return [tokens, tokens.filter((_, index) => index !== markerIndex && index !== markerIndex + 1)];
+  }
+  const letteredIndex = tokens.findIndex(token => /^\d+[a-z]$/u.test(token));
+  if (
+    letteredIndex >= 0
+    && tokens.length > 2
+    && tokens.some(isNumberToken)
+  ) {
+    return [tokens, withoutIndex(tokens, letteredIndex)];
+  }
+  return [tokens];
+}
+
+// A pasted address usually trails "…, City, Province Postal". The index keys
+// component variants (base, base+locality, base+postcode, full formatted), so
+// with and without its unit the query cumulatively sheds the postal code and
+// then a short trailing region abbreviation to meet those variants; street
+// suffixes and directionals are never shed.
+function tailVariants(tokens) {
+  const variants = [];
+  const branches = unitShedVariants(tokens);
+  for (let branch = 0; branch < branches.length; branch++) {
+    let trimmed = branches[branch];
+    // Pasted envelope forms routinely carry a postal/region tail the index
+    // never keys, so shedding is half the cost of a substitution.
+    let cost = branch;
+    variants.push({ tokens: trimmed, cost });
+    const push = next => {
+      if (next.length && next.length !== trimmed.length) {
+        trimmed = next;
+        cost += 0.5;
+        variants.push({ tokens: next, cost });
+      }
+    };
+    const postalIndex = trimmed.findIndex((token, index) => (
+      CANADIAN_POSTAL_FSA.test(token) && CANADIAN_POSTAL_LDU.test(trimmed[index + 1] || "")
+    ));
+    if (postalIndex >= 0) {
+      push(trimmed.filter((_, index) => index !== postalIndex && index !== postalIndex + 1));
+    } else if (
+      trimmed.length > 1
+      && /^\d{5}$/u.test(trimmed.at(-1))
+      && trimmed.slice(0, -1).some(isNumberToken)
+    ) {
+      push(trimmed.slice(0, -1));
+    }
+    const last = trimmed.at(-1) || "";
+    if (trimmed.length > 2 && /^[a-z]{2,3}$/u.test(last) && !TRAILING_KEEP_TOKENS.has(last)) {
+      push(trimmed.slice(0, -1));
+    }
+  }
+  return variants;
+}
+
+// Every plausible reading of a typed address, as ordered token lists,
+// cheapest interpretation first: candidates are ranked by how many rewrites
+// (readings substituted, suffixes merged, unit letters handled, tail tokens
+// shed) separate them from the typed form, so a low-value stacked rewrite
+// can never crowd a likely one out of the probe budget. The first entry is
+// always the canonical normalizeAddressKey reading, so callers that only
+// need one key keep their existing behavior.
+export function addressQueryTokenVariants(value, maxVariants = 40) {
+  const base = normalizeAddressKey(value);
+  if (!base) return [];
+  const candidates = [];
+  for (const reading of readingsVariants(base.split(" "))) {
+    for (const concatenation of concatenationVariants(reading.tokens)) {
+      for (const unitVariant of unitLetterVariants(concatenation.tokens)) {
+        for (const tail of tailVariants(unitVariant.tokens)) {
+          candidates.push({
+            tokens: tail.tokens,
+            cost: reading.cost + concatenation.cost + unitVariant.cost + tail.cost,
+            order: candidates.length
+          });
+        }
+      }
+    }
+  }
+  candidates.sort((left, right) => left.cost - right.cost || left.order - right.order);
+  const seen = new Set();
+  const out = [];
+  for (const candidate of candidates) {
+    const key = candidate.tokens.join(" ");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate.tokens);
+    if (out.length >= maxVariants) break;
+  }
+  return out;
+}
+
+// Sorted set-like authority keys for every reading of a typed address. The
+// builder still derives exactly one key per indexed value; probing extra keys
+// at query time keeps abbreviated French forms ("311 A Bd Cartier O, Laval,
+// QC H7N 2J3") resolvable against already-published indexes.
+export function addressAuthorityQueryKeys(value) {
+  const keys = [];
+  const seen = new Set();
+  for (const tokens of addressQueryTokenVariants(value)) {
+    const key = tokens.slice().sort().join(" ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  return keys;
+}
+
 const CANADIAN_POSTAL_CODE = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\b/giu;
 const CANADIAN_POSTAL_CODE_QUERY = /^\s*[abceghj-nprstvxy]\d[abceghj-nprstvwxyz]\s*[0-9][abceghj-nprstvwxyz][0-9]\s*$/iu;
 const CANADIAN_POSTAL_CODE_PREFIX = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9](?:[abceghj-nprstvwxyz](?:[0-9])?)?)$/iu;
@@ -206,30 +472,34 @@ export function addressRangeLookupValues(start, end, step, addressTails, bucketS
 }
 
 // Return every plausible numeric house token. Considering all numeric tokens
-// preserves reordered address queries and gracefully handles postal codes.
+// preserves reordered address queries and gracefully handles postal codes;
+// query token variants keep abbreviated French forms resolvable.
 export function addressRangeQueryCandidates(value, bucketSize = ADDRESS_RANGE_BUCKET_SIZE) {
-  const tokens = normalizeAddressKey(value).split(" ").filter(Boolean);
   const candidates = [];
   const seen = new Set();
-  for (let index = 0; index < tokens.length; index++) {
-    if (!/^\d+$/u.test(tokens[index])) continue;
-    const houseNumber = Number(tokens[index]);
-    if (!Number.isSafeInteger(houseNumber) || houseNumber < 0) continue;
-    const tail = tokens.filter((_, tokenIndex) => tokenIndex !== index).sort().join(" ");
-    if (!tail) continue;
-    const parity = Math.abs(houseNumber % 2);
-    // Probe both parity suffixes. Valid ranges match their natural parity;
-    // probing the companion key also lets a complete opposite-parity range
-    // prove an exact zero without adding duplicate keys to the index.
-    for (const candidateParity of [parity, 1 - parity]) {
-      const lookupValue = rangeLookupValue(
-        Math.floor(houseNumber / bucketSize),
-        candidateParity,
-        tail
-      );
-      if (seen.has(lookupValue)) continue;
-      seen.add(lookupValue);
-      candidates.push({ houseNumber, lookupValue });
+  // Interpolation probes pay two parity keys per candidate, so the variant
+  // budget stays tighter than the flat authority lane's.
+  for (const tokens of addressQueryTokenVariants(value, 8)) {
+    for (let index = 0; index < tokens.length; index++) {
+      if (!/^\d+$/u.test(tokens[index])) continue;
+      const houseNumber = Number(tokens[index]);
+      if (!Number.isSafeInteger(houseNumber) || houseNumber < 0) continue;
+      const tail = tokens.filter((_, tokenIndex) => tokenIndex !== index).sort().join(" ");
+      if (!tail) continue;
+      const parity = Math.abs(houseNumber % 2);
+      // Probe both parity suffixes. Valid ranges match their natural parity;
+      // probing the companion key also lets a complete opposite-parity range
+      // prove an exact zero without adding duplicate keys to the index.
+      for (const candidateParity of [parity, 1 - parity]) {
+        const lookupValue = rangeLookupValue(
+          Math.floor(houseNumber / bucketSize),
+          candidateParity,
+          tail
+        );
+        if (seen.has(lookupValue)) continue;
+        seen.add(lookupValue);
+        candidates.push({ houseNumber, lookupValue });
+      }
     }
   }
   return candidates;

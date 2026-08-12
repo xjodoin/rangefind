@@ -446,8 +446,20 @@ reusable `selection` carrying query text and shard hints.
 
 Complete civic addresses use a zero-posting canonical authority lane. Multiple
 canonical forms cover component reorderings, common road abbreviations, postal
-spacing, and useful partial forms. Explicit address points always win over
-interpolation.
+spacing, and useful partial forms. Queries additionally probe every plausible
+reading of a pasted envelope form against keys already published by older
+builds: abbreviation readings generated from libpostal's address dictionaries
+for 14 languages (en, fr, es, de, pt, it, nl, ca, sv, da, nb, pl, cs, ro) —
+"St" as Saint, Street, Straße, Strada, or Straat; "Trl", "Hwy", "Ch", "Rte",
+"Vle", "Avda", "Ul"; "Ste" as Sainte or a suite — directionals ("311 A Bd
+Cartier O, Laval, QC H7N 2J3" resolves like "311 Boulevard Cartier Ouest,
+Laval"; "NW" like "Northwest"), Germanic/Scandinavian concatenated street
+suffixes ("Marktstr 5" and "Markt Str 5" both resolve like "Marktstraße 5"),
+single-token state/province names in both directions ("Ohio" ↔ "OH"),
+detached or attached unit letters and "Apt N"/"#2F" designations, and
+trailing province/state and postal-code tails. Candidates rank cheapest
+interpretation first under a fixed probe cap, so unambiguous queries still
+derive a single key. Explicit address points always win over interpolation.
 
 OSM `addr:interpolation` ways remain compact ranges rather than becoming one
 document per potential house number. The runtime checks range bounds,

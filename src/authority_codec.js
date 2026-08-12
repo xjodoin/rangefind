@@ -3,7 +3,7 @@ import { foldMulti } from "./analysis_fold.js";
 import { DEFAULT_ANALYZER } from "./analysis.js";
 import { assertMagic, pushUtf8, readUtf8 } from "./codec.js";
 import { autocompleteEntrySummary, isAutocompleteKey } from "./authority_lexicon.js";
-import { normalizeAddressAuthorityKey } from "./address.js";
+import { addressAuthorityQueryKeys, normalizeAddressAuthorityKey } from "./address.js";
 
 export const AUTHORITY_FORMAT = "rfauth-v2";
 // Root-level suggest routing artifact for sharded indexes (the block lives
@@ -131,9 +131,13 @@ export function authorityKeysForQuery(query, baseTerms, options = {}) {
   const tokenKey = authorityTokenKeyFromTerms(baseTerms);
   if (tokenKey && !out.some(item => item.key === tokenKey)) out.push({ key: tokenKey, kind: "tokens" });
   if (options.address) {
-    const address = normalizeAddressAuthorityKey(query);
-    if (address && !out.some(item => item.key === `${ADDRESS_PREFIX}${address}`)) {
-      out.push({ key: `${ADDRESS_PREFIX}${address}`, kind: "address" });
+    // The builder derives exactly one key per indexed value; the query probes
+    // every plausible reading (French abbreviations, detached unit letters,
+    // shed postal/region tails) so pasted addresses match published keys.
+    for (const address of addressAuthorityQueryKeys(query)) {
+      if (!out.some(item => item.key === `${ADDRESS_PREFIX}${address}`)) {
+        out.push({ key: `${ADDRESS_PREFIX}${address}`, kind: "address" });
+      }
     }
   }
   return out;
