@@ -63,6 +63,9 @@ function report(path) {
   const header = rows.find((r) => r.kind === "route");
   const fixes = rows.filter((r) => r.kind === "fix");
   const marks = rows.filter((r) => r.kind === "mark");
+  // What the driver said about each mark. It lands five seconds after the
+  // mark itself, on a line of its own, keyed by the same ordinal.
+  const notes = new Map(rows.filter((r) => r.kind === "mark-note").map((n) => [n.ordinal, n]));
   const events = rows.filter((r) => r.kind === "event");
   const render = rows.findLast?.((r) => r.kind === "render") ??
     [...rows].reverse().find((r) => r.kind === "render");
@@ -171,6 +174,11 @@ function report(path) {
   for (const mark of marks) {
     const at = new Date(mark.at).toISOString().slice(11, 19);
     console.log(`  flagged      #${mark.ordinal} at ${at} · ${mark.nav?.stepName ?? "?"} · ${mark.screenshot}`);
+    // The driver's own account, which is the one line here that says what
+    // was wrong rather than what the app believed.
+    const note = notes.get(mark.ordinal);
+    if (note?.text) console.log(`               \x1b[1m“${note.text}”\x1b[0m`);
+    else if (note?.error) console.log(`               (nothing transcribed: ${note.error})`);
   }
 }
 
