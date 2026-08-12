@@ -2234,7 +2234,22 @@ export async function openRouteGraph(options) {
         // A sliver, or the same road carrying on: extend rather than invent
         // an instruction out of the last few metres of a street the driver
         // is already on.
-        if (!previous || (tailName && tailName !== previous.name && tailMeters >= ARRIVAL_STEP_METERS)) {
+        //
+        // "The same road" is settled by the name where there is one and by
+        // the class where there is not, because a leg with no name is still a
+        // road the driver has to turn onto. Requiring a name dropped the one
+        // case where the last movement of a drive is the one that most needs
+        // saying: a door on Boulevard Cartier sits on the far carriageway of
+        // a divided boulevard, and the way across the median is 12.9 m of
+        // unnamed `highway=service`. It reached the distance and the drawn
+        // line and produced no step at all — so the client announced the
+        // arrival on the carriageway the driver was still travelling along,
+        // and left them to discover a turn across oncoming traffic by
+        // looking at the map.
+        const differentRoad = tailName
+          ? tailName !== previous?.name
+          : tail.classCode !== previous?.roadClass;
+        if (!previous || (differentRoad && tailMeters >= ARRIVAL_STEP_METERS)) {
           steps.push({
             name: tailName,
             meters: tailMeters,

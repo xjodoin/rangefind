@@ -3546,3 +3546,91 @@ test("the last step is the street the address is on", async (t) => {
 
   assert.ok(checked > 20, `too few routes to conclude anything (${checked})`);
 });
+
+test("the way across a median is the last instruction, not the last few metres of the boulevard", async (t) => {
+  // A door on a divided boulevard is on one carriageway or the other, and
+  // getting to the far one means crossing the median at the one place there
+  // is a way across. That way is almost never named — it is a dozen metres
+  // of `highway=service` between two carriageways — and it was the last leg
+  // of the route, which is the seed the search finished on rather than an
+  // edge it traversed.
+  //
+  // The tail only became a step when it had a name, so this one did not: its
+  // metres went into Boulevard Cartier Ouest, its geometry went onto the
+  // line, and the drive ended with no instruction for the one movement left
+  // to make. A driver was told they had arrived while still on the
+  // carriageway they had been on for two kilometres, with a left turn across
+  // oncoming traffic drawn on the map and spoken nowhere.
+  const baseLat = 455000000;
+  const baseLon = -736000000;
+  const east = 5126;   // ~40 m of longitude here
+  const median = 1168; // ~13 m of latitude, which is the width of the median
+
+  const nodeLat = [];
+  const nodeLon = [];
+  // 0..4 the carriageway the driver is on, running east.
+  for (let k = 0; k < 5; k++) { nodeLat.push(baseLat); nodeLon.push(baseLon + k * east); }
+  // 5..9 the other one, across the median, running the other way.
+  for (let k = 0; k < 5; k++) { nodeLat.push(baseLat + median); nodeLon.push(baseLon + k * east); }
+
+  const from = [], to = [], weightDs = [], distDm = [], name = [], roadClass = [];
+  const geomOffsets = [0], geomBytes = [];
+  const addEdge = (a, b, dm, ds, nameId, classId) => {
+    from.push(a); to.push(b);
+    distDm.push(dm); weightDs.push(ds);
+    name.push(nameId); roadClass.push(classId);
+    geomBytes.push(0); // varint 0: no interior geometry points
+    geomOffsets.push(geomBytes.length);
+  };
+  for (let k = 0; k < 4; k++) addEdge(k, k + 1, 400, 29, 1, 0);
+  for (let k = 9; k > 5; k--) addEdge(k, k - 1, 400, 29, 1, 0);
+  addEdge(2, 7, 130, 31, 0, 1); // the crossover: 13 m, unnamed, service
+
+  const graph = {
+    nodeLat: Int32Array.from(nodeLat),
+    nodeLon: Int32Array.from(nodeLon),
+    edgeFrom: Uint32Array.from(from),
+    edgeTo: Uint32Array.from(to),
+    edgeWeightDs: Uint32Array.from(weightDs),
+    edgeDistDm: Uint32Array.from(distDm),
+    edgeName: Uint32Array.from(name),
+    edgeClass: Uint8Array.from(roadClass),
+    geomOffsets: Uint32Array.from(geomOffsets),
+    geomBytes: Uint8Array.from(geomBytes),
+    names: ["", "Boulevard Cartier Ouest"],
+    profile: "car",
+    classes: ["tertiary", "service"]
+  };
+
+  const dir = mkdtempSync(join(tmpdir(), "rangefind-median-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  buildRouteGraph(graph, dir, { leafNodes: 16, fanout: 4, topMaxCells: 4 });
+  const engine = await openRouteGraphDir(dir);
+
+  // A door just past the far kerb, which is what the crossover exists for.
+  const route = await engine.route({
+    from: { lat: baseLat / 1e7, lon: baseLon / 1e7 },
+    to: { lat: (baseLat + median + 700) / 1e7, lon: (baseLon + 2 * east) / 1e7 },
+    geometry: true
+  });
+
+  const last = route.steps[route.steps.length - 1];
+  assert.equal(graph.classes[last.roadClass], "service", "the drive ends on the way across, not on the boulevard");
+  assert.notEqual(last.name, "Boulevard Cartier Ouest");
+  assert.ok(last.meters > 12 && last.meters < 14, `the crossing is 13 m, not ${last.meters.toFixed(1)} m`);
+
+  // Every metre still belongs to a step, which is what the folding bought
+  // and what pulling the leg back out must not cost.
+  const summed = route.steps.reduce((total, step) => total + step.meters, 0);
+  assert.ok(Math.abs(summed - route.distanceMeters) < 0.5);
+
+  // And the step starts at the vertex the turn is read from: a client takes
+  // the maneuver off the bearings either side of `at`, and the crossing is a
+  // left turn off the carriageway rather than a continuation of it.
+  const before = route.geometry[last.at - 1];
+  const at = route.geometry[last.at];
+  const after = route.geometry[last.at + 1];
+  const bearing = (a, b) => (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180 / Math.PI + 360) % 360;
+  const turn = ((bearing(at, after) - bearing(before, at) + 540) % 360) - 180;
+  assert.ok(turn < -60, `the crossing turns ${turn.toFixed(0)}° off the boulevard and must read as a turn`);
+});
