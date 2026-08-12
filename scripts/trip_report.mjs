@@ -58,6 +58,66 @@ function readTrace(path) {
 /** Below this the vehicle is stopped, and nothing about motion is measurable. */
 const MOVING_MPS = 2.0;
 
+/**
+ * What the mesh did, alongside what the drive did.
+ *
+ * The counters are the easy half. The hard question a drive asks is "why did
+ * I never see any traffic", and it has two answers that look identical from
+ * outside: nobody near this driver published anything, or records arrived and
+ * every one of them was refused. Only the gossip counters separate them, so
+ * where they are missing this says so rather than implying the first.
+ */
+function reportMesh(rows) {
+  const mesh = rows.filter((r) => r.kind === "mesh");
+  if (!mesh.length) return;
+  const last = mesh[mesh.length - 1];
+  const scope = [
+    last.zones != null ? `${last.zones} zones` : null,
+    last.cells != null ? `${last.cells} cells` : null,
+    last.warmedLeaves ? `${last.warmedLeaves} warmed` : null
+  ].filter(Boolean).join(" / ");
+  console.log(
+    `  mesh         ${last.mode}${last.simulated ? " (simulated)" : ""}` +
+      `${last.epoch ? ` · epoch ${last.epoch.slice(0, 8)}` : ""}` +
+      `${last.transport ? ` · ${last.transport}` : ""}${scope ? ` · ${scope}` : ""}`
+  );
+
+  // Peers as a range rather than a final value: a mesh that was there the
+  // whole time and one that came and went read the same at the end, and only
+  // one of them explains a corridor that never got fetched.
+  const peers = mesh.map((m) => m.peers ?? 0);
+  const lost = mesh.filter((m) => (m.peers ?? 0) === 0).length;
+  console.log(
+    `               peers ${Math.min(...peers)}–${Math.max(...peers)}` +
+      `${lost ? `, none on ${lost} of ${mesh.length} samples` : ""}` +
+      `, held ${last.records ?? 0} records / ${last.segments ?? 0} segments`
+  );
+
+  console.log(
+    `               offered ${last.fixes ?? 0} fixes, emitted ${last.emitted ?? 0}, ` +
+      `suppressed ${last.suppressed ?? 0}${last.lastReason ? ` · ${last.lastReason}` : ""}`
+  );
+
+  const gossip = last.gossip;
+  if (gossip) {
+    const rules = Object.entries(gossip.dropsByRule ?? {})
+      .sort((a, b) => b[1] - a[1])
+      .map(([rule, count]) => `${rule}×${count}`)
+      .join(", ");
+    console.log(
+      `               gossip accepted ${gossip.accepted}, dropped ${gossip.dropped}` +
+        `${rules ? ` (${rules})` : ""}, ${gossip.antiEntropyRounds} anti-entropy rounds`
+    );
+  } else if ((last.records ?? 0) === 0) {
+    console.log(
+      `               \x1b[2mnothing was ever held, and this trace predates the gossip counters —\x1b[0m`
+    );
+    console.log(
+      `               \x1b[2m"nobody published" and "everything was refused" cannot be told apart here\x1b[0m`
+    );
+  }
+}
+
 function report(path) {
   const rows = readTrace(path);
   const header = rows.find((r) => r.kind === "route");
@@ -169,6 +229,8 @@ function report(path) {
   } else {
     console.log(`  map          no render summary (trace predates the frame instrumentation)`);
   }
+
+  reportMesh(rows);
 
   for (const event of events) console.log(`  event        ${event.event}${event.detail ? ` · ${event.detail}` : ""}`);
   for (const mark of marks) {

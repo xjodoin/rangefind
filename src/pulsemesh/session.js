@@ -134,6 +134,9 @@ export async function createMeshSession({
   // Live corridor watches (see watchRoute). Driven from tick() so a watch
   // works with no wiring beyond start(); stopped ones are dropped there.
   const watches = new Set();
+  // Cells the route asked for that nobody has been asked for yet, because
+  // there was no peer to ask or the ask failed. Retried from tick().
+  let pendingCorridor = null;
 
   async function warmLeaves(leaves) {
     const wanted = [];
@@ -357,12 +360,36 @@ export async function createMeshSession({
     stats.cells = cells.size;
     if (!node) return zoneList;
     node.subscribeZones(zoneList);
-    if (fetch && cells.size && network?.peersOf?.(id)?.length) {
-      // The §11.3 padding, decoys, shuffle and split all live inside
-      // fetchCells; a corridor never leaves this device in order.
-      await node.fetchCells([...cells.values()]).catch(() => 0);
-    }
+    // Held until it has actually been asked for. The fetch needs a peer to
+    // ask, and whether there is one at this instant has nothing to do with
+    // the route: a phone whose peers blinked out for six seconds — which one
+    // recorded drive did, on the minute — adopted its corridor into silence
+    // and never asked again, because nothing retried and nothing said so.
+    // The tick below picks it up as soon as anybody is there.
+    pendingCorridor = fetch && cells.size ? [...cells.values()] : null;
+    await fetchCorridor();
     return zoneList;
+  }
+
+  /**
+   * Ask for the corridor, if there is one outstanding and anyone to ask.
+   *
+   * The §11.3 padding, decoys, shuffle and split all live inside fetchCells;
+   * a corridor never leaves this device in order. A refusal leaves the
+   * request outstanding rather than dropping it, so a keeper that was busy
+   * is retried on the next beat instead of costing the drive its traffic.
+   */
+  async function fetchCorridor() {
+    if (!node || !pendingCorridor) return false;
+    if (!network?.peersOf?.(id)?.length) return false;
+    const asked = pendingCorridor;
+    pendingCorridor = null;
+    const got = await node.fetchCells(asked).catch(() => null);
+    if (got === null) {
+      pendingCorridor = asked;
+      return false;
+    }
+    return true;
   }
 
   // --- Incidents ---------------------------------------------------------
@@ -649,6 +676,10 @@ export async function createMeshSession({
   async function tick(nowMillis = clock()) {
     if (node) await node.tick(nowMillis);
     if (!node) return;
+    // A corridor the route asked for and no peer was there to answer. Ask
+    // now, before the watches read a store that would otherwise stay empty
+    // for the whole drive.
+    await fetchCorridor();
     // Corridor watches run before the warm: a driver wants to hear about
     // the jam ahead on this beat, not the next one.
     for (const watch of watches) {
