@@ -1144,6 +1144,27 @@ async function anchoredExactText(engine, q, params, anchor, {
           sort: "distance"
         }
       });
+      // Locality enrichment stamps the municipality into every local doc's
+      // searchable text, so a bare city name now term-matches the streets
+      // around the caller. The exact lane's promise is the nearest bearers
+      // of the queried name; results that merely sit in a place of that name
+      // are not an answer, and a page with no bearer at all means the name
+      // belongs to the locality resolvers further down the cascade.
+      if (!intent) {
+        const bearers = (response.results || []).filter(result => {
+          const name = result.name || result.title;
+          return fold(name) === fold(q) || withinOneFoldedEdit(name, q);
+        });
+        if (!bearers.length) return null;
+        if (bearers.length !== response.results.length) {
+          return exactGeoResponse({
+            ...response,
+            total: bearers.length,
+            approximate: true,
+            results: bearers
+          }, authority, scope, NEAR_TEXT_RADIUS_METERS, lane);
+        }
+      }
       return exactGeoResponse(response, authority, scope, NEAR_TEXT_RADIUS_METERS, lane);
     } catch (error) {
       if (!isGeoTextSortBudgetError(error)) throw error;
@@ -1239,9 +1260,43 @@ async function anchoredExactText(engine, q, params, anchor, {
     ))) fuzzy.push(ranked);
     else other.push(ranked);
   }
-  if (!authority && !exact.length && !fuzzy.length) return null;
+  // A bare name with no exact bearer on the page is the signature of a
+  // locality query since enrichment: "montreal" matches every stamped doc
+  // and every "... Montréal ..." venue, while the city place doc itself is
+  // drowned below the probe window. One root-authority read (already cached
+  // by this lane's own gate) arbitrates; an authority miss keeps the fuzzy
+  // page for genuine partial names.
+  if (!intent && !exact.length) {
+    const lexicon = await engineCategoryLexicon(engine);
+    if (possibleLocalityQuery(q, lexicon)) {
+      const locality = await resolveLocality(engine, q, params, { authorityMissIsFinal: true });
+      if (locality) {
+        const resolved = localityExactResponse(locality, params, q);
+        const trace = mergeRuntimeTraces(response.stats?.trace, resolved.stats?.trace);
+        return {
+          ...resolved,
+          stats: {
+            ...(resolved.stats || {}),
+            ...(trace ? { trace } : {})
+          }
+        };
+      }
+    }
+  }
+  // Without an intent the query is a plain name; when nothing in the probe
+  // bears it even fuzzily, the term matches came from enriched locality
+  // text and the cascade's place resolvers own the answer — authority
+  // proving the name exists somewhere does not make these results bearers.
+  if ((!authority || !intent) && !exact.length && !fuzzy.length) return null;
   const byDistance = (left, right) => Number(left.distanceMeters ?? Infinity) - Number(right.distanceMeters ?? Infinity);
-  exact.sort(byDistance);
+  // A bare query that names a place outranks same-named stops and venues:
+  // someone typing just "Longueuil" means the city before its bus stop.
+  exact.sort(!intent
+    ? (left, right) => (
+      Number(LOCALITY_TYPES.has(right.type)) - Number(LOCALITY_TYPES.has(left.type))
+      || byDistance(left, right)
+    )
+    : byDistance);
   fuzzy.sort(byDistance);
   other.sort(byDistance);
   const localCandidates = [...exact, ...fuzzy, ...other];
@@ -2523,6 +2578,31 @@ async function searchOsmQueryBase(engine, rawParams = {}) {
         }
       });
       if (local.total > 0 && local.results.length) {
+        // Enriched locality text makes any city name match its own streets
+        // and addresses, so a non-empty local page no longer proves the
+        // query named something nearby. When nothing on the page bears the
+        // name itself and the surface could be a place, one root-authority
+        // read (already cached by the exact lane above) arbitrates: a
+        // proven locality answers as the place, an authority miss keeps
+        // this local page exactly as before.
+        const bearsName = local.results.some(result => {
+          const name = result.name || result.title;
+          return fold(name) === fold(q) || withinOneFoldedEdit(name, q);
+        });
+        if (!bearsName && possibleLocalityQuery(q, lexicon)) {
+          const locality = await resolveLocality(engine, q, params, { authorityMissIsFinal: true });
+          if (locality) {
+            const response = localityExactResponse(locality, params, q);
+            const trace = mergeRuntimeTraces(local.stats?.trace, response.stats?.trace);
+            return {
+              ...response,
+              stats: {
+                ...(response.stats || {}),
+                ...(trace ? { trace } : {})
+              }
+            };
+          }
+        }
         return collapseCivicDuplicates({
           ...local,
           stats: {

@@ -1761,6 +1761,85 @@ test("OSM repeated brand names use true nearest order inside the anchor shard", 
   assert.equal(exact.results[0].distanceMeters, 313.3);
 });
 
+test("OSM bare city names resolve the place, not the locality-stamped docs around the caller", async () => {
+  // Locality enrichment stamps the municipality into every doc's searchable
+  // text, so "laval" term-matches the streets and addresses surrounding an
+  // anchor inside Laval. None of those results bear the queried name; the
+  // planner must hand the query to the locality resolver instead of
+  // returning the nearest stamped street.
+  const calls = [];
+  const engine = {
+    manifest: {
+      features: { shards: true },
+      shards: [
+        { id: "ontario", bbox: [41.6, -95.2, 56.9, -74.3] },
+        { id: "quebec", bbox: [44.9, -79.9, 62.7, -57] }
+      ]
+    },
+    async authorityLookup() {
+      return {
+        matches: [{ text: "Laval", weight: 5000, count: 4504, shards: ["quebec"] }]
+      };
+    },
+    async search(params) {
+      calls.push(params);
+      if (params.geo?.sort === "distance") {
+        // Nearest text matches are enrichment-stamped street segments.
+        return {
+          total: 18,
+          results: Array.from({ length: 18 }, (_, index) => ({
+            name: "Boulevard Curé-Labelle",
+            type: "primary",
+            city: "Laval",
+            shard: "quebec",
+            lat: 45.5841 + index / 10000,
+            lon: -73.7881,
+            distanceMeters: 59 + index * 5
+          })),
+          stats: {}
+        };
+      }
+      if (params.filters?.facets?.category?.includes("place")) {
+        return {
+          total: 263,
+          results: [
+            { name: "Laval", type: "city", shard: "quebec", lat: 45.6066, lon: -73.7124 },
+            { name: "Laval-en-Belledonne", type: "village", shard: "france", lat: 45.25, lon: 5.98 }
+          ],
+          stats: {}
+        };
+      }
+      // The bounded relevance probe: stamped addresses on streets that merely
+      // contain the token, drowning the place doc below the window.
+      return {
+        total: 597,
+        results: Array.from({ length: 32 }, (_, index) => ({
+          name: `${2000 + index} Laval Ouest, Laval, QC`,
+          type: "address",
+          city: "Laval",
+          shard: "quebec",
+          lat: 45.58 + index / 10000,
+          lon: -73.79
+        })),
+        stats: {}
+      };
+    }
+  };
+
+  const response = await searchOsmQuery(engine, {
+    q: "laval",
+    size: 10,
+    near: { lat: 45.5841, lon: -73.7881 }
+  });
+
+  assert.equal(response.stats.plannerLane, "osmLocalityExact");
+  assert.equal(response.total, 1);
+  assert.equal(response.results[0].name, "Laval");
+  assert.equal(response.results[0].type, "city");
+  const placeCall = calls.find(params => params.filters?.facets?.category?.includes("place"));
+  assert.deepEqual(placeCall.shards, ["quebec"], "locality resolution stays routed to the authority shard");
+});
+
 test("OSM viewport brand search orders locally and never accepts a foreign authority hint", async () => {
   const calls = [];
   const box = { minLat: 45.55, maxLat: 45.66, minLon: -73.8, maxLon: -73.62 };
