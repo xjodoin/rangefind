@@ -31,6 +31,12 @@ jobs:
           cache: npm
       - run: npm ci
 
+      # The plugin resolves the widget through the `rangefind/element` export
+      # (dist/rangefind-search.{js,css}), which is build output and therefore
+      # absent from a fresh checkout — its tests copy those files.
+      - name: Build search element bundle
+        run: npm run build:element
+
       - name: Build sdist and wheel
         run: |
           python -m pip install --upgrade build
