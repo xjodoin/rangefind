@@ -156,6 +156,25 @@ for (const name of DICTIONARIES) {
   }
 }
 
+// Single-token canonical street types across every language, canonicalized.
+// The runtime uses this only as a detector: a query that carries a house
+// number but none of these tokens probably omitted its street type
+// ("214 libersan ste-thérèse"), so insertion variants apply.
+const streetTypeTokens = new Set();
+for (const lang of DICTIONARY_LANGUAGES) {
+  let text;
+  try {
+    text = await loadDictionary(`${lang}/street_types.txt`, dictDir);
+  } catch {
+    continue;
+  }
+  for (const line of text.split("\n")) {
+    const [canonical] = line.trim().split("|");
+    const folded = normalizeEntry(canonical || "").map(canonToken);
+    if (folded.length === 1 && /^[a-z]{2,}$/u.test(folded[0])) streetTypeTokens.add(folded[0]);
+  }
+}
+
 const concatenatedSuffixes = new Set(CURATED_CONCATENATED_SUFFIXES);
 try {
   const text = await loadDictionary("de/concatenated_suffixes_separable.txt", dictDir);
@@ -204,6 +223,11 @@ export const CONCATENATED_STREET_SUFFIXES = new Set(${JSON.stringify(suffixList)
 export const CONCATENATED_SUFFIX_READINGS = new Map([
 ${suffixReadings}
 ]);
+
+// Single-token canonical street types across every language. A query with a
+// house number but none of these tokens probably omitted its street type;
+// insertion variants probe the common types.
+export const STREET_TYPE_TOKENS = new Set(${JSON.stringify([...streetTypeTokens].sort())});
 `;
 
 writeFileSync(resolve(import.meta.dirname, "../src/address_abbreviations.js"), output);

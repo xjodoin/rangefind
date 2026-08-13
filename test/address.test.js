@@ -88,6 +88,13 @@ test("French-Canadian abbreviated queries probe the published address keys", () 
   const values = addressRangeLookupValues(202, 218, 2, ["Boulevard Cartier Ouest Laval"]);
   assert.ok(addressRangeQueryCandidates("214 Bd Cartier O, Laval")
     .some(candidate => values.includes(candidate.lookupValue) && candidate.houseNumber === 214));
+
+  // Street type omitted and locality abbreviated at once: the interpolation
+  // lane still reaches the tail the builder derived from "Rue Libersan,
+  // Sainte-Thérèse".
+  const libersan = addressRangeLookupValues(202, 218, 2, ["Rue Libersan Sainte-Thérèse"]);
+  assert.ok(addressRangeQueryCandidates("214 libersan ste-thérèse")
+    .some(candidate => libersan.includes(candidate.lookupValue) && candidate.houseNumber === 214));
 });
 
 test("abbreviated queries reach spelled-out keys across the libpostal en/fr matrix", () => {
@@ -126,7 +133,11 @@ test("abbreviated queries reach spelled-out keys across the libpostal en/fr matr
     ["Av del Libertador 100, Madrid", "Avenida del Libertador 100, Madrid"],
     ["Avda Diagonal 200, Barcelona", "Avinguda Diagonal 200, Barcelona"],
     ["Vle Monza 100, Milano", "Viale Monza 100, Milano"],
-    ["Ul Marszałkowska 1, Warszawa", "Ulica Marszałkowska 1, Warszawa"]
+    ["Ul Marszałkowska 1, Warszawa", "Ulica Marszałkowska 1, Warszawa"],
+    // street type omitted entirely: insertion probes the common types
+    ["214 libersan ste-thérèse", "214 Rue Libersan, Sainte-Thérèse"],
+    ["311 cartier ouest laval", "311 Boulevard Cartier Ouest, Laval"],
+    ["100 main brooklyn", "100 Main Street, Brooklyn"]
   ];
   for (const [query, indexed] of cases) {
     assert.ok(
@@ -651,6 +662,17 @@ test("exact, reordered, and component address forms bypass postings", async () =
     const saintSpelled = await engine.search({ q: "1500 Saint Clair Ave W, Toronto", size: 5 });
     assert.equal(saintSpelled.stats.plannerLane, "addressAuthorityExact");
     assert.equal(saintSpelled.results[0].id, "st-clair");
+
+    // Street type omitted entirely: insertion probes recover the flat
+    // address and, with the locality abbreviated too, the interpolated one.
+    const typeOmitted = await engine.search({ q: "311 cartier ouest laval", size: 5 });
+    assert.equal(typeOmitted.stats.plannerLane, "addressAuthorityExact");
+    assert.equal(typeOmitted.results[0].id, "cartier-ouest");
+
+    const bareInterpolated = await engine.search({ q: "214 libersan ste-thérèse", size: 2 });
+    assert.equal(bareInterpolated.stats.plannerLane, "addressInterpolationExact");
+    assert.equal(bareInterpolated.total, 1);
+    assert.equal(bareInterpolated.results[0].house_number, "214");
   } finally {
     await engine.close();
   }

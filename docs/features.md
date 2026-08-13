@@ -456,10 +456,13 @@ Cartier O, Laval, QC H7N 2J3" resolves like "311 Boulevard Cartier Ouest,
 Laval"; "NW" like "Northwest"), Germanic/Scandinavian concatenated street
 suffixes ("Marktstr 5" and "Markt Str 5" both resolve like "Marktstraße 5"),
 single-token state/province names in both directions ("Ohio" ↔ "OH"),
-detached or attached unit letters and "Apt N"/"#2F" designations, and
-trailing province/state and postal-code tails. Candidates rank cheapest
-interpretation first under a fixed probe cap, so unambiguous queries still
-derive a single key. Explicit address points always win over interpolation.
+detached or attached unit letters and "Apt N"/"#2F" designations, trailing
+province/state and postal-code tails, and omitted street types — a house
+number with a bare street name ("214 libersan ste-thérèse") probes the
+common types inserted ("214 Rue Libersan, Sainte-Thérèse"). Candidates rank
+cheapest interpretation first under a fixed probe cap, so unambiguous
+queries still derive a single key. Explicit address points always win over
+interpolation.
 
 OSM `addr:interpolation` ways remain compact ranges rather than becoming one
 document per potential house number. The runtime checks range bounds,

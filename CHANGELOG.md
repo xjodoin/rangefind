@@ -82,7 +82,11 @@
   "Markt Straße 5" all reach the key of "Marktstraße 5", same for Dutch
   -straat and Scandinavian -gatan/-vej forms); unit letters and "Apt N"/
   "#2F" designations merged, split, and shed; postal codes and short
-  trailing region abbreviations shed. Candidates rank cheapest
+  trailing region abbreviations shed; and omitted street types recovered —
+  a house number beside a bare street name ("214 libersan ste-thérèse")
+  probes the common types inserted, reaching "214 Rue Libersan,
+  Sainte-Thérèse" on both the flat and interpolated lanes. Candidates rank
+  cheapest
   interpretation first (readings substituted, suffixes merged, tails shed —
   lone-letter directionals cheapest, stacked substitutions dearest) under a
   40-key cap, so unambiguous queries still derive a single key, and the

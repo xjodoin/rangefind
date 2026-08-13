@@ -2,7 +2,8 @@ import { foldMulti } from "./analysis_fold.js";
 import {
   ADDRESS_TOKEN_READINGS,
   CONCATENATED_STREET_SUFFIXES,
-  CONCATENATED_SUFFIX_READINGS
+  CONCATENATED_SUFFIX_READINGS,
+  STREET_TYPE_TOKENS
 } from "./address_abbreviations.js";
 
 const DIRECTION_PHRASES = [
@@ -270,6 +271,33 @@ function readingsVariants(baseTokens, maxVariants = 12) {
 
 const UNIT_MARKER_TOKENS = new Set(["unit", "apt", "ste", "app"]);
 
+// The street types people actually omit, most common first. Canonical forms
+// (post TOKEN_ALIASES), one insertion probe each. German/Dutch types are
+// absent on purpose: they concatenate onto the name, so an omitted type
+// changes the name token itself and insertion cannot reconstruct it.
+const STREET_TYPE_INSERTIONS = [
+  "st", "rue", "ave", "rd", "dr", "blvd", "ln", "chemin", "ct", "calle", "via", "rua"
+];
+
+// "214 libersan ste-thérèse": a house number with a bare street name. Every
+// indexed key carries the street type, so a query that has a number but no
+// type token probes the common types inserted after the number. A missing
+// word is a bigger leap than reading an abbreviation, so insertions cost 2
+// and rank behind every single substitution.
+function streetTypeInsertionVariants(tokens) {
+  const variants = [{ tokens, cost: 0 }];
+  const numberIndex = tokens.findIndex(isNumberToken);
+  if (numberIndex < 0 || tokens.length < 3) return variants;
+  if (tokens.some(token => STREET_TYPE_TOKENS.has(token))) return variants;
+  for (const type of STREET_TYPE_INSERTIONS) {
+    variants.push({
+      tokens: [...tokens.slice(0, numberIndex + 1), type, ...tokens.slice(numberIndex + 1)],
+      cost: 2
+    });
+  }
+  return variants;
+}
+
 // Germanic and Scandinavian street names concatenate their type suffix, so a
 // spaced query ("Markt Straße 5") also probes the merged form the index
 // derived from "Marktstraße". Runs after readings so "Markt Str" reaches
@@ -367,14 +395,16 @@ export function addressQueryTokenVariants(value, maxVariants = 40) {
   if (!base) return [];
   const candidates = [];
   for (const reading of readingsVariants(base.split(" "))) {
-    for (const concatenation of concatenationVariants(reading.tokens)) {
-      for (const unitVariant of unitLetterVariants(concatenation.tokens)) {
-        for (const tail of tailVariants(unitVariant.tokens)) {
-          candidates.push({
-            tokens: tail.tokens,
-            cost: reading.cost + concatenation.cost + unitVariant.cost + tail.cost,
-            order: candidates.length
-          });
+    for (const insertion of streetTypeInsertionVariants(reading.tokens)) {
+      for (const concatenation of concatenationVariants(insertion.tokens)) {
+        for (const unitVariant of unitLetterVariants(concatenation.tokens)) {
+          for (const tail of tailVariants(unitVariant.tokens)) {
+            candidates.push({
+              tokens: tail.tokens,
+              cost: reading.cost + insertion.cost + concatenation.cost + unitVariant.cost + tail.cost,
+              order: candidates.length
+            });
+          }
         }
       }
     }
@@ -478,8 +508,11 @@ export function addressRangeQueryCandidates(value, bucketSize = ADDRESS_RANGE_BU
   const candidates = [];
   const seen = new Set();
   // Interpolation probes pay two parity keys per candidate, so the variant
-  // budget stays tighter than the flat authority lane's.
-  for (const tokens of addressQueryTokenVariants(value, 8)) {
+  // budget stays tighter than the flat authority lane's — but wide enough
+  // that a street-type insertion stacked on one substitution ("214 libersan
+  // ste-thérèse" -> "214 rue libersan sainte-thérèse") still makes the cut.
+  // This lane only runs after the flat authority lane came up empty.
+  for (const tokens of addressQueryTokenVariants(value, 24)) {
     for (let index = 0; index < tokens.length; index++) {
       if (!/^\d+$/u.test(tokens[index])) continue;
       const houseNumber = Number(tokens[index]);
