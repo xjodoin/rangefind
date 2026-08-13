@@ -749,6 +749,11 @@ var TOKEN_ALIASES = new Map(Object.entries({
   avenue: "ave",
   av: "ave",
   boulevard: "blvd",
+  // French-Canadian civic addresses abbreviate "boulevard" as "boul" or "bd"
+  // ("311 Bd Cartier O"). OSM/RQA data spells the word out, so both spellings
+  // must land on the same canonical token as "boulevard" itself.
+  boul: "blvd",
+  bd: "blvd",
   road: "rd",
   drive: "dr",
   lane: "ln",
@@ -843,6 +848,7 @@ function normalizeAddressKey(value) {
   const tokens = normalizeOrdinalTokens(normalized.match(/[a-z0-9]+/gu) || []);
   return tokens.map((token) => TOKEN_ALIASES.get(token) || token).join(" ");
 }
+var TRAILING_KEEP_TOKENS = /* @__PURE__ */ new Set([...new Set(TOKEN_ALIASES.values()), "o"]);
 var CANADIAN_POSTAL_CODE = /\b([abceghj-nprstvxy]\d[abceghj-nprstvwxyz])\s*([0-9][abceghj-nprstvwxyz][0-9])\b/giu;
 function normalizePostalCodeSpacing(value) {
   return String(value || "").replace(CANADIAN_POSTAL_CODE, "$1 $2");
