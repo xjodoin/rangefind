@@ -768,12 +768,20 @@ a { color: inherit; }
 .map-pick-button.active > span { background: var(--marker); box-shadow: 0 0 0 3px rgba(255, 201, 64, .12); }
 .maplibregl-canvas.is-picking { cursor: crosshair; }
 
+/* Search mode delegates scrolling to #resultList, which shrinks to the space
+   it is given. Directions mode instead stacks fixed-height cards — the route
+   card and the live-traffic card — that together outgrow this box, so the
+   column itself has to scroll or everything past the fold is unreachable. */
 .results {
   display: flex;
   min-height: 0;
   flex: 1 1 auto;
   flex-direction: column;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #484e59 transparent;
+  scrollbar-width: thin;
 }
 
 .status-line {
@@ -1540,15 +1548,12 @@ a { color: inherit; }
 }
 .route-steps-wrap summary::-webkit-details-marker { display: none; }
 .route-steps-wrap[open] summary .query-receipt__chevron { transform: rotate(180deg); }
+/* The steps ride the panel's own scroll rather than nesting a second
+   scroller inside it: one gesture reaches the last step of a long route. */
 .route-steps {
-  max-height: min(30vh, 260px);
   margin: 7px 0 0;
   padding: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
   list-style: none;
-  scrollbar-color: #484e59 transparent;
-  scrollbar-width: thin;
 }
 .route-step {
   display: grid;
@@ -1952,7 +1957,6 @@ a { color: inherit; }
   .map-hud { top: 14px; bottom: auto; left: 14px; right: auto; }
   .maplibregl-ctrl-top-right { top: 6px; right: 6px; }
   .mode-switch { margin-bottom: 10px; }
-  .route-steps { max-height: 22vh; }
   .route-card__eta strong { font-size: 1.4rem; }
   .toast { top: 60px; }
 }
@@ -2150,10 +2154,6 @@ a { color: inherit; }
   .panel.is-sheet .results {
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-  }
-
-  .panel.is-sheet .route-steps {
-    max-height: none;
   }
 }
 
