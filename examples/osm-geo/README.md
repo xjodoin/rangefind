@@ -123,8 +123,17 @@ a multilevel bidirectional Dijkstra client-side. The demo bundles the
 dependency-free engine as `public/route.browser.js` (built by
 `npm run build:osm-demo` alongside the runtime and OSM bundles).
 
-The UI probes `route-graph/manifest.json` at startup. When absent, the
-Directions tab explains how to publish an index:
+The UI probes `route-graph/manifest.json` at startup and uses that local
+index when it exists. Otherwise it opens the published route catalog
+(`routes/catalog.json` beside the search index), which carries one graph per
+region, and opens the single region the current view needs — so the deployed
+demo routes without shipping a graph of its own. A stop outside the open
+region moves to its own region while it is the only stop; regions published
+by an older builder than the client simply do not open, and the next region
+covering the point is tried instead.
+
+When neither source is reachable, the Directions tab explains how to publish
+a local index:
 
 ```bash
 # Build a route graph (Luxembourg matches the demo fixture region)

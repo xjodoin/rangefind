@@ -15,6 +15,7 @@ import {
   openRouteGraphUrl,
   remainingPath,
   repriceDecision,
+  resolveIndexBase,
   segmentsOf,
   shouldRepriceNow
 } from "./route.browser.js";
@@ -1638,10 +1639,17 @@ const ROUTE_COLORS = { active: "#ffc940", legAlt: "#35c2ac", casing: "#14161d", 
 const SNAP_NOTE_MIN_METERS = 20;
 const COVERAGE_PAD_DEG = 0.12;
 
+// The published planet catalog: one immutable route graph per region, plus
+// the portal packs that join them. It is the discovery layer only — a single
+// regional graph is what snaps, routes, and unpacks geometry here.
+const OSM_ROUTE_CATALOG_URL = new URL("routes/catalog.json", OSM_INDEX_BASE_URL).href;
+
 let routeEngine = null;
 let routeAvailable = null; // null = probing, false = missing, true = ready
 let routeCoverage = null;
 let routeBucketNames = [];
+let routeCatalogIndexes = null; // null while local, else the car-profile regions
+let routeRegionLabel = "";
 let directionsMode = false;
 let stops = [];
 let stopPickIndex = -1;
@@ -1711,33 +1719,99 @@ function insideCoverage(point, pad = COVERAGE_PAD_DEG) {
     && point.lon >= routeCoverage.minLon - pad && point.lon <= routeCoverage.maxLon + pad;
 }
 
+function activateRouteGraph(engine, label) {
+  routeEngine = engine;
+  routeRegionLabel = label;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  for (const leaf of engine.root.leaves) {
+    if (leaf.bbox.minLat < minLat) minLat = leaf.bbox.minLat;
+    if (leaf.bbox.maxLat > maxLat) maxLat = leaf.bbox.maxLat;
+    if (leaf.bbox.minLon < minLon) minLon = leaf.bbox.minLon;
+    if (leaf.bbox.maxLon > maxLon) maxLon = leaf.bbox.maxLon;
+  }
+  routeCoverage = { minLat: minLat / 1e7, maxLat: maxLat / 1e7, minLon: minLon / 1e7, maxLon: maxLon / 1e7 };
+  routeBucketNames = engine.root.buckets.map(bucket => bucket.name);
+  routeAvailable = true;
+  departureRow.hidden = routeBucketNames.length < 2;
+  modeDirectionsTab.title = label
+    ? `Turn-by-turn routing computed in this browser — ${label}`
+    : "Turn-by-turn routing computed in this browser";
+  // Live traffic is bound to this exact index build (its sourceHash is
+  // the mesh epoch), so the card only exists once the graph is open.
+  wireMeshControls();
+}
+
+// Catalog bboxes are [minLat, minLon, maxLat, maxLon] in degrees.
+function regionCovers(index, point, pad = COVERAGE_PAD_DEG) {
+  const [minLat, minLon, maxLat, maxLon] = index.bbox;
+  return point.lat >= minLat - pad && point.lat <= maxLat + pad
+    && point.lon >= minLon - pad && point.lon <= maxLon + pad;
+}
+
+function regionArea(index) {
+  const [minLat, minLon, maxLat, maxLon] = index.bbox;
+  return Math.max(0, maxLat - minLat) * Math.max(0, maxLon - minLon);
+}
+
+// Open the published graph covering `point` and make it the active one.
+// Regions are tried tightest-first: a small graph is the cheaper open, and
+// where coverage nests the local build is the more detailed one. A region
+// published by an older builder than this client simply does not open, so
+// the search continues with the next candidate instead of failing outright.
+async function openRegionFor(point) {
+  if (!routeCatalogIndexes) return false;
+  const candidates = routeCatalogIndexes
+    .filter(index => regionCovers(index, point))
+    .sort((left, right) => regionArea(left) - regionArea(right));
+  for (const index of candidates) {
+    try {
+      const engine = await openRouteGraphUrl(resolveIndexBase(OSM_ROUTE_CATALOG_URL, index.base));
+      activateRouteGraph(engine, humanize(index.region));
+      return true;
+    } catch {
+      // Try the next region that covers this point.
+    }
+  }
+  return false;
+}
+
+async function loadRouteCatalog() {
+  const response = await fetch(OSM_ROUTE_CATALOG_URL, { cache: "no-store" });
+  if (!response.ok) throw new Error(`route catalog ${response.status}`);
+  const catalog = await response.json();
+  const indexes = (catalog.indexes || [])
+    .filter(index => index.profile === "car" && index.base && Array.isArray(index.bbox) && index.bbox.length === 4);
+  if (!indexes.length) throw new Error("route catalog publishes no car regions");
+  return indexes;
+}
+
+// A locally published graph wins when present — it is how the demo is
+// developed offline — and otherwise the demo routes on the published planet
+// catalog, opening the one region the current view needs.
 async function initRouteGraph() {
   try {
-    const probe = await fetch("route-graph/manifest.json");
-    if (!probe.ok) throw new Error(`route-graph manifest ${probe.status}`);
-    routeEngine = await openRouteGraphUrl("route-graph/");
-    let minLat = Infinity;
-    let maxLat = -Infinity;
-    let minLon = Infinity;
-    let maxLon = -Infinity;
-    for (const leaf of routeEngine.root.leaves) {
-      if (leaf.bbox.minLat < minLat) minLat = leaf.bbox.minLat;
-      if (leaf.bbox.maxLat > maxLat) maxLat = leaf.bbox.maxLat;
-      if (leaf.bbox.minLon < minLon) minLon = leaf.bbox.minLon;
-      if (leaf.bbox.maxLon > maxLon) maxLon = leaf.bbox.maxLon;
+    const probe = await fetch("route-graph/manifest.json").catch(() => null);
+    if (probe?.ok) {
+      activateRouteGraph(await openRouteGraphUrl("route-graph/"), "");
+      return;
     }
-    routeCoverage = { minLat: minLat / 1e7, maxLat: maxLat / 1e7, minLon: minLon / 1e7, maxLon: maxLon / 1e7 };
-    routeBucketNames = routeEngine.root.buckets.map(bucket => bucket.name);
-    routeAvailable = true;
-    departureRow.hidden = routeBucketNames.length < 2;
-    modeDirectionsTab.title = "Turn-by-turn routing computed in this browser";
-    // Live traffic is bound to this exact index build (its sourceHash is
-    // the mesh epoch), so the card only exists once the graph is open.
-    wireMeshControls();
+    routeCatalogIndexes = await loadRouteCatalog();
+    const center = map.getCenter();
+    if (!await openRegionFor({ lat: center.lat, lon: center.lng })) {
+      // No region opened for the current view: directions stay available,
+      // and the first stop the user picks chooses the region instead.
+      routeAvailable = true;
+      routeCoverage = null;
+      modeDirectionsTab.title = "Turn-by-turn routing computed in this browser";
+    }
   } catch {
     routeAvailable = false;
+    routeCatalogIndexes = null;
     modeDirectionsTab.setAttribute("aria-disabled", "true");
-    modeDirectionsTab.title = "No route graph published at route-graph/";
+    modeDirectionsTab.title = "No route graph published";
     if (directionsMode) enterDirectionsUnavailable();
   }
 }
@@ -1789,8 +1863,8 @@ function directionsEmptyState() {
 function enterDirectionsUnavailable() {
   routeSetupHint.hidden = false;
   directionsForm.hidden = true;
-  setStatus("Route graph not published", "error");
-  showEmpty("Directions needs a route index", "Publish a route graph at route-graph/ using the commands above, then reload.");
+  setStatus("Route graph unreachable", "error");
+  showEmpty("Directions needs a route index", "Publish a route graph at route-graph/ using the commands above, or make the published route catalog reachable, then reload.");
 }
 
 function setDirectionsMode(on) {
@@ -1970,13 +2044,26 @@ async function setStopPlace(index, place) {
   stop.place = place;
   stop.snap = null;
   stop.error = "";
-  if (routeCoverage && !insideCoverage(place)) {
-    stop.error = "coverage";
-    setStopNote(stop, "Outside the routable area", "error");
-    showToast("The route graph covers Luxembourg only — pick a point inside it.", "error");
-    updateStopMarkers();
-    maybeRoute();
-    return;
+  if (!routeEngine || (routeCoverage && !insideCoverage(place))) {
+    // One regional graph routes within itself, so a stop outside the open
+    // region can only move the whole route: allowed while this is the sole
+    // anchor, refused once another stop is committed to the current region.
+    const anchored = stops.some(other => other !== stop && other.place && !other.error);
+    const switched = !anchored && await openRegionFor(place);
+    if (token !== stop.resolveToken) return;
+    if (!switched) {
+      stop.error = "coverage";
+      setStopNote(stop, "Outside the routable area", "error");
+      showToast(
+        anchored && routeRegionLabel
+          ? `This route is inside ${routeRegionLabel} — clear the stops to route somewhere else.`
+          : "No published route graph covers that point yet.",
+        "error"
+      );
+      updateStopMarkers();
+      maybeRoute();
+      return;
+    }
   }
   if (!routeEngine) {
     setStopNote(stop, "Route graph still loading — try again in a moment", "error");
@@ -6394,7 +6481,11 @@ function startNavigation(source) {
         const { latitude, longitude, heading } = position.coords;
         if (!nav || nav.source !== "gps") return;
         if (routeCoverage && !insideCoverage({ lat: latitude, lon: longitude }, 0.05)) {
-          showToast("Your GPS fix is outside the Luxembourg route graph — switching to the demo drive.", "error", 5200);
+          showToast(
+            `Your GPS fix is outside the ${routeRegionLabel || "open"} route graph — switching to the demo drive.`,
+            "error",
+            5200
+          );
           switchNavToSim();
           return;
         }

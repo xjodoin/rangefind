@@ -60,7 +60,7 @@ function portalTriples(values) {
   return portals;
 }
 
-function resolveIndexBase(catalogUrl, base) {
+export function resolveIndexBase(catalogUrl, base) {
   const value = String(base || "./");
   const catalogBase = new URL(".", catalogUrl);
   // Production catalogs are stored at routes/catalog.json but their entries

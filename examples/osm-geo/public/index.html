@@ -224,8 +224,8 @@
 
         <div id="directionsControls" class="directions" hidden>
           <p id="routeSetupHint" class="route-setup-hint" hidden>
-            No route graph is published at <code>route-graph/</code>. Build the static
-            routing index, then copy it into the demo:
+            Neither the published route catalog nor a local <code>route-graph/</code>
+            could be reached. Build the static routing index, then copy it into the demo:
             <code>node scripts/osm_road_graph.mjs luxembourg-latest.osm.pbf luxembourg.graph.bin</code>
             <code>node scripts/route_bench.mjs build luxembourg.graph.bin bench/route/luxembourg-index --peak</code>
             <code>npm run setup:osm-demo-route</code>
