@@ -1,10 +1,5 @@
 node_modules/
-dist/*
-!dist/
-!dist/runtime.browser.js
-!dist/osm.browser.js
-!dist/rangefind-search.js
-!dist/rangefind-search.css
+dist/
 examples/basic/public/rangefind/
 examples/basic/public/runtime.browser.js
 examples/basic/public/rangefind-search.js
