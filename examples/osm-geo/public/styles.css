@@ -780,6 +780,9 @@ a { color: inherit; }
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* Scrolled to the end, the last row would otherwise stop exactly on the
+     footer's top border and read as clipped. */
+  padding-bottom: 10px;
   scrollbar-color: #484e59 transparent;
   scrollbar-width: thin;
 }
