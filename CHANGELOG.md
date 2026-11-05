@@ -2,7 +2,23 @@
 
 ## Unreleased
 
+## 0.5.1 — 2026-11-05
+
 ### Added
+
+- `augmentOsmWithAddressSources({ candidateCache: { path, identity } })`
+  caches the source-only half of address enrichment. Only the OSM-duplicate
+  check depends on the OSM corpus; parsing, normalization, source-priority
+  dedupe, civic documents, and postal aggregates depend only on the sources.
+  A miss writes every unique civic candidate (with its dedupe keys) and postal
+  document to a gzip cache for +9% time; a hit skips the sources and SQLite
+  entirely and re-filters the candidates against an in-memory set of the new
+  corpus's OSM address keys — byte-identical output, ~10x faster on 1M rows.
+  On the planet pipeline a country such as Brazil reads 96M source rows
+  against only 1.7M OSM address keys, so a weekly PBF refresh with unchanged
+  addresses no longer pays the hour-long source pass. `meta.candidateCache`
+  reports `"hit"`/`"miss"`; key the cache on source *content* (e.g. a
+  regional partition hash), since provider snapshot identities churn.
 
 - Suggestions became previews of search instead of bare strings. Autocomplete
   entries keep their best `[doc, score]` rows (`suggestMaxDocRows`, default 3
