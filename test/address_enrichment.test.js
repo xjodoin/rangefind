@@ -220,3 +220,66 @@ test("enrichment cache compares generic remote identities and provenance metadat
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a candidate-cache replay against a new OSM corpus equals a full enrichment", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-address-enrichment-cache-"));
+  try {
+    const osmDoc = (id, houseNumber, city = "Rosemère") => JSON.stringify({
+      id, address: `${houseNumber} Rue Exemple, ${city}`, house_number: houseNumber, street: "Rue Exemple", city, lat: 45.64, lon: -73.8
+    });
+    const civic = Array.from({ length: 40 }, (_, i) => ({
+      id: `a${i}`, houseNumber: String(i), street: "Rue Exemple", city: i % 3 ? "Rosemère" : "", state: "QC",
+      country: "CA", postcode: i % 2 ? "J7A 1V6" : "J7A 2B2", lat: 45.6 + i / 1000, lon: -73.8
+    }));
+    let reads = 0;
+    const sources = () => [
+      {
+        id: "postal-authority", name: "Postal Authority", version: "2026-08", includeAddresses: false,
+        records: () => { reads++; return records([{ id: "p", kind: "postal_code", postcode: "j7a1v6", city: "Rosemère", state: "QC", country: "CA", lat: 45.64, lon: -73.79 }]); }
+      },
+      {
+        id: "address-authority", name: "Address Authority", version: "2026-08",
+        // Repeats exercise source-priority dedupe, which only the full pass sees.
+        records: () => { reads++; return records([...civic, ...civic.slice(0, 5)]); }
+      }
+    ];
+    const cachePath = join(root, "candidates.gz");
+    const candidateCache = { path: cachePath, identity: "region-content-v1" };
+    const normalize = meta => {
+      const { seconds, osm, candidateCache: _mode, ...rest } = meta;
+      return rest;
+    };
+
+    // Cycle 1: OSM already has #4 and #5 → cache miss, cache written.
+    await writeFile(join(root, "osm1.jsonl"), `${osmDoc("node/1", "4")}\n${osmDoc("node/2", "5")}\n`);
+    const first = await augmentOsmWithAddressSources({
+      root, osmPath: join(root, "osm1.jsonl"), outputPath: join(root, "out1.jsonl"), osmDocs: 2, sources: sources(), candidateCache
+    });
+    assert.equal(first.meta.candidateCache, "miss");
+    assert.equal(first.meta.osmDuplicates, 2);
+
+    // Cycle 2: OSM drops #5, gains #7/#8 and a cityless #9 that matches nothing.
+    await writeFile(join(root, "osm2.jsonl.gz"), gzipSync(`${osmDoc("node/1", "4")}\n${osmDoc("node/7", "7")}\n${osmDoc("node/8", "8")}\n${osmDoc("node/9", "9", "")}\n`));
+    const full = await augmentOsmWithAddressSources({
+      root, osmPath: join(root, "osm2.jsonl.gz"), outputPath: join(root, "full.jsonl"), osmDocs: 4, sources: sources()
+    });
+    const readsBeforeReplay = reads;
+    const replay = await augmentOsmWithAddressSources({
+      root, osmPath: join(root, "osm2.jsonl.gz"), outputPath: join(root, "replay.jsonl"), osmDocs: 4, sources: sources(), candidateCache
+    });
+    assert.equal(reads, readsBeforeReplay, "a cache hit must not read the address sources");
+    assert.equal(replay.meta.candidateCache, "hit");
+    assert.equal(await readFile(join(root, "replay.jsonl"), "utf8"), await readFile(join(root, "full.jsonl"), "utf8"));
+    assert.deepEqual(normalize(replay.meta), normalize(full.meta));
+    assert.equal(replay.meta.osmDuplicates, 3);
+
+    // A different content identity is a miss, not a stale replay.
+    const changed = await augmentOsmWithAddressSources({
+      root, osmPath: join(root, "osm2.jsonl.gz"), outputPath: join(root, "changed.jsonl"), osmDocs: 4, sources: sources(),
+      candidateCache: { path: cachePath, identity: "region-content-v2" }
+    });
+    assert.equal(changed.meta.candidateCache, "miss");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

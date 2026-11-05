@@ -1072,6 +1072,18 @@ region filters belong to the adapter. The shared layer owns bounded
 streaming, deterministic IDs, on-disk deduplication, aggregation, provenance,
 and atomic output.
 
+Pass `candidateCache: { path, identity }` to make a new OSM extract cheap when
+the address sources did not change. Only the OSM-duplicate check depends on
+the OSM corpus; parsing, normalization, source-priority dedupe, civic
+documents, and postal aggregates depend only on the sources. The first run
+writes every unique civic candidate and postal document to `path` (gzip);
+later runs whose cache key matches skip the sources entirely and re-filter
+the cached candidates against an in-memory set of the new corpus's OSM
+address keys. The output is byte-identical to a full pass, and `meta.candidateCache`
+reports `"hit"` or `"miss"`. `identity` should describe the source *content*
+(for example a hash of a regional partition file); when omitted, the source
+identities are used, which change whenever any provider metadata changes.
+
 ### Search, autocomplete, and reverse geocoding
 
 ```js

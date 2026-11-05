@@ -88,6 +88,12 @@ export interface AddressEnrichmentOptions {
   sources: AddressEnrichmentSource[];
   osmDocs?: number;
   includePostalCodes?: boolean;
+  /**
+   * Cache of the source-only work (civic candidates and postal documents).
+   * A run whose key matches replays it against the new OSM corpus instead of
+   * re-reading the sources. `identity` should describe the source content.
+   */
+  candidateCache?: { path: string; identity?: unknown };
   force?: boolean;
   limit?: number;
   progressLogMs?: number;
@@ -95,6 +101,7 @@ export interface AddressEnrichmentOptions {
 }
 
 export const ADDRESS_ENRICHMENT_SCHEMA_VERSION: number;
+export const ADDRESS_CANDIDATE_CACHE_SCHEMA_VERSION: number;
 export function normalizeExternalAddressRecord(
   record: Record<string, unknown>,
   defaults?: Partial<ExternalAddressRecord>

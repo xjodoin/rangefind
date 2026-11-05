@@ -20,7 +20,7 @@ import { dirname, extname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
-import { createGunzip } from "node:zlib";
+import { createGunzip, gzipSync } from "node:zlib";
 import {
   normalizeAddressAuthorityKey,
   normalizePostalCodeSpacing
@@ -28,9 +28,12 @@ import {
 import { createJsonlReadStream } from "../../../jsonl.js";
 
 export const ADDRESS_ENRICHMENT_SCHEMA_VERSION = 1;
+export const ADDRESS_CANDIDATE_CACHE_SCHEMA_VERSION = 1;
 
 const WRITE_BUFFER_BYTES = 8 * 1024 * 1024;
 const SQLITE_BATCH_ROWS = 250_000;
+const CANDIDATE_CACHE_BLOCK_BYTES = 8 * 1024 * 1024;
+const KEY_SET_SHARDS = 64;
 const require = createRequire(import.meta.url);
 let DatabaseSync = null;
 
@@ -106,7 +109,10 @@ function createAppendJsonlWriter(path) {
   }
   return {
     write(value) {
-      const line = `${JSON.stringify(value)}\n`;
+      this.writeJson(JSON.stringify(value));
+    },
+    writeJson(json) {
+      const line = `${json}\n`;
       parts.push(line);
       bytes += Buffer.byteLength(line);
       if (bytes >= WRITE_BUFFER_BYTES) flush();
@@ -523,6 +529,221 @@ function postalAreaDocument(db, row) {
   };
 }
 
+// --- candidate cache ---------------------------------------------------------
+//
+// Everything enrichment does except the OSM-duplicate check depends only on
+// the address sources: parsing, normalization, source-priority dedupe, civic
+// documents and postal aggregates. For a country that is ~96M rows of SQLite
+// work against ~1.7M OSM address keys, so a new PBF with unchanged sources
+// replays the cached candidates and only re-filters them against the OSM keys.
+//
+// Cache lines are `c<sourceIndex>\t<keys>\t<civic doc json>` (every unique
+// civic candidate, before the OSM-duplicate check) and `p\t<postal doc json>`,
+// written as gzip members. <keys> are baseAddressKeys(doc) — the same fields
+// addressIdentity() and looseAddressIdentity() read from the record — joined
+// by \u001e, so a replay filters without parsing the doc. Keys are
+// space-joined tokens; a key that ever held a tab or \u001e would fall back
+// to `j<sourceIndex>\t<json>`, whose keys are recomputed from the parsed doc.
+
+function candidateCacheKey(options, sources, sourceMeta) {
+  return createHash("sha256").update(stableJson({
+    schemaVersion: ADDRESS_CANDIDATE_CACHE_SCHEMA_VERSION,
+    enrichmentSchemaVersion: ADDRESS_ENRICHMENT_SCHEMA_VERSION,
+    identity: options.candidateCache.identity ?? sourceMeta.map(source => source.identity),
+    sources: sourceMeta.map(({ identity, ...provenance }, index) => ({
+      ...provenance,
+      includeAddresses: sources[index].includeAddresses !== false,
+      includeUnits: sources[index].includeUnits === true,
+      includeCountry: sources[index].includeCountry !== false,
+      defaults: sources[index].defaults ?? null
+    })),
+    includePostalCodes: options.includePostalCodes !== false,
+    limit: Number(options.limit || 0)
+  })).digest("hex");
+}
+
+function readCandidateCacheMeta(path, key) {
+  if (!existsSync(path) || !existsSync(`${path}.meta.json`)) return null;
+  try {
+    const meta = JSON.parse(readFileSync(`${path}.meta.json`, "utf8"));
+    return meta.schemaVersion === ADDRESS_CANDIDATE_CACHE_SCHEMA_VERSION
+      && meta.key === key
+      && meta.bytes === statSync(path).size
+      ? meta
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function createCandidateCacheWriter(path) {
+  mkdirSync(dirname(path), { recursive: true });
+  const partial = `${path}.partial`;
+  rmSync(partial, { force: true });
+  const fd = openSync(partial, "w");
+  let parts = [];
+  let size = 0;
+  let members = 0;
+  let closed = false;
+  const flush = () => {
+    if (!size && members) return;
+    writeAll(fd, gzipSync(Buffer.from(parts.join("")), { level: 1 }));
+    members++;
+    parts = [];
+    size = 0;
+  };
+  return {
+    write(line) {
+      parts.push(line);
+      size += line.length;
+      if (size >= CANDIDATE_CACHE_BLOCK_BYTES) flush();
+    },
+    commit(meta) {
+      flush();
+      closeSync(fd);
+      closed = true;
+      renameSync(partial, path);
+      writeFileSync(`${path}.meta.json`, JSON.stringify({ ...meta, bytes: statSync(path).size }, null, 2));
+    },
+    abort() {
+      if (!closed) closeSync(fd);
+      closed = true;
+      rmSync(partial, { force: true });
+    }
+  };
+}
+
+// Exact OSM address-key set. Sharded because one Set caps at 2^24 entries.
+function createKeySet() {
+  const shards = Array.from({ length: KEY_SET_SHARDS }, () => new Set());
+  const shardOf = key => {
+    let hash = 0;
+    for (let index = 0; index < key.length; index++) hash = (Math.imul(hash, 31) + key.charCodeAt(index)) | 0;
+    return shards[hash & (KEY_SET_SHARDS - 1)];
+  };
+  return {
+    add(key) { shardOf(key).add(key); },
+    has(key) { return shardOf(key).has(key); }
+  };
+}
+
+async function readBaseAddressKeys(osmPath) {
+  const keys = createKeySet();
+  let addresses = 0;
+  const lines = createInterface({ input: createJsonlReadStream(osmPath), crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line) continue;
+    const docKeys = baseAddressKeys(JSON.parse(line));
+    if (!docKeys.length) continue;
+    for (const key of docKeys) keys.add(key);
+    addresses++;
+  }
+  return { keys, addresses };
+}
+
+// Same predicate as the SQLite lookup in the full pass:
+// base has `f<key>` or (loose ? `l<loose>` : `f<key>`).
+function osmDuplicate(keys, candidateKeys) {
+  for (const key of candidateKeys) {
+    if (keys.has(key)) return true;
+  }
+  return false;
+}
+
+// candidateKeys must equal baseAddressKeys(doc); the full pass passes the
+// keys it already computed from the record (same fields, same normalizer).
+function candidateCacheLine(sourceIndex, json, candidateKeys) {
+  const keys = candidateKeys.join("\u001e");
+  return candidateKeys.some(key => /[\t\n\u001e]/u.test(key))
+    ? `j${sourceIndex}\t${json}\n`
+    : `c${sourceIndex}\t${keys}\t${json}\n`;
+}
+
+async function replayCandidateCache({ cachePath, cacheMeta, osmPath, outputPath, outputPartial, metaPath, sourceMeta, options }) {
+  const started = performance.now();
+  rmSync(outputPartial, { force: true });
+  if (osmPath.toLowerCase().endsWith(".gz")) {
+    await pipeline(createJsonlReadStream(osmPath), createWriteStream(outputPartial));
+  } else {
+    copyFileSync(osmPath, outputPartial);
+  }
+  const fd = openSync(outputPartial, "a");
+  let parts = [];
+  let bytes = 0;
+  const flush = () => {
+    if (!parts.length) return;
+    writeAll(fd, Buffer.from(parts.join("")));
+    parts = [];
+    bytes = 0;
+  };
+  const write = json => {
+    const line = `${json}\n`;
+    parts.push(line);
+    bytes += line.length;
+    if (bytes >= WRITE_BUFFER_BYTES) flush();
+  };
+  try {
+    const { keys, addresses: osmAddresses } = await readBaseAddressKeys(osmPath);
+    const written = new Array(sourceMeta.length).fill(0);
+    let osmDuplicates = 0;
+    let postalDocs = 0;
+    const lines = createInterface({ input: createReadStream(cachePath).pipe(createGunzip()), crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!line) continue;
+      const tab = line.indexOf("\t");
+      if (line[0] === "p") {
+        write(line.slice(tab + 1));
+        postalDocs++;
+        continue;
+      }
+      let json;
+      let candidateKeys;
+      if (line[0] === "c") {
+        const keyEnd = line.indexOf("\t", tab + 1);
+        json = line.slice(keyEnd + 1);
+        candidateKeys = keyEnd > tab + 1 ? line.slice(tab + 1, keyEnd).split("\u001e") : [];
+      } else {
+        json = line.slice(tab + 1);
+        candidateKeys = baseAddressKeys(JSON.parse(json));
+      }
+      if (osmDuplicate(keys, candidateKeys)) {
+        osmDuplicates++;
+        continue;
+      }
+      write(json);
+      written[Number(line.slice(1, tab))]++;
+    }
+    flush();
+    closeSync(fd);
+    renameSync(outputPartial, outputPath);
+    const addressesWritten = written.reduce((sum, count) => sum + count, 0);
+    const osmDocs = Number(options.osmDocs || 0);
+    const meta = {
+      schemaVersion: ADDRESS_ENRICHMENT_SCHEMA_VERSION,
+      sources: sourceMeta,
+      osm: identityFor(osmPath),
+      osmAddresses,
+      ...cacheMeta.totals,
+      addressesWritten,
+      osmDuplicates,
+      postalDocs,
+      bySource: cacheMeta.bySource.map((source, index) => ({ ...source, addressesWritten: written[index] })),
+      osmDocs,
+      totalDocs: osmDocs + addressesWritten + postalDocs,
+      bytes: statSync(outputPath).size,
+      seconds: Math.round((performance.now() - started) / 100) / 10,
+      candidateCache: "hit"
+    };
+    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    options.log?.(`[address-enrichment] replayed cached candidates: wrote ${addressesWritten.toLocaleString()} civic and ${postalDocs.toLocaleString()} postal docs in ${meta.seconds}s`);
+    return { path: outputPath, meta };
+  } catch (error) {
+    try { closeSync(fd); } catch { /* already closed */ }
+    rmSync(outputPartial, { force: true });
+    throw error;
+  }
+}
+
 function enrichmentSourcesMeta(sources) {
   return sources.map(source => ({
     id: sourceId(source),
@@ -573,6 +794,16 @@ export async function augmentOsmWithAddressSources(options = {}) {
     if (reusable) return { path: outputPath, meta };
   }
 
+  const cachePath = options.candidateCache?.path ? resolve(options.candidateCache.path) : "";
+  const cacheKey = cachePath ? candidateCacheKey(options, sources, sourceMeta) : "";
+  if (cachePath) {
+    const cacheMeta = readCandidateCacheMeta(cachePath, cacheKey);
+    if (cacheMeta) {
+      mkdirSync(dirname(outputPath), { recursive: true });
+      return replayCandidateCache({ cachePath, cacheMeta, osmPath, outputPath, outputPartial, metaPath, sourceMeta, options });
+    }
+  }
+
   mkdirSync(dirname(outputPath), { recursive: true });
   mkdirSync(dirname(sqlitePath), { recursive: true });
   rmSync(outputPartial, { force: true });
@@ -582,6 +813,7 @@ export async function augmentOsmWithAddressSources(options = {}) {
     copyFileSync(osmPath, outputPartial);
   }
   const writer = createAppendJsonlWriter(outputPartial);
+  const cache = cachePath ? createCandidateCacheWriter(cachePath) : null;
   const db = openDedupeStore(sqlitePath);
   const started = performance.now();
   const totals = {
@@ -685,15 +917,20 @@ export async function augmentOsmWithAddressSources(options = {}) {
           if (record.kind === "address" && uniqueAddress && source.includeAddresses !== false) {
             const looseKey = looseAddressIdentity(record);
             const duplicate = Boolean(exactBase.get(`f\u001f${key}`, looseKey ? `l\u001f${looseKey}` : `f\u001f${key}`));
+            const doc = (!duplicate || cache) ? externalAddressDocument(record, source, {
+              includeUnits: source.includeUnits,
+              includeCountry: source.includeCountry
+            }) : null;
+            const json = doc ? JSON.stringify(doc) : "";
+            if (doc && cache) {
+              const candidateKeys = looseKey ? [`f\u001f${key}`, `l\u001f${looseKey}`] : [`f\u001f${key}`];
+              cache.write(candidateCacheLine(sourceIndex, json, candidateKeys));
+            }
             if (duplicate) {
               totals.osmDuplicates++;
             } else {
-              const doc = externalAddressDocument(record, source, {
-                includeUnits: source.includeUnits,
-                includeCountry: source.includeCountry
-              });
               if (doc) {
-                writer.write(doc);
+                writer.writeJson(json);
                 totals.addressesWritten++;
                 sourceStats.addressesWritten++;
               }
@@ -717,12 +954,23 @@ export async function augmentOsmWithAddressSources(options = {}) {
     if (options.includePostalCodes !== false) {
       const postalRows = db.prepare("SELECT * FROM postal_areas ORDER BY country, postcode");
       for (const row of postalRows.iterate()) {
-        writer.write(postalAreaDocument(db, row));
+        const doc = postalAreaDocument(db, row);
+        writer.write(doc);
+        if (cache) cache.write(`p\t${JSON.stringify(doc)}\n`);
         totals.postalDocs++;
       }
     }
     writer.close();
     renameSync(outputPartial, outputPath);
+    if (cache) {
+      const { addressesWritten, osmDuplicates, ...sourceTotals } = totals;
+      cache.commit({
+        schemaVersion: ADDRESS_CANDIDATE_CACHE_SCHEMA_VERSION,
+        key: cacheKey,
+        totals: sourceTotals,
+        bySource: bySource.map(({ addressesWritten: _written, ...source }) => source)
+      });
+    }
     const osmDocs = Number(options.osmDocs || 0);
     const meta = {
       schemaVersion: ADDRESS_ENRICHMENT_SCHEMA_VERSION,
@@ -734,13 +982,15 @@ export async function augmentOsmWithAddressSources(options = {}) {
       osmDocs,
       totalDocs: osmDocs + totals.addressesWritten + totals.postalDocs,
       bytes: statSync(outputPath).size,
-      seconds: Math.round((performance.now() - started) / 100) / 10
+      seconds: Math.round((performance.now() - started) / 100) / 10,
+      ...(cache ? { candidateCache: "miss" } : {})
     };
     writeFileSync(metaPath, JSON.stringify(meta, null, 2));
     options.log?.(`[address-enrichment] wrote ${totals.addressesWritten.toLocaleString()} civic and ${totals.postalDocs.toLocaleString()} postal docs in ${meta.seconds}s`);
     return { path: outputPath, meta };
   } catch (error) {
     writer.close();
+    cache?.abort();
     rmSync(outputPartial, { force: true });
     throw error;
   } finally {
