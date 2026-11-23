@@ -1,0 +1,5 @@
+# Start wasm instances with a 16 MiB heap: dlmalloc otherwise grows linear
+# memory 64 KiB at a time, and each memory.grow is expensive. Measured on the
+# sharded parity suite, growth dominated cold-query time.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--initial-memory=16777216"]

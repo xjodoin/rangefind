@@ -63,6 +63,29 @@ test("ordinary points without geometry or bbox remain markers only", () => {
   assert.equal(resultGeometryFeature({ id: "node/1", type: "cafe", lat: 45.5, lon: -73.5 }), null);
 });
 
+test("multi-ring boundary contours decode into a MultiPolygon overlay", () => {
+  const rings = {
+    island: [{ lat: 45.0, lon: -74.0 }, { lat: 45.0, lon: -73.5 }, { lat: 45.5, lon: -73.5 }, { lat: 45.0, lon: -74.0 }],
+    islet: [{ lat: 46.0, lon: -73.4 }, { lat: 46.0, lon: -73.3 }, { lat: 46.1, lon: -73.3 }, { lat: 46.0, lon: -73.4 }]
+  };
+  const feature = resultGeometryFeature({
+    id: "node/979092789",
+    type: "city",
+    category: "place",
+    geometry: {
+      encoding: "polyline",
+      type: "MultiPolygon",
+      precision: 5,
+      encoded: ["island", "islet"]
+    }
+  }, encoded => rings[encoded]);
+  assert.equal(feature.properties.kind, "result-geometry");
+  assert.equal(feature.geometry.type, "MultiPolygon");
+  assert.equal(feature.geometry.coordinates.length, 2);
+  assert.deepEqual(feature.geometry.coordinates[0][0][0], [-74, 45]);
+  assert.deepEqual(geometryFeatureBounds(feature), [[-74, 45], [-73.3, 46.1]]);
+});
+
 test("real encoded geometry takes precedence over a postal fallback", () => {
   const feature = resultGeometryFeature({
     id: "postal/CA/J7A1V6",

@@ -107,10 +107,14 @@ export function resultGeometryFeature(item, decodePolyline) {
   const postal = String(item?.type || "").toLowerCase() === "postal_code";
   if (geometry?.encoding === "polyline" && geometry.encoded && typeof decodePolyline === "function") {
     try {
-      const coordinates = decodePolyline(geometry.encoded, geometry.precision || 5)
-        .map(point => [point.lon, point.lat]);
-      if (coordinates.length >= 2) {
-        return {
+      // Multi-ring boundaries (island municipalities) arrive as an array of
+      // encoded rings; each ring renders as its own polygon.
+      const rings = (Array.isArray(geometry.encoded) ? geometry.encoded : [geometry.encoded])
+        .map(encoded => decodePolyline(encoded, geometry.precision || 5)
+          .map(point => [point.lon, point.lat]))
+        .filter(coordinates => coordinates.length >= 2);
+      if (rings.length) {
+        const feature = shape => ({
           type: "Feature",
           id: item.id,
           properties: {
@@ -120,10 +124,15 @@ export function resultGeometryFeature(item, decodePolyline) {
             kind: postal ? "postal-area" : "result-geometry",
             approximate: false
           },
-          geometry: geometry.type === "Polygon"
-            ? { type: "Polygon", coordinates: [coordinates] }
-            : { type: "LineString", coordinates }
-        };
+          geometry: shape
+        });
+        if (geometry.type === "MultiPolygon" || (rings.length > 1 && geometry.type === "Polygon")) {
+          return feature({ type: "MultiPolygon", coordinates: rings.map(ring => [ring]) });
+        }
+        if (geometry.type === "Polygon") {
+          return feature({ type: "Polygon", coordinates: [rings[0]] });
+        }
+        return feature({ type: "LineString", coordinates: rings[0] });
       }
     } catch {
       // A bbox remains a useful fallback when optional geometry is bad.

@@ -1,0 +1,37 @@
+[package]
+name = "rangefind"
+version = "0.5.1"
+edition = "2021"
+license = "MIT"
+description = "Rangefind query engine: range-packed static search for native and WebAssembly hosts."
+repository = "https://github.com/xjodoin/rangefind"
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = { version = "0.10", default-features = false }
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+unicode-script = "0.5"
+
+
+
+[features]
+default = ["engine", "osm"]
+# Module groups build independently so each can be developed and tested in
+# isolation; `engine` needs all of them.
+analysis = []
+codec = []
+geo = []
+authority = []
+vector = []
+engine = ["analysis", "codec", "geo", "authority", "vector"]
+osm = ["engine"]
+
+[[bin]]
+name = "rangefind-rs"
+path = "src/bin/rangefind-rs.rs"
+required-features = ["engine"]

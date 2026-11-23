@@ -126,7 +126,7 @@ function firstCategory(tags) {
   return null;
 }
 
-function normalizedNameIdentity(value) {
+export function normalizedNameIdentity(value) {
   return foldMulti(value)
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
@@ -385,6 +385,78 @@ export function geometryForWay(points) {
       encoded: encodePolyline(ring, 5),
       bbox: [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)]
     }
+  };
+}
+
+// A municipality's contour for its place document, from the locality
+// index's assembled boundary rings (flat [lat, lon, ...] arrays, closed).
+// Boundaries are km-scale, so simplification tolerance adapts to the
+// boundary's span instead of geometryForWay's building-scale metre
+// tolerance; tiny islet rings below half a percent of the main ring's
+// extent are display noise and are dropped. Returns the doc-embeddable
+// geometry plus the canonical [minLat, minLon, maxLat, maxLon] doc bbox.
+const BOUNDARY_CONTOUR_MAX_RINGS = 16;
+const BOUNDARY_CONTOUR_MAX_POINTS = 192;
+
+export function boundaryContourGeometry(flatRings) {
+  const rings = [];
+  for (const flat of flatRings || []) {
+    if (!flat || flat.length < 8) continue;
+    const points = [];
+    let valid = true;
+    for (let i = 0; i < flat.length; i += 2) {
+      const lat = Number(flat[i]);
+      const lon = Number(flat[i + 1]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)
+        || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+        valid = false;
+        break;
+      }
+      points.push({ lat, lon });
+    }
+    if (!valid || points.length < 4) continue;
+    const lats = points.map(point => point.lat);
+    const lons = points.map(point => point.lon);
+    rings.push({
+      points,
+      span: (Math.max(...lats) - Math.min(...lats)) * (Math.max(...lons) - Math.min(...lons))
+    });
+  }
+  if (!rings.length) return null;
+  rings.sort((left, right) => right.span - left.span);
+  const kept = rings
+    .filter(ring => ring.span >= rings[0].span * 0.005)
+    .slice(0, BOUNDARY_CONTOUR_MAX_RINGS);
+  const spans = kept.flatMap(ring => ring.points);
+  const spanLat = Math.max(...spans.map(point => point.lat)) - Math.min(...spans.map(point => point.lat));
+  const spanLon = Math.max(...spans.map(point => point.lon)) - Math.min(...spans.map(point => point.lon));
+  const tolerance = Math.max(0.0001, Math.max(spanLat, spanLon) / 1024);
+  const encoded = [];
+  let minLat = Infinity;
+  let minLon = Infinity;
+  let maxLat = -Infinity;
+  let maxLon = -Infinity;
+  for (const ring of kept) {
+    const simplified = simplifyRing(ring.points, tolerance, BOUNDARY_CONTOUR_MAX_POINTS);
+    if (simplified.length < 4) continue;
+    for (const point of simplified) {
+      if (point.lat < minLat) minLat = point.lat;
+      if (point.lat > maxLat) maxLat = point.lat;
+      if (point.lon < minLon) minLon = point.lon;
+      if (point.lon > maxLon) maxLon = point.lon;
+    }
+    encoded.push(encodePolyline(simplified, 5));
+  }
+  if (!encoded.length) return null;
+  return {
+    geometry: {
+      type: encoded.length === 1 ? "Polygon" : "MultiPolygon",
+      encoding: "polyline",
+      precision: 5,
+      encoded: encoded.length === 1 ? encoded[0] : encoded,
+      bbox: [minLon, minLat, maxLon, maxLat]
+    },
+    bbox: [minLat, minLon, maxLat, maxLon]
   };
 }
 

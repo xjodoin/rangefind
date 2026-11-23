@@ -358,6 +358,11 @@ Accepts `true`/`false`/`1`/`0`/`"true"`/`"false"`.
   `sort` + text queries fast. Each entry is `"year"` or
   `{ "field": "year", "order": "desc" }`; the field must be a configured
   number or boolean.
+- Documents without a value sort after every valued document in both
+  orders, then by score and document order, in every lane. Sorted doc-value
+  trees and sort replicas written by earlier builders stored missing
+  values as `0` and mis-coded booleans; the runtime ignores them (the exact
+  sort lane answers), so rebuild to get the fast sorted lanes back.
 
 ### `rankPrior`
 
@@ -695,6 +700,7 @@ await engine.search({
 
 - `q` — query string (empty for browse/filter/sort/geo/vector-only).
 - `page` / `size` — 1-based page and page size (`size` clamped to `maxPageSize`).
+  A non-numeric `page` reads as 1 and a non-numeric `size` as 10.
 - `filters` — `{ facets: { field: [values] }, numbers: { field: { min, max } },
   booleans: { field: bool } }`. Numeric `min`/`max` accept dates when the field
   is `type: "date"`.
@@ -784,7 +790,8 @@ early-stopped totals and sampled facet counts.
   results come back shard-stamped. On generational engines pass
   `context.generation` (doc ordinals are generation-local); results come back
   generation-stamped. This is the direct-selection path for suggestions
-  carrying `doc`.
+  carrying `doc`. Throws when a row index is not an integer document index
+  in `[0, total)`.
 
   **Lane note.** Hydrating *one* document is two small range reads and needs
   no options. Hydrating *several suggestion* documents does: they are
@@ -1134,6 +1141,12 @@ const addresses = await reverseGeocodeOsm(engine, {
 
 `suggestOsmQuery` returns legacy `text`/`weight` fields plus structured
 `mainText`, `secondaryText`, `matchedRanges`, `types`, and `selection`.
+`matchedRanges` highlights the typed words in `text`: each folded input token,
+in order, claims the first not-yet-claimed display word (a run of letters and
+numbers; accents and case ignored) that starts with it, so a range never
+crosses a space or punctuation. Ranges are `[start, end)` UTF-16 offsets into
+`text`, the units `String.prototype.slice` uses, sorted by `start`. Suggestions
+with equal weight are ordered by UTF-16 code units, the same in every runtime.
 `selection.shards` can scope the selected follow-up search. When a suggestion
 names exactly one document in one shard (an entity, not a street/category/
 shared surface), `selection.doc = { index, shard? }` is present and
@@ -1249,8 +1262,8 @@ geometry. Geometry has the form:
 
 ```js
 {
-  type: "Polygon",             // or "LineString"
-  encoded: "...",
+  type: "Polygon",             // or "LineString" / "MultiPolygon"
+  encoded: "...",              // MultiPolygon: an array, one encoded ring each
   precision: 5,
   bbox: [minLon, minLat, maxLon, maxLat]
 }
@@ -1259,6 +1272,14 @@ geometry. Geometry has the form:
 Decode `encoded` with `decodePolyline`; polygon rings are closed. Extraction
 limits, simplifies, and caps the retained point sequence so geometry remains a
 small result capsule rather than a general-purpose vector-tile replacement.
+
+Locality place documents (city, town, municipality, village, hamlet) carry
+their municipality's contour as this same geometry: the administrative
+boundary relation joined through its `admin_centre`/`label` member when the
+mappers linked one, otherwise by name plus containment. Island municipalities
+arrive as `MultiPolygon`; islets below half a percent of the main ring's
+extent are dropped. The contoured place document also fills `bbox`
+(`[minLat, minLon, maxLat, maxLon]`).
 
 ### OSM schema compatibility
 

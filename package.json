@@ -49,6 +49,10 @@
       "types": "./types/runtime.d.ts",
       "default": "./dist/runtime.browser.js"
     },
+    "./wasm": {
+      "types": "./types/wasm.d.ts",
+      "default": "./dist/rangefind_wasm.mjs"
+    },
     "./element": "./dist/rangefind-search.js",
     "./element.css": "./dist/rangefind-search.css",
     "./builder": {
@@ -239,7 +243,12 @@
     "test": "node --test test/*.test.js",
     "test:smoke": "npm run build:browser && npm run build:example && node scripts/smoke.mjs",
     "test:all": "npm run build:browser && npm run build:element && npm run check && npm test && npm run test:smoke",
-    "prepublishOnly": "npm run test:all"
+    "prepublishOnly": "npm run build:wasm && npm run test:all && node scripts/check_wasm_package.mjs",
+    "build:wasm": "bash rust/tools/wasm/build.sh",
+    "test:rust:fixtures": "for s in analysis codec geo vector authority osm_modules; do node rust/tools/fixtures/$s.mjs || exit 1; done && node rust/tools/parity/build_fixtures.mjs",
+    "test:rust": "cd rust/rangefind && cargo test --release",
+    "test:wasm": "npm run build:wasm && node rust/tools/wasm/node_parity.mjs",
+    "test:wasm:browser": "npm run build:wasm && node rust/tools/wasm/browser_parity.mjs"
   },
   "devDependencies": {
     "@chainsafe/libp2p-gossipsub": "^14.1.2",

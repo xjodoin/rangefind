@@ -38,9 +38,11 @@ import { fileURLToPath } from "node:url";
 import { scanPbf } from "./osm_pbf.mjs";
 import {
   addressFromTags,
+  boundaryContourGeometry,
   enrichDocLocality,
   geometryForWay,
   interpolationRangeDocs,
+  normalizedNameIdentity,
   placeDoc,
   retainedAddressTagEntries,
   searchablePlaceTags,
@@ -77,7 +79,8 @@ const REGIONS = {
 // silently reuse an older corpus shape.
 // v10: compact render geometry and true area centroids for useful POI ways.
 // v11: expanded, normalized alternate-name extraction and fallback identities.
-const OSM_FIXTURE_SCHEMA_VERSION = 11;
+// v12: municipality contours stamped onto locality place documents.
+const OSM_FIXTURE_SCHEMA_VERSION = 12;
 
 function parseArgs(argv) {
   const args = {
@@ -292,15 +295,20 @@ async function writeJsonl(args) {
         const name = tags.get("name");
         if (!name) return;
         const wayIds = [];
+        const anchorNodeIds = [];
         for (const member of members) {
           // Inner rings join the even-odd containment test alongside outers,
-          // so both roles spool; other roles (admin_centre, label) are nodes.
+          // so both roles spool. The admin_centre/label node members name the
+          // municipality's own place node — the exact join for stamping the
+          // boundary contour onto that place document later.
           if (member.type === "way" && (member.role === "outer" || member.role === "inner" || member.role === "")) {
             wayIds.push(member.ref);
+          } else if (member.type === "node" && (member.role === "admin_centre" || member.role === "label")) {
+            anchorNodeIds.push(member.ref);
           }
         }
         if (!wayIds.length) return;
-        writer.write([id, name, Number(tags.get("admin_level")), wayIds]);
+        writer.write([id, name, Number(tags.get("admin_level")), wayIds, anchorNodeIds]);
         boundaryRelations++;
       }
     });
@@ -498,6 +506,7 @@ async function writeJsonl(args) {
   let wayDocs = 0;
   let interpolationRangeDocsWritten = 0;
   const enriched = { boundary: 0, place: 0 };
+  let contouredPlaces = 0;
   let localityStats = { boundaries: 0, boundariesDropped: 0, ringsDropped: 0, places: 0 };
   const outputProgress = progressLogger("output documents");
   try {
@@ -509,7 +518,8 @@ async function writeJsonl(args) {
     await eachJsonLine(boundaryWaysPath, ([id, refs]) => {
       boundaryWayRefs.set(id, refs);
     });
-    await eachJsonLine(boundaryRelationsPath, ([, name, adminLevel, wayIds]) => {
+    const boundaryByAnchorNode = new Map();
+    await eachJsonLine(boundaryRelationsPath, ([, name, adminLevel, wayIds, anchorNodeIds]) => {
       const memberWays = wayIds.map(wayId => boundaryWayRefs.get(wayId)).filter(Boolean);
       if (!memberWays.length) {
         localityStats.boundariesDropped++;
@@ -530,8 +540,18 @@ async function writeJsonl(args) {
         }
         if (points.length) rings.push(points);
       }
-      if (rings.length && locality.addBoundary({ id: 0, name, adminLevel, rings })) {
+      const boundary = rings.length ? locality.addBoundary({ id: 0, name, adminLevel, rings }) : null;
+      if (boundary) {
         localityStats.boundaries++;
+        // The relation's admin_centre/label member is the municipality's own
+        // place node; a node can anchor several admin levels (a city that is
+        // also its county's seat), and the most specific boundary wins.
+        for (const nodeId of anchorNodeIds || []) {
+          const existing = boundaryByAnchorNode.get(nodeId);
+          if (!existing || boundary.adminLevel > existing.adminLevel) {
+            boundaryByAnchorNode.set(nodeId, boundary);
+          }
+        }
       } else {
         localityStats.boundariesDropped++;
       }
@@ -549,9 +569,46 @@ async function writeJsonl(args) {
       if (resolved && enrichDocLocality(doc, resolved.city)) enriched[resolved.source]++;
     };
 
+    // A locality's place document carries its municipality contour: the
+    // assembled boundary that contains the place node and bears the same
+    // name. Search results can then draw the actual city outline instead of
+    // guessing a radius around the place node.
+    const contourTypes = new Set(Object.keys(PLACE_RADII_METERS));
+    const boundaryIdentity = new Map();
+    const boundaryForPlace = doc => {
+      // The relation's own admin_centre/label member is the exact join and
+      // survives display-name differences and enclave holes; a boundary
+      // containing the node and bearing the same name covers the majority of
+      // municipalities that never linked their place node.
+      const anchored = doc.id?.startsWith("node/")
+        ? boundaryByAnchorNode.get(Number(doc.id.slice("node/".length)))
+        : null;
+      if (anchored) return anchored;
+      const identity = normalizedNameIdentity(doc.name);
+      if (!identity) return null;
+      for (const boundary of locality.boundariesAt(doc.lat, doc.lon)) {
+        if (!boundaryIdentity.has(boundary)) {
+          boundaryIdentity.set(boundary, normalizedNameIdentity(boundary.name));
+        }
+        if (boundaryIdentity.get(boundary) === identity) return boundary;
+      }
+      return null;
+    };
+    const attachContour = doc => {
+      if (doc.category !== "place" || doc.geometry || !contourTypes.has(doc.type)) return;
+      const boundary = boundaryForPlace(doc);
+      if (!boundary) return;
+      const contour = boundaryContourGeometry(boundary.rings);
+      if (!contour) return;
+      doc.geometry = contour.geometry;
+      doc.bbox = contour.bbox;
+      contouredPlaces++;
+    };
+
     await eachJsonLine(nodePath, doc => {
       if (args.limit && docs >= args.limit) return true;
       enrich(doc);
+      attachContour(doc);
       writer.write(doc);
       docs++;
       nodeDocs++;
@@ -582,6 +639,7 @@ async function writeJsonl(args) {
             const doc = placeDoc("way", id, center.lat, center.lon, tags, { geometry: shape?.geometry });
             if (doc) {
               enrich(doc);
+              attachContour(doc);
               writer.write(doc);
               docs++;
               wayDocs++;
@@ -619,13 +677,18 @@ async function writeJsonl(args) {
     ways,
     boundaryWays,
     anchors: uniqueAnchors,
-    locality: { ...localityStats, enrichedFromBoundaries: enriched.boundary, enrichedFromPlaces: enriched.place },
+    locality: {
+      ...localityStats,
+      enrichedFromBoundaries: enriched.boundary,
+      enrichedFromPlaces: enriched.place,
+      contouredPlaces
+    },
     bytes: statSync(outPath).size,
     stageSeconds,
     seconds: Math.round((performance.now() - t0) / 100) / 10
   };
   writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  console.log(`[osm] wrote ${docs} docs to ${outPath} in ${meta.seconds}s (locality: ${enriched.boundary.toLocaleString()} from boundaries, ${enriched.place.toLocaleString()} from place nodes)`);
+  console.log(`[osm] wrote ${docs} docs to ${outPath} in ${meta.seconds}s (locality: ${enriched.boundary.toLocaleString()} from boundaries, ${enriched.place.toLocaleString()} from place nodes, ${contouredPlaces.toLocaleString()} place contours)`);
   return finishOsmCorpus(args, outPath, meta);
 }
 

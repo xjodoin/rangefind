@@ -1384,12 +1384,17 @@ function safeObjectName(value) {
   return String(value || "field").replace(/[^A-Za-z0-9_-]+/gu, "_").replace(/^_+|_+$/gu, "") || "field";
 }
 
+// Sortable code of a doc value: booleans as 1/2, numbers as themselves, and
+// null for a missing value. Missing values must stay null (Number(null) is
+// 0): sorted trees and sort replicas omit those docs, and the runtime ranks
+// them after every present value, like compareRankedRows.
 function sortableDocValue(field, value) {
   if (field.kind === "boolean") {
     if (value === true || value === 1 || value === "true" || value === "1") return 2;
     if (value === false || value === 0 || value === "false" || value === "0") return 1;
     return null;
   }
+  if (value == null || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -1606,7 +1611,10 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
       maxOpenRuns: config.docValueSortedSortMaxOpenRuns,
       readValues: (start, count) => codeRows(codes, field.name, start, start + count),
       valueOf: value => sortableDocValue(field, value)
-    }, (doc, value) => {
+    }, (doc, code) => {
+      // Rows arrive as sortable codes; the page encoder takes raw values
+      // (it maps booleans to 1/2 itself), so booleans go back to true/false.
+      const value = field.kind === "boolean" ? code === 2 : code;
       // Preserve the v1 page contract: start with pageSize rows, extend equal
       // values up to 4x to avoid splitting common ties, then cap the page.
       if (pageRows.length >= pageSize && (
@@ -1675,6 +1683,9 @@ function writeDocValueSortedIndexes(out, config, total, codes) {
   return {
     storage: "range-pack-v1",
     compression: "gzip-member",
+    // Docs without a value are not in the trees (older builders wrote them
+    // as 0 and double-coded booleans; the runtime ignores trees without it).
+    missing_values: "omitted",
     directory_format: DOC_VALUE_SORT_DIRECTORY_FORMAT,
     page_format: DOC_VALUE_SORT_PAGE_FORMAT,
     page_size: pageSize,
@@ -2671,12 +2682,14 @@ function sortReplicaRankChunkSize(config) {
 
 function sortRowsForReplica(config, total, codes, field, order) {
   const rows = [];
+  const missing = [];
   const readChunkSize = Math.max(1, Math.floor(Number(config.docValueChunkSize || 2048)));
   for (let start = 0; start < total; start += readChunkSize) {
     const values = codeRows(codes, field.name, start, Math.min(total, start + readChunkSize));
     for (let row = 0; row < values.length; row++) {
       const value = sortableDocValue(field, values[row]);
       if (Number.isFinite(value)) rows.push({ doc: start + row, value });
+      else missing.push({ doc: start + row, value: NaN });
     }
   }
   rows.sort((a, b) => (
@@ -2684,6 +2697,11 @@ function sortRowsForReplica(config, total, codes, field, order) {
       ? b.value - a.value || a.doc - b.doc
       : a.value - b.value || a.doc - b.doc
   ));
+  // Docs without a value rank after every valued doc in both orders (like
+  // the runtime's compareRankedRows), in doc order, with a NaN rank-map
+  // value. They stay in the replica so its postings keep the main index's
+  // df and total, and therefore bit-identical impacts.
+  for (const row of missing) rows.push(row);
   return rows;
 }
 
@@ -3087,6 +3105,7 @@ async function buildSortReplicas(config, measured, dirs, selectedTermSpool, docS
       field_type: definition.field.type,
       order: definition.order,
       total: rows.length,
+      missing_values: "last",
       posting_order: "sort-rank",
       base_shard_depth: config.baseShardDepth,
       max_shard_depth: config.maxShardDepth,
@@ -4824,6 +4843,7 @@ export async function build({ configPath, update = false, compact = false }) {
     doc_value_sorted: {
       storage: docValueSorted.storage,
       compression: docValueSorted.compression,
+      missing_values: docValueSorted.missing_values,
       directory_format: docValueSorted.directory_format,
       page_format: docValueSorted.page_format,
       page_size: docValueSorted.page_size,
