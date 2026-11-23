@@ -464,3 +464,14 @@ test("replaced documents tombstone their old version", async () => {
     await server.close();
   }
 });
+
+test("successive updates tombstone only the live version of each replaced document", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rangefind-gen-successive-replace-"));
+  await buildAt(root, [makeDoc(0), makeDoc(1), makeDoc(2)]);
+  await buildAt(root, [makeDoc(0, 2), makeDoc(3)], {}, { update: true });
+  await buildAt(root, [makeDoc(0, 3), makeDoc(1, 2), makeDoc(3, 2), makeDoc(4)], {}, { update: true });
+
+  const manifest = JSON.parse(await readFile(join(root, "public/rangefind/manifest.min.json"), "utf8"));
+  assert.deepEqual(manifest.generations.map(generation => generation.tombstones), [[0, 1], [0, 1], []]);
+  assert.equal(manifest.total, 5);
+});

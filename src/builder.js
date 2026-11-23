@@ -2433,7 +2433,7 @@ function generationDirName(index) {
   return `gen-${String(index).padStart(4, "0")}`;
 }
 
-async function prepareGenerationalUpdate(config, { frozenStats = false } = {}) {
+function prepareGenerationalUpdate(config, { frozenStats = false } = {}) {
   const rootDir = config.output;
   const rootManifestPath = resolve(rootDir, "manifest.json");
   if (!existsSync(rootManifestPath)) {
@@ -2469,10 +2469,8 @@ async function prepareGenerationalUpdate(config, { frozenStats = false } = {}) {
   const genDir = generationDirName(genIndex);
   let prevTotal = 0;
   const prevFieldTotals = {};
-  const idMap = new Map();
   const dfBase = new Map();
-  for (let g = 0; g < generations.length; g++) {
-    const generation = generations[g];
+  for (const generation of generations) {
     prevTotal += generation.total || 0;
     for (const [field, tokens] of Object.entries(generation.field_stats?.field_totals || {})) {
       prevFieldTotals[field] = (prevFieldTotals[field] || 0) + tokens;
@@ -2488,10 +2486,6 @@ async function prepareGenerationalUpdate(config, { frozenStats = false } = {}) {
         "Rangefind update: the analysis profile differs from the existing index; " +
         "keep the same `analysis` config for delta builds or run a full rebuild."
       );
-    }
-    const tombstoned = new Set(generation.tombstones || []);
-    for await (const [externalId, localIndex] of readIdMapEntries(resolve(genRoot, generation.id_map))) {
-      if (!tombstoned.has(localIndex)) idMap.set(externalId, [g, localIndex]);
     }
     // Stats-frozen shards take idf from the shared scoring-stats artifact
     // instead — the same table the base generation baked from, so the delta
@@ -2511,14 +2505,29 @@ async function prepareGenerationalUpdate(config, { frozenStats = false } = {}) {
   config.resumeBuild = false;
   config._buildRoot = resolve(config.output, "_build");
   mkdirSync(resolve(config.output), { recursive: true });
-  return { rootDir, rootManifest, generations, genIndex, genDir, prevTotal, prevFieldTotals, idMap, dfBase };
+  return { rootDir, generations, genDir, prevTotal, prevFieldTotals, dfBase };
 }
 
 async function writeGenerationalRoot(generational, deltaManifest, config) {
-  const { rootDir, generations, genDir, idMap } = generational;
-  let replaced = 0;
+  const { rootDir, generations, genDir } = generational;
+  // Keep only delta IDs in memory. A base shard can exceed V8's Map limit
+  // even when an update replaces only a small fraction of its documents.
+  const replacements = new Map();
   for await (const [externalId] of readIdMapEntries(resolve(config.output, deltaManifest.id_map))) {
-    const previous = idMap.get(externalId);
+    replacements.set(externalId, null);
+  }
+  // Read generations in order so the newest live version of an ID wins.
+  for (const [generationIndex, generation] of generations.entries()) {
+    const tombstoned = new Set(generation.tombstones || []);
+    const idMapPath = resolve(rootDir, generation.path || ".", generation.id_map);
+    for await (const [externalId, localIndex] of readIdMapEntries(idMapPath)) {
+      if (replacements.has(externalId) && !tombstoned.has(localIndex)) {
+        replacements.set(externalId, [generationIndex, localIndex]);
+      }
+    }
+  }
+  let replaced = 0;
+  for (const previous of replacements.values()) {
     if (!previous) continue;
     const [genIndexPrev, localIndex] = previous;
     generations[genIndexPrev].tombstones = generations[genIndexPrev].tombstones || [];
@@ -4493,7 +4502,7 @@ export async function build({ configPath, update = false, compact = false }) {
   if (scoringStats && queryBundlesEnabled(config)) {
     throw new Error("Rangefind: scoringStats shard builds do not support queryBundles yet; disable queryBundles.");
   }
-  const generational = update ? await prepareGenerationalUpdate(config, { frozenStats: Boolean(scoringStats) }) : null;
+  const generational = update ? prepareGenerationalUpdate(config, { frozenStats: Boolean(scoringStats) }) : null;
   const compaction = compact ? await prepareCompaction(config) : null;
   if (compact && !compaction) console.log("Rangefind: no generational index at the output; --compact runs as a plain full build.");
   const fingerprint = config.resumeBuild ? buildFingerprint(config) : "scratch";

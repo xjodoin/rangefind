@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.5.2 — 2026-11-23
+
+### Fixed
+
+- Generational updates stream existing document IDs and track only the IDs in
+  the delta, so large base shards can update without exceeding V8's `Map`
+  capacity. Replacements still tombstone the latest live version across
+  generations.
+
 ## 0.5.1 — 2026-11-05
 
 ### Added
