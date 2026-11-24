@@ -36,6 +36,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # Native "open now" reads TZif files where Node uses ICU's tz data.
+      # Ubuntu 24.04 ships the legacy aliases ICU still accepts (US/Eastern,
+      # EST) in tzdata-legacy; Windows has no zoneinfo, so point TZDIR at
+      # the IANA files from Python's tzdata package.
+      - name: Time-zone database
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get install -y -qq tzdata-legacy
+          else
+            python -m pip install --quiet tzdata
+            echo "TZDIR=$(python -c 'import os, tzdata; print(os.path.join(os.path.dirname(tzdata.__file__), "zoneinfo"))')" >> "$GITHUB_ENV"
+          fi
       # Module fixtures: real JS encoders produce the binary inputs and the
       # expected outputs; Rust must decode/compute identically.
       - name: Module fixtures

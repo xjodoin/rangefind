@@ -227,6 +227,11 @@ imports two functions from its host — `rangefind.host_now_ms` and
 `Date.now()` and `Intl`, keeping "open now" identical to the JS layer.
 Embedders loading the module without the glue must provide both. Native
 builds read the system tz database (`$TZDIR` or `/usr/share/zoneinfo`).
+Windows has none, and Ubuntu 24.04 moved legacy aliases such as
+`US/Eastern` and `EST` to the `tzdata-legacy` package. There, set `$TZDIR`
+to an IANA zoneinfo directory (Python's `tzdata` package ships one) or
+plug in `OpeningHoursOptions::zone_resolver`; otherwise named zones report
+`invalid-time-zone`.
 
 Parity: the OSM suite (`node rust/tools/parity/osm_fixtures.mjs`, then
 `cargo test --release --test osm_parity` and `node rust/tools/wasm/osm_parity.mjs`)
