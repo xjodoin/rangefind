@@ -138,7 +138,8 @@ fn concurrent_load_failure_propagates() {
     // shard loads succeed, but B also needs A's shard.
     let mut failed = false;
     let mut fail = |request: &FetchRequest| {
-        if !failed && request.url.contains("terms/packs/") {
+        // Windows paths resolve with `\` separators.
+        if !failed && request.url.replace('\\', "/").contains("terms/packs/") {
             failed = true;
             return true;
         }
@@ -243,8 +244,9 @@ fn file_transport_clamps_ranges() {
     assert!(error.message().contains("Range request failed"), "{}", error.message());
     let error = fetch_now(&transport, &url, vec![ByteRange { offset: u64::MAX, length: u64::MAX }]).unwrap_err();
     assert!(error.message().contains("Range request failed"));
-    // Plain paths are used verbatim: `?`, `#` and `%` are file-name bytes.
-    let odd = dir.join("a?b#c%20d.bin");
+    // Plain paths are used verbatim: `?`, `#` and `%` are file-name bytes
+    // (Windows forbids `?` in file names).
+    let odd = dir.join(if cfg!(windows) { "a#c%20d.bin" } else { "a?b#c%20d.bin" });
     std::fs::write(&odd, b"odd").unwrap();
     assert!(matches!(fetch_now(&transport, &odd.display().to_string(), vec![]), Ok(FetchResponse::Ok(_))));
     std::fs::remove_dir_all(&dir).ok();
