@@ -150,9 +150,11 @@ Known, documented differences, all outside normal indexes:
   platform libm can differ by 1–2 ulp. Ranking does not depend on these (geo
   distances are rounded before use). `Math.cos` and `Math.log1p`, where
   scores need bit-exact values, are ported from V8's fdlibm.
-- **Unicode version.** The Rust crates use Unicode 18, Node 24 uses
-  Unicode 16. Only characters assigned after Unicode 16 can tokenize
-  differently. Exclusion tables keep `\p{L}`/`\p{N}` identical to Node.
+- **Unicode version.** The Rust crates use Unicode 18. Exclusion tables
+  pin `\p{L}`/`\p{N}` to Unicode 16, matching Node 24.10. Node releases
+  with a newer ICU (Unicode 17+) treat a few thousand newly assigned
+  characters as letters, so only those can tokenize differently. CI pins
+  Node 24.10.0 for the fixtures for that reason.
 - **Lone surrogates** in strings become U+FFFD (Rust strings are valid
   UTF-8). Index keys built from them were already unreachable in JS.
 - **Corrupt input** may fail with a different message where JS would have

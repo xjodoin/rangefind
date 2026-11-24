@@ -191,17 +191,24 @@ function lonePairSafeName(value) {
   return Array.from(value, char => char.charCodeAt(0).toString(16)).join("-") || "empty";
 }
 
+// Characters Windows refuses in file names (plus controls), and the trailing
+// dot or space it strips, and its reserved device names (CON, NUL, COM1...).
+// Shard prefixes are normalized text, so "r|h" or "a*" are real shard names.
+const UNPORTABLE_FILE_NAME = /[<>:"/\\|?*\u0000-\u001f]|[. ]$|^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])$/iu;
+
 function safeShardDirName(shard) {
   // Base shards can start with a lone surrogate when a shard prefix splits an
   // astral code point, which encodeURIComponent and utf8 filenames reject or
   // collapse; encode such names as UTF-16 unit hex instead.
   const value = String(shard);
-  return value.isWellFormed() ? encodeURIComponent(value) : lonePairSafeName(value);
+  if (!value.isWellFormed()) return lonePairSafeName(value);
+  const encoded = encodeURIComponent(value);
+  return UNPORTABLE_FILE_NAME.test(encoded) ? lonePairSafeName(value) : encoded;
 }
 
 function shardRunFileName(shard) {
   const value = String(shard);
-  return value.isWellFormed() ? `${value}.run` : `${lonePairSafeName(value)}.run`;
+  return value.isWellFormed() && !UNPORTABLE_FILE_NAME.test(value) ? `${value}.run` : `${lonePairSafeName(value)}.run`;
 }
 
 export async function reduceAuthorityRuns(config, dirs, baseShards) {

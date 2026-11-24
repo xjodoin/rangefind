@@ -50,10 +50,17 @@ fn base64(input: &str) -> Vec<u8> {
 }
 
 fn from_bits(value: &Value) -> f64 {
+    if value.as_str() == Some("nan") {
+        return f64::NAN;
+    }
     f64::from_bits(u64::from_str_radix(value.as_str().expect("bits"), 16).expect("hex bits"))
 }
 
 fn bits(value: f64) -> Value {
+    // NaN sign and payload depend on the CPU, not the code (see the fixture).
+    if value.is_nan() {
+        return Value::String("nan".into());
+    }
     Value::String(format!("{:016x}", value.to_bits()))
 }
 

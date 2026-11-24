@@ -51,6 +51,9 @@ const pick = list => list[Math.floor(rand() * list.length)];
 const int = (lo, hi) => lo + Math.floor(rand() * (hi - lo + 1));
 
 function bits(value) {
+  // A NaN's sign and payload are unobservable in JS and differ by CPU (x86
+  // produces 0xfff8..., arm64 0x7ff8...), so every NaN records as "nan".
+  if (Number.isNaN(Number(value))) return "nan";
   const view = new DataView(new ArrayBuffer(8));
   view.setFloat64(0, Number(value));
   return view.getBigUint64(0).toString(16).padStart(16, "0");
