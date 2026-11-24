@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  collapseStreetSuggestions,
   parseCoordinateIntent,
   parseNearbyCategoryIntent,
   parseOsmQueryIntent,
@@ -2102,4 +2103,95 @@ test("OSM anchored search keeps the category lane for strong or nearby localitie
   // No anchored-text probe: the city interpretation goes straight through.
   assert.equal(calls.filter(call => call.geo?.boost && !call.geo?.sort).length, 0);
   assert.equal(response.stats.plannerLane, "osmCategoryLocality");
+});
+
+test("OSM exact-authority scope retries after a failed lookup instead of caching the miss", async () => {
+  let failures = 1;
+  const engine = {
+    manifest: { shards: [{ id: "alberta", bbox: [49, -120, 60, -110] }] },
+    async authorityLookup(surface) {
+      if (surface === "Calgary Tower" && failures > 0) {
+        failures--;
+        throw new Error("transient authority failure");
+      }
+      return surface === "Calgary Tower"
+        ? { matches: [{ text: "Calgary Tower", weight: 10, count: 1, shards: ["alberta"] }] }
+        : { matches: [] };
+    },
+    async search(params) {
+      if (params.q === "Calgary Tower" && params.shards?.includes("alberta")) {
+        return { total: 1, results: [{ id: "way/1", name: "Calgary Tower", type: "attraction", lat: 51.04, lon: -114.06 }], stats: {} };
+      }
+      return { total: 0, results: [], stats: {} };
+    }
+  };
+  const first = await searchOsmQuery(engine, { q: "Calgary Tower", size: 5 });
+  assert.notEqual(first.stats.plannerLane, "osmGlobalExactText");
+  const second = await searchOsmQuery(engine, { q: "Calgary Tower", size: 5 });
+  assert.equal(second.stats.plannerLane, "osmGlobalExactText");
+  assert.equal(second.results[0].name, "Calgary Tower");
+});
+
+test("OSM autocomplete match ranges stay inside words and use UTF-16 offsets", async () => {
+  const rangesFor = async (text, q) => {
+    const engine = { async suggest() { return { suggestions: [{ text, count: 2 }], stats: {} }; } };
+    return (await suggestOsmQuery(engine, { q, size: 8 })).suggestions[0].matchedRanges;
+  };
+  // Tokens match word prefixes only; nothing straddles "de la".
+  assert.deepEqual(await rangesFor("Rue de la Gare", "el"), []);
+  assert.deepEqual(await rangesFor("Rue de la Gare", "rue de la g"), [
+    { start: 0, end: 3 }, { start: 4, end: 6 }, { start: 7, end: 9 }, { start: 10, end: 11 }
+  ]);
+  // Astral characters count two UTF-16 units and every range has an end.
+  assert.deepEqual(await rangesFor("\u{20000} Gare", "gare"), [{ start: 3, end: 7 }]);
+  // A combining mark belongs to the letter it follows.
+  assert.deepEqual(await rangesFor("Le Café", "cafe"), [{ start: 3, end: 8 }]);
+  // Repeated tokens claim successive words.
+  assert.deepEqual(await rangesFor("Gare de Lyon de Paris", "de de"), [{ start: 5, end: 7 }, { start: 13, end: 15 }]);
+});
+
+test("OSM street suggestions break weight ties in code-unit order", () => {
+  const response = collapseStreetSuggestions({
+    suggestions: [
+      { text: "apple", weight: 1 },
+      { text: "Éclair", weight: 1 },
+      { text: "Zebra", weight: 1 }
+    ]
+  }, { q: "x", size: 8 });
+  assert.deepEqual(response.suggestions.map(item => item.text), ["Zebra", "apple", "Éclair"]);
+});
+
+test("OSM street-locality search reuses the authority-scoped street page when the place resolves to the same shard", async () => {
+  const streetSearches = [];
+  const engine = {
+    async authorityLookup(surface) {
+      return surface === "Montréal"
+        ? { matches: [{ text: "Montréal", weight: 1704694, count: 1, shards: ["quebec"] }] }
+        : { matches: [] };
+    },
+    async search(params) {
+      if (params.q === "Denis") {
+        streetSearches.push(params);
+        // The city field disagrees, so the authority shortcut cannot validate.
+        return {
+          total: 1,
+          results: [{ id: "way/7", name: "Rue Saint-Denis", city: "Outremont", lat: 45.52, lon: -73.58 }],
+          stats: {}
+        };
+      }
+      if (params.q === "Montréal") {
+        return {
+          total: 1,
+          results: [{ id: "node/2", name: "Montréal", type: "city", population: 1704694, lat: 45.5, lon: -73.57, shard: "quebec" }],
+          stats: {}
+        };
+      }
+      return { total: 0, results: [], stats: {} };
+    }
+  };
+  const response = await searchOsmQuery(engine, { q: "Rue Saint-Denis, Montréal", size: 10 });
+  assert.equal(response.stats.plannerLane, "osmStreetLocality");
+  assert.equal(response.results[0].name, "Rue Saint-Denis");
+  assert.equal(streetSearches.length, 1, "the identical street search must not run twice");
+  assert.deepEqual(streetSearches[0].shards, ["quebec"]);
 });

@@ -37,6 +37,11 @@ combination, fallback, and deliberate boundary with runnable examples.
   via positional file reads, or remote HTTP(S) indexes with memory + persistent
   caching — see `docs/mobile.md` (covers WebView, Flutter, and native apps
   too).
+- Rust engine (`rangefind/wasm`, `rust/rangefind`): the same query engine
+  ported to Rust, as a WebAssembly module for browsers/workers/Node/edge and
+  as a native library with a C ABI for iOS, Android, desktop and servers.
+  Verified response-for-response against the JavaScript runtime — see
+  `docs/rust-engine.md`.
 - Lazy paged binary range directories at `terms/directory-root.<hash>.bin.gz`
   and `terms/directory-pages/*.bin.gz`.
 - ZFS-inspired object pointers with SHA-256 verification before decompression.
@@ -193,6 +198,7 @@ Start with the guide that matches the job:
 | **[OSM example](examples/osm-geo/README.md)** | Map search, autocomplete, geocoding, constraints, route corridors, geometry, extraction, and RQA. |
 | **[Replace Google Maps APIs](https://rangefind.dev/google-maps-api-alternative/)** | Free public OSM index, migration adapter, API mapping, complete use cases, production checklist, attribution, and parity boundaries. |
 | **[Node](docs/node-runtime.md) / [mobile](docs/mobile.md)** | Local, remote, cached, embedded, and offline runtimes. |
+| **[Rust engine](docs/rust-engine.md)** | The query engine in Rust: WebAssembly for every JS host, native C ABI for iOS/Android/desktop, parity-tested against the JS runtime. |
 | **[Sharded OSM](docs/sharded-osm.md)** | Planet-scale regional builds, root routing, and exact score comparability. |
 | **[Route graph](docs/route-graph.md)** | Static routing, travel-time matrices, and itinerary planning over range-addressed road-network cells and overlays. |
 | **[Production maps benchmark](docs/osm-maps-benchmark.md)** | Google Maps-style workload coverage, quality assertions, and phone budgets. |

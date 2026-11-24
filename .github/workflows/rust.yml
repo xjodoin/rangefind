@@ -1,0 +1,118 @@
+name: Rust engine
+
+on:
+  push:
+    branches: [main]
+    paths: ["rust/**", "src/**", "types/**", "scripts/check_wasm_package.mjs", "package.json", "package-lock.json", "bench/competitive/**", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["rust/**", "src/**", "types/**", "scripts/check_wasm_package.mjs", "package.json", "package-lock.json", "bench/competitive/**", ".github/workflows/rust.yml"]
+
+env:
+  # Tests do not need fat LTO; it only slows every test binary's link.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          # Pinned: fixtures record V8's \p{L}/\p{N} tables, and the Rust
+          # engine matches Unicode 16 (Node 24.10). A newer ICU adds letters.
+          node-version: "24.10.0"
+          cache: npm
+      - run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Native "open now" reads TZif files where Node uses ICU's tz data.
+      # Ubuntu 24.04 ships the legacy aliases ICU still accepts (US/Eastern,
+      # EST) in tzdata-legacy; Windows has no zoneinfo, so point TZDIR at
+      # the IANA files from Python's tzdata package.
+      - name: Time-zone database
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get install -y -qq tzdata-legacy
+          else
+            python -m pip install --quiet tzdata
+            echo "TZDIR=$(python -c 'import os, tzdata; print(os.path.join(os.path.dirname(tzdata.__file__), "zoneinfo"))')" >> "$GITHUB_ENV"
+          fi
+      # Module fixtures: real JS encoders produce the binary inputs and the
+      # expected outputs; Rust must decode/compute identically.
+      - name: Module fixtures
+        shell: bash
+        run: |
+          for script in analysis codec geo vector authority osm_modules; do
+            node rust/tools/fixtures/$script.mjs
+          done
+          # Generated tables (stopwords, address abbreviations) are checked
+          # in; regenerating them must not change anything. Linux only:
+          # Windows checkouts rewrite line endings.
+          if [ "$RUNNER_OS" = "Linux" ]; then git diff --exit-code -- rust/rangefind/src; fi
+      # Engine fixtures: 16 real indexes and ~6k recorded JS responses.
+      - name: Engine parity fixtures
+        run: node rust/tools/parity/build_fixtures.mjs
+      # OSM query layer: unit-test replays + synthetic indexes (the
+      # Luxembourg suite needs the local OSM extract and runs locally).
+      - name: OSM parity fixtures
+        run: node rust/tools/parity/osm_fixtures.mjs --only=replay,testville,twoshards
+      - name: Tests (unit, module parity, engine parity, host protocol)
+        working-directory: rust/rangefind
+        run: cargo test --release
+      - name: Module groups build in isolation
+        working-directory: rust/rangefind
+        shell: bash
+        run: |
+          for feature in analysis codec geo authority vector; do
+            cargo build --no-default-features --features "$feature"
+          done
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          # Pinned: fixtures record V8's \p{L}/\p{N} tables, and the Rust
+          # engine matches Unicode 16 (Node 24.10). A newer ICU adds letters.
+          node-version: "24.10.0"
+          cache: npm
+      - run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build wasm module
+        run: bash rust/tools/wasm/build.sh
+      - name: Engine parity fixtures
+        run: node rust/tools/parity/build_fixtures.mjs
+      - name: wasm parity in Node
+        run: node rust/tools/wasm/node_parity.mjs
+      - name: OSM wasm parity in Node
+        run: |
+          node rust/tools/parity/osm_fixtures.mjs --only=replay,testville,twoshards
+          node rust/tools/wasm/osm_parity.mjs --only=testville,twoshards
+      - name: Package guard and browser bundling
+        run: |
+          node scripts/check_wasm_package.mjs
+          npx esbuild dist/rangefind_wasm.mjs --bundle --platform=browser --format=esm --outfile=/tmp/rangefind-wasm-bundle.js
+      - name: Install Chromium
+        working-directory: bench/competitive
+        run: npm install && npx playwright install --with-deps chromium
+      - name: wasm parity in Chromium
+        run: node rust/tools/wasm/browser_parity.mjs --browser=chromium

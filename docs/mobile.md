@@ -11,7 +11,7 @@ app:
 | WebView / hybrid (Capacitor, Ionic, PWA, React Native WebView) | The standard browser runtime | None — works today |
 | React Native / Expo (Hermes or JSC) | `rangefind/mobile` | Adapter + polyfills below |
 | Flutter | Headless WebView + local range server | Recipe below |
-| Native Swift/Kotlin | Local range server + WebView, or an embedded JS engine with `rangefind/mobile` | Recipe below |
+| Native Swift/Kotlin | The Rust engine's C ABI ([Rust engine](rust-engine.md)), or a local range server + WebView, or an embedded JS engine with `rangefind/mobile` | Link a static library |
 
 The differentiated capability on mobile is offline search at scale: because
 the runtime reads byte ranges instead of loading the index, a bundled or

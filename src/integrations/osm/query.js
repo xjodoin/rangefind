@@ -317,6 +317,12 @@ export async function reverseGeocodeOsm(engine, rawParams = {}) {
   };
 }
 
+// Deterministic tie-break order (UTF-16 code units), identical in every
+// runtime — unlike localeCompare, which follows the host's ICU data.
+function compareCodeUnits(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function mergeRuntimeTraces(...values) {
   const traces = [...new Set(values.filter(trace => trace?.spans?.length))];
   if (!traces.length) return null;
@@ -340,7 +346,7 @@ function mergeRuntimeTraces(...values) {
   }
   const spans = [...byName.values()]
     .map(({ bytes, ...span }) => bytes > 0 ? { ...span, bytes } : span)
-    .sort((left, right) => right.totalMs - left.totalMs || left.name.localeCompare(right.name));
+    .sort((left, right) => right.totalMs - left.totalMs || compareCodeUnits(left.name, right.name));
   return {
     totalMs: traces.reduce((sum, trace) => sum + Number(trace.totalMs || 0), 0),
     totalBytes: spans.reduce((sum, span) => sum + Number(span.bytes || 0), 0),
@@ -459,10 +465,12 @@ async function exactAuthorityScope(engine, surface) {
         const lookup = await authorityLookupCached(engine, surface);
         return exactAuthorityFromLookup(lookup, key);
       } catch {
+        // A failed read is not an answer: evict it so the next query retries
+        // instead of losing the authority shortcut for this surface forever.
+        if (cache.get(key) === promise) cache.delete(key);
         return null;
       }
     })();
-    promise.catch(() => cache.delete(key));
     cache.set(key, promise);
   }
   return cache.get(key);
@@ -1260,13 +1268,14 @@ async function anchoredExactText(engine, q, params, anchor, {
     ))) fuzzy.push(ranked);
     else other.push(ranked);
   }
-  // A bare name with no exact bearer on the page is the signature of a
+  // A bare name whose exact bearers include no place is the signature of a
   // locality query since enrichment: "montreal" matches every stamped doc
-  // and every "... Montréal ..." venue, while the city place doc itself is
-  // drowned below the probe window. One root-authority read (already cached
-  // by this lane's own gate) arbitrates; an authority miss keeps the fuzzy
-  // page for genuine partial names.
-  if (!intent && !exact.length) {
+  // and every "... Montréal ..." venue, "dudelange" its motorway junction,
+  // while the city place doc itself is drowned below the probe window. One
+  // root-authority read (already cached by this lane's own gate)
+  // arbitrates; an authority miss keeps the page for genuine partial names
+  // and same-named POIs.
+  if (!intent && !exact.some(result => LOCALITY_TYPES.has(result.type))) {
     const lexicon = await engineCategoryLexicon(engine);
     if (possibleLocalityQuery(q, lexicon)) {
       const locality = await resolveLocality(engine, q, params, { authorityMissIsFinal: true });
@@ -1465,7 +1474,7 @@ export function collapseStreetSuggestions(response, params = {}) {
     .sort((left, right) => (
       (right.type === "street") - (left.type === "street")
       || Number(right.weight || 0) - Number(left.weight || 0)
-      || String(left.text).localeCompare(String(right.text))
+      || compareCodeUnits(String(left.text), String(right.text))
     ))
     .slice(0, size);
   return {
@@ -1478,37 +1487,64 @@ export function collapseStreetSuggestions(response, params = {}) {
   };
 }
 
-function foldedTextWithOffsets(value) {
-  let text = "";
-  const starts = [];
-  const ends = [];
+// Display words of a suggestion: maximal runs of letters and numbers
+// (combining marks stay with the character they follow), each folded
+// character by character with the planner fold. `starts`/`ends` map every
+// UTF-16 unit of the folded word back to the [start, end) UTF-16 span of the
+// display character it came from.
+function suggestionWords(value) {
+  const words = [];
+  let current = null;
+  let lastStart = 0;
   let offset = 0;
   for (const character of String(value || "")) {
-    const folded = fold(character);
-    for (const unit of folded) {
-      text += unit;
-      starts.push(offset);
-      ends.push(offset + character.length);
+    const length = character.length;
+    if (/[\p{L}\p{N}]/u.test(character)) {
+      if (!current) {
+        current = { text: "", starts: [], ends: [] };
+        words.push(current);
+      }
+      lastStart = current.starts.length;
+      for (const unit of fold(character)) {
+        current.text += unit;
+        for (let index = 0; index < unit.length; index++) {
+          current.starts.push(offset);
+          current.ends.push(offset + length);
+        }
+      }
+    } else if (current && /\p{M}/u.test(character)) {
+      for (let index = lastStart; index < current.ends.length; index++) current.ends[index] = offset + length;
+    } else {
+      current = null;
     }
-    offset += character.length;
+    offset += length;
   }
-  return { text, starts, ends };
+  return words;
 }
 
+// Final sigma folds differently per character than inside a word.
+function sigmaInsensitive(value) {
+  return value.replaceAll("\u03c2", "\u03c3");
+}
+
+// Highlight ranges for a suggestion. Each folded input token, in order,
+// claims the first unclaimed display word whose folded form starts with it;
+// its range covers the display characters that fold to the token. Matches
+// never straddle words. Ranges are [start, end) UTF-16 offsets into the
+// display text, sorted by start.
 function suggestionMatchRanges(text, input) {
-  const haystack = foldedTextWithOffsets(text);
-  const tokens = fold(input).split(/\s+/u).filter(token => token.length >= 1);
+  const words = suggestionWords(text);
+  const keys = words.map(word => sigmaInsensitive(word.text));
+  const claimed = new Set();
   const ranges = [];
-  for (const token of tokens) {
-    const start = haystack.text.indexOf(token);
-    if (start < 0) continue;
-    ranges.push({ start: haystack.starts[start], end: haystack.ends[start + token.length - 1] });
+  for (const token of fold(input).split(" ").filter(Boolean)) {
+    const needle = sigmaInsensitive(token);
+    const index = keys.findIndex((key, position) => !claimed.has(position) && key.startsWith(needle));
+    if (index < 0) continue;
+    claimed.add(index);
+    ranges.push({ start: words[index].starts[0], end: words[index].ends[token.length - 1] });
   }
-  return ranges
-    .filter((range, index, all) => !all.some((other, otherIndex) => (
-      otherIndex < index && other.start === range.start && other.end === range.end
-    )))
-    .sort((left, right) => left.start - right.start || left.end - right.end);
+  return ranges.sort((left, right) => left.start - right.start || left.end - right.end);
 }
 
 function structuredSuggestion(item, input) {
@@ -2238,6 +2274,11 @@ async function resolveStreetLocality(engine, surface, params) {
     let locality = null;
     let response = null;
     let authorityLocality = false;
+    // The authority-scoped street search, kept even when its city check
+    // fails: if the resolved locality lands on that same scope, the search
+    // below would be the identical request.
+    let authorityScope = null;
+    let authorityResponse = null;
 
     // The root authority already proves which shard owns an exact locality.
     // Search that shard immediately and validate the candidate's structured
@@ -2249,6 +2290,8 @@ async function resolveStreetLocality(engine, surface, params) {
       if (authority?.shards?.length) {
         try {
           const candidateResponse = await searchStreet(authority.shards);
+          authorityScope = authority.shards;
+          authorityResponse = candidateResponse;
           const localityKeys = new Set([
             fold(localitySurface),
             fold(authority.text)
@@ -2285,6 +2328,9 @@ async function resolveStreetLocality(engine, surface, params) {
     // doc-value chunks — both cost far more than checking thirty results.
     // A miss falls back to the surrounding cascade like before.
     const localityShard = String(locality.shard || "").split("/")[0];
+    const sameScope = authorityResponse && localityShard
+      && authorityScope.length === 1 && String(authorityScope[0]) === localityShard;
+    if (!response && sameScope) response = authorityResponse;
     if (!response) {
       try {
         response = await searchStreet(localityShard ? [localityShard] : null);

@@ -42,3 +42,6 @@ examples/vector-bench/
 examples/osm-geo/shard-bench/
 bench/route/
 site/_site/
+rust/target/
+rust/rangefind/target/
+rust/rangefind/js/rangefind_wasm.wasm

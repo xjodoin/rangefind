@@ -136,6 +136,21 @@ function createRuntimeTrace() {
 // grows with the query keeps short queries as strict as they were — nothing
 // below eight terms changes — while letting a long, mostly-right address
 // still find its street.
+// `params.page` for a single index. It stays a double (a fractional page
+// pages by a fractional offset), but a non-numeric page reads as page 1: a NaN
+// offset reaches no row and NaN top-k bounds crash the proof lanes.
+function requestPage(value) {
+  const page = Number(value || 1);
+  return Number.isNaN(page) ? 1 : Math.max(1, page);
+}
+
+// `params.size` for a single index, clamped to [1, max]; a non-numeric size
+// reads as the default 10 (a NaN size, like a NaN page, crashes the lanes).
+function requestSize(value, max) {
+  const size = Math.floor(Number(value || 10));
+  return Number.isNaN(size) ? Math.min(10, max) : Math.max(1, Math.min(max, size));
+}
+
 function minShouldMatchFor(baseTerms) {
   const count = baseTerms.length;
   if (count <= 4) return count;
@@ -633,7 +648,16 @@ export async function createSearch(options = {}) {
       fullManifestPromise = fetchJsonIfOk(manifest.lazy_manifests.full)
         .then(full => {
           if (!full) return manifest;
+          // The full manifest carries facet *summaries* ({ count }) where the
+          // lazily loaded dictionaries (value arrays) may already sit in
+          // manifest.facets. Keep the loaded dictionaries: their cache entries
+          // stay resolved, so they would never be reloaded.
+          const loadedFacets = Object.entries(manifest.facets || {}).filter(([, values]) => Array.isArray(values));
           Object.assign(manifest, full);
+          if (loadedFacets.length) {
+            manifest.facets = { ...(manifest.facets || {}) };
+            for (const [field, values] of loadedFacets) manifest.facets[field] = values;
+          }
           docValues = manifest.doc_values || null;
           docValueSorted = manifest.doc_value_sorted || null;
           filterBitmaps = manifest.filter_bitmaps || null;
@@ -943,7 +967,21 @@ export async function createSearch(options = {}) {
   }
 
   function docValueSortField(field) {
+    // Trees from builders that wrote missing values as 0 (and double-coded
+    // booleans) would rank docs out of order: the exact lanes answer those.
+    if (docValueSorted?.missing_values !== "omitted") return null;
     return docValueSorted?.fields?.[field] || null;
+  }
+
+  // Docs without a sort value are not in a sorted tree or sort replica and
+  // rank after every valued doc (compareRankedRows). A sorted lane that
+  // exhausted its tree may therefore still owe those docs (and their count)
+  // unless a filter on the sort field itself rejects missing values.
+  function sortLaneOmitsMissingDocs(fieldTotal, field, docFilterPlan) {
+    if (Number.isFinite(fieldTotal) && fieldTotal >= manifest.total) return false;
+    if (docFilterPlan?.numbers?.some(([name]) => name === field)) return false;
+    if (docFilterPlan?.booleans?.some(([name]) => name === field)) return false;
+    return true;
   }
 
   function docValueSortPageCacheKey(field, pageIndexValue) {
@@ -1948,8 +1986,11 @@ export async function createSearch(options = {}) {
       && bundle.nextTieDoc > boundary[0];
   }
 
-  function queryBundleFilteredTopKProven(bundle, ranked, k) {
-    if (bundle.complete) return true;
+  // `exhausted`: every candidate row has been filtered. A complete bundle
+  // holds every matching doc, so it proves the filtered top k once k rows
+  // passed (later rows rank lower) or once no candidate row is left.
+  function queryBundleFilteredTopKProven(bundle, ranked, k, exhausted) {
+    if (bundle.complete) return exhausted || ranked.length >= k;
     if (ranked.length < k) return false;
     const boundary = ranked[k - 1];
     return !!boundary && (bundle.nextScoreBound || 0) < boundary[1];
@@ -1982,7 +2023,7 @@ export async function createSearch(options = {}) {
       for (const row of batch) {
         if (passesFilterPlanWithKnown(row[0], codeData, docFilterPlan, knownQueryBundleFilterValues(bundle, embeddedFields, row[0]))) ranked.push(row);
       }
-      if (queryBundleFilteredTopKProven(bundle, ranked, k)) {
+      if (queryBundleFilteredTopKProven(bundle, ranked, k, scanned >= candidateRows.length)) {
         const valueSource = usedDocValues ? "queryBundleRows+docValues" : "queryBundleRows";
         return {
           ranked,
@@ -2000,7 +2041,7 @@ export async function createSearch(options = {}) {
     const valueSource = usedDocValues ? "queryBundleRows+docValues" : "queryBundleRows";
     return {
       ranked,
-      topKProven: queryBundleFilteredTopKProven(bundle, ranked, k),
+      topKProven: queryBundleFilteredTopKProven(bundle, ranked, k, true),
       scanned,
       accepted: ranked.length,
       exhausted: true,
@@ -2015,7 +2056,7 @@ export async function createSearch(options = {}) {
     if (summaryProvesFilters) {
       return {
         ranked: candidateRows,
-        topKProven: queryBundleFilteredTopKProven(bundle, candidateRows, k),
+        topKProven: queryBundleFilteredTopKProven(bundle, candidateRows, k, true),
         scanned: 0,
         accepted: candidateRows.length,
         exhausted: true,
@@ -2057,7 +2098,7 @@ export async function createSearch(options = {}) {
       for (const row of batch) {
         if (passesFilterPlan(row[0], codeData, docFilterPlan)) ranked.push(row);
       }
-      if (queryBundleFilteredTopKProven(bundle, ranked, k)) {
+      if (queryBundleFilteredTopKProven(bundle, ranked, k, scanned >= candidateRows.length)) {
         return {
           ranked,
           topKProven: true,
@@ -2073,7 +2114,7 @@ export async function createSearch(options = {}) {
     }
     return {
       ranked,
-      topKProven: queryBundleFilteredTopKProven(bundle, ranked, k),
+      topKProven: queryBundleFilteredTopKProven(bundle, ranked, k, true),
       scanned,
       accepted: ranked.length,
       exhausted: true,
@@ -2102,7 +2143,12 @@ export async function createSearch(options = {}) {
     const filterFields = hasFilters ? filterPlanFields(docFilterPlan) : [];
 
     let lookups = 0;
-    for (const plan of queryBundleKeysFromBaseTerms(baseTerms)) {
+    // A bundle stores the exact ranking of its own base terms. Only a bundle
+    // over the query's full base-term list answers the query: a 2-term
+    // window of a 3-term query ranks a different (larger) match set.
+    const plans = queryBundleKeysFromBaseTerms(baseTerms)
+      .filter(plan => plan.baseTerms.length === baseTerms.length && plan.baseTerms.every((term, index) => term === baseTerms[index]));
+    for (const plan of plans) {
       lookups++;
       const loaded = await loadQueryBundle(plan.key);
       const bundle = loaded?.bundle;
@@ -3848,6 +3894,18 @@ export async function createSearch(options = {}) {
   }
 
   function mergeSortPageFilter(filters, field, page) {
+    if (booleanFields.has(field)) {
+      // Boolean sort pages hold codes 1 (false) and 2 (true). A single-valued
+      // page narrows the posting blocks to that boolean; a numeric range
+      // would be compared against the boolean block summaries.
+      const booleans = { ...(filters.booleans || {}) };
+      if (booleans[field] == null && page?.min === page?.max && (page?.min === 1 || page?.min === 2)) booleans[field] = page.min === 2;
+      return {
+        facets: filters.facets || {},
+        numbers: filters.numbers || {},
+        booleans
+      };
+    }
     const numbers = { ...(filters.numbers || {}) };
     const current = numbers[field] || {};
     const fieldMeta = numberFields.get(field);
@@ -3938,7 +3996,10 @@ export async function createSearch(options = {}) {
 
   function sortReplicaForPlan(sortPlan) {
     const replicas = manifest.sort_replicas?.replicas || {};
-    return replicas[sortReplicaPlanKey(sortPlan)] || null;
+    const replica = replicas[sortReplicaPlanKey(sortPlan)] || null;
+    // Older replicas ranked missing values as 0 (before every negative value
+    // and after nothing else); current ones rank them last with a NaN value.
+    return replica?.missing_values === "last" ? replica : null;
   }
 
   function sortReplicaDirectoryState(replica) {
@@ -4132,7 +4193,8 @@ export async function createSearch(options = {}) {
       if (!chunk) continue;
       const offset = rank - chunk.start;
       if (offset < 0 || offset >= chunk.count) continue;
-      out.set(rank, { rank, doc: chunk.docs[offset], value: chunk.values[offset] });
+      const value = chunk.values[offset];
+      out.set(rank, { rank, doc: chunk.docs[offset], value: Number.isFinite(value) ? value : null });
     }
     return out;
   }
@@ -4446,12 +4508,18 @@ export async function createSearch(options = {}) {
   async function sortReplicaStopState(replica, cursors, scores, hits, minShouldMatch, k, sortPlan, stats) {
     const state = await sortReplicaRankedState(replica, scores, hits, minShouldMatch, sortPlan, stats);
     if (state.eligible.length < k) return { ...state, stop: false, exhausted: false, boundarySortValue: null };
-    const boundarySortValue = state.sortValues.get(state.eligible[k - 1][0]);
+    const boundarySortValue = state.sortValues.get(state.eligible[Math.ceil(k) - 1][0]);
     const nextRanks = sortReplicaNextRanks(cursors);
     if (!nextRanks.length) return { ...state, stop: true, exhausted: true, boundarySortValue };
     const nextRows = await sortReplicaRankRows(replica, nextRanks, stats);
+    // Missing values rank last: past a missing boundary any row may still
+    // outscore it, while a missing row never reaches a valued boundary.
     const canTieOrBeat = [...nextRows.values()].some(row => (
-      sortPlan.desc ? row.value >= boundarySortValue : row.value <= boundarySortValue
+      boundarySortValue == null
+        ? true
+        : row.value == null
+          ? false
+          : sortPlan.desc ? row.value >= boundarySortValue : row.value <= boundarySortValue
     ));
     return { ...state, stop: !canTieOrBeat, exhausted: false, boundarySortValue };
   }
@@ -4595,7 +4663,7 @@ export async function createSearch(options = {}) {
     let pointsAccepted = 0;
     let definiteLeaves = 0;
     let stoppedEarly = false;
-    const kthDistance = () => (best.length >= k ? best[k - 1].dist : Infinity);
+    const kthDistance = () => (best.length >= k ? best[Math.ceil(k) - 1].dist : Infinity);
     const routeOrder = match => {
       const directedProgress = geoPlan.routeDirection === "reverse"
         ? geoPlan.route.totalMeters - match.progressMeters
@@ -4694,7 +4762,7 @@ export async function createSearch(options = {}) {
             else hi = mid;
           }
           best.splice(lo, 0, { doc, dist: order, routeMatch });
-          if (best.length > k) best.length = k;
+          if (best.length > k) best.length = Math.ceil(k);
         } else {
           collected.push([doc, 0]);
           if (near) distances.set(doc, dist);
@@ -4809,6 +4877,7 @@ export async function createSearch(options = {}) {
     const desc = !!sortPlan?.desc;
     const pages = sortedDirectoryPages(directory, desc, docFilterPlan);
     const collected = [];
+    const sortValues = new Map();
     const filterFields = filterPlanFields(docFilterPlan).filter(item => item !== field);
     let pagesVisited = 0;
     let rowsScanned = 0;
@@ -4836,18 +4905,27 @@ export async function createSearch(options = {}) {
         for (const row of rows) {
           const known = { [field]: row.value };
           if (!definite && !passesFilterPlanWithKnown(row.doc, codeData, docFilterPlan, known)) continue;
+          sortValues.set(row.doc, row.sortValue);
           collected.push([row.doc, 0]);
           rowsAccepted++;
-          if (collected.length >= k) {
+        }
+        // Equal values can straddle pages (ties split at 4x the page size,
+        // and mixed pages overlap the next page's value in descending
+        // order), so stop only once the next page cannot reach the k-th row.
+        if (collected.length >= k) {
+          collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
+          const boundarySortValue = sortValues.get(collected[Math.ceil(k) - 1][0]);
+          if (!nextSortPageCanTie(pages[pageIndex + 1], boundarySortValue, desc)) {
             stoppedEarly = true;
             break;
           }
         }
-        if (stoppedEarly) break;
       }
       pageIndex = startPageIndex + batchPages.length;
     }
 
+    if (!stoppedEarly && sortLaneOmitsMissingDocs(directory.total, field, docFilterPlan)) return null;
+    collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
     const resultContext = { hasTextTerms: false, preferDocPages: true };
     const results = await rowsToResults(collected.slice(offset, offset + size), resultContext);
     const exactTotal = !stoppedEarly;
@@ -5233,7 +5311,7 @@ export async function createSearch(options = {}) {
 
         collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
         if (collected.length >= k) {
-          const boundarySortValue = sortValues.get(collected[k - 1][0]);
+          const boundarySortValue = sortValues.get(collected[Math.ceil(k) - 1][0]);
           if (!nextSortPageCanTie(candidatePages[pageIndex + 1], boundarySortValue, desc)) {
             stoppedBySortBound = true;
             break;
@@ -5243,6 +5321,7 @@ export async function createSearch(options = {}) {
       pageIndex = startPageIndex + batchPages.length;
     }
 
+    if (!stoppedBySortBound && sortLaneOmitsMissingDocs(directory.total, field, docFilterPlan)) return null;
     collected.sort((a, b) => compareKnownSortRows(a, b, sortPlan, sortValues));
     const rows = collected.slice(offset, offset + size);
     const resultContext = { hasTextTerms: true, preferDocPages: true };
@@ -7643,8 +7722,8 @@ export async function createSearch(options = {}) {
   async function executeSearch(params = {}) {
     if (params.vector) return executeHybridSearch(params);
     const q = String(params.q || "").trim();
-    const page = Math.max(1, Number(params.page || 1));
-    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
+    const page = requestPage(params.page);
+    const size = requestSize(params.size, maxPageSize);
     const offset = (page - 1) * size;
     const userFilters = params.filters || {};
     const geoPlan = params.geo ? makeGeoPlan(params.geo) : null;
@@ -7668,7 +7747,9 @@ export async function createSearch(options = {}) {
         const geoResponse = await runGeoBrowse({ page, size, filters: userFilters, geoPlan, hasFilters: hasUserFilters });
         if (geoResponse) return geoResponse;
       }
-      if (hasFilters) await ensureDocValuesManifest();
+      // Sorting reads the sort field's doc values (the sorted lane defers here
+      // when its tree cannot answer), so load the lazy manifest for it too.
+      if (hasFilters || sortPlan) await ensureDocValuesManifest();
       if (!sortPlan && !hasFilters && !geoPlan) {
         const docs = manifest.initial_results.slice(offset, offset + size);
         return { total: manifest.total, results: docs, page, size };
@@ -8055,8 +8136,8 @@ export async function createSearch(options = {}) {
   // filters are enforced on both lanes (the vector lane verifies candidates
   // against doc values before fusion).
   async function executeHybridSearch(params) {
-    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
-    const page = Math.max(1, Number(params.page || 1));
+    const size = requestSize(params.size, maxPageSize);
+    const page = requestPage(params.page);
     const poolSize = Math.max(size * 3, Math.min(100, size * 5));
     const rrfK = Math.max(1, Math.floor(Number(params.hybrid?.rrfK || 60)));
     const q = String(params.q || "").trim();
@@ -8978,6 +9059,13 @@ export async function createSearch(options = {}) {
   }
 
   async function hydrateRows(rows, context = {}) {
+    // Ids that are not document indexes used to reach the document reader
+    // and fail (or silently read doc 0) depending on the host transport.
+    for (const [index] of rows) {
+      if (!Number.isInteger(index) || index < 0 || index >= manifest.total) {
+        throw new Error(`Rangefind: hydrateRows row index ${String(index)} is not a document index in [0, ${manifest.total}).`);
+      }
+    }
     return rowsToResults(rows, context);
   }
 
@@ -8987,8 +9075,8 @@ export async function createSearch(options = {}) {
   // geometry; an unhydrated row cannot be reconstructed by the outer merge.
   async function searchAddressAuthority(params = {}) {
     const q = String(params.q || "").trim();
-    const page = Math.max(1, Number(params.page || 1));
-    const size = Math.max(1, Math.min(maxPageSize, Math.floor(Number(params.size || 10))));
+    const page = requestPage(params.page);
+    const size = requestSize(params.size, maxPageSize);
     const filters = params.filters || {};
     const hasFilters = Object.keys(filters.facets || {}).length
       || Object.keys(filters.numbers || {}).length

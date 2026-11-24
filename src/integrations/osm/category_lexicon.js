@@ -377,7 +377,7 @@ export function lookupCategoryFuzzy(lexicon, surface) {
   if (types.size !== 1) return null;
   const match = matches
     .sort((left, right) => Math.abs(left.key.length - folded.length) - Math.abs(right.key.length - folded.length)
-      || left.key.localeCompare(right.key))[0];
+      || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0))[0];
   if (!match) return null;
   return {
     type: match.entry.type,

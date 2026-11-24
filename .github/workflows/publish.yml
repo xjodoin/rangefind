@@ -38,6 +38,12 @@ jobs:
       - run: npm install -g npm@latest
 
       - run: npm ci
+      # `prepublishOnly` builds the Rust engine to WebAssembly for the
+      # `rangefind/wasm` export (dist/ is gitignored).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: npm run build:wasm
       - run: npm run test:all
       - run: npm test --workspaces --if-present
 

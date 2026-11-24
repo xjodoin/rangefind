@@ -155,9 +155,11 @@ export function createLocalityIndex() {
   return {
     // rings: array of closed [ [lat, lon], ... ] rings (outer and inner
     // together — even-odd containment handles holes without role tracking).
+    // Returns the stored boundary record (truthy) so callers can hold onto
+    // it — e.g. to join a relation's admin_centre node to its polygon.
     addBoundary({ id, name, adminLevel, rings }) {
       if (finalized) throw new Error("Locality index is finalized.");
-      if (!name || !rings?.length) return false;
+      if (!name || !rings?.length) return null;
       const flat = rings.map(flattenRing);
       let bbox = null;
       for (const ring of flat) {
@@ -168,9 +170,10 @@ export function createLocalityIndex() {
       }
       // Boundaries spanning more than half the globe are either broken
       // geometry or antimeridian crossers this planar test cannot handle.
-      if (!bbox || bbox[3] - bbox[1] > 180) return false;
-      boundaries.push({ id, name: String(name), adminLevel: Number(adminLevel) || 0, rings: flat, bbox });
-      return true;
+      if (!bbox || bbox[3] - bbox[1] > 180) return null;
+      const boundary = { id, name: String(name), adminLevel: Number(adminLevel) || 0, rings: flat, bbox };
+      boundaries.push(boundary);
+      return boundary;
     },
 
     addPlace({ name, type, lat, lon }) {
@@ -198,6 +201,23 @@ export function createLocalityIndex() {
 
     stats() {
       return { boundaries: boundaries.length, places: places.length };
+    },
+
+    // Every assembled boundary containing the point, most specific admin
+    // level first (the finalize() sort order). Callers join on the boundary
+    // name — e.g. attaching a municipality's contour to its place document.
+    boundariesAt(lat, lon) {
+      if (!finalized) throw new Error("Locality index is not finalized.");
+      const bucket = boundaryGrid.get(gridKey(cellOf(lat), cellOf(lon)));
+      if (!bucket) return [];
+      const containing = [];
+      for (const index of bucket) {
+        const boundary = boundaries[index];
+        const box = boundary.bbox;
+        if (lat < box[0] || lat > box[2] || lon < box[1] || lon > box[3]) continue;
+        if (pointInRings(boundary.rings, lat, lon)) containing.push(boundary);
+      }
+      return containing;
     },
 
     resolve(lat, lon) {

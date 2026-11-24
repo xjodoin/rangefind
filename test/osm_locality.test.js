@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { scanPbf } from "../scripts/osm_pbf.mjs";
 import { extractOsmPlaces } from "../scripts/osm_fixture.mjs";
-import { enrichDocLocality } from "../src/integrations/osm/documents.js";
+import { boundaryContourGeometry, enrichDocLocality } from "../src/integrations/osm/documents.js";
 import { assembleRings, createLocalityIndex } from "../src/integrations/osm/locality_index.js";
 
 // --- minimal OSM PBF encoder (enough for scanPbf's subset) -----------------
@@ -181,6 +181,7 @@ function fixtureElements() {
   };
   const outer = ring(45.0, -73.2, 45.2, -73.0);
   const hole = ring(45.08, -73.12, 45.12, -73.08);
+  const testburg = ring(46.5, -71.5, 46.7, -71.3);
 
   const pois = [
     { id: 9001, lat: 45.05, lon: -73.15, tags: { name: "Pharmacie Test", amenity: "pharmacy" } },
@@ -189,7 +190,11 @@ function fixtureElements() {
     { id: 9004, lat: 45.06, lon: -73.14, tags: { name: "Chez Tagged", amenity: "restaurant", "addr:city": "Mapperville" } },
     { id: 9010, lat: 45.1, lon: -73.1, tags: { name: "Holeburg", place: "village" } },
     { id: 9011, lat: 47.0, lon: -70.0, tags: { name: "Fallbackton", place: "hamlet" } },
-    { id: 9012, lat: 45.09, lon: -73.11, tags: { name: "Testville", place: "town" } }
+    // Deliberately inside the boundary hole: only the relation's
+    // admin_centre membership can join this node to its municipality.
+    { id: 9012, lat: 45.09, lon: -73.11, tags: { name: "Testville", place: "town" } },
+    // No admin_centre link anywhere: joins by name + containment.
+    { id: 9013, lat: 46.6, lon: -71.4, tags: { name: "Testburg", place: "town" } }
   ];
   nodes.push(...pois);
 
@@ -198,7 +203,8 @@ function fixtureElements() {
   const ways = [
     { id: 501, refs: [outer[0], outer[1], outer[2]], tags: {} },
     { id: 502, refs: [outer[0], outer[3], outer[2]], tags: {} },
-    { id: 503, refs: [...hole, hole[0]], tags: {} }
+    { id: 503, refs: [...hole, hole[0]], tags: {} },
+    { id: 504, refs: [...testburg, testburg[0]], tags: {} }
   ];
   const relations = [
     {
@@ -210,6 +216,11 @@ function fixtureElements() {
         { type: "way", ref: 503, role: "inner" },
         { type: "node", ref: 9012, role: "admin_centre" }
       ]
+    },
+    {
+      id: 7002,
+      tags: { boundary: "administrative", admin_level: "8", name: "Testburg" },
+      members: [{ type: "way", ref: 504, role: "outer" }]
     }
   ];
   return { nodes: nodes.sort((a, b) => a.id - b.id), ways, relations };
@@ -234,7 +245,7 @@ test("scanPbf parses relations with members and roles", async () => {
       seen.relations.push({ id, members, tags });
     }
   });
-  assert.equal(counts.relations, 1);
+  assert.equal(counts.relations, 2);
   assert.equal(seen.relations[0].id, 7001);
   assert.equal(seen.relations[0].tags.get("name"), "Testville");
   assert.deepEqual(
@@ -287,6 +298,16 @@ test("locality index resolves boundaries with holes and place fallbacks", () => 
   assert.ok(index.addPlace({ name: "Bigcity", type: "city", lat: 47.05, lon: -70.05 }));
   index.finalize();
 
+  // boundariesAt lists every containing boundary, most specific first, so a
+  // caller can name-join a place document to its municipality polygon.
+  assert.deepEqual(
+    index.boundariesAt(45.05, -73.15).map(boundary => [boundary.name, boundary.adminLevel]),
+    [["Testville", 8], ["Test County", 7]]
+  );
+  // Inside Testville's hole only the level-7 parent contains the point.
+  assert.deepEqual(index.boundariesAt(45.1, -73.1).map(boundary => boundary.name), ["Test County"]);
+  assert.deepEqual(index.boundariesAt(10, 10), []);
+
   assert.deepEqual(index.resolve(45.05, -73.15), { city: "Testville", source: "boundary" });
   // Inside the hole: not Testville; the county still contains it… but the
   // hole is only cut from Testville, so the level-7 parent claims it.
@@ -296,6 +317,48 @@ test("locality index resolves boundaries with holes and place fallbacks", () => 
   assert.deepEqual(index.resolve(47.001, -70.001), { city: "Fallbackton", source: "place" });
   // Far from everything: no locality.
   assert.equal(index.resolve(10, 10), null);
+});
+
+test("boundaryContourGeometry simplifies, prunes islets, and encodes multi-ring contours", () => {
+  const flatSquare = (minLat, minLon, maxLat, maxLon, steps = 1) => {
+    const points = [];
+    const push = (lat, lon) => points.push(lat, lon);
+    // Walk each edge in `steps` segments so simplification has vertices to
+    // remove; collinear intermediates must not survive.
+    const corners = [
+      [minLat, minLon], [minLat, maxLon], [maxLat, maxLon], [maxLat, minLon], [minLat, minLon]
+    ];
+    for (let edge = 1; edge < corners.length; edge++) {
+      const [fromLat, fromLon] = corners[edge - 1];
+      const [toLat, toLon] = corners[edge];
+      for (let step = 0; step < steps; step++) {
+        push(fromLat + ((toLat - fromLat) * step) / steps, fromLon + ((toLon - fromLon) * step) / steps);
+      }
+    }
+    push(minLat, minLon);
+    return Float64Array.from(points);
+  };
+
+  const single = boundaryContourGeometry([flatSquare(45.0, -73.2, 45.2, -73.0, 32)]);
+  assert.equal(single.geometry.type, "Polygon");
+  assert.equal(single.geometry.encoding, "polyline");
+  assert.equal(typeof single.geometry.encoded, "string");
+  assert.deepEqual(single.bbox, [45.0, -73.2, 45.2, -73.0]);
+  assert.deepEqual(single.geometry.bbox, [-73.2, 45.0, -73.0, 45.2]);
+
+  // A second island keeps the contour a MultiPolygon; a speck far below half
+  // a percent of the main ring's extent is display noise and is dropped.
+  const multi = boundaryContourGeometry([
+    flatSquare(45.0, -73.2, 45.2, -73.0),
+    flatSquare(45.3, -73.5, 45.4, -73.4),
+    flatSquare(45.5, -73.51, 45.5001, -73.5099)
+  ]);
+  assert.equal(multi.geometry.type, "MultiPolygon");
+  assert.equal(multi.geometry.encoded.length, 2);
+
+  // Broken coordinates discard the ring, never the extraction.
+  assert.equal(boundaryContourGeometry([Float64Array.from([91, 0, 91, 1, 92, 1, 91, 0])]), null);
+  assert.equal(boundaryContourGeometry([]), null);
 });
 
 test("enrichDocLocality stamps city and search text without touching addresses", () => {
@@ -332,10 +395,11 @@ test("extraction enriches documents from boundaries and place nodes end to end",
   await writeFile(pbf, encodePbf([encodeBlock(strings, { nodes, ways, relations })]));
 
   const meta = await extractOsmPlaces({ root, pbf, region: "testville" });
-  assert.equal(meta.schemaVersion, 11);
-  assert.equal(meta.locality.boundaries, 1);
+  assert.equal(meta.schemaVersion, 12);
+  assert.equal(meta.locality.boundaries, 2);
   assert.ok(meta.locality.enrichedFromBoundaries >= 1);
   assert.ok(meta.locality.enrichedFromPlaces >= 2);
+  assert.equal(meta.locality.contouredPlaces, 2);
 
   const docs = (await readFile(join(root, "data", "osm-places.jsonl"), "utf8"))
     .trim().split("\n").map(line => JSON.parse(line));
@@ -352,4 +416,24 @@ test("extraction enriches documents from boundaries and place nodes end to end",
   assert.equal(byName.get("Chez Tagged").city, "Mapperville");
   // Place documents never get stamped with themselves.
   assert.equal(byName.get("Testville").city, undefined);
+  // Testville's place node sits inside the boundary hole, so only the
+  // relation's admin_centre membership joins it: it still carries both
+  // rings of its municipality contour plus the canonical doc bbox.
+  const town = byName.get("Testville");
+  assert.equal(town.geometry.encoding, "polyline");
+  assert.equal(town.geometry.type, "MultiPolygon");
+  assert.equal(town.geometry.encoded.length, 2);
+  assert.ok(Math.abs(town.bbox[0] - 45.0) < 1e-4);
+  assert.ok(Math.abs(town.bbox[1] - -73.2) < 1e-4);
+  assert.ok(Math.abs(town.bbox[2] - 45.2) < 1e-4);
+  assert.ok(Math.abs(town.bbox[3] - -73.0) < 1e-4);
+  // Testburg has no admin_centre link: name + containment joins it.
+  const testburg = byName.get("Testburg");
+  assert.equal(testburg.geometry.type, "Polygon");
+  assert.equal(typeof testburg.geometry.encoded, "string");
+  assert.ok(Math.abs(testburg.bbox[0] - 46.5) < 1e-4);
+  assert.ok(Math.abs(testburg.bbox[3] - -71.3) < 1e-4);
+  // The village sits in the hole, inside the boundary's bbox but outside
+  // its rings — and its name doesn't match; no contour.
+  assert.equal(byName.get("Holeburg").geometry, undefined);
 });

@@ -164,6 +164,7 @@ export interface Suggestion {
   description?: string;
   mainText?: string;
   secondaryText?: string;
+  /** Word-prefix matches of the input tokens: [start, end) UTF-16 offsets into `text`. */
   matchedRanges?: Array<{ start: number; end: number }>;
   kind?: string;
   types?: string[];
